@@ -35,13 +35,36 @@ use crate::github::{model, records::CommitIndex};
 /// `REVIEWS_COMMIT` anchor edges/diagnostics, but a pre-#334 state file's cached
 /// review-endpoint `ETags` (`/pulls/comments`, `/pulls/{n}/reviews`) would return
 /// HTTP 304 and skip re-emission, silently suppressing the new contract for
-/// unchanged reviews. A version mismatch discards the stale state, forcing
-/// exactly ONE full refresh that re-emits reviews with the anchor field; the
-/// version-3 state written afterward keeps subsequent unchanged re-imports
-/// idempotent. The additive `review_commit_artifacts` field itself is
-/// `#[serde(default)]` and needs no bump — the bump is for the changed emitted
-/// per-resource contract, exactly as #333 bumped 1 → 2.
+/// unchanged reviews.
+///
+/// Unlike the #333 1 → 2 bump (v1 held no merge artifacts, so a blunt discard was
+/// safe), a v2 file DOES carry #333's `pr_merge_artifacts` tracking, so this bump
+/// MUST NOT discard the whole file. [`State::load_or_fresh`] therefore *migrates*
+/// v2 → v3 (Codex #352 P2): it preserves every v2 field — critically
+/// `pr_merge_artifacts`, so a merge that resolves differently on the first v3 run
+/// can still tombstone the stale artifact — and clears ONLY the review-endpoint
+/// `ETag` caches so review anchoring refreshes without a 304 hiding it. The
+/// `/pulls` list `ETag` and every other cache survive. The v2-stored review
+/// resource hashes are kept but harmless: the v3 review change hash folds in the
+/// `REVIEWS_COMMIT` marker ([`review_hash`]) — a different formula than the v2
+/// `blake3(payload)` — so on the forced 200 refetch no stored hash can match and
+/// every review re-emits with the anchor field exactly once. The additive
+/// `review_commit_artifacts` field itself is `#[serde(default)]`.
 pub const STATE_SCHEMA_VERSION: u32 = 3;
+
+/// Returns `true` when `key` is an `ETag` cache key for one of the
+/// commit-anchored review endpoints whose emitted per-resource contract changed
+/// in the v2 → v3 bump (issue #334): `/pulls/comments` (PR review comments) or
+/// `/pulls/{n}/reviews` (per-PR review summaries).
+///
+/// The `/pulls` *list* endpoint key (`/pulls?state=…`, which uses `/pulls?` and
+/// never `/pulls/`) is deliberately excluded — its contract is unchanged, so its
+/// `ETag` (and the #333 merge-artifact tracking that depends on the pulls branch
+/// running) must survive a v2 → v3 migration. Keys are `"<path>?page=<n>"`
+/// (see [`crate::github::client::GithubClient::fetch_paginated`]).
+fn is_review_endpoint_etag_key(key: &str) -> bool {
+    key.contains("/pulls/comments") || (key.contains("/pulls/") && key.contains("/reviews"))
+}
 
 /// Per-endpoint update watermarks (inclusive `>=` selection, §5).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -146,31 +169,53 @@ impl State {
     }
 
     /// Loads state from `path`, returning a fresh state when the file is
-    /// missing, unreadable, unparseable, or carries an unsupported
-    /// `schema_version` (a partial file from a crashed run, per §5).
+    /// missing, unreadable, or unparseable (a partial file from a crashed run,
+    /// per §5), and migrating older but recoverable schema versions in place.
     ///
-    /// The cached state is also discarded when its `source_repo` or
+    /// The cached state is discarded (fresh-empty) when its `source_repo` or
     /// `api_base_url` does not match the current run: `ETags` and resource
     /// hashes are scoped to one `(api_base, owner/repo)` pair, so reusing the
     /// same `--state-file` across GitHub Enterprise, the default API, or a mock
     /// `--api-base` must start fresh rather than send conditional requests with
     /// another server's `ETags`.
+    ///
+    /// Schema-version handling (see [`STATE_SCHEMA_VERSION`]):
+    /// - `== STATE_SCHEMA_VERSION` → used as-is.
+    /// - `== 2` → MIGRATED to v3, not discarded (Codex #352 P2). Discarding
+    ///   would drop #333's `pr_merge_artifacts` tracking, so a PR whose merge
+    ///   resolves differently on the first v3 run could emit the fresh artifact
+    ///   yet never tombstone the stale one, leaving stale + fresh merge evidence
+    ///   live. Migration preserves every v2 field (the additive
+    ///   `review_commit_artifacts` defaults to empty via serde) and clears ONLY
+    ///   the review-endpoint `ETag` caches ([`is_review_endpoint_etag_key`]) so
+    ///   #334 review anchoring refreshes without a 304 hiding it — the `/pulls`
+    ///   list `ETag` and every other cache survive.
+    /// - anything else (`< 2`, pre-#333 with no merge artifacts to lose, or an
+    ///   unsupported future value) → safe fresh-empty fallback.
     #[must_use]
     pub fn load_or_fresh(path: &Path, source_repo: &str, api_base_url: &str) -> Self {
         let fallback = || Self::fresh(source_repo, api_base_url);
         let Ok(raw) = std::fs::read_to_string(path) else {
             return fallback();
         };
-        match serde_json::from_str::<Self>(&raw) {
-            Ok(s)
-                if s.schema_version == STATE_SCHEMA_VERSION
-                    && s.source_repo == source_repo
-                    && s.api_base_url == api_base_url =>
-            {
-                s
-            }
-            _ => fallback(),
+        let Ok(mut s) = serde_json::from_str::<Self>(&raw) else {
+            return fallback();
+        };
+        // `ETags`/hashes are scoped to one `(api_base, owner/repo)` pair; a
+        // cross-scope reuse must never send another server's conditional probes.
+        if s.source_repo != source_repo || s.api_base_url != api_base_url {
+            return fallback();
         }
+        if s.schema_version == STATE_SCHEMA_VERSION {
+            return s;
+        }
+        if s.schema_version == 2 {
+            // Migrate v2 → v3 in place rather than discarding the whole file.
+            s.etags.retain(|k, _| !is_review_endpoint_etag_key(k));
+            s.schema_version = STATE_SCHEMA_VERSION;
+            return s;
+        }
+        fallback()
     }
 
     /// Serialises state to `path` (pretty JSON for operator inspection).
@@ -703,23 +748,153 @@ mod tests {
     }
 
     #[test]
-    fn load_discards_pre_334_state_version() {
-        // A pre-#334 (version-2) state file must be discarded so the #334 review
-        // contract forces exactly one full refresh, mirroring the #333 1→2 bump.
-        let dir = std::env::temp_dir().join(format!("egst-pre334-{}", std::process::id()));
+    fn migrate_v2_to_v3_preserves_state_and_clears_only_review_etags() {
+        // Codex #352 P2: a pre-#334 (version-2) state file must be MIGRATED, not
+        // discarded — discarding drops #333's `pr_merge_artifacts` tracking. The
+        // migration preserves every v2 field (merge artifacts, resource hashes,
+        // watermarks, the `/pulls` list ETag) and clears ONLY the review-endpoint
+        // ETags so review anchoring refreshes without a 304 hiding it.
+        let dir = std::env::temp_dir().join(format!("egst-mig334-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
         std::fs::write(
             &path,
-            r#"{"schema_version":2,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"resource_hashes":{"pr_review:3:7":"abc"}}"#,
+            r#"{"schema_version":2,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"resource_hashes":{"pr_review:3:7":"abc","pr:10":"deadbeef"}}"#,
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
+        // Migrated, NOT discarded: v2 resource hashes survive (the runtime v3
+        // review hash uses a different formula, so re-emission still happens).
+        assert!(
+            s.is_unchanged("pr_review:3:7", "abc") && s.is_unchanged("pr:10", "deadbeef"),
+            "v2 state must be migrated in place, not discarded"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_v2_to_v3_retains_pr_merge_artifacts() {
+        // Codex #352 P2 core: a v2 store with a populated `pr_merge_artifacts` map
+        // (a PR already carrying a prior MERGED_AS/unresolved artifact id) must
+        // retain that map under v3, so `prior_merge_artifact` is still available and
+        // the merge-retraction/tombstone path still fires on the first v3 run.
+        let dir = std::env::temp_dir().join(format!("egst-mig-pma-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":2,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"pr_merge_artifacts":{"pr:10":"project:v1:merged-edge-10","pr:11":"project:v1:unresolved-diag-11"}}"#,
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
+        assert_eq!(
+            s.prior_merge_artifact("pr:10"),
+            Some("project:v1:merged-edge-10"),
+            "v2→v3 migration must retain pr_merge_artifacts so the stale artifact can be tombstoned"
+        );
+        assert_eq!(
+            s.prior_merge_artifact("pr:11"),
+            Some("project:v1:unresolved-diag-11")
+        );
+        // The additive review-artifact map defaults to empty on a v2 file.
+        assert!(s.review_commit_artifacts.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_v2_to_v3_clears_review_etags_but_keeps_pulls_and_other_etags() {
+        // The migration clears exactly the two commit-anchored review-endpoint ETag
+        // caches (`/pulls/comments`, `/pulls/{n}/reviews`) so #334 review anchoring
+        // cannot be 304-hidden, while PRESERVING the `/pulls` list ETag and every
+        // unrelated endpoint's ETag.
+        let dir = std::env::temp_dir().join(format!("egst-mig-etag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let pulls_list = "/repos/o/r/pulls?state=all&per_page=100?page=1";
+        let review_comments = "/repos/o/r/pulls/comments?per_page=100?page=1";
+        let per_pr_reviews = "/repos/o/r/pulls/12/reviews?per_page=100?page=1";
+        let issues = "/repos/o/r/issues?state=all&per_page=100?page=1";
+        let issue_comments = "/repos/o/r/issues/comments?per_page=100?page=1";
+        let labels = "/repos/o/r/labels?page=1";
+        let json = serde_json::json!({
+            "schema_version": 2,
+            "source_repo": "o/r",
+            "api_base_url": "x",
+            "last_run_at_unix_ms": 0,
+            "etags": {
+                pulls_list: "\"pulls-list\"",
+                review_comments: "\"prc\"",
+                per_pr_reviews: "\"reviews-12\"",
+                issues: "\"issues\"",
+                issue_comments: "\"ic\"",
+                labels: "\"labels\"",
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
+        // Review-endpoint ETags cleared.
+        assert!(
+            !s.etags.contains_key(review_comments),
+            "the /pulls/comments review ETag must be cleared"
+        );
+        assert!(
+            !s.etags.contains_key(per_pr_reviews),
+            "the /pulls/{{n}}/reviews review ETag must be cleared"
+        );
+        // The /pulls list ETag and unrelated endpoints survive.
+        assert_eq!(
+            s.etags.get(pulls_list).map(String::as_str),
+            Some("\"pulls-list\""),
+            "the /pulls LIST ETag must survive (its contract is unchanged)"
+        );
+        assert_eq!(s.etags.get(issues).map(String::as_str), Some("\"issues\""));
+        assert_eq!(
+            s.etags.get(issue_comments).map(String::as_str),
+            Some("\"ic\"")
+        );
+        assert_eq!(s.etags.get(labels).map(String::as_str), Some("\"labels\""));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_discards_pre_333_version_1_state() {
+        // A pre-#333 (version-1) state carried no merge artifacts, so discarding it
+        // is still safe and forces the #333 full refresh (unchanged behavior).
+        let dir = std::env::temp_dir().join(format!("egst-v1-disc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"resource_hashes":{"pr:10":"abc"}}"#,
         )
         .unwrap();
         let s = State::load_or_fresh(&path, "o/r", "x");
         assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
         assert!(
-            !s.is_unchanged("pr_review:3:7", "abc"),
-            "stale version-2 state is discarded, forcing a review refresh"
+            !s.is_unchanged("pr:10", "abc"),
+            "pre-#333 version-1 state is still discarded (no merge artifacts to lose)"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_review_endpoint_etag_key_matches_only_review_endpoints() {
+        assert!(is_review_endpoint_etag_key(
+            "/repos/o/r/pulls/comments?per_page=100?page=1"
+        ));
+        assert!(is_review_endpoint_etag_key(
+            "/repos/o/r/pulls/12/reviews?per_page=100?page=3"
+        ));
+        // The /pulls LIST endpoint uses `/pulls?`, never `/pulls/`.
+        assert!(!is_review_endpoint_etag_key(
+            "/repos/o/r/pulls?state=all&per_page=100?page=1"
+        ));
+        assert!(!is_review_endpoint_etag_key(
+            "/repos/o/r/issues?state=all&per_page=100?page=1"
+        ));
+        assert!(!is_review_endpoint_etag_key("/repos/o/r/labels?page=1"));
     }
 }

@@ -2033,6 +2033,91 @@ fn merge_resolution_unresolved_to_resolved_retracts_prior_diagnostic() {
 }
 
 #[test]
+fn upgraded_v2_store_still_tombstones_changed_merge_resolution() {
+    // Codex #352 P2 end-to-end regression: bumping STATE_SCHEMA_VERSION 2→3 must
+    // MIGRATE the on-disk state, not discard it. A blunt discard drops #333's
+    // `pr_merge_artifacts` tracking, so on the FIRST v3 run against an upgraded
+    // store a PR whose merge now resolves differently emits the fresh artifact but
+    // cannot tombstone the stale one → stale + fresh merge evidence coexist. The
+    // v2→v3 migration preserves `pr_merge_artifacts`, so the retraction still fires.
+    let merge_sha = "merge30000000000000000000000000000000030";
+    let decoy_sha = "decoy000000000000000000000000000000000000";
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+    let code_graph = tmp.path().join("code.jsonl");
+    let server = MockServer::start(one_merged_pr_routes("\"pulls-v2mig\""));
+
+    // 1. Unseeded (decoy-only) merge SHA → PR #30 emits diagnostic D; the state
+    //    records D's id in pr_merge_artifacts. State is written at the current
+    //    (v3) version.
+    std::fs::write(&code_graph, commit_seed(&[decoy_sha])).unwrap();
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(
+        &server.base_url,
+        &out1,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok1);
+    let d_id = nodes_of_kind(&j1, "Diagnostic")
+        .into_iter()
+        .find(|d| {
+            let s = d["summary"].as_str().unwrap_or("");
+            s.contains("github_commit_unresolved") && s.contains(merge_sha)
+        })
+        .expect("run 1 emits a github_commit_unresolved Diagnostic")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 2. Simulate a pre-#334 (v2) store that already tracked pr_merge_artifacts:
+    //    downgrade ONLY the on-disk schema_version to 2, leaving pr_merge_artifacts
+    //    (and every other field) intact — exactly what an upgraded store looks like.
+    let mut sj: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    sj["schema_version"] = serde_json::json!(2);
+    assert!(
+        sj["pr_merge_artifacts"]
+            .as_object()
+            .is_some_and(|m| !m.is_empty()),
+        "precondition: the v2 state must carry a tracked merge artifact"
+    );
+    std::fs::write(&state, serde_json::to_string_pretty(&sj).unwrap()).unwrap();
+
+    // 3. First v3 run against the migrated store, now with a RESOLVING seed: the
+    //    outcome changes D→E. Because the migration preserved pr_merge_artifacts,
+    //    the superseded diagnostic D is tombstoned. (RED against the blunt-discard
+    //    code: prior_merge_artifact would be empty and no tombstone would fire.)
+    std::fs::write(&code_graph, commit_seed(&[merge_sha])).unwrap();
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(
+        &server.base_url,
+        &out2,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok2);
+    assert_eq!(
+        edges_of_label(&j2, "MERGED_AS"),
+        1,
+        "the resolving seed emits the fresh MERGED_AS edge"
+    );
+    let retracted_d = tombstones(&j2)
+        .into_iter()
+        .any(|t| t["deleted_id"] == d_id.as_str());
+    assert!(
+        retracted_d,
+        "v2→v3 migration must preserve pr_merge_artifacts so the stale diagnostic D is tombstoned: {j2}"
+    );
+    assert!(
+        !nodes_of_kind(&j2, "Diagnostic")
+            .into_iter()
+            .any(|d| d["id"] == d_id.as_str()),
+        "the stale diagnostic node is retracted, not re-emitted"
+    );
+}
+
+#[test]
 fn merge_resolution_resolved_to_unresolved_retracts_prior_edge() {
     // The reverse transition: PR #30 goes from RESOLVED (MERGED_AS edge E) back to
     // UNRESOLVED (a diagnostic). The superseded edge E must be retracted via a
