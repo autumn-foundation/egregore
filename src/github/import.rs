@@ -99,6 +99,21 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     let mut graph = Graph::new();
     let mut emitted_count = 0usize;
 
+    // Seed-graph fingerprint gating for the `/pulls` conditional request (#333,
+    // Codex round-5). PR merge-link resolution depends on the local seed graph,
+    // which GitHub's `/pulls` `ETag` cannot see, so a cached `ETag` can return 304
+    // and short-circuit PR processing before the round-4 `pull_hash` marker ever
+    // runs. When the current fingerprint differs from the stored one (including a
+    // `None`/"unknown" stored value from a pre-fingerprint state file, and every
+    // none→some / some→different / some→none transition), the `/pulls` `ETag` is
+    // suppressed below so GitHub returns a full 200 and merge links recompute; an
+    // unchanged fingerprint keeps the 304 fast path. Only `/pulls` is affected —
+    // MERGED_AS lives only on PR tasks — so issues/reviews/other endpoints keep
+    // their conditional fast path.
+    let code_graph_fingerprint = state::code_graph_fingerprint(&commit_index);
+    let seed_graph_changed =
+        state.code_graph_fingerprint.as_deref() != Some(code_graph_fingerprint.as_str());
+
     let ctx = Context {
         source_repo: opts.source_repo,
         transaction_time: &transaction_time,
@@ -142,8 +157,18 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     let pulls_path = format!("/repos/{}/pulls?state=all&per_page=100", opts.source_repo);
     let mut changed_pr_numbers: Vec<u64> = Vec::new();
     let mut pulls_changed = false;
+    // A changed seed graph suppresses the `/pulls` conditional `ETag` so GitHub
+    // returns a full 200 and merge links are recomputed even when the PR payload
+    // is byte-identical. An unchanged seed keeps every stored page `ETag` (304
+    // fast path). Only the `/pulls` page `ETags` are dropped; all other endpoints
+    // continue to use `state.etags`.
+    let pulls_prior_etags = if seed_graph_changed {
+        etags_without_prefix(&state.etags, &format!("{pulls_path}?page="))
+    } else {
+        state.etags.clone()
+    };
     if let FetchOutcome::Modified { items, etags } =
-        client.fetch_paginated("pulls", &pulls_path, &state.etags)?
+        client.fetch_paginated("pulls", &pulls_path, &pulls_prior_etags)?
     {
         pulls_changed = true;
         state.etags.extend(etags);
@@ -280,6 +305,9 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     state.last_run_at_unix_ms = now_unix_ms();
     state.api_base_url.clone_from(&opts.api_base);
     opts.source_repo.clone_into(&mut state.source_repo);
+    // Persist the current seed-graph fingerprint so the next unchanged-seed run
+    // takes the `/pulls` 304 fast path again (#333, Codex round-5).
+    state.code_graph_fingerprint = Some(code_graph_fingerprint);
 
     let jsonl = graph.to_jsonl().map_err(|e| GithubError::Io {
         detail: format!("serialize handoff: {e}"),
@@ -395,6 +423,22 @@ fn advance_watermark(watermark: &mut Option<String>, candidate: &str) {
         Some(w) if w.as_str() >= candidate => {}
         _ => *watermark = Some(candidate.to_owned()),
     }
+}
+
+/// Returns a copy of `etags` with every key beginning `prefix` removed.
+///
+/// Used to suppress the `/pulls` per-page conditional `ETags` when the seed graph
+/// changed (#333, Codex round-5), forcing a full 200 refetch of that endpoint
+/// while leaving every other endpoint's stored `ETags` intact.
+fn etags_without_prefix(
+    etags: &std::collections::BTreeMap<String, String>,
+    prefix: &str,
+) -> std::collections::BTreeMap<String, String> {
+    etags
+        .iter()
+        .filter(|(k, _)| !k.starts_with(prefix))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// BLAKE3 hex of the canonical JSON of a value (change-detection for reviews).

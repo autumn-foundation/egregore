@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::github::model;
+use crate::github::{model, records::CommitIndex};
 
 /// Current idempotency-state schema version.
 ///
@@ -62,6 +62,15 @@ pub struct State {
     /// `"issue:<n>" | "pr:<n>" -> blake3(content hash of key fields)`.
     #[serde(default)]
     pub resource_hashes: BTreeMap<String, String>,
+    /// Fingerprint of the seeded code graph relevant to PR merge-link resolution
+    /// (issue #333, Codex round-5). PR merge-link resolution depends on the local
+    /// seed graph, which GitHub's `/pulls` `ETag` cannot see; this gates the
+    /// `/pulls` conditional request. A pre-fingerprint state file lacks the field
+    /// and deserialises to `None` ("unknown"), which never equals any real
+    /// fingerprint and so forces exactly one full `/pulls` refetch on the first
+    /// upgraded run (fail-safe), after which the real fingerprint is persisted.
+    #[serde(default)]
+    pub code_graph_fingerprint: Option<String>,
 }
 
 impl State {
@@ -78,6 +87,7 @@ impl State {
             last_seen_updated_at: Watermarks::default(),
             label_list_hash: None,
             resource_hashes: BTreeMap::new(),
+            code_graph_fingerprint: None,
         }
     }
 
@@ -214,6 +224,44 @@ pub fn label_list_hash(labels: &[model::Label]) -> String {
         .to_string()
 }
 
+/// Computes a stable fingerprint of the seeded code graph relevant to PR
+/// merge-link resolution (issue #333, Codex round-5).
+///
+/// PR `MERGED_AS` resolution matches a PR's `merge_commit_sha` against the
+/// `Commit` nodes captured in `commit_index`, so the fingerprint digests the
+/// full `commit_sha -> [commit_record_id]` mapping (per-SHA record IDs sorted so
+/// an incidental reorder never spuriously flips the fingerprint). GitHub's
+/// `/pulls` `ETag` cannot observe this local seed, so [`run_import`] gates the
+/// `/pulls` conditional request on this value: a changed fingerprint forces a
+/// full 200 refetch that recomputes merge links, while an unchanged fingerprint
+/// keeps the 304 fast path (merge links cannot have changed).
+///
+/// An empty index (no `--code-graph`) is the distinct, stable marker `"none"` so
+/// a none→some, some→different, or some→none transition all register as a
+/// change. Deterministic and byte-identical across runs for a given seed graph.
+///
+/// [`run_import`]: crate::github::import::run_import
+#[must_use]
+pub fn code_graph_fingerprint(commit_index: &CommitIndex) -> String {
+    if commit_index.is_empty() {
+        return "none".to_owned();
+    }
+    let mut hasher = blake3::Hasher::new();
+    // `commit_index` is a `BTreeMap`, so keys iterate in sorted order already.
+    for (sha, ids) in commit_index {
+        let mut ids = ids.clone();
+        ids.sort();
+        hasher.update(sha.as_bytes());
+        hasher.update(&[0]);
+        for id in &ids {
+            hasher.update(id.as_bytes());
+            hasher.update(&[0]);
+        }
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +386,72 @@ mod tests {
             merge_commit_sha: None,
             html_url: String::new(),
         }
+    }
+
+    #[test]
+    fn code_graph_fingerprint_marks_empty_seed_distinctly_and_is_stable() {
+        let empty = CommitIndex::new();
+        assert_eq!(
+            code_graph_fingerprint(&empty),
+            "none",
+            "no seed graph is the distinct stable marker"
+        );
+
+        let mut a = CommitIndex::new();
+        a.insert("sha-aaa".to_owned(), vec!["codegraph:v5:c0".to_owned()]);
+        let fp_a = code_graph_fingerprint(&a);
+        assert_ne!(fp_a, "none", "a seeded graph is not the empty marker");
+        assert_eq!(fp_a, code_graph_fingerprint(&a), "stable across runs");
+
+        // A different SHA set yields a different fingerprint (some→different).
+        let mut b = CommitIndex::new();
+        b.insert("sha-bbb".to_owned(), vec!["codegraph:v5:c0".to_owned()]);
+        assert_ne!(fp_a, code_graph_fingerprint(&b));
+
+        // The SAME SHA resolving to a DIFFERENT record id also changes it, so a
+        // re-resolution is caught and forces a `/pulls` refetch.
+        let mut c = CommitIndex::new();
+        c.insert("sha-aaa".to_owned(), vec!["codegraph:v5:c9".to_owned()]);
+        assert_ne!(fp_a, code_graph_fingerprint(&c));
+    }
+
+    #[test]
+    fn code_graph_fingerprint_ignores_per_sha_id_order() {
+        let mut a = CommitIndex::new();
+        a.insert("sha".to_owned(), vec!["id-b".to_owned(), "id-a".to_owned()]);
+        let mut b = CommitIndex::new();
+        b.insert("sha".to_owned(), vec!["id-a".to_owned(), "id-b".to_owned()]);
+        assert_eq!(
+            code_graph_fingerprint(&a),
+            code_graph_fingerprint(&b),
+            "per-SHA record id ordering must not affect the fingerprint"
+        );
+    }
+
+    #[test]
+    fn legacy_state_without_fingerprint_loads_as_unknown() {
+        // A state file written before the fingerprint field existed (schema
+        // version 2, no `code_graph_fingerprint`) must still load rather than
+        // panic; the missing field deserialises to `None` ("unknown"), which
+        // never equals a real fingerprint and so forces one `/pulls` refetch.
+        let dir = std::env::temp_dir().join(format!("egst-legacy-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"schema_version":{STATE_SCHEMA_VERSION},"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"etags":{{"/repos/o/r/pulls?state=all&per_page=100?page=1":"\"pulls-1\""}},"resource_hashes":{{"pr:1":"abc"}}}}"#
+            ),
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert_eq!(
+            s.code_graph_fingerprint, None,
+            "missing fingerprint loads as unknown (None), forcing a /pulls refetch"
+        );
+        // The rest of the version-matched state is preserved (not discarded).
+        assert!(s.is_unchanged("pr:1", "abc"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

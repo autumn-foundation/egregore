@@ -108,6 +108,16 @@ top-level handoff record). When a single issue or PR changes, only that
 resource's records are re-emitted. Re-importing identical state produces
 byte-identical record IDs.
 
+The `/pulls` conditional fast path is additionally gated on a fingerprint of the
+seeded `--code-graph`, because PR merge-link resolution (`MERGED_AS`) depends on
+the local seed graph that GitHub's ETag cannot see. A **changed** seed graph
+(added, removed, or a different set of `Commit` SHAs — including running with
+`--code-graph` after a run without it) suppresses the `/pulls` ETag so GitHub
+returns a full payload and merge links are recomputed; an **unchanged** seed
+graph keeps the `/pulls` `304` fast path since merge links cannot have changed.
+Only `/pulls` is refetched — issues, labels, comments, and reviews keep their own
+conditional fast path.
+
 ## Failure modes
 
 Failures exit non-zero with a stable, token-scrubbed `{"code":"github_..."}`

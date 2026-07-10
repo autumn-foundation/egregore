@@ -201,7 +201,8 @@ Schema (one JSON object per `<owner>/<repo>`, abbreviated type notation):
     pulls: RFC3339
   },
   label_list_hash: String | null,
-  resource_hashes: { "<issue|pr>:<n>": "<hash>" }
+  resource_hashes: { "<issue|pr>:<n>": "<hash>" },
+  code_graph_fingerprint: String | null
 }
 ```
 
@@ -242,6 +243,37 @@ On re-import, a resource selected by the `>= last_seen_updated_at` watermark is
 compared against its stored hash; if identical, no new record is emitted and the
 hash entry is left unchanged. If different, a new record is emitted and the hash
 entry is updated. An absent entry is treated as "never imported" — always emit.
+
+**Seed-graph fingerprint gate on the `/pulls` conditional request (`code_graph_fingerprint`, issue #333):**
+The merge-link resolution outcome folded into the PR hash (above) can only be
+recomputed when the pulls list is actually re-processed. But `/pulls` is a
+conditional endpoint: when its cached ETag matches, GitHub replies `304 Not
+Modified` and PR processing short-circuits **before** the merge-link marker is
+ever computed. GitHub's `/pulls` ETag reflects only the remote PR payload — it
+cannot see the local `--code-graph` seed on which merge-link resolution depends.
+So a `/pulls` ETag is only trustworthy when the seed graph is **also** unchanged.
+The importer therefore persists a `code_graph_fingerprint`: a deterministic,
+byte-identical BLAKE3 digest over the sorted `commit_sha → [Commit record id]`
+mapping of the seeded code graph, or the distinct stable marker `"none"` when no
+`--code-graph` is supplied. Before issuing the conditional `/pulls` request, the
+importer compares the current fingerprint against the stored one; if they differ
+— including `none → some`, `some → different`, `some → none`, and a missing
+(pre-fingerprint) stored value treated as "unknown" — it **suppresses the
+`If-None-Match` for `/pulls` only**, so GitHub returns a full `200` payload,
+`/pulls` is re-processed, and the merge-link marker (and any `MERGED_AS`
+edge/`github_commit_unresolved` diagnostic) is recomputed. Composed with the
+round-4 hash marker, an actually-changed merge link is re-emitted while an
+unchanged one stays idempotent (zero records). When the fingerprint **matches**,
+the `/pulls` ETag fast path is kept (a `304` is allowed) because merge links
+cannot have changed. Only `/pulls` is affected — `MERGED_AS` lives solely on PR
+tasks — so issues, labels, comments, and reviews keep their own conditional fast
+path. After every successful run the current fingerprint is persisted, so the
+next unchanged-seed re-import takes the `304` fast path again. The fingerprint
+participates in conditional-request gating only; it never affects stable record
+identity, and it is **not** part of a `STATE_SCHEMA_VERSION` bump — a
+pre-fingerprint state file loads normally with `code_graph_fingerprint = null`,
+which reads as "unknown" and forces exactly one fail-safe `/pulls` refetch before
+the real fingerprint is stored.
 
 **Deferred endpoint ETag rule:** The v1 importer MUST NOT store ETags for
 deferred comment/review endpoints (`/issues/comments`, `/pulls/comments`,

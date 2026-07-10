@@ -1624,6 +1624,116 @@ fn seeded_code_graph_change_re_emits_merge_link_then_stays_idempotent() {
     );
 }
 
+#[test]
+fn seed_graph_change_reprocesses_prs_across_304() {
+    // Issue #333, Codex round-5: the round-4 `pull_hash` merge-link marker only
+    // runs INSIDE the `FetchOutcome::Modified` branch. When the cached `/pulls`
+    // ETag matches, GitHub returns 304 and PR processing short-circuits BEFORE the
+    // marker is ever computed, so a changed seed graph never re-emits the
+    // `MERGED_AS` edge. The `/pulls` conditional request must therefore be gated on
+    // a seed-graph fingerprint: a changed seed graph suppresses the
+    // `If-None-Match` so `/pulls` returns a full 200 and merge links recompute,
+    // while an unchanged seed keeps the 304 fast path.
+    //
+    // Unlike the round-4 test, the pulls ETag is held CONSTANT across every run so
+    // the mock genuinely returns 304 whenever the importer sends `If-None-Match`.
+    let sha = "merge30000000000000000000000000000000030";
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+    let code_graph = tmp.path().join("code.jsonl");
+    std::fs::write(&code_graph, commit_seed(&[sha])).unwrap();
+
+    // One server, one stable pulls ETag for every run.
+    let server = MockServer::start(one_merged_pr_routes("\"pulls-const\""));
+
+    // 1. First import WITHOUT `--code-graph`: 200 (first fetch, no prior ETag). The
+    //    merge SHA cannot resolve → no MERGED_AS. State caches the pulls ETag and
+    //    the fingerprint for the empty seed ("none").
+    let out1 = tmp.path().join("graph1.jsonl");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    assert_eq!(
+        edges_of_label(&j1, "MERGED_AS"),
+        0,
+        "no MERGED_AS without a seeded code graph"
+    );
+
+    // 2. Re-import the SAME unchanged PR (same pulls ETag → the mock is prepared to
+    //    return 304) but now WITH a seed code graph containing a Commit whose SHA
+    //    == merge_commit_sha. Against pre-fix code the importer sends the cached
+    //    ETag → mock 304 → PRs skipped → NO MERGED_AS (RED). With the fix the
+    //    changed fingerprint suppresses the `/pulls` ETag → mock 200 → MERGED_AS
+    //    emitted.
+    server.clear_requests();
+    let out2 = tmp.path().join("graph2.jsonl");
+    let (j2, _, ok2) = run_import(
+        &server.base_url,
+        &out2,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok2);
+    assert_eq!(
+        edges_of_label(&j2, "MERGED_AS"),
+        1,
+        "a changed seed graph must suppress the /pulls ETag so the merge link \
+         recomputes across a would-be 304"
+    );
+    let pr30_id = pr_task(&j2, 30)["id"].as_str().unwrap().to_owned();
+    let linked = j2
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|v| {
+            v["label"] == "MERGED_AS"
+                && v["source"] == pr30_id.as_str()
+                && v["target"] == "codegraph:v5:commit-0"
+        });
+    assert!(linked, "MERGED_AS links PR #30 to the seeded Commit");
+    // A full 200 payload means the per-PR reviews endpoint was visited (per-PR
+    // reviews fire only when the pulls list changed).
+    assert!(
+        server
+            .request_paths()
+            .iter()
+            .any(|p| p.contains("/pulls/30/reviews")),
+        "a changed seed graph forces a full /pulls 200 (per-PR reviews fetched)"
+    );
+
+    // 3. Re-import a THIRD time with the SAME seed graph and unchanged PR. The
+    //    fingerprint now matches, so the importer sends `If-None-Match` and the
+    //    mock returns a genuine 304 fast path: zero per-resource records, no
+    //    duplicate MERGED_AS, and the per-PR reviews endpoint is never visited.
+    server.clear_requests();
+    let out3 = tmp.path().join("graph3.jsonl");
+    let (j3, _, ok3) = run_import(
+        &server.base_url,
+        &out3,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok3);
+    assert_eq!(
+        nodes_of_kind(&j3, "Task").len(),
+        0,
+        "AC8: unchanged PR + unchanged seed re-emits no Task: {j3}"
+    );
+    assert_eq!(
+        edges_of_label(&j3, "MERGED_AS"),
+        0,
+        "AC8: no duplicate MERGED_AS on an unchanged re-import"
+    );
+    // A genuine 304 on `/pulls` short-circuits PR processing: the per-PR reviews
+    // endpoint must NOT be visited on the unchanged-seed fast path. This proves the
+    // mock honoured the conditional request (returned 304) in step 3.
+    assert!(
+        !server
+            .request_paths()
+            .iter()
+            .any(|p| p.contains("/pulls/30/reviews")),
+        "an unchanged seed graph keeps the /pulls 304 fast path (no per-PR review fetch)"
+    );
+}
+
 /// Route table for one OPEN PR (#20, `merged_at: null`) whose REST payload still
 /// carries a `merge_commit_sha` — GitHub's temporary TEST-MERGE commit for a
 /// mergeable-but-unmerged PR. The importer must treat this SHA as *not* merge
