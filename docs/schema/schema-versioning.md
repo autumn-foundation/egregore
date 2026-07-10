@@ -86,6 +86,7 @@ Current callsites that must stay wired through those helpers:
 | `src/daemon.rs::apply_write` | daemon ingest rejects unknown versions before domain-specific validation |
 | `src/cli.rs::inspect` | report mode surfaces recognized and unknown tuples |
 | `src/cli.rs::load_records_from_jsonl` | default query/ingest JSONL loading rejects unknown versions |
+| `src/cli/audit.rs::evidence_pack_assemble_cmd` | evidence-pack (#338) reads records via `load_query_records`, which routes JSONL through `read_record_line` |
 | `src/incremental.rs::scan_repository_incremental_at` | cache records are validated before reuse; incompatible cache schema falls back to rebuild |
 
 The list is intentionally grep-able. New reader surfaces must update this table

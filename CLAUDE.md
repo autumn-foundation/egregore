@@ -574,6 +574,55 @@ execution, never proof of control effectiveness. This is the catalog surface
 only; evidence-pack assembly is #338. See `docs/cli/control-catalog.md` and
 `docs/controls/README.md`.
 
+Control-scoped, time-windowed evidence-pack assembly + verify (issue #338):
+
+```powershell
+cargo run -- audit evidence-pack assemble --control CC8.1 \
+  --from 2026-03-01T00:00:00Z --to 2026-04-01T00:00:00Z --graph history.graph.jsonl
+cargo run -- audit evidence-pack assemble --control CC8.1 \
+  --from <T0> --to <T1> --data-dir .egregore --min-review-coverage 0.8
+cargo run -- audit evidence-pack verify pack.json   # exit 0 clean, 1 defect, 2 load error
+```
+
+`eg audit evidence-pack assemble` builds a deterministic, redaction-safe pack
+scoped to one control and one half-open valid-time window (`from <= t < to`),
+composing the #337 catalog (id/version/`control_catalog:v1:` hash pin echoed in
+the manifest), #68 bundle scrub-to-hash + integrity/coverage/safety verify
+mechanics, #65 citation classification (reused byte-for-byte for the citation
+gate), #118/#157 section-level delta disclaimers, #103 pre-ingest validation,
+#60 protected handles (raw bytes never enter), and the #333 PR head/base/merge
+SHA fields. Every catalog class the control maps becomes a section, always
+present even when empty; class availability drives `evaluate_requirement`'s
+three-way outcome, so a required class with no records anywhere gate-fails
+(`required_class_unavailable`) while an optional one degrades to
+`{"status":"unavailable","unavailable_reason":...}` +
+`evidence_class_unavailable` (log-domain classes report `log_domain_absent`).
+Per-record valid time resolves `temporal.valid_time -> node valid_time ->
+executed_at`; a class-relevant record with no resolvable valid time is excluded
+under a counted `missing_valid_time` diagnostic. The closed `gaps` enum is
+`{merged_pr_without_approving_review, approval_precedes_final_head,
+review_unanchored_no_commit_sha, commit_outside_any_pr, missing_valid_time}`;
+each row cites its source record IDs. Because issue #334 (the `review_commit_sha`
+field / `REVIEWS_COMMIT` edge) is not yet merged, the two #334-dependent gap
+classes detect their backing facts at runtime and, when absent, emit a single
+`capability_unavailable` diagnostic naming #334 with zero rows — never
+fabricated, and wired to populate once #334 lands. Exit 0 when every verdict
+passes (an empty window is a vacuous success), 1 on any verdict failure (report
+still printed) including review coverage below `--min-review-coverage` (default
+1.0), 2 on usage/load errors (`unknown_control` naming the known IDs,
+`reversed_window`, `invalid_timestamp`, both/neither input flag, unreadable
+store/graph/catalog). Output is byte-identical across runs and across `--graph`
+vs `--data-dir`, allow-list only (IDs, handles, hashes, bounded labels, valid
+times, counts — never bodies), reads no wall clock unless `--captured-at` is
+pinned, and carries this verbatim manifest disclaimer: "rows are recorded
+observations of process execution as imported; never proof of control
+effectiveness, compliance, or completeness; absence of a record means no
+imported evidence, not no event; not an auditor opinion". `eg audit
+evidence-pack verify <path>` re-checks a pack offline (Integrity, Coverage,
+Safety, Window-consistency). Use `eg bundle export` instead when you want a
+record-closure-scoped bundle rather than a control/window-scoped pack. See
+`docs/cli/evidence-pack.md`.
+
 Embedded store write locking (issue #200):
 
 Every embedded write open takes the OS-level exclusive store lease (`egregored.lock`),
