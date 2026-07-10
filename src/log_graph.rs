@@ -507,10 +507,20 @@ pub fn scan_log_records(
 /// (issue #321).
 ///
 /// Reads the log, normalizes CRLF/CR to LF (the same basis the scanner hashes),
-/// and redacts each line independently through the v1 redaction policy
-/// (`redaction::redact_value`, the same per-message gate the extractor applies),
-/// so a secret-bearing line is returned already collapsed to its
-/// `<REDACTED:…>` marker and the raw secret never reaches the protected blob.
+/// and applies the v1 redaction policy so a secret-bearing line is returned
+/// collapsed to its `<REDACTED:…>` marker and the raw secret never reaches the
+/// protected blob.
+///
+/// Secret detection runs over the **whole normalized text** via
+/// [`redaction::detect_secret_span`], not line by line: a multi-line secret —
+/// e.g. a PEM / OpenSSH private-key block whose base64 body and `END` line are
+/// not individually secret-shaped — is caught as one span that covers every
+/// line it touches. Each maximal run of secret-bearing lines is then collapsed
+/// to a single `<REDACTED:class:hash>` marker through [`redaction::redact_value`]
+/// (the run's joined text carries the leading secret the whole-value detector
+/// recognizes), and every non-secret line is preserved verbatim. Redacting each
+/// line independently (this function's original form, issue #321) collapsed only
+/// the `BEGIN` marker line and wrote the key body to the blob unchanged.
 ///
 /// This materializes redacted bytes ONLY when protected capture is requested;
 /// ordinary graph extraction ([`scan_log_records`]) never calls it and is
@@ -536,18 +546,75 @@ pub fn redacted_source_bytes(log_path: &Path) -> Result<Vec<u8>, LogScanError> {
         std::str::from_utf8(&normalized).map_err(|error| LogScanError::UnrecognizedFormat {
             detail: format!("file is not valid UTF-8: {error}"),
         })?;
+
+    let secret_lines = secret_bearing_lines(text);
+
     // `split('\n')` (not `lines()`) preserves the exact normalized structure,
-    // including a trailing empty segment when the file ends in a newline, so the
-    // rejoined output is the normalized log with only secret-bearing lines
-    // collapsed to markers.
+    // including a trailing empty segment when the file ends in a newline. Each
+    // maximal run of secret-bearing lines collapses to ONE marker so a
+    // multi-line key block does not leak its body/END lines; non-secret lines
+    // pass through verbatim. Output is deterministic and byte-stable.
+    let lines: Vec<&str> = text.split('\n').collect();
     let mut out = String::with_capacity(text.len());
-    for (i, line) in text.split('\n').enumerate() {
-        if i > 0 {
+    let mut i = 0;
+    let mut first = true;
+    while i < lines.len() {
+        if !first {
             out.push('\n');
         }
-        out.push_str(&redaction::redact_value(line));
+        first = false;
+        if secret_lines.contains(&i) {
+            let run_start = i;
+            while i < lines.len() && secret_lines.contains(&i) {
+                i += 1;
+            }
+            let run = lines[run_start..i].join("\n");
+            out.push_str(&redaction::redact_value(&run));
+        } else {
+            out.push_str(lines[i]);
+            i += 1;
+        }
     }
     Ok(out.into_bytes())
+}
+
+/// Returns the set of line indices (0-based over `text.split('\n')`) that any
+/// v1-policy secret span touches.
+///
+/// Spans are detected over the WHOLE text (via [`redaction::detect_secret_span`])
+/// so a multi-line secret block marks every line its byte range covers, not just
+/// the one line that is individually secret-shaped. Zero-length (empty) line
+/// segments are never marked. Detection is deterministic left-to-right.
+fn secret_bearing_lines(text: &str) -> std::collections::BTreeSet<usize> {
+    // Absolute byte range [start, end) of each split('\n') line's content.
+    let mut line_ranges = Vec::new();
+    let mut offset = 0_usize;
+    for line in text.split('\n') {
+        let start = offset;
+        let end = start + line.len();
+        line_ranges.push((start, end));
+        offset = end + 1; // skip the '\n' separator
+    }
+
+    let mut secret = std::collections::BTreeSet::new();
+    let mut cursor = 0_usize;
+    while cursor < text.len() {
+        let Some((_, rel_start, len)) = redaction::detect_secret_span(&text[cursor..]) else {
+            break;
+        };
+        let span_start = cursor + rel_start;
+        let span_end = span_start + len;
+        for (idx, &(ls, le)) in line_ranges.iter().enumerate() {
+            // A line is secret-bearing when the span overlaps its non-empty
+            // content range.
+            if le > ls && span_start < le && span_end > ls {
+                secret.insert(idx);
+            }
+        }
+        // Advance past this span; guard against a zero-length span.
+        cursor = span_end.max(span_start + 1);
+    }
+    secret
 }
 
 /// Computes the repository-relative path of a log file under the repo root,

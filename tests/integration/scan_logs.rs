@@ -773,6 +773,82 @@ fn stored_blob_is_redacted_and_omits_the_secret() {
     );
 }
 
+// AC5 (regression, issue #321): a MULTI-LINE private-key block must be redacted
+// in full. The original capture path redacted each normalized line
+// independently, so only the `-----BEGIN … PRIVATE KEY-----` marker line (the
+// one line that is individually secret-shaped) collapsed to a marker; the
+// base64 key-material body lines and the `-----END … PRIVATE KEY-----` line
+// were written to the protected blob unchanged, leaking the secret.
+#[test]
+fn stored_blob_redacts_multiline_private_key_block_in_full() {
+    const KEY_BODY_MARKER: &str = "LEAKEDPRIVATEKEYBODY";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("keyed.log");
+    let mut fixture = String::new();
+    fixture.push_str("2026-01-02T03:00:00Z INFO service starting up nominally\n");
+    fixture.push_str("2026-01-02T03:00:01Z [ERROR] loaded deploy key material below\n");
+    fixture.push_str("-----BEGIN OPENSSH PRIVATE KEY-----\n");
+    fixture.push_str("b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtz\n");
+    fixture.push_str("c2VjcmV0");
+    fixture.push_str(KEY_BODY_MARKER);
+    fixture.push_str("YmFzZTY0bGluZXNNdXN0QmVSZWRhY3RlZA==\n");
+    fixture.push_str("ZWQyNTUxOQAAACDNqorgFVACa1nGGkM0iZBExampleTW9yZUJvZHkAAAA\n");
+    fixture.push_str("-----END OPENSSH PRIVATE KEY-----\n");
+    fixture.push_str("2026-01-02T03:00:05Z INFO service ready to accept traffic\n");
+    fs::write(&log, &fixture).expect("write keyed fixture");
+
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+    scan_logs_capture(&log, temp.path(), &out, &store, "op-1").success();
+
+    let handle = only_manifest_record(&store)["handle"]
+        .as_str()
+        .expect("handle")
+        .to_owned();
+    let got = egregore()
+        .args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let blob = String::from_utf8(got).expect("utf8 blob");
+
+    // The key block collapses to a redaction marker.
+    assert!(
+        blob.contains("<REDACTED:"),
+        "the key block must be stored as a redaction marker"
+    );
+    // Body key-material bytes must never survive capture — the core bug.
+    assert!(
+        !blob.contains(KEY_BODY_MARKER),
+        "base64 key-material body must be redacted, not just the BEGIN line"
+    );
+    // The BEGIN and END delimiter lines of the block are gone too.
+    assert!(
+        !blob.contains("-----END OPENSSH PRIVATE KEY-----"),
+        "the END line of the key block must also be redacted"
+    );
+    assert!(
+        !blob.contains("-----BEGIN OPENSSH PRIVATE KEY-----"),
+        "the BEGIN line of the key block must also be redacted"
+    );
+    // Non-secret lines around the block are preserved (no over-redaction).
+    assert!(
+        blob.contains("service starting up nominally"),
+        "normal lines before the key block are preserved"
+    );
+    assert!(
+        blob.contains("service ready to accept traffic"),
+        "normal lines after the key block are preserved"
+    );
+}
+
 // AC5/AC7: `protected get` verifies + returns bytes and `list` shows a
 // log_payload entry with metadata only (no raw bytes).
 #[test]
