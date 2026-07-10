@@ -1964,6 +1964,30 @@ impl GraphRecord {
         }
     }
 
+    /// Stamps an explicit `valid_time` and `valid_time_source` on a node record
+    /// without touching `ingested_at`. No-op on non-node records.
+    ///
+    /// Used by the log-signature extractor (issues #319 / #320) to record a
+    /// parsed event timestamp (`valid_time_source = "log_event_timestamp"`) or
+    /// the transaction-time fallback for a timestamp-less line.
+    #[must_use]
+    pub fn with_valid_time(
+        mut self,
+        node_valid_time: impl Into<String>,
+        node_valid_time_source: impl Into<String>,
+    ) -> Self {
+        if let Self::Node {
+            valid_time,
+            valid_time_source,
+            ..
+        } = &mut self
+        {
+            *valid_time = Some(node_valid_time.into());
+            *valid_time_source = Some(node_valid_time_source.into());
+        }
+        self
+    }
+
     /// Stamps inferred `valid_time` and `valid_time_source` on current-tree scan records.
     ///
     /// Used by `scan_repository_at` to satisfy the rule from
