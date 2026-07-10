@@ -3649,6 +3649,11 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "CostUsage" => Ok(NodeKind::CostUsage),
         "Retraction" => Ok(NodeKind::Retraction),
         "DependencyDeclaration" => Ok(NodeKind::DependencyDeclaration),
+        // Log-signature node kinds (issues #319 / #320).
+        "LogSource" => Ok(NodeKind::LogSource),
+        "ErrorSignature" => Ok(NodeKind::ErrorSignature),
+        "LogEvent" => Ok(NodeKind::LogEvent),
+        "LogOccurrenceBucket" => Ok(NodeKind::LogOccurrenceBucket),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded node kind {kind}"),
@@ -3695,6 +3700,12 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "REVOKED_BY" => Ok(EdgeLabel::RevokedBy),
         "SCOPED_TO_REPO" => Ok(EdgeLabel::ScopedToRepo),
         "RELATES_TO" => Ok(EdgeLabel::RelatesTo),
+        // Log-signature edge labels (issues #319 / #320).
+        "FINGERPRINTED_AS" => Ok(EdgeLabel::FingerprintedAs),
+        "CAPTURED_FROM" => Ok(EdgeLabel::CapturedFrom),
+        "AGGREGATES" => Ok(EdgeLabel::Aggregates),
+        "FRAME_RESOLVES_TO" => Ok(EdgeLabel::FrameResolvesTo),
+        "EMITTED_DURING" => Ok(EdgeLabel::EmittedDuring),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded edge label {label}"),

@@ -201,6 +201,7 @@ fn make_agent_memory_node(
         diff_hunk_handle: None,
         review_side: None,
         dependency: None,
+        log: None,
         user_context: aletheia_egregore::UserContextFields::empty(),
         producer: None,
     }

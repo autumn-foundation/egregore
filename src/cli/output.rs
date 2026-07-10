@@ -135,6 +135,7 @@ pub(crate) fn domain_category(domain: &str) -> &'static str {
         "artifact" => "Artifacts",
         "verification" => "Verification Evidence",
         "user_context" => "User Context",
+        "log" => "Runtime Observations",
         _ => "Unknown Domain",
     }
 }
