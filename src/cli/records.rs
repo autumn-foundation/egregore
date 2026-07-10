@@ -1,0 +1,249 @@
+use super::*;
+
+pub(crate) fn load_query_records(
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+) -> Result<Vec<GraphRecord>> {
+    match (graph, data_dir) {
+        (Some(path), None) => load_records_from_jsonl(path),
+        (None, Some(dir)) => load_records_from_db(dir),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("provide only one of --graph or --data-dir, not both")
+        }
+        (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+    }
+}
+
+pub(crate) fn load_records_from_jsonl(graph: &Path) -> Result<Vec<GraphRecord>> {
+    let jsonl = fs::read_to_string(graph)
+        .with_context(|| format!("failed to read graph JSONL from {}", graph.display()))?;
+    crate::adapters::records_from_jsonl(&jsonl)
+        .map_err(|e| anyhow::anyhow!("failed to parse graph JSONL: {e}"))
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) fn validate_existing_embedded_store(data_dir: &Path) -> Result<()> {
+    match fs::read_dir(data_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "error: embedded store not found at {} - \
+                 run `eg ingest --adapter embedded --data-dir <path>` first",
+                data_dir.display()
+            );
+        }
+        Ok(mut entries) => {
+            if entries.next().is_none() {
+                anyhow::bail!(
+                    "error: embedded store at {} is empty - \
+                     run `eg ingest --adapter embedded --data-dir <path>` first",
+                    data_dir.display()
+                );
+            }
+        }
+        Err(_) => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+            .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+        sink.read_all_records()
+            .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// Reads the tombstoned-record → attribution-parent map from an embedded
+/// store (issue #234 `--repo` scoping).
+///
+/// The current-state read suppresses tombstoned edge and node records, so a
+/// scoped producer-drift run cannot resolve a deletion tombstone's
+/// `deleted_id` from the record slice alone; this recovers the edge sources
+/// and containment parents the append-only store still holds. Callers
+/// honouring the read-only guarantee must pass the same throwaway store copy
+/// they load records from.
+pub(crate) fn load_tombstoned_record_parents_from_db(
+    data_dir: &Path,
+) -> Result<BTreeMap<String, String>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+            .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+        sink.tombstoned_record_parents()
+            .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// Loads records from an embedded `--data-dir` store without mutating it (issue #82).
+///
+/// The embedded engine re-persists its index files on open, so a freshness check
+/// that opened the live store directly would modify it — violating the read-only
+/// guarantee. This copies the store to a throwaway temporary directory and reads
+/// the copy, leaving the original byte-for-byte untouched.
+/// Returns a read-only working location for embedded-store audit reads plus the
+/// tempdir guard that must outlive those reads.
+///
+/// With the embedded feature this is a throwaway copy of the store, so the audit
+/// never re-persists or otherwise mutates the original. Without the feature the
+/// path is returned unchanged (the subsequent read bails on the missing feature).
+pub(crate) fn readonly_audit_store(
+    data_dir: &Path,
+) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let temp =
+            tempfile::tempdir().context("failed to create temporary read-only store copy")?;
+        let copy_root = temp.path().join("store");
+        copy_dir_recursive(data_dir, &copy_root).with_context(|| {
+            format!(
+                "failed to copy store {} for read-only audit",
+                data_dir.display()
+            )
+        })?;
+        Ok((copy_root, Some(temp)))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        Ok((data_dir.to_path_buf(), None))
+    }
+}
+
+pub(crate) fn load_records_from_data_dir_readonly(data_dir: &Path) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let temp =
+            tempfile::tempdir().context("failed to create temporary read-only store copy")?;
+        let copy_root = temp.path().join("store");
+        copy_dir_recursive(data_dir, &copy_root).with_context(|| {
+            format!(
+                "failed to copy store {} for read-only inspection",
+                data_dir.display()
+            )
+        })?;
+        load_records_from_db(&copy_root)
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// Recursively copies the regular files and directories under `src` into `dst`.
+///
+/// Symlinks and other non-regular entries are skipped; this is used only to make
+/// a read-only working copy of an embedded store directory.
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Loads query records for a transaction-time query (issue #66).
+///
+/// The `--graph` JSONL path already preserves every written line, so it is used
+/// unchanged. The embedded `--data-dir` path additionally surfaces superseded
+/// non-temporal versions so a prior store view can be reconstructed.
+pub(crate) fn load_query_records_history(
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+) -> Result<Vec<GraphRecord>> {
+    match (graph, data_dir) {
+        (Some(path), None) => load_records_from_jsonl(path),
+        (None, Some(dir)) => load_records_from_db_history(dir),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("provide only one of --graph or --data-dir, not both")
+        }
+        (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+    }
+}
+
+pub(crate) fn load_records_from_db_history(data_dir: &Path) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+            .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+        sink.read_all_records_including_superseded()
+            .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// Loads the history-inclusive view from a store without mutating it (issue #85).
+///
+/// `eg evidence_freshness` is strictly read-only, but opening the embedded engine
+/// re-persists its on-disk index files. This copies the store to a throwaway
+/// temporary directory and reads the history-inclusive view from the copy, leaving
+/// the original byte-for-byte untouched (mirrors `load_records_from_data_dir_readonly`).
+pub(crate) fn load_records_from_db_history_readonly(data_dir: &Path) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let temp =
+            tempfile::tempdir().context("failed to create temporary read-only store copy")?;
+        let copy_root = temp.path().join("store");
+        copy_dir_recursive(data_dir, &copy_root).with_context(|| {
+            format!(
+                "failed to copy store {} for read-only inspection",
+                data_dir.display()
+            )
+        })?;
+        let sink = EmbeddedAletheiaSink::open_unleased(&copy_root)
+            .with_context(|| format!("failed to open embedded store {}", copy_root.display()))?;
+        sink.read_all_records_including_superseded()
+            .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// History-inclusive record load for the strictly read-only evidence-freshness
+/// command. `--graph` is already read-only; `--data-dir` reads a throwaway copy.
+pub(crate) fn load_evidence_freshness_records(
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+) -> Result<Vec<GraphRecord>> {
+    match (graph, data_dir) {
+        (Some(path), None) => load_records_from_jsonl(path),
+        (None, Some(dir)) => load_records_from_db_history_readonly(dir),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("provide only one of --graph or --data-dir, not both")
+        }
+        (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+    }
+}

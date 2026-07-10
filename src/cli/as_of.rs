@@ -1,0 +1,48 @@
+use super::*;
+
+// ---------------------------------------------------------------------------
+// query symbol --as-of <instant>
+// ---------------------------------------------------------------------------
+
+pub(crate) fn query_symbol_as_of(
+    records: &[GraphRecord],
+    name: &str,
+    as_of: &str,
+    format: OutputFormat,
+    index: &query::RepositoryIndex,
+    selected_repo: Option<&str>,
+    freshness_code: Option<&(String, &'static str)>,
+) -> Result<()> {
+    match query::symbol_as_of_valid_time_by_repo(records, name, as_of, index, selected_repo) {
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            std::process::exit(1);
+        }
+        Ok(results) if results.is_empty() => {
+            eprintln!("error: no match found for symbol `{name}` at or before `{as_of}`");
+            std::process::exit(2);
+        }
+        Ok(results) => {
+            // One best record per repository (plus one for any unattributed
+            // legacy group): a single-result time view must never pick one
+            // group implicitly on a collision (issue #67).
+            if selected_repo.is_none() {
+                let groups: std::collections::BTreeSet<Option<&str>> =
+                    results.iter().map(|r| index.owner_of(r.id())).collect();
+                if groups.len() > 1 {
+                    exit_ambiguous_repository(&groups);
+                }
+            }
+            let deleted = current_deleted_ids(records);
+            let mut symbol_results: Vec<SymbolResult<'_>> = results
+                .iter()
+                .filter_map(|r| symbol_result(r, name, index, records, &deleted))
+                .collect();
+            stamp_freshness(&mut symbol_results, freshness_code);
+            for result in &symbol_results {
+                print_result(result, format)?;
+            }
+        }
+    }
+    Ok(())
+}
