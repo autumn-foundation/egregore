@@ -26,6 +26,7 @@ mod deterministic_scan;
 mod doctor;
 mod embeddings;
 mod evidence_freshness;
+mod evidence_pack;
 mod evidence_write;
 mod failure_history;
 mod forget;

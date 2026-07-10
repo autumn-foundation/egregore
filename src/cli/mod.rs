@@ -2735,6 +2735,66 @@ pub(crate) enum AuditSubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Assemble or re-verify a control-scoped, time-windowed evidence pack (issue #338).
+    ///
+    /// `assemble` composes the #337 catalog, #68 bundle scrub/hash/citation
+    /// mechanics, and #65 citation classification into a deterministic,
+    /// redaction-safe evidence pack scoped to one control and one half-open
+    /// valid-time window. `verify` re-checks an assembled pack offline.
+    ///
+    /// Exit codes:
+    ///   0 — every verdict passed (`ok: true`); empty windows are vacuous success.
+    ///   1 — a verdict failed (`ok: false`); the full report is still printed.
+    ///   2 — usage/load error (unknown control, reversed/invalid window, both or
+    ///       neither input flag, unreadable store/graph/catalog).
+    EvidencePack {
+        /// The assemble/verify action.
+        #[command(subcommand)]
+        action: EvidencePackAction,
+    },
+}
+
+/// Actions for `eg audit evidence-pack` (issue #338).
+#[derive(Debug, Subcommand)]
+pub(crate) enum EvidencePackAction {
+    /// Assemble a control-scoped, time-windowed evidence pack.
+    Assemble {
+        /// Anchoring control ID (e.g. `CC8.1`).
+        #[arg(long)]
+        control: String,
+        /// Inclusive lower bound of the valid-time window (RFC 3339).
+        #[arg(long)]
+        from: String,
+        /// Exclusive upper bound of the valid-time window (RFC 3339).
+        #[arg(long)]
+        to: String,
+        /// Graph JSONL path (mutually exclusive with `--data-dir`).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` store directory (mutually exclusive with `--graph`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Control catalog document path. Defaults to the embedded `soc2-v1` catalog.
+        #[arg(long)]
+        catalog: Option<PathBuf>,
+        /// Minimum review-coverage fraction the pack must meet.
+        #[arg(long, default_value_t = 1.0)]
+        min_review_coverage: f64,
+        /// Pinned capture time (RFC 3339); no wall clock is read otherwise.
+        #[arg(long)]
+        captured_at: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Re-verify an assembled evidence pack offline (integrity, coverage, safety, window).
+    Verify {
+        /// Path to the evidence-pack JSON file to verify.
+        path: PathBuf,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 /// Subcommands for `bundle`.

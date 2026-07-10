@@ -52,7 +52,230 @@ pub(crate) fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
             format,
         ),
         AuditSubcommand::ControlCatalog { catalog, format } => control_catalog_cmd(catalog, format),
+        AuditSubcommand::EvidencePack { action } => evidence_pack_cmd(action),
     }
+}
+
+/// Routes `eg audit evidence-pack` actions (issue #338).
+pub(crate) fn evidence_pack_cmd(action: EvidencePackAction) -> Result<()> {
+    match action {
+        EvidencePackAction::Assemble {
+            control,
+            from,
+            to,
+            graph,
+            data_dir,
+            catalog,
+            min_review_coverage,
+            captured_at,
+            format,
+        } => evidence_pack_assemble_cmd(
+            &control,
+            &from,
+            &to,
+            graph.as_deref(),
+            data_dir.as_deref(),
+            catalog,
+            min_review_coverage,
+            captured_at.as_deref(),
+            format,
+        ),
+        EvidencePackAction::Verify { path, format } => evidence_pack_verify_cmd(&path, format),
+    }
+}
+
+/// Prints a redaction-safe JSON error and exits with the usage/load code (2).
+pub(crate) fn evidence_pack_exit(value: &serde_json::Value) -> ! {
+    eprintln!("{value}");
+    std::process::exit(2);
+}
+
+/// Handles `eg audit evidence-pack assemble` (issue #338): builds a
+/// control-scoped, time-windowed evidence pack. Exit 0 all verdicts pass, 1 any
+/// verdict fails (report still printed), 2 usage/load error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evidence_pack_assemble_cmd(
+    control: &str,
+    from: &str,
+    to: &str,
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+    catalog: Option<PathBuf>,
+    min_review_coverage: f64,
+    captured_at: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    use crate::evidence_pack::{self, DEFAULT_SOC2_CATALOG_JSON, Window};
+
+    if !min_review_coverage.is_finite() || !(0.0..=1.0).contains(&min_review_coverage) {
+        evidence_pack_exit(&serde_json::json!({
+            "code": "invalid_min_review_coverage",
+            "value": min_review_coverage.to_string(),
+            "message": "--min-review-coverage must be a finite value in [0.0, 1.0]",
+        }));
+    }
+
+    // Enforce exactly-one-of the input flags before opening any store, so the
+    // both/neither error is precise rather than a downstream store-copy failure.
+    match (graph, data_dir) {
+        (Some(_), Some(_)) => evidence_pack_exit(&serde_json::json!({
+            "code": "conflicting_input_flags",
+            "message": "provide only one of --graph or --data-dir, not both",
+        })),
+        (None, None) => evidence_pack_exit(&serde_json::json!({
+            "code": "missing_input_flag",
+            "message": "provide --graph <path> or --data-dir <path>",
+        })),
+        _ => {}
+    }
+
+    // Load and validate the catalog first (exit 2 on any read/parse error).
+    let catalog_text = catalog.map_or_else(
+        || DEFAULT_SOC2_CATALOG_JSON.to_owned(),
+        |path| {
+            fs::read_to_string(&path).unwrap_or_else(|error| {
+                evidence_pack_exit(&serde_json::json!({
+                    "code": "catalog_read_error",
+                    "path": path.display().to_string(),
+                    "message": error.to_string(),
+                }))
+            })
+        },
+    );
+    let parsed_catalog = evidence_pack::parse_catalog(&catalog_text)
+        .unwrap_or_else(|error| evidence_pack_exit(&error.to_json()));
+
+    // Load records read-only. An embedded store is read through a throwaway copy.
+    let store_copy = data_dir.map(|dir| match readonly_audit_store(dir) {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    });
+    let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
+    let records = match load_query_records(graph, effective_data_dir) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("{error}");
+            drop(store_copy);
+            std::process::exit(2);
+        }
+    };
+
+    let window = Window {
+        from: from.to_owned(),
+        to: to.to_owned(),
+    };
+    let pack = match evidence_pack::assemble_pack(
+        &records,
+        &parsed_catalog,
+        control,
+        &window,
+        min_review_coverage,
+        env!("CARGO_PKG_VERSION"),
+        captured_at,
+    ) {
+        Ok(pack) => pack,
+        Err(error) => {
+            drop(store_copy);
+            evidence_pack_exit(&error.to_json());
+        }
+    };
+
+    let output = match format {
+        OutputFormat::Json => {
+            serde_json::to_string(&pack).context("failed to serialize evidence pack")?
+        }
+        OutputFormat::Text => render_pack_text(&pack),
+    };
+    println!("{output}");
+    let exit_code = i32::from(!pack.verdicts.ok);
+    drop(store_copy);
+    std::process::exit(exit_code);
+}
+
+/// Handles `eg audit evidence-pack verify` (issue #338): re-verifies an
+/// assembled pack offline. Exit 0 all checks pass, 1 any fails (report still
+/// printed), 2 unreadable/unparseable pack.
+pub(crate) fn evidence_pack_verify_cmd(path: &Path, format: OutputFormat) -> Result<()> {
+    use crate::evidence_pack::{EvidencePack, verify_pack};
+
+    let text = fs::read_to_string(path).unwrap_or_else(|error| {
+        evidence_pack_exit(&serde_json::json!({
+            "code": "pack_read_error",
+            "path": path.display().to_string(),
+            "message": error.to_string(),
+        }))
+    });
+    let pack: EvidencePack = serde_json::from_str(&text).unwrap_or_else(|error| {
+        evidence_pack_exit(&serde_json::json!({
+            "code": "pack_parse_error",
+            "path": path.display().to_string(),
+            "message": error.to_string(),
+        }))
+    });
+
+    let report = verify_pack(&pack);
+    let output = match format {
+        OutputFormat::Json => {
+            serde_json::to_string(&report).context("failed to serialize verify report")?
+        }
+        OutputFormat::Text => {
+            let mut lines = vec![format!("ok: {}", report.ok)];
+            for (name, v) in [
+                ("integrity", &report.integrity),
+                ("coverage", &report.coverage),
+                ("safety", &report.safety),
+                ("window_consistency", &report.window_consistency),
+            ] {
+                lines.push(format!("{name}: {} — {}", v.passed, v.detail));
+            }
+            lines.join("\n")
+        }
+    };
+    println!("{output}");
+    std::process::exit(i32::from(!report.ok));
+}
+
+/// Renders an assembled evidence pack as a deterministic human-readable report.
+fn render_pack_text(pack: &crate::evidence_pack::EvidencePack) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!(
+        "control: {} — {}",
+        pack.manifest.control_id, pack.manifest.control_title
+    ));
+    lines.push(format!(
+        "window: {} <= t < {}",
+        pack.manifest.window.from, pack.manifest.window.to
+    ));
+    lines.push(format!(
+        "catalog: {} ({})",
+        pack.manifest.catalog_pin.catalog_id, pack.manifest.catalog_pin.catalog_hash
+    ));
+    lines.push(format!("ok: {}", pack.verdicts.ok));
+    for (name, v) in [
+        ("required_classes", &pack.verdicts.required_classes),
+        ("citation", &pack.verdicts.citation),
+        ("review_coverage", &pack.verdicts.review_coverage),
+        ("integrity", &pack.verdicts.integrity),
+        ("safety", &pack.verdicts.safety),
+    ] {
+        lines.push(format!("  {name}: {} — {}", v.passed, v.detail));
+    }
+    lines.push("sections:".to_owned());
+    for s in &pack.sections {
+        lines.push(format!(
+            "  {} [{}] {} ({} records)",
+            s.class, s.requirement, s.status, s.record_count
+        ));
+    }
+    lines.push(format!("gaps: {}", pack.gaps.len()));
+    for g in &pack.gaps {
+        lines.push(format!("  {} {}", g.gap_class, g.record_ids.join(",")));
+    }
+    lines.push(format!("disclaimer: {}", pack.manifest.disclaimer));
+    lines.join("\n")
 }
 
 /// Prints a redaction-safe JSON error and exits with the load/parse code (2).
