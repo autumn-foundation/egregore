@@ -1080,7 +1080,10 @@ fn in_window(valid_time: &str, window: &Window) -> bool {
 /// Maps a record to its catalog evidence class, when it maps to one.
 #[must_use]
 pub fn evidence_class_for_record(record: &GraphRecord) -> Option<EvidenceClass> {
-    let GraphRecord::Node { kind, source_kind, .. } = record else {
+    let GraphRecord::Node {
+        kind, source_kind, ..
+    } = record
+    else {
         return None;
     };
     match kind.as_str() {
@@ -1206,12 +1209,14 @@ fn citation_view(rows: &[&BundleRecord]) -> (Vec<ClassCitationTally>, bool, bool
     };
     let tallies = per_class
         .into_iter()
-        .map(|(trust_class, (total, cited, missing))| ClassCitationTally {
-            trust_class,
-            total,
-            cited,
-            missing,
-        })
+        .map(
+            |(trust_class, (total, cited, missing))| ClassCitationTally {
+                trust_class,
+                total,
+                cited,
+                missing,
+            },
+        )
         .collect();
     (tallies, code_pass, non_code_ok)
 }
@@ -1390,7 +1395,9 @@ pub fn assemble_pack(
         let is_review_coverage = class == EvidenceClass::ReviewCoverage;
         let (status, reason) = match availability {
             Availability::Present => ("present", None),
-            Availability::Unavailable => ("unavailable", Some(unavailable_reason(class).to_owned())),
+            Availability::Unavailable => {
+                ("unavailable", Some(unavailable_reason(class).to_owned()))
+            }
         };
         if outcome == ClassOutcome::GateFail {
             required_unavailable.push(class.as_wire().to_owned());
@@ -1441,7 +1448,13 @@ pub fn assemble_pack(
     }
 
     // --- gaps ---
-    let gaps = derive_gaps(records, window, &merged_pr_ids, &approving_targets, &mut diagnostics);
+    let gaps = derive_gaps(
+        records,
+        window,
+        &merged_pr_ids,
+        &approving_targets,
+        &mut diagnostics,
+    );
 
     // --- citation verdict ---
     let row_refs: Vec<&BundleRecord> = all_section_rows.iter().collect();
@@ -1465,7 +1478,10 @@ pub fn assemble_pack(
         detail: if required_passed {
             "every required class resolved (populated or explicitly empty)".to_owned()
         } else {
-            format!("required classes unavailable: {}", required_unavailable.join(", "))
+            format!(
+                "required classes unavailable: {}",
+                required_unavailable.join(", ")
+            )
         },
     };
     let citation = VerificationVerdict {
@@ -1478,9 +1494,7 @@ pub fn assemble_pack(
     };
     let review_coverage = VerificationVerdict {
         passed: review_coverage_passed,
-        detail: format!(
-            "review coverage {coverage:.4} vs minimum {min_review_coverage:.4}"
-        ),
+        detail: format!("review coverage {coverage:.4} vs minimum {min_review_coverage:.4}"),
     };
 
     let ok = required_passed
@@ -1573,9 +1587,13 @@ fn derive_gaps(
     // merged_pr_without_approving_review
     for pr_id in merged_pr_ids {
         if !approving_targets.contains(pr_id) {
-            let vt = by_id.get(pr_id.as_str()).and_then(|r| resolve_valid_time(r));
+            let vt = by_id
+                .get(pr_id.as_str())
+                .and_then(|r| resolve_valid_time(r));
             gaps.push(GapRow {
-                gap_class: GapClass::MergedPrWithoutApprovingReview.as_wire().to_owned(),
+                gap_class: GapClass::MergedPrWithoutApprovingReview
+                    .as_wire()
+                    .to_owned(),
                 record_ids: vec![pr_id.clone()],
                 valid_time: vt,
                 detail: "merged pull request has no linked approving review".to_owned(),
@@ -1660,8 +1678,9 @@ fn derive_gaps(
 fn record_has_reviewed_commit_fact(record: &GraphRecord) -> bool {
     match record {
         GraphRecord::Edge { label, .. } => label.as_str() == "REVIEWS_COMMIT",
-        GraphRecord::Node { .. } => serde_json::to_string(record)
-            .is_ok_and(|json| json.contains("\"review_commit_sha\"")),
+        GraphRecord::Node { .. } => {
+            serde_json::to_string(record).is_ok_and(|json| json.contains("\"review_commit_sha\""))
+        }
         GraphRecord::Tombstone { .. } => false,
     }
 }
@@ -1766,8 +1785,11 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
             let computed = blake3::hash(serialized.as_bytes()).to_string();
             if computed != br.hash {
                 integrity_passed = false;
-                integrity_detail =
-                    format!("record {} hash mismatch in section {}", br.record.id(), section.class);
+                integrity_detail = format!(
+                    "record {} hash mismatch in section {}",
+                    br.record.id(),
+                    section.class
+                );
                 break 'integrity;
             }
         }
@@ -1891,7 +1913,19 @@ pub(crate) mod fixture {
     }
 
     fn commit(id: &str, vt: &str) -> GraphRecord {
-        set_temporal_valid_time(node(id, NodeKind::Commit, SCHEMA_VERSION), vt)
+        let mut r = set_temporal_valid_time(node(id, NodeKind::Commit, SCHEMA_VERSION), vt);
+        // Carry raw Git authorship so the #116 email-redaction path is exercised
+        // by scrub_record (the assembled pack must never leak the raw address).
+        if let GraphRecord::Node {
+            author_email,
+            author_name,
+            ..
+        } = &mut r
+        {
+            *author_email = Some("dev@example.com".to_owned());
+            *author_name = Some("Dev Example".to_owned());
+        }
+        r
     }
 
     fn commit_no_vt(id: &str) -> GraphRecord {
@@ -2830,7 +2864,11 @@ mod pack338_tests {
             ["project:v1:pr04", "project:v1:pr05", "project:v1:pr06"]
         );
         // Out-of-window merged-no-review PRs must not surface.
-        assert!(!gap_prs.iter().any(|id| id.contains("prf") || id.contains("pra")));
+        assert!(
+            !gap_prs
+                .iter()
+                .any(|id| id.contains("prf") || id.contains("pra"))
+        );
     }
 
     #[test]
@@ -2872,8 +2910,18 @@ mod pack338_tests {
                     && d.unavailable_reason.as_deref()
                         == Some("issue_334_reviewed_commit_facts_absent"))
         );
-        assert!(!pack.gaps.iter().any(|g| g.gap_class == "review_unanchored_no_commit_sha"));
-        assert!(!pack.gaps.iter().any(|g| g.gap_class == "approval_precedes_final_head"));
+        assert!(
+            !pack
+                .gaps
+                .iter()
+                .any(|g| g.gap_class == "review_unanchored_no_commit_sha")
+        );
+        assert!(
+            !pack
+                .gaps
+                .iter()
+                .any(|g| g.gap_class == "approval_precedes_final_head")
+        );
     }
 
     #[test]
@@ -2912,8 +2960,8 @@ mod pack338_tests {
     fn unknown_control_names_known_ids() {
         let records = build_seed_records();
         let catalog = load_default_catalog();
-        let err =
-            assemble_pack(&records, &catalog, "ZZ9.9", &win(), 1.0, "v", None).expect_err("unknown");
+        let err = assemble_pack(&records, &catalog, "ZZ9.9", &win(), 1.0, "v", None)
+            .expect_err("unknown");
         assert_eq!(err.code(), "unknown_control");
         assert_eq!(
             err,
@@ -2960,8 +3008,7 @@ mod pack338_tests {
             from: "2026-01-01T00:00:00Z".to_owned(),
             to: "2026-01-02T00:00:00Z".to_owned(),
         };
-        let pack =
-            assemble_pack(&records, &catalog, "CC8.1", &empty, 1.0, "v", None).unwrap();
+        let pack = assemble_pack(&records, &catalog, "CC8.1", &empty, 1.0, "v", None).unwrap();
         assert!(pack.verdicts.ok, "empty window should be vacuous success");
         for s in &pack.sections {
             assert_eq!(s.record_count, 0);
@@ -3003,8 +3050,12 @@ mod pack338_tests {
     fn no_raw_payload_or_email_in_serialized_pack() {
         let pack = assemble_cc81();
         let json = serde_json::to_string(&pack).unwrap();
-        // No unredacted author email pattern beyond the redaction marker.
-        assert!(!json.contains("@example.com"));
+        // The raw author email (#116) is never present; the redaction marker is.
+        assert!(!json.contains("dev@example.com"));
+        assert!(
+            json.contains("<REDACTED:email:"),
+            "commit author emails must be redacted, exercising the #116 path"
+        );
         // The disclaimer is present verbatim.
         assert_eq!(pack.manifest.disclaimer, PACK_DISCLAIMER);
     }
@@ -3013,8 +3064,7 @@ mod pack338_tests {
     fn captured_at_is_only_present_when_pinned() {
         let records = build_seed_records();
         let catalog = load_default_catalog();
-        let without =
-            assemble_pack(&records, &catalog, "CC8.1", &win(), 1.0, "v", None).unwrap();
+        let without = assemble_pack(&records, &catalog, "CC8.1", &win(), 1.0, "v", None).unwrap();
         assert!(without.manifest.captured_at.is_none());
         let with = assemble_pack(
             &records,
@@ -3026,7 +3076,10 @@ mod pack338_tests {
             Some("2026-05-01T00:00:00Z"),
         )
         .unwrap();
-        assert_eq!(with.manifest.captured_at.as_deref(), Some("2026-05-01T00:00:00Z"));
+        assert_eq!(
+            with.manifest.captured_at.as_deref(),
+            Some("2026-05-01T00:00:00Z")
+        );
     }
 
     /// Regenerates the committed integration fixture. Runs only when the
@@ -3036,8 +3089,8 @@ mod pack338_tests {
         if std::env::var_os("EG_REGEN_EVIDENCE_PACK_FIXTURE").is_none() {
             return;
         }
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/evidence_pack");
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/evidence_pack");
         std::fs::create_dir_all(&dir).expect("create fixture dir");
         std::fs::write(dir.join("seed.graph.jsonl"), seed_jsonl()).expect("write fixture");
     }

@@ -109,10 +109,12 @@ fn disclaimer_is_verbatim_and_no_raw_payload() {
         pack["manifest"]["disclaimer"],
         "rows are recorded observations of process execution as imported; never proof of control effectiveness, compliance, or completeness; absence of a record means no imported evidence, not no event; not an auditor opinion"
     );
-    // Serialized pack must not carry raw emails or secret markers.
+    // Serialized pack must not carry raw emails or secret markers; the #116
+    // redaction marker replaces the raw commit author address.
     let raw = serde_json::to_string(&pack).unwrap();
     assert!(!raw.contains("@example.com"));
     assert!(!raw.contains("BEGIN RSA PRIVATE KEY"));
+    assert!(raw.contains("<REDACTED:email:"));
 }
 
 #[test]
