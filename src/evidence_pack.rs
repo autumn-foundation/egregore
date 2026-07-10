@@ -993,6 +993,8 @@ pub struct ClassCitationTally {
     pub cited: usize,
     /// Rows missing a required handle.
     pub missing: usize,
+    /// Rows excluded as protected/unverified (reported, never counted cited).
+    pub excluded: usize,
 }
 
 /// The pack's assemble-time verdicts (AC6).
@@ -1194,27 +1196,43 @@ fn section_sort_key(record: &GraphRecord) -> (String, String) {
 /// assemble-time citation verdict and `verify_pack`'s coverage check (AC4).
 fn citation_view(rows: &[&BundleRecord]) -> (Vec<ClassCitationTally>, bool, bool) {
     // (tallies, code_gate_pass, non_code_gate_pass)
-    let mut per_class: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
+    // per_class entry: (total, cited, missing, excluded)
+    let mut per_class: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
     let mut code_total = 0usize;
     let mut code_cited = 0usize;
     let mut non_code_ok = true;
     for br in rows {
         let classified = classify_record_external(&br.record);
         let trust = classified.trust_class.to_owned();
-        let cited = classified.status != CitationStatus::MissingRequiredHandle;
-        let entry = per_class.entry(trust.clone()).or_insert((0, 0, 0));
+        // A row satisfies the citation contract only when it carries the handle
+        // its trust class requires. Mirror `citation_audit`'s exact satisfying
+        // set (`Cited | AbsentHandleDocumented`) so the pack's per-class tallies
+        // are byte-identical to `eg audit citations` on the same records. A
+        // protected/unverified exclusion (`ExcludedProtected`/`ExcludedUnverified`)
+        // is NOT satisfying — it is tallied separately, never counted as cited.
+        let satisfied = matches!(
+            classified.status,
+            CitationStatus::Cited | CitationStatus::AbsentHandleDocumented
+        );
+        let missing = classified.status == CitationStatus::MissingRequiredHandle;
+        let entry = per_class.entry(trust.clone()).or_insert((0, 0, 0, 0));
         entry.0 += 1;
-        if cited {
+        if satisfied {
             entry.1 += 1;
-        } else {
+        } else if missing {
             entry.2 += 1;
+        } else {
+            entry.3 += 1;
         }
         if classified.trust_class == "source_fact" {
             code_total += 1;
-            if cited {
+            if satisfied {
                 code_cited += 1;
             }
-        } else if !cited {
+        } else if missing {
+            // The non-code (100%) gate fails only on a genuinely missing handle,
+            // exactly as `citation_audit` gates it. Protected/unverified
+            // exclusions are reported (tallied), never a gate failure.
             non_code_ok = false;
         }
     }
@@ -1227,11 +1245,12 @@ fn citation_view(rows: &[&BundleRecord]) -> (Vec<ClassCitationTally>, bool, bool
     let tallies = per_class
         .into_iter()
         .map(
-            |(trust_class, (total, cited, missing))| ClassCitationTally {
+            |(trust_class, (total, cited, missing, excluded))| ClassCitationTally {
                 trust_class,
                 total,
                 cited,
                 missing,
+                excluded,
             },
         )
         .collect();
@@ -1473,6 +1492,7 @@ pub fn assemble_pack(
     // --- gaps ---
     let gaps = derive_gaps(
         records,
+        control,
         window,
         &merged_pr_ids,
         &approving_targets,
@@ -1597,8 +1617,20 @@ fn diagnostic_sort_key(d: &PackDiagnostic) -> (String, String, String) {
 /// Derives the closed set of gap rows (AC5). Two classes require issue #334
 /// facts; when those facts are absent a single `capability_unavailable`
 /// diagnostic is emitted and zero rows are produced for them.
+/// True when the control marks `class` as [`Requirement::Required`].
+///
+/// The control-scoping predicate for gap derivation is derived from this over
+/// the control's own `evidence_classes`, never a hardcoded control-id list.
+fn control_requires(control: &Control, class: EvidenceClass) -> bool {
+    control
+        .evidence_classes
+        .iter()
+        .any(|cr| cr.class == class && cr.requirement == Requirement::Required)
+}
+
 fn derive_gaps(
     records: &[GraphRecord],
+    control: &Control,
     window: &Window,
     merged_pr_ids: &[String],
     approving_targets: &BTreeSet<String>,
@@ -1607,49 +1639,72 @@ fn derive_gaps(
     let mut gaps: Vec<GapRow> = Vec::new();
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
 
+    // Gap classes are control-scoped: a defect over PR/commit/review evidence is
+    // only meaningful for a control that actually requires that evidence class.
+    // The predicate is derived from the control's own `Requirement::Required`
+    // entries, never a hardcoded control-id list, so a CC7.2/CC7.3 monitoring
+    // pack never emits change-management (CC8.1) PR/commit/review gaps.
+    let requires_commits = control_requires(control, EvidenceClass::Commits);
+    let requires_pull_requests = control_requires(control, EvidenceClass::PullRequests);
+    let requires_review = control_requires(control, EvidenceClass::Reviews)
+        || control_requires(control, EvidenceClass::ReviewCoverage);
+    // `merged_pr_without_approving_review`: the PR/review linkage defect.
+    let want_merged_pr_gap = requires_pull_requests || requires_review;
+    // `commit_outside_any_pr`: the commit/PR provenance defect.
+    let want_commit_outside_gap = requires_commits || requires_pull_requests;
+    // The #334-degraded pair (`review_unanchored_no_commit_sha`,
+    // `approval_precedes_final_head`) and its capability diagnostic.
+    let want_review_anchored = requires_review;
+
     // merged_pr_without_approving_review
-    for pr_id in merged_pr_ids {
-        if !approving_targets.contains(pr_id) {
-            let vt = by_id
-                .get(pr_id.as_str())
-                .and_then(|r| resolve_valid_time(r));
-            gaps.push(GapRow {
-                gap_class: GapClass::MergedPrWithoutApprovingReview
-                    .as_wire()
-                    .to_owned(),
-                record_ids: vec![pr_id.clone()],
-                valid_time: vt,
-                detail: "merged pull request has no linked approving review".to_owned(),
-            });
+    if want_merged_pr_gap {
+        for pr_id in merged_pr_ids {
+            if !approving_targets.contains(pr_id) {
+                let vt = by_id
+                    .get(pr_id.as_str())
+                    .and_then(|r| resolve_valid_time(r));
+                gaps.push(GapRow {
+                    gap_class: GapClass::MergedPrWithoutApprovingReview
+                        .as_wire()
+                        .to_owned(),
+                    record_ids: vec![pr_id.clone()],
+                    valid_time: vt,
+                    detail: "merged pull request has no linked approving review".to_owned(),
+                });
+            }
         }
     }
 
     // commit_outside_any_pr: in-window commit not targeted by any MERGED_AS edge
-    let merged_commit_targets: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Edge { label, target, .. } if label.as_str() == "MERGED_AS" => {
-                Some(target.as_str())
+    if want_commit_outside_gap {
+        let merged_commit_targets: BTreeSet<&str> = records
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Edge { label, target, .. } if label.as_str() == "MERGED_AS" => {
+                    Some(target.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        for record in records {
+            if record.node_kind_name() == Some("Commit")
+                && let Some(vt) = resolve_valid_time(record)
+                && in_window(&vt, window)
+                && !merged_commit_targets.contains(record.id())
+            {
+                gaps.push(GapRow {
+                    gap_class: GapClass::CommitOutsideAnyPr.as_wire().to_owned(),
+                    record_ids: vec![record.id().to_owned()],
+                    valid_time: Some(vt),
+                    detail: "commit not claimed by any pull request via MERGED_AS".to_owned(),
+                });
             }
-            _ => None,
-        })
-        .collect();
-    for record in records {
-        if record.node_kind_name() == Some("Commit")
-            && let Some(vt) = resolve_valid_time(record)
-            && in_window(&vt, window)
-            && !merged_commit_targets.contains(record.id())
-        {
-            gaps.push(GapRow {
-                gap_class: GapClass::CommitOutsideAnyPr.as_wire().to_owned(),
-                record_ids: vec![record.id().to_owned()],
-                valid_time: Some(vt),
-                detail: "commit not claimed by any pull request via MERGED_AS".to_owned(),
-            });
         }
     }
 
-    // missing_valid_time: class-relevant records with no resolvable valid time
+    // missing_valid_time: class-relevant records with no resolvable valid time.
+    // Generic and unconditional — it is about any class-relevant record excluded
+    // for lacking valid time, so it applies to every control.
     for record in records {
         if evidence_class_for_record(record).is_some() && resolve_valid_time(record).is_none() {
             gaps.push(GapRow {
@@ -1661,21 +1716,25 @@ fn derive_gaps(
         }
     }
 
-    // #334-dependent classes: detect the backing facts; degrade when absent.
-    let has_issue_334_facts = records.iter().any(record_has_reviewed_commit_fact);
-    if has_issue_334_facts {
-        // (Populated automatically once #334 lands; no facts to derive from yet.)
-    } else {
-        diagnostics.push(PackDiagnostic {
-            code: "capability_unavailable".to_owned(),
-            evidence_class: None,
-            unavailable_reason: Some("issue_334_reviewed_commit_facts_absent".to_owned()),
-            record_ids: Vec::new(),
-            detail: "gap classes review_unanchored_no_commit_sha and \
-                     approval_precedes_final_head require issue #334 reviewed-commit \
-                     facts (review_commit_sha / REVIEWS_COMMIT), which are not present"
-                .to_owned(),
-        });
+    // #334-dependent classes: only in scope when the control requires review
+    // evidence. Detect the backing facts; degrade with one capability diagnostic
+    // when absent (populated automatically once #334 lands).
+    if want_review_anchored {
+        let has_issue_334_facts = records.iter().any(record_has_reviewed_commit_fact);
+        if has_issue_334_facts {
+            // (Populated automatically once #334 lands; no facts to derive yet.)
+        } else {
+            diagnostics.push(PackDiagnostic {
+                code: "capability_unavailable".to_owned(),
+                evidence_class: None,
+                unavailable_reason: Some("issue_334_reviewed_commit_facts_absent".to_owned()),
+                record_ids: Vec::new(),
+                detail: "gap classes review_unanchored_no_commit_sha and \
+                         approval_precedes_final_head require issue #334 reviewed-commit \
+                         facts (review_commit_sha / REVIEWS_COMMIT), which are not present"
+                    .to_owned(),
+            });
+        }
     }
 
     gaps.sort_by(|a, b| {
@@ -1967,6 +2026,19 @@ pub(crate) mod fixture {
             format!("Git change M to {path}"),
         );
         set_temporal_valid_time(r, vt)
+    }
+
+    /// A `Change` (`source_fact`) node whose only citable handle is a protected
+    /// raw-artifact handle (`protected:v1:…`) carried in `source_handle`. This is
+    /// the `citation_audit` `ExcludedProtected` vector: a code row that must count
+    /// AGAINST the code citation gate, never as cited. The handle is placed in a
+    /// field `scrub_record` preserves so it survives the pack scrub pipeline.
+    pub fn protected_change(id: &str, path: &str, vt: &str) -> GraphRecord {
+        let mut r = change(id, path, vt);
+        if let GraphRecord::Node { source_handle, .. } = &mut r {
+            *source_handle = Some(format!("protected:v1:{}", "0123456789abcdef".repeat(4)));
+        }
+        r
     }
 
     pub fn pr(id: &str, vt: &str, merge_commit: &str) -> GraphRecord {
@@ -3141,6 +3213,180 @@ mod pack338_tests {
                 .iter()
                 .any(|g| g.gap_class == "approval_precedes_final_head")
         );
+    }
+
+    /// Codex round-3 finding A: gap derivation is control-scoped. A CC7.2
+    /// (monitoring) pack over a store rich in merged-PR-without-review and
+    /// commit-outside-PR facts must emit NONE of the change-management PR/commit
+    /// gap classes — those evidence classes are not required by CC7.2 — nor the
+    /// #334 review-anchored capability diagnostic. Only the generic
+    /// `missing_valid_time` gap (about class-relevant records excluded for
+    /// lacking valid time) may appear.
+    #[test]
+    fn cc72_pack_emits_no_pr_commit_review_gaps() {
+        let records = build_seed_records();
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC7.2",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        for class in [
+            "merged_pr_without_approving_review",
+            "commit_outside_any_pr",
+            "review_unanchored_no_commit_sha",
+            "approval_precedes_final_head",
+        ] {
+            assert!(
+                !pack.gaps.iter().any(|g| g.gap_class == class),
+                "CC7.2 must not emit gap class {class}: gaps={:?}",
+                pack.gaps
+            );
+        }
+        // The #334 capability diagnostic is scoped to the review-anchored pair,
+        // so it must not appear for a control that requires no review evidence.
+        assert!(
+            !pack
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "capability_unavailable"
+                    && d.unavailable_reason.as_deref()
+                        == Some("issue_334_reviewed_commit_facts_absent")),
+            "CC7.2 must not emit the #334 review-anchored capability diagnostic"
+        );
+        // The generic missing_valid_time gap stays unconditional: c15 is a
+        // class-relevant Commit with no resolvable valid time.
+        assert!(
+            pack.gaps.iter().any(|g| g.gap_class == "missing_valid_time"
+                && g.record_ids.contains(&"codegraph:v5:c15".to_owned())),
+            "missing_valid_time must remain generic across controls"
+        );
+    }
+
+    /// Regression guard for finding A: CC8.1 over the SAME store still emits the
+    /// change-management PR/commit gaps (it requires those classes), including
+    /// the three planted `merged_pr_without_approving_review` gaps and the
+    /// commit-outside-PR gaps, plus the #334 review-anchored diagnostic.
+    #[test]
+    fn cc81_pack_still_emits_pr_commit_gaps_over_same_store() {
+        let records = build_seed_records();
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        let mut planted: Vec<&str> = pack
+            .gaps
+            .iter()
+            .filter(|g| g.gap_class == "merged_pr_without_approving_review")
+            .flat_map(|g| g.record_ids.iter().map(String::as_str))
+            .collect();
+        planted.sort_unstable();
+        assert_eq!(
+            planted,
+            ["project:v1:pr04", "project:v1:pr05", "project:v1:pr06"]
+        );
+        assert!(
+            pack.gaps
+                .iter()
+                .any(|g| g.gap_class == "commit_outside_any_pr"),
+            "CC8.1 must still emit commit_outside_any_pr gaps"
+        );
+        assert!(
+            pack.diagnostics
+                .iter()
+                .any(|d| d.code == "capability_unavailable"
+                    && d.unavailable_reason.as_deref()
+                        == Some("issue_334_reviewed_commit_facts_absent")),
+            "CC8.1 must still emit the #334 review-anchored capability diagnostic"
+        );
+    }
+
+    /// Codex round-3 finding B: a `source_fact` code row whose only handle is a
+    /// protected raw-artifact handle is `ExcludedProtected` — it must count
+    /// AGAINST the pack code citation gate (excluded, not cited), byte-identical
+    /// to how `eg audit citations` classifies the same records. Before the fix
+    /// the pack treated every non-`MissingRequiredHandle` status as cited, so a
+    /// protected-only code row passed the gate while `citation_audit` failed it.
+    #[test]
+    fn protected_only_code_row_counts_excluded_not_cited_parity_with_citation_audit() {
+        use super::fixture::{change, protected_change};
+        let records = vec![
+            change("codegraph:v5:chg01", "src/a.rs", "2026-03-10T09:00:00Z"),
+            protected_change("codegraph:v5:chgP", "src/b.rs", "2026-03-11T09:00:00Z"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+
+        // Pack source_fact tally: one cited (documented-absent Change) + one
+        // excluded (protected), zero missing.
+        let sf = pack
+            .verdicts
+            .citation_tallies
+            .iter()
+            .find(|t| t.trust_class == "source_fact")
+            .expect("source_fact tally present");
+        assert_eq!(sf.total, 2, "two source_fact rows");
+        assert_eq!(sf.cited, 1, "only the documented-absent Change is cited");
+        assert_eq!(
+            sf.excluded, 1,
+            "the protected-only row is excluded, not cited"
+        );
+        assert_eq!(sf.missing, 0);
+
+        // The excluded protected row drives code completeness below 0.95, so the
+        // pack citation verdict now fails — matching citation_audit's gate.
+        assert!(
+            !pack.verdicts.citation.passed,
+            "protected-only code row must fail the pack code citation gate"
+        );
+
+        // Byte-for-byte parity: recompute the per-class tally the way
+        // citation_audit classifies rows over the SAME scrubbed section rows.
+        let structural = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "structural_deltas")
+            .expect("structural_deltas section");
+        let mut audit_total = 0usize;
+        let mut audit_cited = 0usize;
+        let mut audit_excluded = 0usize;
+        let mut audit_missing = 0usize;
+        for br in &structural.records {
+            let row = classify_record_external(&br.record);
+            assert_eq!(row.trust_class, "source_fact");
+            audit_total += 1;
+            match row.status {
+                CitationStatus::Cited | CitationStatus::AbsentHandleDocumented => {
+                    audit_cited += 1;
+                }
+                CitationStatus::MissingRequiredHandle => audit_missing += 1,
+                CitationStatus::ExcludedProtected | CitationStatus::ExcludedUnverified => {
+                    audit_excluded += 1;
+                }
+            }
+        }
+        assert_eq!(audit_total, sf.total, "tally parity: total");
+        assert_eq!(audit_cited, sf.cited, "tally parity: cited");
+        assert_eq!(audit_excluded, sf.excluded, "tally parity: excluded");
+        assert_eq!(audit_missing, sf.missing, "tally parity: missing");
     }
 
     #[test]

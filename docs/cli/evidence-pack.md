@@ -128,25 +128,40 @@ domain. Only the log-signature classes degrade with `log_domain_absent`.
 The per-verdict block is: `required_classes`, `citation` (with per-trust-class
 tallies), `review_coverage`, `integrity`, `safety`.
 
+Each per-trust-class citation tally carries `total`, `cited`, `missing`, and
+`excluded`. `cited` is exactly `eg audit citations`'s satisfying set
+(`Cited | AbsentHandleDocumented`); `excluded` counts protected/unverified rows
+(`ExcludedProtected`/`ExcludedUnverified`) — a code (`source_fact`) row whose
+only handle is a `protected:v1:` payload is counted **excluded, never cited**,
+so it drives code-citation completeness **down** exactly as `eg audit citations`
+would count it. The tallies are byte-identical to `eg audit citations` on the
+same records.
+
 ## Gaps — the closed class set
 
 `gaps` always report, regardless of verdicts. Each gap row cites the record IDs
-it derives from.
+it derives from. Gap classes are **control-scoped**: a PR/commit/review defect is
+only emitted for a control that actually requires the relevant evidence class
+(derived from the control's `Requirement::Required` entries, never a hardcoded
+control-id list). A monitoring control (CC7.2/CC7.3) that requires no
+PR/commit/review evidence therefore emits none of those change-management gaps;
+`missing_valid_time` stays generic across every control.
 
-| Gap class | Meaning | Status |
-|-----------|---------|--------|
-| `merged_pr_without_approving_review` | A merged PR Task with no linked **in-window** approving `Review` (via `REFERENCES_TASK`). An approving review that resolves outside the pack window — or has no resolvable valid time — is omitted from the `reviews` section and does **not** suppress this gap. | Fully implemented. |
-| `commit_outside_any_pr` | An in-window `Commit` not claimed by any PR via `MERGED_AS`. | Fully implemented. |
-| `missing_valid_time` | A class-relevant record with no resolvable valid time. | Fully implemented. |
-| `review_unanchored_no_commit_sha` | A review with no anchoring reviewed-commit SHA. | **Needs #334.** Degrades. |
-| `approval_precedes_final_head` | A recorded approval whose commit predates the PR's final head. | **Needs #334.** Degrades. |
+| Gap class | Meaning | Emitted when the control requires | Status |
+|-----------|---------|-----------------------------------|--------|
+| `merged_pr_without_approving_review` | A merged PR Task with no linked **in-window** approving `Review` (via `REFERENCES_TASK`). An approving review that resolves outside the pack window — or has no resolvable valid time — is omitted from the `reviews` section and does **not** suppress this gap. | `pull_requests` and/or `reviews`/`review_coverage` | Fully implemented. |
+| `commit_outside_any_pr` | An in-window `Commit` not claimed by any PR via `MERGED_AS`. | `commits` and/or `pull_requests` | Fully implemented. |
+| `missing_valid_time` | A class-relevant record with no resolvable valid time. | *(generic — any control)* | Fully implemented. |
+| `review_unanchored_no_commit_sha` | A review with no anchoring reviewed-commit SHA. | `reviews`/`review_coverage` | **Needs #334.** Degrades. |
+| `approval_precedes_final_head` | A recorded approval whose commit predates the PR's final head. | `reviews`/`review_coverage` | **Needs #334.** Degrades. |
 
 Because issue #334 (the `review_commit_sha` field / `REVIEWS_COMMIT` edge) is
-not merged, the last two classes have no backing facts. The pack **detects the
-field/edge at runtime**; when absent it emits a single `capability_unavailable`
-diagnostic naming issue #334 and produces zero rows for those two classes — it
-never fabricates. The enum stays closed; the two classes populate automatically
-once #334's facts appear.
+not merged, the last two classes have no backing facts. When a control requires
+review evidence the pack **detects the field/edge at runtime**; when absent it
+emits a single `capability_unavailable` diagnostic naming issue #334 and produces
+zero rows for those two classes — it never fabricates. A control that requires no
+review evidence emits neither those gap classes nor the #334 diagnostic. The enum
+stays closed; the two classes populate automatically once #334's facts appear.
 
 ## `verify <path>`
 
