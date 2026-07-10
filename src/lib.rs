@@ -33,6 +33,8 @@ pub mod error;
 pub mod evidence;
 /// Evidence-link freshness verdicts for agent observations (issue #85).
 pub mod evidence_freshness;
+/// Versioned SOC2 control->evidence-class catalog loader, validator, and hash-pin (issue #337).
+pub mod evidence_pack;
 /// Operator-facing logical retraction of persisted records (issue #231).
 pub mod forget;
 /// Read-only store freshness classification (issue #82).

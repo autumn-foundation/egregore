@@ -18,6 +18,7 @@ mod claude_code;
 mod cli;
 mod co_change_coupling;
 mod codex;
+mod control_catalog;
 mod cross_file_calls;
 mod daemon;
 mod deps;

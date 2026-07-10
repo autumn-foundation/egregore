@@ -492,6 +492,29 @@ file/span or commit handle; an uncited answer is a miss, not a win. A class belo
 yields a distinct exit code and a `below_token_savings_threshold` diagnostic naming the class
 and ratio. Output is deterministic and redaction-safe. See `docs/cli/token-cost.md`.
 
+SOC2 control-catalog loader/validator/pin (issue #337):
+
+```powershell
+cargo run -- audit control-catalog                              # exit 0 valid, 2 load/parse error
+cargo run -- audit control-catalog --catalog path/to/soc2.json  # validate a catalog file
+cargo run -- audit control-catalog --format text                # human-readable summary
+```
+
+`eg audit control-catalog` loads, validates, and BLAKE3 hash-pins a versioned
+SOC2 control→evidence-class catalog (the embedded `soc2-v1` by default, or a
+`--catalog` override). It checks the schema-version tuple
+`(control_catalog, ControlCatalog, 1)` and the closed 11-value evidence-class
+vocabulary, then prints a deterministic single-line report carrying the catalog
+identity, its `control_catalog:v1:<hex>` hash-pin handle, and the per-control
+evidence-class map (`required`/`optional`). Pure, offline, read-only;
+byte-identical across runs. Unknown schema version, unknown evidence class,
+malformed JSON, and unreadable files exit 2 with a redaction-safe JSON error.
+The catalog maps a control ID to Egregore evidence classes — not an
+interpretation of the AICPA criteria and not legal advice; evidence of process
+execution, never proof of control effectiveness. This is the catalog surface
+only; evidence-pack assembly is #338. See `docs/cli/control-catalog.md` and
+`docs/controls/README.md`.
+
 Embedded store write locking (issue #200):
 
 Every embedded write open takes the OS-level exclusive store lease (`egregored.lock`),

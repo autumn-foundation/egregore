@@ -18,6 +18,32 @@ use crate::ir::{
 /// Stable error code for default reader rejection of an unknown record version.
 pub const UNKNOWN_SCHEMA_VERSION_CODE: &str = "unknown_schema_version";
 
+/// Domain for the versioned SOC2 control->evidence-class catalog (issue #337).
+///
+/// The control catalog is a standalone document, not a `GraphRecord`; its tuple
+/// is registered here for discoverability but is recognized by
+/// [`is_known_control_catalog_schema_version`] rather than
+/// [`is_known_record_version`], which only reads `GraphRecord`-derived domains.
+pub const CONTROL_CATALOG_DOMAIN: &str = "control_catalog";
+
+/// Kind for the control catalog document (issue #337).
+pub const CONTROL_CATALOG_KIND: &str = "ControlCatalog";
+
+/// Current schema version of the control catalog document (issue #337).
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 1;
+
+/// Returns true when this binary knows how to read the control-catalog tuple.
+///
+/// Kept separate from [`is_known_record_version`] because the control catalog is
+/// not a `GraphRecord`; adding a `control_catalog` arm there would corrupt the
+/// `GraphRecord` reader path. See [`crate::evidence_pack`] (issue #337).
+#[must_use]
+pub fn is_known_control_catalog_schema_version(domain: &str, kind: &str, version: u32) -> bool {
+    domain == CONTROL_CATALOG_DOMAIN
+        && kind == CONTROL_CATALOG_KIND
+        && version == CONTROL_CATALOG_SCHEMA_VERSION
+}
+
 /// Reader-side schema-version identity scoped per record domain and kind.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct RecordVersion {
