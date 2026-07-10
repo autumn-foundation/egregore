@@ -82,9 +82,18 @@ Task record shape.
 | `assignees` | string array | yes | Agent IDs or human identifiers; opaque strings, not resolved to `Agent` nodes in this slice. |
 | `labels` | string array | yes | Redacted per #4. |
 | `priority` | enum | yes | `low`, `normal`, `high`, `urgent`, `unknown`; additive. |
+| `head_sha` | string | no (PR only) | GitHub PR head (source-branch) commit SHA (issue #333). Plaintext; omitted on non-PR Tasks. |
+| `head_ref` | string | no (PR only) | GitHub PR head (source-branch) ref name (issue #333). Plaintext; omitted on non-PR Tasks. |
+| `base_ref` | string | no (PR only) | GitHub PR base (target-branch) ref name (issue #333). Plaintext; omitted on non-PR Tasks. |
+| `merge_commit_sha` | string | no (PR only) | GitHub PR merge commit SHA; present only when actually merged (`merged_at` present), gating out GitHub's temporary test-merge SHA on unmerged PRs (issue #333). Plaintext. Resolves to a `MERGED_AS` edge, below (also merged-only). |
+| `merged_at` | RFC3339 | no (PR only) | GitHub PR merge timestamp; present only when merged (issue #333). Plaintext. |
+| `draft` | bool | no (PR only) | GitHub PR draft flag (issue #333). Plaintext; omitted on non-PR Tasks. |
 
-GitHub issue and PR importers both write `Task`; GitHub-only fields can land in
-reserved `GitHubIssue` or `PR` records in a later slice.
+GitHub issue and PR importers both write `Task`; the six optional PR fields above
+are promoted flat `Task` fields (issue #333, consumed by #334/#338). They are
+additive — a pre-#333 `Task` that omits them is still valid at
+`PROJECT_SCHEMA_VERSION = 1`. Remaining GitHub-only fields can land in reserved
+`GitHubIssue` or `PR` records in a later slice.
 
 ## 4 - AcceptanceCriterion record shape
 
@@ -136,8 +145,8 @@ payload definitions belong to their own slices.
 | `Project` | Bounded area of work under a `Product` - reserved. |
 | `Plan` | Strategy, milestone, or implementation plan - reserved. `Plan` records are project-domain entries; `docs/plans/*.md` files are artifact-domain `Plan` records distinguished by `domain`. |
 | `GitHubIssue` | GitHub-specific issue metadata - reserved; day-one shape collapses issues into `Task` with `source_kind` and `ExternalLink`. |
-| `PR` | GitHub pull-request metadata - reserved for fields such as `merged_at`, `base_ref`, and `head_ref`. |
-| `Review` | Review comment, finding, approval, requested change, or blocker - reserved; depends on #6 `EvidenceLink` array shape for review-to-AC citations. |
+| `PR` | GitHub pull-request metadata - reserved. As of issue #333 the core PR fields (`head_sha`, `head_ref`, `base_ref`, `merge_commit_sha`, `merged_at`, `draft`) are promoted to first-class flat `Task` fields; a dedicated `PR` record remains reserved only for the residual PR-only surface (requested reviewers, `mergeable_state`, …). |
+| `Review` | Review comment, finding, approval, requested change, or blocker. Shipped in issue #46 (no longer reserved): the GitHub importer emits `project.Review` records for issue comments, PR review summaries, and PR review comments. |
 | `LocalTask` | Named in the PRD as a sibling of `GitHubIssue` - reserved; day-one shape collapses it into `Task` with `source_kind: local_jsonl`. |
 
 ## 7 - Cross-Domain Edge Rows
@@ -148,11 +157,12 @@ project-domain side of the contract, but the registry remains the one from #6.
 
 | Label | FROM domain(s) | TO domain(s) | FROM kind(s) | TO kind(s) | Cardinality | `confidence` required |
 |-------|---------------|-------------|-------------|-----------|-------------|----------------------|
-| `REFERENCES_TASK` | `agent_memory`, `project` *(Review, reserved)* | `project` | `Observation`, `Decision`, `Failure`, `Lesson`; `Review` *(reserved — ships when Review is promoted)* | `Task` | many:many | no |
+| `REFERENCES_TASK` | `agent_memory`, `project` | `project` | `Observation`, `Decision`, `Failure`, `Lesson`; `Review` | `Task` | many:many | no |
 | `CLOSES_ACCEPTANCE_CRITERION` | `project` | `verification` | `AcceptanceCriterion` | `Verification`, `CommandRun`, `TestRun` | many:1 | no |
 | `OWNED_BY_TASK` | `project` | `project` | `AcceptanceCriterion` | `Task` | many:1 | no |
 | `EXTERNAL_HANDLE` | `project` | `project` | `Task`, `AcceptanceCriterion` | `ExternalLink` | many:1 | no |
-| `TOUCHES_FILE` | `project` | `codegraph` | `Task`; `Review` *(reserved — ships when Review is promoted)* | `File` | many:many | no |
+| `TOUCHES_FILE` | `project` | `codegraph` | `Task`; `Review` | `File` | many:many | no |
+| `MERGED_AS` | `project` | `codegraph` | `Task` *(`source_kind: github_pr`)* | `Commit` | many:1 | no |
 | `MENTIONS_SYMBOL` | `project` | `codegraph` | `Task` | `Symbol` | many:many | yes |
 
 `REFERENCES_TASK` is promoted from reserved to defined: #6 already reserved the
@@ -160,7 +170,36 @@ label, and this slice fills in `project.Task` as the target.
 
 The daemon applier synthesizes `OWNED_BY_TASK`, `EXTERNAL_HANDLE`, and
 `CLOSES_ACCEPTANCE_CRITERION` from the denormalized project fields. Directly
-submitted project edges must obey the same FROM/TO kind rules.
+submitted project edges (e.g. the importer's `TOUCHES_FILE` and `MERGED_AS`)
+must obey the same FROM/TO kind rules and MUST carry a project-domain identity —
+a `project:v<schema_version>:` record ID and `schema_version = PROJECT_SCHEMA_VERSION`
+— so the daemon project-edge validator applies to them and `project:v1:` readers
+find them. An edge that names a project-only label but carries a `codegraph:` ID
+serializes under the wrong domain and is skipped by the project-edge validator.
+`MERGED_AS` additionally requires the FROM `Task` to have
+`source_kind = github_pr`: the validator rejects a `MERGED_AS` whose source Task
+is a `github_issue`, `local_jsonl`, or otherwise-typed task (or carries no
+`source_kind`), so a non-PR task can never be persisted as merge evidence.
+
+**Merge-resolution lifecycle (issue #333, Codex round-6).** A PR's merge
+evidence is one of two artifacts: a `MERGED_AS` edge (unique `Commit` match) or a
+`github_commit_unresolved` project `Diagnostic` (zero/ambiguous match). When a
+re-import changes that outcome — the SHA newly resolves, stops resolving,
+resolves to a different `Commit`, or the merged `merge_commit_sha` itself changes
+— the GitHub importer emits a project-domain `Tombstone` naming the prior
+artifact's record ID via `deleted_id` before emitting the new one. In a
+persistent store the tombstone suppresses the superseded artifact from the
+current read view, so exactly one merge artifact per PR is ever live at once; an
+unchanged outcome emits no tombstone. The `github_commit_unresolved` Diagnostic's
+stable ID is **repo-scoped** (Codex round-7): `source_repo` is part of the ID, so
+same-PR-number/same-SHA diagnostics never collide across repositories in a shared
+store. When a resolution **cycles back** to a previously tombstoned outcome
+(resolved-A → unresolved/B → resolved-A) the re-emitted artifact reconstructs the
+same record ID and bytes; the embedded sink then **revives the tombstoned ID** by
+forcing a fresh, tombstone-post-dating observation, so the current read view
+surfaces the re-resolved artifact again. See
+[`import-github.md`](import-github.md) §5–6 for the state tracking and the full
+transition matrix.
 
 ## 8 - Redaction Call-Out
 

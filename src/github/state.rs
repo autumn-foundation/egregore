@@ -10,10 +10,26 @@ use std::{collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::github::model;
+use crate::github::{model, records::CommitIndex};
 
 /// Current idempotency-state schema version.
-pub const STATE_SCHEMA_VERSION: u32 = 1;
+///
+/// Bumped 1 → 2 for issue #333 (Codex P2): the importer began emitting new
+/// first-class flat PR `Task` fields (head/base/merge SHAs and refs), but a
+/// pre-#333 state file's cached `/pulls` `ETag` would return HTTP 304 and skip the
+/// pulls branch, silently suppressing the new contract for unchanged PRs. A
+/// version mismatch discards the stale state (see [`State::load_or_fresh`]),
+/// forcing exactly ONE full refresh that re-emits the promoted fields; the
+/// version-2 state written afterward keeps subsequent unchanged re-imports
+/// idempotent (issue #333 AC8). Bump this whenever the emitted per-resource
+/// contract changes in a way that a cached conditional probe could hide.
+///
+/// NOT bumped for the Codex round-6 `pr_merge_artifacts` field: it is
+/// `#[serde(default)]`, so a version-2 state file loads with an empty map and is
+/// simply treated as "no known prior artifact" (which safely emits no
+/// tombstone). A bump would discard every cached `ETag`/hash and force a heavy
+/// full refetch for zero benefit — the additive field needs no forced refresh.
+pub const STATE_SCHEMA_VERSION: u32 = 2;
 
 /// Per-endpoint update watermarks (inclusive `>=` selection, §5).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -52,6 +68,33 @@ pub struct State {
     /// `"issue:<n>" | "pr:<n>" -> blake3(content hash of key fields)`.
     #[serde(default)]
     pub resource_hashes: BTreeMap<String, String>,
+    /// Maps `"pr:<n>"` to the record ID of the last-emitted `MERGED_AS` artifact
+    /// (the `MERGED_AS` edge ID on a unique resolution, or the
+    /// `github_commit_unresolved` Diagnostic ID otherwise). Issue #333, Codex
+    /// round-6.
+    ///
+    /// The importer is otherwise purely additive: when a PR's merge-resolution
+    /// outcome changes on re-import, the new artifact carries a NEW id and the
+    /// prior artifact would linger live in a persistent store, so stale and
+    /// fresh merge evidence coexist. Persisting the prior artifact's id lets a
+    /// changed re-import retract the superseded record via a `Tombstone`
+    /// (`deleted_id`) before emitting the current one. The full record id (not a
+    /// lossy marker) is stored so a changed `merge_commit_sha` under a
+    /// still-unresolved outcome still retracts the diagnostic keyed on the OLD
+    /// sha. A `#[serde(default)]` empty map means legacy state loads without a
+    /// schema bump (see [`STATE_SCHEMA_VERSION`]): a missing prior is treated as
+    /// "no known artifact", which safely emits no tombstone.
+    #[serde(default)]
+    pub pr_merge_artifacts: BTreeMap<String, String>,
+    /// Fingerprint of the seeded code graph relevant to PR merge-link resolution
+    /// (issue #333, Codex round-5). PR merge-link resolution depends on the local
+    /// seed graph, which GitHub's `/pulls` `ETag` cannot see; this gates the
+    /// `/pulls` conditional request. A pre-fingerprint state file lacks the field
+    /// and deserialises to `None` ("unknown"), which never equals any real
+    /// fingerprint and so forces exactly one full `/pulls` refetch on the first
+    /// upgraded run (fail-safe), after which the real fingerprint is persisted.
+    #[serde(default)]
+    pub code_graph_fingerprint: Option<String>,
 }
 
 impl State {
@@ -68,6 +111,8 @@ impl State {
             last_seen_updated_at: Watermarks::default(),
             label_list_hash: None,
             resource_hashes: BTreeMap::new(),
+            pr_merge_artifacts: BTreeMap::new(),
+            code_graph_fingerprint: None,
         }
     }
 
@@ -120,6 +165,30 @@ impl State {
     pub fn record_hash(&mut self, key: String, hash: String) {
         self.resource_hashes.insert(key, hash);
     }
+
+    /// Returns the record ID of the merge-resolution artifact last emitted for
+    /// `key` (`"pr:<n>"`), or `None` when no artifact is tracked (issue #333,
+    /// Codex round-6).
+    #[must_use]
+    pub fn prior_merge_artifact(&self, key: &str) -> Option<&str> {
+        self.pr_merge_artifacts.get(key).map(String::as_str)
+    }
+
+    /// Records (`Some`) or clears (`None`) the merge-resolution artifact id
+    /// currently emitted for `key` (`"pr:<n>"`). `None` means the PR emits no
+    /// merge artifact (unmerged, no seed match candidate, or empty SHA), so no
+    /// stale record can exist to retract on a later change (issue #333, Codex
+    /// round-6).
+    pub fn set_merge_artifact(&mut self, key: String, artifact_id: Option<String>) {
+        match artifact_id {
+            Some(id) => {
+                self.pr_merge_artifacts.insert(key, id);
+            }
+            None => {
+                self.pr_merge_artifacts.remove(&key);
+            }
+        }
+    }
 }
 
 /// Computes the content hash of an issue's emission-affecting key fields (§5).
@@ -143,8 +212,17 @@ pub fn issue_hash(issue: &model::Issue) -> String {
 }
 
 /// Computes the content hash of a PR's emission-affecting key fields (§5).
+///
+/// `merge_link_marker` is the PR's `MERGED_AS` resolution outcome against the
+/// current seeded code graph (see [`crate::github::records::merge_resolution_marker`]).
+/// It participates in the change hash (issue #333, Codex round-4) because the
+/// merge-link output depends on the seed graph while the PR payload does not: a
+/// seed graph that newly resolves this PR's `merge_commit_sha` must re-emit the
+/// `MERGED_AS` edge even though the payload is unchanged, and an unchanged seed
+/// must stay idempotent (AC8). This affects only change detection — never the
+/// stable record identity ([`crate::ir::project_stable_id`]).
 #[must_use]
-pub fn pull_hash(pr: &model::PullRequest) -> String {
+pub fn pull_hash(pr: &model::PullRequest, merge_link_marker: &str) -> String {
     let key = serde_json::json!({
         "number": pr.number,
         "state": pr.state,
@@ -158,11 +236,17 @@ pub fn pull_hash(pr: &model::PullRequest) -> String {
         "merged_at": pr.merged_at,
         "draft": pr.draft,
         "head_sha": pr.head.as_ref().map(|h| &h.sha),
+        // head_ref is now a first-class flat Task field (#333), so a branch
+        // rename with every other field unchanged must force re-emission.
+        "head_ref": pr.head.as_ref().map(|h| &h.ref_name),
         "base_ref": pr.base.as_ref().map(|b| &b.ref_name),
         // merge_commit_sha is persisted in the task body blob, so it must be in
         // the change hash — GitHub may rewrite it after finalizing a merge while
         // every other field is unchanged.
         "merge_commit_sha": pr.merge_commit_sha,
+        // MERGED_AS resolution outcome against the seeded code graph (#333,
+        // Codex round-4): a changed seed graph re-emits the merge edge.
+        "merge_link": merge_link_marker,
     });
     blake3::hash(serde_json::to_string(&key).unwrap_or_default().as_bytes())
         .to_hex()
@@ -187,6 +271,44 @@ pub fn label_list_hash(labels: &[model::Label]) -> String {
     blake3::hash(rows.join("\n").as_bytes())
         .to_hex()
         .to_string()
+}
+
+/// Computes a stable fingerprint of the seeded code graph relevant to PR
+/// merge-link resolution (issue #333, Codex round-5).
+///
+/// PR `MERGED_AS` resolution matches a PR's `merge_commit_sha` against the
+/// `Commit` nodes captured in `commit_index`, so the fingerprint digests the
+/// full `commit_sha -> [commit_record_id]` mapping (per-SHA record IDs sorted so
+/// an incidental reorder never spuriously flips the fingerprint). GitHub's
+/// `/pulls` `ETag` cannot observe this local seed, so [`run_import`] gates the
+/// `/pulls` conditional request on this value: a changed fingerprint forces a
+/// full 200 refetch that recomputes merge links, while an unchanged fingerprint
+/// keeps the 304 fast path (merge links cannot have changed).
+///
+/// An empty index (no `--code-graph`) is the distinct, stable marker `"none"` so
+/// a none→some, some→different, or some→none transition all register as a
+/// change. Deterministic and byte-identical across runs for a given seed graph.
+///
+/// [`run_import`]: crate::github::import::run_import
+#[must_use]
+pub fn code_graph_fingerprint(commit_index: &CommitIndex) -> String {
+    if commit_index.is_empty() {
+        return "none".to_owned();
+    }
+    let mut hasher = blake3::Hasher::new();
+    // `commit_index` is a `BTreeMap`, so keys iterate in sorted order already.
+    for (sha, ids) in commit_index {
+        let mut ids = ids.clone();
+        ids.sort();
+        hasher.update(sha.as_bytes());
+        hasher.update(&[0]);
+        for id in &ids {
+            hasher.update(id.as_bytes());
+            hasher.update(&[0]);
+        }
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 #[cfg(test)]
@@ -223,9 +345,34 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("egst-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
-        std::fs::write(&path, r#"{"schema_version":2,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0}"#).unwrap();
+        std::fs::write(&path, r#"{"schema_version":99,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0}"#).unwrap();
         let s = State::load_or_fresh(&path, "o/r", "x");
         assert!(s.resource_hashes.is_empty());
+        assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_discards_pre_333_state_format_version() {
+        // A pre-#333 state file carries state-format version 1 with cached ETags
+        // and resource hashes. The upgraded binary (STATE_SCHEMA_VERSION >= 2)
+        // must discard it so the next import re-fetches every endpoint and
+        // re-emits the newly-promoted flat PR Task fields (issue #333, Codex P2).
+        // The literal `1` in the fixture is the pre-#333 state-format version; the
+        // current binary's STATE_SCHEMA_VERSION has moved past it, so it is stale.
+        let dir = std::env::temp_dir().join(format!("egst-pre333-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"etags":{"/repos/o/r/pulls?state=all&per_page=100?page=1":"\"pulls-333\""},"resource_hashes":{"pr:10":"abc"}}"#,
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert!(
+            s.etags.is_empty() && s.resource_hashes.is_empty(),
+            "pre-#333 (version 1) state must be discarded so a forced refresh re-emits the new fields"
+        );
         assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -291,15 +438,140 @@ mod tests {
     }
 
     #[test]
+    fn code_graph_fingerprint_marks_empty_seed_distinctly_and_is_stable() {
+        let empty = CommitIndex::new();
+        assert_eq!(
+            code_graph_fingerprint(&empty),
+            "none",
+            "no seed graph is the distinct stable marker"
+        );
+
+        let mut a = CommitIndex::new();
+        a.insert("sha-aaa".to_owned(), vec!["codegraph:v5:c0".to_owned()]);
+        let fp_a = code_graph_fingerprint(&a);
+        assert_ne!(fp_a, "none", "a seeded graph is not the empty marker");
+        assert_eq!(fp_a, code_graph_fingerprint(&a), "stable across runs");
+
+        // A different SHA set yields a different fingerprint (some→different).
+        let mut b = CommitIndex::new();
+        b.insert("sha-bbb".to_owned(), vec!["codegraph:v5:c0".to_owned()]);
+        assert_ne!(fp_a, code_graph_fingerprint(&b));
+
+        // The SAME SHA resolving to a DIFFERENT record id also changes it, so a
+        // re-resolution is caught and forces a `/pulls` refetch.
+        let mut c = CommitIndex::new();
+        c.insert("sha-aaa".to_owned(), vec!["codegraph:v5:c9".to_owned()]);
+        assert_ne!(fp_a, code_graph_fingerprint(&c));
+    }
+
+    #[test]
+    fn code_graph_fingerprint_ignores_per_sha_id_order() {
+        let mut a = CommitIndex::new();
+        a.insert("sha".to_owned(), vec!["id-b".to_owned(), "id-a".to_owned()]);
+        let mut b = CommitIndex::new();
+        b.insert("sha".to_owned(), vec!["id-a".to_owned(), "id-b".to_owned()]);
+        assert_eq!(
+            code_graph_fingerprint(&a),
+            code_graph_fingerprint(&b),
+            "per-SHA record id ordering must not affect the fingerprint"
+        );
+    }
+
+    #[test]
+    fn legacy_state_without_fingerprint_loads_as_unknown() {
+        // A state file written before the fingerprint field existed (schema
+        // version 2, no `code_graph_fingerprint`) must still load rather than
+        // panic; the missing field deserialises to `None` ("unknown"), which
+        // never equals a real fingerprint and so forces one `/pulls` refetch.
+        let dir = std::env::temp_dir().join(format!("egst-legacy-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"schema_version":{STATE_SCHEMA_VERSION},"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"etags":{{"/repos/o/r/pulls?state=all&per_page=100?page=1":"\"pulls-1\""}},"resource_hashes":{{"pr:1":"abc"}}}}"#
+            ),
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert_eq!(
+            s.code_graph_fingerprint, None,
+            "missing fingerprint loads as unknown (None), forcing a /pulls refetch"
+        );
+        // The rest of the version-matched state is preserved (not discarded).
+        assert!(s.is_unchanged("pr:1", "abc"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_state_without_pr_merge_artifacts_loads_empty() {
+        // A state file written before the round-6 `pr_merge_artifacts` field
+        // existed (current schema version, no such key) must still load rather
+        // than fail; the missing map deserialises to an empty `BTreeMap`, which
+        // reads as "no known prior artifact" and safely emits no tombstone. This
+        // is why the field needed no `STATE_SCHEMA_VERSION` bump.
+        let dir = std::env::temp_dir().join(format!("egst-legacy-pma-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"schema_version":{STATE_SCHEMA_VERSION},"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"resource_hashes":{{"pr:1":"abc"}}}}"#
+            ),
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert!(
+            s.pr_merge_artifacts.is_empty(),
+            "missing pr_merge_artifacts loads as an empty map"
+        );
+        assert_eq!(s.prior_merge_artifact("pr:1"), None);
+        // The rest of the version-matched state is preserved (not discarded).
+        assert!(s.is_unchanged("pr:1", "abc"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_and_read_prior_merge_artifact_roundtrips() {
+        let mut s = State::fresh("o/r", "x");
+        assert_eq!(s.prior_merge_artifact("pr:7"), None);
+        s.set_merge_artifact("pr:7".to_owned(), Some("project:v1:edge-e".to_owned()));
+        assert_eq!(s.prior_merge_artifact("pr:7"), Some("project:v1:edge-e"));
+        // Clearing (None) removes the entry so a later change sees "no prior".
+        s.set_merge_artifact("pr:7".to_owned(), None);
+        assert_eq!(s.prior_merge_artifact("pr:7"), None);
+    }
+
+    #[test]
     fn pull_hash_changes_when_merge_commit_sha_changes() {
         let mut a = pull(1);
         let mut b = pull(1);
         a.merge_commit_sha = Some("aaaa".to_owned());
         b.merge_commit_sha = Some("bbbb".to_owned());
         assert_ne!(
-            pull_hash(&a),
-            pull_hash(&b),
+            pull_hash(&a, "none"),
+            pull_hash(&b, "none"),
             "merge_commit_sha must affect the change hash"
+        );
+    }
+
+    #[test]
+    fn pull_hash_changes_when_merge_link_marker_changes() {
+        // Issue #333, Codex round-4: an unchanged PR payload against a seed graph
+        // that newly resolves its merge_commit_sha must produce a different change
+        // hash so the MERGED_AS edge is re-emitted; an unchanged marker stays
+        // idempotent.
+        let p = pull(1);
+        let unseeded = pull_hash(&p, "none");
+        let resolved = pull_hash(&p, "resolved:codegraph:v5:commit-0");
+        assert_ne!(
+            unseeded, resolved,
+            "a changed merge-link resolution outcome must change the hash"
+        );
+        assert_eq!(
+            resolved,
+            pull_hash(&p, "resolved:codegraph:v5:commit-0"),
+            "an unchanged marker keeps the hash stable (AC8)"
         );
     }
 }

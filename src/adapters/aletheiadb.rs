@@ -1792,7 +1792,14 @@ impl EmbeddedAletheiaSink {
 
     #[allow(clippy::too_many_lines)]
     fn write_node(&mut self, record: &GraphRecord) -> AdapterResult<()> {
-        if self.expected_record_state(record)? == ExpectedRecordState::Matched {
+        // Same revive-after-tombstone guard as `write_edge` (#333 Codex round-7):
+        // a byte-identical node whose stable ID is actively tombstoned must write
+        // a fresh version so the newer NodeId supersedes the tombstone and the
+        // current read view surfaces the node again. Without this, an identical
+        // re-emit would match and short-circuit, leaving the tombstone latest.
+        if self.expected_record_state(record)? == ExpectedRecordState::Matched
+            && !self.active_deleted_ids()?.contains(record.id())
+        {
             #[cfg(feature = "embeddings")]
             self.backfill_embedding_for_matched_node(record)?;
             return Ok(());
@@ -1843,6 +1850,12 @@ impl EmbeddedAletheiaSink {
             parent_task_id,
             ordinal,
             verification_link_id,
+            head_sha,
+            head_ref,
+            base_ref,
+            merge_commit_sha,
+            merged_at,
+            draft,
             system,
             url,
             system_native_id,
@@ -1965,6 +1978,15 @@ impl EmbeddedAletheiaSink {
             "verification_link_id",
             verification_link_id.as_deref(),
         );
+        // GitHub PR-promoted flat Task fields (issue #333). Plaintext substrate.
+        builder = insert_optional(builder, "head_sha", head_sha.as_deref());
+        builder = insert_optional(builder, "head_ref", head_ref.as_deref());
+        builder = insert_optional(builder, "base_ref", base_ref.as_deref());
+        builder = insert_optional(builder, "merge_commit_sha", merge_commit_sha.as_deref());
+        builder = insert_optional(builder, "merged_at", merged_at.as_deref());
+        if let Some(value) = draft {
+            builder = builder.insert("draft", if *value { "true" } else { "false" });
+        }
         builder = insert_optional(builder, "system", system.as_deref());
         builder = insert_optional(builder, "url", url.as_deref());
         builder = insert_optional(builder, "system_native_id", system_native_id.as_deref());
@@ -2320,7 +2342,18 @@ impl EmbeddedAletheiaSink {
     }
 
     fn write_edge(&mut self, record: &GraphRecord) -> AdapterResult<()> {
-        if self.expected_record_state(record)? == ExpectedRecordState::Matched {
+        // A re-emitted edge whose bytes match an existing physical edge is
+        // normally a no-op. But when the edge's stable ID is CURRENTLY actively
+        // tombstoned, that matching physical edge is being SUPPRESSED by the
+        // tombstone; short-circuiting would leave the tombstone the latest event
+        // and keep the edge dead (revive-after-tombstone, #333 Codex round-7; cf.
+        // the #318 stale-tombstone fix). Force a fresh write so the new
+        // observation post-dates the tombstone (higher `egregore_seq`) and the
+        // current read view (`read_all_records`) surfaces the edge again. Mirrors
+        // the `write_tombstone` staleness short-circuit convention.
+        if self.expected_record_state(record)? == ExpectedRecordState::Matched
+            && !self.active_deleted_ids()?.contains(record.id())
+        {
             return Ok(());
         }
 
@@ -2774,6 +2807,23 @@ impl EmbeddedAletheiaSink {
                 "verification_link_id",
                 node.get_property("verification_link_id"),
             )?,
+            // GitHub PR-promoted flat Task fields (issue #333).
+            head_sha: optional_str_property(record_id, "head_sha", node.get_property("head_sha"))?,
+            head_ref: optional_str_property(record_id, "head_ref", node.get_property("head_ref"))?,
+            base_ref: optional_str_property(record_id, "base_ref", node.get_property("base_ref"))?,
+            merge_commit_sha: optional_str_property(
+                record_id,
+                "merge_commit_sha",
+                node.get_property("merge_commit_sha"),
+            )?,
+            merged_at: optional_str_property(
+                record_id,
+                "merged_at",
+                node.get_property("merged_at"),
+            )?,
+            draft: optional_str_property(record_id, "draft", node.get_property("draft"))?
+                .as_deref()
+                .map(|s| s == "true"),
             system: optional_str_property(record_id, "system", node.get_property("system"))?,
             url: optional_str_property(record_id, "url", node.get_property("url"))?,
             system_native_id: optional_str_property(
@@ -3671,6 +3721,7 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "OWNED_BY_TASK" => Ok(EdgeLabel::OwnedByTask),
         "EXTERNAL_HANDLE" => Ok(EdgeLabel::ExternalHandle),
         "TOUCHES_FILE" => Ok(EdgeLabel::TouchesFile),
+        "MERGED_AS" => Ok(EdgeLabel::MergedAs),
         "FAILED_ON" => Ok(EdgeLabel::FailedOn),
         "EXPLAINS_CHANGE" => Ok(EdgeLabel::ExplainsChange),
         "REFERENCES_TASK" => Ok(EdgeLabel::ReferencesTask),
@@ -4367,6 +4418,74 @@ mod tests {
                 && tx_stamps.contains("2026-01-03T00:00:00Z"),
             "both prior and current transaction times must be present, got {tx_stamps:?}"
         );
+    }
+
+    /// Issue #333: the six PR-promoted flat `Task` fields survive an embedded
+    /// write/read round-trip verbatim (draft as bool; the rest as strings).
+    #[test]
+    fn pr_promoted_task_fields_survive_embedded_round_trip() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("pr-fields-store");
+        let mut task = GraphRecord::node(
+            "project:v1:pr-333-task".to_owned(),
+            NodeKind::Task,
+            None,
+            None,
+            Some("Promote PR fields".to_owned()),
+            "github_pr #333".to_owned(),
+        );
+        if let GraphRecord::Node {
+            schema_version,
+            domain,
+            source_kind,
+            head_sha,
+            head_ref,
+            base_ref,
+            merge_commit_sha,
+            merged_at,
+            draft,
+            ..
+        } = &mut task
+        {
+            *schema_version = crate::ir::PROJECT_SCHEMA_VERSION;
+            *domain = Some("project".to_owned());
+            *source_kind = Some("github_pr".to_owned());
+            *head_sha = Some("headsha333".to_owned());
+            *head_ref = Some("feature-333".to_owned());
+            *base_ref = Some("main".to_owned());
+            *merge_commit_sha = Some("mergesha333".to_owned());
+            *merged_at = Some("2026-07-10T00:00:00Z".to_owned());
+            *draft = Some(true);
+        }
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&task).expect("task should write");
+        sink.persist_indexes().expect("indexes should persist");
+        drop(sink);
+
+        let reopened = EmbeddedAletheiaSink::open(&data_dir).expect("store should reopen");
+        let records = reopened.read_all_records().expect("read back");
+        let GraphRecord::Node {
+            head_sha,
+            head_ref,
+            base_ref,
+            merge_commit_sha,
+            merged_at,
+            draft,
+            ..
+        } = records
+            .iter()
+            .find(|r| r.id() == "project:v1:pr-333-task")
+            .expect("PR task read back")
+        else {
+            panic!("read-back record should be a node");
+        };
+        assert_eq!(head_sha.as_deref(), Some("headsha333"));
+        assert_eq!(head_ref.as_deref(), Some("feature-333"));
+        assert_eq!(base_ref.as_deref(), Some("main"));
+        assert_eq!(merge_commit_sha.as_deref(), Some("mergesha333"));
+        assert_eq!(merged_at.as_deref(), Some("2026-07-10T00:00:00Z"));
+        assert_eq!(*draft, Some(true));
     }
 
     #[test]
@@ -5212,6 +5331,94 @@ mod tests {
             has_edge,
             "re-ingested edge must appear in read_all_records when tombstone is superseded"
         );
+    }
+
+    #[test]
+    fn read_all_records_revives_edge_on_identical_reemit_after_tombstone() {
+        // Revive-after-tombstone through the embedded CURRENT read view (#333,
+        // Codex round-7): a merge resolution that cycles resolved-A →
+        // unresolved/B → resolved-A re-emits the SAME edge bytes + stable id as
+        // the first run. Across a PERSISTENT store reopened each phase, the third
+        // (byte-identical) re-emit must revive the tombstoned id — otherwise the
+        // matching physical edge is short-circuited, the tombstone stays latest,
+        // and `read_all_records` keeps suppressing the re-resolved merge link.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("edge-revive-identical-store");
+        let task_id = stable_id(&["node", "task", "pr:7"]);
+        let commit_id = stable_id(&["node", "commit", "sha-a"]);
+        // MERGED_AS edge to commit A. Identical bytes are reconstructed below.
+        let edge = GraphRecord::edge(
+            EdgeLabel::MergedAs,
+            task_id.clone(),
+            commit_id.clone(),
+            Some("1.0".to_owned()),
+            "PR #7 merged as commit sha-a".to_owned(),
+        );
+        let edge_id = edge.id().to_owned();
+        let tombstone_id = stable_id(&["tombstone", &edge_id]);
+
+        // Phase 1: resolved-A — endpoints + live edge E_A.
+        {
+            let mut sink =
+                EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+            sink.write_record(&file_record(&task_id, "task"))
+                .expect("task node should write");
+            sink.write_record(&current_symbol_record(&commit_id, "commit", 10))
+                .expect("commit node should write");
+            sink.write_record(&edge).expect("edge should write");
+        }
+
+        // Phase 2: A → unresolved/B — tombstone E_A. It must now be suppressed.
+        {
+            let mut sink =
+                EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+            sink.write_record(&GraphRecord::Tombstone {
+                id: tombstone_id,
+                schema_version: crate::ir::SCHEMA_VERSION,
+                deleted_id: edge_id.clone(),
+                summary: "merge resolution superseded".to_owned(),
+                producer: None,
+            })
+            .expect("tombstone should write");
+            let records = sink
+                .read_all_records()
+                .expect("read_all_records should succeed");
+            assert!(
+                !records
+                    .iter()
+                    .any(|r| matches!(r, GraphRecord::Edge { id, .. } if id == &edge_id)),
+                "edge must be suppressed while its id is actively tombstoned"
+            );
+        }
+
+        // Phase 3: unresolved/B → resolved-A — re-emit IDENTICAL E_A bytes.
+        {
+            let mut sink =
+                EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+            let reemitted = GraphRecord::edge(
+                EdgeLabel::MergedAs,
+                task_id,
+                commit_id,
+                Some("1.0".to_owned()),
+                "PR #7 merged as commit sha-a".to_owned(),
+            );
+            assert_eq!(
+                reemitted.id(),
+                edge_id,
+                "re-emit must reconstruct the same id"
+            );
+            sink.write_record(&reemitted)
+                .expect("identical edge re-emit should write");
+            let records = sink
+                .read_all_records()
+                .expect("read_all_records should succeed");
+            assert!(
+                records
+                    .iter()
+                    .any(|r| matches!(r, GraphRecord::Edge { id, .. } if id == &edge_id)),
+                "byte-identical re-emit must revive the tombstoned merge edge in the current view"
+            );
+        }
     }
 
     #[test]

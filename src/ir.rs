@@ -878,6 +878,29 @@ pub enum GraphRecord {
         /// Optional verification-domain record that closed an AC.
         #[serde(skip_serializing_if = "Option::is_none")]
         verification_link_id: Option<String>,
+        // ── GitHub PR-promoted fields (issue #333; consumed by #334/#338) ────
+        // Optional first-class flat fields promoted from the redacted body blob
+        // so queries/joins/citations can reach them. Set only on PR-derived
+        // Tasks (`source_kind = github_pr`); absent on issue Tasks. Plaintext
+        // query substrate per `docs/schema/import-github.md` §8; never redacted.
+        /// Head (source-branch) commit SHA of a pull request.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        head_sha: Option<String>,
+        /// Head (source-branch) ref name of a pull request.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        head_ref: Option<String>,
+        /// Base (target-branch) ref name of a pull request.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        base_ref: Option<String>,
+        /// Merge commit SHA of a pull request; `Some` only when merged.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        merge_commit_sha: Option<String>,
+        /// Merge timestamp (recorded string form); `Some` means merged.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        merged_at: Option<String>,
+        /// Draft flag of a pull request.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        draft: Option<bool>,
         /// External system enum value for `ExternalLink`.
         #[serde(skip_serializing_if = "Option::is_none")]
         system: Option<String>,
@@ -1119,6 +1142,7 @@ impl GraphRecord {
 
     /// Creates a graph node record.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub const fn node(
         id: String,
         kind: NodeKind,
@@ -1172,6 +1196,12 @@ impl GraphRecord {
             parent_task_id: None,
             ordinal: None,
             verification_link_id: None,
+            head_sha: None,
+            head_ref: None,
+            base_ref: None,
+            merge_commit_sha: None,
+            merged_at: None,
+            draft: None,
             system: None,
             url: None,
             system_native_id: None,
@@ -1231,6 +1261,7 @@ impl GraphRecord {
 
     /// Creates a syntax-backed node record with language metadata.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn syntax_node(
         id: String,
         kind: NodeKind,
@@ -1285,6 +1316,12 @@ impl GraphRecord {
             parent_task_id: None,
             ordinal: None,
             verification_link_id: None,
+            head_sha: None,
+            head_ref: None,
+            base_ref: None,
+            merge_commit_sha: None,
+            merged_at: None,
+            draft: None,
             system: None,
             url: None,
             system_native_id: None,
@@ -1344,6 +1381,7 @@ impl GraphRecord {
 
     /// Creates a syntax-backed symbol record.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn symbol(
         id: String,
         symbol_kind: &str,
@@ -1397,6 +1435,12 @@ impl GraphRecord {
             parent_task_id: None,
             ordinal: None,
             verification_link_id: None,
+            head_sha: None,
+            head_ref: None,
+            base_ref: None,
+            merge_commit_sha: None,
+            merged_at: None,
+            draft: None,
             system: None,
             url: None,
             system_native_id: None,
@@ -1459,7 +1503,7 @@ impl GraphRecord {
     /// Prefer this over [`Self::symbol`] when the language and source-order
     /// disambiguator are known at construction time.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn syntax_symbol(
         id: String,
         symbol_kind: &str,
@@ -1515,6 +1559,12 @@ impl GraphRecord {
             parent_task_id: None,
             ordinal: None,
             verification_link_id: None,
+            head_sha: None,
+            head_ref: None,
+            base_ref: None,
+            merge_commit_sha: None,
+            merged_at: None,
+            draft: None,
             system: None,
             url: None,
             system_native_id: None,
@@ -1610,6 +1660,38 @@ impl GraphRecord {
         Self::Edge {
             id,
             schema_version: SCHEMA_VERSION,
+            label,
+            source,
+            target,
+            confidence,
+            resolution: None,
+            temporal: None,
+            summary,
+            producer: None,
+        }
+    }
+
+    /// Creates a project-domain graph edge record.
+    ///
+    /// Unlike [`GraphRecord::edge`], which stamps a `codegraph:v{SCHEMA_VERSION}`
+    /// ID and the code-graph schema version, this mints a `project:v1:` ID and
+    /// [`PROJECT_SCHEMA_VERSION`] so the edge serializes under the project domain.
+    /// Project-graph consumers (which filter on the `project:v1:` prefix) and the
+    /// daemon project-edge validator only see edges that carry this identity. The
+    /// ID is derived solely from `(label, source, target)`, matching the daemon's
+    /// synthesized project-edge ID scheme, so it stays byte-identical across runs.
+    #[must_use]
+    pub fn project_edge(
+        label: EdgeLabel,
+        source: String,
+        target: String,
+        confidence: Option<String>,
+        summary: String,
+    ) -> Self {
+        let id = project_stable_id(&["project", "edge", label.as_str(), &source, &target]);
+        Self::Edge {
+            id,
+            schema_version: PROJECT_SCHEMA_VERSION,
             label,
             source,
             target,
@@ -2352,6 +2434,11 @@ pub enum EdgeLabel {
     ExternalHandle,
     /// Project task intends to touch a code-graph file.
     TouchesFile,
+    /// Project PR `Task` was merged as a specific code-graph `Commit`
+    /// (issue #333; consumed by #334/#338). FROM `project.Task` TO
+    /// `codegraph.Commit`; emitted only when a seeded code graph resolves the
+    /// PR's `merge_commit_sha` to exactly one `Commit`.
+    MergedAs,
     /// Agent-memory node describes a failure on a code entity.
     FailedOn,
     /// Agent-memory node explains a code change.
@@ -2408,6 +2495,7 @@ impl EdgeLabel {
             "OWNED_BY_TASK" => Some(Self::OwnedByTask),
             "EXTERNAL_HANDLE" => Some(Self::ExternalHandle),
             "TOUCHES_FILE" => Some(Self::TouchesFile),
+            "MERGED_AS" => Some(Self::MergedAs),
             "FAILED_ON" => Some(Self::FailedOn),
             "EXPLAINS_CHANGE" => Some(Self::ExplainsChange),
             "REFERENCES_TASK" => Some(Self::ReferencesTask),
@@ -2443,6 +2531,7 @@ impl EdgeLabel {
                 | Self::OwnedByTask
                 | Self::ExternalHandle
                 | Self::TouchesFile
+                | Self::MergedAs
                 | Self::FailedOn
                 | Self::ExplainsChange
                 | Self::ReferencesTask
@@ -2506,6 +2595,7 @@ impl EdgeLabel {
             Self::OwnedByTask => "OWNED_BY_TASK",
             Self::ExternalHandle => "EXTERNAL_HANDLE",
             Self::TouchesFile => "TOUCHES_FILE",
+            Self::MergedAs => "MERGED_AS",
             Self::FailedOn => "FAILED_ON",
             Self::ExplainsChange => "EXPLAINS_CHANGE",
             Self::ReferencesTask => "REFERENCES_TASK",

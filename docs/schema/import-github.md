@@ -201,7 +201,8 @@ Schema (one JSON object per `<owner>/<repo>`, abbreviated type notation):
     pulls: RFC3339
   },
   label_list_hash: String | null,
-  resource_hashes: { "<issue|pr>:<n>": "<hash>" }
+  resource_hashes: { "<issue|pr>:<n>": "<hash>" },
+  code_graph_fingerprint: String | null
 }
 ```
 
@@ -225,12 +226,69 @@ state. `resource_hashes` provides that storage: it maps `"issue:<n>"` or
 (**all fields that can affect the emitted `Task` or `ExternalLink`:**
 `number`, `state`, `state_reason`, `title`, `body`, `labels`, `assignees`,
 `milestone` (full object), `updated_at`, `closed_at`, and PR-specific fields
-`merged_at`, `draft`, `head.sha`, `base.ref`; omitting any of these fields
-from the hash means a change to that field is permanently missed on re-import).
+`merged_at`, `draft`, `head.sha`, `head.ref`, `base.ref`, `merge_commit_sha`;
+omitting any of these fields from the hash means a change to that field is
+permanently missed on re-import). For a PR the hash **also** folds in the
+`MERGED_AS` merge-link **resolution outcome** against the current seeded
+`--code-graph` (issue #333): the target `Commit` record ID when the
+`merge_commit_sha` resolves, or a stable `unresolved` / `ambiguous:<count>` /
+`none` marker otherwise. The merge-link output depends on the seed graph while
+the PR payload does not, so a re-import whose seed graph now contains (or no
+longer contains) the merge commit changes this outcome, changes the hash, and
+re-emits the PR **with** its `MERGED_AS` edge/diagnostic — even though the PR
+payload is byte-identical. An unchanged seed graph produces the same marker and
+stays idempotent (AC8). This participates in change detection only; it never
+affects the stable record identity.
 On re-import, a resource selected by the `>= last_seen_updated_at` watermark is
 compared against its stored hash; if identical, no new record is emitted and the
 hash entry is left unchanged. If different, a new record is emitted and the hash
 entry is updated. An absent entry is treated as "never imported" — always emit.
+
+**Seed-graph fingerprint gate on the `/pulls` conditional request (`code_graph_fingerprint`, issue #333):**
+The merge-link resolution outcome folded into the PR hash (above) can only be
+recomputed when the pulls list is actually re-processed. But `/pulls` is a
+conditional endpoint: when its cached ETag matches, GitHub replies `304 Not
+Modified` and PR processing short-circuits **before** the merge-link marker is
+ever computed. GitHub's `/pulls` ETag reflects only the remote PR payload — it
+cannot see the local `--code-graph` seed on which merge-link resolution depends.
+So a `/pulls` ETag is only trustworthy when the seed graph is **also** unchanged.
+The importer therefore persists a `code_graph_fingerprint`: a deterministic,
+byte-identical BLAKE3 digest over the sorted `commit_sha → [Commit record id]`
+mapping of the seeded code graph, or the distinct stable marker `"none"` when no
+`--code-graph` is supplied. Before issuing the conditional `/pulls` request, the
+importer compares the current fingerprint against the stored one; if they differ
+— including `none → some`, `some → different`, `some → none`, and a missing
+(pre-fingerprint) stored value treated as "unknown" — it **suppresses the
+`If-None-Match` for `/pulls` only**, so GitHub returns a full `200` payload,
+`/pulls` is re-processed, and the merge-link marker (and any `MERGED_AS`
+edge/`github_commit_unresolved` diagnostic) is recomputed. Composed with the
+round-4 hash marker, an actually-changed merge link is re-emitted while an
+unchanged one stays idempotent (zero records). When the fingerprint **matches**,
+the `/pulls` ETag fast path is kept (a `304` is allowed) because merge links
+cannot have changed. Only `/pulls` is affected — `MERGED_AS` lives solely on PR
+tasks — so issues, labels, comments, and reviews keep their own conditional fast
+path. After every successful run the current fingerprint is persisted, so the
+next unchanged-seed re-import takes the `304` fast path again. The fingerprint
+participates in conditional-request gating only; it never affects stable record
+identity, and it is **not** part of a `STATE_SCHEMA_VERSION` bump — a
+pre-fingerprint state file loads normally with `code_graph_fingerprint = null`,
+which reads as "unknown" and forces exactly one fail-safe `/pulls` refetch before
+the real fingerprint is stored.
+
+**Prior merge-artifact tracking (`pr_merge_artifacts`, issue #333, Codex
+round-6):** the state file also maps `"pr:<n>"` to the **record ID** of the
+last-emitted `MERGED_AS` artifact (the merge edge ID on a unique resolution, or
+the `github_commit_unresolved` diagnostic ID otherwise; absent when the PR emits
+no merge artifact). On a re-import whose merge-resolution outcome **changed**, the
+importer emits a `Tombstone` retracting this prior artifact before emitting the
+current one (see §6, "Superseded merge-resolution retraction"), so a persistent
+store never shows stale + fresh merge evidence for one PR. The full record ID
+(not a lossy marker) is stored so a changed `merge_commit_sha` under a
+still-unresolved outcome still retracts the diagnostic keyed on the old SHA. The
+field is `#[serde(default)]` and is **not** part of a `STATE_SCHEMA_VERSION` bump:
+a state file written before it loads normally with an empty map (an absent prior
+reads as "no known artifact" and emits no tombstone), avoiding a heavy full
+refetch that a version bump would force.
 
 **Deferred endpoint ETag rule:** The v1 importer MUST NOT store ETags for
 deferred comment/review endpoints (`/issues/comments`, `/pulls/comments`,
@@ -275,6 +333,18 @@ the state file. A partial state file from a crashed previous run is detected
 via `schema_version` field validation; an invalid or truncated file is treated
 as a missing state file.
 
+**State-format version (`STATE_SCHEMA_VERSION`, issue #333):** the state file
+carries its own format version, bumped `1 → 2` when the emitted per-resource
+contract changes in a way a cached conditional probe could otherwise hide. A
+loaded state whose version does not match the current binary is discarded (same
+path as a missing/partial file), so upgrading forces exactly ONE full refresh
+that re-fetches every endpoint and re-emits the current contract — this is what
+lets the #333 promoted flat PR `Task` fields reach existing importer users whose
+pre-#333 `/pulls` ETag would otherwise return HTTP 304 and skip the pulls branch.
+The refresh writes a current-version state, so a subsequent unchanged re-import
+is idempotent again (emits zero per-resource records). This is strictly a
+state-cache migration; it never backfills already-persisted AletheiaDB stores.
+
 ---
 
 ## 6 - GitHub-to-Record-Shape Mapping
@@ -315,7 +385,7 @@ follow-up slice that promotes them from reserved.
 | GitHub Resource | v1 Emission |
 |-----------------|------------|
 | Issue | `Task + ExternalLink` only (`source_kind: github_issue`). GitHub-only metadata (`state_reason`, `milestone`, etc.) stored in `Task.body_handle` for round-trip fidelity; `GitHubIssue` deferred. `Task.priority` defaults to `unknown` (GitHub issues have no native priority field; a future label-mapping rule may override this). |
-| Pull Request | `Task + ExternalLink` only (`source_kind: github_pr`). PR-specific fields deferred to `PR` record promotion. `Task.priority` defaults to `unknown`. |
+| Pull Request | `Task + ExternalLink` (`source_kind: github_pr`). Six PR-specific fields are promoted to first-class **optional flat `Task` fields** (issue #333): `head_sha`, `head_ref`, `base_ref`, `merge_commit_sha`, `merged_at`, `draft`. Present only on PR-derived Tasks; issue Tasks omit them (serde-skipped). They are additive plaintext query substrate (see §8) and continue to also appear inside `Task.body_handle` for round-trip fidelity, so pre-#333 body-blob readers are unaffected. The `merge_commit_sha` flat field is populated only for actually-merged PRs (`merged_at` present); an unmerged PR never carries it even when the REST payload supplied a temporary test-merge SHA. A merged PR whose `merge_commit_sha` resolves against a seeded `--code-graph` `Commit` also emits a `MERGED_AS` `Task → Commit` edge (resolve-or-diagnose, below). Remaining PR-only fields (requested reviewers, `mergeable_state`, …) stay deferred to `PR` record promotion. `Task.priority` defaults to `unknown`. Downstream consumers: issues #334 (compliance/evidence surfaces) and #338 build directly on this exact field schema. |
 | Issue Comment | **Deferred.** Comment endpoints are still fetched and ETag-cached; records emitted when `Review` is promoted. |
 | PR Review | **Deferred.** Same rationale as issue comments. |
 | PR Review Comment | **Deferred.** Same rationale. `REFERENCES_TASK` from `project.Review` and `TOUCHED_FILE` from `project.Review` must also be registered in `project-graph.md` before emission. |
@@ -325,6 +395,74 @@ edge registrations must be added to the cross-domain edge table in
 [`docs/schema/project-graph.md`](project-graph.md):
 - `REFERENCES_TASK` from `project.Review` TO `project.Task` (extends the existing registration to add `project.Review` alongside the `agent_memory` FROM kinds)
 - `TOUCHES_FILE` from `project.Review` TO `codegraph.File` (extends the existing registration to add `project.Review` alongside the `project.Task` FROM kind)
+
+**`MERGED_AS` edge (issue #333):** A PR `Task` whose promoted `merge_commit_sha`
+resolves against a seeded `--code-graph` is linked to the merge commit it landed
+as.
+
+| Label | FROM | TO | Meaning |
+|-------|------|----|---------|
+| `MERGED_AS` | `project.Task` (`source_kind: github_pr`) | `codegraph.Commit` | The PR was merged as this specific commit. |
+
+Resolution is **resolve-or-diagnose** (mirroring the `TOUCHES_FILE` discipline):
+the flat `merge_commit_sha` field and the `MERGED_AS` edge/diagnostic are emitted
+**only for actually-merged PRs** (`merged_at` present). For a
+mergeable-but-unmerged PR (open, or closed-unmerged) GitHub's REST API can
+populate `merge_commit_sha` with a *temporary test-merge* commit rather than a
+landed merge commit; that SHA is never merge evidence, so an unmerged PR carries
+no flat `merge_commit_sha` field and produces neither a `MERGED_AS` edge nor a
+`github_commit_unresolved` diagnostic — even when the seeded `--code-graph`
+contains a `Commit` with that exact SHA. For a merged PR,
+a `merge_commit_sha` matching **exactly one** `Commit` (whose `name` equals the
+SHA) emits one `MERGED_AS` edge; **zero or multiple** matches emit a project
+`Diagnostic` node with code `github_commit_unresolved` carrying the SHA and the
+Task record ID — never a guessed link. This diagnostic's stable ID is
+**repo-scoped** (issue #333, Codex round-7): `source_repo` is part of the ID
+composition, exactly like the Task/Review/ExternalLink IDs, so a shared
+multi-repo store never collides diagnostics for the same PR number + merge SHA
+across repositories (one repo's import could otherwise overwrite or tombstone
+another repo's merge evidence). A merged PR with no `merge_commit_sha`
+emits neither edge nor diagnostic. Without a seeded
+`--code-graph`, no `MERGED_AS` edges and no unresolved diagnostics are produced.
+`MERGED_AS` is a project-only, evidence-class edge label: it is rejected on
+`agent_memory:v1:` edges, exactly like `TOUCHES_FILE` and `EXTERNAL_HANDLE`. The
+edge itself is a **project-domain edge**: its own record ID carries the
+`project:v1:` prefix and `PROJECT_SCHEMA_VERSION`, so the daemon project-edge
+validator sees it and `project:v1:` consumers find the link (its `Commit` *target*
+stays a `codegraph:` node). Only the `(Task, Commit, MERGED_AS)` triple
+identifies the edge — the promoted flat PR fields never enter its stable ID, so
+output stays byte-identical across runs.
+
+**Superseded merge-resolution retraction (issue #333, Codex round-6):** the
+importer is otherwise purely additive, so when a PR's merge-resolution **outcome
+changes** on a re-import — the SHA newly resolves, stops resolving, resolves to a
+different `Commit`, or the merged `merge_commit_sha` itself changes — the *new*
+artifact carries a *new* record ID and, without retraction, the *prior* artifact
+(edge or diagnostic) would linger live in a persistent store, so both stale and
+fresh merge evidence would coexist for one PR. To prevent that, the importer
+persists the last-emitted merge artifact's record ID per PR (`pr_merge_artifacts`
+in the state file) and, when the current outcome differs, emits a project-domain
+`Tombstone` naming the prior artifact via `deleted_id` **before** emitting the
+current outcome. In a persistent embedded store the tombstone suppresses the
+superseded record from the current read view (a later write's higher sequence
+wins), so the current view shows only the fresh outcome. Handled transitions
+include resolved-A → resolved-B, resolved → unresolved, unresolved → resolved,
+unresolved ↔ ambiguous, and a changed merged `merge_commit_sha` under a
+still-unresolved outcome (the diagnostic keyed on the old SHA is retracted). When
+the outcome is **unchanged** the change hash is unchanged, the PR is skipped, and
+no tombstone is emitted (AC8 idempotency preserved). The tombstone's own ID is
+derived deterministically from `(pr, deleted_id)`, so output stays byte-identical
+across runs. When a resolution **cycles back** to a previously resolved-and-then-
+tombstoned outcome (resolved-A → unresolved/B → resolved-A), the re-emitted
+artifact reconstructs the *same* record ID and bytes as the first run; the
+embedded sink therefore **revives the tombstoned ID** by forcing a fresh
+observation whenever a re-emitted record's stable ID is actively tombstoned
+(issue #333, Codex round-7), so the newer sequence post-dates the tombstone and
+the current read view surfaces the re-resolved merge link again rather than
+leaving it suppressed. The full prior record ID (not a lossy marker) is persisted so the
+old-SHA diagnostic case retracts correctly; the `pr_merge_artifacts` field is
+`#[serde(default)]`, so legacy state files load without a state-schema bump (an
+absent prior is treated as "no known artifact" and emits no tombstone).
 
 **`valid_time_source`:** All GitHub-sourced records use `github_updated_at`.
 **`source_kind`:** Issues use `github_issue`; PRs use `github_pr`.
@@ -376,6 +514,16 @@ These GitHub fields pass through the redaction pipeline defined in
 
 Repo name, issue/PR number, state, author login, `created_at`, `updated_at`,
 `closed_at`, merge commit SHA, head/base branch names.
+
+**First-class plaintext PR `Task` fields (issue #333):** The six promoted flat
+`Task` fields — `head_sha`, `head_ref`, `base_ref`, `merge_commit_sha`,
+`merged_at`, and `draft` — are permitted plaintext query substrate and are
+**deliberately NOT routed through the redaction pipeline**. They are not listed
+in the sensitive-field index (`docs/schema/redaction.md`) and therefore pass the
+redaction gate unchanged: a commit SHA, branch name, merge timestamp, or draft
+flag is non-secret structural metadata that must remain joinable and citable.
+They survive verbatim in a redaction-on export. Downstream consumers #334
+(compliance/evidence) and #338 rely on this plaintext guarantee.
 
 **Redacted body-stored metadata:** Milestone title (`Task.body_handle` field) is
 NOT in the plaintext carve-out. `Task.body_handle.inline` is a redactable field

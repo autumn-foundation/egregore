@@ -21,7 +21,7 @@ use crate::{
         client::{Client, FetchOutcome},
         error::{GithubError, GithubResult},
         model,
-        records::{self, Context, Emitted, FileIndex},
+        records::{self, CommitIndex, Context, Emitted, FileIndex},
         state::{self, State},
     },
     ir::{Graph, GraphRecord, NodeKind, PROJECT_SCHEMA_VERSION, project_stable_id},
@@ -94,16 +94,32 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     // Repo probe (auth state machine). Failures here may suppress state writes.
     client.probe_repo(opts.source_repo)?;
 
-    let file_index = load_file_index(opts.code_graph)?;
+    let (file_index, commit_index) = load_indexes(opts.code_graph)?;
     let mut state = prior_state;
     let mut graph = Graph::new();
     let mut emitted_count = 0usize;
+
+    // Seed-graph fingerprint gating for the `/pulls` conditional request (#333,
+    // Codex round-5). PR merge-link resolution depends on the local seed graph,
+    // which GitHub's `/pulls` `ETag` cannot see, so a cached `ETag` can return 304
+    // and short-circuit PR processing before the round-4 `pull_hash` marker ever
+    // runs. When the current fingerprint differs from the stored one (including a
+    // `None`/"unknown" stored value from a pre-fingerprint state file, and every
+    // none→some / some→different / some→none transition), the `/pulls` `ETag` is
+    // suppressed below so GitHub returns a full 200 and merge links recompute; an
+    // unchanged fingerprint keeps the 304 fast path. Only `/pulls` is affected —
+    // MERGED_AS lives only on PR tasks — so issues/reviews/other endpoints keep
+    // their conditional fast path.
+    let code_graph_fingerprint = state::code_graph_fingerprint(&commit_index);
+    let seed_graph_changed =
+        state.code_graph_fingerprint.as_deref() != Some(code_graph_fingerprint.as_str());
 
     let ctx = Context {
         source_repo: opts.source_repo,
         transaction_time: &transaction_time,
         redact: &redact_value,
         file_index: &file_index,
+        commit_index: &commit_index,
     };
 
     // ── Issues (Task + ExternalLink) ────────────────────────────────────────────
@@ -141,8 +157,18 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     let pulls_path = format!("/repos/{}/pulls?state=all&per_page=100", opts.source_repo);
     let mut changed_pr_numbers: Vec<u64> = Vec::new();
     let mut pulls_changed = false;
+    // A changed seed graph suppresses the `/pulls` conditional `ETag` so GitHub
+    // returns a full 200 and merge links are recomputed even when the PR payload
+    // is byte-identical. An unchanged seed keeps every stored page `ETag` (304
+    // fast path). Only the `/pulls` page `ETags` are dropped; all other endpoints
+    // continue to use `state.etags`.
+    let pulls_prior_etags = if seed_graph_changed {
+        etags_without_prefix(&state.etags, &format!("{pulls_path}?page="))
+    } else {
+        state.etags.clone()
+    };
     if let FetchOutcome::Modified { items, etags } =
-        client.fetch_paginated("pulls", &pulls_path, &state.etags)?
+        client.fetch_paginated("pulls", &pulls_path, &pulls_prior_etags)?
     {
         pulls_changed = true;
         state.etags.extend(etags);
@@ -154,11 +180,47 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             advance_watermark(&mut watermark, &pr.updated_at);
             changed_pr_numbers.push(pr.number);
             let key = format!("pr:{}", pr.number);
-            let hash = state::pull_hash(&pr);
+            // The MERGED_AS resolution outcome against the seeded code graph
+            // participates in the change hash (#333, Codex round-4): a changed
+            // seed graph that now resolves this PR's merge_commit_sha must
+            // re-emit the merge edge even though the PR payload is unchanged.
+            let merge_marker = records::merge_resolution_marker(ctx.commit_index, &pr);
+            let hash = state::pull_hash(&pr, &merge_marker);
+            // The record id of the merge artifact this run would emit (edge,
+            // diagnostic, or none). Since the marker is folded into `hash`, an
+            // unchanged hash guarantees an unchanged artifact id, so tombstoning
+            // is only ever needed on the reprocess path below (#333, round-6).
+            let current_artifact =
+                records::merge_artifact_id(ctx.commit_index, opts.source_repo, &pr);
             if state.is_unchanged(&key, &hash) {
+                // Backfill the tracked artifact id without emitting anything: a
+                // no-op on a store this build already wrote, but it populates a
+                // pre-round-6 (or legacy) store so a LATER outcome change can
+                // still retract this artifact. Safe because the unchanged hash
+                // proves `current_artifact` equals what was emitted before.
+                state.set_merge_artifact(key, current_artifact);
                 continue;
             }
-            state.record_hash(key, hash);
+            // Retract a superseded merge artifact whose outcome changed on this
+            // re-import (#333, Codex round-6): the importer is otherwise purely
+            // additive, so without this the prior edge/diagnostic would linger
+            // live alongside the new one in a persistent store. Emit the
+            // tombstone (keyed on the prior record's id) before the fresh
+            // outcome; `graph.to_jsonl` sorts, so relative order is immaterial.
+            if let Some(prior) = state.prior_merge_artifact(&key).map(str::to_owned)
+                && Some(prior.as_str()) != current_artifact.as_deref()
+            {
+                push_emitted(
+                    &mut graph,
+                    &mut emitted_count,
+                    Emitted {
+                        records: vec![records::merge_artifact_tombstone(pr.number, &prior)],
+                        link_diagnostics: 0,
+                    },
+                );
+            }
+            state.record_hash(key.clone(), hash);
+            state.set_merge_artifact(key, current_artifact);
             push_emitted(
                 &mut graph,
                 &mut emitted_count,
@@ -274,6 +336,9 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     state.last_run_at_unix_ms = now_unix_ms();
     state.api_base_url.clone_from(&opts.api_base);
     opts.source_repo.clone_into(&mut state.source_repo);
+    // Persist the current seed-graph fingerprint so the next unchanged-seed run
+    // takes the `/pulls` 304 fast path again (#333, Codex round-5).
+    state.code_graph_fingerprint = Some(code_graph_fingerprint);
 
     let jsonl = graph.to_jsonl().map_err(|e| GithubError::Io {
         detail: format!("serialize handoff: {e}"),
@@ -340,10 +405,18 @@ fn handoff_record(source_repo: &str, transaction_time: &str, emitted: usize) -> 
     rec
 }
 
-/// Loads a `repo_relative_path -> [file_id]` index from a code-graph JSONL.
-fn load_file_index(code_graph: Option<&Path>) -> GithubResult<FileIndex> {
+/// Loads both the `repo_relative_path -> [file_id]` and `commit_sha ->
+/// [commit_id]` indexes from a code-graph JSONL in a single read + parse pass.
+///
+/// A `File` node carries its path in `repo_relative_path`; a `Commit` node
+/// carries its SHA in the `name` field (see `commit_record` in `history.rs`).
+/// A SHA claimed by more than one `Commit` record is ambiguous and is diagnosed
+/// rather than linked by [`records::pull_records`] (#333).
+fn load_indexes(code_graph: Option<&Path>) -> GithubResult<(FileIndex, CommitIndex)> {
+    let mut files = FileIndex::new();
+    let mut commits = CommitIndex::new();
     let Some(path) = code_graph else {
-        return Ok(FileIndex::new());
+        return Ok((files, commits));
     };
     let jsonl = std::fs::read_to_string(path).map_err(|e| GithubError::Io {
         detail: format!("read code-graph {}: {e}", path.display()),
@@ -351,19 +424,24 @@ fn load_file_index(code_graph: Option<&Path>) -> GithubResult<FileIndex> {
     let records = records_from_jsonl(&jsonl).map_err(|e| GithubError::Io {
         detail: format!("parse code-graph: {e}"),
     })?;
-    let mut index = FileIndex::new();
     for rec in &records {
-        if let GraphRecord::Node {
-            id,
-            kind: NodeKind::File,
-            repo_relative_path: Some(p),
-            ..
-        } = rec
-        {
-            index.entry(p.clone()).or_default().push(id.clone());
+        match rec {
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::File,
+                repo_relative_path: Some(p),
+                ..
+            } => files.entry(p.clone()).or_default().push(id.clone()),
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::Commit,
+                name: Some(sha),
+                ..
+            } => commits.entry(sha.clone()).or_default().push(id.clone()),
+            _ => {}
         }
     }
-    Ok(index)
+    Ok((files, commits))
 }
 
 /// Advances `watermark` to `candidate` when it is lexically greater (RFC 3339
@@ -376,6 +454,22 @@ fn advance_watermark(watermark: &mut Option<String>, candidate: &str) {
         Some(w) if w.as_str() >= candidate => {}
         _ => *watermark = Some(candidate.to_owned()),
     }
+}
+
+/// Returns a copy of `etags` with every key beginning `prefix` removed.
+///
+/// Used to suppress the `/pulls` per-page conditional `ETags` when the seed graph
+/// changed (#333, Codex round-5), forcing a full 200 refetch of that endpoint
+/// while leaving every other endpoint's stored `ETags` intact.
+fn etags_without_prefix(
+    etags: &std::collections::BTreeMap<String, String>,
+    prefix: &str,
+) -> std::collections::BTreeMap<String, String> {
+    etags
+        .iter()
+        .filter(|(k, _)| !k.starts_with(prefix))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// BLAKE3 hex of the canonical JSON of a value (change-detection for reviews).

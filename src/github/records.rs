@@ -39,6 +39,12 @@ const INLINE_CEILING: usize = 16 * 1024;
 /// claim it. A path with more than one ID is ambiguous and is not linked.
 pub type FileIndex = BTreeMap<String, Vec<String>>;
 
+/// Index from commit SHA to the code-graph `Commit` record IDs that carry it.
+///
+/// Issue #333. A SHA with zero or more than one match is unresolved and is
+/// diagnosed rather than linked (`MERGED_AS` resolve-or-diagnose discipline).
+pub type CommitIndex = BTreeMap<String, Vec<String>>;
+
 /// A redaction closure applied to free-text before persistence.
 pub type Redact<'a> = dyn Fn(&str) -> String + 'a;
 
@@ -53,6 +59,9 @@ pub struct Context<'a> {
     /// Code-graph file index for `TOUCHES_FILE` resolution; empty when no
     /// seeded store was provided.
     pub file_index: &'a FileIndex,
+    /// Code-graph commit index for `MERGED_AS` resolution (issue #333); empty
+    /// when no seeded store was provided.
+    pub commit_index: &'a CommitIndex,
 }
 
 /// Records and diagnostics emitted for one or more GitHub resources.
@@ -187,6 +196,29 @@ fn body_blob(
 
 // ── Issue / PR → Task + ExternalLink ───────────────────────────────────────────
 
+/// GitHub PR fields promoted to first-class flat `Task` fields (issue #333).
+///
+/// Set only on the PR path; issue Tasks pass `None` so serde skips them. These
+/// are plaintext query substrate per `docs/schema/import-github.md` §8 and are
+/// never routed through redaction. They duplicate (rather than replace) the
+/// values still carried in the redacted `body_handle` blob, so existing readers
+/// are unaffected.
+#[derive(Debug, Clone, Default)]
+pub struct PrTaskFields {
+    /// Head (source-branch) commit SHA.
+    pub head_sha: Option<String>,
+    /// Head (source-branch) ref name.
+    pub head_ref: Option<String>,
+    /// Base (target-branch) ref name.
+    pub base_ref: Option<String>,
+    /// Merge commit SHA; `Some` only when merged.
+    pub merge_commit_sha: Option<String>,
+    /// Merge timestamp string; `Some` means merged.
+    pub merged_at: Option<String>,
+    /// Draft flag.
+    pub draft: Option<bool>,
+}
+
 /// Emits the `Task`, `ExternalLink`, and `EXTERNAL_HANDLE` edge for one issue.
 #[must_use]
 pub fn issue_records(ctx: &Context<'_>, issue: &model::Issue) -> Emitted {
@@ -218,15 +250,38 @@ pub fn issue_records(ctx: &Context<'_>, issue: &model::Issue) -> Emitted {
             None,
             issue.closed_at.as_deref(),
         ),
+        None,
     )
 }
 
 /// Emits the `Task`, `ExternalLink`, and `EXTERNAL_HANDLE` edge for one PR.
+///
+/// For an actually-merged PR (`merged_at` present) also emits a `MERGED_AS` edge
+/// (or `github_commit_unresolved` diagnostic) when the PR's `merge_commit_sha`
+/// resolves against a seeded code graph (issue #333). An unmerged PR's
+/// test-merge SHA is never merge evidence: no flat field, edge, or diagnostic.
 #[must_use]
 pub fn pull_records(ctx: &Context<'_>, pr: &model::PullRequest) -> Emitted {
     let number = pr.number;
     let native = format!("pr:{number}");
-    task_and_link(
+    // `merge_commit_sha` is merge evidence only when the PR actually merged
+    // (#333, Codex P2). For a mergeable-but-unmerged PR (open, or closed
+    // unmerged) GitHub's REST API can populate `merge_commit_sha` with a
+    // TEMPORARY TEST-MERGE commit rather than a landed merge commit; treating
+    // that as evidence would corrupt the merge surface. Gate on `merged_at`.
+    let is_merged = pr.merged_at.is_some();
+    // Promote the PR-only fields to first-class flat Task fields (#333). These
+    // duplicate the values still carried in `body_blob`, which is left
+    // unchanged so existing body-blob readers are unaffected (AC3).
+    let pr_fields = PrTaskFields {
+        head_sha: pr.head.as_ref().map(|h| h.sha.clone()),
+        head_ref: pr.head.as_ref().map(|h| h.ref_name.clone()),
+        base_ref: pr.base.as_ref().map(|b| b.ref_name.clone()),
+        merge_commit_sha: is_merged.then(|| pr.merge_commit_sha.clone()).flatten(),
+        merged_at: pr.merged_at.clone(),
+        draft: Some(pr.draft),
+    };
+    let mut emitted = task_and_link(
         ctx,
         NodeKind::Task,
         SOURCE_KIND_PR,
@@ -252,7 +307,244 @@ pub fn pull_records(ctx: &Context<'_>, pr: &model::PullRequest) -> Emitted {
             pr.merge_commit_sha.as_deref(),
             pr.closed_at.as_deref(),
         ),
-    )
+        Some(pr_fields),
+    );
+
+    // MERGED_AS resolve-or-diagnose against the seeded code graph (#333). Only
+    // an actually-merged PR carries a landed merge commit; an unmerged PR's
+    // test-merge SHA is never merge evidence, so it emits neither edge nor
+    // diagnostic regardless of the seeded graph (Codex P2).
+    if let Some(sha) = pr
+        .merge_commit_sha
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .filter(|_| is_merged)
+    {
+        let task_id = task_id_for(ctx, "pr", number);
+        if let Some(extra) = resolve_merge_commit(ctx, &task_id, number, sha) {
+            emitted.records.push(extra.0);
+            if extra.1 {
+                emitted.link_diagnostics += 1;
+            }
+        }
+    }
+    emitted
+}
+
+/// A stable marker capturing a PR's `MERGED_AS` resolution outcome against the
+/// current commit index, for the PR change-detection hash (issue #333, Codex
+/// round-4).
+///
+/// The merge-link output depends on `ctx.commit_index`, but the PR idempotency
+/// key did not, so an unchanged PR payload against a newly-seeded code graph was
+/// wrongly suppressed by the `state.is_unchanged("pr:<n>", ...)` gate and the
+/// `MERGED_AS` edge never appeared. Folding this marker into `pull_hash` fixes
+/// that: the marker changes exactly when the emitted `MERGED_AS` edge/diagnostic
+/// outcome changes, so a seed graph that newly resolves (or stops resolving) a
+/// merge SHA re-emits the edge, while an unchanged seed keeps re-imports
+/// idempotent (AC8).
+///
+/// Mirrors [`pull_records`]/[`resolve_merge_commit`] exactly: only an
+/// actually-merged PR (`merged_at` present) with a non-empty `merge_commit_sha`
+/// against a non-empty seed graph produces an edge/diagnostic. Every other case
+/// (unmerged, no/empty SHA, or no seeded graph) is the stable `"none"` marker —
+/// no edge, no diagnostic. Resolved links carry the target `Commit` record ID so
+/// re-resolving the SAME SHA to a DIFFERENT commit also re-emits.
+#[must_use]
+pub fn merge_resolution_marker(commit_index: &CommitIndex, pr: &model::PullRequest) -> String {
+    let Some(sha) = pr
+        .merge_commit_sha
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .filter(|_| pr.merged_at.is_some())
+    else {
+        return "none".to_owned();
+    };
+    if commit_index.is_empty() {
+        return "none".to_owned();
+    }
+    match commit_index.get(sha).map(Vec::as_slice) {
+        Some([commit_id]) => format!("resolved:{commit_id}"),
+        Some(ids) if ids.len() > 1 => format!("ambiguous:{}", ids.len()),
+        // None or empty slice → unresolved (no matching Commit in the seed).
+        _ => "unresolved".to_owned(),
+    }
+}
+
+/// The stable record ID of the `MERGED_AS` artifact a PR would emit (issue #333,
+/// Codex round-6).
+///
+/// The `MERGED_AS` edge ID on a unique resolution against `commit_index`, or the
+/// `github_commit_unresolved` Diagnostic ID on a zero- or multiple-match — or
+/// `None` when the PR emits no merge artifact at all (unmerged, empty/absent
+/// `merge_commit_sha`, or no seeded graph).
+///
+/// Mirrors [`pull_records`]/[`resolve_merge_commit`] exactly so the returned ID
+/// is byte-identical to the artifact actually emitted. The importer persists this
+/// per-PR (`state.pr_merge_artifacts`) and, when a re-import's outcome changes,
+/// retracts the SUPERSEDED prior artifact via [`merge_artifact_tombstone`] before
+/// emitting the current one — so a persistent store's current read view never
+/// shows both stale and fresh merge evidence for one PR. The ID (not a lossy
+/// marker) is persisted so a changed `merge_commit_sha` under a still-unresolved
+/// outcome still retracts the prior diagnostic keyed on the OLD sha.
+#[must_use]
+pub fn merge_artifact_id(
+    commit_index: &CommitIndex,
+    source_repo: &str,
+    pr: &model::PullRequest,
+) -> Option<String> {
+    let sha = pr
+        .merge_commit_sha
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .filter(|_| pr.merged_at.is_some())?;
+    if commit_index.is_empty() {
+        return None;
+    }
+    let number = pr.number;
+    match commit_index.get(sha).map(Vec::as_slice) {
+        Some([commit_id]) => {
+            let task_id = project_stable_id(&[
+                "project",
+                "Task",
+                source_repo,
+                &number.to_string(),
+                &format!("pr:{number}"),
+            ]);
+            Some(project_stable_id(&[
+                "project",
+                "edge",
+                EdgeLabel::MergedAs.as_str(),
+                &task_id,
+                commit_id,
+            ]))
+        }
+        // Zero or multiple matches → the repo-scoped diagnostic.
+        _ => Some(commit_diagnostic_id(source_repo, number, sha)),
+    }
+}
+
+/// Builds a project-domain [`GraphRecord::Tombstone`] retracting a superseded
+/// merge-resolution artifact whose PR outcome changed (issue #333, Codex round-6).
+///
+/// The retracted artifact is a `MERGED_AS` edge or a `github_commit_unresolved`
+/// Diagnostic emitted by an earlier import of the same PR.
+///
+/// The tombstone ID is derived from `(pr, deleted_id)`, so it is deterministic
+/// and byte-identical across runs and distinct per retracted target (a
+/// resolved-A→resolved-B→resolved-A cycle mints one tombstone per target).
+/// `deleted_id` drives the embedded adapter's current-view suppression
+/// (`read_all_records`), so a persistent store stops surfacing the stale record.
+#[must_use]
+pub fn merge_artifact_tombstone(number: u64, deleted_id: &str) -> GraphRecord {
+    let native = format!("pr:{number}");
+    let id = project_stable_id(&[
+        "project",
+        "Tombstone",
+        IMPORTER_ID,
+        &native,
+        "merge_resolution_superseded",
+        deleted_id,
+    ]);
+    GraphRecord::Tombstone {
+        id,
+        schema_version: PROJECT_SCHEMA_VERSION,
+        deleted_id: deleted_id.to_owned(),
+        summary: format!(
+            "[merge_resolution_superseded] PR #{number} merge-resolution outcome changed; \
+             retracting superseded artifact {deleted_id}"
+        ),
+        producer: None,
+    }
+}
+
+/// Resolves a PR's `merge_commit_sha` to a `MERGED_AS` edge, or a diagnostic.
+///
+/// Returns `(record, is_diagnostic)`: exactly one matching `Commit` yields the
+/// `MERGED_AS` Task→Commit edge; zero or multiple matches yield a
+/// `github_commit_unresolved` project `Diagnostic`. An empty commit index (no
+/// seeded code graph) resolves to `None` — no edge, no diagnostic.
+fn resolve_merge_commit(
+    ctx: &Context<'_>,
+    task_id: &str,
+    number: u64,
+    sha: &str,
+) -> Option<(GraphRecord, bool)> {
+    if ctx.commit_index.is_empty() {
+        return None;
+    }
+    let detail = match ctx.commit_index.get(sha).map(Vec::as_slice) {
+        Some([commit_id]) => {
+            // MERGED_AS is a project-domain Task→Commit relationship (#333, Codex
+            // P2). It must carry a `project:v1:` ID + PROJECT_SCHEMA_VERSION —
+            // NOT the codegraph identity `GraphRecord::edge` would stamp — so the
+            // daemon project-edge validator sees it and `project:v1:` consumers
+            // find the merge link. The Commit target stays a codegraph node.
+            let edge = GraphRecord::project_edge(
+                EdgeLabel::MergedAs,
+                task_id.to_owned(),
+                commit_id.clone(),
+                None,
+                format!("PR #{number} merged as commit {sha}"),
+            );
+            return Some((edge, false));
+        }
+        Some(ids) if ids.len() > 1 => {
+            format!("{} code-graph Commit records claim this SHA", ids.len())
+        }
+        // None or empty slice → unresolved (no matching Commit in the seed).
+        _ => "no code-graph Commit record matches this SHA in the seeded store".to_owned(),
+    };
+    Some((commit_diagnostic(ctx, number, sha, task_id, &detail), true))
+}
+
+/// The stable `github_commit_unresolved` Diagnostic record ID for a PR/SHA.
+///
+/// Repo-scoped (#333, Codex round-7): `source_repo` is part of the id, mirroring
+/// the Task/Review/ExternalLink ids, so a shared multi-repo store never collides
+/// diagnostics for the same PR number + merge SHA across repositories (one repo's
+/// import could otherwise overwrite or tombstone another's merge evidence).
+///
+/// Seed-independent within a repo: the zero-match (unresolved) and multiple-match
+/// (ambiguous) cases share ONE id per `(repo, PR, sha)`, so re-emitting either
+/// case overwrites the same record and retracting it needs only
+/// `(source_repo, number, sha)`. Factored out so the emitter
+/// ([`commit_diagnostic`]) and the retraction path ([`merge_artifact_id`]) agree
+/// byte-for-byte on the id.
+fn commit_diagnostic_id(source_repo: &str, number: u64, sha: &str) -> String {
+    let native = format!("pr:{number}");
+    project_stable_id(&[
+        "project",
+        "Diagnostic",
+        IMPORTER_ID,
+        source_repo,
+        &native,
+        "github_commit_unresolved",
+        sha,
+    ])
+}
+
+/// Builds a project-domain `Diagnostic` node for an unresolved merge commit
+/// (`github_commit_unresolved`), carrying the SHA and Task record ID (#333).
+fn commit_diagnostic(
+    ctx: &Context<'_>,
+    number: u64,
+    sha: &str,
+    task_id: &str,
+    detail: &str,
+) -> GraphRecord {
+    let code = "github_commit_unresolved";
+    let id = commit_diagnostic_id(ctx.source_repo, number, sha);
+    let mut rec = GraphRecord::node(
+        id.clone(),
+        NodeKind::Diagnostic,
+        None,
+        None,
+        None,
+        format!("[{code}] {detail}; merge_commit_sha='{sha}' task='{task_id}'"),
+    );
+    set_common(&mut rec, &id, ctx.transaction_time, ctx);
+    rec
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -270,6 +562,7 @@ fn task_and_link(
     assignees: &[model::User],
     author: Option<&str>,
     body_handle: Box<OutputHandle>,
+    pr_fields: Option<PrTaskFields>,
 ) -> Emitted {
     let number_s = number.to_string();
     let task_id = project_stable_id(&["project", "Task", ctx.source_repo, &number_s, native_id]);
@@ -305,6 +598,12 @@ fn task_and_link(
         labels: lbl,
         priority,
         author: au,
+        head_sha: hs,
+        head_ref: hr,
+        base_ref: br,
+        merge_commit_sha: mcs,
+        merged_at: ma,
+        draft: dr,
         ..
     } = &mut task
     {
@@ -317,6 +616,16 @@ fn task_and_link(
         *lbl = Some(labels.iter().map(|l| (ctx.redact)(&l.name)).collect());
         *priority = Some("unknown".to_owned());
         *au = author.map(str::to_owned);
+        // PR-promoted plaintext fields (#333); absent on issue Tasks. Never
+        // routed through redaction (see `docs/schema/import-github.md` §8).
+        if let Some(pf) = pr_fields {
+            *hs = pf.head_sha;
+            *hr = pf.head_ref;
+            *br = pf.base_ref;
+            *mcs = pf.merge_commit_sha;
+            *ma = pf.merged_at;
+            *dr = pf.draft;
+        }
     }
 
     // ── ExternalLink node ────────────────────────────────────────────────────────
@@ -673,12 +982,15 @@ pub fn merge(parts: impl IntoIterator<Item = Emitted>) -> Emitted {
 mod tests {
     use super::*;
 
+    static EMPTY_COMMIT_INDEX: std::sync::OnceLock<CommitIndex> = std::sync::OnceLock::new();
+
     fn ctx<'a>(repo: &'a str, idx: &'a FileIndex, redact: &'a Redact<'a>) -> Context<'a> {
         Context {
             source_repo: repo,
             transaction_time: "2026-01-01T00:00:00Z",
             redact,
             file_index: idx,
+            commit_index: EMPTY_COMMIT_INDEX.get_or_init(CommitIndex::new),
         }
     }
 
@@ -774,6 +1086,111 @@ mod tests {
         let issue_task = issue.records[0].id();
         let pr_task = pr.records[0].id();
         assert_ne!(issue_task, pr_task);
+    }
+
+    fn merged_pr(sha: Option<&str>, merged: bool) -> model::PullRequest {
+        model::PullRequest {
+            number: 30,
+            title: "PR 30".to_owned(),
+            body: None,
+            state: "closed".to_owned(),
+            merged_at: merged.then(|| "2026-01-02T00:00:00Z".to_owned()),
+            draft: false,
+            labels: vec![],
+            assignees: vec![],
+            user: None,
+            milestone: None,
+            created_at: String::new(),
+            updated_at: "2026-01-02T00:00:00Z".to_owned(),
+            closed_at: None,
+            head: None,
+            base: None,
+            merge_commit_sha: sha.map(str::to_owned),
+            html_url: "https://github.com/o/r/pull/30".to_owned(),
+        }
+    }
+
+    #[test]
+    fn merge_resolution_marker_reflects_seed_graph_outcome() {
+        let sha = "merge30";
+        // No seeded graph → stable "none" (mirrors: no edge, no diagnostic).
+        let empty = CommitIndex::new();
+        assert_eq!(
+            merge_resolution_marker(&empty, &merged_pr(Some(sha), true)),
+            "none"
+        );
+        // Seeded graph that resolves the SHA → carries the target Commit id.
+        let mut resolves = CommitIndex::new();
+        resolves.insert(sha.to_owned(), vec!["codegraph:v5:commit-0".to_owned()]);
+        assert_eq!(
+            merge_resolution_marker(&resolves, &merged_pr(Some(sha), true)),
+            "resolved:codegraph:v5:commit-0"
+        );
+        // Seeded graph without the SHA → unresolved.
+        let mut other = CommitIndex::new();
+        other.insert(
+            "elsewhere".to_owned(),
+            vec!["codegraph:v5:commit-9".to_owned()],
+        );
+        assert_eq!(
+            merge_resolution_marker(&other, &merged_pr(Some(sha), true)),
+            "unresolved"
+        );
+        // Ambiguous SHA → ambiguous:<count>.
+        let mut ambiguous = CommitIndex::new();
+        ambiguous.insert(
+            sha.to_owned(),
+            vec!["codegraph:v5:a".to_owned(), "codegraph:v5:b".to_owned()],
+        );
+        assert_eq!(
+            merge_resolution_marker(&ambiguous, &merged_pr(Some(sha), true)),
+            "ambiguous:2"
+        );
+        // Unmerged PR carrying a test-merge SHA → "none" even with a matching seed.
+        assert_eq!(
+            merge_resolution_marker(&resolves, &merged_pr(Some(sha), false)),
+            "none"
+        );
+        // Merged PR with no merge_commit_sha → "none".
+        assert_eq!(
+            merge_resolution_marker(&resolves, &merged_pr(None, true)),
+            "none"
+        );
+    }
+
+    #[test]
+    fn unresolved_commit_diagnostic_id_is_repo_scoped() {
+        // Two repositories sharing one store, each with a PR of the SAME number
+        // and SAME unresolved merge_commit_sha, must mint DISTINCT diagnostic
+        // record ids so neither import overwrites or tombstones the other's
+        // merge-resolution evidence (#333, Codex round-7). Before the fix the id
+        // omitted `source_repo`, so both collided.
+        let idx = FileIndex::new();
+        let c_a = ctx("acme/repo-a", &idx, &identity);
+        let c_b = ctx("acme/repo-b", &idx, &identity);
+        let sha = "deadbeefcafe";
+        let number = 42;
+        let task_id = "project:v1:task-shared";
+        let detail = "no code-graph Commit record matches this SHA in the seeded store";
+        let diag_a = commit_diagnostic(&c_a, number, sha, task_id, detail);
+        let diag_b = commit_diagnostic(&c_b, number, sha, task_id, detail);
+        assert_ne!(
+            diag_a.id(),
+            diag_b.id(),
+            "same PR number + merge SHA in different repos must not collide"
+        );
+        // The retraction path ([`merge_artifact_id`]) must agree byte-for-byte
+        // with the emitted id, and likewise stay repo-scoped.
+        assert_eq!(
+            diag_a.id(),
+            commit_diagnostic_id("acme/repo-a", number, sha),
+            "emitter and retraction path must agree on the repo-scoped id"
+        );
+        assert_ne!(
+            commit_diagnostic_id("acme/repo-a", number, sha),
+            commit_diagnostic_id("acme/repo-b", number, sha),
+            "diagnostic id must include the source repo"
+        );
     }
 
     #[test]
