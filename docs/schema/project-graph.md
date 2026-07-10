@@ -170,7 +170,12 @@ label, and this slice fills in `project.Task` as the target.
 
 The daemon applier synthesizes `OWNED_BY_TASK`, `EXTERNAL_HANDLE`, and
 `CLOSES_ACCEPTANCE_CRITERION` from the denormalized project fields. Directly
-submitted project edges must obey the same FROM/TO kind rules.
+submitted project edges (e.g. the importer's `TOUCHES_FILE` and `MERGED_AS`)
+must obey the same FROM/TO kind rules and MUST carry a project-domain identity —
+a `project:v<schema_version>:` record ID and `schema_version = PROJECT_SCHEMA_VERSION`
+— so the daemon project-edge validator applies to them and `project:v1:` readers
+find them. An edge that names a project-only label but carries a `codegraph:` ID
+serializes under the wrong domain and is skipped by the project-edge validator.
 
 ## 8 - Redaction Call-Out
 

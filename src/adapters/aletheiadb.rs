@@ -3703,6 +3703,7 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "OWNED_BY_TASK" => Ok(EdgeLabel::OwnedByTask),
         "EXTERNAL_HANDLE" => Ok(EdgeLabel::ExternalHandle),
         "TOUCHES_FILE" => Ok(EdgeLabel::TouchesFile),
+        "MERGED_AS" => Ok(EdgeLabel::MergedAs),
         "FAILED_ON" => Ok(EdgeLabel::FailedOn),
         "EXPLAINS_CHANGE" => Ok(EdgeLabel::ExplainsChange),
         "REFERENCES_TASK" => Ok(EdgeLabel::ReferencesTask),

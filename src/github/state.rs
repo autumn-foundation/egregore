@@ -13,7 +13,17 @@ use serde::{Deserialize, Serialize};
 use crate::github::model;
 
 /// Current idempotency-state schema version.
-pub const STATE_SCHEMA_VERSION: u32 = 1;
+///
+/// Bumped 1 → 2 for issue #333 (Codex P2): the importer began emitting new
+/// first-class flat PR `Task` fields (head/base/merge SHAs and refs), but a
+/// pre-#333 state file's cached `/pulls` `ETag` would return HTTP 304 and skip the
+/// pulls branch, silently suppressing the new contract for unchanged PRs. A
+/// version mismatch discards the stale state (see [`State::load_or_fresh`]),
+/// forcing exactly ONE full refresh that re-emits the promoted fields; the
+/// version-2 state written afterward keeps subsequent unchanged re-imports
+/// idempotent (issue #333 AC8). Bump this whenever the emitted per-resource
+/// contract changes in a way that a cached conditional probe could hide.
+pub const STATE_SCHEMA_VERSION: u32 = 2;
 
 /// Per-endpoint update watermarks (inclusive `>=` selection, §5).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -226,9 +236,34 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("egst-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
-        std::fs::write(&path, r#"{"schema_version":2,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0}"#).unwrap();
+        std::fs::write(&path, r#"{"schema_version":99,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0}"#).unwrap();
         let s = State::load_or_fresh(&path, "o/r", "x");
         assert!(s.resource_hashes.is_empty());
+        assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_discards_pre_333_state_format_version() {
+        // A pre-#333 state file carries state-format version 1 with cached ETags
+        // and resource hashes. The upgraded binary (STATE_SCHEMA_VERSION >= 2)
+        // must discard it so the next import re-fetches every endpoint and
+        // re-emits the newly-promoted flat PR Task fields (issue #333, Codex P2).
+        // The literal `1` in the fixture is the pre-#333 state-format version; the
+        // current binary's STATE_SCHEMA_VERSION has moved past it, so it is stale.
+        let dir = std::env::temp_dir().join(format!("egst-pre333-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"etags":{"/repos/o/r/pulls?state=all&per_page=100?page=1":"\"pulls-333\""},"resource_hashes":{"pr:10":"abc"}}"#,
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert!(
+            s.etags.is_empty() && s.resource_hashes.is_empty(),
+            "pre-#333 (version 1) state must be discarded so a forced refresh re-emits the new fields"
+        );
         assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
         std::fs::remove_dir_all(&dir).ok();
     }

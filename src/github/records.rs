@@ -348,7 +348,12 @@ fn resolve_merge_commit(
     }
     let detail = match ctx.commit_index.get(sha).map(Vec::as_slice) {
         Some([commit_id]) => {
-            let edge = GraphRecord::edge(
+            // MERGED_AS is a project-domain Task→Commit relationship (#333, Codex
+            // P2). It must carry a `project:v1:` ID + PROJECT_SCHEMA_VERSION —
+            // NOT the codegraph identity `GraphRecord::edge` would stamp — so the
+            // daemon project-edge validator sees it and `project:v1:` consumers
+            // find the merge link. The Commit target stays a codegraph node.
+            let edge = GraphRecord::project_edge(
                 EdgeLabel::MergedAs,
                 task_id.to_owned(),
                 commit_id.clone(),

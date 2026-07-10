@@ -275,6 +275,18 @@ the state file. A partial state file from a crashed previous run is detected
 via `schema_version` field validation; an invalid or truncated file is treated
 as a missing state file.
 
+**State-format version (`STATE_SCHEMA_VERSION`, issue #333):** the state file
+carries its own format version, bumped `1 → 2` when the emitted per-resource
+contract changes in a way a cached conditional probe could otherwise hide. A
+loaded state whose version does not match the current binary is discarded (same
+path as a missing/partial file), so upgrading forces exactly ONE full refresh
+that re-fetches every endpoint and re-emits the current contract — this is what
+lets the #333 promoted flat PR `Task` fields reach existing importer users whose
+pre-#333 `/pulls` ETag would otherwise return HTTP 304 and skip the pulls branch.
+The refresh writes a current-version state, so a subsequent unchanged re-import
+is idempotent again (emits zero per-resource records). This is strictly a
+state-cache migration; it never backfills already-persisted AletheiaDB stores.
+
 ---
 
 ## 6 - GitHub-to-Record-Shape Mapping
@@ -350,7 +362,13 @@ Task record ID — never a guessed link. A merged PR with no `merge_commit_sha`
 emits neither edge nor diagnostic. Without a seeded
 `--code-graph`, no `MERGED_AS` edges and no unresolved diagnostics are produced.
 `MERGED_AS` is a project-only, evidence-class edge label: it is rejected on
-`agent_memory:v1:` edges, exactly like `TOUCHES_FILE` and `EXTERNAL_HANDLE`.
+`agent_memory:v1:` edges, exactly like `TOUCHES_FILE` and `EXTERNAL_HANDLE`. The
+edge itself is a **project-domain edge**: its own record ID carries the
+`project:v1:` prefix and `PROJECT_SCHEMA_VERSION`, so the daemon project-edge
+validator sees it and `project:v1:` consumers find the link (its `Commit` *target*
+stays a `codegraph:` node). Only the `(Task, Commit, MERGED_AS)` triple
+identifies the edge — the promoted flat PR fields never enter its stable ID, so
+output stays byte-identical across runs.
 
 **`valid_time_source`:** All GitHub-sourced records use `github_updated_at`.
 **`source_kind`:** Issues use `github_issue`; PRs use `github_pr`.

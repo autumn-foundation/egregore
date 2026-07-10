@@ -1379,6 +1379,111 @@ fn merged_as_multiple_commit_matches_emits_diagnostic_not_guess() {
     );
 }
 
+#[test]
+fn merged_as_edge_is_a_project_domain_edge() {
+    // Issue #333 / Codex P2: the MERGED_AS Task→Commit edge must be a
+    // project-domain edge (`project:v1:` ID + PROJECT_SCHEMA_VERSION), not a
+    // `codegraph:v5:` edge. A codegraph-stamped edge serializes under the
+    // codegraph domain, bypasses the daemon project-edge validator, and makes
+    // `project:v1:` consumers miss the PR→Commit merge link.
+    let tmp = TempDir::new().unwrap();
+    let code_graph = tmp.path().join("code.jsonl");
+    std::fs::write(
+        &code_graph,
+        commit_seed(&["mergeaaa1111111111111111111111111111111a"]),
+    )
+    .unwrap();
+
+    let server = MockServer::start(six_pr_routes());
+    let out = tmp.path().join("graph.jsonl");
+    let state = tmp.path().join("state.json");
+    let (jsonl, _, ok) = run_import(
+        &server.base_url,
+        &out,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok);
+
+    let pr10_id = pr_task(&jsonl, 10)["id"].as_str().unwrap().to_owned();
+    let edge = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["label"] == "MERGED_AS" && v["source"] == pr10_id.as_str())
+        .expect("PR #10 MERGED_AS edge present");
+
+    let id = edge["id"].as_str().unwrap_or("");
+    assert!(
+        id.starts_with("project:v1:"),
+        "MERGED_AS must be a project-domain edge, got id '{id}'"
+    );
+    assert_eq!(
+        edge["schema_version"], 1,
+        "MERGED_AS edge must carry PROJECT_SCHEMA_VERSION (1), got {edge}"
+    );
+    // The target stays the codegraph Commit node — only the edge's own identity
+    // moves into the project domain.
+    assert_eq!(edge["target"], "codegraph:v5:commit-0");
+}
+
+#[test]
+fn upgrading_state_format_forces_one_pulls_refresh_then_idempotent() {
+    // Issue #333 / Codex P2: a pre-#333 state file carries an older state-format
+    // version. When the upgraded binary runs against it, a cached `/pulls` ETag
+    // would otherwise 304 and skip the pulls branch, so unchanged PRs never get
+    // the newly-promoted flat Task fields. The state-format bump must discard the
+    // stale state so the pulls branch re-fetches and re-emits the new fields.
+    // After that ONE forced refresh, AC8 idempotency must still hold.
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("graph.jsonl");
+    let state = tmp.path().join("state.json");
+    let server = MockServer::start(six_pr_routes());
+
+    // 1. Fresh import writes a current-version state with cached pulls ETag.
+    let (_j1, _e1, ok1) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok1);
+
+    // 2. Simulate a pre-#333 state file: identical cached ETags/hashes but the
+    //    OLDER state-format version (1). Without the format bump this file is
+    //    reused as-is and the pulls endpoint 304s, suppressing the new fields.
+    let mut sj: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    sj["schema_version"] = serde_json::json!(1);
+    std::fs::write(&state, serde_json::to_string_pretty(&sj).unwrap()).unwrap();
+
+    // 3. Re-import with the upgraded binary. The older-version state is discarded
+    //    → pulls re-fetched (200) → PR #10 re-emitted WITH the promoted head_sha.
+    let out2 = tmp.path().join("graph2.jsonl");
+    let (j2, _e2, ok2) = run_import(&server.base_url, &out2, &state, &[]);
+    assert!(ok2);
+    let pr10 = pr_task(&j2, 10);
+    assert_eq!(
+        pr10["head_sha"], "headsha000000000000000000000000000000a10",
+        "forced refresh must re-emit the promoted head_sha field: {pr10}"
+    );
+
+    // 4. A second unchanged re-import on the now-current-version state must be
+    //    idempotent — zero per-resource records re-emitted (issue #333 AC8).
+    let out3 = tmp.path().join("graph3.jsonl");
+    let (j3, _e3, ok3) = run_import(&server.base_url, &out3, &state, &[]);
+    assert!(ok3);
+    assert_eq!(
+        nodes_of_kind(&j3, "Task").len(),
+        0,
+        "AC8: no Task re-emitted on an unchanged re-import: {j3}"
+    );
+    assert_eq!(
+        nodes_of_kind(&j3, "ExternalLink").len(),
+        0,
+        "AC8: no ExternalLink re-emitted on an unchanged re-import"
+    );
+    assert_eq!(
+        nodes_of_kind(&j3, "Review").len(),
+        0,
+        "AC8: no Review re-emitted on an unchanged re-import"
+    );
+}
+
 /// Route table for one OPEN PR (#20, `merged_at: null`) whose REST payload still
 /// carries a `merge_commit_sha` — GitHub's temporary TEST-MERGE commit for a
 /// mergeable-but-unmerged PR. The importer must treat this SHA as *not* merge

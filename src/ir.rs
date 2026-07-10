@@ -1665,6 +1665,38 @@ impl GraphRecord {
         }
     }
 
+    /// Creates a project-domain graph edge record.
+    ///
+    /// Unlike [`GraphRecord::edge`], which stamps a `codegraph:v{SCHEMA_VERSION}`
+    /// ID and the code-graph schema version, this mints a `project:v1:` ID and
+    /// [`PROJECT_SCHEMA_VERSION`] so the edge serializes under the project domain.
+    /// Project-graph consumers (which filter on the `project:v1:` prefix) and the
+    /// daemon project-edge validator only see edges that carry this identity. The
+    /// ID is derived solely from `(label, source, target)`, matching the daemon's
+    /// synthesized project-edge ID scheme, so it stays byte-identical across runs.
+    #[must_use]
+    pub fn project_edge(
+        label: EdgeLabel,
+        source: String,
+        target: String,
+        confidence: Option<String>,
+        summary: String,
+    ) -> Self {
+        let id = project_stable_id(&["project", "edge", label.as_str(), &source, &target]);
+        Self::Edge {
+            id,
+            schema_version: PROJECT_SCHEMA_VERSION,
+            label,
+            source,
+            target,
+            confidence,
+            resolution: None,
+            temporal: None,
+            summary,
+            producer: None,
+        }
+    }
+
     /// Attaches a cross-file call resolution status to an edge record (issue #152).
     ///
     /// No-op on node and tombstone records.
