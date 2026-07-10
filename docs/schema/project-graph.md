@@ -85,7 +85,7 @@ Task record shape.
 | `head_sha` | string | no (PR only) | GitHub PR head (source-branch) commit SHA (issue #333). Plaintext; omitted on non-PR Tasks. |
 | `head_ref` | string | no (PR only) | GitHub PR head (source-branch) ref name (issue #333). Plaintext; omitted on non-PR Tasks. |
 | `base_ref` | string | no (PR only) | GitHub PR base (target-branch) ref name (issue #333). Plaintext; omitted on non-PR Tasks. |
-| `merge_commit_sha` | string | no (PR only) | GitHub PR merge commit SHA; present only when merged (issue #333). Plaintext. Resolves to a `MERGED_AS` edge, below. |
+| `merge_commit_sha` | string | no (PR only) | GitHub PR merge commit SHA; present only when actually merged (`merged_at` present), gating out GitHub's temporary test-merge SHA on unmerged PRs (issue #333). Plaintext. Resolves to a `MERGED_AS` edge, below (also merged-only). |
 | `merged_at` | RFC3339 | no (PR only) | GitHub PR merge timestamp; present only when merged (issue #333). Plaintext. |
 | `draft` | bool | no (PR only) | GitHub PR draft flag (issue #333). Plaintext; omitted on non-PR Tasks. |
 

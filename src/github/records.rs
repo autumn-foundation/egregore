@@ -256,12 +256,20 @@ pub fn issue_records(ctx: &Context<'_>, issue: &model::Issue) -> Emitted {
 
 /// Emits the `Task`, `ExternalLink`, and `EXTERNAL_HANDLE` edge for one PR.
 ///
-/// Also emits a `MERGED_AS` edge (or `github_commit_unresolved` diagnostic) when
-/// the PR's `merge_commit_sha` resolves against a seeded code graph (issue #333).
+/// For an actually-merged PR (`merged_at` present) also emits a `MERGED_AS` edge
+/// (or `github_commit_unresolved` diagnostic) when the PR's `merge_commit_sha`
+/// resolves against a seeded code graph (issue #333). An unmerged PR's
+/// test-merge SHA is never merge evidence: no flat field, edge, or diagnostic.
 #[must_use]
 pub fn pull_records(ctx: &Context<'_>, pr: &model::PullRequest) -> Emitted {
     let number = pr.number;
     let native = format!("pr:{number}");
+    // `merge_commit_sha` is merge evidence only when the PR actually merged
+    // (#333, Codex P2). For a mergeable-but-unmerged PR (open, or closed
+    // unmerged) GitHub's REST API can populate `merge_commit_sha` with a
+    // TEMPORARY TEST-MERGE commit rather than a landed merge commit; treating
+    // that as evidence would corrupt the merge surface. Gate on `merged_at`.
+    let is_merged = pr.merged_at.is_some();
     // Promote the PR-only fields to first-class flat Task fields (#333). These
     // duplicate the values still carried in `body_blob`, which is left
     // unchanged so existing body-blob readers are unaffected (AC3).
@@ -269,7 +277,7 @@ pub fn pull_records(ctx: &Context<'_>, pr: &model::PullRequest) -> Emitted {
         head_sha: pr.head.as_ref().map(|h| h.sha.clone()),
         head_ref: pr.head.as_ref().map(|h| h.ref_name.clone()),
         base_ref: pr.base.as_ref().map(|b| b.ref_name.clone()),
-        merge_commit_sha: pr.merge_commit_sha.clone(),
+        merge_commit_sha: is_merged.then(|| pr.merge_commit_sha.clone()).flatten(),
         merged_at: pr.merged_at.clone(),
         draft: Some(pr.draft),
     };
@@ -302,8 +310,16 @@ pub fn pull_records(ctx: &Context<'_>, pr: &model::PullRequest) -> Emitted {
         Some(pr_fields),
     );
 
-    // MERGED_AS resolve-or-diagnose against the seeded code graph (#333).
-    if let Some(sha) = pr.merge_commit_sha.as_deref().filter(|s| !s.is_empty()) {
+    // MERGED_AS resolve-or-diagnose against the seeded code graph (#333). Only
+    // an actually-merged PR carries a landed merge commit; an unmerged PR's
+    // test-merge SHA is never merge evidence, so it emits neither edge nor
+    // diagnostic regardless of the seeded graph (Codex P2).
+    if let Some(sha) = pr
+        .merge_commit_sha
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .filter(|_| is_merged)
+    {
         let task_id = task_id_for(ctx, "pr", number);
         if let Some(extra) = resolve_merge_commit(ctx, &task_id, number, sha) {
             emitted.records.push(extra.0);

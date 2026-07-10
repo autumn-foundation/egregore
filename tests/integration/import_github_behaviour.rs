@@ -1379,6 +1379,114 @@ fn merged_as_multiple_commit_matches_emits_diagnostic_not_guess() {
     );
 }
 
+/// Route table for one OPEN PR (#20, `merged_at: null`) whose REST payload still
+/// carries a `merge_commit_sha` — GitHub's temporary TEST-MERGE commit for a
+/// mergeable-but-unmerged PR. The importer must treat this SHA as *not* merge
+/// evidence: no flat `merge_commit_sha` field, no `MERGED_AS` edge, and no
+/// `github_commit_unresolved` diagnostic, even when the seeded code graph
+/// contains a Commit with that exact SHA.
+fn open_pr_with_test_merge_routes() -> HashMap<String, Canned> {
+    let pulls = serde_json::json!([
+        {
+            "number": 20, "title":"Open, mergeable","body":"PR body T.",
+            "state":"open","draft":false,"labels":[],"assignees":[],
+            "user":{"login":"dev"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T06:00:00Z",
+            "head":{"ref":"feature-t","sha":"headsha000000000000000000000000000000t20"},
+            "base":{"ref":"main","sha":"basesha000000000000000000000000000000b20"},
+            "merge_commit_sha":"testmerge99999999999999999999999999999999",
+            "html_url":"https://github.com/o/r/pull/20"
+        }
+    ])
+    .to_string();
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/repos/o/r".to_owned(),
+        Canned::ok("{\"full_name\":\"o/r\"}", "\"repo\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues?state=all&per_page=100".to_owned(),
+        Canned::ok("[]", "\"issues-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, "\"pulls-testmerge\""),
+    );
+    routes.insert(
+        "/repos/o/r/labels?per_page=100".to_owned(),
+        Canned::ok("[]", "\"labels-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"ic-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"prc-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/20/reviews?per_page=100".to_owned(),
+        Canned::ok("[]", "\"prr-20\""),
+    );
+    routes
+}
+
+#[test]
+fn open_pr_test_merge_sha_is_not_merge_evidence() {
+    // Regression (Codex P2, #333): an OPEN PR whose payload carries a temporary
+    // test-merge `merge_commit_sha` must never be treated as merge evidence, even
+    // when the seeded code graph contains a Commit with that exact SHA.
+    let sha = "testmerge99999999999999999999999999999999";
+    let tmp = TempDir::new().unwrap();
+    let code_graph = tmp.path().join("code.jsonl");
+    std::fs::write(&code_graph, commit_seed(&[sha])).unwrap();
+
+    let server = MockServer::start(open_pr_with_test_merge_routes());
+    let out = tmp.path().join("graph.jsonl");
+    let state = tmp.path().join("state.json");
+    let (jsonl, _, ok) = run_import(
+        &server.base_url,
+        &out,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok);
+
+    // 1. No first-class flat merge_commit_sha on the open PR's Task.
+    let pr20 = pr_task(&jsonl, 20);
+    assert!(
+        pr20.get("merge_commit_sha").is_none() || pr20["merge_commit_sha"].is_null(),
+        "unmerged PR must not carry a merge_commit_sha field: {pr20}"
+    );
+    assert!(
+        pr20.get("merged_at").is_none() || pr20["merged_at"].is_null(),
+        "unmerged PR has no merged_at"
+    );
+
+    // 2. No MERGED_AS edge from this PR Task (none at all in this fixture).
+    let pr20_id = pr20["id"].as_str().unwrap().to_owned();
+    let has_edge = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|v| v["label"] == "MERGED_AS" && v["source"] == pr20_id.as_str());
+    assert!(!has_edge, "unmerged PR must not emit a MERGED_AS edge");
+    assert_eq!(
+        edges_of_label(&jsonl, "MERGED_AS"),
+        0,
+        "no MERGED_AS edge for a test-merge SHA on an unmerged PR"
+    );
+
+    // 3. No github_commit_unresolved diagnostic keyed to this PR/SHA.
+    let diagnosed = nodes_of_kind(&jsonl, "Diagnostic").into_iter().any(|d| {
+        let s = d["summary"].as_str().unwrap_or("");
+        s.contains("github_commit_unresolved") && (s.contains(sha) || s.contains(&pr20_id))
+    });
+    assert!(
+        !diagnosed,
+        "unmerged PR must not emit a github_commit_unresolved diagnostic"
+    );
+}
+
 #[test]
 fn pr_promoted_fields_survive_redaction_on_export() {
     // Redaction is always on in the importer; the six PR fields are plaintext

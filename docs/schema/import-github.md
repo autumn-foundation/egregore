@@ -315,7 +315,7 @@ follow-up slice that promotes them from reserved.
 | GitHub Resource | v1 Emission |
 |-----------------|------------|
 | Issue | `Task + ExternalLink` only (`source_kind: github_issue`). GitHub-only metadata (`state_reason`, `milestone`, etc.) stored in `Task.body_handle` for round-trip fidelity; `GitHubIssue` deferred. `Task.priority` defaults to `unknown` (GitHub issues have no native priority field; a future label-mapping rule may override this). |
-| Pull Request | `Task + ExternalLink` (`source_kind: github_pr`). Six PR-specific fields are promoted to first-class **optional flat `Task` fields** (issue #333): `head_sha`, `head_ref`, `base_ref`, `merge_commit_sha`, `merged_at`, `draft`. Present only on PR-derived Tasks; issue Tasks omit them (serde-skipped). They are additive plaintext query substrate (see §8) and continue to also appear inside `Task.body_handle` for round-trip fidelity, so pre-#333 body-blob readers are unaffected. A merged PR whose `merge_commit_sha` resolves against a seeded `--code-graph` `Commit` also emits a `MERGED_AS` `Task → Commit` edge (resolve-or-diagnose, below). Remaining PR-only fields (requested reviewers, `mergeable_state`, …) stay deferred to `PR` record promotion. `Task.priority` defaults to `unknown`. Downstream consumers: issues #334 (compliance/evidence surfaces) and #338 build directly on this exact field schema. |
+| Pull Request | `Task + ExternalLink` (`source_kind: github_pr`). Six PR-specific fields are promoted to first-class **optional flat `Task` fields** (issue #333): `head_sha`, `head_ref`, `base_ref`, `merge_commit_sha`, `merged_at`, `draft`. Present only on PR-derived Tasks; issue Tasks omit them (serde-skipped). They are additive plaintext query substrate (see §8) and continue to also appear inside `Task.body_handle` for round-trip fidelity, so pre-#333 body-blob readers are unaffected. The `merge_commit_sha` flat field is populated only for actually-merged PRs (`merged_at` present); an unmerged PR never carries it even when the REST payload supplied a temporary test-merge SHA. A merged PR whose `merge_commit_sha` resolves against a seeded `--code-graph` `Commit` also emits a `MERGED_AS` `Task → Commit` edge (resolve-or-diagnose, below). Remaining PR-only fields (requested reviewers, `mergeable_state`, …) stay deferred to `PR` record promotion. `Task.priority` defaults to `unknown`. Downstream consumers: issues #334 (compliance/evidence surfaces) and #338 build directly on this exact field schema. |
 | Issue Comment | **Deferred.** Comment endpoints are still fetched and ETag-cached; records emitted when `Review` is promoted. |
 | PR Review | **Deferred.** Same rationale as issue comments. |
 | PR Review Comment | **Deferred.** Same rationale. `REFERENCES_TASK` from `project.Review` and `TOUCHED_FILE` from `project.Review` must also be registered in `project-graph.md` before emission. |
@@ -335,11 +335,19 @@ as.
 | `MERGED_AS` | `project.Task` (`source_kind: github_pr`) | `codegraph.Commit` | The PR was merged as this specific commit. |
 
 Resolution is **resolve-or-diagnose** (mirroring the `TOUCHES_FILE` discipline):
+the flat `merge_commit_sha` field and the `MERGED_AS` edge/diagnostic are emitted
+**only for actually-merged PRs** (`merged_at` present). For a
+mergeable-but-unmerged PR (open, or closed-unmerged) GitHub's REST API can
+populate `merge_commit_sha` with a *temporary test-merge* commit rather than a
+landed merge commit; that SHA is never merge evidence, so an unmerged PR carries
+no flat `merge_commit_sha` field and produces neither a `MERGED_AS` edge nor a
+`github_commit_unresolved` diagnostic — even when the seeded `--code-graph`
+contains a `Commit` with that exact SHA. For a merged PR,
 a `merge_commit_sha` matching **exactly one** `Commit` (whose `name` equals the
 SHA) emits one `MERGED_AS` edge; **zero or multiple** matches emit a project
 `Diagnostic` node with code `github_commit_unresolved` carrying the SHA and the
-Task record ID — never a guessed link. A PR with no `merge_commit_sha`
-(open/draft/closed-unmerged) emits neither edge nor diagnostic. Without a seeded
+Task record ID — never a guessed link. A merged PR with no `merge_commit_sha`
+emits neither edge nor diagnostic. Without a seeded
 `--code-graph`, no `MERGED_AS` edges and no unresolved diagnostics are produced.
 `MERGED_AS` is a project-only, evidence-class edge label: it is rejected on
 `agent_memory:v1:` edges, exactly like `TOUCHES_FILE` and `EXTERNAL_HANDLE`.
