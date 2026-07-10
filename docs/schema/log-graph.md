@@ -39,7 +39,17 @@ payload), serialized internally-tagged on `log_kind`.
   (every logical line, including info/debug noise).
 - **`ErrorSignature`**: `fingerprint_algorithm` (`template-v1`),
   `template_excerpt` (redacted, ≤200 chars), `severity`
-  (`fatal` | `error` | `warn`), `occurrence_count`, `first_seen`, `last_seen`.
+  (`fatal` | `error` | `warn`), `occurrence_count`, `first_seen`, `last_seen`,
+  and (issue #322) an optional `frames` array of structured, redaction-safe
+  backtrace frames captured at scan time. Each frame carries `frame_index`
+  (zero-based backtrace position) and optional `module_path`, `file_path`
+  (repo-relative or generalized external-toolchain form), and `line`. `frames`
+  is absent when no backtrace was parsed, capped at 64 frames, and each
+  module/file text is bounded to 200 chars. **Frames are non-identity** — see
+  the identity table. They are captured **because** `template-v1` normalization
+  rewrites file paths to `<PATH>` and drops long backtraces past the excerpt
+  bound, so the structured frames preserve the resolvable frame data the
+  excerpt cannot.
 - **`LogEvent`**: `event_excerpt` (redacted, ≤200 chars), `event_content_hash`,
   `source_line`, `severity`.
 - **`LogOccurrenceBucket`**: `bucket_start` (RFC 3339 UTC, hour-floored),
@@ -55,17 +65,39 @@ Structural (emitted by `scan-logs`):
 | `CapturedFrom` | `CAPTURED_FROM` | `ErrorSignature` / `LogEvent` → `LogSource` |
 | `Aggregates` | `AGGREGATES` | `LogOccurrenceBucket` → `ErrorSignature` |
 
-Evidence-link (declared as schema groundwork; **reserved** for #322/#323, not
-emitted by `scan-logs`):
+Evidence-link:
 
 | Label | Wire string | Purpose |
 |-------|-------------|---------|
-| `FrameResolvesTo` | `FRAME_RESOLVES_TO` | A backtrace frame resolves to a code-graph `Symbol`. |
-| `EmittedDuring` | `EMITTED_DURING` | A signature was emitted during a verification/agent run. |
+| `FrameResolvesTo` | `FRAME_RESOLVES_TO` | A backtrace frame resolves to a code-graph `Symbol` / `File` / `Diagnostic` (issue #322, emitted by `eg resolve-frames`). |
+| `EmittedDuring` | `EMITTED_DURING` | A signature was emitted during a verification/agent run (reserved for #323, not yet emitted). |
 
 `FRAME_RESOLVES_TO` and `EMITTED_DURING` are valid evidence-link labels;
 `FINGERPRINTED_AS`, `CAPTURED_FROM`, and `AGGREGATES` are structural. None of the
 five is a code-graph topology label.
+
+### `FRAME_RESOLVES_TO` edge fields (issue #322)
+
+A `FRAME_RESOLVES_TO` edge runs `ErrorSignature` → target and carries two
+optional fields (present only on this edge kind):
+
+- `frame_index` — the zero-based backtrace position of the resolved frame.
+- `frame_resolution` — a value from the **closed, stable** set:
+
+  | Value | Meaning | Target |
+  |-------|---------|--------|
+  | `resolved` | The frame's `file:line` (or module-path name) matched exactly one in-repo `Symbol`. | that `Symbol` |
+  | `ambiguous` | Two or more in-repo `Symbol`s matched; **every** candidate gets its own edge (no silent pick). | each candidate `Symbol` |
+  | `path_only` | The frame's file exists but no enclosing symbol contains the line (optimized-out / macro-generated frame). | the `File` node |
+  | `unresolved` | The frame names a repo-relative path absent from the resolved view (deleted / renamed). | a `Diagnostic` marker carrying the redacted frame text |
+
+  A frame into the standard library or a dependency is classified **`external`**
+  in a per-signature tally and mints **no** edge; `external` is therefore not a
+  member of the on-edge enum. Modeled verbatim on `CallResolution` (issues
+  #152/#134): a frame handle is never silently bound to an invented target.
+
+Each edge is mirrored by an `EvidenceLink` (relation `FRAME_RESOLVES_TO`) on the
+source `ErrorSignature` node; the two representations agree at write time.
 
 ## Stable-ID identity
 
@@ -78,7 +110,7 @@ hashing, so CRLF and LF checkouts yield identical IDs.
 | Kind | Identity parts | Non-identity inputs |
 |------|----------------|---------------------|
 | `LogSource` | `repository_id`, `source_relative_path`, `source_artifact_hash` | `line_count`, capture/transaction time, producer |
-| `ErrorSignature` | `repository_id`, `fingerprint_algorithm`, `normalized_template`, `severity` | `occurrence_count`, `first_seen`, `last_seen`, producer, capture time |
+| `ErrorSignature` | `repository_id`, `fingerprint_algorithm`, `normalized_template`, `severity` | `occurrence_count`, `first_seen`, `last_seen`, **`frames`**, producer, capture time |
 | `LogEvent` | `repository_id`, `signature_id`, `event_valid_time`, `event_content_hash` | `source_line`, byte offsets, producer, capture time |
 | `LogOccurrenceBucket` | `repository_id`, `signature_id`, `bucket_start`, `bucket_width` | `occurrence_count`, producer, capture time |
 
@@ -112,12 +144,17 @@ enters IDs or canonical output. See
 ## Redaction
 
 Redacted fields: `ErrorSignature.template_excerpt`, `LogEvent.event_excerpt`,
-and (reserved for #322/#323) resolved backtrace-frame text. The v1 redaction
-policy ([`redaction.md`](redaction.md)) runs on the normalized template; a record
-whose excerpt carries a `<REDACTED:…>` marker sets `redaction_policy_version`.
-Excerpts are bounded to 200 characters. Output carries only IDs, hashes,
-severities, counts, paths, bucket boundaries, and markers — never raw payload
-beyond the bounded post-redaction excerpts.
+and (issue #322) each `ErrorSignature.frames[].module_path` / `file_path` plus
+the redacted frame text on any `unresolved` `Diagnostic` marker. The v1
+redaction policy ([`redaction.md`](redaction.md)) runs on the normalized
+template and on every frame's module/file text; a frame `file_path` is
+additionally normalized to a repository-relative form (or truncated from a
+recognized external-toolchain anchor such as `/rustc/` or `/registry/`) so no
+absolute host path or username enters the graph. A record whose excerpt carries
+a `<REDACTED:…>` marker sets `redaction_policy_version`. Excerpts and frame
+text are bounded to 200 characters. Output carries only IDs, hashes,
+severities, counts, paths, bucket boundaries, frames, and markers — never raw
+payload beyond the bounded post-redaction excerpts.
 
 ## Producer
 

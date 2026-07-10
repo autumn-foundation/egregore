@@ -91,6 +91,20 @@ In `plain-v1`, a Rust panic plus its indented/backtrace continuation lines
 (leading whitespace, `stack backtrace:`, `note:`, `at …`, or `<n>: …` frames)
 are one logical event.
 
+### Structured frame capture (issue #322)
+
+Because `template-v1` normalization rewrites file paths to `<PATH>` and the
+200-char excerpt bound drops long backtraces, `scan-logs` additionally captures
+each event's backtrace as a structured, redaction-safe `frames` array on the
+`ErrorSignature` (`frame_index`, and optional `module_path`, `file_path`,
+`line`). File paths are normalized to a repository-relative form (or truncated
+from a recognized external-toolchain anchor such as `/rustc/` or `/registry/`),
+and every module/file text passes through the v1 redaction policy, so no
+absolute host path or username enters the graph. Frames are **non-identity** —
+they never change a signature's record ID — capped at 64 per signature, and
+absent when no backtrace parsed. They are the input `eg resolve-frames` binds to
+code-graph symbols (see [`resolve-frames.md`](resolve-frames.md)).
+
 ### `template-v1` normalization
 
 Applied before any hash or ID. Variable spans are replaced, most-specific-first,

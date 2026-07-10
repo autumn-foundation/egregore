@@ -2662,6 +2662,7 @@ const PROJECT_EDGE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::ExternalHandle,
     EdgeLabel::TouchesFile,
     EdgeLabel::MergedAs,
+    EdgeLabel::ReviewsCommit,
     EdgeLabel::MentionsSymbol,
 ];
 
@@ -3420,35 +3421,32 @@ fn validate_project_edge(
                 &[NodeKind::File],
             )?;
         }
-        EdgeLabel::MergedAs => {
+        // Importer-only Commit-anchor edges: MERGED_AS (Task, #333) and its
+        // review-side mirror REVIEWS_COMMIT (Review, #334). Both require the FROM
+        // node to carry the exact importer source_kind so a forged/mistyped node
+        // is never persisted as merge/review evidence.
+        EdgeLabel::MergedAs | EdgeLabel::ReviewsCommit => {
+            let (from_kind, from_source_kind) = if label == EdgeLabel::MergedAs {
+                (NodeKind::Task, "github_pr")
+            } else {
+                (NodeKind::Review, "github_review")
+            };
             validate_project_edge_kinds(
                 edge_id,
                 label,
                 source_kind,
-                &[NodeKind::Task],
+                &[from_kind],
                 target_kind,
                 &[NodeKind::Commit],
             )?;
-            // The #333 schema constrains MERGED_AS to PR tasks: a merge-evidence
-            // link may only originate from a `github_pr` Task. Reject any other
-            // origin (github_issue, local_jsonl, or an absent source_kind) so a
-            // non-PR task is never persisted as having landed as a commit.
-            let task_source_kind = lookup_node_source_kind(source, records, sink)?;
-            match task_source_kind.as_deref() {
-                Some("github_pr") => {}
-                Some(other) => {
-                    return Err(ApiError::bad_request(format!(
-                        "project edge '{edge_id}' label '{}' requires a github_pr source task, not source_kind '{other}'",
-                        label.as_str()
-                    )));
-                }
-                None => {
-                    return Err(ApiError::bad_request(format!(
-                        "project edge '{edge_id}' label '{}' requires a github_pr source task, but the source task has no source_kind",
-                        label.as_str()
-                    )));
-                }
-            }
+            require_project_edge_source_kind(
+                edge_id,
+                label,
+                source,
+                from_source_kind,
+                records,
+                sink,
+            )?;
         }
         EdgeLabel::MentionsSymbol => {
             validate_project_edge_kinds(
@@ -3464,6 +3462,31 @@ fn validate_project_edge(
         _ => {}
     }
     Ok(())
+}
+
+/// Requires a directly-submitted project edge's FROM node to carry an exact
+/// `source_kind`, so importer-only relations (`MERGED_AS` → `github_pr`,
+/// `REVIEWS_COMMIT` → `github_review`) can never originate from a forged or
+/// mistyped source node (issues #333/#334).
+fn require_project_edge_source_kind(
+    edge_id: &str,
+    label: EdgeLabel,
+    source: &str,
+    expected: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    match lookup_node_source_kind(source, records, sink)?.as_deref() {
+        Some(kind) if kind == expected => Ok(()),
+        Some(other) => Err(ApiError::bad_request(format!(
+            "project edge '{edge_id}' label '{}' requires a {expected} source node, not source_kind '{other}'",
+            label.as_str()
+        ))),
+        None => Err(ApiError::bad_request(format!(
+            "project edge '{edge_id}' label '{}' requires a {expected} source node, but the source node has no source_kind",
+            label.as_str()
+        ))),
+    }
 }
 
 fn validate_project_edge_kinds(
@@ -3573,6 +3596,8 @@ fn project_edge(label: EdgeLabel, source: &str, target: &str, summary: &str) -> 
         target: target.to_owned(),
         confidence: None,
         resolution: None,
+        frame_resolution: None,
+        frame_index: None,
         temporal: None,
         summary: summary.to_owned(),
         producer: None,
@@ -4220,7 +4245,8 @@ pub fn validate_agent_memory_record_for_cli(
                 | EdgeLabel::OwnedByTask
                 | EdgeLabel::ExternalHandle
                 | EdgeLabel::TouchesFile
-                | EdgeLabel::MergedAs => {
+                | EdgeLabel::MergedAs
+                | EdgeLabel::ReviewsCommit => {
                     anyhow::bail!(
                         "evidence link relation '{}' is project-only and must be written as a project edge",
                         edge_label.as_str()
@@ -5414,6 +5440,8 @@ fn user_context_edge(
         target: target.to_owned(),
         confidence,
         resolution: None,
+        frame_resolution: None,
+        frame_index: None,
         temporal: None,
         summary: summary.to_owned(),
         producer: None,
@@ -6456,6 +6484,7 @@ fn validate_agent_memory_edge_endpoints(
             | EdgeLabel::ExternalHandle
             | EdgeLabel::TouchesFile
             | EdgeLabel::MergedAs
+            | EdgeLabel::ReviewsCommit
     ) {
         return Err(ApiError::bad_request(format!(
             "agent-memory edge '{edge_id}' label '{}' is project-only; use a project:v1: edge",
@@ -6987,7 +7016,8 @@ fn validate_and_synthesize_evidence_edges(
                         | EdgeLabel::OwnedByTask
                         | EdgeLabel::ExternalHandle
                         | EdgeLabel::TouchesFile
-                        | EdgeLabel::MergedAs => {
+                        | EdgeLabel::MergedAs
+                        | EdgeLabel::ReviewsCommit => {
                             return Err(ApiError::bad_request(format!(
                                 "evidence link relation '{}' is project-only and must be written as a project edge",
                                 edge_label.as_str()

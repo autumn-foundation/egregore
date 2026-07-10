@@ -1908,6 +1908,7 @@ impl EmbeddedAletheiaSink {
             author,
             diff_hunk_handle,
             review_side,
+            review_commit_sha,
             user_context,
             producer,
         } = record
@@ -2137,6 +2138,7 @@ impl EmbeddedAletheiaSink {
             builder = builder.insert("diff_hunk_handle_json", json.as_str());
         }
         builder = insert_optional(builder, "review_side", review_side.as_deref());
+        builder = insert_optional(builder, "review_commit_sha", review_commit_sha.as_deref());
         if !user_context.is_empty()
             && let Ok(json) = serde_json::to_string(user_context)
         {
@@ -2371,6 +2373,8 @@ impl EmbeddedAletheiaSink {
             target,
             confidence,
             resolution,
+            frame_resolution,
+            frame_index,
             temporal,
             summary,
             producer,
@@ -2394,6 +2398,13 @@ impl EmbeddedAletheiaSink {
             "resolution",
             resolution.map(crate::ir::CallResolution::as_str),
         );
+        builder = insert_optional(
+            builder,
+            "frame_resolution",
+            frame_resolution.map(crate::ir::FrameResolution::as_str),
+        );
+        let frame_index_str = frame_index.map(|i| i.to_string());
+        builder = insert_optional(builder, "frame_index", frame_index_str.as_deref());
         builder = insert_temporal(builder, temporal.as_ref());
         if let Some(p) = producer
             && let Ok(json) = serde_json::to_string(p)
@@ -3119,6 +3130,11 @@ impl EmbeddedAletheiaSink {
                 "review_side",
                 node.get_property("review_side"),
             )?,
+            review_commit_sha: optional_str_property(
+                record_id,
+                "review_commit_sha",
+                node.get_property("review_commit_sha"),
+            )?,
             user_context: optional_str_property(
                 record_id,
                 "user_context_json",
@@ -3267,6 +3283,30 @@ impl EmbeddedAletheiaSink {
             .map(|value| {
                 crate::ir::CallResolution::from_wire(value).ok_or_else(|| {
                     read_back_error(record_id, format!("resolution invalid: {value}"))
+                })
+            })
+            .transpose()?,
+            frame_resolution: optional_str_property(
+                record_id,
+                "frame_resolution",
+                edge.get_property("frame_resolution"),
+            )?
+            .as_deref()
+            .map(|value| {
+                crate::ir::FrameResolution::from_wire(value).ok_or_else(|| {
+                    read_back_error(record_id, format!("frame_resolution invalid: {value}"))
+                })
+            })
+            .transpose()?,
+            frame_index: optional_str_property(
+                record_id,
+                "frame_index",
+                edge.get_property("frame_index"),
+            )?
+            .as_deref()
+            .map(|value| {
+                value.parse::<u32>().map_err(|_| {
+                    read_back_error(record_id, format!("frame_index invalid: {value}"))
                 })
             })
             .transpose()?,
@@ -3739,6 +3779,7 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "EXTERNAL_HANDLE" => Ok(EdgeLabel::ExternalHandle),
         "TOUCHES_FILE" => Ok(EdgeLabel::TouchesFile),
         "MERGED_AS" => Ok(EdgeLabel::MergedAs),
+        "REVIEWS_COMMIT" => Ok(EdgeLabel::ReviewsCommit),
         "FAILED_ON" => Ok(EdgeLabel::FailedOn),
         "EXPLAINS_CHANGE" => Ok(EdgeLabel::ExplainsChange),
         "REFERENCES_TASK" => Ok(EdgeLabel::ReferencesTask),
@@ -5444,6 +5485,89 @@ mod tests {
                     .iter()
                     .any(|r| matches!(r, GraphRecord::Edge { id, .. } if id == &edge_id)),
                 "byte-identical re-emit must revive the tombstoned merge edge in the current view"
+            );
+        }
+    }
+
+    #[test]
+    fn read_all_records_revives_reviews_commit_edge_after_tombstone() {
+        // Issue #334 (contract #6): the generic revive-after-tombstone fix
+        // (#333, round-7) must also cover the new REVIEWS_COMMIT project edge — a
+        // re-resolution that cycles resolved-A → superseded → resolved-A re-emits
+        // the SAME edge bytes/id and must revive the tombstoned anchor in the
+        // current read view, not stay suppressed.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("reviews-commit-revive-store");
+        let review_id = stable_id(&["node", "review", "pr_review:3:100"]);
+        let commit_id = stable_id(&["node", "commit", "sha-a"]);
+        // REVIEWS_COMMIT project edge to commit A. `project_edge` mints the
+        // `project:v1:` id; identical bytes are reconstructed below.
+        let edge = GraphRecord::project_edge(
+            EdgeLabel::ReviewsCommit,
+            review_id.clone(),
+            commit_id.clone(),
+            None,
+            "review anchored to commit sha-a".to_owned(),
+        );
+        let edge_id = edge.id().to_owned();
+        let tombstone_id = stable_id(&["tombstone", &edge_id]);
+
+        // Phase 1: resolved-A — endpoints + live edge.
+        {
+            let mut sink =
+                EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+            sink.write_record(&file_record(&review_id, "review"))
+                .expect("review node should write");
+            sink.write_record(&current_symbol_record(&commit_id, "commit", 10))
+                .expect("commit node should write");
+            sink.write_record(&edge).expect("edge should write");
+        }
+
+        // Phase 2: superseded — tombstone the edge; it must now be suppressed.
+        {
+            let mut sink =
+                EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+            sink.write_record(&GraphRecord::Tombstone {
+                id: tombstone_id,
+                schema_version: crate::ir::PROJECT_SCHEMA_VERSION,
+                deleted_id: edge_id.clone(),
+                summary: "review anchor superseded".to_owned(),
+                producer: None,
+            })
+            .expect("tombstone should write");
+            let records = sink
+                .read_all_records()
+                .expect("read_all_records should succeed");
+            assert!(
+                !records
+                    .iter()
+                    .any(|r| matches!(r, GraphRecord::Edge { id, .. } if id == &edge_id)),
+                "edge must be suppressed while its id is actively tombstoned"
+            );
+        }
+
+        // Phase 3: re-emit IDENTICAL edge bytes — must revive.
+        {
+            let mut sink =
+                EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+            let reemitted = GraphRecord::project_edge(
+                EdgeLabel::ReviewsCommit,
+                review_id,
+                commit_id,
+                None,
+                "review anchored to commit sha-a".to_owned(),
+            );
+            assert_eq!(reemitted.id(), edge_id, "re-emit must reconstruct the id");
+            sink.write_record(&reemitted)
+                .expect("identical edge re-emit should write");
+            let records = sink
+                .read_all_records()
+                .expect("read_all_records should succeed");
+            assert!(
+                records
+                    .iter()
+                    .any(|r| matches!(r, GraphRecord::Edge { id, .. } if id == &edge_id)),
+                "byte-identical re-emit must revive the tombstoned anchor edge in the current view"
             );
         }
     }

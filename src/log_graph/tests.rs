@@ -137,6 +137,125 @@ fn log_edge_labels_classify_on_both_predicates() {
     }
 }
 
+// ── frame-resolution closed set (issue #322) ─────────────────────────────────
+
+#[test]
+fn frame_resolution_as_str_and_from_wire_round_trip() {
+    use crate::ir::FrameResolution;
+    for value in [
+        FrameResolution::Resolved,
+        FrameResolution::Ambiguous,
+        FrameResolution::PathOnly,
+        FrameResolution::Unresolved,
+    ] {
+        assert_eq!(
+            FrameResolution::from_wire(value.as_str()),
+            Some(value),
+            "{} must round-trip through as_str/from_wire",
+            value.as_str()
+        );
+    }
+    // Closed set: an unknown token is never coerced into a member.
+    assert_eq!(FrameResolution::from_wire("external"), None);
+    assert_eq!(FrameResolution::from_wire("nonsense"), None);
+    // Explicit wire spellings are stable.
+    assert_eq!(FrameResolution::PathOnly.as_str(), "path_only");
+    assert_eq!(FrameResolution::Unresolved.as_str(), "unresolved");
+}
+
+#[test]
+fn frame_resolves_to_schema_tuple_is_known() {
+    use crate::ir::{EdgeLabel, GraphRecord, LOG_SCHEMA_VERSION};
+    use crate::schema_version::{is_known_record_version, record_version};
+    let edge = GraphRecord::Edge {
+        id: log_stable_id(&["edge", "FRAME_RESOLVES_TO", "repo", "a", "b"]),
+        schema_version: LOG_SCHEMA_VERSION,
+        label: EdgeLabel::FrameResolvesTo,
+        source: "a".to_owned(),
+        target: "b".to_owned(),
+        confidence: None,
+        resolution: None,
+        frame_resolution: Some(crate::ir::FrameResolution::Resolved),
+        frame_index: Some(0),
+        temporal: None,
+        summary: "frame resolves to symbol".to_owned(),
+        producer: None,
+    };
+    let version = record_version(&edge);
+    assert_eq!(version.domain, "log");
+    assert_eq!(version.kind, "FRAME_RESOLVES_TO");
+    assert_eq!(version.version, 1);
+    assert!(
+        is_known_record_version(&version),
+        "(log, FRAME_RESOLVES_TO, 1) must be an accepted schema tuple"
+    );
+}
+
+// ── structured backtrace frame capture (issue #322) ──────────────────────────
+
+#[test]
+fn parse_frames_captures_rust_backtrace_shape() {
+    let repo = std::path::Path::new(".");
+    let text = "thread 'main' panicked at 'boom', src/alpha.rs:10:5\n\
+                stack backtrace:\n\
+                   0: myapp::alpha::do_thing\n\
+                             at src/alpha.rs:10\n\
+                   1: myapp::shared::helper\n\
+                             at src/shared.rs:5:9\n\
+                   2: core::panicking::panic\n\
+                             at /rustc/abc123/library/core/src/panicking.rs:50";
+    let frames = parse_frames(text, repo);
+    assert_eq!(frames.len(), 3, "three backtrace frames parsed");
+
+    assert_eq!(frames[0].frame_index, 0);
+    assert_eq!(
+        frames[0].module_path.as_deref(),
+        Some("myapp::alpha::do_thing")
+    );
+    assert_eq!(frames[0].file_path.as_deref(), Some("src/alpha.rs"));
+    assert_eq!(frames[0].line, Some(10));
+
+    assert_eq!(frames[1].frame_index, 1);
+    assert_eq!(frames[1].file_path.as_deref(), Some("src/shared.rs"));
+    assert_eq!(frames[1].line, Some(5));
+
+    // External toolchain path is generalized from the /rustc/ anchor: no
+    // absolute host prefix, and the module root is a stdlib crate.
+    assert_eq!(frames[2].frame_index, 2);
+    assert_eq!(
+        frames[2].file_path.as_deref(),
+        Some("rustc/abc123/library/core/src/panicking.rs")
+    );
+    assert_eq!(
+        frames[2].module_path.as_deref(),
+        Some("core::panicking::panic")
+    );
+}
+
+#[test]
+fn parse_frames_strips_absolute_repo_prefix() {
+    // An absolute in-repo path under the repo root normalizes to repo-relative.
+    let temp = std::env::temp_dir();
+    let root = temp.join("egregore_frame_test_root");
+    let _ = std::fs::create_dir_all(root.join("src"));
+    let abs = format!("{}/src/beta.rs", root.to_string_lossy().replace('\\', "/"));
+    let text =
+        format!("ERROR crash\nstack backtrace:\n   0: app::beta::run\n             at {abs}:7");
+    let frames = parse_frames(&text, &root);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].file_path.as_deref(), Some("src/beta.rs"));
+    assert_eq!(frames[0].line, Some(7));
+}
+
+#[test]
+fn parse_frames_absent_without_backtrace() {
+    let frames = parse_frames(
+        "ERROR just a one-line error, no backtrace",
+        std::path::Path::new("."),
+    );
+    assert!(frames.is_empty(), "no frame lines means no frames");
+}
+
 // ── stable-id identity contract ──────────────────────────────────────────────
 
 #[test]

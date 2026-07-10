@@ -38,6 +38,22 @@ store as a `log_payload` blob (disabled by default; the graph never stores the
 handle; capture I/O failure exits 3 with no partial manifest). See
 `docs/cli/scan-logs.md` and `docs/schema/log-graph.md`.
 
+`eg resolve-frames <log.graph.jsonl> --graph <code.graph.jsonl> --out <out>`
+(issue #322) resolves the structured, redaction-safe backtrace frames captured
+on each `ErrorSignature` (scan-time capture, since `template-v1` normalization
+drops file paths and long backtraces) to code-graph targets, emitting
+`FRAME_RESOLVES_TO` edges each labeled with a closed-set `frame_resolution`
+(`resolved` / `ambiguous` / `path_only` / `unresolved`) plus a `frame_index`,
+mirrored by an `EvidenceLink` on the signature. The ladder mirrors
+`CallResolution` (#152/#134): `ambiguous` enumerates every candidate and never
+silently picks one; `unresolved` targets a `Diagnostic` carrying the redacted
+frame text, never an invented symbol; `path_only` targets the `File` node.
+Frames into stdlib/deps are classified `external` in a per-signature tally and
+mint no edge. Accepts `--data-dir` and `--at`/`--as-of` (mutually exclusive).
+Frames are non-identity. A binding proves the frame NAMES the symbol, never that
+the symbol is at fault. Deterministic and byte-stable; raw log text never enters
+the graph. See `docs/cli/resolve-frames.md`.
+
 `eg inspect --data-dir` inspects an embedded store directly — no daemon, no
 network, no embeddings (issue #125, the daemon-free analog of #47). It reports
 totals plus per-domain/per-kind/per-schema-version counts grouped by trust

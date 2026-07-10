@@ -199,6 +199,11 @@ pub struct Review {
     /// Submission timestamp; the `valid_time` source.
     #[serde(default)]
     pub submitted_at: Option<String>,
+    /// Commit SHA the review was anchored to — the exact commit the reviewer
+    /// looked at (issue #334). Absent on rare payloads (e.g. an unsubmitted
+    /// `PENDING` review); a genuinely-absent value is diagnosed, never faked.
+    #[serde(default)]
+    pub commit_id: Option<String>,
     /// Canonical HTML URL.
     #[serde(default)]
     pub html_url: String,
@@ -288,5 +293,31 @@ mod tests {
         let json = r#"{"number":1,"title":"t","some_new_field":123}"#;
         let issue: Issue = serde_json::from_str(json).unwrap();
         assert_eq!(issue.number, 1);
+    }
+
+    #[test]
+    fn review_parses_with_commit_id() {
+        // Issue #334: a submitted review carries the commit_id it reviewed.
+        let json = r#"{"id":10,"state":"APPROVED","commit_id":"deadbeef"}"#;
+        let review: Review = serde_json::from_str(json).unwrap();
+        assert_eq!(review.commit_id.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn review_parses_without_commit_id() {
+        // Issue #334: an absent commit_id (rare, e.g. a PENDING review)
+        // deserializes to None rather than failing — the gap is diagnosed, not
+        // faked, downstream.
+        let json = r#"{"id":11,"state":"PENDING"}"#;
+        let review: Review = serde_json::from_str(json).unwrap();
+        assert_eq!(review.commit_id, None);
+    }
+
+    #[test]
+    fn review_comment_parses_commit_id() {
+        // ReviewComment already carried commit_id; #334 begins USING it.
+        let json = r#"{"id":12,"commit_id":"cafef00d","pull_request_url":"https://api.github.com/repos/o/r/pulls/3"}"#;
+        let c: ReviewComment = serde_json::from_str(json).unwrap();
+        assert_eq!(c.commit_id.as_deref(), Some("cafef00d"));
     }
 }

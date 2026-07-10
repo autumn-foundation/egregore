@@ -2033,6 +2033,91 @@ fn merge_resolution_unresolved_to_resolved_retracts_prior_diagnostic() {
 }
 
 #[test]
+fn upgraded_v2_store_still_tombstones_changed_merge_resolution() {
+    // Codex #352 P2 end-to-end regression: bumping STATE_SCHEMA_VERSION 2→3 must
+    // MIGRATE the on-disk state, not discard it. A blunt discard drops #333's
+    // `pr_merge_artifacts` tracking, so on the FIRST v3 run against an upgraded
+    // store a PR whose merge now resolves differently emits the fresh artifact but
+    // cannot tombstone the stale one → stale + fresh merge evidence coexist. The
+    // v2→v3 migration preserves `pr_merge_artifacts`, so the retraction still fires.
+    let merge_sha = "merge30000000000000000000000000000000030";
+    let decoy_sha = "decoy000000000000000000000000000000000000";
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+    let code_graph = tmp.path().join("code.jsonl");
+    let server = MockServer::start(one_merged_pr_routes("\"pulls-v2mig\""));
+
+    // 1. Unseeded (decoy-only) merge SHA → PR #30 emits diagnostic D; the state
+    //    records D's id in pr_merge_artifacts. State is written at the current
+    //    (v3) version.
+    std::fs::write(&code_graph, commit_seed(&[decoy_sha])).unwrap();
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(
+        &server.base_url,
+        &out1,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok1);
+    let d_id = nodes_of_kind(&j1, "Diagnostic")
+        .into_iter()
+        .find(|d| {
+            let s = d["summary"].as_str().unwrap_or("");
+            s.contains("github_commit_unresolved") && s.contains(merge_sha)
+        })
+        .expect("run 1 emits a github_commit_unresolved Diagnostic")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 2. Simulate a pre-#334 (v2) store that already tracked pr_merge_artifacts:
+    //    downgrade ONLY the on-disk schema_version to 2, leaving pr_merge_artifacts
+    //    (and every other field) intact — exactly what an upgraded store looks like.
+    let mut sj: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    sj["schema_version"] = serde_json::json!(2);
+    assert!(
+        sj["pr_merge_artifacts"]
+            .as_object()
+            .is_some_and(|m| !m.is_empty()),
+        "precondition: the v2 state must carry a tracked merge artifact"
+    );
+    std::fs::write(&state, serde_json::to_string_pretty(&sj).unwrap()).unwrap();
+
+    // 3. First v3 run against the migrated store, now with a RESOLVING seed: the
+    //    outcome changes D→E. Because the migration preserved pr_merge_artifacts,
+    //    the superseded diagnostic D is tombstoned. (RED against the blunt-discard
+    //    code: prior_merge_artifact would be empty and no tombstone would fire.)
+    std::fs::write(&code_graph, commit_seed(&[merge_sha])).unwrap();
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(
+        &server.base_url,
+        &out2,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok2);
+    assert_eq!(
+        edges_of_label(&j2, "MERGED_AS"),
+        1,
+        "the resolving seed emits the fresh MERGED_AS edge"
+    );
+    let retracted_d = tombstones(&j2)
+        .into_iter()
+        .any(|t| t["deleted_id"] == d_id.as_str());
+    assert!(
+        retracted_d,
+        "v2→v3 migration must preserve pr_merge_artifacts so the stale diagnostic D is tombstoned: {j2}"
+    );
+    assert!(
+        !nodes_of_kind(&j2, "Diagnostic")
+            .into_iter()
+            .any(|d| d["id"] == d_id.as_str()),
+        "the stale diagnostic node is retracted, not re-emitted"
+    );
+}
+
+#[test]
 fn merge_resolution_resolved_to_unresolved_retracts_prior_edge() {
     // The reverse transition: PR #30 goes from RESOLVED (MERGED_AS edge E) back to
     // UNRESOLVED (a diagnostic). The superseded edge E must be retracted via a
@@ -2196,5 +2281,756 @@ fn merge_resolution_change_suppresses_stale_artifact_in_embedded_current_view() 
     assert!(
         e_present,
         "the fresh MERGED_AS edge E must appear in the embedded current read view"
+    );
+}
+
+// ── Issue #334: anchor every review to the commit it reviewed ────────────────────
+
+// Distinct review-commit SHAs. `_a`/`_b` are seeded (resolvable); `_x` is never
+// seeded (unresolved). None equal any PR head SHA — reviews anchor to the exact
+// commit reviewed, which after a force-push differs from the PR head.
+const RC_SHA_A: &str = "revcommitaaa0000000000000000000000000000a";
+const RC_SHA_B: &str = "revcommitbbb0000000000000000000000000000b";
+const RC_SHA_X: &str = "revcommitxxx0000000000000000000000000000x";
+
+/// Four PRs (10–13), each open with a distinct head SHA that differs from every
+/// review commit SHA (the force-push case).
+fn four_pulls_json() -> String {
+    let mut prs = Vec::new();
+    for n in 10..=13 {
+        prs.push(serde_json::json!({
+            "number": n, "title": format!("PR {n}"), "body": format!("Body {n}."),
+            "state":"open","draft":false,"labels":[],"assignees":[],
+            "user":{"login":"dev"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z",
+            "head":{"ref":format!("feature-{n}"),"sha":format!("prheadsha{n}00000000000000000000000000000000")},
+            "base":{"ref":"main","sha":format!("prbasesha{n}00000000000000000000000000000000")},
+            "html_url":format!("https://github.com/o/r/pull/{n}")
+        }));
+    }
+    serde_json::Value::Array(prs).to_string()
+}
+
+/// Eight PR review summaries across the four PRs. Mix of resolvable, unresolved,
+/// and genuinely-absent (`commit_id` omitted → unanchored) anchors.
+fn eight_pr_reviews_for(number: u64) -> String {
+    let rows: Vec<serde_json::Value> = match number {
+        10 => vec![
+            review_row(401, Some(RC_SHA_A)),
+            review_row(402, Some(RC_SHA_X)),
+        ],
+        11 => vec![review_row(403, Some(RC_SHA_B)), review_row(404, None)],
+        12 => vec![
+            review_row(405, Some(RC_SHA_A)),
+            review_row(406, Some(RC_SHA_B)),
+        ],
+        13 => vec![review_row(407, Some(RC_SHA_X)), review_row(408, None)],
+        _ => vec![],
+    };
+    serde_json::Value::Array(rows).to_string()
+}
+
+fn review_row(id: u64, commit_id: Option<&str>) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "id": id, "body": format!("Review {id}."), "state":"APPROVED",
+        "user":{"login":"reviewer"},"submitted_at":"2026-01-02T03:00:00Z",
+        "html_url": format!("https://github.com/o/r/pull/x#pullrequestreview-{id}")
+    });
+    if let Some(sha) = commit_id {
+        v["commit_id"] = serde_json::json!(sha);
+    }
+    v
+}
+
+/// Six PR review comments across the four PRs: resolvable, unresolved, and one
+/// with no `commit_id` (unanchored).
+fn six_review_comments_json() -> String {
+    let rows = vec![
+        review_comment_row(501, 10, Some(RC_SHA_A)),
+        review_comment_row(502, 10, Some(RC_SHA_X)),
+        review_comment_row(503, 11, Some(RC_SHA_B)),
+        review_comment_row(504, 11, None),
+        review_comment_row(505, 12, Some(RC_SHA_A)),
+        review_comment_row(506, 13, Some(RC_SHA_X)),
+    ];
+    serde_json::Value::Array(rows).to_string()
+}
+
+fn review_comment_row(id: u64, pr: u64, commit_id: Option<&str>) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "id": id, "body": format!("Comment {id}."), "user":{"login":"reviewer"},
+        "path":"src/lib.rs","line":10,"side":"RIGHT",
+        "pull_request_url": format!("https://api.github.com/repos/o/r/pulls/{pr}"),
+        "created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z",
+        "html_url": format!("https://github.com/o/r/pull/{pr}#discussion_r{id}")
+    });
+    if let Some(sha) = commit_id {
+        v["commit_id"] = serde_json::json!(sha);
+    }
+    v
+}
+
+/// One issue comment on a PR conversation (proves the `issue_comment` exemption).
+fn one_issue_comment_json() -> String {
+    serde_json::json!([
+        {
+            "id": 601, "body":"General PR chatter.", "user":{"login":"pm"},
+            "issue_url":"https://api.github.com/repos/o/r/issues/10",
+            "created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z",
+            "html_url":"https://github.com/o/r/pull/10#issuecomment-601"
+        }
+    ])
+    .to_string()
+}
+
+fn review_anchor_routes(pulls_etag: &str) -> HashMap<String, Canned> {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/repos/o/r".to_owned(),
+        Canned::ok("{\"full_name\":\"o/r\"}", "\"repo\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues?state=all&per_page=100".to_owned(),
+        Canned::ok("[]", "\"issues-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&four_pulls_json(), pulls_etag),
+    );
+    routes.insert(
+        "/repos/o/r/labels?per_page=100".to_owned(),
+        Canned::ok("[]", "\"labels-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues/comments?per_page=100".to_owned(),
+        Canned::ok(&one_issue_comment_json(), "\"ic-334\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/comments?per_page=100".to_owned(),
+        Canned::ok(&six_review_comments_json(), "\"prc-334\""),
+    );
+    for n in 10..=13 {
+        routes.insert(
+            format!("/repos/o/r/pulls/{n}/reviews?per_page=100"),
+            Canned::ok(&eight_pr_reviews_for(n), &format!("\"prr-334-{n}\"")),
+        );
+    }
+    routes
+}
+
+/// The Review node whose summary names `#<pr>` and carries review kind `kind`.
+fn review_node_by_summary(jsonl: &str, kind: &str, needle: &str) -> Option<serde_json::Value> {
+    nodes_of_kind(jsonl, "Review")
+        .into_iter()
+        .find(|r| r["review_kind"] == kind && r["summary"].as_str().unwrap_or("").contains(needle))
+}
+
+/// The Review node whose `system_native_id` ends with `:<id>`.
+fn review_by_native(jsonl: &str, id: u64) -> serde_json::Value {
+    let suffix = format!(":{id}");
+    nodes_of_kind(jsonl, "Review")
+        .into_iter()
+        .find(|r| {
+            r["system_native_id"]
+                .as_str()
+                .unwrap_or("")
+                .ends_with(&suffix)
+        })
+        .unwrap_or_else(|| panic!("Review with native id ending {suffix} should exist"))
+}
+
+fn diagnostics_with(jsonl: &str, code: &str) -> usize {
+    nodes_of_kind(jsonl, "Diagnostic")
+        .into_iter()
+        .filter(|d| d["summary"].as_str().unwrap_or("").contains(code))
+        .count()
+}
+
+#[test]
+fn fresh_review_import_anchors_resolved_diagnoses_unresolved_and_unanchored() {
+    let tmp = TempDir::new().unwrap();
+    let code_graph = tmp.path().join("code.jsonl");
+    // Seed Commits for RC_SHA_A (commit-0) and RC_SHA_B (commit-1); RC_SHA_X is
+    // never seeded.
+    std::fs::write(&code_graph, commit_seed(&[RC_SHA_A, RC_SHA_B])).unwrap();
+
+    let server = MockServer::start(review_anchor_routes("\"pulls-334-v1\""));
+    let out = tmp.path().join("graph.jsonl");
+    let state = tmp.path().join("state.json");
+    let (jsonl, stderr, ok) = run_import(
+        &server.base_url,
+        &out,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok, "import should succeed; stderr={stderr}");
+
+    // review_commit_sha field populated on a resolvable pr_review.
+    let approved_review = review_by_native(&jsonl, 401);
+    assert_eq!(approved_review["review_kind"], "pr_review");
+    assert_eq!(approved_review["review_commit_sha"], RC_SHA_A);
+
+    // review_commit_sha on a pr_review_comment.
+    let inline_comment = review_by_native(&jsonl, 501);
+    assert_eq!(inline_comment["review_kind"], "pr_review_comment");
+    assert_eq!(inline_comment["review_commit_sha"], RC_SHA_A);
+
+    // issue_comment review is exempt: no review_commit_sha at all.
+    let ic = review_node_by_summary(&jsonl, "issue_comment", "#10")
+        .expect("issue_comment review present");
+    assert!(
+        ic.get("review_commit_sha").is_none() || ic["review_commit_sha"].is_null(),
+        "issue_comment reviews carry no review_commit_sha: {ic}"
+    );
+
+    // REVIEWS_COMMIT edges: 4 resolvable reviews (401,403,405,406) + 3 resolvable
+    // comments (501,503,505) = 7.
+    assert_eq!(
+        edges_of_label(&jsonl, "REVIEWS_COMMIT"),
+        7,
+        "one REVIEWS_COMMIT edge per resolved review commit"
+    );
+    // Every REVIEWS_COMMIT edge is a project-domain edge targeting a Commit.
+    for edge in jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["label"] == "REVIEWS_COMMIT")
+    {
+        assert!(
+            edge["id"].as_str().unwrap_or("").starts_with("project:v1:"),
+            "REVIEWS_COMMIT must be a project-domain edge: {edge}"
+        );
+        assert_eq!(edge["schema_version"], 1);
+        let target = edge["target"].as_str().unwrap_or("");
+        assert!(
+            target == "codegraph:v5:commit-0" || target == "codegraph:v5:commit-1",
+            "edge targets a seeded Commit: {edge}"
+        );
+    }
+
+    // Unresolved (RC_SHA_X): reviews 402,407 + comments 502,506 = 4 diagnostics.
+    assert_eq!(
+        diagnostics_with(&jsonl, "github_commit_unresolved"),
+        4,
+        "unresolved review commits diagnose, never guess"
+    );
+    // Unanchored (absent commit_id): reviews 404,408 + comment 504 = 3.
+    assert_eq!(
+        diagnostics_with(&jsonl, "github_review_unanchored"),
+        3,
+        "absent commit_id diagnoses the gap, never fabricates a SHA"
+    );
+
+    // The unresolved review still carries the raw SHA on its field.
+    let rv402 = review_by_native(&jsonl, 402);
+    assert_eq!(rv402["review_commit_sha"], RC_SHA_X);
+}
+
+#[test]
+fn review_anchor_import_is_byte_identical_across_five_reimports() {
+    let tmp = TempDir::new().unwrap();
+    let code_graph = tmp.path().join("code.jsonl");
+    std::fs::write(&code_graph, commit_seed(&[RC_SHA_A, RC_SHA_B])).unwrap();
+    let mut outputs = Vec::new();
+    for i in 0..5 {
+        let server = MockServer::start(review_anchor_routes("\"pulls-334-v1\""));
+        let out = tmp.path().join(format!("graph-{i}.jsonl"));
+        let state = tmp.path().join(format!("state-{i}.json"));
+        let (jsonl, _, ok) = run_import(
+            &server.base_url,
+            &out,
+            &state,
+            &["--code-graph", code_graph.to_str().unwrap()],
+        );
+        assert!(ok, "import {i} should succeed");
+        outputs.push(jsonl);
+    }
+    for (i, jsonl) in outputs.iter().enumerate().skip(1) {
+        assert_eq!(
+            *jsonl, outputs[0],
+            "re-import {i} must be byte-identical to the first"
+        );
+    }
+    assert!(outputs[0].contains("REVIEWS_COMMIT"));
+    assert!(outputs[0].contains(&format!("\"review_commit_sha\":\"{RC_SHA_A}\"")));
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn review_anchor_survives_embedded_roundtrip_and_inspect() {
+    use aletheia_egregore::adapters::EmbeddedAletheiaSink;
+    use aletheia_egregore::ir::{EdgeLabel, GraphRecord};
+
+    let tmp = TempDir::new().unwrap();
+    let code_graph = tmp.path().join("code.jsonl");
+    std::fs::write(&code_graph, commit_seed(&[RC_SHA_A, RC_SHA_B])).unwrap();
+    let server = MockServer::start(review_anchor_routes("\"pulls-334-v1\""));
+    let out = tmp.path().join("graph.jsonl");
+    let state = tmp.path().join("state.json");
+    let (_jsonl, _, ok) = run_import(
+        &server.base_url,
+        &out,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok);
+
+    let data_dir = tmp.path().join("store");
+    // The REVIEWS_COMMIT edge targets a seeded Commit node, so the seed graph
+    // must be ingested into the same store first (it lives only in the seed file,
+    // never re-emitted by the importer).
+    let seed_ingest = egregore()
+        .args([
+            "ingest",
+            code_graph.to_str().unwrap(),
+            "--adapter",
+            "embedded",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("ingest seed commits");
+    assert!(
+        seed_ingest.status.success(),
+        "seed commit ingest should succeed: {}",
+        String::from_utf8_lossy(&seed_ingest.stderr)
+    );
+    let ingest = egregore()
+        .args([
+            "ingest",
+            out.to_str().unwrap(),
+            "--adapter",
+            "embedded",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("ingest embedded");
+    assert!(
+        ingest.status.success(),
+        "embedded ingest should succeed (REVIEWS_COMMIT edge label must round-trip): {}",
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+
+    // Read back through the embedded sink: the field + edge survive.
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("open embedded store");
+    let records = sink.read_all_records().expect("read current view");
+    assert!(
+        records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Edge {
+                label: EdgeLabel::ReviewsCommit,
+                ..
+            }
+        )),
+        "a REVIEWS_COMMIT edge must round-trip through the embedded store"
+    );
+    assert!(
+        records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Node { review_commit_sha: Some(sha), .. } if sha == RC_SHA_A
+        )),
+        "review_commit_sha must round-trip through the embedded store"
+    );
+
+    let inspect = egregore()
+        .args(["inspect", "--data-dir", data_dir.to_str().unwrap()])
+        .output()
+        .expect("inspect data-dir");
+    assert!(inspect.status.success());
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    let report: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().unwrap_or("{}")).expect("inspect JSON");
+    assert_eq!(
+        report["unknown_schema_versions"]
+            .as_object()
+            .map_or(0, serde_json::Map::len),
+        0,
+        "no unknown schema versions after review-anchor ingest: {report}"
+    );
+}
+
+/// One open PR (#20) with one `pr_review` (id 700) carrying a resolvable
+/// `commit_id`, with an overridable pulls `ETag` so a re-import can force the
+/// reviews to re-resolve while the review payload stays byte-identical (#334).
+fn one_review_routes(pulls_etag: &str, review_commit: &str) -> HashMap<String, Canned> {
+    let pulls = serde_json::json!([
+        {
+            "number": 20, "title":"Open PR","body":"Body.",
+            "state":"open","draft":false,"labels":[],"assignees":[],
+            "user":{"login":"dev"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z",
+            "head":{"ref":"feature-x","sha":"prheadsha200000000000000000000000000000000"},
+            "base":{"ref":"main","sha":"prbasesha200000000000000000000000000000000"},
+            "html_url":"https://github.com/o/r/pull/20"
+        }
+    ])
+    .to_string();
+    let reviews = serde_json::json!([
+        {
+            "id": 700, "body":"Anchored review.", "state":"APPROVED",
+            "user":{"login":"reviewer"},"submitted_at":"2026-01-02T03:00:00Z",
+            "commit_id": review_commit,
+            "html_url":"https://github.com/o/r/pull/20#pullrequestreview-700"
+        }
+    ])
+    .to_string();
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/repos/o/r".to_owned(),
+        Canned::ok("{\"full_name\":\"o/r\"}", "\"repo\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues?state=all&per_page=100".to_owned(),
+        Canned::ok("[]", "\"issues-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, pulls_etag),
+    );
+    routes.insert(
+        "/repos/o/r/labels?per_page=100".to_owned(),
+        Canned::ok("[]", "\"labels-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"ic-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"prc-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/20/reviews?per_page=100".to_owned(),
+        Canned::ok(&reviews, "\"prr-700\""),
+    );
+    routes
+}
+
+fn tombstones334(jsonl: &str) -> Vec<serde_json::Value> {
+    jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["record_type"] == "tombstone")
+        .collect()
+}
+
+#[test]
+fn review_seed_graph_change_re_resolves_tombstones_and_revives() {
+    // Issue #334 (contracts #4/#5/#6): a review whose commit_id resolves only
+    // after a seed-graph change must (1) re-emit the REVIEWS_COMMIT edge across a
+    // would-be 304, (2) tombstone the superseded diagnostic when the outcome
+    // changes, and (3) revive the edge after a resolved→unresolved→resolved cycle.
+    // The pulls ETag is held CONSTANT so the mock returns 304 unless the seed
+    // fingerprint suppresses it.
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+    let code_graph = tmp.path().join("code.jsonl");
+    std::fs::write(&code_graph, commit_seed(&[RC_SHA_A])).unwrap();
+    // A DIFFERENT non-empty seed that does NOT contain the review's commit, so
+    // the outcome flips edge→unresolved-diagnostic (not edge→nothing) while the
+    // seed fingerprint still changes to force reprocessing across a would-be 304.
+    let code_graph_other = tmp.path().join("code_other.jsonl");
+    std::fs::write(&code_graph_other, commit_seed(&[RC_SHA_B])).unwrap();
+
+    let server = MockServer::start(one_review_routes("\"pulls-const-334\"", RC_SHA_A));
+
+    // 1. First import WITHOUT --code-graph: commit_id cannot resolve → no edge,
+    //    no diagnostic (mirrors MERGED_AS empty-seed None).
+    let out1 = tmp.path().join("graph1.jsonl");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    assert_eq!(
+        edges_of_label(&j1, "REVIEWS_COMMIT"),
+        0,
+        "no REVIEWS_COMMIT without a seeded code graph"
+    );
+
+    // 2. Re-import WITH the seed graph. The constant pulls ETag would 304, but the
+    //    changed seed fingerprint must suppress it so reviews re-resolve and the
+    //    edge appears.
+    server.clear_requests();
+    let out2 = tmp.path().join("graph2.jsonl");
+    let (j2, _, ok2) = run_import(
+        &server.base_url,
+        &out2,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok2);
+    assert_eq!(
+        edges_of_label(&j2, "REVIEWS_COMMIT"),
+        1,
+        "a changed seed graph must re-emit the REVIEWS_COMMIT edge across a would-be 304"
+    );
+    assert!(
+        server
+            .request_paths()
+            .iter()
+            .any(|p| p.contains("/pulls/20/reviews")),
+        "a changed seed graph forces the per-PR reviews fetch"
+    );
+
+    // 3. Re-import with a DIFFERENT seed graph that lacks the review's commit: the
+    //    outcome changes edge→unresolved-diagnostic and the superseded edge must be
+    //    retracted via a Tombstone(deleted_id == edge id).
+    let edge_id = j2
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["label"] == "REVIEWS_COMMIT")
+        .and_then(|v| v["id"].as_str().map(str::to_owned))
+        .expect("edge id from run 2");
+    server.clear_requests();
+    let out3 = tmp.path().join("graph3.jsonl");
+    let (j3, _, ok3) = run_import(
+        &server.base_url,
+        &out3,
+        &state,
+        &["--code-graph", code_graph_other.to_str().unwrap()],
+    );
+    assert!(ok3);
+    assert_eq!(
+        edges_of_label(&j3, "REVIEWS_COMMIT"),
+        0,
+        "removing the seed commit drops the edge"
+    );
+    assert!(
+        tombstones334(&j3)
+            .iter()
+            .any(|t| t["deleted_id"] == edge_id.as_str()),
+        "the superseded REVIEWS_COMMIT edge must be retracted via a Tombstone: {j3}"
+    );
+    assert_eq!(
+        diagnostics_with(&j3, "github_commit_unresolved"),
+        1,
+        "the now-unresolved review emits a diagnostic"
+    );
+
+    // 4. Re-import WITH the seed graph once more: the outcome flips back to the
+    //    ORIGINAL edge id. The prior diagnostic is tombstoned and the byte-
+    //    identical edge is revived (contract #6).
+    server.clear_requests();
+    let out4 = tmp.path().join("graph4.jsonl");
+    let (j4, _, ok4) = run_import(
+        &server.base_url,
+        &out4,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok4);
+    let revived = j4
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|v| v["label"] == "REVIEWS_COMMIT" && v["id"] == edge_id.as_str());
+    assert!(
+        revived,
+        "the byte-identical REVIEWS_COMMIT edge must be re-emitted (revived): {j4}"
+    );
+    assert!(
+        !tombstones334(&j4).is_empty(),
+        "flipping back tombstones the superseded diagnostic: {j4}"
+    );
+}
+
+/// Merge SHA for the v2→v3 upgrade P1 regression fixture (resolves against seed).
+const UPGRADE_MERGE_SHA: &str = "upgmerge00000000000000000000000000000010";
+
+/// Route table for the v2→v3 upgrade P1 regression: one closed+merged PR (#10)
+/// whose `merge_commit_sha` resolves against the seed, one issue (#1) with a
+/// label, one inline PR review comment (id 501) and one PR review summary (id
+/// 401), each anchored to a resolvable review commit. The pulls `ETag` is held
+/// constant so the mock 304s the `/pulls` list unless the migration clears it.
+fn upgrade_regression_routes(pulls_etag: &str) -> HashMap<String, Canned> {
+    let pulls = serde_json::json!([
+        {
+            "number": 10, "title":"Merged PR","body":"Body.",
+            "state":"closed","draft":false,"labels":[],"assignees":[],
+            "user":{"login":"dev"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z",
+            "merged_at":"2026-01-02T00:00:00Z","closed_at":"2026-01-02T00:00:00Z",
+            "head":{"ref":"feature-a","sha":"upgheadsha00000000000000000000000000000010"},
+            "base":{"ref":"main","sha":"upgbasesha00000000000000000000000000000010"},
+            "merge_commit_sha": UPGRADE_MERGE_SHA,
+            "html_url":"https://github.com/o/r/pull/10"
+        }
+    ])
+    .to_string();
+    let issues = serde_json::json!([
+        {
+            "number": 1, "title":"An issue","body":"Body.",
+            "state":"open","labels":[{"name":"bug","color":"f00"}],"assignees":[],
+            "user":{"login":"reporter"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z",
+            "html_url":"https://github.com/o/r/issues/1"
+        }
+    ])
+    .to_string();
+    let review_comments = serde_json::json!([
+        {
+            "id": 501, "body":"Inline.", "user":{"login":"reviewer"},
+            "path":"src/lib.rs","line":10,"side":"RIGHT",
+            "pull_request_url":"https://api.github.com/repos/o/r/pulls/10",
+            "commit_id": RC_SHA_A,
+            "created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z",
+            "html_url":"https://github.com/o/r/pull/10#discussion_r501"
+        }
+    ])
+    .to_string();
+    let reviews = serde_json::json!([
+        {
+            "id": 401, "body":"Anchored review.", "state":"APPROVED",
+            "user":{"login":"reviewer"},"submitted_at":"2026-01-02T03:00:00Z",
+            "commit_id": RC_SHA_A,
+            "html_url":"https://github.com/o/r/pull/10#pullrequestreview-401"
+        }
+    ])
+    .to_string();
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/repos/o/r".to_owned(),
+        Canned::ok("{\"full_name\":\"o/r\"}", "\"repo\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues?state=all&per_page=100".to_owned(),
+        Canned::ok(&issues, "\"issues-upg\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, pulls_etag),
+    );
+    routes.insert(
+        "/repos/o/r/labels?per_page=100".to_owned(),
+        Canned::ok("[{\"name\":\"bug\",\"color\":\"f00\"}]", "\"labels-upg\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"ic-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/comments?per_page=100".to_owned(),
+        Canned::ok(&review_comments, "\"prc-upg\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/10/reviews?per_page=100".to_owned(),
+        Canned::ok(&reviews, "\"prr-401\""),
+    );
+    routes
+}
+
+#[test]
+fn upgraded_v2_store_reemits_review_anchors_when_pull_list_unchanged() {
+    // Codex #352 P1: the per-PR `/pulls/{n}/reviews` fetch is gated behind
+    // `if pulls_changed` in import.rs, which is only true when the `/pulls` LIST
+    // returns 200. Round 1's v2→v3 migration PRESERVED the `/pulls` list ETag, so
+    // an upgraded store with an UNCHANGED PR list and seed graph took the 304 fast
+    // path → pulls_changed == false → the per-PR reviews were never fetched → the
+    // pre-existing `pr_review` records never re-emitted with `review_commit_sha` /
+    // `REVIEWS_COMMIT`, silently dropping the #334 contract for existing reviews
+    // (the common upgrade case). The migration must force a FULL review refresh
+    // even when nothing changed. The pulls ETag and the seed are held CONSTANT so
+    // the mock WOULD 304 the /pulls list if its ETag survived the migration.
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+    let code_graph = tmp.path().join("code.jsonl");
+    std::fs::write(&code_graph, commit_seed(&[UPGRADE_MERGE_SHA, RC_SHA_A])).unwrap();
+
+    // 1. Fresh v3 import: emits the PR/issue Tasks, the MERGED_AS edge, and both
+    //    review anchors (review 401 + comment 501). State is written at v3.
+    let server = MockServer::start(upgrade_regression_routes("\"pulls-upg-const\""));
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(
+        &server.base_url,
+        &out1,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok1);
+    assert_eq!(edges_of_label(&j1, "MERGED_AS"), 1, "fresh: MERGED_AS edge");
+    assert_eq!(
+        edges_of_label(&j1, "REVIEWS_COMMIT"),
+        2,
+        "fresh: two review anchors (summary + comment)"
+    );
+    assert_eq!(review_by_native(&j1, 401)["review_commit_sha"], RC_SHA_A);
+
+    // 2. Simulate a pre-#334 (v2) store: downgrade the on-disk schema_version to 2
+    //    and drop the review-family resource hashes. A genuine v2 store hashed
+    //    reviews as blake3(payload) (the v2 formula), which the v3 `review_hash`
+    //    (payload+marker) can never equal — so on the forced 200 refetch every
+    //    review re-emits exactly once. Deleting the review hashes models that
+    //    guaranteed formula mismatch. Every OTHER field (ETags incl. the /pulls
+    //    LIST ETag, the pr:10 / issue:1 resource hashes, watermarks, the
+    //    fingerprint) is left intact — exactly what an upgraded store looks like.
+    let mut sj: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    sj["schema_version"] = serde_json::json!(2);
+    if let Some(hashes) = sj["resource_hashes"].as_object_mut() {
+        hashes.retain(|k, _| !k.starts_with("pr_review"));
+    }
+    assert!(
+        sj["etags"]
+            .as_object()
+            .is_some_and(|m| m.keys().any(|k| k.contains("/pulls?state=all"))),
+        "precondition: the v2 state carries a /pulls LIST ETag that would 304"
+    );
+    std::fs::write(&state, serde_json::to_string_pretty(&sj).unwrap()).unwrap();
+
+    // 3. First v3 run against the migrated store, PR list + seed UNCHANGED. The
+    //    migration must clear the /pulls list ETag so the mock returns 200,
+    //    pulls_changed becomes true, and the per-PR reviews re-fetch. RED against
+    //    round-1 code: the preserved /pulls ETag 304s → review 401 is never fetched.
+    server.clear_requests();
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(
+        &server.base_url,
+        &out2,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok2);
+
+    // The per-PR reviews endpoint WAS fetched (the whole point of the P1 fix).
+    assert!(
+        server
+            .request_paths()
+            .iter()
+            .any(|p| p.contains("/pulls/10/reviews")),
+        "the migration must force the per-PR reviews fetch even on an unchanged PR list"
+    );
+    // Both existing reviews re-emit with the #334 anchor contract.
+    let summary_review = review_by_native(&j2, 401);
+    assert_eq!(summary_review["review_kind"], "pr_review");
+    assert_eq!(
+        summary_review["review_commit_sha"], RC_SHA_A,
+        "the pre-existing pr_review must re-emit with review_commit_sha on upgrade"
+    );
+    let inline_comment = review_by_native(&j2, 501);
+    assert_eq!(inline_comment["review_kind"], "pr_review_comment");
+    assert_eq!(inline_comment["review_commit_sha"], RC_SHA_A);
+    assert_eq!(
+        edges_of_label(&j2, "REVIEWS_COMMIT"),
+        2,
+        "both review anchors (summary + comment) re-emit their REVIEWS_COMMIT edge"
+    );
+
+    // Idempotency of every OTHER domain is preserved on the same run: the PR list
+    // and seed are unchanged, so no MERGED_AS re-emits and no stale artifact is
+    // tombstoned, and the unchanged issue/PR Tasks do not re-emit.
+    assert_eq!(
+        edges_of_label(&j2, "MERGED_AS"),
+        0,
+        "unchanged seed must NOT spuriously re-emit MERGED_AS (preserved pr:10 hash)"
+    );
+    assert!(
+        tombstones334(&j2).is_empty(),
+        "no artifact is tombstoned when the seed graph is unchanged: {j2}"
+    );
+    let reemitted_tasks: Vec<String> = nodes_of_kind(&j2, "Task")
+        .into_iter()
+        .map(|t| t["summary"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert!(
+        reemitted_tasks.is_empty(),
+        "unchanged issue/PR Tasks must NOT re-emit on the migrated run: {reemitted_tasks:?}"
     );
 }

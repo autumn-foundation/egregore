@@ -506,6 +506,12 @@ pub struct ErrorSignaturePayload {
     pub first_seen: String,
     /// Valid time of the latest occurrence. Non-identity.
     pub last_seen: String,
+    /// Structured, redaction-safe backtrace frames captured at scan time
+    /// (issue #322), when the signature carried a parseable backtrace. Frames
+    /// are **non-identity**: they are never part of the signature record-ID
+    /// hash preimage. Absent (`None`) when no backtrace was parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<Vec<StackFrame>>,
 }
 
 /// Payload for a `LogEvent` node: one bounded exemplar occurrence.
@@ -814,6 +820,95 @@ impl CallResolution {
             _ => None,
         }
     }
+}
+
+/// Resolution class of one backtrace stack frame against the code graph
+/// (issue #322). Modeled on [`CallResolution`]: a frame handle is never
+/// silently bound to an invented target.
+///
+/// The value set is **closed and stable**:
+///
+/// - `resolved` — the frame's `file:line` (or its module-path name) matched
+///   exactly one in-repo `Symbol`; the `FRAME_RESOLVES_TO` edge targets it.
+/// - `ambiguous` — two or more in-repo `Symbol`s matched; every candidate
+///   carries its own edge and no candidate is silently chosen.
+/// - `path_only` — the frame's file exists in the graph but no enclosing
+///   symbol contains the line (e.g. an optimized-out or macro-generated
+///   frame); the edge targets the `File` node.
+/// - `unresolved` — the frame names a repo-relative path that is absent from
+///   the resolved view (deleted or renamed since the log); the edge targets a
+///   `Diagnostic` node carrying the redacted frame text, never an invented
+///   symbol.
+///
+/// Frames into the standard library or a dependency are classified `external`
+/// in a per-signature tally and mint **no** edge, so `external` is not a member
+/// of this on-edge enum.
+///
+/// Adding this optional edge field is additive per
+/// `docs/schema/schema-versioning.md`; legacy edges simply lack it.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameResolution {
+    /// Exactly one in-repo `Symbol` matched the frame.
+    Resolved,
+    /// Two or more in-repo `Symbol`s matched; all candidates carry edges.
+    Ambiguous,
+    /// The frame's file exists but no enclosing symbol contains the line; the
+    /// edge targets the `File` node.
+    PathOnly,
+    /// The frame names a repo path absent from the resolved view; the edge
+    /// targets a `Diagnostic` marker.
+    Unresolved,
+}
+
+impl FrameResolution {
+    /// Returns the serialized resolution status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Ambiguous => "ambiguous",
+            Self::PathOnly => "path_only",
+            Self::Unresolved => "unresolved",
+        }
+    }
+
+    /// Parses a frame-resolution status from its wire string. Returns `None`
+    /// for unknown values.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "resolved" => Some(Self::Resolved),
+            "ambiguous" => Some(Self::Ambiguous),
+            "path_only" => Some(Self::PathOnly),
+            "unresolved" => Some(Self::Unresolved),
+            _ => None,
+        }
+    }
+}
+
+/// One structured backtrace stack frame captured from a runtime log
+/// (issues #319/#320/#322).
+///
+/// Redaction-safe by construction: `module_path` and `file_path` pass through
+/// the v1 redaction policy at capture time and `file_path` is normalized to a
+/// repository-relative form (or a generalized external-toolchain form) so no
+/// absolute host path or username enters the graph. Frames are **non-identity**:
+/// they never participate in the `ErrorSignature` record-ID hash preimage.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StackFrame {
+    /// Zero-based position of the frame in the captured backtrace.
+    pub frame_index: u32,
+    /// Redacted `module::path` of the frame, when the backtrace named one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module_path: Option<String>,
+    /// Redacted, repo-relative (or generalized external) file path, when the
+    /// backtrace named one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    /// One-based source line named by the frame, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
 }
 
 /// One JSONL graph record.
@@ -1180,6 +1275,18 @@ pub enum GraphRecord {
         /// pair refers to. Plaintext query substrate; never redacted.
         #[serde(skip_serializing_if = "Option::is_none")]
         review_side: Option<String>,
+        /// Commit SHA the review was anchored to for `pr_review` and
+        /// `pr_review_comment` records — the GitHub payload's `commit_id`, the
+        /// exact commit the reviewer looked at (issue #334). Populated whenever
+        /// the payload carries `commit_id`, with no `merged_at`-style gate: a
+        /// review commit is a real observed commit, not a throwaway test-merge.
+        /// Absent on `issue_comment` reviews (general PR-conversation comments
+        /// are not anchored to a commit). Plaintext query substrate per
+        /// `docs/schema/import-github.md` §8 (the plaintext-SHA carve-out);
+        /// never redacted. Legacy records lacking the field deserialize to
+        /// `None`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        review_commit_sha: Option<String>,
         /// User-context domain fields, flattened into node JSON.
         #[serde(flatten)]
         user_context: UserContextFields,
@@ -1209,6 +1316,16 @@ pub enum GraphRecord {
         /// (absence means "outside the resolution contract", not "resolved").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resolution: Option<CallResolution>,
+        /// Backtrace-frame resolution status (issue #322); present only on
+        /// `FRAME_RESOLVES_TO` edges minted by `eg resolve-frames`, absent
+        /// elsewhere (absence means "outside the frame-resolution contract").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_resolution: Option<FrameResolution>,
+        /// Zero-based index of the resolved backtrace frame (issue #322);
+        /// present alongside `frame_resolution` on `FRAME_RESOLVES_TO` edges,
+        /// absent elsewhere.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_index: Option<u32>,
         /// Git and bitemporal provenance for history-backed records.
         #[serde(skip_serializing_if = "Option::is_none")]
         temporal: Option<TemporalMetadata>,
@@ -1367,6 +1484,7 @@ impl GraphRecord {
             author: None,
             diff_hunk_handle: None,
             review_side: None,
+            review_commit_sha: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -1488,6 +1606,7 @@ impl GraphRecord {
             author: None,
             diff_hunk_handle: None,
             review_side: None,
+            review_commit_sha: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -1608,6 +1727,7 @@ impl GraphRecord {
             author: None,
             diff_hunk_handle: None,
             review_side: None,
+            review_commit_sha: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -1733,6 +1853,7 @@ impl GraphRecord {
             author: None,
             diff_hunk_handle: None,
             review_side: None,
+            review_commit_sha: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -1758,6 +1879,8 @@ impl GraphRecord {
             target,
             confidence,
             resolution: None,
+            frame_resolution: None,
+            frame_index: None,
             temporal: None,
             summary,
             producer: None,
@@ -1783,6 +1906,8 @@ impl GraphRecord {
             target,
             confidence,
             resolution: None,
+            frame_resolution: None,
+            frame_index: None,
             temporal: None,
             summary,
             producer: None,
@@ -1815,6 +1940,8 @@ impl GraphRecord {
             target,
             confidence,
             resolution: None,
+            frame_resolution: None,
+            frame_index: None,
             temporal: None,
             summary,
             producer: None,
@@ -1838,6 +1965,54 @@ impl GraphRecord {
     pub const fn resolution(&self) -> Option<CallResolution> {
         match self {
             Self::Edge { resolution, .. } => *resolution,
+            Self::Node { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches a backtrace-frame resolution status to an edge record
+    /// (issue #322). No-op on node and tombstone records.
+    #[must_use]
+    pub const fn with_frame_resolution(mut self, resolution: FrameResolution) -> Self {
+        if let Self::Edge {
+            frame_resolution, ..
+        } = &mut self
+        {
+            *frame_resolution = Some(resolution);
+        }
+        self
+    }
+
+    /// Attaches the zero-based backtrace frame index to an edge record
+    /// (issue #322). No-op on node and tombstone records.
+    #[must_use]
+    pub const fn with_frame_index(mut self, frame_index: u32) -> Self {
+        if let Self::Edge {
+            frame_index: fi, ..
+        } = &mut self
+        {
+            *fi = Some(frame_index);
+        }
+        self
+    }
+
+    /// Returns the backtrace-frame resolution status when this record is an
+    /// edge carrying one; `None` otherwise (issue #322).
+    #[must_use]
+    pub const fn frame_resolution(&self) -> Option<FrameResolution> {
+        match self {
+            Self::Edge {
+                frame_resolution, ..
+            } => *frame_resolution,
+            Self::Node { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Returns the zero-based backtrace frame index when this record is an edge
+    /// carrying one; `None` otherwise (issue #322).
+    #[must_use]
+    pub const fn frame_index(&self) -> Option<u32> {
+        match self {
+            Self::Edge { frame_index, .. } => *frame_index,
             Self::Node { .. } | Self::Tombstone { .. } => None,
         }
     }
@@ -2020,6 +2195,16 @@ impl GraphRecord {
     pub fn with_log(mut self, payload: LogPayload) -> Self {
         if let Self::Node { log, .. } = &mut self {
             *log = Some(Box::new(payload));
+        }
+        self
+    }
+
+    /// Sets the evidence-link citation list on a node record. No-op on non-node
+    /// records. An empty list clears the field back to `None`.
+    #[must_use]
+    pub fn with_evidence_links(mut self, links: Vec<EvidenceLink>) -> Self {
+        if let Self::Node { evidence_links, .. } = &mut self {
+            *evidence_links = if links.is_empty() { None } else { Some(links) };
         }
         self
     }
@@ -2620,6 +2805,14 @@ pub enum EdgeLabel {
     /// `codegraph.Commit`; emitted only when a seeded code graph resolves the
     /// PR's `merge_commit_sha` to exactly one `Commit`.
     MergedAs,
+    /// Project `Review` was anchored to a specific code-graph `Commit`
+    /// (issue #334; the review-side mirror of [`Self::MergedAs`]). FROM
+    /// `project.Review` TO `codegraph.Commit`; emitted only when a seeded code
+    /// graph resolves the review's `review_commit_sha` (the GitHub payload's
+    /// `commit_id`, the exact commit the reviewer looked at) to exactly one
+    /// `Commit`. "Anchored at this SHA" is never "approved all changes in a
+    /// range": it names the tree the review observed, not a verdict on it.
+    ReviewsCommit,
     /// Agent-memory node describes a failure on a code entity.
     FailedOn,
     /// Agent-memory node explains a code change.
@@ -2691,6 +2884,7 @@ impl EdgeLabel {
             "EXTERNAL_HANDLE" => Some(Self::ExternalHandle),
             "TOUCHES_FILE" => Some(Self::TouchesFile),
             "MERGED_AS" => Some(Self::MergedAs),
+            "REVIEWS_COMMIT" => Some(Self::ReviewsCommit),
             "FAILED_ON" => Some(Self::FailedOn),
             "EXPLAINS_CHANGE" => Some(Self::ExplainsChange),
             "REFERENCES_TASK" => Some(Self::ReferencesTask),
@@ -2732,6 +2926,7 @@ impl EdgeLabel {
                 | Self::ExternalHandle
                 | Self::TouchesFile
                 | Self::MergedAs
+                | Self::ReviewsCommit
                 | Self::FailedOn
                 | Self::ExplainsChange
                 | Self::ReferencesTask
@@ -2798,6 +2993,7 @@ impl EdgeLabel {
             Self::ExternalHandle => "EXTERNAL_HANDLE",
             Self::TouchesFile => "TOUCHES_FILE",
             Self::MergedAs => "MERGED_AS",
+            Self::ReviewsCommit => "REVIEWS_COMMIT",
             Self::FailedOn => "FAILED_ON",
             Self::ExplainsChange => "EXPLAINS_CHANGE",
             Self::ReferencesTask => "REFERENCES_TASK",

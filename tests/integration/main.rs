@@ -82,6 +82,7 @@ mod redaction_report;
 mod refresh;
 mod repair;
 mod repo_scope;
+mod resolve_frames;
 mod scan_logs;
 mod schema_versioning;
 mod semantic_drift;
