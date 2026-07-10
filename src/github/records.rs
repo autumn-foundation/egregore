@@ -330,7 +330,7 @@ fn resolve_merge_commit(
     if ctx.commit_index.is_empty() {
         return None;
     }
-    match ctx.commit_index.get(sha).map(Vec::as_slice) {
+    let detail = match ctx.commit_index.get(sha).map(Vec::as_slice) {
         Some([commit_id]) => {
             let edge = GraphRecord::edge(
                 EdgeLabel::MergedAs,
@@ -339,30 +339,15 @@ fn resolve_merge_commit(
                 None,
                 format!("PR #{number} merged as commit {sha}"),
             );
-            Some((edge, false))
+            return Some((edge, false));
         }
-        Some(ids) if ids.len() > 1 => Some((
-            commit_diagnostic(
-                ctx,
-                number,
-                sha,
-                task_id,
-                &format!("{} code-graph Commit records claim this SHA", ids.len()),
-            ),
-            true,
-        )),
+        Some(ids) if ids.len() > 1 => {
+            format!("{} code-graph Commit records claim this SHA", ids.len())
+        }
         // None or empty slice → unresolved (no matching Commit in the seed).
-        _ => Some((
-            commit_diagnostic(
-                ctx,
-                number,
-                sha,
-                task_id,
-                "no code-graph Commit record matches this SHA in the seeded store",
-            ),
-            true,
-        )),
-    }
+        _ => "no code-graph Commit record matches this SHA in the seeded store".to_owned(),
+    };
+    Some((commit_diagnostic(ctx, number, sha, task_id, &detail), true))
 }
 
 /// Builds a project-domain `Diagnostic` node for an unresolved merge commit

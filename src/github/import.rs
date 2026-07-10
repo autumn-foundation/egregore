@@ -94,8 +94,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     // Repo probe (auth state machine). Failures here may suppress state writes.
     client.probe_repo(opts.source_repo)?;
 
-    let file_index = load_file_index(opts.code_graph)?;
-    let commit_index = load_commit_index(opts.code_graph)?;
+    let (file_index, commit_index) = load_indexes(opts.code_graph)?;
     let mut state = prior_state;
     let mut graph = Graph::new();
     let mut emitted_count = 0usize;
@@ -342,40 +341,18 @@ fn handoff_record(source_repo: &str, transaction_time: &str, emitted: usize) -> 
     rec
 }
 
-/// Loads a `repo_relative_path -> [file_id]` index from a code-graph JSONL.
-fn load_file_index(code_graph: Option<&Path>) -> GithubResult<FileIndex> {
-    let Some(path) = code_graph else {
-        return Ok(FileIndex::new());
-    };
-    let jsonl = std::fs::read_to_string(path).map_err(|e| GithubError::Io {
-        detail: format!("read code-graph {}: {e}", path.display()),
-    })?;
-    let records = records_from_jsonl(&jsonl).map_err(|e| GithubError::Io {
-        detail: format!("parse code-graph: {e}"),
-    })?;
-    let mut index = FileIndex::new();
-    for rec in &records {
-        if let GraphRecord::Node {
-            id,
-            kind: NodeKind::File,
-            repo_relative_path: Some(p),
-            ..
-        } = rec
-        {
-            index.entry(p.clone()).or_default().push(id.clone());
-        }
-    }
-    Ok(index)
-}
-
-/// Loads a `commit_sha -> [commit_id]` index from a code-graph JSONL (#333).
+/// Loads both the `repo_relative_path -> [file_id]` and `commit_sha ->
+/// [commit_id]` indexes from a code-graph JSONL in a single read + parse pass.
 ///
-/// A `Commit` node carries its SHA in the `name` field (see `commit_record` in
-/// `history.rs`). A SHA claimed by more than one `Commit` record is ambiguous
-/// and is diagnosed rather than linked by [`records::pull_records`].
-fn load_commit_index(code_graph: Option<&Path>) -> GithubResult<CommitIndex> {
+/// A `File` node carries its path in `repo_relative_path`; a `Commit` node
+/// carries its SHA in the `name` field (see `commit_record` in `history.rs`).
+/// A SHA claimed by more than one `Commit` record is ambiguous and is diagnosed
+/// rather than linked by [`records::pull_records`] (#333).
+fn load_indexes(code_graph: Option<&Path>) -> GithubResult<(FileIndex, CommitIndex)> {
+    let mut files = FileIndex::new();
+    let mut commits = CommitIndex::new();
     let Some(path) = code_graph else {
-        return Ok(CommitIndex::new());
+        return Ok((files, commits));
     };
     let jsonl = std::fs::read_to_string(path).map_err(|e| GithubError::Io {
         detail: format!("read code-graph {}: {e}", path.display()),
@@ -383,19 +360,24 @@ fn load_commit_index(code_graph: Option<&Path>) -> GithubResult<CommitIndex> {
     let records = records_from_jsonl(&jsonl).map_err(|e| GithubError::Io {
         detail: format!("parse code-graph: {e}"),
     })?;
-    let mut index = CommitIndex::new();
     for rec in &records {
-        if let GraphRecord::Node {
-            id,
-            kind: NodeKind::Commit,
-            name: Some(sha),
-            ..
-        } = rec
-        {
-            index.entry(sha.clone()).or_default().push(id.clone());
+        match rec {
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::File,
+                repo_relative_path: Some(p),
+                ..
+            } => files.entry(p.clone()).or_default().push(id.clone()),
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::Commit,
+                name: Some(sha),
+                ..
+            } => commits.entry(sha.clone()).or_default().push(id.clone()),
+            _ => {}
         }
     }
-    Ok(index)
+    Ok((files, commits))
 }
 
 /// Advances `watermark` to `candidate` when it is lexically greater (RFC 3339
