@@ -32,7 +32,11 @@ claim, deterministically parsed but never verified. Raw log text never enters th
 graph; excerpts are `template-v1`-normalized, redacted, and bounded. Deterministic
 and byte-stable; CRLF and LF checkouts yield identical IDs. Unrecognized
 (binary/non-UTF-8) input exits 1 with a machine-readable diagnostic and no partial
-output. See `docs/cli/scan-logs.md` and `docs/schema/log-graph.md`.
+output. Add `--protected-raw-artifacts --protected-store <dir> --producer <id>`
+(issue #321) to also capture the log's post-redaction bytes into the #60 protected
+store as a `log_payload` blob (disabled by default; the graph never stores the
+handle; capture I/O failure exits 3 with no partial manifest). See
+`docs/cli/scan-logs.md` and `docs/schema/log-graph.md`.
 
 `eg inspect --data-dir` inspects an embedded store directly — no daemon, no
 network, no embeddings (issue #125, the daemon-free analog of #47). It reports

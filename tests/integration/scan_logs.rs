@@ -14,6 +14,10 @@ use serde_json::Value;
 
 const FIXED_TIME: &str = "2026-07-01T00:00:00Z";
 const REPO_ID: &str = "log-fixture-repo";
+/// Fixed capture timestamp for deterministic protected manifests (issue #321).
+const FIXED_CAPTURED_AT: &str = "2026-06-18T00:00:00Z";
+/// The secret embedded in the plain-text fixture's `[ERROR]` bootstrap line.
+const FIXTURE_SECRET: &str = "hunterSECRETtokenValueLong";
 
 fn egregore() -> Command {
     Command::cargo_bin("egregore").expect("binary should be built")
@@ -581,5 +585,364 @@ fn exemplar_cap_emits_diagnostic_and_keeps_default_cap() {
         events_for_repeated,
         log_graph::DEFAULT_EXEMPLAR_CAP,
         "the repeated signature keeps exactly the exemplar cap"
+    );
+}
+
+// ── Protected raw-log capture (issue #321) ───────────────────────────────────
+
+/// Runs `eg scan-logs` with protected capture enabled and returns the completed
+/// assertion (caller decides success/failure).
+fn scan_logs_capture(
+    plain: &Path,
+    repo: &Path,
+    out: &Path,
+    store: &Path,
+    producer: &str,
+) -> assert_cmd::assert::Assert {
+    egregore()
+        .arg("scan-logs")
+        .arg(plain)
+        .arg("--repo-path")
+        .arg(repo)
+        .arg("--out")
+        .arg(out)
+        .arg("--repo-id-override")
+        .arg(REPO_ID)
+        .arg("--protected-raw-artifacts")
+        .arg("--protected-store")
+        .arg(store)
+        .arg("--producer")
+        .arg(producer)
+        .arg("--captured-at")
+        .arg(FIXED_CAPTURED_AT)
+        .assert()
+}
+
+/// Returns the single manifest record of an enabled-capture protected store.
+fn only_manifest_record(store: &Path) -> Value {
+    let manifest =
+        fs::read_to_string(store.join("manifest.jsonl")).expect("manifest.jsonl must exist");
+    let lines: Vec<&str> = manifest.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "expected exactly one manifest record");
+    serde_json::from_str(lines[0]).expect("manifest record is valid JSON")
+}
+
+fn blob_count(store: &Path) -> usize {
+    fs::read_dir(store.join("blobs"))
+        .expect("blobs dir must exist")
+        .count()
+}
+
+// AC1: disabled by default — no store, no blob, no manifest.
+#[test]
+fn protected_capture_disabled_by_default_writes_nothing() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (plain, _) = write_fixtures(temp.path());
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+
+    egregore()
+        .arg("scan-logs")
+        .arg(&plain)
+        .arg("--repo-path")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&out)
+        .arg("--repo-id-override")
+        .arg(REPO_ID)
+        .assert()
+        .success();
+
+    assert!(out.exists(), "graph JSONL is still written");
+    assert!(
+        !store.exists(),
+        "protected store dir must not be created without the flag"
+    );
+    assert!(!store.join("blobs").exists(), "no blobs without the flag");
+    assert!(
+        !store.join("manifest.jsonl").exists(),
+        "no manifest without the flag"
+    );
+}
+
+// AC1: enabled — exactly one blob + one manifest entry, class log_payload.
+#[test]
+fn protected_capture_enabled_writes_one_blob_and_manifest_entry() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (plain, _) = write_fixtures(temp.path());
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+
+    let assert = scan_logs_capture(&plain, temp.path(), &out, &store, "op-1").success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let summary: Value = serde_json::from_str(stdout.trim()).expect("capture summary JSON line");
+    assert_eq!(summary["ok"], true);
+    assert_eq!(summary["protected_capture"]["source_class"], "log_payload");
+    assert_eq!(summary["protected_capture"]["stored"], true);
+    assert!(
+        summary["protected_capture"]["byte_len"]
+            .as_u64()
+            .expect("byte_len present")
+            > 0,
+        "captured byte_len must be positive"
+    );
+    let handle = summary["protected_capture"]["handle"]
+        .as_str()
+        .expect("handle present");
+    assert!(handle.starts_with("protected:v1:"));
+
+    let record = only_manifest_record(&store);
+    assert_eq!(record["source_class"], "log_payload");
+    assert_eq!(record["schema_version"], 1);
+    assert_eq!(record["handle"], handle);
+    assert_eq!(blob_count(&store), 1, "exactly one blob");
+}
+
+// AC3: recapturing an unchanged log 5× yields zero duplicate manifest entries.
+#[test]
+fn protected_capture_five_times_is_zero_duplicate() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (plain, _) = write_fixtures(temp.path());
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+
+    for _ in 0..5 {
+        scan_logs_capture(&plain, temp.path(), &out, &store, "op-1").success();
+    }
+    let manifest =
+        fs::read_to_string(store.join("manifest.jsonl")).expect("manifest.jsonl must exist");
+    assert_eq!(
+        manifest.lines().filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "5 recaptures → exactly one manifest entry"
+    );
+    assert_eq!(blob_count(&store), 1, "5 recaptures → exactly one blob");
+}
+
+// AC4: the graph JSONL never stores a protected handle.
+#[test]
+fn emitted_graph_never_contains_protected_handle() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (plain, _) = write_fixtures(temp.path());
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+
+    scan_logs_capture(&plain, temp.path(), &out, &store, "op-1").success();
+
+    let graph = fs::read_to_string(&out).expect("graph JSONL exists");
+    assert!(
+        !graph.contains("protected:v1:"),
+        "graph JSONL must never carry a protected handle"
+    );
+}
+
+// AC5: the stored blob is POST-REDACTION — carries the marker, not the secret.
+#[test]
+fn stored_blob_is_redacted_and_omits_the_secret() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (plain, _) = write_fixtures(temp.path());
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+
+    scan_logs_capture(&plain, temp.path(), &out, &store, "op-1").success();
+    let handle = only_manifest_record(&store)["handle"]
+        .as_str()
+        .expect("handle")
+        .to_owned();
+
+    let got = egregore()
+        .args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let blob = String::from_utf8(got).expect("utf8 blob");
+    assert!(
+        blob.contains("<REDACTED:"),
+        "the secret-bearing line must be stored as a redaction marker"
+    );
+    assert!(
+        !blob.contains(FIXTURE_SECRET),
+        "the raw secret must never reach the protected blob"
+    );
+}
+
+// AC5/AC7: `protected get` verifies + returns bytes and `list` shows a
+// log_payload entry with metadata only (no raw bytes).
+#[test]
+fn protected_get_and_list_expose_log_payload_metadata_only() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (plain, _) = write_fixtures(temp.path());
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+    let retrieved = temp.path().join("retrieved.log");
+
+    scan_logs_capture(&plain, temp.path(), &out, &store, "op-1").success();
+    let handle = only_manifest_record(&store)["handle"]
+        .as_str()
+        .expect("handle")
+        .to_owned();
+
+    egregore()
+        .args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .arg("--out")
+        .arg(&retrieved)
+        .assert()
+        .success();
+    assert!(retrieved.exists(), "retrieved file exists");
+    assert!(
+        !fs::read_to_string(&retrieved)
+            .unwrap()
+            .contains(FIXTURE_SECRET),
+        "retrieved bytes carry no raw secret"
+    );
+
+    let list = egregore()
+        .args(["protected", "list"])
+        .arg("--store")
+        .arg(&store)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let list_json: Value = serde_json::from_slice(&list).expect("list JSON");
+    assert_eq!(list_json["count"], 1);
+    let entry = &list_json["handles"][0];
+    assert_eq!(entry["source_class"], "log_payload");
+    assert!(entry["byte_len"].as_u64().unwrap() > 0);
+    // Metadata only: no raw payload byte field is present in list output.
+    let list_text = String::from_utf8(list).unwrap();
+    assert!(
+        !list_text.contains(FIXTURE_SECRET),
+        "list output never includes raw bytes"
+    );
+}
+
+// AC6: an unwritable store fails with a machine-readable diagnostic, a distinct
+// non-zero exit code, and leaves no partial manifest.
+#[test]
+fn protected_capture_store_failure_is_machine_readable_and_atomic() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (plain, _) = write_fixtures(temp.path());
+    let out = temp.path().join("log.graph.jsonl");
+    // A regular FILE where the store directory should be forces a store I/O
+    // failure (the root is not a real directory).
+    let store = temp.path().join("protected-file");
+    fs::write(&store, b"sentinel").expect("write blocking file");
+
+    scan_logs_capture(&plain, temp.path(), &out, &store, "op-1")
+        .code(3)
+        .stderr(predicates::str::contains("\"code\":\"store_io_error\""));
+
+    // No partial write: the blocking file is untouched and no manifest exists.
+    assert_eq!(
+        fs::read(&store).unwrap(),
+        b"sentinel",
+        "the blocking file must be untouched (no partial write)"
+    );
+    assert!(
+        !store.join("manifest.jsonl").exists(),
+        "no partial manifest on failure"
+    );
+}
+
+// AC6: capture enabled without --producer or --protected-store exits 1 with a
+// machine-readable missing_field diagnostic.
+#[test]
+fn protected_capture_enabled_requires_producer_and_store() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (plain, _) = write_fixtures(temp.path());
+    let out = temp.path().join("log.graph.jsonl");
+
+    // Missing --producer (store present).
+    egregore()
+        .arg("scan-logs")
+        .arg(&plain)
+        .arg("--repo-path")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&out)
+        .arg("--repo-id-override")
+        .arg(REPO_ID)
+        .arg("--protected-raw-artifacts")
+        .arg("--protected-store")
+        .arg(temp.path().join("protected"))
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("\"code\":\"missing_field\""));
+
+    // Missing --protected-store (producer present).
+    egregore()
+        .arg("scan-logs")
+        .arg(&plain)
+        .arg("--repo-path")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&out)
+        .arg("--repo-id-override")
+        .arg(REPO_ID)
+        .arg("--protected-raw-artifacts")
+        .arg("--producer")
+        .arg("op-1")
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("\"code\":\"missing_field\""));
+}
+
+// AC7: neither stdout nor stderr of an enabled capture ever echoes the secret.
+#[test]
+fn protected_capture_output_never_echoes_the_secret() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (plain, _) = write_fixtures(temp.path());
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+
+    let assert = scan_logs_capture(&plain, temp.path(), &out, &store, "op-1").success();
+    let output = assert.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains(FIXTURE_SECRET),
+        "capture output must never echo the raw secret"
+    );
+    assert!(
+        !combined.contains("<REDACTED:"),
+        "capture output reports handles/hashes only, not payload text"
+    );
+}
+
+// AC3/determinism: two enabled scans with a fixed captured_at produce a
+// byte-identical manifest.
+#[test]
+fn protected_manifest_is_byte_identical_across_runs() {
+    let mk = || {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (plain, _) = write_fixtures(temp.path());
+        let out = temp.path().join("log.graph.jsonl");
+        let store = temp.path().join("protected");
+        scan_logs_capture(&plain, temp.path(), &out, &store, "op-1").success();
+        let manifest = fs::read_to_string(store.join("manifest.jsonl")).expect("manifest exists");
+        (temp, manifest)
+    };
+    let (_a, manifest_a) = mk();
+    let (_b, manifest_b) = mk();
+    assert_eq!(
+        manifest_a, manifest_b,
+        "fixed captured_at must yield a byte-identical manifest"
     );
 }

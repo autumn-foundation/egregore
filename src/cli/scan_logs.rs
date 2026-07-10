@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::log_graph::{self, LogScanError};
+use crate::protected::{ProtectedPayloadClass, ProtectedStore};
 
 /// Handles `eg scan-logs <log_path> --repo-path <repo> --out <log.graph.jsonl>`.
 ///
@@ -10,12 +11,67 @@ use crate::log_graph::{self, LogScanError};
 /// to stdout and exits 1 with no partial output. Exemplar-cap diagnostics, when
 /// any, are printed as machine-readable JSON lines to stderr — never a silent
 /// drop.
+///
+/// With `--protected-raw-artifacts` (issue #321) the scanned log's
+/// POST-REDACTION raw bytes are additionally captured into the protected
+/// artifact store as a `log_payload` blob; the graph JSONL never stores the
+/// protected handle. A protected-capture I/O failure prints a machine-readable
+/// `store_io_error` envelope to stderr and exits 3 with no partial manifest.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn scan_logs(
     log_path: &Path,
     repo_path: &Path,
     out: &Path,
     repo_id_override: Option<&str>,
+    protected_raw_artifacts: bool,
+    protected_store: Option<&Path>,
+    producer: Option<&str>,
+    captured_at_override: Option<&str>,
 ) -> Result<()> {
+    // Validate the protected-capture flag group before doing any work, reusing
+    // the #60 `missing_field` diagnostic shape.
+    if protected_raw_artifacts {
+        for (value, field, flag) in [
+            (
+                protected_store.is_some(),
+                "protected_store",
+                "--protected-store",
+            ),
+            (producer.is_some(), "producer", "--producer"),
+        ] {
+            if !value {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "missing_field",
+                        "detail": {
+                            "field": field,
+                            "message": format!(
+                                "{flag} is required when --protected-raw-artifacts is set"
+                            )
+                        }
+                    }
+                });
+                eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+                process::exit(1);
+            }
+        }
+        if producer.is_some_and(|p| p.trim().is_empty()) {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "invalid_field",
+                    "detail": {
+                        "field": "producer",
+                        "message": "--producer must not be empty when --protected-raw-artifacts is set"
+                    }
+                }
+            });
+            eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+            process::exit(1);
+        }
+    }
+
     let repository_id = identity::compute_repository_identity(repo_path, repo_id_override).id;
     let transaction_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
@@ -36,12 +92,13 @@ pub(crate) fn scan_logs(
             }
         };
 
-    let producer = log_graph::log_importer_producer(scan.source_format_version, &transaction_time);
+    let producer_envelope =
+        log_graph::log_importer_producer(scan.source_format_version, &transaction_time);
     let mut graph = Graph::new();
     for record in scan.records {
         graph.push(record);
     }
-    let graph = graph.stamp_producer(&producer);
+    let graph = graph.stamp_producer(&producer_envelope);
     let jsonl = graph
         .to_jsonl()
         .context("failed to serialize log graph JSONL")?;
@@ -52,5 +109,79 @@ pub(crate) fn scan_logs(
     for diagnostic in &scan.diagnostics {
         eprintln!("{}", serde_json::to_string(diagnostic).unwrap_or_default());
     }
+
+    // Protected raw-artifact capture (issue #321): store the POST-REDACTION log
+    // bytes as a `log_payload` blob. The graph never holds the handle.
+    if protected_raw_artifacts {
+        let store_dir = protected_store.expect("validated present above");
+        let producer_id = producer.expect("validated present above");
+        let captured_at = captured_at_override.unwrap_or(&transaction_time);
+
+        // Materialize redacted bytes on demand; raw bytes never leave the helper.
+        let redacted = match log_graph::redacted_source_bytes(log_path) {
+            Ok(b) => b,
+            // The scan already succeeded above, so a read/format error here is a
+            // race; report it as a machine-readable capture failure, never raw
+            // bytes.
+            Err(err) => {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "store_io_error",
+                        "detail": {
+                            "message": format!("failed to materialize redacted log bytes: {err}")
+                        }
+                    }
+                });
+                eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+                process::exit(3);
+            }
+        };
+        let source_rel = log_graph::source_relative_path(repo_path, log_path);
+        let store = ProtectedStore::new(store_dir);
+        match store.capture_bytes(
+            ProtectedPayloadClass::LogPayload,
+            &source_rel,
+            &redacted,
+            producer_id,
+            env!("CARGO_PKG_VERSION"),
+            captured_at,
+            true,
+        ) {
+            Ok(report) => {
+                // Report only non-sensitive metadata (handle, hash, byte count,
+                // class) — never raw bytes or secrets.
+                let entry = &report.entries[0];
+                let envelope = serde_json::json!({
+                    "ok": true,
+                    "protected_capture": {
+                        "handle": entry.handle,
+                        "content_hash": entry.content_hash,
+                        "byte_len": entry.byte_len,
+                        "source_class": ProtectedPayloadClass::LogPayload.as_str(),
+                        "stored": entry.stored,
+                    }
+                });
+                println!("{}", serde_json::to_string(&envelope).expect("infallible"));
+            }
+            Err(e) => {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "store_io_error",
+                        "detail": {
+                            "message": format!(
+                                "protected store I/O failed at {}: {e}",
+                                store_dir.display()
+                            )
+                        }
+                    }
+                });
+                eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+                process::exit(3);
+            }
+        }
+    }
+
     Ok(())
 }

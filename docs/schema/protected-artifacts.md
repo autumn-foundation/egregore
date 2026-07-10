@@ -9,7 +9,7 @@ rule used by `eg protected` (issue #60).
 |-------|------|----------|-------|
 | `handle` | string | yes | `"protected:v1:<blake3 hex>"` — content-addressed stable ID |
 | `schema_version` | u32 | yes | Always `1` |
-| `source_class` | string | yes | One of `transcript`, `command_output`, `patch`, `task_narrative`, `report` |
+| `source_class` | string | yes | One of `transcript`, `command_output`, `patch`, `task_narrative`, `report`, `log_payload` |
 | `source_path` | string | when known | Repo-relative or absolute source path at capture time; `null` for synthetic payloads |
 | `content_hash` | string | yes | BLAKE3 hex of the full raw payload bytes |
 | `byte_len` | u64 | yes | Exact byte length of the raw payload |
@@ -58,11 +58,26 @@ ensures byte-identical output across re-imports and is how AC7 is verified.
 | `patch` | Raw patch bytes (unified diff) |
 | `task_narrative` | Task or issue narrative (markdown description, AC list, PRD body) |
 | `report` | Generated report (analysis, scan summary, evaluation result) |
+| `log_payload` | Post-redaction raw log bytes captured by `eg scan-logs` (issue #321) |
+
+### Class-extension rule (additive)
+
+The `source_class` vocabulary is **open to additive extension**.  Adding a new payload class —
+such as `log_payload` (issue #321) — is a backward-compatible change and does **not** bump
+`PROTECTED_SCHEMA_VERSION`.  The `ProtectedHandle` record shape is unchanged (a new class is a
+new *value* of an existing string field, not a new field), and the handle identity rule is
+frozen, so records written by an older binary keep resolving unchanged.  An older reader that
+does not recognise a new class string simply treats those records as an unknown class rather
+than mis-parsing existing records.  Only a change to the record *shape* (a new or removed field,
+or a changed identity rule) increments the schema version.
 
 ## Schema version
 
 `PROTECTED_SCHEMA_VERSION = 1`.  This constant is recorded in every `ProtectedHandle` record.
-Future additions to the record shape must increment this version and document a migration path.
+Adding a payload class is additive (see [Class-extension rule](#class-extension-rule-additive))
+and does **not** change this version.  Only a change to the record *shape* — a new or removed
+field, or a changed handle-identity rule — must increment this version and document a migration
+path.
 
 ## Security invariants
 

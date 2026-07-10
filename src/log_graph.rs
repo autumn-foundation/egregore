@@ -503,6 +503,61 @@ pub fn scan_log_records(
     })
 }
 
+/// Produces the POST-REDACTION whole-file bytes of a log for protected capture
+/// (issue #321).
+///
+/// Reads the log, normalizes CRLF/CR to LF (the same basis the scanner hashes),
+/// and redacts each line independently through the v1 redaction policy
+/// (`redaction::redact_value`, the same per-message gate the extractor applies),
+/// so a secret-bearing line is returned already collapsed to its
+/// `<REDACTED:…>` marker and the raw secret never reaches the protected blob.
+///
+/// This materializes redacted bytes ONLY when protected capture is requested;
+/// ordinary graph extraction ([`scan_log_records`]) never calls it and is
+/// unchanged. Raw, unredacted bytes never leave this function.
+///
+/// # Errors
+///
+/// Returns [`LogScanError::Read`] when the file cannot be read and
+/// [`LogScanError::UnrecognizedFormat`] for binary / non-UTF-8 input, matching
+/// [`scan_log_records`] so capture and extraction agree on what is a valid log.
+pub fn redacted_source_bytes(log_path: &Path) -> Result<Vec<u8>, LogScanError> {
+    let raw = std::fs::read(log_path).map_err(|source| LogScanError::Read {
+        path: log_path.to_path_buf(),
+        source,
+    })?;
+    let normalized = normalize_newlines(&raw);
+    if normalized.contains(&0) {
+        return Err(LogScanError::UnrecognizedFormat {
+            detail: "file contains NUL bytes; not a text log".to_owned(),
+        });
+    }
+    let text =
+        std::str::from_utf8(&normalized).map_err(|error| LogScanError::UnrecognizedFormat {
+            detail: format!("file is not valid UTF-8: {error}"),
+        })?;
+    // `split('\n')` (not `lines()`) preserves the exact normalized structure,
+    // including a trailing empty segment when the file ends in a newline, so the
+    // rejoined output is the normalized log with only secret-bearing lines
+    // collapsed to markers.
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&redaction::redact_value(line));
+    }
+    Ok(out.into_bytes())
+}
+
+/// Computes the repository-relative path of a log file under the repo root,
+/// exposed for protected capture so the blob handle uses the same repo-relative
+/// path the `LogSource` node records (issue #321).
+#[must_use]
+pub fn source_relative_path(repo_root: &Path, log_path: &Path) -> String {
+    repo_relative_path(repo_root, log_path)
+}
+
 /// Builds a log-domain edge record (`log:v1:` ID, schema version 1).
 fn log_edge(
     label: EdgeLabel,

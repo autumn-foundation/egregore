@@ -51,10 +51,15 @@ pub(crate) const MAX_STORE_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
 
 // ── Payload class ──────────────────────────────────────────────────────────────
 
-/// The five protected payload classes recognised by this slice.
+/// The protected payload classes recognised by this slice.
 ///
 /// `serde` serialises these as `snake_case` strings so JSONL records are human-
 /// readable and stable across binary versions.
+///
+/// The set is extended additively: adding a variant (e.g. `LogPayload`, issue
+/// #321) is backward-compatible and does NOT bump [`PROTECTED_SCHEMA_VERSION`],
+/// because an older reader that does not recognise a new class string simply
+/// treats its records as unknown rather than mis-parsing existing ones.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtectedPayloadClass {
@@ -68,6 +73,11 @@ pub enum ProtectedPayloadClass {
     TaskNarrative,
     /// Generated report (analysis, scan summary, evaluation result).
     Report,
+    /// Post-redaction raw log bytes captured by `eg scan-logs` (issue #321).
+    ///
+    /// Additive class extension: the stored bytes are the redacted,
+    /// newline-normalized log; the graph never stores this payload's handle.
+    LogPayload,
 }
 
 impl ProtectedPayloadClass {
@@ -82,6 +92,7 @@ impl ProtectedPayloadClass {
             Self::Patch => "patch",
             Self::TaskNarrative => "task_narrative",
             Self::Report => "report",
+            Self::LogPayload => "log_payload",
         }
     }
 }
@@ -103,6 +114,7 @@ pub fn parse_class(s: &str) -> Option<ProtectedPayloadClass> {
         "patch" => Some(ProtectedPayloadClass::Patch),
         "task_narrative" => Some(ProtectedPayloadClass::TaskNarrative),
         "report" => Some(ProtectedPayloadClass::Report),
+        "log_payload" => Some(ProtectedPayloadClass::LogPayload),
         _ => None,
     }
 }
@@ -1190,7 +1202,7 @@ impl ProtectedStore {
                         message: format!(
                             "payload class {class_str:?} is not supported; \
                              recognised classes: transcript, command_output, \
-                             patch, task_narrative, report",
+                             patch, task_narrative, report, log_payload",
                         ),
                     }),
                 });
@@ -1464,6 +1476,219 @@ impl ProtectedStore {
             entries: outcomes,
             stored_count,
             skipped_count,
+        })
+    }
+
+    /// Captures one in-memory payload (issue #321).
+    ///
+    /// Unlike [`Self::capture`], the bytes are supplied directly (already
+    /// redacted by the caller) instead of read from a source file, so this is
+    /// the entry point for capturing derived, post-redaction payloads such as
+    /// `eg scan-logs` log sources.  It reuses the exact same content-addressed
+    /// blob write, [`BlobTxn`] rollback, [`StoreLock`] serialization, manifest
+    /// dedup, manifest-derived authorization, and single atomic manifest commit
+    /// as [`Self::capture`], and the FROZEN handle identity — `class + "\n" +
+    /// content_hash + "\n" + source_path`, with `captured_at` excluded — so
+    /// recapturing unchanged bytes yields the same handle and produces zero
+    /// duplicate manifest entries.
+    ///
+    /// `content_hash` is BLAKE3 over the SUPPLIED bytes; the caller (e.g.
+    /// `scan-logs`) may hold an independent graph-side hash over unredacted bytes
+    /// — the two are deliberately distinct and never conflated.
+    ///
+    /// When `enabled` is `false` this is a preview: the content hash, byte
+    /// length, and handle are computed and returned but nothing is written and
+    /// the store directory is not created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on manifest or filesystem I/O failure, on an empty
+    /// `producer_id` in enabled mode, or on a non-RFC-3339 `captured_at`.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn capture_bytes(
+        &self,
+        class: ProtectedPayloadClass,
+        logical_source_path: &str,
+        bytes: &[u8],
+        producer_id: &str,
+        producer_version: &str,
+        captured_at: &str,
+        enabled: bool,
+    ) -> io::Result<CaptureReport> {
+        let content_hash = blake3::hash(bytes).to_hex().to_string();
+        let byte_len = bytes.len() as u64;
+        let handle =
+            ProtectedHandle::compute_handle(&class, &content_hash, Some(logical_source_path));
+
+        // Preview: compute identity only, write nothing, do not create the store.
+        if !enabled {
+            return Ok(CaptureReport {
+                enabled: false,
+                entries: vec![CaptureEntryOutcome {
+                    source_path: logical_source_path.to_owned(),
+                    handle,
+                    content_hash,
+                    byte_len,
+                    stored: false,
+                    diagnostic: None,
+                }],
+                stored_count: 0,
+                skipped_count: 0,
+            });
+        }
+
+        // Enabled-mode validation mirrors `capture` so the store boundary — not
+        // just the CLI — rejects an empty producer or malformed timestamp before
+        // any write.
+        if producer_id.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "producer_id must not be empty when capture is enabled",
+            ));
+        }
+        chrono::DateTime::parse_from_rfc3339(captured_at).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("captured_at must be RFC 3339 (got {captured_at:?}): {e}"),
+            )
+        })?;
+
+        // Reject a symlinked store root, create it, then re-check to close the
+        // TOCTOU gap (`create_private_dir` is a no-op when the path exists).
+        self.checked_root()?;
+        create_private_dir(&self.root)?;
+        self.checked_root()?;
+
+        // Serialize the read-modify-write cycle against concurrent captures.
+        let _lock = StoreLock::acquire(&self.root)?;
+
+        let mut existing = self.read_manifest()?;
+        let original_blob_hashes: std::collections::HashSet<String> =
+            Self::canonical_valid_records(&existing)
+                .iter()
+                .map(|h| h.content_hash.clone())
+                .collect();
+
+        let mut mutated = false;
+
+        // Purge corrupt duplicate-handle records up front (recovery/tampering),
+        // forcing a canonical single-record-per-handle rewrite — same rule as
+        // `capture`.
+        {
+            let mut counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for h in &existing {
+                *counts.entry(h.handle.clone()).or_insert(0) += 1;
+            }
+            if counts.values().any(|&n| n > 1) {
+                existing.retain(|h| counts.get(&h.handle) == Some(&1));
+                mutated = true;
+            }
+        }
+
+        // Rolls back a newly written blob if the manifest commit fails before it
+        // is durable.  Declared after `_lock` so it drops (and cleans up) while
+        // the store lock is still held.
+        let mut blob_txn = BlobTxn::default();
+
+        let blobs = self.checked_blobs_dir()?;
+
+        // Drop any existing record for the SAME payload unless it is fully valid,
+        // so a recapture writes one canonical replacement — identical semantics
+        // to `capture`.
+        existing.retain(|h| {
+            let recomputed = ProtectedHandle::compute_handle(
+                &h.source_class,
+                &h.content_hash,
+                h.source_path.as_deref(),
+            );
+            if h.handle != handle && recomputed != handle {
+                return true; // genuinely different payload — keep
+            }
+            recomputed == h.handle
+                && h.handle == handle
+                && h.byte_len == byte_len
+                && h.schema_version == PROTECTED_SCHEMA_VERSION
+                && chrono::DateTime::parse_from_rfc3339(&h.captured_at).is_ok()
+                && !h.producer_id.trim().is_empty()
+        });
+
+        let blob = blobs.join(&content_hash);
+        let already_exists = existing.iter().any(|h| h.handle == handle);
+
+        // Repair or write the content-addressed blob only when a VALID one is not
+        // already present (idempotent recapture writes nothing).
+        let blob_valid = blob_matches(&blob, &content_hash, byte_len);
+        if !blob_valid {
+            create_private_dir(&blobs)?;
+            // Re-validate after create to reject a symlink planted in the TOCTOU
+            // gap, mirroring `capture`.
+            require_real_dir_or_absent(&blobs, "blobs path")?;
+            // `write_private_file` stages to a sibling temp and atomically
+            // renames into place (never follows a symlink at the blob path).
+            write_private_file(&blob, bytes)?;
+            if !original_blob_hashes.contains(&content_hash) {
+                blob_txn.track(blob);
+            }
+        }
+
+        if !already_exists {
+            existing.push(ProtectedHandle {
+                handle: handle.clone(),
+                schema_version: PROTECTED_SCHEMA_VERSION,
+                source_class: class,
+                source_path: Some(logical_source_path.to_owned()),
+                content_hash: content_hash.clone(),
+                byte_len,
+                captured_at: captured_at.to_owned(),
+                producer_id: producer_id.to_owned(),
+                producer_version: producer_version.to_owned(),
+            });
+        }
+
+        if !blob_valid || !already_exists {
+            mutated = true;
+        }
+
+        // Authorization is manifest-derived: a producer that only reused/repaired
+        // an existing handle registered no new record and must not be handed a
+        // handle `get` would reject.  Report it as not stored with the same
+        // `already_captured` diagnostic as `capture`.
+        let (stored, stored_count, diagnostic) = if Self::is_authorized(&existing, producer_id) {
+            (true, 1usize, None)
+        } else {
+            (
+                false,
+                0usize,
+                Some(EntryDiagnostic {
+                    code: "already_captured".to_owned(),
+                    message: "payload already present for an existing handle; this \
+                              producer registered no new record and is not authorized"
+                        .to_owned(),
+                }),
+            )
+        };
+
+        // One atomic manifest rename commits both the handle and its
+        // authorization; on failure the early return drops `blob_txn` and rolls
+        // back the new blob, so no partial manifest and no orphan bytes remain.
+        if mutated {
+            self.write_manifest(&existing)?;
+            blob_txn.commit();
+        }
+
+        Ok(CaptureReport {
+            enabled: true,
+            entries: vec![CaptureEntryOutcome {
+                source_path: logical_source_path.to_owned(),
+                handle,
+                content_hash,
+                byte_len,
+                stored,
+                diagnostic,
+            }],
+            stored_count,
+            skipped_count: 0,
         })
     }
 
@@ -1850,6 +2075,130 @@ mod tests {
         assert_ne!(base, diff_hash);
         assert_ne!(base, diff_path);
         assert_ne!(base, no_path);
+    }
+
+    // ── Unit: log_payload class (issue #321) ───────────────────────────────────
+
+    #[test]
+    fn log_payload_class_round_trips_as_str_and_parse() {
+        assert_eq!(ProtectedPayloadClass::LogPayload.as_str(), "log_payload");
+        assert_eq!(
+            parse_class("log_payload"),
+            Some(ProtectedPayloadClass::LogPayload)
+        );
+        // serde uses the same snake_case string as the identity component.
+        let json = serde_json::to_string(&ProtectedPayloadClass::LogPayload).unwrap();
+        assert_eq!(json, "\"log_payload\"");
+        let back: ProtectedPayloadClass = serde_json::from_str("\"log_payload\"").unwrap();
+        assert_eq!(back, ProtectedPayloadClass::LogPayload);
+    }
+
+    #[test]
+    fn log_payload_handle_is_stable_and_distinct_from_other_classes() {
+        let hash = "abc123";
+        let h1 = ProtectedHandle::compute_handle(
+            &ProtectedPayloadClass::LogPayload,
+            hash,
+            Some("a.log"),
+        );
+        let h2 = ProtectedHandle::compute_handle(
+            &ProtectedPayloadClass::LogPayload,
+            hash,
+            Some("a.log"),
+        );
+        assert_eq!(h1, h2, "log_payload handles must be deterministic");
+        assert!(h1.starts_with(PROTECTED_HANDLE_PREFIX));
+        // Same content + path but a different class must yield a different handle.
+        let as_report =
+            ProtectedHandle::compute_handle(&ProtectedPayloadClass::Report, hash, Some("a.log"));
+        assert_ne!(h1, as_report);
+    }
+
+    #[test]
+    fn capture_bytes_disabled_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path().join("store"));
+        let report = store
+            .capture_bytes(
+                ProtectedPayloadClass::LogPayload,
+                "app.log",
+                b"redacted log bytes\n",
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                false,
+            )
+            .unwrap();
+        assert!(!report.enabled);
+        assert_eq!(report.stored_count, 0);
+        assert_eq!(report.entries.len(), 1);
+        assert!(!report.entries[0].stored);
+        assert!(
+            report.entries[0]
+                .handle
+                .starts_with(PROTECTED_HANDLE_PREFIX)
+        );
+        assert!(
+            !dir.path().join("store").exists(),
+            "no store dir in preview"
+        );
+    }
+
+    #[test]
+    fn capture_bytes_enabled_then_get_round_trips() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let bytes = b"line one\n<REDACTED:api_token:deadbeefcafe>\n";
+        let report = store
+            .capture_bytes(
+                ProtectedPayloadClass::LogPayload,
+                "logs/app.log",
+                bytes,
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap();
+        assert!(report.enabled);
+        assert_eq!(report.stored_count, 1);
+        let handle = report.entries[0].handle.clone();
+        // The producer that captured is authorized to retrieve the exact bytes.
+        let got = store.get(&handle, "op-1").unwrap();
+        assert_eq!(got, bytes);
+    }
+
+    #[test]
+    fn capture_bytes_recapture_is_zero_duplicate() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let bytes = b"stable redacted bytes\n";
+        let mut first_handle = None;
+        for _ in 0..5 {
+            let report = store
+                .capture_bytes(
+                    ProtectedPayloadClass::LogPayload,
+                    "app.log",
+                    bytes,
+                    "op-1",
+                    "0.1.0",
+                    fixed_ts(),
+                    true,
+                )
+                .unwrap();
+            let h = report.entries[0].handle.clone();
+            first_handle.get_or_insert_with(|| h.clone());
+            assert_eq!(first_handle.as_deref(), Some(h.as_str()));
+        }
+        let manifest =
+            fs::read_to_string(dir.path().join("manifest.jsonl")).expect("manifest exists");
+        assert_eq!(
+            manifest.lines().filter(|l| !l.is_empty()).count(),
+            1,
+            "recapture must not duplicate the record"
+        );
+        let blob_count = fs::read_dir(dir.path().join("blobs")).unwrap().count();
+        assert_eq!(blob_count, 1, "exactly one blob");
     }
 
     #[test]
