@@ -108,7 +108,11 @@ before enforcing the strict v1 body shape. So an unsupported/newer catalog that
 also adds or renames fields is still reported as `unknown_schema_version`, not
 `malformed_json` — the version signal is never masked by the strict-shape check.
 Only supported-version documents are then held to the strict v1 shape (where a
-stray field is `malformed_json`).
+stray or wrong-type field is `malformed_json`). The `malformed_json` envelope is
+redaction-safe: it carries a stable code plus a value-free failure location
+(`{ "code": "malformed_json", "line": <n>, "column": <n>, "category": "…" }`) and
+never echoes catalog field values. A wrong-type field would otherwise leak its
+value through `serde_json`'s raw message, so that message is deliberately dropped.
 
 ## BLAKE3 canonical hash-pin contract
 

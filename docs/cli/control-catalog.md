@@ -76,9 +76,14 @@ documents are then held to the strict v1 shape, where an unknown/stray field is
 
 - Missing/unreadable `--catalog` file:
   `{ "code": "catalog_read_error", "path": "…", "message": "…" }`
-- Malformed JSON (structurally broken, missing `schema_version`, or a stray
-  field in a supported-version document):
-  `{ "code": "malformed_json", "message": "…" }`
+- Malformed JSON (structurally broken, missing `schema_version`, a wrong-type
+  field, or a stray field in a supported-version document):
+  `{ "code": "malformed_json", "line": <n>, "column": <n>, "category": "syntax|data|eof|io" }`.
+  The envelope carries only a stable code plus the value-free failure location
+  (1-based `line`/`column`) and serde `category`; it never echoes catalog field
+  values. A wrong-type field (e.g. a string where a number is expected) makes
+  `serde_json`'s raw message name the offending value, so the raw message is
+  deliberately dropped to honor the redaction-safe error contract.
 - Unknown schema version:
   `{ "code": "unknown_schema_version", "version": { "domain": "…", "kind": "…", "version": 2 } }`
 - Unknown evidence class:

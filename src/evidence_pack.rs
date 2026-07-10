@@ -184,9 +184,20 @@ pub struct ControlCatalog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogError {
     /// The document was not well-formed JSON or did not match the catalog shape.
+    ///
+    /// Carries only value-free diagnostics from the serde error — the 1-based
+    /// line and column of the failure and its stable category — never the raw
+    /// `serde_json::Error` message, which for a wrong-type field echoes the
+    /// offending catalog value (e.g. `invalid type: string "SECRET", expected
+    /// u32`) and would violate the module's redaction-safe error contract.
     Json {
-        /// Parser error message.
-        message: String,
+        /// 1-based line of the parse failure (`serde_json::Error::line`).
+        line: usize,
+        /// 1-based column of the parse failure (`serde_json::Error::column`).
+        column: usize,
+        /// Stable failure category from `serde_json::Error::classify`:
+        /// `"io"`, `"syntax"`, `"data"`, or `"eof"`.
+        category: &'static str,
     },
     /// The schema-version tuple was not the recognized `(control_catalog, ControlCatalog, 1)`.
     UnknownSchemaVersion {
@@ -257,9 +268,15 @@ impl CatalogError {
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         match self {
-            Self::Json { message } => serde_json::json!({
+            Self::Json {
+                line,
+                column,
+                category,
+            } => serde_json::json!({
                 "code": self.code(),
-                "message": message,
+                "line": line,
+                "column": column,
+                "category": category,
             }),
             Self::UnknownSchemaVersion {
                 domain,
@@ -369,6 +386,27 @@ struct SchemaVersionTupleProbe {
     version: u32,
 }
 
+/// Maps a `serde_json::Error` to a redaction-safe [`CatalogError::Json`].
+///
+/// A wrong-type field makes `serde_json::Error::to_string()` embed the offending
+/// catalog value (e.g. `invalid type: string "SECRET", expected u32`). Capturing
+/// only the 1-based line/column and the stable `classify` category keeps the
+/// error envelope value-free, honoring the module's redaction-safe contract.
+fn sanitize_json_error(error: &serde_json::Error) -> CatalogError {
+    use serde_json::error::Category;
+    let category = match error.classify() {
+        Category::Io => "io",
+        Category::Syntax => "syntax",
+        Category::Data => "data",
+        Category::Eof => "eof",
+    };
+    CatalogError::Json {
+        line: error.line(),
+        column: error.column(),
+        category,
+    }
+}
+
 /// Parses and validates a control catalog document.
 ///
 /// Pure: no I/O. Line endings are normalized (`\r\n` -> `\n`) before parsing as
@@ -398,9 +436,7 @@ pub fn parse_catalog(text: &str) -> Result<ControlCatalog, CatalogError> {
     // A structurally broken document or one missing `schema_version` fails the
     // probe and maps to `malformed_json`.
     let probe: SchemaVersionProbe =
-        serde_json::from_str(&normalized).map_err(|error| CatalogError::Json {
-            message: error.to_string(),
-        })?;
+        serde_json::from_str(&normalized).map_err(|error| sanitize_json_error(&error))?;
 
     if !is_known_control_catalog_schema_version(
         &probe.schema_version.domain,
@@ -418,9 +454,7 @@ pub fn parse_catalog(text: &str) -> Result<ControlCatalog, CatalogError> {
     // the document to the exact v1 body; unknown fields here still map to
     // `malformed_json`.
     let raw: RawCatalog =
-        serde_json::from_str(&normalized).map_err(|error| CatalogError::Json {
-            message: error.to_string(),
-        })?;
+        serde_json::from_str(&normalized).map_err(|error| sanitize_json_error(&error))?;
 
     let schema_version = CatalogSchemaVersion {
         domain: raw.schema_version.domain,
@@ -964,6 +998,61 @@ mod tests {
         let err = parse_catalog("{ not valid json").expect_err("malformed json must fail");
         assert_eq!(err.code(), "malformed_json");
         assert!(matches!(err, CatalogError::Json { .. }));
+    }
+
+    #[test]
+    fn malformed_json_error_does_not_leak_field_values() {
+        // A wrong-type `schema_version.version` (string, not u32) makes
+        // serde name the offending value in its raw message. The sanitized
+        // error envelope must expose only line/column/category, never the value.
+        let version_json = r#"{
+            "catalog_id": "x",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": "LEAK_SENTINEL_9271" },
+            "controls": []
+        }"#;
+        let err = parse_catalog(version_json).expect_err("wrong-type version must fail");
+        assert_eq!(err.code(), "malformed_json");
+        assert!(matches!(err, CatalogError::Json { .. }));
+        let rendered = serde_json::to_string(&err.to_json()).expect("serialize error envelope");
+        assert!(
+            rendered.contains("\"code\":\"malformed_json\""),
+            "envelope must carry the stable code: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"line\":"),
+            "envelope must carry a line field: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"column\":"),
+            "envelope must carry a column field: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"category\":"),
+            "envelope must carry a category field: {rendered}"
+        );
+        assert!(
+            !rendered.contains("LEAK_SENTINEL_9271"),
+            "sanitized error must not echo the catalog field value: {rendered}"
+        );
+
+        // A wrong-type `controls` (string, not array) carrying the same sentinel
+        // must likewise never appear in the error output.
+        let controls_json = r#"{
+            "catalog_id": "x",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+            "controls": "LEAK_SENTINEL_9271"
+        }"#;
+        let err = parse_catalog(controls_json).expect_err("wrong-type controls must fail");
+        assert_eq!(err.code(), "malformed_json");
+        let rendered = serde_json::to_string(&err.to_json()).expect("serialize error envelope");
+        assert!(
+            rendered.contains("\"code\":\"malformed_json\""),
+            "envelope must carry the stable code: {rendered}"
+        );
+        assert!(
+            !rendered.contains("LEAK_SENTINEL_9271"),
+            "sanitized error must not echo the catalog field value: {rendered}"
+        );
     }
 
     #[test]

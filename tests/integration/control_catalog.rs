@@ -179,6 +179,39 @@ fn malformed_json_exits_two() {
 }
 
 #[test]
+fn malformed_catalog_error_is_redaction_safe() {
+    // A wrong-type field (string where a u32 is expected) makes serde name the
+    // offending value in its raw message. The stderr error envelope must expose
+    // only a stable code plus a value-free location, never the catalog value —
+    // the module's redaction-safe error contract (Codex P2, round 4).
+    let bad = r#"{
+        "catalog_id": "x",
+        "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": "LEAK_SENTINEL_9271" },
+        "controls": []
+    }"#;
+    let (_temp, path) = write_temp("wrong_type_field.json", bad);
+    let output = egregore()
+        .args(["audit", "control-catalog", "--catalog"])
+        .arg(&path)
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("LEAK_SENTINEL_9271"),
+        "stderr must not echo the catalog field value: {stderr}"
+    );
+    let err: Value = serde_json::from_slice(&output.stderr).expect("stderr json");
+    assert_eq!(err["code"], "malformed_json");
+    assert!(err.get("line").is_some(), "envelope must carry line");
+    assert!(err.get("column").is_some(), "envelope must carry column");
+    assert!(
+        err.get("category").is_some(),
+        "envelope must carry category"
+    );
+}
+
+#[test]
 fn unknown_field_exits_two_and_reports_malformed_json() {
     // An off-schema catalog with an extra top-level key must be rejected, not
     // silently normalized — otherwise its hash-pin would collide with the
