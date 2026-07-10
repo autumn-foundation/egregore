@@ -5,11 +5,16 @@
 //! wider #123 `deps` label set with an explicit `unresolved` category.
 #![allow(missing_docs, clippy::similar_names, clippy::doc_markdown)]
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command as GitCommand, Stdio},
+};
 
 use aletheia_egregore::{
     CallResolution, EdgeLabel, GraphRecord, NodeKind, SourceSpan, TemporalMetadata,
     ir::{Graph, SCHEMA_VERSION, stable_id},
+    scan_repository_history,
 };
 use assert_cmd::Command;
 
@@ -1547,4 +1552,137 @@ fn data_dir_store_returns_same_reachable_set() {
     graph_ids.sort_unstable();
     store_ids.sort_unstable();
     assert_eq!(graph_ids, store_ids, "graph and store views must agree");
+}
+
+// ---------------------------------------------------------------------------
+// Regression (issue #253, Codex P1): the temporal `--at <sha>` filter must
+// preserve outbound same-file dependency edges from a REAL `scan-history` run.
+// The other `--at` tests hand-stamp their GraphRecords, so this drives the
+// genuine scan-history extractor over a temp Git repo end-to-end and asserts a
+// same-file CALLS edge survives the temporal filter (mirrors the churn/ownership
+// real-history fixture pattern that uses the in-process `scan_repository_history`
+// API rather than the CLI binary).
+// ---------------------------------------------------------------------------
+
+fn git_run<const N: usize>(repo: &Path, args: [&str; N]) {
+    let output = GitCommand::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("git should execute");
+    assert!(
+        output.status.success(),
+        "git command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn at_over_real_scan_history_preserves_outbound_dependency_edges() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("repo src dir");
+
+    git_run(&repo, ["init"]);
+    git_run(&repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git_run(&repo, ["config", "user.name", "Codegraph Test"]);
+    git_run(&repo, ["config", "core.autocrlf", "false"]);
+    git_run(&repo, ["config", "commit.gpgsign", "false"]);
+
+    // Same-file call chain: caller() -> helper(), both defined in src/lib.rs.
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn caller() {\n    helper();\n}\n\npub fn helper() {}\n",
+    )
+    .expect("write source");
+    git_run(&repo, ["add", "."]);
+    let status = GitCommand::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["commit", "-m", "same-file call chain"])
+        .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+        .stdin(Stdio::null())
+        .output()
+        .expect("git commit should execute");
+    assert!(status.status.success(), "git commit failed");
+
+    let sha = {
+        let out = GitCommand::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .stdin(Stdio::null())
+            .output()
+            .expect("git rev-parse");
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned()
+    };
+
+    // Drive the REAL scan-history extractor (in-process API, matching the churn
+    // and ownership history fixtures) and serialize to a history graph JSONL.
+    let jsonl = scan_repository_history(&repo)
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let graph = temp.path().join("history.graph.jsonl");
+    fs::write(&graph, &jsonl).expect("write history graph");
+
+    // transitive-callees caller --at <sha>: the outbound same-file CALLS edge
+    // must NOT be dropped by the temporal filter.
+    let (header, rows) = run_query(&[
+        "query",
+        "transitive-callees",
+        "caller",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--at",
+        &sha,
+    ]);
+    assert_eq!(header["ok"], true);
+    assert_eq!(header["at_commit"], sha);
+    assert!(
+        header["total_reachable"].as_u64().unwrap() >= 1,
+        "the same-file dependency edge must survive --at; got {header}"
+    );
+
+    let reach = reachable_rows(&rows);
+    let helper = reach
+        .iter()
+        .find(|r| r["name"].as_str() == Some("helper"))
+        .unwrap_or_else(|| panic!("helper must be reachable as-of {sha}: {rows:?}"));
+    assert_eq!(helper["repo_relative_path"], "src/lib.rs");
+    // Reached via a CALLS hop — the outbound dependency edge, not some other label.
+    let via_calls = helper["path"]
+        .as_array()
+        .expect("path array")
+        .iter()
+        .any(|step| step["edge_label"].as_str() == Some("CALLS"));
+    assert!(
+        via_calls,
+        "helper must be reachable via a CALLS edge preserved by --at: {helper}"
+    );
+
+    // AC5 tie-in: `query deps caller --at <sha>` must also list helper.
+    let (_, dep_rows) = run_query(&[
+        "query",
+        "deps",
+        "caller",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--at",
+        &sha,
+    ]);
+    assert!(
+        dep_rows
+            .iter()
+            .any(|r| r["category"].as_str() == Some("dependency")
+                && r["name"].as_str() == Some("helper")),
+        "deps --at must list the same-file helper dependency: {dep_rows:?}"
+    );
 }
