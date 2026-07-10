@@ -105,6 +105,25 @@ PR counts as unapproved. The comparison uses fields available today (the review'
 gap, which compares an approval against the PR's final HEAD commit and stays
 `capability_unavailable` until #334 lands.
 
+### Coverage-link edges are included as citable pack content
+
+The specific `REFERENCES_TASK` edges that substantiate an approval — each linking
+an **included** approving `Review` to an **included** merged-in-window PR — are
+themselves included in the pack, in the `review_coverage` section, as scrubbed +
+BLAKE3-hashed records ordered by the same `(valid_time, record_id)` key as every
+other section row. So `approved_pr_count` is backed by present, hashed records a
+consumer and the offline `verify` can substantiate, rather than by a relationship
+the pack never carries. The `review_coverage` measurement's
+`approval_link_edge_ids` cites exactly these included edges. A link edge carries
+no intrinsic valid time, so it is stamped with its approving review's valid time —
+the instant the approval relationship became valid, an in-window value, not a
+fabricated one — which makes it window-consistent and lets it flow through the
+ordinary scrub/hash/manifest-count pipeline with no special case. Only the edges
+that actually back the coverage count are included: unrelated `REFERENCES_TASK`
+edges, and links to out-of-window or non-approving reviews, never appear. These
+edges are counted in `manifest.included_record_counts` (trust class `other`) and
+`manifest.tuple_counts` (`REFERENCES_TASK/v1`).
+
 ## Catalog integration and the three-way class outcome
 
 Every class the control maps becomes a section. A class is **available** when
@@ -181,6 +200,14 @@ could mark the required CC8.1 `Reviews` class available and let a relaxed
 
 The per-verdict block is: `required_classes`, `citation` (with per-trust-class
 tallies), `review_coverage`, `integrity`, `safety`.
+
+The assemble-time `safety` verdict runs the **same whole-artifact scan** as
+`verify` (below): it inspects the entire serialized pack — every scrubbed record
+*and* every non-record text field (`manifest.control_title` echoed from a
+`--catalog`, gap/diagnostic details, verdict details, section and top-level
+disclaimers) — before the pack is returned. A secret injected into a non-record
+field therefore fails the assembled `safety` verdict (and `verdicts.ok`) rather
+than being serialized to stdout while `safety.passed` wrongly reads `true`.
 
 ### `review_coverage` gates only review-requiring controls
 
@@ -282,7 +309,13 @@ Re-verifies an assembled pack offline and read-only:
   manifest window.
 
 Exit 0 all checks pass, 1 any fails (report still printed), 2 unreadable or
-unparseable pack.
+unparseable pack. A parse failure (exit 2) emits a **sanitized** `pack_parse_error`
+envelope carrying only the source path, a stable `category` (`io` / `syntax` /
+`data` / `eof`), and the 1-based `line` / `column` — never the raw `serde_json`
+message. serde's `Display` embeds the offending **value** for a wrong-typed field
+(e.g. `invalid type: string "…", expected usize`), so a secret in a mistyped pack
+field would otherwise leak; the envelope mirrors the catalog parser's redaction-safe
+error contract instead.
 
 ## Determinism, redaction, and safety
 

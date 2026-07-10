@@ -743,7 +743,7 @@ pub fn load_default_catalog() -> ControlCatalog {
 
 use crate::bundle::{BundleRecord, VerificationVerdict, scrub_record};
 use crate::citation_audit::{CitationStatus, citation_trust_class, classify_record_external};
-use crate::ir::GraphRecord;
+use crate::ir::{GraphRecord, TemporalMetadata};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Verbatim disclaimer carried in every assembled pack manifest (AC10).
@@ -928,6 +928,13 @@ pub struct ReviewCoverageMeasurement {
     /// IDs of merged PRs lacking an approving review, sorted.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub unapproved_pr_ids: Vec<String>,
+    /// Record IDs of the coverage-substantiating `REFERENCES_TASK` edges included
+    /// in the `review_coverage` section, sorted (Codex round-11 Finding C). These
+    /// are the exact edges linking an included approving review to an included
+    /// merged PR, so a consumer can trace `approved_pr_count` to hashed pack
+    /// records rather than to a relationship the pack never carries.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub approval_link_edge_ids: Vec<String>,
 }
 
 /// One evidence-class section of an assembled pack (AC1/AC7).
@@ -1237,6 +1244,30 @@ fn is_approving_review(record: &GraphRecord) -> bool {
     )
 }
 
+/// Stamps a coverage-substantiating link edge with the valid time of its
+/// approving review (Codex round-11 Finding C).
+///
+/// A `REFERENCES_TASK` edge carries no intrinsic valid time, so without a stamp
+/// it could not be a window-consistent, canonically-ordered pack record. The
+/// approval relationship becomes valid the moment the approving review is
+/// submitted, so its valid time is the review's own — an in-window instant that
+/// is genuine, not fabricated. The stamped edge then flows through the ordinary
+/// scrub/hash/section pipeline like any other record, passing `verify_pack`'s
+/// window-consistency, integrity, and manifest-count checks with no special case.
+fn stamp_edge_valid_time(mut edge: GraphRecord, valid_time: &str) -> GraphRecord {
+    if let GraphRecord::Edge { temporal, .. } = &mut edge {
+        *temporal = Some(TemporalMetadata {
+            git_commit: String::new(),
+            git_parent_commits: Vec::new(),
+            valid_time: valid_time.to_owned(),
+            author_time: None,
+            observed_at: valid_time.to_owned(),
+            valid_time_source: Some("approving_review_valid_time".to_owned()),
+        });
+    }
+    edge
+}
+
 /// Scrubs, hashes, and canonically orders a set of records for a section.
 fn build_section_records(records: Vec<GraphRecord>) -> Vec<BundleRecord> {
     let mut rows: Vec<BundleRecord> = records
@@ -1469,36 +1500,53 @@ pub fn assemble_pack(
     // uses fields available today (`merged_at`); it is distinct from the
     // #334-degraded `approval_precedes_final_head` gap, which compares against the
     // final HEAD commit and stays capability-unavailable.
-    let approving_targets: BTreeSet<String> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Edge {
-                label,
-                source,
-                target,
-                ..
-            } if label.as_str() == "REFERENCES_TASK" => {
-                // The referenced PR's merge time. A target with no resolvable
-                // `merged_at` is not a windowable merged PR, so no approval can be
-                // gated by it.
-                let merged_at = records
-                    .iter()
-                    .find(|rec| rec.id() == target)
-                    .and_then(merged_pr_merge_time)
-                    .and_then(parse_rfc3339)?;
-                let approving = records.iter().any(|rec| {
-                    rec.id() == source
-                        && is_approving_review(rec)
-                        && resolve_valid_time(rec).is_some_and(|vt| {
-                            in_window(&vt, window)
-                                && parse_rfc3339(&vt).is_some_and(|rt| rt <= merged_at)
-                        })
-                });
-                approving.then(|| target.clone())
+    // In one pass, collect both the approved-PR targets AND the specific edges
+    // that substantiate them (Codex round-11 Finding C). An edge substantiates
+    // approval when its source is an approving review resolving in-window at or
+    // before the referenced PR's merge time. Only edges whose target is an
+    // INCLUDED merged-in-window PR (`merged_pr_ids`) — the exact edges backing the
+    // coverage count — are captured for inclusion, so the pack carries neither
+    // unrelated links nor links to out-of-window PRs.
+    let mut approving_targets: BTreeSet<String> = BTreeSet::new();
+    let mut coverage_link_edges: Vec<GraphRecord> = Vec::new();
+    for record in records {
+        let GraphRecord::Edge {
+            label,
+            source,
+            target,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if label.as_str() != "REFERENCES_TASK" {
+            continue;
+        }
+        // The referenced PR's merge time. A target with no resolvable `merged_at`
+        // is not a windowable merged PR, so no approval can be gated by it.
+        let Some(merged_at) = records
+            .iter()
+            .find(|rec| rec.id() == target)
+            .and_then(merged_pr_merge_time)
+            .and_then(parse_rfc3339)
+        else {
+            continue;
+        };
+        let approving_review = records.iter().find(|rec| {
+            rec.id() == source
+                && is_approving_review(rec)
+                && resolve_valid_time(rec).is_some_and(|vt| {
+                    in_window(&vt, window) && parse_rfc3339(&vt).is_some_and(|rt| rt <= merged_at)
+                })
+        });
+        if let Some(review) = approving_review {
+            approving_targets.insert(target.clone());
+            if merged_pr_ids.contains(target) {
+                let review_vt = resolve_valid_time(review).unwrap_or_default();
+                coverage_link_edges.push(stamp_edge_valid_time(record.clone(), &review_vt));
             }
-            _ => None,
-        })
-        .collect();
+        }
+    }
     let unapproved_pr_ids: Vec<String> = merged_pr_ids
         .iter()
         .filter(|id| !approving_targets.contains(*id))
@@ -1513,6 +1561,18 @@ pub fn assemble_pack(
         approved_pr_count as f64 / merged_pr_count as f64
     };
     let review_coverage_passed = coverage >= min_review_coverage;
+
+    // Scrub + hash + canonically order the substantiating link edges once. They
+    // populate the `review_coverage` section (co-located with the measurement they
+    // back) and are cited by the measurement's `approval_link_edge_ids`.
+    let coverage_link_rows = build_section_records(coverage_link_edges);
+    let mut approval_link_edge_ids: Vec<String> = coverage_link_rows
+        .iter()
+        .map(|br| br.record.id().to_owned())
+        .collect();
+    approval_link_edge_ids.sort();
+    approval_link_edge_ids.dedup();
+
     let review_measurement = ReviewCoverageMeasurement {
         merged_pr_count,
         approved_pr_count,
@@ -1520,6 +1580,7 @@ pub fn assemble_pack(
         min_required: min_review_coverage,
         passed: review_coverage_passed,
         unapproved_pr_ids,
+        approval_link_edge_ids,
     };
 
     // --- build sections in catalog-class order ---
@@ -1557,7 +1618,9 @@ pub fn assemble_pack(
             });
         }
         let records_for_class = if is_review_coverage {
-            Vec::new()
+            // The coverage-substantiating link edges (Codex round-11 Finding C):
+            // hashed, citable records backing the coverage measurement.
+            coverage_link_rows.clone()
         } else {
             in_window_by_class
                 .remove(class.as_wire())
@@ -1600,15 +1663,21 @@ pub fn assemble_pack(
     let (citation_tallies, code_pass, non_code_pass) = citation_view(&row_refs);
     let citation_ok = code_pass && non_code_pass;
 
-    // --- integrity + safety are structurally guaranteed at assemble time ---
+    // --- integrity is structurally guaranteed at assemble time ---
     let integrity = VerificationVerdict {
         passed: true,
         detail: "records hashed over scrubbed form; sections canonically ordered".to_owned(),
     };
-    let (safety_passed, safety_detail) = pack_safety(&all_section_rows);
+    // Safety scans the WHOLE assembled artifact (records AND every non-record text
+    // field), identical to `verify_pack` (Codex round-11 Finding A). It cannot run
+    // until the pack exists — the scan reads the pack's own fields — so a
+    // placeholder holds the slot here and the real verdict replaces it after the
+    // pack is constructed, below. This keeps a secret echoed into a non-record
+    // field (a malicious `--catalog` control title, a diagnostic detail) from
+    // being serialized while the assembled safety verdict wrongly reads `passed`.
     let safety = VerificationVerdict {
-        passed: safety_passed,
-        detail: safety_detail,
+        passed: true,
+        detail: String::new(),
     };
 
     let required_passed = required_unavailable.is_empty();
@@ -1661,14 +1730,14 @@ pub fn assemble_pack(
     // the explicit applicability guard keeps that intent legible.
     let review_coverage_gate_ok = !review_coverage.applicable || review_coverage.passed;
 
-    let ok = required_passed
-        && citation_ok
-        && review_coverage_gate_ok
-        && integrity.passed
-        && safety.passed;
+    // `ok` is finalized after the whole-artifact safety scan runs on the built
+    // pack (below); the non-safety gates are fixed here.
+    let gates_ok_without_safety =
+        required_passed && citation_ok && review_coverage_gate_ok && integrity.passed;
 
     let verdicts = PackVerdicts {
-        ok,
+        // Placeholder; recomputed once safety is known.
+        ok: gates_ok_without_safety,
         required_classes,
         citation,
         review_coverage,
@@ -1696,13 +1765,29 @@ pub fn assemble_pack(
         disclaimer: PACK_DISCLAIMER.to_owned(),
     };
 
-    Ok(EvidencePack {
+    let mut pack = EvidencePack {
         manifest,
         sections,
         gaps,
         verdicts,
         diagnostics,
-    })
+    };
+
+    // --- whole-artifact safety (Codex round-11 Finding A) ---
+    // Run the SAME scan `verify_pack` runs, over the fully-constructed pack, so
+    // the assembled safety verdict reflects the entire serialized artifact (record
+    // rows AND non-record text fields), not just the scrubbed section rows. The
+    // scan is computed with the placeholder safety verdict in place; its own
+    // detail is a fixed, redaction-safe area/class string that a later re-scan by
+    // `verify_pack` sees identically, so assemble and verify agree.
+    let (safety_passed, safety_detail) = pack_artifact_safety(&pack, &all_section_rows);
+    pack.verdicts.safety = VerificationVerdict {
+        passed: safety_passed,
+        detail: safety_detail,
+    };
+    pack.verdicts.ok = gates_ok_without_safety && pack.verdicts.safety.passed;
+
+    Ok(pack)
 }
 
 /// A distinct `(kind, schema_version)` tuple key for a record (AC8).
@@ -4647,6 +4732,156 @@ mod pack338_tests {
             "detail must never leak the secret value: {}",
             report.safety.detail
         );
+    }
+
+    /// Codex round-11 Finding A: `assemble_pack` must run the SAME whole-artifact
+    /// safety scan as `verify_pack`, so a secret echoed into a NON-record field —
+    /// a malicious `--catalog` control title copied into `manifest.control_title`
+    /// — fails the ASSEMBLED safety verdict, not only the per-record scan. Before
+    /// the fix `assemble_pack` scanned only scrubbed section rows, so the secret
+    /// was serialized to stdout with `verdicts.safety.passed == true`.
+    #[test]
+    fn assemble_runs_whole_artifact_safety_over_control_title() {
+        let records = build_seed_records();
+        let mut catalog = load_default_catalog();
+        catalog.controls[0].title = format!("Change Management {INJECTED_SECRET}");
+        let pack = assemble_pack(&records, &catalog, "CC8.1", &win(), 1.0, "test-0.0.0", None)
+            .expect("assembles");
+        assert!(
+            !pack.verdicts.safety.passed,
+            "assembled safety must fail on a secret in manifest.control_title"
+        );
+        assert!(
+            !pack.verdicts.ok,
+            "overall assemble verdict fails on the secret"
+        );
+        assert!(
+            pack.verdicts.safety.detail.contains("control_title"),
+            "detail names WHERE: {}",
+            pack.verdicts.safety.detail
+        );
+        assert!(
+            !pack.verdicts.safety.detail.contains(INJECTED_SECRET),
+            "detail must never leak the secret value: {}",
+            pack.verdicts.safety.detail
+        );
+    }
+
+    /// Codex round-11 Finding A (positive): the clean scrubbed seed pack still
+    /// passes the whole-artifact safety scan at ASSEMBLE time (no false positive
+    /// on legitimate high-entropy hex).
+    #[test]
+    fn assemble_clean_pack_passes_whole_artifact_safety() {
+        let pack = assemble_cc81();
+        assert!(
+            pack.verdicts.safety.passed,
+            "clean assembled pack passes whole-artifact safety: {}",
+            pack.verdicts.safety.detail
+        );
+    }
+
+    /// Codex round-11 Finding C: a merged PR approved solely via a
+    /// `REFERENCES_TASK` edge must carry that edge as PRESENT, hashed, citable
+    /// pack content backing the coverage measurement — not an absent relationship
+    /// offline verify and consumers cannot substantiate. The three seed approving
+    /// links (rv01->pr01, rv02->pr02, rv03->pr03) land in the `review_coverage`
+    /// section, are scrubbed + hashed, counted in the manifest, canonically
+    /// ordered, and referenced by the measurement. Before the fix the
+    /// `review_coverage` section held zero records.
+    #[test]
+    fn coverage_link_edges_are_included_hashed_and_substantiated() {
+        let pack = assemble_cc81();
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .expect("review_coverage section");
+
+        // The three approving REFERENCES_TASK edges are present as section rows.
+        assert_eq!(
+            rc.record_count, 3,
+            "the three approving link edges are included"
+        );
+        assert_eq!(rc.records.len(), 3);
+        for br in &rc.records {
+            // Each is a REFERENCES_TASK edge from an approving review to a merged PR.
+            let GraphRecord::Edge {
+                label,
+                source,
+                target,
+                ..
+            } = &br.record
+            else {
+                panic!("coverage link row must be an edge, got {:?}", br.record);
+            };
+            assert_eq!(label.as_str(), "REFERENCES_TASK");
+            assert!(
+                ["project:v1:rv01", "project:v1:rv02", "project:v1:rv03"]
+                    .contains(&source.as_str()),
+                "source is an approving review: {source}"
+            );
+            assert!(
+                ["project:v1:pr01", "project:v1:pr02", "project:v1:pr03"]
+                    .contains(&target.as_str()),
+                "target is an included merged PR: {target}"
+            );
+            // The row hash matches a recompute over its scrubbed form (hashed).
+            let recomputed =
+                blake3::hash(serde_json::to_string(&br.record).unwrap().as_bytes()).to_string();
+            assert_eq!(br.hash, recomputed, "edge row is hashed over scrubbed form");
+        }
+
+        // Canonically ordered by (valid_time, record_id).
+        for pair in rc.records.windows(2) {
+            assert!(section_sort_key(&pair[0].record) <= section_sort_key(&pair[1].record));
+        }
+
+        // The measurement references the included edges so a consumer can trace
+        // approved_pr_count to hashed records.
+        let m = rc.measurement.as_ref().expect("measurement present");
+        let mut row_ids: Vec<String> = rc
+            .records
+            .iter()
+            .map(|br| br.record.id().to_owned())
+            .collect();
+        row_ids.sort();
+        assert_eq!(
+            m.approval_link_edge_ids, row_ids,
+            "measurement cites exactly the included coverage-link edge IDs"
+        );
+        assert_eq!(m.approved_pr_count, 3);
+
+        // Manifest counts include the edges (trust class `other`, REFERENCES_TASK tuple).
+        assert_eq!(
+            pack.manifest.included_record_counts.get("other").copied(),
+            Some(3),
+            "manifest included_record_counts counts the 3 link edges"
+        );
+        assert_eq!(
+            pack.manifest
+                .tuple_counts
+                .get("REFERENCES_TASK/v1")
+                .copied(),
+            Some(3),
+            "manifest tuple_counts counts the 3 REFERENCES_TASK edges"
+        );
+
+        // Offline verify substantiates coverage: integrity re-hashes the edges,
+        // window-consistency accepts them (stamped with the review's valid time),
+        // safety passes.
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "integrity: {}",
+            report.integrity.detail
+        );
+        assert!(
+            report.window_consistency.passed,
+            "window: {}",
+            report.window_consistency.detail
+        );
+        assert!(report.safety.passed, "safety: {}", report.safety.detail);
+        assert!(report.ok, "verify substantiates the pack: {report:?}");
     }
 
     /// Regenerates the committed integration fixture. Runs only when the

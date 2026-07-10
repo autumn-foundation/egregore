@@ -227,10 +227,26 @@ pub(crate) fn evidence_pack_verify_cmd(path: &Path, format: OutputFormat) -> Res
         }))
     });
     let pack: EvidencePack = serde_json::from_str(&text).unwrap_or_else(|error| {
+        // Sanitize the serde error: `Error::to_string()` embeds the offending
+        // VALUE for a wrong-typed field (e.g. `invalid type: string "SECRET",
+        // expected usize`), so a secret in a mistyped pack field would leak
+        // despite the redaction-safe contract (Codex round-11 Finding B). Emit
+        // only a stable category plus 1-based line/column, mirroring the catalog
+        // parser (`sanitize_json_error` / `CatalogError::Json`) — never the raw
+        // message or value.
+        use serde_json::error::Category;
+        let category = match error.classify() {
+            Category::Io => "io",
+            Category::Syntax => "syntax",
+            Category::Data => "data",
+            Category::Eof => "eof",
+        };
         evidence_pack_exit(&serde_json::json!({
             "code": "pack_parse_error",
             "path": path.display().to_string(),
-            "message": error.to_string(),
+            "line": error.line(),
+            "column": error.column(),
+            "category": category,
         }))
     });
 

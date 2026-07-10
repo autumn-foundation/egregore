@@ -332,6 +332,51 @@ fn verify_passes_clean_pack_and_fails_tampered() {
     assert_eq!(report["integrity"]["passed"], false);
 }
 
+/// Codex round-11 Finding B: `verify` on a malformed pack whose parse fails on a
+/// wrong-typed field carrying a secret must NOT echo the secret in the
+/// `pack_parse_error` envelope. serde's `Error::to_string()` embeds the offending
+/// VALUE for type errors, so the handler must emit a sanitized envelope — a stable
+/// category plus 1-based line/column, never the raw serde message — mirroring the
+/// catalog parser. Exit code stays 2.
+#[test]
+fn verify_malformed_pack_does_not_leak_secret_in_parse_error() {
+    const SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
+    let temp = tempfile::tempdir().unwrap();
+    let (_code, pack) = assemble_over_graph();
+    let mut json = pack;
+    // `excluded_missing_valid_time` is a usize; a string with a secret triggers a
+    // serde type (Data) error whose Display embeds the offending value.
+    json["manifest"]["excluded_missing_valid_time"] = Value::String(SECRET.to_owned());
+    let path = temp.path().join("malformed.json");
+    fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+    let out = egregore()
+        .args(["audit", "evidence-pack", "verify"])
+        .arg(&path)
+        .output()
+        .expect("run verify");
+    assert_eq!(out.status.code(), Some(2), "malformed pack is a load error");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains(SECRET),
+        "parse error must not leak the wrong-typed field value: {stderr}"
+    );
+    let err: Value = serde_json::from_slice(&out.stderr).expect("stderr is JSON");
+    assert_eq!(err["code"], "pack_parse_error");
+    assert!(err["line"].is_number(), "carries a line: {err}");
+    assert!(err["column"].is_number(), "carries a column: {err}");
+    assert!(
+        err["category"].is_string(),
+        "carries a stable category: {err}"
+    );
+    // The raw serde message (which leaks the value) must not be present.
+    assert!(
+        err.get("message").is_none(),
+        "sanitized envelope must not carry the raw serde message: {err}"
+    );
+}
+
 #[test]
 fn verify_unreadable_pack_exits_2() {
     let missing = egregore()
