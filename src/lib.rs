@@ -59,6 +59,9 @@ pub mod link_evidence;
 pub mod local_project;
 /// Runtime log-signature extraction (`scan-logs`, issues #319 / #320).
 pub mod log_graph;
+/// Backtrace stack-frame resolution to code-graph symbols (`resolve-frames`,
+/// issue #322).
+pub mod log_resolve;
 /// Cargo manifest dependency-declaration extraction (issue #180).
 pub mod manifest_deps;
 /// MCP server exposing read-only evidence-query tools (issue #53).

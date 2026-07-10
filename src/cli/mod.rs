@@ -46,6 +46,7 @@ mod public_api;
 mod public_api_deltas;
 mod records;
 mod repair_cmd;
+mod resolve_frames;
 mod scan;
 mod scan_logs;
 mod semantic;
@@ -107,6 +108,7 @@ pub(crate) use public_api::*;
 pub(crate) use public_api_deltas::*;
 pub(crate) use records::*;
 pub(crate) use repair_cmd::*;
+pub(crate) use resolve_frames::*;
 pub(crate) use scan::*;
 pub(crate) use scan_logs::*;
 pub(crate) use semantic::*;
@@ -245,6 +247,42 @@ pub(crate) enum Commands {
         /// tests or when the auto-detected remote is wrong (e.g. a mirror).
         #[arg(long)]
         repo_id_override: Option<String>,
+    },
+    /// Resolve log backtrace frames to code-graph symbols (issue #322).
+    ///
+    /// Reads a log graph (from `scan-logs`) carrying `ErrorSignature` records
+    /// with structured backtrace frames plus a code graph of `File`/`Symbol`
+    /// records, and emits `FRAME_RESOLVES_TO` edges — each labeled with a
+    /// closed-set `FrameResolution` (`resolved` / `ambiguous` / `path_only` /
+    /// `unresolved`) and a `frame_index` — mirrored by evidence links on each
+    /// `ErrorSignature`. Frames into the standard library or a dependency are
+    /// classified `external` in a per-signature tally and mint no edge. A
+    /// binding proves the frame NAMES the symbol, never that the symbol is at
+    /// fault. Output is deterministic and byte-identical across runs; raw log
+    /// text never enters the graph. See `docs/cli/resolve-frames.md`.
+    ResolveFrames {
+        /// Path to the log graph JSONL (from `scan-logs`). Omit when using
+        /// `--data-dir`, which holds both the log and code graphs.
+        log_graph: Option<PathBuf>,
+        /// Path to the code graph JSONL (from `scan`). Required with
+        /// `log_graph`; mutually exclusive with `--data-dir`.
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded store holding both the log and code graphs (mutually
+        /// exclusive with the positional log graph and `--graph`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output JSONL path for the enriched records.
+        #[arg(long)]
+        out: PathBuf,
+        /// Resolve against the code-graph state at this commit SHA or unique
+        /// prefix (requires a history graph). Mutually exclusive with --as-of.
+        #[arg(long)]
+        at: Option<String>,
+        /// Resolve against the code-graph state at the most recent commit at or
+        /// before this RFC 3339 instant. Mutually exclusive with --at.
+        #[arg(long)]
+        as_of: Option<String>,
     },
     /// Incrementally refresh an ingested store from working-tree edits.
     ///
@@ -2863,6 +2901,21 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             out,
             repo_id_override,
         } => scan_logs(&log_path, &repo_path, &out, repo_id_override.as_deref()),
+        Commands::ResolveFrames {
+            log_graph,
+            graph,
+            data_dir,
+            out,
+            at,
+            as_of,
+        } => resolve_frames_cmd(
+            log_graph.as_deref(),
+            graph.as_deref(),
+            data_dir.as_deref(),
+            &out,
+            at.as_deref(),
+            as_of.as_deref(),
+        ),
         Commands::Inspect {
             graph,
             #[cfg(feature = "embedded-aletheiadb")]

@@ -152,6 +152,8 @@ fn build_fixture_records() -> Vec<GraphRecord> {
         target: "obs_verified".to_owned(),
         confidence: None,
         resolution: None,
+        frame_resolution: None,
+        frame_index: None,
         temporal: None,
         summary: "Contradiction edge".to_owned(),
         producer: None,

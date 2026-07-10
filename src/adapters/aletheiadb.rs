@@ -2371,6 +2371,8 @@ impl EmbeddedAletheiaSink {
             target,
             confidence,
             resolution,
+            frame_resolution,
+            frame_index,
             temporal,
             summary,
             producer,
@@ -2394,6 +2396,13 @@ impl EmbeddedAletheiaSink {
             "resolution",
             resolution.map(crate::ir::CallResolution::as_str),
         );
+        builder = insert_optional(
+            builder,
+            "frame_resolution",
+            frame_resolution.map(crate::ir::FrameResolution::as_str),
+        );
+        let frame_index_str = frame_index.map(|i| i.to_string());
+        builder = insert_optional(builder, "frame_index", frame_index_str.as_deref());
         builder = insert_temporal(builder, temporal.as_ref());
         if let Some(p) = producer
             && let Ok(json) = serde_json::to_string(p)
@@ -3267,6 +3276,30 @@ impl EmbeddedAletheiaSink {
             .map(|value| {
                 crate::ir::CallResolution::from_wire(value).ok_or_else(|| {
                     read_back_error(record_id, format!("resolution invalid: {value}"))
+                })
+            })
+            .transpose()?,
+            frame_resolution: optional_str_property(
+                record_id,
+                "frame_resolution",
+                edge.get_property("frame_resolution"),
+            )?
+            .as_deref()
+            .map(|value| {
+                crate::ir::FrameResolution::from_wire(value).ok_or_else(|| {
+                    read_back_error(record_id, format!("frame_resolution invalid: {value}"))
+                })
+            })
+            .transpose()?,
+            frame_index: optional_str_property(
+                record_id,
+                "frame_index",
+                edge.get_property("frame_index"),
+            )?
+            .as_deref()
+            .map(|value| {
+                value.parse::<u32>().map_err(|_| {
+                    read_back_error(record_id, format!("frame_index invalid: {value}"))
                 })
             })
             .transpose()?,

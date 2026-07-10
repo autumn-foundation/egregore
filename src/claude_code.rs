@@ -1656,6 +1656,8 @@ fn make_edge(
         target,
         confidence: None,
         resolution: None,
+        frame_resolution: None,
+        frame_index: None,
         temporal: None,
         summary: summary.to_owned(),
         producer: None,

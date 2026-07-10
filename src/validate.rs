@@ -584,6 +584,8 @@ mod tests {
             target: target.to_owned(),
             confidence: None,
             resolution: None,
+            frame_resolution: None,
+            frame_index: None,
             temporal: None,
             summary: "test edge".to_owned(),
             producer: None,
