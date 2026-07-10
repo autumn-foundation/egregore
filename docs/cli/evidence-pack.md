@@ -96,7 +96,12 @@ Log-domain optional classes degrade with `unavailable_reason: "log_domain_absent
 - **2** — usage/load error: `unknown_control` (naming the catalog's known IDs),
   `reversed_window`, `invalid_timestamp`, `conflicting_input_flags`,
   `missing_input_flag`, `invalid_min_review_coverage`, `catalog_read_error`,
-  `catalog`-parse errors, or an unreadable/missing/empty store or graph.
+  `catalog`-parse errors, an unreadable/missing store or graph, or
+  `empty_evidence_input` (naming the source path) when the input loads **zero
+  records** — a genuinely empty or whitespace-only graph, or an initialized
+  store holding zero records. This is distinct from the exit-0 vacuous
+  `empty_window` success, which is a *non-empty* input whose records merely fall
+  outside the window.
 
 The per-verdict block is: `required_classes`, `citation` (with per-trust-class
 tallies), `review_coverage`, `integrity`, `safety`.
@@ -108,7 +113,7 @@ it derives from.
 
 | Gap class | Meaning | Status |
 |-----------|---------|--------|
-| `merged_pr_without_approving_review` | A merged PR Task with no linked approving `Review` (via `REFERENCES_TASK`). | Fully implemented. |
+| `merged_pr_without_approving_review` | A merged PR Task with no linked **in-window** approving `Review` (via `REFERENCES_TASK`). An approving review that resolves outside the pack window — or has no resolvable valid time — is omitted from the `reviews` section and does **not** suppress this gap. | Fully implemented. |
 | `commit_outside_any_pr` | An in-window `Commit` not claimed by any PR via `MERGED_AS`. | Fully implemented. |
 | `missing_valid_time` | A class-relevant record with no resolvable valid time. | Fully implemented. |
 | `review_unanchored_no_commit_sha` | A review with no anchoring reviewed-commit SHA. | **Needs #334.** Degrades. |

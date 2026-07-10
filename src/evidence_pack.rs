@@ -1342,7 +1342,12 @@ pub fn assemble_pack(
     }
     merged_pr_ids.sort();
     merged_pr_ids.dedup();
-    // A PR is approved when an approving Review references it via REFERENCES_TASK.
+    // A PR is approved when an approving Review references it via REFERENCES_TASK
+    // AND that review resolves inside the same half-open pack window. An
+    // approving review whose valid time falls before `from` or at/after `to`,
+    // or that has no resolvable valid time, is omitted from the windowed
+    // `reviews` section, so it must not count toward approval either — otherwise
+    // the pack would suppress the gap while showing zero in-window approval.
     let approving_targets: BTreeSet<String> = records
         .iter()
         .filter_map(|r| match r {
@@ -1352,9 +1357,11 @@ pub fn assemble_pack(
                 target,
                 ..
             } if label.as_str() == "REFERENCES_TASK" => {
-                let approving = records
-                    .iter()
-                    .any(|rec| rec.id() == source && is_approving_review(rec));
+                let approving = records.iter().any(|rec| {
+                    rec.id() == source
+                        && is_approving_review(rec)
+                        && resolve_valid_time(rec).is_some_and(|vt| in_window(&vt, window))
+                });
                 approving.then(|| target.clone())
             }
             _ => None,
@@ -1931,7 +1938,7 @@ pub(crate) mod fixture {
         node(id, NodeKind::Commit, SCHEMA_VERSION)
     }
 
-    fn pr(id: &str, vt: &str, merge_commit: &str) -> GraphRecord {
+    pub fn pr(id: &str, vt: &str, merge_commit: &str) -> GraphRecord {
         let mut r = node(id, NodeKind::Task, PROJECT_SCHEMA_VERSION);
         if let GraphRecord::Node {
             source_kind,
@@ -1957,7 +1964,7 @@ pub(crate) mod fixture {
         r
     }
 
-    fn review(id: &str, vt: &str, state: &str) -> GraphRecord {
+    pub fn review(id: &str, vt: &str, state: &str) -> GraphRecord {
         let mut r = node(id, NodeKind::Review, PROJECT_SCHEMA_VERSION);
         if let GraphRecord::Node {
             entity_id,
@@ -2001,7 +2008,7 @@ pub(crate) mod fixture {
         )
     }
 
-    fn references_task(review_id: &str, pr_id: &str) -> GraphRecord {
+    pub fn references_task(review_id: &str, pr_id: &str) -> GraphRecord {
         GraphRecord::project_edge(
             EdgeLabel::ReferencesTask,
             review_id.to_owned(),
@@ -2868,6 +2875,96 @@ mod pack338_tests {
                 .iter()
                 .any(|id| id.contains("prf") || id.contains("pra"))
         );
+    }
+
+    /// Codex finding 1: an approving review whose resolved valid time falls
+    /// OUTSIDE the pack window must not suppress the
+    /// `merged_pr_without_approving_review` gap. The review is omitted from the
+    /// windowed `reviews` section, so counting it toward approval overstates
+    /// in-window review coverage.
+    #[test]
+    fn out_of_window_approving_review_does_not_suppress_gap() {
+        use super::fixture::{pr, references_task, review};
+        // Merged, in-window PR whose ONLY approving review resolves in April,
+        // outside the March [from, to) window.
+        let records = vec![
+            pr("project:v1:prX", "2026-03-15T12:00:00Z", "cX"),
+            review("project:v1:rvX", "2026-04-15T08:00:00Z", "approved"),
+            references_task("project:v1:rvX", "project:v1:prX"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+
+        // The gap must be present.
+        assert!(
+            pack.gaps
+                .iter()
+                .any(|g| g.gap_class == "merged_pr_without_approving_review"
+                    && g.record_ids.contains(&"project:v1:prX".to_owned())),
+            "out-of-window approval must not suppress the gap: gaps={:?}",
+            pack.gaps
+        );
+        // And review-coverage measurement must count the PR as unapproved.
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_ref())
+            .expect("review_coverage measurement");
+        assert_eq!(rc.merged_pr_count, 1);
+        assert_eq!(rc.approved_pr_count, 0);
+        assert!(
+            rc.unapproved_pr_ids.contains(&"project:v1:prX".to_owned()),
+            "PR with only out-of-window approval must be unapproved"
+        );
+    }
+
+    /// Positive companion: an in-window approving review DOES suppress the gap.
+    #[test]
+    fn in_window_approving_review_suppresses_gap() {
+        use super::fixture::{pr, references_task, review};
+        let records = vec![
+            pr("project:v1:prX", "2026-03-15T12:00:00Z", "cX"),
+            review("project:v1:rvX", "2026-03-16T08:00:00Z", "approved"),
+            references_task("project:v1:rvX", "project:v1:prX"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+
+        assert!(
+            !pack
+                .gaps
+                .iter()
+                .any(|g| g.gap_class == "merged_pr_without_approving_review"
+                    && g.record_ids.contains(&"project:v1:prX".to_owned())),
+            "in-window approval must suppress the gap: gaps={:?}",
+            pack.gaps
+        );
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_ref())
+            .expect("review_coverage measurement");
+        assert_eq!(rc.merged_pr_count, 1);
+        assert_eq!(rc.approved_pr_count, 1);
+        assert!(rc.unapproved_pr_ids.is_empty());
     }
 
     #[test]

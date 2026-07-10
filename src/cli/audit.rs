@@ -163,6 +163,24 @@ pub(crate) fn evidence_pack_assemble_cmd(
         }
     };
 
+    // A genuinely empty evidence input (zero records loaded — an empty or
+    // whitespace-only graph, or an initialized store holding zero records) is a
+    // LOAD error naming the path (AC6), distinct from the vacuous `empty_window`
+    // SUCCESS, which is a non-empty store whose records simply fall outside the
+    // window.
+    if records.is_empty() {
+        let source_path = graph
+            .or(data_dir)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        drop(store_copy);
+        evidence_pack_exit(&serde_json::json!({
+            "code": "empty_evidence_input",
+            "path": source_path,
+            "message": "evidence input holds zero records; provide a non-empty graph or store",
+        }));
+    }
+
     let window = Window {
         from: from.to_owned(),
         to: to.to_owned(),

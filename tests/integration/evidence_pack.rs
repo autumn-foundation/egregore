@@ -348,6 +348,75 @@ fn verify_unreadable_pack_exits_2() {
     assert_eq!(err["code"], "pack_read_error");
 }
 
+/// Codex finding 2 / AC6: an empty or whitespace-only `--graph` (zero records
+/// loaded) is a LOAD error — exit 2 with a machine-readable code naming the
+/// path — never the exit-1 "required class unavailable" path.
+#[test]
+fn empty_graph_input_exits_2_and_names_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let empty = temp.path().join("empty.graph.jsonl");
+    // Whitespace-only content: the JSONL reader skips blank lines, so zero
+    // records load.
+    fs::write(&empty, "\n   \n\n").unwrap();
+
+    let output = egregore()
+        .args([
+            "audit",
+            "evidence-pack",
+            "assemble",
+            "--control",
+            "CC8.1",
+            "--from",
+            FROM,
+            "--to",
+            TO,
+            "--graph",
+        ])
+        .arg(&empty)
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "empty evidence input is a load error, not exit 1"
+    );
+    let err: Value = serde_json::from_slice(&output.stderr).expect("stderr is JSON");
+    assert_eq!(err["code"], "empty_evidence_input");
+    assert_eq!(
+        err["path"].as_str().unwrap(),
+        empty.display().to_string(),
+        "the error must name the source path"
+    );
+}
+
+/// Guard against regressing the vacuous-success case: a NON-empty store whose
+/// records simply fall outside the window still exits 0 (`empty_window`), never
+/// the new exit-2 empty-input path.
+#[test]
+fn out_of_window_nonempty_store_still_exits_0() {
+    let output = egregore()
+        .args([
+            "audit",
+            "evidence-pack",
+            "assemble",
+            "--control",
+            "CC8.1",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-01-02T00:00:00Z",
+            "--graph",
+        ])
+        .arg(fixture_path())
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "non-empty store with no in-window records is a vacuous success"
+    );
+}
+
 /// `--graph` and `--data-dir` must produce a byte-identical pack. Only built
 /// when the embedded store backend is compiled in.
 #[cfg(feature = "embedded-aletheiadb")]
