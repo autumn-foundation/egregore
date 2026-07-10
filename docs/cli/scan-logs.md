@@ -41,7 +41,13 @@ eg scan-logs <LOG_PATH> --repo-path <REPO> --out <OUT.jsonl> [--repo-id-override
 With `--protected-raw-artifacts`, the scanned log's redaction-normalized bytes are stored as a
 `log_payload` blob in the protected store, retrievable later with `eg protected get`. Redaction
 runs **before** capture (a secret-bearing line is stored as its `<REDACTED:…>` marker; the
-unredacted original is never persisted). The blob's `content_hash` (BLAKE3 over post-redaction
+unredacted original is never persisted). The captured bytes are the redaction of the exact
+normalized buffer the scan read and hashed — the log file is read once, so a log being appended
+to or rotated cannot make the blob describe different bytes than the graph records (issue #321).
+Because these blobs are contractually the post-redaction bytes, `log_payload` is produced **only**
+here; a generic `eg protected capture` manifest that declares `class: "log_payload"` is rejected
+with a `log_payload_requires_scan_logs` per-entry diagnostic (that path applies no redaction). The
+blob's `content_hash` (BLAKE3 over post-redaction
 bytes) is independent of the graph's `LogSource.source_artifact_hash` (BLAKE3 over the
 unredacted, newline-normalized bytes), and the graph never carries the protected handle. On
 success `scan-logs` prints a one-line JSON capture summary (handle, hash, byte count, class —

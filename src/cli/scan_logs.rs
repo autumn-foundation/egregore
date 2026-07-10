@@ -122,22 +122,10 @@ pub(crate) fn scan_logs(
         let producer_id = producer.expect("validated present above");
         let captured_at = captured_at_override.unwrap_or(&transaction_time);
 
-        // Materialize redacted bytes on demand; raw bytes never leave the helper.
-        let redacted = match log_graph::redacted_source_bytes(log_path) {
-            Ok(b) => b,
-            // The scan already succeeded above, so a read/format error here is a
-            // race; report it as a machine-readable capture failure, never raw
-            // bytes.
-            Err(err) => {
-                exit_capture_error(
-                    "store_io_error",
-                    &serde_json::json!({
-                        "message": format!("failed to materialize redacted log bytes: {err}")
-                    }),
-                    3,
-                );
-            }
-        };
+        // Redact the SAME normalized buffer the scan read and hashed — never a
+        // second filesystem read that could observe appended/rotated bytes
+        // (issue #321, Codex finding B). Raw bytes never leave the helper.
+        let redacted = log_graph::redacted_source_bytes(&scan.normalized_source);
         let source_rel = log_graph::source_relative_path(repo_path, log_path);
         let store = ProtectedStore::new(store_dir);
         match store.capture_bytes(

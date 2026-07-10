@@ -50,7 +50,7 @@ captures the listed payloads.
 | `patch` | Unified diff bytes |
 | `task_narrative` | Issue description, PR body, local task file |
 | `report` | Scan summary, eval result, analysis document |
-| `log_payload` | Post-redaction raw log bytes captured by `eg scan-logs` (issue #321) |
+| `log_payload` | Post-redaction raw log bytes captured by `eg scan-logs` (issue #321) — **produced only by `eg scan-logs --protected-raw-artifacts`; rejected in a generic `protected capture` manifest** (see below) |
 
 **Flags:**
 
@@ -87,8 +87,9 @@ Per-entry problems produce diagnostics and do not abort capture:
 
 | Diagnostic code | Meaning |
 |----------------|---------|
-| `unsupported_payload_class` | The `class` field is not one of the five recognised classes |
+| `unsupported_payload_class` | The `class` field is not one of the recognised classes |
 | `stale_source_path` | The source file is not readable (moved or deleted before capture) |
+| `log_payload_requires_scan_logs` | The entry declares `class: "log_payload"`. That class is the log's **post-redaction** bytes and is produced only by `eg scan-logs --protected-raw-artifacts` (which redacts before capture). The generic manifest capture path reads `source_path` straight from disk with no redaction, so it refuses the entry — no blob and no manifest record are written for it, and any other valid entries in the same manifest still store atomically. |
 
 **Example:**
 
@@ -301,6 +302,7 @@ No error ever echoes raw payload bytes, bearer tokens, patch hunks, secrets, or 
 | `hash_mismatch` | 1 | Stored blob bytes do not match the recorded BLAKE3 content hash |
 | `unsupported_payload_class` | n/a | Capture-manifest entry `class` is unrecognised (per-entry diagnostic, not a fatal error) |
 | `stale_source_path` | n/a | Source file is not readable at capture time (per-entry diagnostic) |
+| `log_payload_requires_scan_logs` | n/a | Capture-manifest entry declares `class: "log_payload"`, which the generic (no-redaction) capture path refuses; produce it via `eg scan-logs --protected-raw-artifacts` instead (per-entry diagnostic) |
 
 ## Scope
 

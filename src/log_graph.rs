@@ -115,6 +115,14 @@ pub struct LogScan {
     pub source_format_version: &'static str,
     /// Exemplar-cap diagnostics, in canonical order.
     pub diagnostics: Vec<ExemplarCapDiagnostic>,
+    /// The exact CRLF/CR→LF-normalized, UTF-8-validated source text the scan
+    /// read and hashed into `LogSource.source_artifact_hash` (issue #321, Codex
+    /// finding B). Protected capture redacts THIS buffer via
+    /// [`redacted_source_bytes`] rather than issuing a second filesystem read, so
+    /// the captured blob corresponds byte-for-byte (post-redaction) to the bytes
+    /// the graph records describe — closing the append/rotate window between the
+    /// scan read and a later capture read.
+    pub normalized_source: String,
 }
 
 /// Builds the `log_importer` producer envelope (issues #319 / #320).
@@ -500,16 +508,26 @@ pub fn scan_log_records(
         records,
         source_format_version,
         diagnostics,
+        // Hand back the exact normalized buffer this scan hashed so protected
+        // capture (issue #321) redacts these same bytes instead of re-reading the
+        // log file, which could observe appended/rotated bytes.
+        normalized_source: text.to_owned(),
     })
 }
 
 /// Produces the POST-REDACTION whole-file bytes of a log for protected capture
 /// (issue #321).
 ///
-/// Reads the log, normalizes CRLF/CR to LF (the same basis the scanner hashes),
-/// and applies the v1 redaction policy so a secret-bearing line is returned
-/// collapsed to its `<REDACTED:…>` marker and the raw secret never reaches the
-/// protected blob.
+/// Takes the ALREADY-normalized, UTF-8-validated source text the scan produced
+/// (`LogScan::normalized_source`) — NOT a path — and applies the v1 redaction
+/// policy so a secret-bearing line is returned collapsed to its `<REDACTED:…>`
+/// marker and the raw secret never reaches the protected blob. Operating on the
+/// scan's own buffer means the redacted blob corresponds byte-for-byte
+/// (post-redaction) to the exact bytes the graph records describe: there is no
+/// second filesystem read that could observe a log being appended to or rotated
+/// between the scan and the capture (issue #321, Codex finding B). The caller
+/// normalizes and validates once, in [`scan_log_records`]; this helper never
+/// touches the filesystem and is therefore infallible.
 ///
 /// Secret detection runs over the **whole normalized text** via
 /// [`redaction::detect_secret_span`] and redaction splices by BYTE SPAN, not by
@@ -531,28 +549,8 @@ pub fn scan_log_records(
 /// This materializes redacted bytes ONLY when protected capture is requested;
 /// ordinary graph extraction ([`scan_log_records`]) never calls it and is
 /// unchanged. Raw, unredacted bytes never leave this function.
-///
-/// # Errors
-///
-/// Returns [`LogScanError::Read`] when the file cannot be read and
-/// [`LogScanError::UnrecognizedFormat`] for binary / non-UTF-8 input, matching
-/// [`scan_log_records`] so capture and extraction agree on what is a valid log.
-pub fn redacted_source_bytes(log_path: &Path) -> Result<Vec<u8>, LogScanError> {
-    let raw = std::fs::read(log_path).map_err(|source| LogScanError::Read {
-        path: log_path.to_path_buf(),
-        source,
-    })?;
-    let normalized = normalize_newlines(&raw);
-    if normalized.contains(&0) {
-        return Err(LogScanError::UnrecognizedFormat {
-            detail: "file contains NUL bytes; not a text log".to_owned(),
-        });
-    }
-    let text =
-        std::str::from_utf8(&normalized).map_err(|error| LogScanError::UnrecognizedFormat {
-            detail: format!("file is not valid UTF-8: {error}"),
-        })?;
-
+#[must_use]
+pub fn redacted_source_bytes(text: &str) -> Vec<u8> {
     // Splice by BYTE SPAN. For each earliest-starting secret span the detector
     // reports, emit the verbatim non-secret prefix, then ONE marker for the exact
     // secret slice, then continue past the span. The marker is built from the
@@ -577,7 +575,7 @@ pub fn redacted_source_bytes(log_path: &Path) -> Result<Vec<u8>, LogScanError> {
             break;
         }
     }
-    Ok(out.into_bytes())
+    out.into_bytes()
 }
 
 /// Returns the class and byte span `(class, start, len)` of the EARLIEST-starting

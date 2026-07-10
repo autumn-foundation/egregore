@@ -217,7 +217,8 @@ pub struct CaptureEntryOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntryDiagnostic {
     /// Stable machine-readable code.  One of:
-    /// `unsupported_payload_class`, `stale_source_path`.
+    /// `unsupported_payload_class`, `stale_source_path`,
+    /// `log_payload_requires_scan_logs`, `already_captured`.
     pub code: String,
     /// Human-readable explanation (never echoes payload bytes).
     pub message: String,
@@ -1208,6 +1209,40 @@ impl ProtectedStore {
                 });
                 continue;
             };
+
+            // Reject `log_payload` in the generic manifest capture path (issue
+            // #321, Codex finding A).  This path streams `source_path` bytes
+            // straight from disk with NO redaction, but a `log_payload` blob is
+            // contractually the POST-REDACTION log bytes.  Accepting one here
+            // would persist an unredacted log under a class defined as redacted.
+            // Those blobs are produced ONLY by `eg scan-logs
+            // --protected-raw-artifacts`, which redacts before capture (via the
+            // in-memory `capture_bytes` path, which continues to allow the
+            // class).  Report the entry as a rejected, unstored outcome — no blob
+            // and no manifest record — preserving the atomic/no-partial-write
+            // property for any other valid entries in the same manifest.
+            if matches!(class, ProtectedPayloadClass::LogPayload) {
+                skipped_count += 1;
+                let fallback_hash = blake3::hash(entry.source_path.as_bytes());
+                let fallback_hash_str = fallback_hash.to_hex().to_string();
+                outcomes.push(CaptureEntryOutcome {
+                    source_path: entry.source_path.clone(),
+                    handle: format!("{PROTECTED_HANDLE_PREFIX}{fallback_hash_str}"),
+                    content_hash: fallback_hash_str,
+                    byte_len: 0,
+                    stored: false,
+                    diagnostic: Some(EntryDiagnostic {
+                        code: "log_payload_requires_scan_logs".to_owned(),
+                        message: "log_payload blobs are post-redaction bytes produced \
+                                  only by `eg scan-logs --protected-raw-artifacts`, \
+                                  which redacts before capture; the generic manifest \
+                                  capture path applies no redaction and refuses this \
+                                  class"
+                            .to_owned(),
+                    }),
+                });
+                continue;
+            }
 
             // Check that the source path is a regular file before reading.
             // `fs::read` follows symlinks and reads FIFOs/character-devices to

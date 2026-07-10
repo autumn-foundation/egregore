@@ -1030,6 +1030,51 @@ fn stored_blob_redacts_private_key_block_with_internal_blank_line() {
     );
 }
 
+// Issue #321 (Codex finding B): the protected blob must be derived from the SAME
+// normalized buffer the scan read — not a second filesystem read that could
+// observe appended/rotated bytes. The scan exposes its normalized buffer, and the
+// capture redaction runs over that exact buffer, so the two never diverge. This
+// test drives the refactored single-read API directly: `scan_log_records` returns
+// the normalized source it hashed, and `redacted_source_bytes` takes that buffer
+// (a `&str`), not a path.
+#[test]
+fn capture_redacts_the_same_normalized_buffer_the_scan_read() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("crlf.log");
+    // CRLF endings + an env-secret line. The scan normalizes CRLF -> LF and hashes
+    // that buffer; capture must redact THAT SAME buffer.
+    std::fs::write(
+        &log,
+        b"2026-01-02T03:00:00Z INFO starting\r\n\
+          2026-01-02T03:00:01Z [ERROR] auth failed API_KEY=hunterSECRETtokenValueLong denied\r\n",
+    )
+    .expect("write crlf fixture");
+
+    let scan = log_graph::scan_log_records(&log, temp.path(), REPO_ID, FIXED_TIME)
+        .expect("scan should succeed");
+
+    // The scan exposes the exact normalized buffer it hashed: CRLF collapsed to LF.
+    assert!(
+        scan.normalized_source.contains('\n') && !scan.normalized_source.contains('\r'),
+        "normalized_source is the CRLF->LF normalized buffer the scan hashed"
+    );
+
+    // Capture redaction runs over that same in-memory buffer (single read) and
+    // matches the redaction of the identical buffer — no second filesystem read.
+    let redacted = log_graph::redacted_source_bytes(&scan.normalized_source);
+    let redacted_str = String::from_utf8(redacted).expect("utf8 redacted");
+    assert!(
+        !redacted_str.contains("hunterSECRETtokenValueLong"),
+        "the secret in the scanned buffer must be redacted in the captured bytes"
+    );
+    assert!(
+        redacted_str.contains("<REDACTED:"),
+        "the captured bytes carry a redaction marker"
+    );
+    // Non-secret content from the scanned buffer is preserved verbatim.
+    assert!(redacted_str.contains("INFO starting"));
+}
+
 // AC5/AC7: `protected get` verifies + returns bytes and `list` shows a
 // log_payload entry with metadata only (no raw bytes).
 #[test]
