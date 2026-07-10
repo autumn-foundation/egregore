@@ -728,8 +728,9 @@ pub fn load_default_catalog() -> ControlCatalog {
 //     (`merged_pr_without_approving_review`, `commit_outside_any_pr`,
 //     `missing_valid_time`) and two (`review_unanchored_no_commit_sha`,
 //     `approval_precedes_final_head`) require issue #334 facts that are not yet
-//     merged — detected at runtime and, when absent, degraded to a single
-//     `capability_unavailable` diagnostic naming #334 with zero rows.
+//     merged — until #334 lands they always degrade to a single unconditional
+//     `capability_unavailable` diagnostic naming #334 with zero rows (only for
+//     controls that require review evidence), never a clean-looking check.
 //   * The manifest echoes the #337 catalog pin, the window, and the verbatim
 //     disclaimer. Everything is byte-identical across runs; no wall clock is
 //     read unless the caller pins `--captured-at`.
@@ -1664,8 +1665,9 @@ fn diagnostic_sort_key(d: &PackDiagnostic) -> (String, String, String) {
 }
 
 /// Derives the closed set of gap rows (AC5). Two classes require issue #334
-/// facts; when those facts are absent a single `capability_unavailable`
-/// diagnostic is emitted and zero rows are produced for them.
+/// facts that are not yet merged; until #334 lands they unconditionally emit a
+/// single `capability_unavailable` diagnostic (for review-requiring controls
+/// only) and produce zero rows, never a clean-looking check.
 /// True when the control marks `class` as [`Requirement::Required`].
 ///
 /// The control-scoping predicate for gap derivation is derived from this over
@@ -1766,24 +1768,30 @@ fn derive_gaps(
     }
 
     // #334-dependent classes: only in scope when the control requires review
-    // evidence. Detect the backing facts; degrade with one capability diagnostic
-    // when absent (populated automatically once #334 lands).
+    // evidence. Issue #334 (the `review_commit_sha` field / `REVIEWS_COMMIT`
+    // edge) is NOT merged: there is no such field or edge in the schema and no
+    // derivation logic exists, so the two dependent gap classes
+    // (`review_unanchored_no_commit_sha`, `approval_precedes_final_head`) cannot
+    // be derived. Emit the capability diagnostic UNCONDITIONALLY here so a pack
+    // never presents as if these two checks ran cleanly when they were actually
+    // skipped (Codex round-7 P2: input that merely resembled the #334 facts must
+    // not be mistaken for a real derivation and suppress the signal).
+    //
+    // WHEN #334 LANDS: replace this unconditional diagnostic with the real
+    // derivation of `review_unanchored_no_commit_sha` and
+    // `approval_precedes_final_head` from the reviewed-commit facts, emitting the
+    // diagnostic only if those facts are genuinely unavailable in the input.
     if want_review_anchored {
-        let has_issue_334_facts = records.iter().any(record_has_reviewed_commit_fact);
-        if has_issue_334_facts {
-            // (Populated automatically once #334 lands; no facts to derive yet.)
-        } else {
-            diagnostics.push(PackDiagnostic {
-                code: "capability_unavailable".to_owned(),
-                evidence_class: None,
-                unavailable_reason: Some("issue_334_reviewed_commit_facts_absent".to_owned()),
-                record_ids: Vec::new(),
-                detail: "gap classes review_unanchored_no_commit_sha and \
-                         approval_precedes_final_head require issue #334 reviewed-commit \
-                         facts (review_commit_sha / REVIEWS_COMMIT), which are not present"
-                    .to_owned(),
-            });
-        }
+        diagnostics.push(PackDiagnostic {
+            code: "capability_unavailable".to_owned(),
+            evidence_class: None,
+            unavailable_reason: Some("issue_334_reviewed_commit_facts_absent".to_owned()),
+            record_ids: Vec::new(),
+            detail: "gap classes review_unanchored_no_commit_sha and \
+                     approval_precedes_final_head require issue #334 reviewed-commit \
+                     facts (review_commit_sha / REVIEWS_COMMIT), which are not implemented"
+                .to_owned(),
+        });
     }
 
     gaps.sort_by(|a, b| {
@@ -1799,21 +1807,6 @@ fn derive_gaps(
             ))
     });
     gaps
-}
-
-/// Detects whether a record carries issue #334 reviewed-commit facts.
-///
-/// #334 is not merged: there is no `review_commit_sha` field and no
-/// `REVIEWS_COMMIT` edge. This probes for both so the two dependent gap classes
-/// populate automatically once #334 lands, and degrade cleanly until then.
-fn record_has_reviewed_commit_fact(record: &GraphRecord) -> bool {
-    match record {
-        GraphRecord::Edge { label, .. } => label.as_str() == "REVIEWS_COMMIT",
-        GraphRecord::Node { .. } => {
-            serde_json::to_string(record).is_ok_and(|json| json.contains("\"review_commit_sha\""))
-        }
-        GraphRecord::Tombstone { .. } => false,
-    }
 }
 
 /// Safety scan over the scrubbed section rows (AC3/AC9). Mirrors the bundle
@@ -3491,6 +3484,68 @@ mod pack338_tests {
                 .gaps
                 .iter()
                 .any(|g| g.gap_class == "approval_precedes_final_head")
+        );
+    }
+
+    /// Codex round-7 P2: the #334-dependent capability diagnostic must be
+    /// UNCONDITIONAL for a review-requiring control. The previous code probed
+    /// the input for the reviewed-commit facts #334 will add (a
+    /// `review_commit_sha` field / `REVIEWS_COMMIT` edge) and SUPPRESSED the
+    /// diagnostic when it saw them — but #334's derivation is unmerged, so no
+    /// `review_unanchored_no_commit_sha` / `approval_precedes_final_head` rows
+    /// were ever produced. An input that merely RESEMBLED the probed facts thus
+    /// made the pack look as if the two checks ran cleanly: a false all-clear.
+    /// Until #334 lands the diagnostic must always fire and the two gap classes
+    /// must stay empty, regardless of what the input happens to contain.
+    #[test]
+    fn issue_334_capability_diagnostic_fires_even_when_input_resembles_probed_facts() {
+        let mut records = build_seed_records();
+        // A record whose serialized JSON contains the `review_commit_sha` token
+        // the old probe keyed on — this would have tripped the suppression
+        // branch. There is no real #334 field to set, so we plant the token in
+        // an ordinary node field; the point is that resemblance must NOT be
+        // mistaken for a derivation that never ran.
+        records.push(GraphRecord::node(
+            "codegraph:v5:probe".to_owned(),
+            crate::ir::NodeKind::Change,
+            Some("src/probe.rs".to_owned()),
+            None,
+            Some("review_commit_sha".to_owned()),
+            "review_commit_sha".to_owned(),
+        ));
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        assert!(
+            pack.diagnostics
+                .iter()
+                .any(|d| d.code == "capability_unavailable"
+                    && d.unavailable_reason.as_deref()
+                        == Some("issue_334_reviewed_commit_facts_absent")),
+            "the #334 capability diagnostic must fire unconditionally, even when \
+             the input resembles the probed reviewed-commit facts: diagnostics={:?}",
+            pack.diagnostics
+        );
+        assert!(
+            !pack
+                .gaps
+                .iter()
+                .any(|g| g.gap_class == "review_unanchored_no_commit_sha"),
+            "no #334 gap rows can be derived until #334 lands"
+        );
+        assert!(
+            !pack
+                .gaps
+                .iter()
+                .any(|g| g.gap_class == "approval_precedes_final_head"),
+            "no #334 gap rows can be derived until #334 lands"
         );
     }
 

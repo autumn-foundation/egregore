@@ -43,7 +43,7 @@ eg audit evidence-pack assemble --control CC8.1 \
 | #103 validate | Referential-integrity gating is a *separate* pre-ingest step; the pack assumes a validated graph. |
 | #60 protected artifacts | `protected:v1:` handles survive as citations; raw bytes never enter the pack. |
 | #333 PR head/base/merge SHAs | First-class PR Task fields drive merge-target and review joins. |
-| #334 reviewed-commit facts | *Not yet merged.* Two gap classes degrade gracefully (see below). |
+| #334 reviewed-commit facts | *Not yet merged.* Two gap classes always report `capability_unavailable` (see below). |
 
 ## When to use `eg bundle export` instead
 
@@ -185,16 +185,22 @@ PR/commit/review evidence therefore emits none of those change-management gaps;
 | `merged_pr_without_approving_review` | A merged PR Task with no linked **in-window** approving `Review` (via `REFERENCES_TASK`). An approving review that resolves outside the pack window — or has no resolvable valid time — is omitted from the `reviews` section and does **not** suppress this gap. | `pull_requests` and/or `reviews`/`review_coverage` | Fully implemented. |
 | `commit_outside_any_pr` | An in-window `Commit` not claimed by any PR via `MERGED_AS`. | `commits` and/or `pull_requests` | Fully implemented. |
 | `missing_valid_time` | A class-relevant record with no resolvable valid time. | *(generic — any control)* | Fully implemented. |
-| `review_unanchored_no_commit_sha` | A review with no anchoring reviewed-commit SHA. | `reviews`/`review_coverage` | **Needs #334.** Degrades. |
-| `approval_precedes_final_head` | A recorded approval whose commit predates the PR's final head. | `reviews`/`review_coverage` | **Needs #334.** Degrades. |
+| `review_unanchored_no_commit_sha` | A review with no anchoring reviewed-commit SHA. | `reviews`/`review_coverage` | **Needs #334.** Always `capability_unavailable`. |
+| `approval_precedes_final_head` | A recorded approval whose commit predates the PR's final head. | `reviews`/`review_coverage` | **Needs #334.** Always `capability_unavailable`. |
 
 Because issue #334 (the `review_commit_sha` field / `REVIEWS_COMMIT` edge) is
-not merged, the last two classes have no backing facts. When a control requires
-review evidence the pack **detects the field/edge at runtime**; when absent it
-emits a single `capability_unavailable` diagnostic naming issue #334 and produces
-zero rows for those two classes — it never fabricates. A control that requires no
-review evidence emits neither those gap classes nor the #334 diagnostic. The enum
-stays closed; the two classes populate automatically once #334's facts appear.
+not merged — there is no such field or edge in the schema and no derivation logic
+exists — the last two classes cannot be derived. When a control requires review
+evidence the pack **always** emits a single `capability_unavailable` diagnostic
+naming issue #334 and produces zero rows for those two classes. This is
+**unconditional**: the pack does **not** probe the input for anything resembling
+the #334 facts and does **not** suppress the diagnostic when it finds such a
+resemblance, so a pack can never present as if the two checks ran cleanly when
+they were in fact skipped (an honest all-clear would be a lie until #334 lands).
+A control that requires no review evidence (e.g. `CC7.2`, `CC7.3`) emits neither
+those gap classes nor the #334 diagnostic. The enum stays closed; when #334's
+derivation lands, the unconditional diagnostic is replaced by real derivation of
+the two gap classes.
 
 ## `verify <path>`
 
