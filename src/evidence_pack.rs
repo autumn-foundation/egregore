@@ -1164,21 +1164,26 @@ const fn unavailable_reason(class: EvidenceClass) -> &'static str {
     }
 }
 
-/// True when the record is a merged PR task (`source_kind == github_pr` and a
-/// merge marker is present).
-fn is_merged_pr(record: &GraphRecord) -> bool {
-    matches!(
-        record,
+/// The MERGE time of a merged GitHub PR task, when the record is a `github_pr`
+/// `Task` carrying an explicit `merged_at` (promoted first-class in #333).
+///
+/// This is deliberately NOT `resolve_valid_time`: the GitHub importer stamps a PR
+/// Task's `valid_time` from `github_updated_at` (`src/github/records.rs`), i.e.
+/// the PR's LAST-UPDATE time, which routinely differs from its merge time. The
+/// merged-in-window determination for review coverage and the
+/// `merged_pr_without_approving_review` gap must window on merge time, so it keys
+/// on `merged_at` (Codex round-5 P1). A merged PR with no resolvable `merged_at`
+/// (e.g. only a `merge_commit_sha`) has no reliable merge time and is therefore
+/// not windowable as merged — it is excluded, never falling back to update time.
+fn merged_pr_merge_time(record: &GraphRecord) -> Option<&str> {
+    match record {
         GraphRecord::Node {
-            merged_at: Some(_),
+            merged_at: Some(m),
             source_kind,
             ..
-        } | GraphRecord::Node {
-            merge_commit_sha: Some(_),
-            source_kind,
-            ..
-        } if source_kind.as_deref() == Some("github_pr")
-    )
+        } if source_kind.as_deref() == Some("github_pr") && !m.is_empty() => Some(m.as_str()),
+        _ => None,
+    }
 }
 
 /// True when the record is a genuine approving pull-request review.
@@ -1403,11 +1408,19 @@ pub fn assemble_pack(
     }
 
     // --- review coverage measurement over in-window merged PRs ---
+    // A PR counts as "merged in window" iff its MERGE time (`merged_at`,
+    // first-class since #333) falls in the half-open window — NOT its Task
+    // `valid_time`, which the GitHub importer stamps from `github_updated_at`
+    // (the PR's last-update time). Keying on the update time would drop a PR
+    // merged in-window but updated after it (vacuously passing coverage and
+    // suppressing the gap) and wrongly admit a PR merged before the window but
+    // updated inside it (Codex round-5 P1). The section windowing of PR evidence
+    // records (which keys on `valid_time`, per the general per-class loop above)
+    // is a separate concern and is intentionally left unchanged.
     let mut merged_pr_ids: Vec<String> = Vec::new();
     for record in records {
-        if is_merged_pr(record)
-            && let Some(vt) = resolve_valid_time(record)
-            && in_window(&vt, window)
+        if let Some(merge_time) = merged_pr_merge_time(record)
+            && in_window(merge_time, window)
         {
             merged_pr_ids.push(record.id().to_owned());
         }
@@ -2099,6 +2112,25 @@ pub(crate) mod fixture {
             *head_sha = Some(format!("head-sha-{id}"));
             *head_ref = Some(format!("feature/{id}"));
             *base_ref = Some("trunk".to_owned());
+        }
+        r
+    }
+
+    /// A merged GitHub-PR `Task` whose merge time (`merged_at`, promoted
+    /// first-class in #333) is set INDEPENDENTLY of its `valid_time`. The GitHub
+    /// importer stamps a PR Task's `valid_time` from `github_updated_at` (the
+    /// PR's last-update time), which routinely differs from its merge time. This
+    /// helper reproduces that split so tests can assert the merged-in-window
+    /// determination keys on merge time, never update time (Codex round-5 P1).
+    pub fn pr_with_merge_time(
+        id: &str,
+        updated_at: &str,
+        merged_at_ts: &str,
+        merge_commit: &str,
+    ) -> GraphRecord {
+        let mut r = pr(id, updated_at, merge_commit);
+        if let GraphRecord::Node { merged_at, .. } = &mut r {
+            *merged_at = Some(merged_at_ts.to_owned());
         }
         r
     }
@@ -3305,6 +3337,128 @@ mod pack338_tests {
         assert_eq!(rc.merged_pr_count, 1);
         assert_eq!(rc.approved_pr_count, 1);
         assert!(rc.unapproved_pr_ids.is_empty());
+    }
+
+    /// Codex round-5 P1: a PR MERGED inside the window but whose Task
+    /// `valid_time` (stamped from `github_updated_at`, the PR's last-update time)
+    /// falls AFTER the window must still count as merged-in-window. The
+    /// merged-in-window determination for review coverage and the
+    /// `merged_pr_without_approving_review` gap keys on `merged_at` (merge time),
+    /// never the update-time `valid_time`. Before the fix this PR was dropped from
+    /// `merged_pr_ids`, so review coverage vacuously passed and the gap was
+    /// suppressed.
+    #[test]
+    fn merged_in_window_but_updated_after_window_counts_as_merged() {
+        use super::fixture::pr_with_merge_time;
+        // merged_at inside March window; updated_at (valid_time) in April, after.
+        let records = vec![pr_with_merge_time(
+            "project:v1:prLate",
+            "2026-04-15T08:00:00Z", // updated_at -> Task valid_time (after window)
+            "2026-03-15T12:00:00Z", // merged_at -> merge time (in window)
+            "cLate",
+        )];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_ref())
+            .expect("review_coverage measurement");
+        assert_eq!(
+            rc.merged_pr_count, 1,
+            "PR merged in-window must count even when updated after the window"
+        );
+        assert_eq!(rc.approved_pr_count, 0);
+        assert!(
+            rc.unapproved_pr_ids
+                .contains(&"project:v1:prLate".to_owned())
+        );
+        assert!(
+            pack.gaps
+                .iter()
+                .any(|g| g.gap_class == "merged_pr_without_approving_review"
+                    && g.record_ids.contains(&"project:v1:prLate".to_owned())),
+            "merged-in-window PR without approving review must gap: gaps={:?}",
+            pack.gaps
+        );
+    }
+
+    /// Codex round-5 P1 (mirror): a PR merged BEFORE the window but UPDATED inside
+    /// it must NOT count as merged-in-window. Before the fix the update-time
+    /// `valid_time` wrongly pulled it into `merged_pr_ids`.
+    #[test]
+    fn merged_before_window_but_updated_in_window_is_not_merged_in_window() {
+        use super::fixture::pr_with_merge_time;
+        let records = vec![pr_with_merge_time(
+            "project:v1:prEarly",
+            "2026-03-15T08:00:00Z", // updated_at -> Task valid_time (in window)
+            "2026-02-15T12:00:00Z", // merged_at -> merge time (before window)
+            "cEarly",
+        )];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_ref())
+            .expect("review_coverage measurement");
+        assert_eq!(
+            rc.merged_pr_count, 0,
+            "PR merged before the window must not count, even if updated in-window"
+        );
+        assert!(
+            !pack
+                .gaps
+                .iter()
+                .any(|g| g.gap_class == "merged_pr_without_approving_review"
+                    && g.record_ids.contains(&"project:v1:prEarly".to_owned())),
+            "PR merged before window must not gap: gaps={:?}",
+            pack.gaps
+        );
+    }
+
+    /// Regression: over the seed store the merged-in-window set is exactly the 6
+    /// in-window PRs (pr01..pr06); the out-of-window prf1/pra1 never enter, and
+    /// review coverage counts all six so the default gate still fails (3 of 6
+    /// unapproved).
+    #[test]
+    fn seed_merged_pr_window_is_exactly_six_and_gate_fails() {
+        let pack = assemble_cc81();
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_ref())
+            .expect("review_coverage measurement");
+        assert_eq!(rc.merged_pr_count, 6);
+        assert_eq!(rc.approved_pr_count, 3);
+        assert!(!rc.passed, "3-of-6 coverage must fail the default 1.0 gate");
+        let mut unapproved = rc.unapproved_pr_ids.clone();
+        unapproved.sort();
+        assert_eq!(
+            unapproved,
+            ["project:v1:pr04", "project:v1:pr05", "project:v1:pr06"]
+        );
     }
 
     #[test]

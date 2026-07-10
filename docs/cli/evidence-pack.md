@@ -67,6 +67,24 @@ pass/fail gate".
 - `--from >= --to` exits 2 (`reversed_window`); a non-RFC-3339 bound exits 2
   (`invalid_timestamp`).
 
+### Merged-PR windowing keys on merge time, not update time
+
+The `review_coverage` measurement and the `merged_pr_without_approving_review`
+gap window a pull request by its **merge time** — the `merged_at` field promoted
+first-class in #333 — using the same half-open `from <= t < to` predicate. This
+is deliberately **distinct** from how PR evidence *records* are selected into the
+`pull_requests` section: a PR `Task`'s `valid_time` is stamped by the GitHub
+importer from `github_updated_at` (the PR's last-*update* time), which routinely
+differs from its merge time. Keying the merged-in-window decision on the update
+time would drop a PR merged inside the window but updated after it (vacuously
+passing coverage and suppressing the gap) and wrongly admit a PR merged before
+the window but updated inside it. A PR counts as merged-in-window iff it carries a
+`merged_at` whose resolved time is inside the window; a merged PR with no
+resolvable `merged_at` is not windowable as merged and never falls back to the
+update time. The `pull_requests` section itself still windows records on
+`valid_time` (the general per-class rule above) — only the coverage/gap
+merged-in-window determination uses `merged_at`.
+
 ## Catalog integration and the three-way class outcome
 
 Every class the control maps becomes a section. A class is **available** when
