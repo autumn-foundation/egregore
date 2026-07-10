@@ -213,6 +213,27 @@ pub enum CatalogError {
         /// The unrecognized requirement wire string.
         requirement: String,
     },
+    /// A control listed the same evidence class (by wire name) more than once.
+    ///
+    /// Duplicate `{class, requirement}` entries would leave the canonical class
+    /// sort with ties, so two catalogs differing only in the order of those
+    /// duplicates could hash differently — breaking the order-independence
+    /// contract. The first offending duplicate in document order is reported.
+    DuplicateEvidenceClass {
+        /// The offending control's identifier.
+        control_id: String,
+        /// The duplicated class wire string.
+        class: String,
+    },
+    /// Two controls declared the same `control_id`.
+    ///
+    /// Controls are sorted by `control_id` in canonical form; duplicate IDs
+    /// would tie identically. The first offending duplicate in document order is
+    /// reported.
+    DuplicateControl {
+        /// The duplicated control identifier.
+        control_id: String,
+    },
 }
 
 impl CatalogError {
@@ -224,6 +245,8 @@ impl CatalogError {
             Self::UnknownSchemaVersion { .. } => "unknown_schema_version",
             Self::UnknownEvidenceClass { .. } => "unknown_evidence_class",
             Self::InvalidRequirement { .. } => "invalid_requirement",
+            Self::DuplicateEvidenceClass { .. } => "duplicate_evidence_class",
+            Self::DuplicateControl { .. } => "duplicate_control_id",
         }
     }
 
@@ -246,7 +269,8 @@ impl CatalogError {
                 "code": self.code(),
                 "version": { "domain": domain, "kind": kind, "version": version },
             }),
-            Self::UnknownEvidenceClass { control_id, class } => serde_json::json!({
+            Self::UnknownEvidenceClass { control_id, class }
+            | Self::DuplicateEvidenceClass { control_id, class } => serde_json::json!({
                 "code": self.code(),
                 "control_id": control_id,
                 "class": class,
@@ -260,6 +284,10 @@ impl CatalogError {
                 "control_id": control_id,
                 "class": class,
                 "requirement": requirement,
+            }),
+            Self::DuplicateControl { control_id } => serde_json::json!({
+                "code": self.code(),
+                "control_id": control_id,
             }),
         }
     }
@@ -328,8 +356,13 @@ struct RawClassRequirement {
 /// [`CatalogError::UnknownSchemaVersion`] when the schema tuple is not
 /// `(control_catalog, ControlCatalog, 1)`, [`CatalogError::UnknownEvidenceClass`]
 /// for a class outside the closed vocabulary (first offender in document order),
-/// and [`CatalogError::InvalidRequirement`] for a requirement outside
-/// `{required, optional}`.
+/// [`CatalogError::InvalidRequirement`] for a requirement outside
+/// `{required, optional}`, [`CatalogError::DuplicateEvidenceClass`] when a
+/// control lists the same class more than once, and
+/// [`CatalogError::DuplicateControl`] when two controls share a `control_id`
+/// (both report the first offender in document order). Rejecting duplicates
+/// removes the sort ties that would otherwise make `canonical_bytes` depend on
+/// input order.
 pub fn parse_catalog(text: &str) -> Result<ControlCatalog, CatalogError> {
     let normalized = text.replace("\r\n", "\n");
     let raw: RawCatalog =
@@ -356,8 +389,16 @@ pub fn parse_catalog(text: &str) -> Result<ControlCatalog, CatalogError> {
     };
 
     let mut controls = Vec::with_capacity(raw.controls.len());
+    let mut seen_control_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for raw_control in raw.controls {
+        if !seen_control_ids.insert(raw_control.control_id.clone()) {
+            return Err(CatalogError::DuplicateControl {
+                control_id: raw_control.control_id,
+            });
+        }
         let mut evidence_classes = Vec::with_capacity(raw_control.evidence_classes.len());
+        let mut seen_classes: std::collections::HashSet<&'static str> =
+            std::collections::HashSet::new();
         for raw_class in raw_control.evidence_classes {
             let class = EvidenceClass::from_wire(&raw_class.class).ok_or_else(|| {
                 CatalogError::UnknownEvidenceClass {
@@ -365,6 +406,12 @@ pub fn parse_catalog(text: &str) -> Result<ControlCatalog, CatalogError> {
                     class: raw_class.class.clone(),
                 }
             })?;
+            if !seen_classes.insert(class.as_wire()) {
+                return Err(CatalogError::DuplicateEvidenceClass {
+                    control_id: raw_control.control_id,
+                    class: class.as_wire().to_owned(),
+                });
+            }
             let requirement = Requirement::from_wire(&raw_class.requirement).ok_or_else(|| {
                 CatalogError::InvalidRequirement {
                     control_id: raw_control.control_id.clone(),
@@ -389,7 +436,9 @@ pub fn parse_catalog(text: &str) -> Result<ControlCatalog, CatalogError> {
 }
 
 /// Canonical form for hashing: fixed field order, controls sorted by
-/// `control_id`, each control's classes sorted by class wire name.
+/// `control_id`, each control's classes sorted by `(class wire name,
+/// requirement)` — a total order, since parsing rejects duplicate classes and
+/// duplicate control IDs.
 ///
 /// Built from `#[derive(Serialize)]` structs whose fields serialize in
 /// declaration order, so the output is independent of `serde_json`'s
@@ -424,9 +473,9 @@ struct CanonicalClassRequirement {
 /// Serializes a catalog to its deterministic canonical byte form.
 ///
 /// Object keys are in fixed declared order, controls are sorted by `control_id`,
-/// and each control's evidence classes are sorted by class wire name. The output
-/// is byte-identical across runs and independent of the input's control/class
-/// ordering.
+/// and each control's evidence classes are sorted by `(class wire name,
+/// requirement)`. The output is byte-identical across runs and independent of
+/// the input's control/class ordering.
 ///
 /// # Panics
 ///
@@ -446,7 +495,15 @@ pub fn canonical_bytes(catalog: &ControlCatalog) -> Vec<u8> {
                     requirement: cr.requirement.as_wire(),
                 })
                 .collect();
-            classes.sort_by(|a, b| a.class.cmp(b.class));
+            // Total order: parsing already rejects duplicate classes within a
+            // control, but the (class, requirement) tie-breaker is
+            // belt-and-suspenders so canonical bytes can never depend on input
+            // order even if a duplicate somehow slipped through.
+            classes.sort_by(|a, b| {
+                a.class
+                    .cmp(b.class)
+                    .then_with(|| a.requirement.cmp(b.requirement))
+            });
             CanonicalControl {
                 control_id: &control.control_id,
                 title: &control.title,
@@ -702,6 +759,84 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_evidence_class_within_control_is_rejected() {
+        // Same class twice with the same requirement.
+        let same_requirement = r#"{
+            "catalog_id": "x",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+            "controls": [
+                { "control_id": "CC1.1", "title": "t", "evidence_classes": [
+                    { "class": "commits", "requirement": "required" },
+                    { "class": "commits", "requirement": "required" }
+                ] }
+            ]
+        }"#;
+        let err = parse_catalog(same_requirement).expect_err("duplicate class must fail");
+        assert_eq!(err.code(), "duplicate_evidence_class");
+        assert_eq!(
+            err,
+            CatalogError::DuplicateEvidenceClass {
+                control_id: "CC1.1".to_owned(),
+                class: "commits".to_owned(),
+            }
+        );
+        let value = err.to_json();
+        assert_eq!(value["code"], "duplicate_evidence_class");
+        assert_eq!(value["control_id"], "CC1.1");
+        assert_eq!(value["class"], "commits");
+
+        // Same class twice with conflicting requirements (required + optional):
+        // exactly the ambiguity Codex flagged — the canonical sort would have
+        // left these tied on class alone.
+        let conflicting = r#"{
+            "catalog_id": "x",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+            "controls": [
+                { "control_id": "CC1.1", "title": "t", "evidence_classes": [
+                    { "class": "commits", "requirement": "required" },
+                    { "class": "commits", "requirement": "optional" }
+                ] }
+            ]
+        }"#;
+        let err = parse_catalog(conflicting).expect_err("conflicting duplicate class must fail");
+        assert_eq!(err.code(), "duplicate_evidence_class");
+        assert_eq!(
+            err,
+            CatalogError::DuplicateEvidenceClass {
+                control_id: "CC1.1".to_owned(),
+                class: "commits".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_control_id_is_rejected() {
+        let json = r#"{
+            "catalog_id": "x",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+            "controls": [
+                { "control_id": "CC1.1", "title": "first", "evidence_classes": [
+                    { "class": "commits", "requirement": "required" }
+                ] },
+                { "control_id": "CC1.1", "title": "second", "evidence_classes": [
+                    { "class": "reviews", "requirement": "optional" }
+                ] }
+            ]
+        }"#;
+        let err = parse_catalog(json).expect_err("duplicate control_id must fail");
+        assert_eq!(err.code(), "duplicate_control_id");
+        assert_eq!(
+            err,
+            CatalogError::DuplicateControl {
+                control_id: "CC1.1".to_owned(),
+            }
+        );
+        let value = err.to_json();
+        assert_eq!(value["code"], "duplicate_control_id");
+        assert_eq!(value["control_id"], "CC1.1");
+    }
+
+    #[test]
     fn wrong_schema_version_is_rejected_with_tuple() {
         let json = r#"{
             "catalog_id": "x",
@@ -869,6 +1004,60 @@ mod tests {
         assert_eq!(pinned.catalog_hash, hash);
         assert_eq!(pinned.catalog_id, "soc2-v1");
         assert_eq!(pinned.catalog_schema_version.version, 1);
+    }
+
+    #[test]
+    fn default_catalog_hash_is_pinned() {
+        // The shipped soc2-v1.json (which has no duplicate controls or classes)
+        // must keep hashing to this exact handle. A change here signals either a
+        // catalog-content change or a canonicalization regression.
+        let catalog = default();
+        assert_eq!(
+            catalog_hash(&catalog),
+            "control_catalog:v1:fb6792a51b5db445392dfe8bcc3e68998299a3f4d975fba424bb01494262016a"
+        );
+    }
+
+    #[test]
+    fn canonical_bytes_order_independent_for_valid_shuffle_without_duplicates() {
+        // The scenario Codex described (duplicate {class, requirement} entries
+        // within one control differing only in order) can no longer be
+        // constructed — parsing rejects it — so order-independence is proven
+        // instead over a valid catalog whose classes and controls are shuffled.
+        let shuffled = r#"{
+            "catalog_id": "s",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+            "controls": [
+                { "control_id": "Z", "title": "z", "evidence_classes": [
+                    { "class": "reviews", "requirement": "optional" },
+                    { "class": "commits", "requirement": "required" },
+                    { "class": "pull_requests", "requirement": "required" }
+                ] },
+                { "control_id": "A", "title": "a", "evidence_classes": [
+                    { "class": "validation_runs", "requirement": "optional" },
+                    { "class": "commits", "requirement": "optional" }
+                ] }
+            ]
+        }"#;
+        let ordered = r#"{
+            "catalog_id": "s",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+            "controls": [
+                { "control_id": "A", "title": "a", "evidence_classes": [
+                    { "class": "commits", "requirement": "optional" },
+                    { "class": "validation_runs", "requirement": "optional" }
+                ] },
+                { "control_id": "Z", "title": "z", "evidence_classes": [
+                    { "class": "commits", "requirement": "required" },
+                    { "class": "pull_requests", "requirement": "required" },
+                    { "class": "reviews", "requirement": "optional" }
+                ] }
+            ]
+        }"#;
+        let a = parse_catalog(shuffled).expect("parses");
+        let b = parse_catalog(ordered).expect("parses");
+        assert_eq!(canonical_bytes(&a), canonical_bytes(&b));
+        assert_eq!(catalog_hash(&a), catalog_hash(&b));
     }
 
     #[test]

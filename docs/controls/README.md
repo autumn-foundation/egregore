@@ -68,6 +68,23 @@ Each control lists its evidence classes with a `requirement`:
 
 The embedded default catalog is `docs/controls/soc2-v1.json`.
 
+### Uniqueness (schema / hash-normalization contract)
+
+Two uniqueness rules keep the canonical hash order-independent (see the hash-pin
+contract below):
+
+- A `control_id` must be unique across the catalog. A repeated `control_id` is
+  rejected at load time with `duplicate_control_id`.
+- Within one control, an evidence class must appear at most once. Listing the
+  same `class` twice — even with different `requirement` values (e.g. `commits`
+  required and `commits` optional) — is rejected with `duplicate_evidence_class`.
+
+Both are hard parse errors (exit 2, first offender in document order). They
+exist because duplicate control IDs or duplicate classes would tie under the
+canonical sort, so two catalogs differing only in the order of the duplicate
+entries could otherwise hash differently, violating the order-independence
+guarantee.
+
 ## Versioning and the `unknown_schema_version` reader contract
 
 The tuple `(control_catalog, ControlCatalog, 1)` is registered in
@@ -90,9 +107,12 @@ silently misreading it.
 Every catalog has a deterministic content hash. The **canonical form** is:
 
 - object keys in fixed field order,
-- `controls` sorted by `control_id`,
-- each control's `evidence_classes` sorted by class wire name.
+- `controls` sorted by `control_id` (unique, so this is a total order),
+- each control's `evidence_classes` sorted by `(class wire name, requirement)`.
 
+Because duplicate control IDs and duplicate classes within a control are
+rejected at load time (see Uniqueness above), the sort keys are unique and the
+ordering is a genuine total order — canonical bytes never depend on input order.
 Canonicalization is independent of the input's control/class ordering and of
 serde_json's `preserve_order` feature, so the hash is stable across runs and
 across equivalent re-orderings of the source document. The hash is a BLAKE3

@@ -36,8 +36,9 @@ cargo run -- audit control-catalog --format text
 ## Exit codes
 
 - `0` — the catalog is valid; the report is printed to stdout.
-- `2` — a read/parse error, an unknown evidence class, or an unknown schema
-  version; a redaction-safe JSON error is printed to stderr.
+- `2` — a read/parse error, an unknown evidence class, an unknown schema
+  version, a duplicate control ID, or a duplicate evidence class within a
+  control; a redaction-safe JSON error is printed to stderr.
 
 ## JSON output
 
@@ -74,3 +75,7 @@ across repeated runs on the same catalog:
   `{ "code": "unknown_evidence_class", "control_id": "…", "class": "…" }`
 - Invalid requirement:
   `{ "code": "invalid_requirement", "control_id": "…", "class": "…", "requirement": "…" }`
+- Duplicate evidence class within a control:
+  `{ "code": "duplicate_evidence_class", "control_id": "…", "class": "…" }`
+- Duplicate control ID:
+  `{ "code": "duplicate_control_id", "control_id": "…" }`

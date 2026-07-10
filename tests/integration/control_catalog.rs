@@ -120,6 +120,31 @@ fn unknown_evidence_class_exits_two_and_names_class() {
 }
 
 #[test]
+fn duplicate_evidence_class_exits_two_and_names_class() {
+    let bad = r#"{
+        "catalog_id": "x",
+        "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+        "controls": [
+            { "control_id": "CC1.1", "title": "t", "evidence_classes": [
+                { "class": "commits", "requirement": "required" },
+                { "class": "commits", "requirement": "optional" }
+            ] }
+        ]
+    }"#;
+    let (_temp, path) = write_temp("dup_class.json", bad);
+    let output = egregore()
+        .args(["audit", "control-catalog", "--catalog"])
+        .arg(&path)
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    let err: Value = serde_json::from_slice(&output.stderr).expect("stderr json");
+    assert_eq!(err["code"], "duplicate_evidence_class");
+    assert_eq!(err["control_id"], "CC1.1");
+    assert_eq!(err["class"], "commits");
+}
+
+#[test]
 fn unknown_schema_version_exits_two_with_tuple() {
     let bad = r#"{
         "catalog_id": "x",
