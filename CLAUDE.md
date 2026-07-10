@@ -58,6 +58,13 @@ cargo run -- query transitive-callers does_not_exist --graph graph.jsonl      # 
 cargo run -- query transitive-callers <symbol_name> --graph graph.jsonl --max-depth 3
 cargo run -- query transitive-callers <symbol_name> --graph history.graph.jsonl --at <sha>  # commit view
 
+# Transitive outbound callees/dependencies with paths (issue #253)
+cargo run -- query transitive-callees <symbol_name> --graph graph.jsonl       # exit 0 (even when empty)
+cargo run -- query transitive-callees <ambiguous_name> --graph graph.jsonl    # exit 1 (candidates listed)
+cargo run -- query transitive-callees does_not_exist --graph graph.jsonl      # exit 2 (no_match)
+cargo run -- query transitive-callees <symbol_name> --graph graph.jsonl --max-depth 3
+cargo run -- query transitive-callees <symbol_name> --graph history.graph.jsonl --at <sha>  # commit view
+
 # Direct outbound dependencies of a symbol (issue #123)
 cargo run -- query deps <symbol_name> --graph graph.jsonl          # exit 0 (even when empty)
 cargo run -- query deps <ambiguous_name> --graph graph.jsonl       # exit 1 (candidates listed)
@@ -184,6 +191,23 @@ candidate record IDs; `--at`/`--as-of` walk a single-commit history view. Output
 newline-delimited JSON (summary envelope line, then one row per line), byte-identical across
 runs. Rows are reachability leads, never proof of breakage. See
 `docs/cli/transitive-callers.md`.
+
+`eg query transitive-callees <handle>` is the outbound mirror of transitive-callers: it walks
+the transitive outbound `CALLS`/`IMPLEMENTS`/`IMPORTS`/`REFERENCES` closure of a symbol
+(record ID or exact name) up to `--max-depth` (default 5) and returns every reachable node
+with its hop distance and one concrete shortest connecting dependency path of
+record-ID/edge-label handles running from the anchor out to the node. The `--max-depth=1`
+reachable-plus-unresolved result is exactly the `eg query deps` (#123) direct dependency set,
+so it carries #123's explicit `unresolved` category: an outbound edge whose target is a
+Diagnostic marker, an `unresolved` call, or a missing record is reported there — never
+silently dropped and never counted as reachable. Cycles terminate deterministically (each
+node reported once, shortest path); reaching the bound emits a truncation diagnostic counting
+dropped frontier nodes per depth. Call-resolution labels (issues #152/#134) propagate along
+paths: each row carries the weakest resolution on its chain. Ambiguous names exit 1 listing
+all candidate record IDs; `--at`/`--as-of` walk a single-commit history view. Output is
+newline-delimited JSON (summary envelope line, then reachable rows, then unresolved rows),
+byte-identical across runs. Rows are reachability leads, never proof of breakage or runtime
+behavior. See `docs/cli/transitive-callees.md`.
 
 `eg query deps <handle>` returns the direct outbound dependencies of a symbol (record ID or
 exact name) — its `CALLS`/`IMPLEMENTS`/`IMPORTS`/`REFERENCES` neighbors — each labeled with

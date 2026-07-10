@@ -89,7 +89,7 @@ Summary envelope fields:
 | `ok` | bool | `true` on success. |
 | `handle` | string | The handle as supplied. |
 | `target` | object | The resolved symbol: `record_id`, `schema_version`, `name`, `kind`, `repo_relative_path`, `span`. |
-| `direction` | string | Always `"inbound"` (the outbound mirror is issue #253). |
+| `direction` | string | Always `"inbound"` (the outbound mirror is [`eg query transitive-callees`](transitive-callees.md), issue #253). |
 | `edge_labels` | array | Always `["CALLS","REFERENCES"]`. |
 | `max_depth` | number | Bound in effect. |
 | `at_commit` | string | Present with `--at`/`--as-of`: the resolved commit SHA. |
@@ -158,7 +158,8 @@ eg query transitive-callers handle_query --graph graph.jsonl --max-depth 3
 ## Out of scope (this slice)
 
 - The outbound direction — transitive callees / "how a route reaches storage"
-  — is the mirror slice owned by issue #253.
+  — is the mirror slice owned by [`eg query transitive-callees`](transitive-callees.md)
+  (issue #253).
 - Joining reachable nodes to public-API/visibility (#124) or test (#126) sets.
 - Risk scoring, ranking, test selection, or root-cause inference.
 - New extraction: no cross-crate resolution, macro expansion, or trait
