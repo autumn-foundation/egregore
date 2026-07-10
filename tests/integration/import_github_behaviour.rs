@@ -2831,3 +2831,206 @@ fn review_seed_graph_change_re_resolves_tombstones_and_revives() {
         "flipping back tombstones the superseded diagnostic: {j4}"
     );
 }
+
+/// Merge SHA for the v2→v3 upgrade P1 regression fixture (resolves against seed).
+const UPGRADE_MERGE_SHA: &str = "upgmerge00000000000000000000000000000010";
+
+/// Route table for the v2→v3 upgrade P1 regression: one closed+merged PR (#10)
+/// whose `merge_commit_sha` resolves against the seed, one issue (#1) with a
+/// label, one inline PR review comment (id 501) and one PR review summary (id
+/// 401), each anchored to a resolvable review commit. The pulls `ETag` is held
+/// constant so the mock 304s the `/pulls` list unless the migration clears it.
+fn upgrade_regression_routes(pulls_etag: &str) -> HashMap<String, Canned> {
+    let pulls = serde_json::json!([
+        {
+            "number": 10, "title":"Merged PR","body":"Body.",
+            "state":"closed","draft":false,"labels":[],"assignees":[],
+            "user":{"login":"dev"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z",
+            "merged_at":"2026-01-02T00:00:00Z","closed_at":"2026-01-02T00:00:00Z",
+            "head":{"ref":"feature-a","sha":"upgheadsha00000000000000000000000000000010"},
+            "base":{"ref":"main","sha":"upgbasesha00000000000000000000000000000010"},
+            "merge_commit_sha": UPGRADE_MERGE_SHA,
+            "html_url":"https://github.com/o/r/pull/10"
+        }
+    ])
+    .to_string();
+    let issues = serde_json::json!([
+        {
+            "number": 1, "title":"An issue","body":"Body.",
+            "state":"open","labels":[{"name":"bug","color":"f00"}],"assignees":[],
+            "user":{"login":"reporter"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z",
+            "html_url":"https://github.com/o/r/issues/1"
+        }
+    ])
+    .to_string();
+    let review_comments = serde_json::json!([
+        {
+            "id": 501, "body":"Inline.", "user":{"login":"reviewer"},
+            "path":"src/lib.rs","line":10,"side":"RIGHT",
+            "pull_request_url":"https://api.github.com/repos/o/r/pulls/10",
+            "commit_id": RC_SHA_A,
+            "created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z",
+            "html_url":"https://github.com/o/r/pull/10#discussion_r501"
+        }
+    ])
+    .to_string();
+    let reviews = serde_json::json!([
+        {
+            "id": 401, "body":"Anchored review.", "state":"APPROVED",
+            "user":{"login":"reviewer"},"submitted_at":"2026-01-02T03:00:00Z",
+            "commit_id": RC_SHA_A,
+            "html_url":"https://github.com/o/r/pull/10#pullrequestreview-401"
+        }
+    ])
+    .to_string();
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/repos/o/r".to_owned(),
+        Canned::ok("{\"full_name\":\"o/r\"}", "\"repo\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues?state=all&per_page=100".to_owned(),
+        Canned::ok(&issues, "\"issues-upg\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, pulls_etag),
+    );
+    routes.insert(
+        "/repos/o/r/labels?per_page=100".to_owned(),
+        Canned::ok("[{\"name\":\"bug\",\"color\":\"f00\"}]", "\"labels-upg\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"ic-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/comments?per_page=100".to_owned(),
+        Canned::ok(&review_comments, "\"prc-upg\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/10/reviews?per_page=100".to_owned(),
+        Canned::ok(&reviews, "\"prr-401\""),
+    );
+    routes
+}
+
+#[test]
+fn upgraded_v2_store_reemits_review_anchors_when_pull_list_unchanged() {
+    // Codex #352 P1: the per-PR `/pulls/{n}/reviews` fetch is gated behind
+    // `if pulls_changed` in import.rs, which is only true when the `/pulls` LIST
+    // returns 200. Round 1's v2→v3 migration PRESERVED the `/pulls` list ETag, so
+    // an upgraded store with an UNCHANGED PR list and seed graph took the 304 fast
+    // path → pulls_changed == false → the per-PR reviews were never fetched → the
+    // pre-existing `pr_review` records never re-emitted with `review_commit_sha` /
+    // `REVIEWS_COMMIT`, silently dropping the #334 contract for existing reviews
+    // (the common upgrade case). The migration must force a FULL review refresh
+    // even when nothing changed. The pulls ETag and the seed are held CONSTANT so
+    // the mock WOULD 304 the /pulls list if its ETag survived the migration.
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+    let code_graph = tmp.path().join("code.jsonl");
+    std::fs::write(&code_graph, commit_seed(&[UPGRADE_MERGE_SHA, RC_SHA_A])).unwrap();
+
+    // 1. Fresh v3 import: emits the PR/issue Tasks, the MERGED_AS edge, and both
+    //    review anchors (review 401 + comment 501). State is written at v3.
+    let server = MockServer::start(upgrade_regression_routes("\"pulls-upg-const\""));
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(
+        &server.base_url,
+        &out1,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok1);
+    assert_eq!(edges_of_label(&j1, "MERGED_AS"), 1, "fresh: MERGED_AS edge");
+    assert_eq!(
+        edges_of_label(&j1, "REVIEWS_COMMIT"),
+        2,
+        "fresh: two review anchors (summary + comment)"
+    );
+    assert_eq!(review_by_native(&j1, 401)["review_commit_sha"], RC_SHA_A);
+
+    // 2. Simulate a pre-#334 (v2) store: downgrade the on-disk schema_version to 2
+    //    and drop the review-family resource hashes. A genuine v2 store hashed
+    //    reviews as blake3(payload) (the v2 formula), which the v3 `review_hash`
+    //    (payload+marker) can never equal — so on the forced 200 refetch every
+    //    review re-emits exactly once. Deleting the review hashes models that
+    //    guaranteed formula mismatch. Every OTHER field (ETags incl. the /pulls
+    //    LIST ETag, the pr:10 / issue:1 resource hashes, watermarks, the
+    //    fingerprint) is left intact — exactly what an upgraded store looks like.
+    let mut sj: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    sj["schema_version"] = serde_json::json!(2);
+    if let Some(hashes) = sj["resource_hashes"].as_object_mut() {
+        hashes.retain(|k, _| !k.starts_with("pr_review"));
+    }
+    assert!(
+        sj["etags"]
+            .as_object()
+            .is_some_and(|m| m.keys().any(|k| k.contains("/pulls?state=all"))),
+        "precondition: the v2 state carries a /pulls LIST ETag that would 304"
+    );
+    std::fs::write(&state, serde_json::to_string_pretty(&sj).unwrap()).unwrap();
+
+    // 3. First v3 run against the migrated store, PR list + seed UNCHANGED. The
+    //    migration must clear the /pulls list ETag so the mock returns 200,
+    //    pulls_changed becomes true, and the per-PR reviews re-fetch. RED against
+    //    round-1 code: the preserved /pulls ETag 304s → review 401 is never fetched.
+    server.clear_requests();
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(
+        &server.base_url,
+        &out2,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok2);
+
+    // The per-PR reviews endpoint WAS fetched (the whole point of the P1 fix).
+    assert!(
+        server
+            .request_paths()
+            .iter()
+            .any(|p| p.contains("/pulls/10/reviews")),
+        "the migration must force the per-PR reviews fetch even on an unchanged PR list"
+    );
+    // Both existing reviews re-emit with the #334 anchor contract.
+    let summary_review = review_by_native(&j2, 401);
+    assert_eq!(summary_review["review_kind"], "pr_review");
+    assert_eq!(
+        summary_review["review_commit_sha"], RC_SHA_A,
+        "the pre-existing pr_review must re-emit with review_commit_sha on upgrade"
+    );
+    let inline_comment = review_by_native(&j2, 501);
+    assert_eq!(inline_comment["review_kind"], "pr_review_comment");
+    assert_eq!(inline_comment["review_commit_sha"], RC_SHA_A);
+    assert_eq!(
+        edges_of_label(&j2, "REVIEWS_COMMIT"),
+        2,
+        "both review anchors (summary + comment) re-emit their REVIEWS_COMMIT edge"
+    );
+
+    // Idempotency of every OTHER domain is preserved on the same run: the PR list
+    // and seed are unchanged, so no MERGED_AS re-emits and no stale artifact is
+    // tombstoned, and the unchanged issue/PR Tasks do not re-emit.
+    assert_eq!(
+        edges_of_label(&j2, "MERGED_AS"),
+        0,
+        "unchanged seed must NOT spuriously re-emit MERGED_AS (preserved pr:10 hash)"
+    );
+    assert!(
+        tombstones334(&j2).is_empty(),
+        "no artifact is tombstoned when the seed graph is unchanged: {j2}"
+    );
+    let reemitted_tasks: Vec<String> = nodes_of_kind(&j2, "Task")
+        .into_iter()
+        .map(|t| t["summary"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert!(
+        reemitted_tasks.is_empty(),
+        "unchanged issue/PR Tasks must NOT re-emit on the migrated run: {reemitted_tasks:?}"
+    );
+}

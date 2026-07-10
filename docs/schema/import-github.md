@@ -349,12 +349,25 @@ Issue #334 bumps `STATE_SCHEMA_VERSION` again (`2 → 3`) for the same reason on
 review side: reviews began emitting a new `review_commit_sha` field and
 `REVIEWS_COMMIT` edge, and a pre-#334 cached review-endpoint ETag
 (`/pulls/comments`, `/pulls/{n}/reviews`) would otherwise 304 and suppress the new
-contract for unchanged reviews. The additive `review_commit_artifacts` state map
-is itself `#[serde(default)]` and needs no bump; the bump is purely for the changed
-emitted contract, and the commit-anchored review endpoints are additionally gated on
-the same `code_graph_fingerprint` as `/pulls` so a later-added code graph still
-re-resolves review anchors in steady state (not only across the one-time
-migration).
+contract for unchanged reviews. Unlike the `1 → 2` bump, the `2 → 3` bump does **not**
+discard the whole file: a v2 file carries #333's `pr_merge_artifacts` tracking, so a
+blunt discard could leave a stale + fresh merge artifact both live on the first v3
+run. The loader instead **migrates** v2 → v3, preserving every field that provides
+idempotency or prior-artifact tracking (resource hashes, watermarks, the
+`code_graph_fingerprint`, and `pr_merge_artifacts`; the additive
+`review_commit_artifacts` map is `#[serde(default)]`) and **clearing every ETag**.
+Clearing all ETags — including the `/pulls` list ETag — is required, not just the
+review-endpoint ones: the per-PR `/pulls/{n}/reviews` fetch is gated behind
+`if pulls_changed`, which is true only when the `/pulls` list returns 200, so a
+preserved `/pulls` list ETag would let an unchanged PR list 304 and the per-PR
+reviews would never be fetched, silently dropping the review-anchor contract for
+existing reviews on upgrade. The forced full refetch stays idempotent for every
+non-review domain because emission is gated by the preserved resource hashes (an
+unchanged issue/PR/label re-fetches but its unchanged hash suppresses re-emission),
+while the v2→v3 review-hash formula change re-emits each existing review exactly once
+with the new anchor. In steady state the commit-anchored review endpoints are
+additionally gated on the same `code_graph_fingerprint` as `/pulls` so a later-added
+code graph still re-resolves review anchors (not only across the one-time migration).
 
 ---
 

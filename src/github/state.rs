@@ -40,31 +40,32 @@ use crate::github::{model, records::CommitIndex};
 /// Unlike the #333 1 → 2 bump (v1 held no merge artifacts, so a blunt discard was
 /// safe), a v2 file DOES carry #333's `pr_merge_artifacts` tracking, so this bump
 /// MUST NOT discard the whole file. [`State::load_or_fresh`] therefore *migrates*
-/// v2 → v3 (Codex #352 P2): it preserves every v2 field — critically
+/// v2 → v3 (Codex #352 P2/P1). A schema bump is a one-time FULL refresh, so the
+/// migration CLEARS EVERY conditional-request `ETag` while preserving every field
+/// that provides idempotency and prior-artifact tracking: the per-resource
+/// resource hashes, watermarks, the seed-graph fingerprint, and — critically —
 /// `pr_merge_artifacts`, so a merge that resolves differently on the first v3 run
-/// can still tombstone the stale artifact — and clears ONLY the review-endpoint
-/// `ETag` caches so review anchoring refreshes without a 304 hiding it. The
-/// `/pulls` list `ETag` and every other cache survive. The v2-stored review
-/// resource hashes are kept but harmless: the v3 review change hash folds in the
-/// `REVIEWS_COMMIT` marker ([`review_hash`]) — a different formula than the v2
-/// `blake3(payload)` — so on the forced 200 refetch no stored hash can match and
-/// every review re-emits with the anchor field exactly once. The additive
-/// `review_commit_artifacts` field itself is `#[serde(default)]`.
-pub const STATE_SCHEMA_VERSION: u32 = 3;
-
-/// Returns `true` when `key` is an `ETag` cache key for one of the
-/// commit-anchored review endpoints whose emitted per-resource contract changed
-/// in the v2 → v3 bump (issue #334): `/pulls/comments` (PR review comments) or
-/// `/pulls/{n}/reviews` (per-PR review summaries).
+/// can still tombstone the stale artifact. The additive `review_commit_artifacts`
+/// field is `#[serde(default)]` and defaults to empty.
 ///
-/// The `/pulls` *list* endpoint key (`/pulls?state=…`, which uses `/pulls?` and
-/// never `/pulls/`) is deliberately excluded — its contract is unchanged, so its
-/// `ETag` (and the #333 merge-artifact tracking that depends on the pulls branch
-/// running) must survive a v2 → v3 migration. Keys are `"<path>?page=<n>"`
-/// (see [`crate::github::client::GithubClient::fetch_paginated`]).
-fn is_review_endpoint_etag_key(key: &str) -> bool {
-    key.contains("/pulls/comments") || (key.contains("/pulls/") && key.contains("/reviews"))
-}
+/// Clearing ALL `ETags` (not just the review-endpoint ones) is required, not
+/// merely convenient (Codex #352 P1). The per-PR `/pulls/{n}/reviews` fetch in
+/// [`crate::github::import::run_import`] is gated behind `if pulls_changed`, which
+/// is true only when the `/pulls` LIST endpoint returns 200. Preserving the
+/// `/pulls` list `ETag` lets an unchanged PR list return 304 →
+/// `pulls_changed == false` → the per-PR review `ETags` (however they were
+/// cleared) are never even requested, so existing reviews never re-emit with the
+/// #334 anchor. Dropping the `/pulls` list `ETag` too forces the 200 that flips
+/// `pulls_changed` true and drives the review refresh. Clearing every other
+/// endpoint's `ETag` is safe because record emission is universally gated by the
+/// preserved resource hashes: an unchanged issue/PR/label/comment re-fetches (200)
+/// but its unchanged hash suppresses re-emission (idempotency, AC8), so a changed
+/// seed graph cannot spuriously re-emit `MERGED_AS`. The v2-stored review resource
+/// hashes are preserved but harmless: the v3 review change hash folds in the
+/// `REVIEWS_COMMIT` marker ([`review_hash`]) — a different formula than the v2
+/// `blake3(payload)` — so on the forced 200 refetch no stored review hash can
+/// match and every review re-emits with the anchor field exactly once.
+pub const STATE_SCHEMA_VERSION: u32 = 3;
 
 /// Per-endpoint update watermarks (inclusive `>=` selection, §5).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -185,11 +186,15 @@ impl State {
     ///   would drop #333's `pr_merge_artifacts` tracking, so a PR whose merge
     ///   resolves differently on the first v3 run could emit the fresh artifact
     ///   yet never tombstone the stale one, leaving stale + fresh merge evidence
-    ///   live. Migration preserves every v2 field (the additive
-    ///   `review_commit_artifacts` defaults to empty via serde) and clears ONLY
-    ///   the review-endpoint `ETag` caches ([`is_review_endpoint_etag_key`]) so
-    ///   #334 review anchoring refreshes without a 304 hiding it — the `/pulls`
-    ///   list `ETag` and every other cache survive.
+    ///   live. Migration preserves every v2 field — the resource hashes,
+    ///   watermarks, the seed-graph fingerprint, and `pr_merge_artifacts` (the
+    ///   additive `review_commit_artifacts` defaults to empty via serde) — and
+    ///   CLEARS EVERY `ETag` so the first v3 run is a full refresh no endpoint can
+    ///   304. Clearing the `/pulls` list `ETag` specifically is what flips
+    ///   `pulls_changed` true in [`crate::github::import::run_import`] and drives
+    ///   the per-PR `/pulls/{n}/reviews` refetch that re-emits the #334 review
+    ///   anchors (Codex #352 P1); the preserved resource hashes keep every other
+    ///   domain idempotent across the refetch.
     /// - anything else (`< 2`, pre-#333 with no merge artifacts to lose, or an
     ///   unsupported future value) → safe fresh-empty fallback.
     #[must_use]
@@ -210,8 +215,14 @@ impl State {
             return s;
         }
         if s.schema_version == 2 {
-            // Migrate v2 → v3 in place rather than discarding the whole file.
-            s.etags.retain(|k, _| !is_review_endpoint_etag_key(k));
+            // Migrate v2 → v3 in place rather than discarding the whole file. A
+            // schema bump is a one-time full refresh: clear EVERY conditional
+            // `ETag` (critically the `/pulls` list `ETag`, so `pulls_changed`
+            // flips true and the per-PR reviews refetch — Codex #352 P1) while
+            // preserving the resource hashes, watermarks, fingerprint, and
+            // `pr_merge_artifacts` that keep the refresh idempotent and able to
+            // tombstone a stale merge artifact.
+            s.etags.clear();
             s.schema_version = STATE_SCHEMA_VERSION;
             return s;
         }
@@ -748,12 +759,12 @@ mod tests {
     }
 
     #[test]
-    fn migrate_v2_to_v3_preserves_state_and_clears_only_review_etags() {
+    fn migrate_v2_to_v3_preserves_resource_hashes() {
         // Codex #352 P2: a pre-#334 (version-2) state file must be MIGRATED, not
         // discarded — discarding drops #333's `pr_merge_artifacts` tracking. The
-        // migration preserves every v2 field (merge artifacts, resource hashes,
-        // watermarks, the `/pulls` list ETag) and clears ONLY the review-endpoint
-        // ETags so review anchoring refreshes without a 304 hiding it.
+        // migration preserves every v2 field except the ETags (which are cleared
+        // for a one-time full refresh); the preserved resource hashes keep the
+        // refresh idempotent for unchanged non-review resources.
         let dir = std::env::temp_dir().join(format!("egst-mig334-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
@@ -804,11 +815,15 @@ mod tests {
     }
 
     #[test]
-    fn migrate_v2_to_v3_clears_review_etags_but_keeps_pulls_and_other_etags() {
-        // The migration clears exactly the two commit-anchored review-endpoint ETag
-        // caches (`/pulls/comments`, `/pulls/{n}/reviews`) so #334 review anchoring
-        // cannot be 304-hidden, while PRESERVING the `/pulls` list ETag and every
-        // unrelated endpoint's ETag.
+    fn migrate_v2_to_v3_clears_all_etags_but_preserves_hashes_watermarks_and_artifacts() {
+        // Codex #352 P1: the v2 → v3 migration must clear EVERY ETag — including
+        // the `/pulls` LIST ETag — so the first v3 run is a full refresh no
+        // endpoint can 304. Preserving the `/pulls` list ETag would let an
+        // unchanged PR list 304 → `pulls_changed == false` → the per-PR
+        // `/pulls/{n}/reviews` fetch (gated behind `if pulls_changed`) never fires
+        // → existing reviews never re-emit the #334 anchor. Everything that
+        // provides idempotency / prior-artifact tracking survives: resource
+        // hashes, watermarks, and `pr_merge_artifacts`.
         let dir = std::env::temp_dir().join(format!("egst-mig-etag-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
@@ -830,32 +845,44 @@ mod tests {
                 issues: "\"issues\"",
                 issue_comments: "\"ic\"",
                 labels: "\"labels\"",
-            }
+            },
+            "last_seen_updated_at": { "issues": "2026-01-03T00:00:00Z", "pulls": "2026-01-04T00:00:00Z" },
+            "label_list_hash": "labhash",
+            "resource_hashes": { "pr:12": "prhash", "issue:1": "ihash" },
+            "pr_merge_artifacts": { "pr:12": "project:v1:merged-edge-12" },
+            "code_graph_fingerprint": "fp-abc"
         });
         std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
         let s = State::load_or_fresh(&path, "o/r", "x");
         assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
-        // Review-endpoint ETags cleared.
+        // EVERY ETag is cleared — the `/pulls` list ETag included (the P1 fix).
         assert!(
-            !s.etags.contains_key(review_comments),
-            "the /pulls/comments review ETag must be cleared"
+            s.etags.is_empty(),
+            "the v2 → v3 migration must clear every ETag (incl. the /pulls list ETag): {:?}",
+            s.etags
         );
-        assert!(
-            !s.etags.contains_key(per_pr_reviews),
-            "the /pulls/{{n}}/reviews review ETag must be cleared"
-        );
-        // The /pulls list ETag and unrelated endpoints survive.
+        // Everything providing idempotency / prior-artifact tracking survives.
+        assert!(s.is_unchanged("pr:12", "prhash"));
+        assert!(s.is_unchanged("issue:1", "ihash"));
+        assert_eq!(s.label_list_hash.as_deref(), Some("labhash"));
         assert_eq!(
-            s.etags.get(pulls_list).map(String::as_str),
-            Some("\"pulls-list\""),
-            "the /pulls LIST ETag must survive (its contract is unchanged)"
+            s.last_seen_updated_at.issues.as_deref(),
+            Some("2026-01-03T00:00:00Z")
         );
-        assert_eq!(s.etags.get(issues).map(String::as_str), Some("\"issues\""));
         assert_eq!(
-            s.etags.get(issue_comments).map(String::as_str),
-            Some("\"ic\"")
+            s.last_seen_updated_at.pulls.as_deref(),
+            Some("2026-01-04T00:00:00Z")
         );
-        assert_eq!(s.etags.get(labels).map(String::as_str), Some("\"labels\""));
+        assert_eq!(
+            s.prior_merge_artifact("pr:12"),
+            Some("project:v1:merged-edge-12"),
+            "pr_merge_artifacts must survive so a changed merge outcome can tombstone the stale artifact"
+        );
+        assert_eq!(
+            s.code_graph_fingerprint.as_deref(),
+            Some("fp-abc"),
+            "the seed-graph fingerprint survives the migration"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -878,23 +905,5 @@ mod tests {
             "pre-#333 version-1 state is still discarded (no merge artifacts to lose)"
         );
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn is_review_endpoint_etag_key_matches_only_review_endpoints() {
-        assert!(is_review_endpoint_etag_key(
-            "/repos/o/r/pulls/comments?per_page=100?page=1"
-        ));
-        assert!(is_review_endpoint_etag_key(
-            "/repos/o/r/pulls/12/reviews?per_page=100?page=3"
-        ));
-        // The /pulls LIST endpoint uses `/pulls?`, never `/pulls/`.
-        assert!(!is_review_endpoint_etag_key(
-            "/repos/o/r/pulls?state=all&per_page=100?page=1"
-        ));
-        assert!(!is_review_endpoint_etag_key(
-            "/repos/o/r/issues?state=all&per_page=100?page=1"
-        ));
-        assert!(!is_review_endpoint_etag_key("/repos/o/r/labels?page=1"));
     }
 }
