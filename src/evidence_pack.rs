@@ -1831,38 +1831,18 @@ fn pack_safety(rows: &[BundleRecord]) -> (bool, String) {
                 ),
             );
         }
-        if let GraphRecord::Node {
-            text,
-            validation_summary,
-            arguments_summary,
-            arguments_handle,
-            result_handle,
-            stdout_handle,
-            stderr_handle,
-            patch_handle,
-            body_handle,
-            diff_hunk_handle,
-            ..
-        } = &br.record
-        {
-            if text.is_some() || validation_summary.is_some() || arguments_summary.is_some() {
-                return (false, format!("record {record_id} retains raw prose"));
-            }
-            let inline_leak = [
-                arguments_handle,
-                result_handle,
-                stdout_handle,
-                stderr_handle,
-                body_handle,
-                diff_hunk_handle,
-            ]
-            .into_iter()
-            .flatten()
-            .any(|h| h.inline.is_some())
-                || patch_handle.as_ref().is_some_and(|h| h.inline.is_some());
-            if inline_leak {
-                return (false, format!("record {record_id} retains inline payload"));
-            }
+        // Assert every field `scrub_record` clears is actually None. Shared with
+        // the #68 bundle verify Safety check (`first_unscrubbed_field`) so the
+        // pack and bundle scrub contracts can never drift — this covers the
+        // top-level prose, inline handle payloads, AND the nested user_context
+        // prose fields (prompt_text, rule_text, decision_rationale, …). A
+        // tampered row that restores any such field fails Safety even when its
+        // row hash was recomputed so Integrity passes.
+        if let Some(field) = crate::bundle::first_unscrubbed_field(&br.record) {
+            return (
+                false,
+                format!("record {record_id} retains scrubbed field '{field}'"),
+            );
         }
     }
     (
@@ -3808,6 +3788,71 @@ mod pack338_tests {
         let report = verify_pack(&tampered);
         assert!(!report.ok);
         assert!(!report.integrity.passed);
+    }
+
+    #[test]
+    fn verify_fails_on_restored_user_context_prose() {
+        // A tampered pack whose section row has nested user_context prose
+        // restored (prompt_text / rule_text) with its row hash recomputed so
+        // Integrity still passes must FAIL the Safety verdict. This mirrors the
+        // #68 bundle scrub/safety contract: every field `scrub_record` clears —
+        // including nested user_context prose — must be asserted None by verify.
+        for field in ["prompt_text", "rule_text"] {
+            let mut pack = assemble_cc81();
+            // Baseline: a properly scrubbed pack passes Safety.
+            assert!(verify_pack(&pack).safety.passed, "clean pack passes safety");
+
+            // Restore benign (non-secret) nested prose on a Node section row.
+            let br = pack
+                .sections
+                .iter_mut()
+                .flat_map(|s| s.records.iter_mut())
+                .find(|br| matches!(br.record, GraphRecord::Node { .. }))
+                .expect("a node section row exists");
+            if let GraphRecord::Node { user_context, .. } = &mut br.record {
+                match field {
+                    "prompt_text" => {
+                        user_context.prompt_text = Some("benign restored prompt".to_owned());
+                    }
+                    "rule_text" => {
+                        user_context.rule_text = Some("benign restored rule".to_owned());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            // Recompute the row hash so Integrity still passes.
+            let serialized = serde_json::to_string(&br.record).unwrap();
+            br.hash = blake3::hash(serialized.as_bytes()).to_string();
+            let record_id = br.record.id().to_owned();
+
+            let report = verify_pack(&pack);
+            assert!(
+                report.integrity.passed,
+                "integrity still passes after hash recompute: {}",
+                report.integrity.detail
+            );
+            assert!(!report.ok, "overall verdict fails on restored prose");
+            assert!(
+                !report.safety.passed,
+                "safety must fail on restored user_context.{field}"
+            );
+            // Redaction-safe detail: names the field + record id, never the value.
+            assert!(
+                report.safety.detail.contains(field),
+                "detail names the restored field: {}",
+                report.safety.detail
+            );
+            assert!(
+                report.safety.detail.contains(&record_id),
+                "detail names the record id: {}",
+                report.safety.detail
+            );
+            assert!(
+                !report.safety.detail.contains("benign restored"),
+                "detail must never leak the restored value: {}",
+                report.safety.detail
+            );
+        }
     }
 
     #[test]
