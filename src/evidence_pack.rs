@@ -1961,6 +1961,168 @@ fn pack_safety(rows: &[BundleRecord]) -> (bool, String) {
     )
 }
 
+/// Safety scan over the ENTIRE assembled pack artifact (Codex round-10 P1).
+///
+/// [`pack_safety`] only inspects the scrubbed section rows, so a secret injected
+/// into a NON-record field — a `gaps[*].detail`, a `diagnostics[*].detail`, a
+/// verdict `detail`, an echoed `manifest.control_title` from a malicious
+/// `--catalog`, a section disclaimer, the top-level disclaimer — leaves every
+/// record hash valid and slips past Safety. Since `eg audit evidence-pack verify`
+/// is THE offline assertion that the artifact carries no raw sensitive classes,
+/// Safety must scan the whole serialized artifact, not just the rows.
+///
+/// `detect_secret` is prefix/marker-anchored and empirically flags NONE of the
+/// pack's legitimate high-entropy hex (BLAKE3 row/catalog hashes, `codegraph:v5:`
+/// / `agent_memory:v1:` record IDs, commit SHAs, `protected:v1:` handles, and
+/// `<REDACTED:email:...>` markers), so the clean scrubbed pack still passes. This
+/// scan therefore (1) keeps the per-record scrubbed-field + secret contract via
+/// [`pack_safety`], (2) scans every enumerated non-record text field so the
+/// failure detail can name WHERE precisely, and (3) as a completeness backstop,
+/// scans the whole serialized artifact so a secret in any string field not yet
+/// enumerated below can never slip through. Details name the area/class only,
+/// never the secret value.
+fn pack_artifact_safety(pack: &EvidencePack, rows: &[BundleRecord]) -> (bool, String) {
+    // (1) Per-record contract: scrubbed fields None + no secret inside a record.
+    let (rec_ok, rec_detail) = pack_safety(rows);
+    if !rec_ok {
+        return (false, rec_detail);
+    }
+    // (2) Enumerated non-record text fields, for a redaction-safe WHERE detail.
+    for (area, text) in nonrecord_text_fields(pack) {
+        if let Some((class, _)) = crate::redaction::detect_secret(text) {
+            return (
+                false,
+                format!(
+                    "pack field '{area}' contains unredacted secret class: {}",
+                    class.as_str()
+                ),
+            );
+        }
+    }
+    // (3) Completeness backstop: scan the whole serialized artifact so a secret in
+    //     ANY string field (including one not enumerated above, e.g. a future
+    //     field) still fails Safety.
+    let serialized = serde_json::to_string(pack).unwrap_or_default();
+    if let Some((class, _)) = crate::redaction::detect_secret(&serialized) {
+        return (
+            false,
+            format!(
+                "pack artifact contains unredacted secret class: {}",
+                class.as_str()
+            ),
+        );
+    }
+    (
+        true,
+        "no raw sensitive classes in records or pack artifact fields; scrubbed prose/handle fields are None"
+            .to_owned(),
+    )
+}
+
+/// Enumerates every string-bearing NON-record field of a pack as
+/// `(area_path, text)` pairs, so [`pack_artifact_safety`] can scan them and name
+/// WHERE a secret was found.
+///
+/// LOCKSTEP: whenever a string-bearing field is added to [`PackManifest`],
+/// [`EvidenceSection`], [`GapRow`], [`PackDiagnostic`], or [`PackVerdicts`], add
+/// it here so its area path appears in the failure detail. The whole-artifact
+/// backstop in [`pack_artifact_safety`] still catches a field missed here, but
+/// only this enumeration gives a precise WHERE. Section RECORDS are covered by
+/// the per-record [`pack_safety`] scan and are intentionally excluded here.
+fn nonrecord_text_fields(pack: &EvidencePack) -> Vec<(String, &str)> {
+    let mut out: Vec<(String, &str)> = Vec::new();
+
+    let m = &pack.manifest;
+    out.push(("manifest.control_id".to_owned(), m.control_id.as_str()));
+    out.push((
+        "manifest.control_title".to_owned(),
+        m.control_title.as_str(),
+    ));
+    out.push(("manifest.window.from".to_owned(), m.window.from.as_str()));
+    out.push(("manifest.window.to".to_owned(), m.window.to.as_str()));
+    out.push((
+        "manifest.catalog_pin.catalog_id".to_owned(),
+        m.catalog_pin.catalog_id.as_str(),
+    ));
+    out.push((
+        "manifest.catalog_pin.catalog_hash".to_owned(),
+        m.catalog_pin.catalog_hash.as_str(),
+    ));
+    out.push((
+        "manifest.egregore_version".to_owned(),
+        m.egregore_version.as_str(),
+    ));
+    if let Some(c) = m.captured_at.as_deref() {
+        out.push(("manifest.captured_at".to_owned(), c));
+    }
+    out.push(("manifest.disclaimer".to_owned(), m.disclaimer.as_str()));
+
+    for (i, s) in pack.sections.iter().enumerate() {
+        out.push((format!("sections[{i}].class"), s.class.as_str()));
+        out.push((format!("sections[{i}].requirement"), s.requirement.as_str()));
+        out.push((format!("sections[{i}].status"), s.status.as_str()));
+        if let Some(r) = s.unavailable_reason.as_deref() {
+            out.push((format!("sections[{i}].unavailable_reason"), r));
+        }
+        if let Some(d) = s.disclaimer.as_deref() {
+            out.push((format!("sections[{i}].disclaimer"), d));
+        }
+    }
+
+    for (i, g) in pack.gaps.iter().enumerate() {
+        out.push((format!("gaps[{i}].gap_class"), g.gap_class.as_str()));
+        out.push((format!("gaps[{i}].detail"), g.detail.as_str()));
+        if let Some(vt) = g.valid_time.as_deref() {
+            out.push((format!("gaps[{i}].valid_time"), vt));
+        }
+    }
+
+    for (i, d) in pack.diagnostics.iter().enumerate() {
+        out.push((format!("diagnostics[{i}].code"), d.code.as_str()));
+        out.push((format!("diagnostics[{i}].detail"), d.detail.as_str()));
+        if let Some(ec) = d.evidence_class.as_deref() {
+            out.push((format!("diagnostics[{i}].evidence_class"), ec));
+        }
+        if let Some(ur) = d.unavailable_reason.as_deref() {
+            out.push((format!("diagnostics[{i}].unavailable_reason"), ur));
+        }
+    }
+
+    let v = &pack.verdicts;
+    out.push((
+        "verdicts.required_classes.detail".to_owned(),
+        v.required_classes.detail.as_str(),
+    ));
+    out.push((
+        "verdicts.citation.detail".to_owned(),
+        v.citation.detail.as_str(),
+    ));
+    out.push((
+        "verdicts.integrity.detail".to_owned(),
+        v.integrity.detail.as_str(),
+    ));
+    out.push((
+        "verdicts.safety.detail".to_owned(),
+        v.safety.detail.as_str(),
+    ));
+    out.push((
+        "verdicts.review_coverage.status".to_owned(),
+        v.review_coverage.status.as_str(),
+    ));
+    out.push((
+        "verdicts.review_coverage.detail".to_owned(),
+        v.review_coverage.detail.as_str(),
+    ));
+    if let Some(r) = v.review_coverage.not_applicable_reason.as_deref() {
+        out.push((
+            "verdicts.review_coverage.not_applicable_reason".to_owned(),
+            r,
+        ));
+    }
+
+    out
+}
+
 /// Offline re-verification verdicts for an assembled pack (AC9).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackVerifyReport {
@@ -2067,9 +2229,10 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
         },
     };
 
-    // Safety.
+    // Safety scans the WHOLE artifact (records AND every non-record text field),
+    // not just section rows (Codex round-10 P1).
     let owned_rows: Vec<BundleRecord> = all_rows.iter().map(|br| (*br).clone()).collect();
-    let (safety_passed, safety_detail) = pack_safety(&owned_rows);
+    let (safety_passed, safety_detail) = pack_artifact_safety(pack, &owned_rows);
     let safety = VerificationVerdict {
         passed: safety_passed,
         detail: safety_detail,
@@ -4359,6 +4522,130 @@ mod pack338_tests {
         assert_eq!(
             with.manifest.captured_at.as_deref(),
             Some("2026-05-01T00:00:00Z")
+        );
+    }
+
+    /// A secret string `detect_secret` reliably flags (`cloud_credential`) and
+    /// which contains none of the pack's legitimate hex — so a hit is
+    /// unambiguously the injected secret, not a false positive on a hash/handle.
+    const INJECTED_SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
+
+    /// Codex round-10 P1: the clean scrubbed seed pack must still PASS Safety
+    /// once Safety scans the whole artifact. Guards against `detect_secret`
+    /// false-positives on the pack's legitimate high-entropy hex (BLAKE3 hashes,
+    /// record IDs, catalog/protected handles, `<REDACTED:email:...>` markers).
+    #[test]
+    fn verify_clean_pack_passes_whole_artifact_safety() {
+        let pack = assemble_cc81();
+        let report = verify_pack(&pack);
+        assert!(
+            report.safety.passed,
+            "clean scrubbed pack must pass whole-artifact Safety: {}",
+            report.safety.detail
+        );
+        assert!(report.ok, "clean pack verifies clean: {report:?}");
+    }
+
+    /// Codex round-10 P1: a secret injected into a non-record field
+    /// (`manifest.control_title`, as a malicious `--catalog` would echo) must
+    /// FAIL Safety even though every record hash stays valid so Integrity passes.
+    #[test]
+    fn verify_fails_on_secret_in_manifest_control_title() {
+        let mut pack = assemble_cc81();
+        assert!(verify_pack(&pack).safety.passed, "baseline passes");
+
+        pack.manifest.control_title = format!("Change Management {INJECTED_SECRET}");
+
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "record hashes untouched so Integrity still passes: {}",
+            report.integrity.detail
+        );
+        assert!(
+            !report.safety.passed,
+            "Safety must fail on a secret in manifest.control_title"
+        );
+        assert!(!report.ok, "overall verdict fails");
+        assert!(
+            report.safety.detail.contains("control_title"),
+            "detail names WHERE: {}",
+            report.safety.detail
+        );
+        assert!(
+            !report.safety.detail.contains(INJECTED_SECRET),
+            "detail must never leak the secret value: {}",
+            report.safety.detail
+        );
+    }
+
+    /// Codex round-10 P1: a secret injected into a `gaps[*].detail` (a non-record
+    /// field) must FAIL Safety while Integrity stays green.
+    #[test]
+    fn verify_fails_on_secret_in_gap_detail() {
+        let mut pack = assemble_cc81();
+        assert!(verify_pack(&pack).safety.passed, "baseline passes");
+
+        pack.gaps.push(GapRow {
+            gap_class: "missing_valid_time".to_owned(),
+            record_ids: Vec::new(),
+            valid_time: None,
+            detail: format!("tampered gap note {INJECTED_SECRET}"),
+        });
+
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "Integrity still passes: {}",
+            report.integrity.detail
+        );
+        assert!(
+            !report.safety.passed,
+            "Safety must fail on a secret in gaps[*].detail"
+        );
+        assert!(!report.ok, "overall verdict fails");
+        assert!(
+            report.safety.detail.contains("gaps"),
+            "detail names WHERE: {}",
+            report.safety.detail
+        );
+        assert!(
+            !report.safety.detail.contains(INJECTED_SECRET),
+            "detail must never leak the secret value: {}",
+            report.safety.detail
+        );
+    }
+
+    /// Codex round-10 P1: a secret injected into a `diagnostics[*].detail` (a
+    /// non-record field) must FAIL Safety while Integrity stays green.
+    #[test]
+    fn verify_fails_on_secret_in_diagnostic_detail() {
+        let mut pack = assemble_cc81();
+        assert!(verify_pack(&pack).safety.passed, "baseline passes");
+        assert!(!pack.diagnostics.is_empty(), "seed pack has diagnostics");
+
+        pack.diagnostics[0].detail = format!("tampered diagnostic {INJECTED_SECRET}");
+
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "Integrity still passes: {}",
+            report.integrity.detail
+        );
+        assert!(
+            !report.safety.passed,
+            "Safety must fail on a secret in diagnostics[*].detail"
+        );
+        assert!(!report.ok, "overall verdict fails");
+        assert!(
+            report.safety.detail.contains("diagnostics"),
+            "detail names WHERE: {}",
+            report.safety.detail
+        );
+        assert!(
+            !report.safety.detail.contains(INJECTED_SECRET),
+            "detail must never leak the secret value: {}",
+            report.safety.detail
         );
     }
 

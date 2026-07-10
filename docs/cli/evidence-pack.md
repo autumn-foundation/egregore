@@ -257,16 +257,27 @@ Re-verifies an assembled pack offline and read-only:
   the first divergent key, and the stored-vs-recomputed numbers (never a payload).
 - **Coverage** — recompute the #65 citation thresholds (>=95% code rows cited;
   100% non-code rows cited).
-- **Safety** — no raw sensitive classes (`redaction::detect_secret`), and every
-  field that `scrub_record` clears is asserted absent: the top-level prose
-  (`text`, `validation_summary`, `arguments_summary`), the inline handle
-  payloads, **and** the nested `user_context` prose (`prompt_text`, `rule_text`,
-  `decision_rationale`, `proposed_rule_text`, `edited_rule_text`,
-  `action_summary`, `constraint_text`). A tampered row that restores any such
-  field — even with its row hash recomputed so Integrity passes — fails Safety
-  with a redaction-safe detail naming the field and record id (never the value).
-  This shares one predicate (`bundle::first_unscrubbed_field`) with the #68
-  bundle verify so the pack and bundle scrub contracts can never drift.
+- **Safety** — scans the **entire serialized pack artifact** for raw sensitive
+  classes (`redaction::detect_secret`), not just the section rows. Two things
+  must hold. First, every field that `scrub_record` clears is asserted absent on
+  each record: the top-level prose (`text`, `validation_summary`,
+  `arguments_summary`), the inline handle payloads, **and** the nested
+  `user_context` prose (`prompt_text`, `rule_text`, `decision_rationale`,
+  `proposed_rule_text`, `edited_rule_text`, `action_summary`, `constraint_text`).
+  A tampered row that restores any such field — even with its row hash recomputed
+  so Integrity passes — fails Safety with a redaction-safe detail naming the field
+  and record id (never the value). This shares one predicate
+  (`bundle::first_unscrubbed_field`) with the #68 bundle verify so the pack and
+  bundle scrub contracts can never drift. Second, every **non-record** text field
+  is scanned too — the manifest fields (including an echoed `control_title` from a
+  malicious `--catalog`), section disclaimers and reasons, gap details, diagnostic
+  details, verdict details, and the top-level disclaimer — so a secret hidden
+  outside the records, with all record hashes left valid, still fails Safety with
+  a redaction-safe detail naming the offending area (never the value). A
+  whole-artifact backstop scan guarantees a secret in any string field not
+  individually enumerated is still caught. The pack's legitimate high-entropy hex
+  (BLAKE3 hashes, record IDs, catalog/protected handles, `<REDACTED:email:...>`
+  markers) is not flagged, so a clean scrubbed pack passes.
 - **Window-consistency** — every row's resolved valid time is inside the
   manifest window.
 
