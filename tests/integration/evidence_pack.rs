@@ -303,7 +303,7 @@ fn verify_passes_clean_pack_and_fails_tampered() {
     assert_eq!(report["ok"], true);
 
     // Flip a single byte in a stored hash.
-    let mut tampered = pack.clone();
+    let mut tampered = pack;
     let sections = tampered["sections"].as_array_mut().unwrap();
     'outer: for s in sections {
         let records = s["records"].as_array_mut().unwrap();

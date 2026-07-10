@@ -1045,15 +1045,15 @@ pub fn resolve_valid_time(record: &GraphRecord) -> Option<String> {
             executed_at,
             ..
         } => {
-            if let Some(t) = temporal {
-                if !t.valid_time.is_empty() {
-                    return Some(t.valid_time.clone());
-                }
+            if let Some(t) = temporal
+                && !t.valid_time.is_empty()
+            {
+                return Some(t.valid_time.clone());
             }
-            if let Some(vt) = valid_time {
-                if !vt.is_empty() {
-                    return Some(vt.clone());
-                }
+            if let Some(vt) = valid_time
+                && !vt.is_empty()
+            {
+                return Some(vt.clone());
             }
             executed_at.clone().filter(|s| !s.is_empty())
         }
@@ -1103,7 +1103,7 @@ pub fn evidence_class_for_record(record: &GraphRecord) -> Option<EvidenceClass> 
 
 /// Stable unavailable reason for a class whose domain is absent.
 #[must_use]
-fn unavailable_reason(class: EvidenceClass) -> &'static str {
+const fn unavailable_reason(class: EvidenceClass) -> &'static str {
     match class {
         EvidenceClass::Commits => "commit_domain_absent",
         EvidenceClass::PullRequests => "pull_request_domain_absent",
@@ -1333,12 +1333,11 @@ pub fn assemble_pack(
     // --- review coverage measurement over in-window merged PRs ---
     let mut merged_pr_ids: Vec<String> = Vec::new();
     for record in records {
-        if is_merged_pr(record) {
-            if let Some(vt) = resolve_valid_time(record) {
-                if in_window(&vt, window) {
-                    merged_pr_ids.push(record.id().to_owned());
-                }
-            }
+        if is_merged_pr(record)
+            && let Some(vt) = resolve_valid_time(record)
+            && in_window(&vt, window)
+        {
+            merged_pr_ids.push(record.id().to_owned());
         }
     }
     merged_pr_ids.sort();
@@ -1381,7 +1380,7 @@ pub fn assemble_pack(
         coverage,
         min_required: min_review_coverage,
         passed: review_coverage_passed,
-        unapproved_pr_ids: unapproved_pr_ids.clone(),
+        unapproved_pr_ids,
     };
 
     // --- build sections in catalog-class order ---
@@ -1522,7 +1521,7 @@ pub fn assemble_pack(
         *tuple_counts.entry(tuple_key(&br.record)).or_insert(0) += 1;
     }
 
-    diagnostics.sort_by(|a, b| diagnostic_sort_key(a).cmp(&diagnostic_sort_key(b)));
+    diagnostics.sort_by_key(diagnostic_sort_key);
 
     let manifest = PackManifest {
         control_id: control.control_id.clone(),
@@ -1612,17 +1611,17 @@ fn derive_gaps(
         })
         .collect();
     for record in records {
-        if record.node_kind_name() == Some("Commit") {
-            if let Some(vt) = resolve_valid_time(record) {
-                if in_window(&vt, window) && !merged_commit_targets.contains(record.id()) {
-                    gaps.push(GapRow {
-                        gap_class: GapClass::CommitOutsideAnyPr.as_wire().to_owned(),
-                        record_ids: vec![record.id().to_owned()],
-                        valid_time: Some(vt),
-                        detail: "commit not claimed by any pull request via MERGED_AS".to_owned(),
-                    });
-                }
-            }
+        if record.node_kind_name() == Some("Commit")
+            && let Some(vt) = resolve_valid_time(record)
+            && in_window(&vt, window)
+            && !merged_commit_targets.contains(record.id())
+        {
+            gaps.push(GapRow {
+                gap_class: GapClass::CommitOutsideAnyPr.as_wire().to_owned(),
+                record_ids: vec![record.id().to_owned()],
+                valid_time: Some(vt),
+                detail: "commit not claimed by any pull request via MERGED_AS".to_owned(),
+            });
         }
     }
 
@@ -3032,7 +3031,7 @@ mod pack338_tests {
         assert!(report.ok, "clean pack verifies: {report:?}");
 
         // Tamper: flip a single byte in a stored hash.
-        let mut tampered = pack.clone();
+        let mut tampered = pack;
         let section = tampered
             .sections
             .iter_mut()
