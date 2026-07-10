@@ -275,6 +275,21 @@ pre-fingerprint state file loads normally with `code_graph_fingerprint = null`,
 which reads as "unknown" and forces exactly one fail-safe `/pulls` refetch before
 the real fingerprint is stored.
 
+**Prior merge-artifact tracking (`pr_merge_artifacts`, issue #333, Codex
+round-6):** the state file also maps `"pr:<n>"` to the **record ID** of the
+last-emitted `MERGED_AS` artifact (the merge edge ID on a unique resolution, or
+the `github_commit_unresolved` diagnostic ID otherwise; absent when the PR emits
+no merge artifact). On a re-import whose merge-resolution outcome **changed**, the
+importer emits a `Tombstone` retracting this prior artifact before emitting the
+current one (see §6, "Superseded merge-resolution retraction"), so a persistent
+store never shows stale + fresh merge evidence for one PR. The full record ID
+(not a lossy marker) is stored so a changed `merge_commit_sha` under a
+still-unresolved outcome still retracts the diagnostic keyed on the old SHA. The
+field is `#[serde(default)]` and is **not** part of a `STATE_SCHEMA_VERSION` bump:
+a state file written before it loads normally with an empty map (an absent prior
+reads as "no known artifact" and emits no tombstone), avoiding a heavy full
+refetch that a version bump would force.
+
 **Deferred endpoint ETag rule:** The v1 importer MUST NOT store ETags for
 deferred comment/review endpoints (`/issues/comments`, `/pulls/comments`,
 `/pulls/{n}/reviews`). Caching ETags before records are emitted would cause
@@ -412,6 +427,30 @@ validator sees it and `project:v1:` consumers find the link (its `Commit` *targe
 stays a `codegraph:` node). Only the `(Task, Commit, MERGED_AS)` triple
 identifies the edge — the promoted flat PR fields never enter its stable ID, so
 output stays byte-identical across runs.
+
+**Superseded merge-resolution retraction (issue #333, Codex round-6):** the
+importer is otherwise purely additive, so when a PR's merge-resolution **outcome
+changes** on a re-import — the SHA newly resolves, stops resolving, resolves to a
+different `Commit`, or the merged `merge_commit_sha` itself changes — the *new*
+artifact carries a *new* record ID and, without retraction, the *prior* artifact
+(edge or diagnostic) would linger live in a persistent store, so both stale and
+fresh merge evidence would coexist for one PR. To prevent that, the importer
+persists the last-emitted merge artifact's record ID per PR (`pr_merge_artifacts`
+in the state file) and, when the current outcome differs, emits a project-domain
+`Tombstone` naming the prior artifact via `deleted_id` **before** emitting the
+current outcome. In a persistent embedded store the tombstone suppresses the
+superseded record from the current read view (a later write's higher sequence
+wins), so the current view shows only the fresh outcome. Handled transitions
+include resolved-A → resolved-B, resolved → unresolved, unresolved → resolved,
+unresolved ↔ ambiguous, and a changed merged `merge_commit_sha` under a
+still-unresolved outcome (the diagnostic keyed on the old SHA is retracted). When
+the outcome is **unchanged** the change hash is unchanged, the PR is skipped, and
+no tombstone is emitted (AC8 idempotency preserved). The tombstone's own ID is
+derived deterministically from `(pr, deleted_id)`, so output stays byte-identical
+across runs. The full prior record ID (not a lossy marker) is persisted so the
+old-SHA diagnostic case retracts correctly; the `pr_merge_artifacts` field is
+`#[serde(default)]`, so legacy state files load without a state-schema bump (an
+absent prior is treated as "no known artifact" and emits no tombstone).
 
 **`valid_time_source`:** All GitHub-sourced records use `github_updated_at`.
 **`source_kind`:** Issues use `github_issue`; PRs use `github_pr`.

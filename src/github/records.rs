@@ -371,6 +371,93 @@ pub fn merge_resolution_marker(commit_index: &CommitIndex, pr: &model::PullReque
     }
 }
 
+/// The stable record ID of the `MERGED_AS` artifact a PR would emit (issue #333,
+/// Codex round-6).
+///
+/// The `MERGED_AS` edge ID on a unique resolution against `commit_index`, or the
+/// `github_commit_unresolved` Diagnostic ID on a zero- or multiple-match — or
+/// `None` when the PR emits no merge artifact at all (unmerged, empty/absent
+/// `merge_commit_sha`, or no seeded graph).
+///
+/// Mirrors [`pull_records`]/[`resolve_merge_commit`] exactly so the returned ID
+/// is byte-identical to the artifact actually emitted. The importer persists this
+/// per-PR (`state.pr_merge_artifacts`) and, when a re-import's outcome changes,
+/// retracts the SUPERSEDED prior artifact via [`merge_artifact_tombstone`] before
+/// emitting the current one — so a persistent store's current read view never
+/// shows both stale and fresh merge evidence for one PR. The ID (not a lossy
+/// marker) is persisted so a changed `merge_commit_sha` under a still-unresolved
+/// outcome still retracts the prior diagnostic keyed on the OLD sha.
+#[must_use]
+pub fn merge_artifact_id(
+    commit_index: &CommitIndex,
+    source_repo: &str,
+    pr: &model::PullRequest,
+) -> Option<String> {
+    let sha = pr
+        .merge_commit_sha
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .filter(|_| pr.merged_at.is_some())?;
+    if commit_index.is_empty() {
+        return None;
+    }
+    let number = pr.number;
+    match commit_index.get(sha).map(Vec::as_slice) {
+        Some([commit_id]) => {
+            let task_id = project_stable_id(&[
+                "project",
+                "Task",
+                source_repo,
+                &number.to_string(),
+                &format!("pr:{number}"),
+            ]);
+            Some(project_stable_id(&[
+                "project",
+                "edge",
+                EdgeLabel::MergedAs.as_str(),
+                &task_id,
+                commit_id,
+            ]))
+        }
+        // Zero or multiple matches → the seed-independent diagnostic.
+        _ => Some(commit_diagnostic_id(number, sha)),
+    }
+}
+
+/// Builds a project-domain [`GraphRecord::Tombstone`] retracting a superseded
+/// merge-resolution artifact whose PR outcome changed (issue #333, Codex round-6).
+///
+/// The retracted artifact is a `MERGED_AS` edge or a `github_commit_unresolved`
+/// Diagnostic emitted by an earlier import of the same PR.
+///
+/// The tombstone ID is derived from `(pr, deleted_id)`, so it is deterministic
+/// and byte-identical across runs and distinct per retracted target (a
+/// resolved-A→resolved-B→resolved-A cycle mints one tombstone per target).
+/// `deleted_id` drives the embedded adapter's current-view suppression
+/// (`read_all_records`), so a persistent store stops surfacing the stale record.
+#[must_use]
+pub fn merge_artifact_tombstone(number: u64, deleted_id: &str) -> GraphRecord {
+    let native = format!("pr:{number}");
+    let id = project_stable_id(&[
+        "project",
+        "Tombstone",
+        IMPORTER_ID,
+        &native,
+        "merge_resolution_superseded",
+        deleted_id,
+    ]);
+    GraphRecord::Tombstone {
+        id,
+        schema_version: PROJECT_SCHEMA_VERSION,
+        deleted_id: deleted_id.to_owned(),
+        summary: format!(
+            "[merge_resolution_superseded] PR #{number} merge-resolution outcome changed; \
+             retracting superseded artifact {deleted_id}"
+        ),
+        producer: None,
+    }
+}
+
 /// Resolves a PR's `merge_commit_sha` to a `MERGED_AS` edge, or a diagnostic.
 ///
 /// Returns `(record, is_diagnostic)`: exactly one matching `Commit` yields the
@@ -411,6 +498,25 @@ fn resolve_merge_commit(
     Some((commit_diagnostic(ctx, number, sha, task_id, &detail), true))
 }
 
+/// The stable `github_commit_unresolved` Diagnostic record ID for a PR/SHA.
+///
+/// Seed-independent: the zero-match (unresolved) and multiple-match (ambiguous)
+/// cases share ONE id per `(PR, sha)`, so re-emitting either case overwrites the
+/// same record and retracting it needs only `(number, sha)`. Factored out so the
+/// emitter ([`commit_diagnostic`]) and the retraction path
+/// ([`merge_artifact_id`]) agree byte-for-byte on the id.
+fn commit_diagnostic_id(number: u64, sha: &str) -> String {
+    let native = format!("pr:{number}");
+    project_stable_id(&[
+        "project",
+        "Diagnostic",
+        IMPORTER_ID,
+        &native,
+        "github_commit_unresolved",
+        sha,
+    ])
+}
+
 /// Builds a project-domain `Diagnostic` node for an unresolved merge commit
 /// (`github_commit_unresolved`), carrying the SHA and Task record ID (#333).
 fn commit_diagnostic(
@@ -421,8 +527,7 @@ fn commit_diagnostic(
     detail: &str,
 ) -> GraphRecord {
     let code = "github_commit_unresolved";
-    let native = format!("pr:{number}");
-    let id = project_stable_id(&["project", "Diagnostic", IMPORTER_ID, &native, code, sha]);
+    let id = commit_diagnostic_id(number, sha);
     let mut rec = GraphRecord::node(
         id.clone(),
         NodeKind::Diagnostic,

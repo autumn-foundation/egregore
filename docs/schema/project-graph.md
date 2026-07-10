@@ -181,6 +181,19 @@ serializes under the wrong domain and is skipped by the project-edge validator.
 is a `github_issue`, `local_jsonl`, or otherwise-typed task (or carries no
 `source_kind`), so a non-PR task can never be persisted as merge evidence.
 
+**Merge-resolution lifecycle (issue #333, Codex round-6).** A PR's merge
+evidence is one of two artifacts: a `MERGED_AS` edge (unique `Commit` match) or a
+`github_commit_unresolved` project `Diagnostic` (zero/ambiguous match). When a
+re-import changes that outcome — the SHA newly resolves, stops resolving,
+resolves to a different `Commit`, or the merged `merge_commit_sha` itself changes
+— the GitHub importer emits a project-domain `Tombstone` naming the prior
+artifact's record ID via `deleted_id` before emitting the new one. In a
+persistent store the tombstone suppresses the superseded artifact from the
+current read view, so exactly one merge artifact per PR is ever live at once; an
+unchanged outcome emits no tombstone. See
+[`import-github.md`](import-github.md) §5–6 for the state tracking and the full
+transition matrix.
+
 ## 8 - Redaction Call-Out
 
 These project fields MUST pass through #4 redaction policy before persistence:

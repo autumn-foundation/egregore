@@ -186,10 +186,41 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             // re-emit the merge edge even though the PR payload is unchanged.
             let merge_marker = records::merge_resolution_marker(ctx.commit_index, &pr);
             let hash = state::pull_hash(&pr, &merge_marker);
+            // The record id of the merge artifact this run would emit (edge,
+            // diagnostic, or none). Since the marker is folded into `hash`, an
+            // unchanged hash guarantees an unchanged artifact id, so tombstoning
+            // is only ever needed on the reprocess path below (#333, round-6).
+            let current_artifact =
+                records::merge_artifact_id(ctx.commit_index, opts.source_repo, &pr);
             if state.is_unchanged(&key, &hash) {
+                // Backfill the tracked artifact id without emitting anything: a
+                // no-op on a store this build already wrote, but it populates a
+                // pre-round-6 (or legacy) store so a LATER outcome change can
+                // still retract this artifact. Safe because the unchanged hash
+                // proves `current_artifact` equals what was emitted before.
+                state.set_merge_artifact(key, current_artifact);
                 continue;
             }
-            state.record_hash(key, hash);
+            // Retract a superseded merge artifact whose outcome changed on this
+            // re-import (#333, Codex round-6): the importer is otherwise purely
+            // additive, so without this the prior edge/diagnostic would linger
+            // live alongside the new one in a persistent store. Emit the
+            // tombstone (keyed on the prior record's id) before the fresh
+            // outcome; `graph.to_jsonl` sorts, so relative order is immaterial.
+            if let Some(prior) = state.prior_merge_artifact(&key).map(str::to_owned)
+                && Some(prior.as_str()) != current_artifact.as_deref()
+            {
+                push_emitted(
+                    &mut graph,
+                    &mut emitted_count,
+                    Emitted {
+                        records: vec![records::merge_artifact_tombstone(pr.number, &prior)],
+                        link_diagnostics: 0,
+                    },
+                );
+            }
+            state.record_hash(key.clone(), hash);
+            state.set_merge_artifact(key, current_artifact);
             push_emitted(
                 &mut graph,
                 &mut emitted_count,

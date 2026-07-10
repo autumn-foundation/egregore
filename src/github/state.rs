@@ -23,6 +23,12 @@ use crate::github::{model, records::CommitIndex};
 /// version-2 state written afterward keeps subsequent unchanged re-imports
 /// idempotent (issue #333 AC8). Bump this whenever the emitted per-resource
 /// contract changes in a way that a cached conditional probe could hide.
+///
+/// NOT bumped for the Codex round-6 `pr_merge_artifacts` field: it is
+/// `#[serde(default)]`, so a version-2 state file loads with an empty map and is
+/// simply treated as "no known prior artifact" (which safely emits no
+/// tombstone). A bump would discard every cached `ETag`/hash and force a heavy
+/// full refetch for zero benefit — the additive field needs no forced refresh.
 pub const STATE_SCHEMA_VERSION: u32 = 2;
 
 /// Per-endpoint update watermarks (inclusive `>=` selection, §5).
@@ -62,6 +68,24 @@ pub struct State {
     /// `"issue:<n>" | "pr:<n>" -> blake3(content hash of key fields)`.
     #[serde(default)]
     pub resource_hashes: BTreeMap<String, String>,
+    /// Maps `"pr:<n>"` to the record ID of the last-emitted `MERGED_AS` artifact
+    /// (the `MERGED_AS` edge ID on a unique resolution, or the
+    /// `github_commit_unresolved` Diagnostic ID otherwise). Issue #333, Codex
+    /// round-6.
+    ///
+    /// The importer is otherwise purely additive: when a PR's merge-resolution
+    /// outcome changes on re-import, the new artifact carries a NEW id and the
+    /// prior artifact would linger live in a persistent store, so stale and
+    /// fresh merge evidence coexist. Persisting the prior artifact's id lets a
+    /// changed re-import retract the superseded record via a `Tombstone`
+    /// (`deleted_id`) before emitting the current one. The full record id (not a
+    /// lossy marker) is stored so a changed `merge_commit_sha` under a
+    /// still-unresolved outcome still retracts the diagnostic keyed on the OLD
+    /// sha. A `#[serde(default)]` empty map means legacy state loads without a
+    /// schema bump (see [`STATE_SCHEMA_VERSION`]): a missing prior is treated as
+    /// "no known artifact", which safely emits no tombstone.
+    #[serde(default)]
+    pub pr_merge_artifacts: BTreeMap<String, String>,
     /// Fingerprint of the seeded code graph relevant to PR merge-link resolution
     /// (issue #333, Codex round-5). PR merge-link resolution depends on the local
     /// seed graph, which GitHub's `/pulls` `ETag` cannot see; this gates the
@@ -87,6 +111,7 @@ impl State {
             last_seen_updated_at: Watermarks::default(),
             label_list_hash: None,
             resource_hashes: BTreeMap::new(),
+            pr_merge_artifacts: BTreeMap::new(),
             code_graph_fingerprint: None,
         }
     }
@@ -139,6 +164,30 @@ impl State {
     /// Records `key`'s new content hash.
     pub fn record_hash(&mut self, key: String, hash: String) {
         self.resource_hashes.insert(key, hash);
+    }
+
+    /// Returns the record ID of the merge-resolution artifact last emitted for
+    /// `key` (`"pr:<n>"`), or `None` when no artifact is tracked (issue #333,
+    /// Codex round-6).
+    #[must_use]
+    pub fn prior_merge_artifact(&self, key: &str) -> Option<&str> {
+        self.pr_merge_artifacts.get(key).map(String::as_str)
+    }
+
+    /// Records (`Some`) or clears (`None`) the merge-resolution artifact id
+    /// currently emitted for `key` (`"pr:<n>"`). `None` means the PR emits no
+    /// merge artifact (unmerged, no seed match candidate, or empty SHA), so no
+    /// stale record can exist to retract on a later change (issue #333, Codex
+    /// round-6).
+    pub fn set_merge_artifact(&mut self, key: String, artifact_id: Option<String>) {
+        match artifact_id {
+            Some(id) => {
+                self.pr_merge_artifacts.insert(key, id);
+            }
+            None => {
+                self.pr_merge_artifacts.remove(&key);
+            }
+        }
     }
 }
 
@@ -452,6 +501,45 @@ mod tests {
         // The rest of the version-matched state is preserved (not discarded).
         assert!(s.is_unchanged("pr:1", "abc"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_state_without_pr_merge_artifacts_loads_empty() {
+        // A state file written before the round-6 `pr_merge_artifacts` field
+        // existed (current schema version, no such key) must still load rather
+        // than fail; the missing map deserialises to an empty `BTreeMap`, which
+        // reads as "no known prior artifact" and safely emits no tombstone. This
+        // is why the field needed no `STATE_SCHEMA_VERSION` bump.
+        let dir = std::env::temp_dir().join(format!("egst-legacy-pma-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"schema_version":{STATE_SCHEMA_VERSION},"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"resource_hashes":{{"pr:1":"abc"}}}}"#
+            ),
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert!(
+            s.pr_merge_artifacts.is_empty(),
+            "missing pr_merge_artifacts loads as an empty map"
+        );
+        assert_eq!(s.prior_merge_artifact("pr:1"), None);
+        // The rest of the version-matched state is preserved (not discarded).
+        assert!(s.is_unchanged("pr:1", "abc"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_and_read_prior_merge_artifact_roundtrips() {
+        let mut s = State::fresh("o/r", "x");
+        assert_eq!(s.prior_merge_artifact("pr:7"), None);
+        s.set_merge_artifact("pr:7".to_owned(), Some("project:v1:edge-e".to_owned()));
+        assert_eq!(s.prior_merge_artifact("pr:7"), Some("project:v1:edge-e"));
+        // Clearing (None) removes the entry so a later change sees "no prior".
+        s.set_merge_artifact("pr:7".to_owned(), None);
+        assert_eq!(s.prior_merge_artifact("pr:7"), None);
     }
 
     #[test]

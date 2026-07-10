@@ -1919,3 +1919,282 @@ fn pr_promoted_fields_survive_embedded_inspect_roundtrip() {
         "six PR Tasks under project:Task:1: {report}"
     );
 }
+
+// ── Issue #333 (Codex round-6): a changed merge-resolution outcome on re-import
+//    retracts the superseded prior artifact via a Tombstone(deleted_id) ─────────
+
+/// Counts `record_type: "tombstone"` records in a handoff JSONL.
+fn tombstones(jsonl: &str) -> Vec<serde_json::Value> {
+    jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["record_type"] == "tombstone")
+        .collect()
+}
+
+#[test]
+fn merge_resolution_unresolved_to_resolved_retracts_prior_diagnostic() {
+    // The importer is otherwise purely additive: when PR #30's merge SHA goes from
+    // UNRESOLVED (a github_commit_unresolved Diagnostic D) to RESOLVED (a MERGED_AS
+    // edge E), the new edge carries a NEW id and — without retraction — D lingers
+    // live in a persistent store, so stale and fresh merge evidence coexist for one
+    // PR. The changed outcome must emit a Tombstone(deleted_id == D).
+    let merge_sha = "merge30000000000000000000000000000000030";
+    let decoy_sha = "decoy000000000000000000000000000000000000";
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+    let code_graph = tmp.path().join("code.jsonl");
+    let server = MockServer::start(one_merged_pr_routes("\"pulls-r6a\""));
+
+    // 1. A NON-EMPTY seed lacking the merge SHA → PR #30 emits diagnostic D.
+    std::fs::write(&code_graph, commit_seed(&[decoy_sha])).unwrap();
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(
+        &server.base_url,
+        &out1,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok1);
+    assert_eq!(
+        edges_of_label(&j1, "MERGED_AS"),
+        0,
+        "an unseeded merge SHA emits no MERGED_AS edge"
+    );
+    let d_id = nodes_of_kind(&j1, "Diagnostic")
+        .into_iter()
+        .find(|d| {
+            let s = d["summary"].as_str().unwrap_or("");
+            s.contains("github_commit_unresolved") && s.contains(merge_sha)
+        })
+        .expect("run 1 emits a github_commit_unresolved Diagnostic")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 2. Re-seed so the merge SHA now RESOLVES → edge E emitted, D retracted.
+    std::fs::write(&code_graph, commit_seed(&[merge_sha])).unwrap();
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(
+        &server.base_url,
+        &out2,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok2);
+    // (a) the new MERGED_AS edge E is emitted.
+    assert_eq!(
+        edges_of_label(&j2, "MERGED_AS"),
+        1,
+        "a resolving seed emits the MERGED_AS edge"
+    );
+    // (b) a Tombstone whose deleted_id == D is emitted (RED against pre-fix code:
+    //     the additive importer never emitted a tombstone, so D stayed live).
+    let retracted_d = tombstones(&j2)
+        .into_iter()
+        .any(|t| t["deleted_id"] == d_id.as_str());
+    assert!(
+        retracted_d,
+        "the superseded diagnostic D must be retracted via a Tombstone(deleted_id): {j2}"
+    );
+    // The stale diagnostic node itself is not re-emitted on the resolving run.
+    assert!(
+        !nodes_of_kind(&j2, "Diagnostic")
+            .into_iter()
+            .any(|d| d["id"] == d_id.as_str()),
+        "the stale diagnostic node is retracted, not re-emitted"
+    );
+
+    // 3. Idempotency (AC8): a third re-import with the SAME resolving seed changes
+    //    nothing — no new tombstone, zero per-resource records.
+    let out3 = tmp.path().join("g3.jsonl");
+    let (j3, _, ok3) = run_import(
+        &server.base_url,
+        &out3,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok3);
+    assert_eq!(
+        nodes_of_kind(&j3, "Task").len(),
+        0,
+        "AC8: no Task re-emitted on an unchanged re-import: {j3}"
+    );
+    assert_eq!(
+        edges_of_label(&j3, "MERGED_AS"),
+        0,
+        "AC8: no duplicate MERGED_AS on an unchanged re-import"
+    );
+    assert_eq!(
+        tombstones(&j3).len(),
+        0,
+        "AC8: no tombstone emitted on an unchanged re-import: {j3}"
+    );
+}
+
+#[test]
+fn merge_resolution_resolved_to_unresolved_retracts_prior_edge() {
+    // The reverse transition: PR #30 goes from RESOLVED (MERGED_AS edge E) back to
+    // UNRESOLVED (a diagnostic). The superseded edge E must be retracted via a
+    // Tombstone(deleted_id == E) so it does not linger live beside the diagnostic.
+    let merge_sha = "merge30000000000000000000000000000000030";
+    let decoy_sha = "decoy000000000000000000000000000000000000";
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+    let code_graph = tmp.path().join("code.jsonl");
+    let server = MockServer::start(one_merged_pr_routes("\"pulls-r6b\""));
+
+    // 1. A resolving seed → MERGED_AS edge E.
+    std::fs::write(&code_graph, commit_seed(&[merge_sha])).unwrap();
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(
+        &server.base_url,
+        &out1,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok1);
+    let pr30_id = pr_task(&j1, 30)["id"].as_str().unwrap().to_owned();
+    let e_id = j1
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["label"] == "MERGED_AS" && v["source"] == pr30_id.as_str())
+        .expect("run 1 emits a MERGED_AS edge")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 2. Re-seed to a non-empty graph WITHOUT the merge SHA → outcome regresses to
+    //    unresolved: a diagnostic is emitted and E is retracted.
+    std::fs::write(&code_graph, commit_seed(&[decoy_sha])).unwrap();
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(
+        &server.base_url,
+        &out2,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok2);
+    assert_eq!(
+        edges_of_label(&j2, "MERGED_AS"),
+        0,
+        "no MERGED_AS edge once the merge SHA no longer resolves"
+    );
+    let retracted_e = tombstones(&j2)
+        .into_iter()
+        .any(|t| t["deleted_id"] == e_id.as_str());
+    assert!(
+        retracted_e,
+        "the superseded MERGED_AS edge E must be retracted via a Tombstone(deleted_id): {j2}"
+    );
+    assert!(
+        nodes_of_kind(&j2, "Diagnostic").into_iter().any(|d| {
+            let s = d["summary"].as_str().unwrap_or("");
+            s.contains("github_commit_unresolved") && s.contains(merge_sha)
+        }),
+        "the new unresolved outcome emits a github_commit_unresolved Diagnostic"
+    );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn merge_resolution_change_suppresses_stale_artifact_in_embedded_current_view() {
+    // End-to-end proof through an embedded store's CURRENT read view: an
+    // unresolved→resolved re-import ingested into one AletheiaDB store must leave
+    // the fresh MERGED_AS edge E visible and the superseded diagnostic D suppressed
+    // (retracted by the Tombstone(deleted_id) the importer now emits). Records are
+    // written in-process through a single sink instance — mirroring two sequential
+    // imports into one persistent store while staying deterministic under load.
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, ingest_records, records_from_jsonl};
+    use aletheia_egregore::ir::GraphRecord;
+
+    let merge_sha = "merge30000000000000000000000000000000030";
+    let decoy_sha = "decoy000000000000000000000000000000000000";
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+    let data_dir = tmp.path().join("store");
+    // The import's `--code-graph` files are read as resolution indexes only, never
+    // ingested — run 1 (decoy: merge SHA unresolved → diagnostic D) and run 2
+    // (merge: resolved → edge E) use SEPARATE index files.
+    let run1_cg = tmp.path().join("run1_cg.jsonl");
+    let run2_cg = tmp.path().join("run2_cg.jsonl");
+    std::fs::write(&run1_cg, commit_seed(&[decoy_sha])).unwrap();
+    std::fs::write(&run2_cg, commit_seed(&[merge_sha])).unwrap();
+    let server = MockServer::start(one_merged_pr_routes("\"pulls-r6emb\""));
+
+    // Run 1: the decoy index leaves the merge SHA unresolved → diagnostic D.
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(
+        &server.base_url,
+        &out1,
+        &state,
+        &["--code-graph", run1_cg.to_str().unwrap()],
+    );
+    assert!(ok1);
+    let d_id = nodes_of_kind(&j1, "Diagnostic")
+        .into_iter()
+        .find(|d| {
+            let s = d["summary"].as_str().unwrap_or("");
+            s.contains("github_commit_unresolved") && s.contains(merge_sha)
+        })
+        .expect("run 1 emits a github_commit_unresolved Diagnostic")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Run 2: the resolving index links the merge SHA → edge E + Tombstone(D).
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(
+        &server.base_url,
+        &out2,
+        &state,
+        &["--code-graph", run2_cg.to_str().unwrap()],
+    );
+    assert!(ok2);
+    let e_id = j2
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["label"] == "MERGED_AS")
+        .expect("run 2 emits a MERGED_AS edge")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Ingest through ONE sink instance: batch 1 = run 1's handoff (writes D);
+    // batch 2 = run 2's handoff prepended with the seed Commit so edge E's target
+    // resolves in-batch (writes E and the Tombstone(D), which supersedes D by a
+    // higher write sequence).
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("open embedded store");
+    let batch1 = records_from_jsonl(&j1).expect("parse run 1 handoff");
+    let report1 = ingest_records(&batch1, &mut sink);
+    assert_eq!(
+        report1.failed, 0,
+        "run 1 ingest failed: {:?}",
+        report1.failures
+    );
+    let mut batch2 = records_from_jsonl(&commit_seed(&[merge_sha])).expect("parse seed commit");
+    batch2.extend(records_from_jsonl(&j2).expect("parse run 2 handoff"));
+    let report2 = ingest_records(&batch2, &mut sink);
+    assert_eq!(
+        report2.failed, 0,
+        "run 2 ingest failed: {:?}",
+        report2.failures
+    );
+
+    // Current read view of the store: D suppressed, E present.
+    let records = sink.read_all_records().expect("read current view");
+    let d_present = records
+        .iter()
+        .any(|r| matches!(r, GraphRecord::Node { id, .. } if *id == d_id));
+    let e_present = records
+        .iter()
+        .any(|r| matches!(r, GraphRecord::Edge { id, .. } if *id == e_id));
+    assert!(
+        !d_present,
+        "the superseded diagnostic D must NOT appear in the embedded current read view"
+    );
+    assert!(
+        e_present,
+        "the fresh MERGED_AS edge E must appear in the embedded current read view"
+    );
+}
