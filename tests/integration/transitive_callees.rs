@@ -172,9 +172,24 @@ fn seed() -> Fixture {
     let dep1_id = symbol(&mut graph, "src/chain.rs", "dep1", (5, 12));
     let dep2_id = symbol(&mut graph, "src/chain.rs", "dep2", (14, 22));
     let dep3_id = symbol(&mut graph, "src/chain.rs", "dep3", (24, 32));
-    calls(&mut graph, &anchor_id, &dep1_id, Some(CallResolution::Resolved));
-    calls(&mut graph, &dep1_id, &dep2_id, Some(CallResolution::Resolved));
-    calls(&mut graph, &dep2_id, &dep3_id, Some(CallResolution::Resolved));
+    calls(
+        &mut graph,
+        &anchor_id,
+        &dep1_id,
+        Some(CallResolution::Resolved),
+    );
+    calls(
+        &mut graph,
+        &dep1_id,
+        &dep2_id,
+        Some(CallResolution::Resolved),
+    );
+    calls(
+        &mut graph,
+        &dep2_id,
+        &dep3_id,
+        Some(CallResolution::Resolved),
+    );
 
     // Direct ambiguous outbound call.
     let amb_direct_id = symbol(&mut graph, "src/chain.rs", "amb_direct", (34, 40));
@@ -285,7 +300,12 @@ fn seed() -> Fixture {
     calls(&mut graph, &anchor_id, &missing_target_id, None);
 
     // A self CALLS edge (recursion): the anchor is never its own callee.
-    calls(&mut graph, &anchor_id, &anchor_id, Some(CallResolution::Resolved));
+    calls(
+        &mut graph,
+        &anchor_id,
+        &anchor_id,
+        Some(CallResolution::Resolved),
+    );
 
     // Unrelated same-name pair with their own outbound edges (zero-bleed).
     let dup_a_id = symbol(&mut graph, "src/dup_a.rs", "dup_name", (5, 12));
@@ -728,14 +748,25 @@ fn max_depth_bounds_walk_and_reports_dropped_frontier() {
     assert!(ids.contains(&f.dep2_id.as_str()), "dep2 is at depth 2");
 
     let trunc = &header["truncation"];
-    assert!(trunc.is_object(), "truncation diagnostic required: {header}");
+    assert!(
+        trunc.is_object(),
+        "truncation diagnostic required: {header}"
+    );
     assert_eq!(trunc["max_depth"].as_u64(), Some(2));
     let dropped = trunc["dropped_frontier"]
         .as_array()
         .expect("dropped_frontier");
-    assert_eq!(dropped.len(), 1, "one dropped depth expected; got {dropped:?}");
+    assert_eq!(
+        dropped.len(),
+        1,
+        "one dropped depth expected; got {dropped:?}"
+    );
     assert_eq!(dropped[0]["depth"].as_u64(), Some(3));
-    assert_eq!(dropped[0]["count"].as_u64(), Some(1), "dep3 dropped at depth 3");
+    assert_eq!(
+        dropped[0]["count"].as_u64(),
+        Some(1),
+        "dep3 dropped at depth 3"
+    );
     assert_eq!(trunc["dropped_total"].as_u64(), Some(1));
 }
 
@@ -796,7 +827,10 @@ fn huge_max_depth_terminates_and_matches_exhausting_depth() {
     let huge = run("1000000000");
     let (h_small, r_small) = parse_ndjson(&small);
     let (h_huge, r_huge) = parse_ndjson(&huge);
-    assert_eq!(r_small, r_huge, "rows must match once the graph is exhausted");
+    assert_eq!(
+        r_small, r_huge,
+        "rows must match once the graph is exhausted"
+    );
     assert_eq!(h_small["total_reachable"], h_huge["total_reachable"]);
     assert_eq!(h_small["total_unresolved"], h_huge["total_unresolved"]);
 }
@@ -1098,8 +1132,14 @@ fn text_format_lists_reachable_symbols() {
         .stdout
         .clone();
     let out = String::from_utf8(stdout).expect("utf8");
-    assert!(out.contains("dep3"), "text mode must list reachable symbols: {out}");
-    assert!(out.contains("hop"), "text mode must show hop distances: {out}");
+    assert!(
+        out.contains("dep3"),
+        "text mode must list reachable symbols: {out}"
+    );
+    assert!(
+        out.contains("hop"),
+        "text mode must show hop distances: {out}"
+    );
     assert!(
         out.contains("external_call"),
         "text mode must report unresolved: {out}"
@@ -1241,7 +1281,10 @@ fn at_commit_returns_callees_as_of_that_commit() {
     assert_eq!(header["at_commit"], "aaaa1111");
     let ids = reachable_ids(&rows);
     assert!(ids.contains(&dep_a_id.as_str()), "dep_a existed at c1");
-    assert!(!ids.contains(&dep_b_id.as_str()), "dep_b did not exist at c1");
+    assert!(
+        !ids.contains(&dep_b_id.as_str()),
+        "dep_b did not exist at c1"
+    );
 
     let (_, rows2) = run_query(&[
         "query",
@@ -1254,7 +1297,10 @@ fn at_commit_returns_callees_as_of_that_commit() {
     ]);
     let ids2 = reachable_ids(&rows2);
     assert!(ids2.contains(&dep_b_id.as_str()), "dep_b exists at c2");
-    assert!(!ids2.contains(&dep_a_id.as_str()), "dep_a's call is gone at c2");
+    assert!(
+        !ids2.contains(&dep_a_id.as_str()),
+        "dep_a's call is gone at c2"
+    );
 }
 
 #[test]
@@ -1269,7 +1315,10 @@ fn as_of_selects_most_recent_commit_at_or_before_instant() {
         "--as-of",
         "2026-01-15T00:00:00Z",
     ]);
-    assert_eq!(header["at_commit"], "aaaa1111", "mid-January resolves to c1");
+    assert_eq!(
+        header["at_commit"], "aaaa1111",
+        "mid-January resolves to c1"
+    );
     let ids = reachable_ids(&rows);
     assert!(ids.contains(&dep_a_id.as_str()));
     assert!(!ids.contains(&dep_b_id.as_str()));
@@ -1375,7 +1424,10 @@ fn repo_scoped_as_of_resolves_within_selected_repository() {
         "--as-of must resolve within the selected repository"
     );
     let ids = reachable_ids(&rows);
-    assert!(ids.contains(&callee_id.as_str()), "callee_ta answered at c1");
+    assert!(
+        ids.contains(&callee_id.as_str()),
+        "callee_ta answered at c1"
+    );
 }
 
 #[test]

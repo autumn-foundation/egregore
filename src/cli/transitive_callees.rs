@@ -411,19 +411,22 @@ pub(crate) fn query_transitive_callees_cmd(
         total_reachable: rows_json.len(),
         total_unresolved: unresolved_json.len(),
         disclaimer: TRANSITIVE_CALLEES_DISCLAIMER,
-        truncation: ctx.truncation.as_ref().map(|t| TransitiveCalleeTruncationJson {
-            code: "max_depth_truncated",
-            max_depth: t.max_depth,
-            dropped_frontier: t
-                .dropped_frontier
-                .iter()
-                .map(|d| TransitiveCalleeDroppedDepthJson {
-                    depth: d.depth,
-                    count: d.count,
-                })
-                .collect(),
-            dropped_total: t.dropped_total,
-        }),
+        truncation: ctx
+            .truncation
+            .as_ref()
+            .map(|t| TransitiveCalleeTruncationJson {
+                code: "max_depth_truncated",
+                max_depth: t.max_depth,
+                dropped_frontier: t
+                    .dropped_frontier
+                    .iter()
+                    .map(|d| TransitiveCalleeDroppedDepthJson {
+                        depth: d.depth,
+                        count: d.count,
+                    })
+                    .collect(),
+                dropped_total: t.dropped_total,
+            }),
         diagnostics,
     };
 

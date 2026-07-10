@@ -84,10 +84,11 @@ impl UnresolvedCalleeReason {
     }
 }
 
-/// One outbound edge discovered during the walk whose target is not a resolved
-/// in-graph node, reported as an explicit `unresolved` category rather than
-/// silently dropped and never counted as reachable (AC4). Unresolved targets
-/// discovered at any hop within the bound are reported.
+/// One outbound edge whose target is not a resolved in-graph node.
+///
+/// Reported as an explicit `unresolved` category rather than silently dropped,
+/// and never counted as reachable (AC4). Unresolved targets discovered from any
+/// source node within the depth bound are reported.
 #[derive(Debug, Clone, Copy)]
 pub struct UnresolvedCalleeRow<'a> {
     /// The `Diagnostic` marker node recording the callee, when present. Its
