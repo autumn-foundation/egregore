@@ -599,7 +599,7 @@ fn secret_bearing_lines(text: &str) -> std::collections::BTreeSet<usize> {
     let mut secret = std::collections::BTreeSet::new();
     let mut cursor = 0_usize;
     while cursor < text.len() {
-        let Some((_, rel_start, len)) = redaction::detect_secret_span(&text[cursor..]) else {
+        let Some((rel_start, len)) = earliest_secret_span(&text[cursor..]) else {
             break;
         };
         let span_start = cursor + rel_start;
@@ -615,6 +615,35 @@ fn secret_bearing_lines(text: &str) -> std::collections::BTreeSet<usize> {
         cursor = span_end.max(span_start + 1);
     }
     secret
+}
+
+/// Returns the byte span `(start, len)` of the EARLIEST-starting v1-policy secret
+/// in `bytes`, or `None` when there is none.
+///
+/// [`redaction::detect_secret_span`] returns the first match in secret-CLASS
+/// priority order, not the earliest byte offset (issue #321, Codex P1 "scan spans
+/// in byte order before marking lines"): a lower-priority secret sitting earlier
+/// in the byte stream loses to a later higher-priority one. Driving the
+/// line-marking cursor straight off that call would advance past the later span
+/// and skip the earlier secret's line entirely, leaking it into the protected
+/// blob. This helper recovers the earliest start by re-probing the strict prefix
+/// before each reported span until the prefix holds no further secret, so the
+/// caller never advances past unprocessed secret text. It reuses
+/// `detect_secret_span` unchanged. The prefix probes look only at bytes strictly
+/// before the current earliest start, so a multi-line secret block (which the
+/// priority order surfaces first, at its own start) is never truncated mid-span.
+fn earliest_secret_span(bytes: &str) -> Option<(usize, usize)> {
+    let (_, mut best_start, mut best_len) = redaction::detect_secret_span(bytes)?;
+    while best_start > 0 {
+        match redaction::detect_secret_span(&bytes[..best_start]) {
+            Some((_, start, len)) => {
+                best_start = start;
+                best_len = len;
+            }
+            None => break,
+        }
+    }
+    Some((best_start, best_len))
 }
 
 /// Computes the repository-relative path of a log file under the repo root,

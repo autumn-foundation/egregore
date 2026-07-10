@@ -849,6 +849,93 @@ fn stored_blob_redacts_multiline_private_key_block_in_full() {
     );
 }
 
+// Regression (issue #321, Codex P1 "scan spans in byte order before marking
+// lines"): when a lower-priority secret (an `API_KEY=` env secret) appears
+// BEFORE a later higher-priority one (an SSH private-key block), the capture
+// path's cursor walk called `detect_secret_span` over the whole remaining text,
+// which returns the highest-priority CLASS match (the later key block) rather
+// than the earliest BYTE offset, then advanced the cursor past that later span —
+// skipping the earlier env-secret line so the API token leaked into the blob.
+#[test]
+fn stored_blob_redacts_earlier_lower_priority_secret_before_later_higher_priority() {
+    const API_TOKEN_MARKER: &str = "hunterAPITOKENleakValueLong";
+    const KEY_BODY_MARKER: &str = "LEAKEDKEYBODYMARKER";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("mixed.log");
+    let mut fixture = String::new();
+    fixture.push_str("2026-01-02T03:00:00Z INFO service starting up nominally\n");
+    // Lower-priority (EnvSecret) secret, EARLIER in the byte stream.
+    fixture.push_str("2026-01-02T03:00:01Z [ERROR] auth bootstrap failed API_KEY=");
+    fixture.push_str(API_TOKEN_MARKER);
+    fixture.push_str(" reason denied\n");
+    fixture.push_str("2026-01-02T03:00:02Z INFO between the two secrets\n");
+    // Higher-priority (SshPrivateKey) secret block, LATER in the byte stream.
+    fixture.push_str("-----BEGIN OPENSSH PRIVATE KEY-----\n");
+    fixture.push_str("b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtz\n");
+    fixture.push_str("c2VjcmV0");
+    fixture.push_str(KEY_BODY_MARKER);
+    fixture.push_str("YmFzZTY0bGluZXNNdXN0QmVSZWRhY3RlZA==\n");
+    fixture.push_str("-----END OPENSSH PRIVATE KEY-----\n");
+    fixture.push_str("2026-01-02T03:00:05Z INFO service ready to accept traffic\n");
+    fs::write(&log, &fixture).expect("write mixed fixture");
+
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+    scan_logs_capture(&log, temp.path(), &out, &store, "op-1").success();
+
+    let handle = only_manifest_record(&store)["handle"]
+        .as_str()
+        .expect("handle")
+        .to_owned();
+    let got = egregore()
+        .args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let blob = String::from_utf8(got).expect("utf8 blob");
+
+    // The EARLIER, lower-priority env-secret value must never survive capture —
+    // the exact leak the byte-order bug produced.
+    assert!(
+        !blob.contains(API_TOKEN_MARKER),
+        "the earlier lower-priority API token must be redacted, not skipped"
+    );
+    // The LATER, higher-priority key block body and END line must also be gone.
+    assert!(
+        !blob.contains(KEY_BODY_MARKER),
+        "base64 key-material body must be redacted"
+    );
+    assert!(
+        !blob.contains("-----END OPENSSH PRIVATE KEY-----"),
+        "the END line of the key block must also be redacted"
+    );
+    // Both secret spans collapse to redaction markers.
+    assert!(
+        blob.contains("<REDACTED:"),
+        "secret spans must be stored as redaction markers"
+    );
+    // Non-secret lines around and between the secrets are preserved verbatim.
+    assert!(
+        blob.contains("service starting up nominally"),
+        "normal line before the first secret is preserved"
+    );
+    assert!(
+        blob.contains("between the two secrets"),
+        "normal line between the two secrets is preserved"
+    );
+    assert!(
+        blob.contains("service ready to accept traffic"),
+        "normal line after the key block is preserved"
+    );
+}
+
 // AC5/AC7: `protected get` verifies + returns bytes and `list` shows a
 // log_payload entry with metadata only (no raw bytes).
 #[test]
