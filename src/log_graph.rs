@@ -292,10 +292,10 @@ pub fn scan_log_records(
     );
 
     // ── Aggregate occurrences by signature (severity + template) ─────────────
-    let mut signatures: BTreeMap<(&'static str, String), Vec<&Occurrence>> = BTreeMap::new();
+    let mut signatures: BTreeMap<(&'static str, &str), Vec<&Occurrence>> = BTreeMap::new();
     for occ in &occurrences {
         signatures
-            .entry((occ.severity.as_str(), occ.template.clone()))
+            .entry((occ.severity.as_str(), occ.template.as_str()))
             .or_default()
             .push(occ);
     }
@@ -346,7 +346,7 @@ pub fn scan_log_records(
             first_seen: first_seen.clone(),
             last_seen,
         }))
-        .with_valid_time(first_seen.clone(), sig_valid_time_source);
+        .with_valid_time(first_seen, sig_valid_time_source);
         if redacted {
             sig_node = sig_node.with_redaction_policy_version(REDACTION_POLICY_VERSION);
         }
