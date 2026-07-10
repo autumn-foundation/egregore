@@ -24,6 +24,7 @@ pub(crate) fn print_counts_text(counts: &InspectCounts) {
         ("artifact", "Artifacts (artifact)"),
         ("verification", "Verification Evidence (verification)"),
         ("user_context", "User Context (user_context)"),
+        ("log", "Runtime Observations (log)"),
     ];
 
     for (dom_name, category) in ordered_domains {

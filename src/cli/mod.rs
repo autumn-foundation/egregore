@@ -47,6 +47,7 @@ mod public_api_deltas;
 mod records;
 mod repair_cmd;
 mod scan;
+mod scan_logs;
 mod semantic;
 mod subsystem;
 mod symbols;
@@ -107,6 +108,7 @@ pub(crate) use public_api_deltas::*;
 pub(crate) use records::*;
 pub(crate) use repair_cmd::*;
 pub(crate) use scan::*;
+pub(crate) use scan_logs::*;
 pub(crate) use semantic::*;
 pub(crate) use subsystem::*;
 pub(crate) use symbols::*;
@@ -215,6 +217,34 @@ pub(crate) enum Commands {
         /// Keep source-embedded secrets in raw form instead of redacting them.
         #[arg(long)]
         raw_literals: bool,
+    },
+    /// Extract runtime log signatures from a captured log file (issues #319 / #320).
+    ///
+    /// Parses one `plain-v1` or `jsonl-v1` log into deterministic,
+    /// redaction-safe graph records — a `LogSource`, one `ErrorSignature` per
+    /// `template-v1` fingerprint, capped `LogEvent` exemplars, and hourly
+    /// `LogOccurrenceBucket` nodes — and writes them as JSONL. Raw log text
+    /// never enters the graph; signatures are the producing program's own
+    /// claims, deterministically parsed but never verified.
+    ///
+    /// An unrecognized (binary / non-UTF-8) input prints a machine-readable
+    /// `{"ok":false,"error":{"code":"unrecognized_format",...}}` diagnostic to
+    /// stdout and exits 1 with no partial output. See `docs/cli/scan-logs.md`.
+    ScanLogs {
+        /// Path to the log file to scan.
+        log_path: PathBuf,
+        /// Repository root for repository attribution.
+        #[arg(long)]
+        repo_path: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Override the auto-detected repository identity.
+        ///
+        /// Forces `identity_source = operator_override`. Use for fixture-stable
+        /// tests or when the auto-detected remote is wrong (e.g. a mirror).
+        #[arg(long)]
+        repo_id_override: Option<String>,
     },
     /// Incrementally refresh an ingested store from working-tree edits.
     ///
@@ -2827,6 +2857,12 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             repo_id_override,
             raw_literals,
         } => scan_history(&repo_path, &out, repo_id_override.as_deref(), raw_literals),
+        Commands::ScanLogs {
+            log_path,
+            repo_path,
+            out,
+            repo_id_override,
+        } => scan_logs(&log_path, &repo_path, &out, repo_id_override.as_deref()),
         Commands::Inspect {
             graph,
             #[cfg(feature = "embedded-aletheiadb")]
@@ -5221,6 +5257,12 @@ pub(crate) fn trust_class_for(record: &GraphRecord) -> &'static str {
         | "Project"
         | "Plan" => "project_state",
         "Artifact" | "PatchArtifact" | "FileEdit" => "artifact",
+        // Runtime log-signature observations (issues #319 / #320): a program's
+        // own claim about its execution, deterministically parsed but never
+        // verified — never source truth or verification evidence.
+        "LogSource" | "ErrorSignature" | "LogEvent" | "LogOccurrenceBucket" => {
+            "runtime_observation"
+        }
         _ => "other",
     }
 }

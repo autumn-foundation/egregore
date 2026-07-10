@@ -220,7 +220,12 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::Constraint
         | NodeKind::CostUsage
         | NodeKind::Retraction
-        | NodeKind::DependencyDeclaration => return None,
+        | NodeKind::DependencyDeclaration
+        // Log-signature nodes carry no source bytes to embed (issues #319/#320).
+        | NodeKind::LogSource
+        | NodeKind::ErrorSignature
+        | NodeKind::LogEvent
+        | NodeKind::LogOccurrenceBucket => return None,
     };
 
     Some(EmbeddingCandidate {

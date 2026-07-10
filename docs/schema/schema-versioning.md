@@ -40,6 +40,7 @@ incremental producers. New domains use their own constants:
 | `artifact` | `ARTIFACT_SCHEMA_VERSION` | artifact records |
 | `project` | `PROJECT_SCHEMA_VERSION` | project-graph records |
 | `semantic` | `SEMANTIC_SCHEMA_VERSION` | semantic-drift records |
+| `log` | `LOG_SCHEMA_VERSION` | log-signature records (`LogSource`, `ErrorSignature`, `LogEvent`, `LogOccurrenceBucket`) — compatibility class `additive`, version 1 |
 
 Rationale: per-domain and per-kind scoping lets #6, #11, #13, #14, and #15 land
 independently. A new project `Task` shape must not force a version bump for

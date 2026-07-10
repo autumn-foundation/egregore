@@ -27,6 +27,7 @@ Both times are **RFC 3339** strings (e.g. `2026-05-19T00:00:00Z`).
 | `artifact` | Build or release timestamp | When the artifact was produced |
 | `verification` | When the check ran | Test run or audit time |
 | `user_context` | When the context window was created | Session-scoped |
+| `log` | Parsed event timestamp (`log_event_timestamp`); inferred from transaction time (`inferred_from_transaction_time`) for a timestamp-less line | `LogOccurrenceBucket.valid_time` = `bucket_start` (hour-floored) |
 
 ---
 
@@ -38,8 +39,9 @@ describes how the value was derived.  Current values:
 | Value | Meaning |
 |-------|---------|
 | `git_commit_committer_date` | Set from the Git commit's committer date during `scan-history` |
-| `inferred_from_transaction_time` | Set by the scan process from the wall-clock time of the scan |
+| `inferred_from_transaction_time` | Set by the scan process from the wall-clock time of the scan (and by `scan-logs` for a timestamp-less log line) |
 | `author_provided` | Explicitly set by the agent or tool that created the record |
+| `log_event_timestamp` | Set by `scan-logs` from the timestamp parsed out of a log line (issues #319/#320) |
 
 ---
 

@@ -1825,6 +1825,7 @@ impl EmbeddedAletheiaSink {
             repository_identity,
             source_snapshot,
             dependency,
+            log,
             text,
             superseded_by,
             agent_id,
@@ -2015,6 +2016,11 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(payload.as_ref())
         {
             builder = builder.insert("dependency_json", json.as_str());
+        }
+        if let Some(payload) = log
+            && let Ok(json) = serde_json::to_string(payload.as_ref())
+        {
+            builder = builder.insert("log_json", json.as_str());
         }
         builder = insert_optional(builder, "text", text.as_deref());
         builder = insert_optional(builder, "superseded_by", superseded_by.as_deref());
@@ -2737,6 +2743,12 @@ impl EmbeddedAletheiaSink {
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("dependency_json invalid: {e}")))?
             .map(Box::new),
+            log: optional_str_property(record_id, "log_json", node.get_property("log_json"))?
+                .as_deref()
+                .map(serde_json::from_str::<crate::ir::LogPayload>)
+                .transpose()
+                .map_err(|e| read_back_error(record_id, format!("log_json invalid: {e}")))?
+                .map(Box::new),
             valid_time: optional_str_property(
                 record_id,
                 "node_valid_time",
@@ -3687,6 +3699,11 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "CostUsage" => Ok(NodeKind::CostUsage),
         "Retraction" => Ok(NodeKind::Retraction),
         "DependencyDeclaration" => Ok(NodeKind::DependencyDeclaration),
+        // Log-signature node kinds (issues #319 / #320).
+        "LogSource" => Ok(NodeKind::LogSource),
+        "ErrorSignature" => Ok(NodeKind::ErrorSignature),
+        "LogEvent" => Ok(NodeKind::LogEvent),
+        "LogOccurrenceBucket" => Ok(NodeKind::LogOccurrenceBucket),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded node kind {kind}"),
@@ -3734,6 +3751,12 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "REVOKED_BY" => Ok(EdgeLabel::RevokedBy),
         "SCOPED_TO_REPO" => Ok(EdgeLabel::ScopedToRepo),
         "RELATES_TO" => Ok(EdgeLabel::RelatesTo),
+        // Log-signature edge labels (issues #319 / #320).
+        "FINGERPRINTED_AS" => Ok(EdgeLabel::FingerprintedAs),
+        "CAPTURED_FROM" => Ok(EdgeLabel::CapturedFrom),
+        "AGGREGATES" => Ok(EdgeLabel::Aggregates),
+        "FRAME_RESOLVES_TO" => Ok(EdgeLabel::FrameResolvesTo),
+        "EMITTED_DURING" => Ok(EdgeLabel::EmittedDuring),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded edge label {label}"),
@@ -3912,7 +3935,11 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::Constraint
         | NodeKind::CostUsage
         | NodeKind::Retraction
-        | NodeKind::DependencyDeclaration => kind.as_str(),
+        | NodeKind::DependencyDeclaration
+        | NodeKind::LogSource
+        | NodeKind::ErrorSignature
+        | NodeKind::LogEvent
+        | NodeKind::LogOccurrenceBucket => kind.as_str(),
     }
 }
 

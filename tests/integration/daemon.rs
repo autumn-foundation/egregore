@@ -4311,6 +4311,12 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::Constraint => "user-context-documented",
         // M3 Codex importer node kinds (issue #21)
         NodeKind::CostUsage => "agent-memory-m3-codex-importer",
+        // Log-signature node kinds (issues #319 / #320), documented in
+        // docs/schema/log-graph.md and docs/cli/scan-logs.md.
+        NodeKind::LogSource
+        | NodeKind::ErrorSignature
+        | NodeKind::LogEvent
+        | NodeKind::LogOccurrenceBucket => "log-domain-documented",
     };
 }
 
@@ -4361,6 +4367,12 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::MaterializedAs
         | EdgeLabel::RevokedBy
         | EdgeLabel::ScopedToRepo => "user-context-registry",
+        // Log-signature registry: documented in docs/schema/log-graph.md
+        EdgeLabel::FingerprintedAs
+        | EdgeLabel::CapturedFrom
+        | EdgeLabel::Aggregates
+        | EdgeLabel::FrameResolvesTo
+        | EdgeLabel::EmittedDuring => "log-domain-registry",
     };
 }
 

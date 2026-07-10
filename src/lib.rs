@@ -57,6 +57,8 @@ pub mod languages;
 pub mod link_evidence;
 /// Local project/task JSONL importer (issue #42).
 pub mod local_project;
+/// Runtime log-signature extraction (`scan-logs`, issues #319 / #320).
+pub mod log_graph;
 /// Cargo manifest dependency-declaration extraction (issue #180).
 pub mod manifest_deps;
 /// MCP server exposing read-only evidence-query tools (issue #53).
@@ -106,15 +108,16 @@ pub use error::{CodegraphError, Result};
 pub use history::{scan_repository_history, scan_repository_history_with_override};
 pub use ir::{
     AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, CallResolution,
-    DependencyDeclarationPayload, Domain, EdgeLabel, EgregoreGit, EmbeddingModel, EvidenceLink,
-    Graph, GraphRecord, IdentitySource, MetricKind, NodeKind, NodeProvenance,
-    PRODUCER_ENVELOPE_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION, PatchHandle, Producer, ProducerKind,
-    RepositoryIdentityPayload, SCHEMA_VERSION, SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE,
-    SEMANTIC_SCHEMA_VERSION, SelectionBasis, SemanticDriftMetadata, SnapshotHead,
-    SourceSnapshotPayload, SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION,
-    UserContextFields, UserContextScope, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
-    artifact_stable_id, project_stable_id, semantic_stable_id, stable_id, user_context_stable_id,
-    verification_stable_id,
+    DependencyDeclarationPayload, Domain, EdgeLabel, EgregoreGit, EmbeddingModel,
+    ErrorSignaturePayload, EvidenceLink, Graph, GraphRecord, IdentitySource, LOG_SCHEMA_VERSION,
+    LogEventPayload, LogOccurrenceBucketPayload, LogPayload, LogSourcePayload, MetricKind,
+    NodeKind, NodeProvenance, PRODUCER_ENVELOPE_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION,
+    PatchHandle, Producer, ProducerKind, RepositoryIdentityPayload, SCHEMA_VERSION,
+    SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, SelectionBasis,
+    SemanticDriftMetadata, SnapshotHead, SourceSnapshotPayload, SourceSpan, TemporalMetadata,
+    USER_CONTEXT_SCHEMA_VERSION, UserContextFields, UserContextScope, VERIFICATION_SCHEMA_VERSION,
+    agent_memory_stable_id, artifact_stable_id, log_stable_id, project_stable_id,
+    semantic_stable_id, stable_id, user_context_stable_id, verification_stable_id,
 };
 pub use local_project::import_local_tasks;
 pub use query::{
