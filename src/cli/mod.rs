@@ -32,6 +32,7 @@ mod import;
 mod ingest;
 mod inspect;
 mod lifeline;
+mod locate;
 mod manifest_deps;
 mod memory;
 mod memory_audit;
@@ -90,6 +91,7 @@ pub(crate) use import::*;
 pub(crate) use ingest::*;
 pub(crate) use inspect::*;
 pub(crate) use lifeline::*;
+pub(crate) use locate::*;
 pub(crate) use manifest_deps::*;
 pub(crate) use memory::*;
 pub(crate) use memory_audit::*;
@@ -2131,6 +2133,61 @@ pub(crate) enum QuerySubcommand {
         /// Restrict resolution to one repository.
         #[arg(long)]
         repo: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Resolve a `file:line` position to its innermost symbol *and* that symbol's
+    /// trust-separated cross-domain context (issue #212).
+    ///
+    /// The positional sibling of `query at`: instead of returning only the
+    /// symbol handle, `locate` is positional entry into the `eg query context`
+    /// contract. It resolves the innermost `Symbol` whose recorded span contains
+    /// the line (reusing the issue #151 span-containment resolver) and returns
+    /// the same trust-separated bundle as `query context` — source facts, agent
+    /// observations, project state, artifacts, and verification evidence — so an
+    /// agent holding a stack-trace frame, blame line, or diff hunk gets the
+    /// evidence graph without first guessing a symbol name.
+    ///
+    /// Absence is always typed, never a nearest-neighbor guess: a line outside
+    /// every symbol span is `no_enclosing_symbol`, a line beyond the file's last
+    /// recorded structural span is `line_out_of_range`, and an unknown path is
+    /// `no_match`.
+    ///
+    /// Exit codes:
+    ///   0 — an enclosing symbol was found (JSON envelope on stdout).
+    ///   1 — malformed location, malformed `--as-of` timestamp, ambiguous commit
+    ///       prefix, ambiguous unscoped repository collision, or unknown/ambiguous
+    ///       repository selector.
+    ///   2 — unknown path (`no_match`), commit absent (`missing_commit`), no
+    ///       enclosing symbol (`no_enclosing_symbol`), or line beyond the file's
+    ///       recorded extent (`line_out_of_range`).
+    ///
+    /// Documented in `docs/cli/query.md`.
+    Locate {
+        /// Location as `<repo-relative-path>:<line>`, e.g. `src/lib.rs:42`.
+        location: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Resolve against symbol spans as they existed at this commit SHA or
+        /// unique prefix (requires a history-bearing store).
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Resolve against symbol spans as of the most recent commit at or
+        /// before this RFC 3339 instant (requires a history-bearing store).
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Restrict resolution to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Supersession resolution mode for memory/observations (matches
+        /// `eg query context`).
+        #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
+        supersession: crate::temporal_status::SupersessionMode,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -4664,6 +4721,58 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 at.as_deref(),
                 &index,
                 selected.as_deref(),
+            )
+        }
+        QuerySubcommand::Locate {
+            location,
+            graph,
+            data_dir,
+            at,
+            as_of,
+            repo,
+            supersession,
+            format,
+        } => {
+            // Validate the location before loading records so malformed input
+            // fails fast with a machine-readable diagnostic (same fail-fast
+            // shape as `query at`).
+            let (path, line) = match parse_file_line_location(&location) {
+                Ok(parsed) => parsed,
+                Err(message) => {
+                    let envelope = serde_json::json!({
+                        "ok": false,
+                        "error": {
+                            "code": "malformed_location",
+                            "location": location,
+                            "message": message,
+                        }
+                    });
+                    println!("{}", serde_json::to_string(&envelope)?);
+                    std::process::exit(1);
+                }
+            };
+            // Strictly read-only lookup: `--data-dir` reads from a throwaway
+            // copy, never the live store (same contract as `query at`).
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_locate_cmd(
+                &records,
+                path,
+                line,
+                at.as_deref(),
+                as_of.as_deref(),
+                &index,
+                selected.as_deref(),
+                supersession,
+                format,
             )
         }
     }

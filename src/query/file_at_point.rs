@@ -478,6 +478,14 @@ pub struct LocationContext<'a> {
     pub primary: Option<&'a GraphRecord>,
     /// Repository owner groups among the path's matched records.
     pub repo_groups: BTreeSet<Option<&'a str>>,
+    /// Maximum recorded span `end_line` across the path's `Symbol`/`Module`
+    /// nodes in the selected view, or `None` when the path has no spanned
+    /// structural records. Lets a caller distinguish a line beyond the file's
+    /// last recorded structural element (out of range of the graph's knowledge)
+    /// from a line in a gap between items — `File` nodes carry no span, so the
+    /// file's true last line is not stored and this recorded extent is the best
+    /// deterministic upper bound.
+    pub max_span_end_line: Option<usize>,
 }
 
 /// Recency ordering for two versions of one stable record ID in the
@@ -621,6 +629,12 @@ pub fn location_context<'a>(
             continue;
         }
         let Some(span) = span else { continue };
+        // Track the deepest recorded structural line for the path so the caller
+        // can tell a line past the last known span (out of range) from a gap.
+        ctx.max_span_end_line = Some(
+            ctx.max_span_end_line
+                .map_or(span.end_line, |m| m.max(span.end_line)),
+        );
         if span.start_line <= line && line <= span.end_line {
             ctx.chain.push(record);
         }

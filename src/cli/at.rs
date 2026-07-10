@@ -30,25 +30,25 @@ pub(crate) fn parse_file_line_location(
 /// one enclosing-chain entry.
 #[derive(Serialize)]
 pub(crate) struct LocationNodeJson<'a> {
-    record_id: &'a str,
-    kind: &'a str,
-    schema_version: u32,
-    name: Option<&'a str>,
+    pub(crate) record_id: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) schema_version: u32,
+    pub(crate) name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    symbol_kind: Option<&'a str>,
-    repo_relative_path: Option<&'a str>,
-    span: Option<SourceSpan>,
+    pub(crate) symbol_kind: Option<&'a str>,
+    pub(crate) repo_relative_path: Option<&'a str>,
+    pub(crate) span: Option<SourceSpan>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    language: Option<&'a str>,
+    pub(crate) language: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    visibility: Option<&'a str>,
+    pub(crate) visibility: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    signature: Option<&'a str>,
+    pub(crate) signature: Option<&'a str>,
     /// Full commit SHA for history-backed (temporal) records.
     #[serde(skip_serializing_if = "Option::is_none")]
-    git_commit: Option<&'a str>,
+    pub(crate) git_commit: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    valid_time: Option<&'a str>,
+    pub(crate) valid_time: Option<&'a str>,
 }
 
 /// Top-level `query at` success envelope.
