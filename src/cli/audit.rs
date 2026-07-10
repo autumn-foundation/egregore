@@ -51,7 +51,101 @@ pub(crate) fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
             min_recall,
             format,
         ),
+        AuditSubcommand::ControlCatalog { catalog, format } => control_catalog_cmd(catalog, format),
     }
+}
+
+/// Prints a redaction-safe JSON error and exits with the load/parse code (2).
+pub(crate) fn control_catalog_exit(value: &serde_json::Value) -> ! {
+    eprintln!("{value}");
+    std::process::exit(2);
+}
+
+/// Handles `eg audit control-catalog` (issue #337): loads, validates, and
+/// hash-pins a SOC2 control->evidence-class catalog. Exit 0 valid, 2 on any
+/// read/parse/unknown-class/unknown-schema-version error.
+pub(crate) fn control_catalog_cmd(catalog: Option<PathBuf>, format: OutputFormat) -> Result<()> {
+    use crate::evidence_pack::{self, DEFAULT_SOC2_CATALOG_JSON};
+
+    let text = catalog.map_or_else(
+        || DEFAULT_SOC2_CATALOG_JSON.to_owned(),
+        |path| {
+            fs::read_to_string(&path).unwrap_or_else(|error| {
+                control_catalog_exit(&serde_json::json!({
+                    "code": "catalog_read_error",
+                    "path": path.display().to_string(),
+                    "message": error.to_string(),
+                }))
+            })
+        },
+    );
+
+    let parsed = evidence_pack::parse_catalog(&text)
+        .unwrap_or_else(|error| control_catalog_exit(&error.to_json()));
+
+    let controls: Vec<serde_json::Value> = parsed
+        .controls
+        .iter()
+        .map(|control| {
+            let classes: Vec<serde_json::Value> = control
+                .evidence_classes
+                .iter()
+                .map(|cr| {
+                    serde_json::json!({
+                        "class": cr.class.as_wire(),
+                        "requirement": cr.requirement.as_wire(),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "control_id": control.control_id,
+                "title": control.title,
+                "evidence_classes": classes,
+            })
+        })
+        .collect();
+
+    let catalog_hash = evidence_pack::catalog_hash(&parsed);
+    let report = serde_json::json!({
+        "ok": true,
+        "catalog_id": parsed.catalog_id,
+        "catalog_schema_version": {
+            "domain": parsed.schema_version.domain,
+            "kind": parsed.schema_version.kind,
+            "version": parsed.schema_version.version,
+        },
+        "catalog_hash": catalog_hash,
+        "control_count": parsed.controls.len(),
+        "controls": controls,
+    });
+
+    match format {
+        OutputFormat::Json => {
+            // Single deterministic compact line, byte-identical across runs.
+            println!(
+                "{}",
+                serde_json::to_string(&report)
+                    .context("failed to serialize control-catalog report")?
+            );
+        }
+        OutputFormat::Text => {
+            println!("catalog: {} ({})", parsed.catalog_id, catalog_hash);
+            println!(
+                "schema_version: {} {} v{}",
+                parsed.schema_version.domain,
+                parsed.schema_version.kind,
+                parsed.schema_version.version
+            );
+            println!("controls: {}", parsed.controls.len());
+            for control in &parsed.controls {
+                println!("  {} — {}", control.control_id, control.title);
+                for cr in &control.evidence_classes {
+                    println!("    {} [{}]", cr.class.as_wire(), cr.requirement.as_wire());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Prints a redaction-safe JSON error and exits with the usage/load code (2).

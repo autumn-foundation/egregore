@@ -1,0 +1,37 @@
+{
+  "catalog_id": "soc2-v1",
+  "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+  "controls": [
+    {
+      "control_id": "CC8.1",
+      "title": "Change management: changes to infrastructure, data, software, and procedures are authorized, designed, developed, tested, approved, and implemented.",
+      "evidence_classes": [
+        { "class": "commits", "requirement": "required" },
+        { "class": "pull_requests", "requirement": "required" },
+        { "class": "reviews", "requirement": "required" },
+        { "class": "review_coverage", "requirement": "required" },
+        { "class": "structural_deltas", "requirement": "optional" },
+        { "class": "public_api_deltas", "requirement": "optional" },
+        { "class": "validation_runs", "requirement": "optional" },
+        { "class": "verification_evidence", "requirement": "optional" }
+      ]
+    },
+    {
+      "control_id": "CC7.2",
+      "title": "System monitoring: the entity monitors system components for anomalies indicative of malicious acts, natural disasters, and errors.",
+      "evidence_classes": [
+        { "class": "error_signatures", "requirement": "optional" },
+        { "class": "occurrence_buckets", "requirement": "optional" }
+      ]
+    },
+    {
+      "control_id": "CC7.3",
+      "title": "Incident evaluation and response: the entity evaluates security events to determine whether they could or did result in a failure to meet objectives, and responds accordingly.",
+      "evidence_classes": [
+        { "class": "error_signatures", "requirement": "optional" },
+        { "class": "occurrence_buckets", "requirement": "optional" },
+        { "class": "remediation_links", "requirement": "optional" }
+      ]
+    }
+  ]
+}

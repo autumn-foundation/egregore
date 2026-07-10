@@ -2685,6 +2685,26 @@ pub(crate) enum AuditSubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Load, validate, and hash-pin a SOC2 control->evidence-class catalog (issue #337).
+    ///
+    /// Parses a versioned control catalog (the embedded `soc2-v1` by default, or
+    /// a `--catalog <path>` override), validates its schema-version tuple and
+    /// evidence-class vocabulary, and prints a deterministic report carrying the
+    /// catalog identity, its BLAKE3 hash-pin handle, and the per-control
+    /// evidence-class map. Pure, offline, read-only.
+    ///
+    /// Exit codes:
+    ///   0 — the catalog is valid; the report is printed to stdout.
+    ///   2 — read/parse error, unknown evidence class, or unknown schema version;
+    ///       a redaction-safe JSON error is printed to stderr.
+    ControlCatalog {
+        /// Catalog document path. Defaults to the embedded `soc2-v1` catalog.
+        #[arg(long)]
+        catalog: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 /// Subcommands for `bundle`.
