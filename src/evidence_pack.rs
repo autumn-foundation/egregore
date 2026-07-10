@@ -1091,6 +1091,10 @@ pub fn evidence_class_for_record(record: &GraphRecord) -> Option<EvidenceClass> 
         "PR" => Some(EvidenceClass::PullRequests),
         "Task" if source_kind.as_deref() == Some("github_pr") => Some(EvidenceClass::PullRequests),
         "Review" => Some(EvidenceClass::Reviews),
+        // Per-file structural deltas: `scan-history` emits one `Change` node per
+        // file touched in a commit (`src/history.rs`), each carrying commit valid
+        // time. These are the genuine stored backing for structural deltas.
+        "Change" => Some(EvidenceClass::StructuralDeltas),
         "Verification" | "CommandRun" | "TestRun" | "CIStatus" | "CommandEvidence"
         | "BenchmarkRun" | "CoverageReport" | "ProofResult" => {
             Some(EvidenceClass::VerificationEvidence)
@@ -1101,7 +1105,18 @@ pub fn evidence_class_for_record(record: &GraphRecord) -> Option<EvidenceClass> 
     }
 }
 
-/// Stable unavailable reason for a class whose domain is absent.
+/// Stable unavailable reason for a class that is not available.
+///
+/// Three honest families:
+/// * `*_domain_absent` — the class has a real stored backing node kind, but no
+///   record of that kind exists in the input (`Change` for structural deltas,
+///   `Commit`/`Task`/`Review`/verification kinds for the rest).
+/// * `derived_class_not_materialized` — the class is a computed/derived surface
+///   (`eg query public-api-deltas` #157, `eg validate` #103) with no stored node
+///   kind, so it can never be materialized as pack evidence records. Reported
+///   honestly rather than mislabeled as a missing domain.
+/// * `log_domain_absent` — the log-signature classes (issues #319/#340) whose
+///   backing domain is not yet emitted.
 #[must_use]
 const fn unavailable_reason(class: EvidenceClass) -> &'static str {
     match class {
@@ -1109,8 +1124,10 @@ const fn unavailable_reason(class: EvidenceClass) -> &'static str {
         EvidenceClass::PullRequests => "pull_request_domain_absent",
         EvidenceClass::Reviews => "review_domain_absent",
         EvidenceClass::ReviewCoverage => "no_pull_requests_to_measure",
-        EvidenceClass::StructuralDeltas | EvidenceClass::PublicApiDeltas => "delta_domain_absent",
-        EvidenceClass::ValidationRuns => "validation_domain_absent",
+        EvidenceClass::StructuralDeltas => "delta_domain_absent",
+        EvidenceClass::PublicApiDeltas | EvidenceClass::ValidationRuns => {
+            "derived_class_not_materialized"
+        }
         EvidenceClass::VerificationEvidence => "verification_domain_absent",
         EvidenceClass::ErrorSignatures
         | EvidenceClass::OccurrenceBuckets
@@ -1936,6 +1953,20 @@ pub(crate) mod fixture {
 
     fn commit_no_vt(id: &str) -> GraphRecord {
         node(id, NodeKind::Commit, SCHEMA_VERSION)
+    }
+
+    /// A per-file structural-delta `Change` node as emitted by `scan-history`
+    /// (`NodeKind::Change`, path-scoped, valid time carried by the commit).
+    pub fn change(id: &str, path: &str, vt: &str) -> GraphRecord {
+        let r = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Change,
+            Some(path.to_owned()),
+            None,
+            Some(format!("M {path}")),
+            format!("Git change M to {path}"),
+        );
+        set_temporal_valid_time(r, vt)
     }
 
     pub fn pr(id: &str, vt: &str, merge_commit: &str) -> GraphRecord {
@@ -2853,6 +2884,98 @@ mod pack338_tests {
                 .iter()
                 .any(|d| d.code == "evidence_class_unavailable")
         );
+    }
+
+    /// Codex round-2 P2: `scan-history` emits per-file structural deltas as
+    /// `NodeKind::Change` records. They have a real stored backing kind, so the
+    /// `structural_deltas` section must be PRESENT and carry in-window Change
+    /// record IDs — never silently `unavailable`/`delta_domain_absent`.
+    #[test]
+    fn structural_deltas_populated_from_in_window_change_records() {
+        use super::fixture::change;
+        let records = vec![
+            change("codegraph:v5:chg01", "src/lib.rs", "2026-03-05T09:00:00Z"),
+            change("codegraph:v5:chg02", "src/main.rs", "2026-03-06T09:00:00Z"),
+            // Out-of-window (February) change must not appear.
+            change("codegraph:v5:chg99", "src/old.rs", "2026-02-05T09:00:00Z"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        let sd = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "structural_deltas")
+            .expect("structural_deltas section");
+        assert_eq!(sd.status, "present", "structural_deltas must be present");
+        assert_eq!(sd.outcome, ClassOutcome::Pass);
+        assert_eq!(sd.record_count, 2);
+        let ids: Vec<&str> = sd.records.iter().map(|r| r.record.id()).collect();
+        assert!(ids.contains(&"codegraph:v5:chg01"));
+        assert!(ids.contains(&"codegraph:v5:chg02"));
+        assert!(!ids.contains(&"codegraph:v5:chg99"));
+        // Rows ordered by (valid_time, id).
+        for pair in sd.records.windows(2) {
+            assert!(section_sort_key(&pair[0].record) <= section_sort_key(&pair[1].record));
+        }
+    }
+
+    /// Present-but-empty: Change records exist in the store but none fall in the
+    /// window. The section is PRESENT with zero rows (an optional present-empty
+    /// class passes), NOT `unavailable`.
+    #[test]
+    fn structural_deltas_present_but_empty_when_no_in_window_change() {
+        use super::fixture::change;
+        let records = vec![change(
+            "codegraph:v5:chg99",
+            "src/old.rs",
+            "2026-02-05T09:00:00Z",
+        )];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        let sd = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "structural_deltas")
+            .expect("structural_deltas section");
+        assert_eq!(sd.status, "present");
+        assert_eq!(sd.outcome, ClassOutcome::Pass);
+        assert_eq!(sd.record_count, 0);
+        assert!(sd.unavailable_reason.is_none());
+    }
+
+    /// Computed-only classes (#157 public-api deltas, #103 validation) have no
+    /// stored backing node kind, so they degrade with the honest
+    /// `derived_class_not_materialized` reason — never the misleading
+    /// `log_domain_absent`, and never `delta_domain_absent` now that structural
+    /// deltas are a genuine stored class.
+    #[test]
+    fn computed_only_classes_report_derived_not_materialized() {
+        let pack = assemble_cc81();
+        for class in ["public_api_deltas", "validation_runs"] {
+            let s = pack.sections.iter().find(|s| s.class == class).unwrap();
+            assert_eq!(s.status, "unavailable", "{class} should be unavailable");
+            assert_eq!(
+                s.unavailable_reason.as_deref(),
+                Some("derived_class_not_materialized"),
+                "{class} must use the honest computed-only reason"
+            );
+        }
     }
 
     #[test]

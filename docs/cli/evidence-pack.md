@@ -81,7 +81,29 @@ pull-request record exists. `evaluate_requirement` (#337) yields:
 | optional | available | `pass` | section populated |
 | optional | unavailable | `reported_optional_unavailable` | `{"status":"unavailable","unavailable_reason":...}` + `evidence_class_unavailable` diagnostic |
 
-Log-domain optional classes degrade with `unavailable_reason: "log_domain_absent"`.
+### What "available" means per class
+
+A class is available when the input holds at least one record of that class's
+**stored backing node kind**. When unavailable, the `unavailable_reason` names
+one of three honest families:
+
+| classes | backing | `unavailable_reason` when absent |
+|---------|---------|----------------------------------|
+| `commits` (`Commit`), `pull_requests` (`Task`/`github_pr`), `reviews` (`Review`), `structural_deltas` (`Change`), `verification_evidence` (`Verification`/`CommandRun`/`TestRun`/`CIStatus`/`CommandEvidence`/`BenchmarkRun`/`CoverageReport`/`ProofResult`) | real stored node kind | `<class>_domain_absent` (e.g. `delta_domain_absent`) |
+| `public_api_deltas` (#157), `validation_runs` (#103) | computed/derived surface, **no stored node kind** | `derived_class_not_materialized` |
+| `error_signatures` (`ErrorSignature`), `occurrence_buckets` (`LogOccurrenceBucket`), `remediation_links` | log-signature domain (issues #319/#340), not yet emitted | `log_domain_absent` |
+| `review_coverage` | computed over merged PRs (available whenever any PR exists) | `no_pull_requests_to_measure` |
+
+`structural_deltas` is a genuine stored class: `scan-history` emits one
+`NodeKind::Change` record per file touched in a commit (`src/history.rs`), each
+carrying the commit's valid time. In-window `Change` records populate the
+`structural_deltas` section; when Change records exist in the store but none fall
+in the window the section is **present but empty** (an optional present-empty
+class passes), never `unavailable`. `public_api_deltas` and `validation_runs`
+are derived query surfaces with no stored record kind, so they can never be
+materialized as pack evidence rows — they degrade with the honest
+`derived_class_not_materialized` reason rather than being mislabeled as a missing
+domain. Only the log-signature classes degrade with `log_domain_absent`.
 
 ## Verdicts and exit codes
 
