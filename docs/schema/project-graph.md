@@ -82,9 +82,18 @@ Task record shape.
 | `assignees` | string array | yes | Agent IDs or human identifiers; opaque strings, not resolved to `Agent` nodes in this slice. |
 | `labels` | string array | yes | Redacted per #4. |
 | `priority` | enum | yes | `low`, `normal`, `high`, `urgent`, `unknown`; additive. |
+| `head_sha` | string | no (PR only) | GitHub PR head (source-branch) commit SHA (issue #333). Plaintext; omitted on non-PR Tasks. |
+| `head_ref` | string | no (PR only) | GitHub PR head (source-branch) ref name (issue #333). Plaintext; omitted on non-PR Tasks. |
+| `base_ref` | string | no (PR only) | GitHub PR base (target-branch) ref name (issue #333). Plaintext; omitted on non-PR Tasks. |
+| `merge_commit_sha` | string | no (PR only) | GitHub PR merge commit SHA; present only when merged (issue #333). Plaintext. Resolves to a `MERGED_AS` edge, below. |
+| `merged_at` | RFC3339 | no (PR only) | GitHub PR merge timestamp; present only when merged (issue #333). Plaintext. |
+| `draft` | bool | no (PR only) | GitHub PR draft flag (issue #333). Plaintext; omitted on non-PR Tasks. |
 
-GitHub issue and PR importers both write `Task`; GitHub-only fields can land in
-reserved `GitHubIssue` or `PR` records in a later slice.
+GitHub issue and PR importers both write `Task`; the six optional PR fields above
+are promoted flat `Task` fields (issue #333, consumed by #334/#338). They are
+additive — a pre-#333 `Task` that omits them is still valid at
+`PROJECT_SCHEMA_VERSION = 1`. Remaining GitHub-only fields can land in reserved
+`GitHubIssue` or `PR` records in a later slice.
 
 ## 4 - AcceptanceCriterion record shape
 
@@ -136,8 +145,8 @@ payload definitions belong to their own slices.
 | `Project` | Bounded area of work under a `Product` - reserved. |
 | `Plan` | Strategy, milestone, or implementation plan - reserved. `Plan` records are project-domain entries; `docs/plans/*.md` files are artifact-domain `Plan` records distinguished by `domain`. |
 | `GitHubIssue` | GitHub-specific issue metadata - reserved; day-one shape collapses issues into `Task` with `source_kind` and `ExternalLink`. |
-| `PR` | GitHub pull-request metadata - reserved for fields such as `merged_at`, `base_ref`, and `head_ref`. |
-| `Review` | Review comment, finding, approval, requested change, or blocker - reserved; depends on #6 `EvidenceLink` array shape for review-to-AC citations. |
+| `PR` | GitHub pull-request metadata - reserved. As of issue #333 the core PR fields (`head_sha`, `head_ref`, `base_ref`, `merge_commit_sha`, `merged_at`, `draft`) are promoted to first-class flat `Task` fields; a dedicated `PR` record remains reserved only for the residual PR-only surface (requested reviewers, `mergeable_state`, …). |
+| `Review` | Review comment, finding, approval, requested change, or blocker. Shipped in issue #46 (no longer reserved): the GitHub importer emits `project.Review` records for issue comments, PR review summaries, and PR review comments. |
 | `LocalTask` | Named in the PRD as a sibling of `GitHubIssue` - reserved; day-one shape collapses it into `Task` with `source_kind: local_jsonl`. |
 
 ## 7 - Cross-Domain Edge Rows
@@ -148,11 +157,12 @@ project-domain side of the contract, but the registry remains the one from #6.
 
 | Label | FROM domain(s) | TO domain(s) | FROM kind(s) | TO kind(s) | Cardinality | `confidence` required |
 |-------|---------------|-------------|-------------|-----------|-------------|----------------------|
-| `REFERENCES_TASK` | `agent_memory`, `project` *(Review, reserved)* | `project` | `Observation`, `Decision`, `Failure`, `Lesson`; `Review` *(reserved — ships when Review is promoted)* | `Task` | many:many | no |
+| `REFERENCES_TASK` | `agent_memory`, `project` | `project` | `Observation`, `Decision`, `Failure`, `Lesson`; `Review` | `Task` | many:many | no |
 | `CLOSES_ACCEPTANCE_CRITERION` | `project` | `verification` | `AcceptanceCriterion` | `Verification`, `CommandRun`, `TestRun` | many:1 | no |
 | `OWNED_BY_TASK` | `project` | `project` | `AcceptanceCriterion` | `Task` | many:1 | no |
 | `EXTERNAL_HANDLE` | `project` | `project` | `Task`, `AcceptanceCriterion` | `ExternalLink` | many:1 | no |
-| `TOUCHES_FILE` | `project` | `codegraph` | `Task`; `Review` *(reserved — ships when Review is promoted)* | `File` | many:many | no |
+| `TOUCHES_FILE` | `project` | `codegraph` | `Task`; `Review` | `File` | many:many | no |
+| `MERGED_AS` | `project` | `codegraph` | `Task` *(`source_kind: github_pr`)* | `Commit` | many:1 | no |
 | `MENTIONS_SYMBOL` | `project` | `codegraph` | `Task` | `Symbol` | many:many | yes |
 
 `REFERENCES_TASK` is promoted from reserved to defined: #6 already reserved the

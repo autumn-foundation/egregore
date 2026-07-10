@@ -21,7 +21,7 @@ use crate::{
         client::{Client, FetchOutcome},
         error::{GithubError, GithubResult},
         model,
-        records::{self, Context, Emitted, FileIndex},
+        records::{self, CommitIndex, Context, Emitted, FileIndex},
         state::{self, State},
     },
     ir::{Graph, GraphRecord, NodeKind, PROJECT_SCHEMA_VERSION, project_stable_id},
@@ -95,6 +95,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     client.probe_repo(opts.source_repo)?;
 
     let file_index = load_file_index(opts.code_graph)?;
+    let commit_index = load_commit_index(opts.code_graph)?;
     let mut state = prior_state;
     let mut graph = Graph::new();
     let mut emitted_count = 0usize;
@@ -104,6 +105,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
         transaction_time: &transaction_time,
         redact: &redact_value,
         file_index: &file_index,
+        commit_index: &commit_index,
     };
 
     // ── Issues (Task + ExternalLink) ────────────────────────────────────────────
@@ -361,6 +363,36 @@ fn load_file_index(code_graph: Option<&Path>) -> GithubResult<FileIndex> {
         } = rec
         {
             index.entry(p.clone()).or_default().push(id.clone());
+        }
+    }
+    Ok(index)
+}
+
+/// Loads a `commit_sha -> [commit_id]` index from a code-graph JSONL (#333).
+///
+/// A `Commit` node carries its SHA in the `name` field (see `commit_record` in
+/// `history.rs`). A SHA claimed by more than one `Commit` record is ambiguous
+/// and is diagnosed rather than linked by [`records::pull_records`].
+fn load_commit_index(code_graph: Option<&Path>) -> GithubResult<CommitIndex> {
+    let Some(path) = code_graph else {
+        return Ok(CommitIndex::new());
+    };
+    let jsonl = std::fs::read_to_string(path).map_err(|e| GithubError::Io {
+        detail: format!("read code-graph {}: {e}", path.display()),
+    })?;
+    let records = records_from_jsonl(&jsonl).map_err(|e| GithubError::Io {
+        detail: format!("parse code-graph: {e}"),
+    })?;
+    let mut index = CommitIndex::new();
+    for rec in &records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::Commit,
+            name: Some(sha),
+            ..
+        } = rec
+        {
+            index.entry(sha.clone()).or_default().push(id.clone());
         }
     }
     Ok(index)

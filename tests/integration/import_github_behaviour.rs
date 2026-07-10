@@ -981,3 +981,478 @@ fn paginated_reimport_probes_every_stored_page() {
     );
     assert!(issue_task_summaries[0].contains("#2"));
 }
+
+// ── Issue #333: PR head/base/merge fields promoted to first-class Task fields ─────
+
+/// A six-PR fixture: three merged with DISTINCT `merge_commit_sha`s, one
+/// closed-unmerged, one draft, one open.
+fn six_pulls_json() -> String {
+    serde_json::json!([
+        {
+            "number": 10, "title":"Merged A","body":"PR body A.",
+            "state":"closed","draft":false,"labels":[],"assignees":[{"login":"dev"}],
+            "user":{"login":"dev"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z",
+            "merged_at":"2026-01-02T00:00:00Z","closed_at":"2026-01-02T00:00:00Z",
+            "head":{"ref":"feature-a","sha":"headsha000000000000000000000000000000a10"},
+            "base":{"ref":"main","sha":"basesha000000000000000000000000000000b10"},
+            "merge_commit_sha":"mergeaaa1111111111111111111111111111111a",
+            "html_url":"https://github.com/o/r/pull/10"
+        },
+        {
+            "number": 11, "title":"Merged B","body":"PR body B.",
+            "state":"closed","draft":false,"labels":[],"assignees":[],
+            "user":{"login":"dev"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T01:00:00Z",
+            "merged_at":"2026-01-02T01:00:00Z","closed_at":"2026-01-02T01:00:00Z",
+            "head":{"ref":"feature-b","sha":"headsha000000000000000000000000000000b11"},
+            "base":{"ref":"main","sha":"basesha000000000000000000000000000000b11"},
+            "merge_commit_sha":"mergebbb2222222222222222222222222222222b",
+            "html_url":"https://github.com/o/r/pull/11"
+        },
+        {
+            "number": 12, "title":"Merged C","body":"PR body C.",
+            "state":"closed","draft":false,"labels":[],"assignees":[],
+            "user":{"login":"dev"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T02:00:00Z",
+            "merged_at":"2026-01-02T02:00:00Z","closed_at":"2026-01-02T02:00:00Z",
+            "head":{"ref":"feature-c","sha":"headsha000000000000000000000000000000c12"},
+            "base":{"ref":"main","sha":"basesha000000000000000000000000000000b12"},
+            "merge_commit_sha":"mergeccc3333333333333333333333333333333c",
+            "html_url":"https://github.com/o/r/pull/12"
+        },
+        {
+            "number": 13, "title":"Closed unmerged","body":"PR body D.",
+            "state":"closed","draft":false,"labels":[],"assignees":[],
+            "user":{"login":"dev"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T03:00:00Z",
+            "closed_at":"2026-01-02T03:00:00Z",
+            "head":{"ref":"feature-d","sha":"headsha000000000000000000000000000000d13"},
+            "base":{"ref":"main","sha":"basesha000000000000000000000000000000b13"},
+            "html_url":"https://github.com/o/r/pull/13"
+        },
+        {
+            "number": 14, "title":"Draft PR","body":"PR body E.",
+            "state":"open","draft":true,"labels":[],"assignees":[],
+            "user":{"login":"dev"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T04:00:00Z",
+            "head":{"ref":"feature-e","sha":"headsha000000000000000000000000000000e14"},
+            "base":{"ref":"main","sha":"basesha000000000000000000000000000000b14"},
+            "html_url":"https://github.com/o/r/pull/14"
+        },
+        {
+            "number": 15, "title":"Open PR","body":"PR body F.",
+            "state":"open","draft":false,"labels":[],"assignees":[],
+            "user":{"login":"dev"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T05:00:00Z",
+            "head":{"ref":"feature-f","sha":"headsha000000000000000000000000000000f15"},
+            "base":{"ref":"main","sha":"basesha000000000000000000000000000000b15"},
+            "html_url":"https://github.com/o/r/pull/15"
+        }
+    ])
+    .to_string()
+}
+
+/// Route table for the six-PR fixture: empty everything except pulls, with an
+/// empty reviews endpoint for each PR (so the per-PR review fetch never 404s).
+fn six_pr_routes() -> HashMap<String, Canned> {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/repos/o/r".to_owned(),
+        Canned::ok("{\"full_name\":\"o/r\"}", "\"repo\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues?state=all&per_page=100".to_owned(),
+        Canned::ok("[]", "\"issues-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&six_pulls_json(), "\"pulls-333\""),
+    );
+    routes.insert(
+        "/repos/o/r/labels?per_page=100".to_owned(),
+        Canned::ok("[]", "\"labels-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"ic-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"prc-empty\""),
+    );
+    for n in 10..=15 {
+        routes.insert(
+            format!("/repos/o/r/pulls/{n}/reviews?per_page=100"),
+            Canned::ok("[]", &format!("\"prr-{n}\"")),
+        );
+    }
+    routes
+}
+
+/// Finds the single `github_pr` Task whose summary is `github_pr #<number>`.
+fn pr_task(jsonl: &str, number: u64) -> serde_json::Value {
+    nodes_of_kind(jsonl, "Task")
+        .into_iter()
+        .find(|t| {
+            t["source_kind"] == "github_pr"
+                && t["summary"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains(&format!("#{number}"))
+        })
+        .unwrap_or_else(|| panic!("PR Task #{number} should exist"))
+}
+
+/// A code-graph JSONL seed with one `Commit` node per given SHA.
+fn commit_seed(shas: &[&str]) -> String {
+    let mut out = String::new();
+    for (i, sha) in shas.iter().enumerate() {
+        let rec = serde_json::json!({
+            "record_type":"node","id":format!("codegraph:v5:commit-{i}"),
+            "kind":"Commit","schema_version":5,"name":sha,
+            "summary":format!("Git commit {sha}")
+        });
+        out.push_str(&rec.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
+fn pr_tasks_promote_six_flat_fields_and_issues_omit_them() {
+    let server = MockServer::start(six_pr_routes());
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("graph.jsonl");
+    let state = tmp.path().join("state.json");
+    let (jsonl, _, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok);
+
+    // Merged PR #10: all six fields present with the recorded values.
+    let pr10 = pr_task(&jsonl, 10);
+    assert_eq!(pr10["head_sha"], "headsha000000000000000000000000000000a10");
+    assert_eq!(pr10["head_ref"], "feature-a");
+    assert_eq!(pr10["base_ref"], "main");
+    assert_eq!(
+        pr10["merge_commit_sha"],
+        "mergeaaa1111111111111111111111111111111a"
+    );
+    assert_eq!(pr10["merged_at"], "2026-01-02T00:00:00Z");
+    assert_eq!(pr10["draft"], false);
+
+    // Draft PR #14: draft=true, no merge_commit_sha / merged_at (serde-skipped).
+    let pr14 = pr_task(&jsonl, 14);
+    assert_eq!(pr14["draft"], true);
+    assert_eq!(pr14["head_ref"], "feature-e");
+    assert!(pr14.get("merge_commit_sha").is_none() || pr14["merge_commit_sha"].is_null());
+    assert!(pr14.get("merged_at").is_none() || pr14["merged_at"].is_null());
+
+    // Open PR #15: no merge fields, draft=false, head/base refs present.
+    let pr15 = pr_task(&jsonl, 15);
+    assert_eq!(pr15["draft"], false);
+    assert!(pr15.get("merge_commit_sha").is_none() || pr15["merge_commit_sha"].is_null());
+
+    // Closed-unmerged PR #13: no merge_commit_sha / merged_at.
+    let pr13 = pr_task(&jsonl, 13);
+    assert!(pr13.get("merge_commit_sha").is_none() || pr13["merge_commit_sha"].is_null());
+    assert!(pr13.get("merged_at").is_none() || pr13["merged_at"].is_null());
+
+    // Issue Tasks (there are none in this fixture) never carry the fields; add
+    // a mixed run to prove issue omission using the canonical fixture.
+    let server2 = MockServer::start(full_routes());
+    let tmp2 = TempDir::new().unwrap();
+    let out2 = tmp2.path().join("g.jsonl");
+    let state2 = tmp2.path().join("s.json");
+    let (jsonl2, _, ok2) = run_import(&server2.base_url, &out2, &state2, &[]);
+    assert!(ok2);
+    for issue_task in nodes_of_kind(&jsonl2, "Task")
+        .into_iter()
+        .filter(|t| t["source_kind"] == "github_issue")
+    {
+        for field in [
+            "head_sha",
+            "head_ref",
+            "base_ref",
+            "merge_commit_sha",
+            "merged_at",
+            "draft",
+        ] {
+            assert!(
+                issue_task.get(field).is_none() || issue_task[field].is_null(),
+                "issue Task must omit PR field {field}: {issue_task}"
+            );
+        }
+    }
+}
+
+#[test]
+fn pr_promoted_fields_are_byte_identical_across_five_reimports() {
+    let tmp = TempDir::new().unwrap();
+    let mut outputs = Vec::new();
+    for i in 0..5 {
+        let server = MockServer::start(six_pr_routes());
+        let out = tmp.path().join(format!("graph-{i}.jsonl"));
+        let state = tmp.path().join(format!("state-{i}.json"));
+        let (jsonl, _, ok) = run_import(&server.base_url, &out, &state, &[]);
+        assert!(ok, "import {i} should succeed");
+        outputs.push(jsonl);
+    }
+    for (i, jsonl) in outputs.iter().enumerate().skip(1) {
+        assert_eq!(
+            *jsonl, outputs[0],
+            "re-import {i} must be byte-identical to the first"
+        );
+    }
+    // The promoted fields are actually present in the stable output.
+    assert!(outputs[0].contains("\"head_sha\":\"headsha000000000000000000000000000000a10\""));
+    assert!(
+        outputs[0].contains("\"merge_commit_sha\":\"mergeaaa1111111111111111111111111111111a\"")
+    );
+}
+
+#[test]
+fn pr_promotion_is_additive_schema_v1_with_stable_ids() {
+    // First import establishes the Task IDs.
+    let server = MockServer::start(six_pr_routes());
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("graph.jsonl");
+    let state = tmp.path().join("state.json");
+    let (jsonl, _, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok);
+
+    // PROJECT_SCHEMA_VERSION stays 1 on every PR Task.
+    for n in 10..=15 {
+        let t = pr_task(&jsonl, n);
+        assert_eq!(t["schema_version"], 1, "project schema version stays 1");
+    }
+    let ids_first: Vec<String> = (10..=15)
+        .map(|n| pr_task(&jsonl, n)["id"].as_str().unwrap().to_owned())
+        .collect();
+
+    // A legacy Task record (pre-#333: no new fields) still parses and inspects
+    // without warnings.
+    let legacy = serde_json::json!({
+        "record_type":"node","id":"project:v1:legacy-task","kind":"Task",
+        "schema_version":1,"domain":"project","source_kind":"github_pr",
+        "summary":"github_pr #999","title":"Legacy"
+    });
+    let legacy_path = tmp.path().join("legacy.jsonl");
+    std::fs::write(&legacy_path, format!("{legacy}\n")).unwrap();
+    let inspect = egregore()
+        .args(["inspect", legacy_path.to_str().unwrap()])
+        .output()
+        .expect("inspect legacy");
+    assert!(inspect.status.success(), "legacy Task inspects cleanly");
+    let inspect_err = String::from_utf8_lossy(&inspect.stderr);
+    assert!(
+        !inspect_err.to_lowercase().contains("warn"),
+        "no warnings for a legacy Task: {inspect_err}"
+    );
+
+    // Re-import into the same state: identical output → stable IDs, no churn.
+    let server2 = MockServer::start(six_pr_routes());
+    let out2 = tmp.path().join("graph2.jsonl");
+    let state2 = tmp.path().join("state2.json");
+    let (jsonl2, _, ok2) = run_import(&server2.base_url, &out2, &state2, &[]);
+    assert!(ok2);
+    let ids_second: Vec<String> = (10..=15)
+        .map(|n| pr_task(&jsonl2, n)["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids_first, ids_second, "stable IDs must not change");
+}
+
+#[test]
+fn merged_pr_links_to_seeded_commit_or_diagnoses_unresolved() {
+    // Seed commits for PR #10 (AAA) and #11 (BBB); #12 (CCC) is unseeded.
+    let tmp = TempDir::new().unwrap();
+    let code_graph = tmp.path().join("code.jsonl");
+    std::fs::write(
+        &code_graph,
+        commit_seed(&[
+            "mergeaaa1111111111111111111111111111111a",
+            "mergebbb2222222222222222222222222222222b",
+        ]),
+    )
+    .unwrap();
+
+    let server = MockServer::start(six_pr_routes());
+    let out = tmp.path().join("graph.jsonl");
+    let state = tmp.path().join("state.json");
+    let (jsonl, _, ok) = run_import(
+        &server.base_url,
+        &out,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok);
+
+    // Exactly two MERGED_AS edges (#10 → commit-0, #11 → commit-1).
+    assert_eq!(
+        edges_of_label(&jsonl, "MERGED_AS"),
+        2,
+        "one MERGED_AS edge per resolved merge commit"
+    );
+    let pr10_id = pr_task(&jsonl, 10)["id"].as_str().unwrap().to_owned();
+    let has_edge = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|v| {
+            v["record_type"] == "edge"
+                && v["label"] == "MERGED_AS"
+                && v["source"] == pr10_id.as_str()
+                && v["target"] == "codegraph:v5:commit-0"
+        });
+    assert!(has_edge, "PR #10 MERGED_AS edge targets the seeded Commit");
+
+    // PR #12's SHA (CCC) has no matching Commit → a github_commit_unresolved
+    // Diagnostic carrying the SHA and the Task record ID.
+    let pr12_id = pr_task(&jsonl, 12)["id"].as_str().unwrap().to_owned();
+    let unresolved = nodes_of_kind(&jsonl, "Diagnostic")
+        .into_iter()
+        .find(|d| {
+            d["summary"]
+                .as_str()
+                .unwrap_or("")
+                .contains("github_commit_unresolved")
+                && d["summary"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("mergeccc3333333333333333333333333333333c")
+        })
+        .expect("PR #12 emits a github_commit_unresolved Diagnostic");
+    assert!(
+        unresolved["summary"].as_str().unwrap().contains(&pr12_id),
+        "diagnostic carries the Task record ID: {unresolved}"
+    );
+
+    // Open / draft / closed-unmerged PRs (no merge_commit_sha) → no edge, no
+    // diagnostic keyed to them.
+    assert!(
+        !jsonl.contains("headsha000000000000000000000000000000e14")
+            || edges_of_label(&jsonl, "MERGED_AS") == 2,
+        "unmerged PRs produce no MERGED_AS edge"
+    );
+}
+
+#[test]
+fn merged_as_multiple_commit_matches_emits_diagnostic_not_guess() {
+    // Two Commit records claim the SAME sha as PR #10's merge_commit_sha.
+    let tmp = TempDir::new().unwrap();
+    let code_graph = tmp.path().join("code.jsonl");
+    std::fs::write(
+        &code_graph,
+        commit_seed(&[
+            "mergeaaa1111111111111111111111111111111a",
+            "mergeaaa1111111111111111111111111111111a",
+        ]),
+    )
+    .unwrap();
+
+    let server = MockServer::start(six_pr_routes());
+    let out = tmp.path().join("graph.jsonl");
+    let state = tmp.path().join("state.json");
+    let (jsonl, _, ok) = run_import(
+        &server.base_url,
+        &out,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok);
+
+    // Ambiguous SHA → no MERGED_AS edge for #10, a diagnostic instead.
+    let pr10_id = pr_task(&jsonl, 10)["id"].as_str().unwrap().to_owned();
+    let edge_for_10 = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|v| v["label"] == "MERGED_AS" && v["source"] == pr10_id.as_str());
+    assert!(!edge_for_10, "ambiguous merge commit must not be guessed");
+    let ambiguous = nodes_of_kind(&jsonl, "Diagnostic").into_iter().any(|d| {
+        d["summary"]
+            .as_str()
+            .unwrap_or("")
+            .contains("github_commit_unresolved")
+            && d["summary"].as_str().unwrap_or("").contains(&pr10_id)
+    });
+    assert!(
+        ambiguous,
+        "multiple matches emit a github_commit_unresolved Diagnostic"
+    );
+}
+
+#[test]
+fn pr_promoted_fields_survive_redaction_on_export() {
+    // Redaction is always on in the importer; the six PR fields are plaintext
+    // substrate and must survive verbatim (never routed through redaction).
+    let server = MockServer::start(six_pr_routes());
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("graph.jsonl");
+    let state = tmp.path().join("state.json");
+    let (jsonl, _, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok);
+
+    let pr10 = pr_task(&jsonl, 10);
+    assert_eq!(
+        pr10["head_sha"], "headsha000000000000000000000000000000a10",
+        "head_sha survives redaction-on export as plaintext"
+    );
+    assert_eq!(
+        pr10["merge_commit_sha"], "mergeaaa1111111111111111111111111111111a",
+        "merge_commit_sha survives redaction-on export as plaintext"
+    );
+    assert!(
+        !jsonl.contains("<REDACTED:")
+            || (pr10["head_sha"] == "headsha000000000000000000000000000000a10"),
+        "PR SHA fields are never redaction markers"
+    );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn pr_promoted_fields_survive_embedded_inspect_roundtrip() {
+    let server = MockServer::start(six_pr_routes());
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("graph.jsonl");
+    let state = tmp.path().join("state.json");
+    let (_jsonl, _, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok);
+
+    let data_dir = tmp.path().join("store");
+    let ingest = egregore()
+        .args([
+            "ingest",
+            out.to_str().unwrap(),
+            "--adapter",
+            "embedded",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("ingest embedded");
+    assert!(
+        ingest.status.success(),
+        "embedded ingest of PR tasks should succeed: {}",
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+
+    let inspect = egregore()
+        .args(["inspect", "--data-dir", data_dir.to_str().unwrap()])
+        .output()
+        .expect("inspect data-dir");
+    assert!(inspect.status.success());
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    let report: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().unwrap_or("{}")).expect("inspect JSON");
+    // Zero unknown (domain, kind, schema_version) tuples.
+    assert_eq!(
+        report["unknown_schema_versions"]
+            .as_object()
+            .map_or(0, serde_json::Map::len),
+        0,
+        "no unknown schema versions: {report}"
+    );
+    // The six PR Tasks are counted under the (project, Task, 1) tuple.
+    assert_eq!(
+        report["schema_versions"]["project:Task:1"], 6,
+        "six PR Tasks under project:Task:1: {report}"
+    );
+}

@@ -158,6 +158,9 @@ pub fn pull_hash(pr: &model::PullRequest) -> String {
         "merged_at": pr.merged_at,
         "draft": pr.draft,
         "head_sha": pr.head.as_ref().map(|h| &h.sha),
+        // head_ref is now a first-class flat Task field (#333), so a branch
+        // rename with every other field unchanged must force re-emission.
+        "head_ref": pr.head.as_ref().map(|h| &h.ref_name),
         "base_ref": pr.base.as_ref().map(|b| &b.ref_name),
         // merge_commit_sha is persisted in the task body blob, so it must be in
         // the change hash — GitHub may rewrite it after finalizing a merge while

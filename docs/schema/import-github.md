@@ -315,7 +315,7 @@ follow-up slice that promotes them from reserved.
 | GitHub Resource | v1 Emission |
 |-----------------|------------|
 | Issue | `Task + ExternalLink` only (`source_kind: github_issue`). GitHub-only metadata (`state_reason`, `milestone`, etc.) stored in `Task.body_handle` for round-trip fidelity; `GitHubIssue` deferred. `Task.priority` defaults to `unknown` (GitHub issues have no native priority field; a future label-mapping rule may override this). |
-| Pull Request | `Task + ExternalLink` only (`source_kind: github_pr`). PR-specific fields deferred to `PR` record promotion. `Task.priority` defaults to `unknown`. |
+| Pull Request | `Task + ExternalLink` (`source_kind: github_pr`). Six PR-specific fields are promoted to first-class **optional flat `Task` fields** (issue #333): `head_sha`, `head_ref`, `base_ref`, `merge_commit_sha`, `merged_at`, `draft`. Present only on PR-derived Tasks; issue Tasks omit them (serde-skipped). They are additive plaintext query substrate (see §8) and continue to also appear inside `Task.body_handle` for round-trip fidelity, so pre-#333 body-blob readers are unaffected. A merged PR whose `merge_commit_sha` resolves against a seeded `--code-graph` `Commit` also emits a `MERGED_AS` `Task → Commit` edge (resolve-or-diagnose, below). Remaining PR-only fields (requested reviewers, `mergeable_state`, …) stay deferred to `PR` record promotion. `Task.priority` defaults to `unknown`. Downstream consumers: issues #334 (compliance/evidence surfaces) and #338 build directly on this exact field schema. |
 | Issue Comment | **Deferred.** Comment endpoints are still fetched and ETag-cached; records emitted when `Review` is promoted. |
 | PR Review | **Deferred.** Same rationale as issue comments. |
 | PR Review Comment | **Deferred.** Same rationale. `REFERENCES_TASK` from `project.Review` and `TOUCHED_FILE` from `project.Review` must also be registered in `project-graph.md` before emission. |
@@ -325,6 +325,24 @@ edge registrations must be added to the cross-domain edge table in
 [`docs/schema/project-graph.md`](project-graph.md):
 - `REFERENCES_TASK` from `project.Review` TO `project.Task` (extends the existing registration to add `project.Review` alongside the `agent_memory` FROM kinds)
 - `TOUCHES_FILE` from `project.Review` TO `codegraph.File` (extends the existing registration to add `project.Review` alongside the `project.Task` FROM kind)
+
+**`MERGED_AS` edge (issue #333):** A PR `Task` whose promoted `merge_commit_sha`
+resolves against a seeded `--code-graph` is linked to the merge commit it landed
+as.
+
+| Label | FROM | TO | Meaning |
+|-------|------|----|---------|
+| `MERGED_AS` | `project.Task` (`source_kind: github_pr`) | `codegraph.Commit` | The PR was merged as this specific commit. |
+
+Resolution is **resolve-or-diagnose** (mirroring the `TOUCHES_FILE` discipline):
+a `merge_commit_sha` matching **exactly one** `Commit` (whose `name` equals the
+SHA) emits one `MERGED_AS` edge; **zero or multiple** matches emit a project
+`Diagnostic` node with code `github_commit_unresolved` carrying the SHA and the
+Task record ID — never a guessed link. A PR with no `merge_commit_sha`
+(open/draft/closed-unmerged) emits neither edge nor diagnostic. Without a seeded
+`--code-graph`, no `MERGED_AS` edges and no unresolved diagnostics are produced.
+`MERGED_AS` is a project-only, evidence-class edge label: it is rejected on
+`agent_memory:v1:` edges, exactly like `TOUCHES_FILE` and `EXTERNAL_HANDLE`.
 
 **`valid_time_source`:** All GitHub-sourced records use `github_updated_at`.
 **`source_kind`:** Issues use `github_issue`; PRs use `github_pr`.
@@ -376,6 +394,16 @@ These GitHub fields pass through the redaction pipeline defined in
 
 Repo name, issue/PR number, state, author login, `created_at`, `updated_at`,
 `closed_at`, merge commit SHA, head/base branch names.
+
+**First-class plaintext PR `Task` fields (issue #333):** The six promoted flat
+`Task` fields — `head_sha`, `head_ref`, `base_ref`, `merge_commit_sha`,
+`merged_at`, and `draft` — are permitted plaintext query substrate and are
+**deliberately NOT routed through the redaction pipeline**. They are not listed
+in the sensitive-field index (`docs/schema/redaction.md`) and therefore pass the
+redaction gate unchanged: a commit SHA, branch name, merge timestamp, or draft
+flag is non-secret structural metadata that must remain joinable and citable.
+They survive verbatim in a redaction-on export. Downstream consumers #334
+(compliance/evidence) and #338 rely on this plaintext guarantee.
 
 **Redacted body-stored metadata:** Milestone title (`Task.body_handle` field) is
 NOT in the plaintext carve-out. `Task.body_handle.inline` is a redactable field

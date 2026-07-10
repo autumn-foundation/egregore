@@ -2661,6 +2661,7 @@ const PROJECT_EDGE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::OwnedByTask,
     EdgeLabel::ExternalHandle,
     EdgeLabel::TouchesFile,
+    EdgeLabel::MergedAs,
     EdgeLabel::MentionsSymbol,
 ];
 
@@ -3417,6 +3418,16 @@ fn validate_project_edge(
                 &[NodeKind::Task],
                 target_kind,
                 &[NodeKind::File],
+            )?;
+        }
+        EdgeLabel::MergedAs => {
+            validate_project_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                &[NodeKind::Task],
+                target_kind,
+                &[NodeKind::Commit],
             )?;
         }
         EdgeLabel::MentionsSymbol => {
@@ -4188,7 +4199,8 @@ pub fn validate_agent_memory_record_for_cli(
                 EdgeLabel::ClosesAcceptanceCriterion
                 | EdgeLabel::OwnedByTask
                 | EdgeLabel::ExternalHandle
-                | EdgeLabel::TouchesFile => {
+                | EdgeLabel::TouchesFile
+                | EdgeLabel::MergedAs => {
                     anyhow::bail!(
                         "evidence link relation '{}' is project-only and must be written as a project edge",
                         edge_label.as_str()
@@ -6399,6 +6411,7 @@ fn validate_agent_memory_edge_endpoints(
             | EdgeLabel::OwnedByTask
             | EdgeLabel::ExternalHandle
             | EdgeLabel::TouchesFile
+            | EdgeLabel::MergedAs
     ) {
         return Err(ApiError::bad_request(format!(
             "agent-memory edge '{edge_id}' label '{}' is project-only; use a project:v1: edge",
@@ -6929,7 +6942,8 @@ fn validate_and_synthesize_evidence_edges(
                         EdgeLabel::ClosesAcceptanceCriterion
                         | EdgeLabel::OwnedByTask
                         | EdgeLabel::ExternalHandle
-                        | EdgeLabel::TouchesFile => {
+                        | EdgeLabel::TouchesFile
+                        | EdgeLabel::MergedAs => {
                             return Err(ApiError::bad_request(format!(
                                 "evidence link relation '{}' is project-only and must be written as a project edge",
                                 edge_label.as_str()

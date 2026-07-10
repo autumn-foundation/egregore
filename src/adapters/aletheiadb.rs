@@ -1843,6 +1843,12 @@ impl EmbeddedAletheiaSink {
             parent_task_id,
             ordinal,
             verification_link_id,
+            head_sha,
+            head_ref,
+            base_ref,
+            merge_commit_sha,
+            merged_at,
+            draft,
             system,
             url,
             system_native_id,
@@ -1965,6 +1971,15 @@ impl EmbeddedAletheiaSink {
             "verification_link_id",
             verification_link_id.as_deref(),
         );
+        // GitHub PR-promoted flat Task fields (issue #333). Plaintext substrate.
+        builder = insert_optional(builder, "head_sha", head_sha.as_deref());
+        builder = insert_optional(builder, "head_ref", head_ref.as_deref());
+        builder = insert_optional(builder, "base_ref", base_ref.as_deref());
+        builder = insert_optional(builder, "merge_commit_sha", merge_commit_sha.as_deref());
+        builder = insert_optional(builder, "merged_at", merged_at.as_deref());
+        if let Some(value) = draft {
+            builder = builder.insert("draft", if *value { "true" } else { "false" });
+        }
         builder = insert_optional(builder, "system", system.as_deref());
         builder = insert_optional(builder, "url", url.as_deref());
         builder = insert_optional(builder, "system_native_id", system_native_id.as_deref());
@@ -2774,6 +2789,23 @@ impl EmbeddedAletheiaSink {
                 "verification_link_id",
                 node.get_property("verification_link_id"),
             )?,
+            // GitHub PR-promoted flat Task fields (issue #333).
+            head_sha: optional_str_property(record_id, "head_sha", node.get_property("head_sha"))?,
+            head_ref: optional_str_property(record_id, "head_ref", node.get_property("head_ref"))?,
+            base_ref: optional_str_property(record_id, "base_ref", node.get_property("base_ref"))?,
+            merge_commit_sha: optional_str_property(
+                record_id,
+                "merge_commit_sha",
+                node.get_property("merge_commit_sha"),
+            )?,
+            merged_at: optional_str_property(
+                record_id,
+                "merged_at",
+                node.get_property("merged_at"),
+            )?,
+            draft: optional_str_property(record_id, "draft", node.get_property("draft"))?
+                .as_deref()
+                .map(|s| s == "true"),
             system: optional_str_property(record_id, "system", node.get_property("system"))?,
             url: optional_str_property(record_id, "url", node.get_property("url"))?,
             system_native_id: optional_str_property(
@@ -4367,6 +4399,74 @@ mod tests {
                 && tx_stamps.contains("2026-01-03T00:00:00Z"),
             "both prior and current transaction times must be present, got {tx_stamps:?}"
         );
+    }
+
+    /// Issue #333: the six PR-promoted flat `Task` fields survive an embedded
+    /// write/read round-trip verbatim (draft as bool; the rest as strings).
+    #[test]
+    fn pr_promoted_task_fields_survive_embedded_round_trip() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("pr-fields-store");
+        let mut task = GraphRecord::node(
+            "project:v1:pr-333-task".to_owned(),
+            NodeKind::Task,
+            None,
+            None,
+            Some("Promote PR fields".to_owned()),
+            "github_pr #333".to_owned(),
+        );
+        if let GraphRecord::Node {
+            schema_version,
+            domain,
+            source_kind,
+            head_sha,
+            head_ref,
+            base_ref,
+            merge_commit_sha,
+            merged_at,
+            draft,
+            ..
+        } = &mut task
+        {
+            *schema_version = crate::ir::PROJECT_SCHEMA_VERSION;
+            *domain = Some("project".to_owned());
+            *source_kind = Some("github_pr".to_owned());
+            *head_sha = Some("headsha333".to_owned());
+            *head_ref = Some("feature-333".to_owned());
+            *base_ref = Some("main".to_owned());
+            *merge_commit_sha = Some("mergesha333".to_owned());
+            *merged_at = Some("2026-07-10T00:00:00Z".to_owned());
+            *draft = Some(true);
+        }
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&task).expect("task should write");
+        sink.persist_indexes().expect("indexes should persist");
+        drop(sink);
+
+        let reopened = EmbeddedAletheiaSink::open(&data_dir).expect("store should reopen");
+        let records = reopened.read_all_records().expect("read back");
+        let GraphRecord::Node {
+            head_sha,
+            head_ref,
+            base_ref,
+            merge_commit_sha,
+            merged_at,
+            draft,
+            ..
+        } = records
+            .iter()
+            .find(|r| r.id() == "project:v1:pr-333-task")
+            .expect("PR task read back")
+        else {
+            panic!("read-back record should be a node");
+        };
+        assert_eq!(head_sha.as_deref(), Some("headsha333"));
+        assert_eq!(head_ref.as_deref(), Some("feature-333"));
+        assert_eq!(base_ref.as_deref(), Some("main"));
+        assert_eq!(merge_commit_sha.as_deref(), Some("mergesha333"));
+        assert_eq!(merged_at.as_deref(), Some("2026-07-10T00:00:00Z"));
+        assert_eq!(*draft, Some(true));
     }
 
     #[test]

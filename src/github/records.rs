@@ -39,6 +39,12 @@ const INLINE_CEILING: usize = 16 * 1024;
 /// claim it. A path with more than one ID is ambiguous and is not linked.
 pub type FileIndex = BTreeMap<String, Vec<String>>;
 
+/// Index from commit SHA to the code-graph `Commit` record IDs that carry it.
+///
+/// Issue #333. A SHA with zero or more than one match is unresolved and is
+/// diagnosed rather than linked (`MERGED_AS` resolve-or-diagnose discipline).
+pub type CommitIndex = BTreeMap<String, Vec<String>>;
+
 /// A redaction closure applied to free-text before persistence.
 pub type Redact<'a> = dyn Fn(&str) -> String + 'a;
 
@@ -53,6 +59,9 @@ pub struct Context<'a> {
     /// Code-graph file index for `TOUCHES_FILE` resolution; empty when no
     /// seeded store was provided.
     pub file_index: &'a FileIndex,
+    /// Code-graph commit index for `MERGED_AS` resolution (issue #333); empty
+    /// when no seeded store was provided.
+    pub commit_index: &'a CommitIndex,
 }
 
 /// Records and diagnostics emitted for one or more GitHub resources.
@@ -187,6 +196,29 @@ fn body_blob(
 
 // ── Issue / PR → Task + ExternalLink ───────────────────────────────────────────
 
+/// GitHub PR fields promoted to first-class flat `Task` fields (issue #333).
+///
+/// Set only on the PR path; issue Tasks pass `None` so serde skips them. These
+/// are plaintext query substrate per `docs/schema/import-github.md` §8 and are
+/// never routed through redaction. They duplicate (rather than replace) the
+/// values still carried in the redacted `body_handle` blob, so existing readers
+/// are unaffected.
+#[derive(Debug, Clone, Default)]
+pub struct PrTaskFields {
+    /// Head (source-branch) commit SHA.
+    pub head_sha: Option<String>,
+    /// Head (source-branch) ref name.
+    pub head_ref: Option<String>,
+    /// Base (target-branch) ref name.
+    pub base_ref: Option<String>,
+    /// Merge commit SHA; `Some` only when merged.
+    pub merge_commit_sha: Option<String>,
+    /// Merge timestamp string; `Some` means merged.
+    pub merged_at: Option<String>,
+    /// Draft flag.
+    pub draft: Option<bool>,
+}
+
 /// Emits the `Task`, `ExternalLink`, and `EXTERNAL_HANDLE` edge for one issue.
 #[must_use]
 pub fn issue_records(ctx: &Context<'_>, issue: &model::Issue) -> Emitted {
@@ -218,15 +250,30 @@ pub fn issue_records(ctx: &Context<'_>, issue: &model::Issue) -> Emitted {
             None,
             issue.closed_at.as_deref(),
         ),
+        None,
     )
 }
 
 /// Emits the `Task`, `ExternalLink`, and `EXTERNAL_HANDLE` edge for one PR.
+///
+/// Also emits a `MERGED_AS` edge (or `github_commit_unresolved` diagnostic) when
+/// the PR's `merge_commit_sha` resolves against a seeded code graph (issue #333).
 #[must_use]
 pub fn pull_records(ctx: &Context<'_>, pr: &model::PullRequest) -> Emitted {
     let number = pr.number;
     let native = format!("pr:{number}");
-    task_and_link(
+    // Promote the PR-only fields to first-class flat Task fields (#333). These
+    // duplicate the values still carried in `body_blob`, which is left
+    // unchanged so existing body-blob readers are unaffected (AC3).
+    let pr_fields = PrTaskFields {
+        head_sha: pr.head.as_ref().map(|h| h.sha.clone()),
+        head_ref: pr.head.as_ref().map(|h| h.ref_name.clone()),
+        base_ref: pr.base.as_ref().map(|b| b.ref_name.clone()),
+        merge_commit_sha: pr.merge_commit_sha.clone(),
+        merged_at: pr.merged_at.clone(),
+        draft: Some(pr.draft),
+    };
+    let mut emitted = task_and_link(
         ctx,
         NodeKind::Task,
         SOURCE_KIND_PR,
@@ -252,7 +299,94 @@ pub fn pull_records(ctx: &Context<'_>, pr: &model::PullRequest) -> Emitted {
             pr.merge_commit_sha.as_deref(),
             pr.closed_at.as_deref(),
         ),
-    )
+        Some(pr_fields),
+    );
+
+    // MERGED_AS resolve-or-diagnose against the seeded code graph (#333).
+    if let Some(sha) = pr.merge_commit_sha.as_deref().filter(|s| !s.is_empty()) {
+        let task_id = task_id_for(ctx, "pr", number);
+        if let Some(extra) = resolve_merge_commit(ctx, &task_id, number, sha) {
+            emitted.records.push(extra.0);
+            if extra.1 {
+                emitted.link_diagnostics += 1;
+            }
+        }
+    }
+    emitted
+}
+
+/// Resolves a PR's `merge_commit_sha` to a `MERGED_AS` edge, or a diagnostic.
+///
+/// Returns `(record, is_diagnostic)`: exactly one matching `Commit` yields the
+/// `MERGED_AS` Task→Commit edge; zero or multiple matches yield a
+/// `github_commit_unresolved` project `Diagnostic`. An empty commit index (no
+/// seeded code graph) resolves to `None` — no edge, no diagnostic.
+fn resolve_merge_commit(
+    ctx: &Context<'_>,
+    task_id: &str,
+    number: u64,
+    sha: &str,
+) -> Option<(GraphRecord, bool)> {
+    if ctx.commit_index.is_empty() {
+        return None;
+    }
+    match ctx.commit_index.get(sha).map(Vec::as_slice) {
+        Some([commit_id]) => {
+            let edge = GraphRecord::edge(
+                EdgeLabel::MergedAs,
+                task_id.to_owned(),
+                commit_id.clone(),
+                None,
+                format!("PR #{number} merged as commit {sha}"),
+            );
+            Some((edge, false))
+        }
+        Some(ids) if ids.len() > 1 => Some((
+            commit_diagnostic(
+                ctx,
+                number,
+                sha,
+                task_id,
+                &format!("{} code-graph Commit records claim this SHA", ids.len()),
+            ),
+            true,
+        )),
+        // None or empty slice → unresolved (no matching Commit in the seed).
+        _ => Some((
+            commit_diagnostic(
+                ctx,
+                number,
+                sha,
+                task_id,
+                "no code-graph Commit record matches this SHA in the seeded store",
+            ),
+            true,
+        )),
+    }
+}
+
+/// Builds a project-domain `Diagnostic` node for an unresolved merge commit
+/// (`github_commit_unresolved`), carrying the SHA and Task record ID (#333).
+fn commit_diagnostic(
+    ctx: &Context<'_>,
+    number: u64,
+    sha: &str,
+    task_id: &str,
+    detail: &str,
+) -> GraphRecord {
+    let code = "github_commit_unresolved";
+    let native = format!("pr:{number}");
+    let id = project_stable_id(&["project", "Diagnostic", IMPORTER_ID, &native, code, sha]);
+    let mut rec = GraphRecord::node(
+        id.clone(),
+        NodeKind::Diagnostic,
+        None,
+        None,
+        None,
+        format!("[{code}] {detail}; merge_commit_sha='{sha}' task='{task_id}'"),
+    );
+    set_common(&mut rec, &id, ctx.transaction_time, ctx);
+    rec
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -270,6 +404,7 @@ fn task_and_link(
     assignees: &[model::User],
     author: Option<&str>,
     body_handle: Box<OutputHandle>,
+    pr_fields: Option<PrTaskFields>,
 ) -> Emitted {
     let number_s = number.to_string();
     let task_id = project_stable_id(&["project", "Task", ctx.source_repo, &number_s, native_id]);
@@ -305,6 +440,12 @@ fn task_and_link(
         labels: lbl,
         priority,
         author: au,
+        head_sha: hs,
+        head_ref: hr,
+        base_ref: br,
+        merge_commit_sha: mcs,
+        merged_at: ma,
+        draft: dr,
         ..
     } = &mut task
     {
@@ -317,6 +458,16 @@ fn task_and_link(
         *lbl = Some(labels.iter().map(|l| (ctx.redact)(&l.name)).collect());
         *priority = Some("unknown".to_owned());
         *au = author.map(str::to_owned);
+        // PR-promoted plaintext fields (#333); absent on issue Tasks. Never
+        // routed through redaction (see `docs/schema/import-github.md` §8).
+        if let Some(pf) = pr_fields {
+            *hs = pf.head_sha;
+            *hr = pf.head_ref;
+            *br = pf.base_ref;
+            *mcs = pf.merge_commit_sha;
+            *ma = pf.merged_at;
+            *dr = pf.draft;
+        }
     }
 
     // ── ExternalLink node ────────────────────────────────────────────────────────
@@ -673,12 +824,15 @@ pub fn merge(parts: impl IntoIterator<Item = Emitted>) -> Emitted {
 mod tests {
     use super::*;
 
+    static EMPTY_COMMIT_INDEX: std::sync::OnceLock<CommitIndex> = std::sync::OnceLock::new();
+
     fn ctx<'a>(repo: &'a str, idx: &'a FileIndex, redact: &'a Redact<'a>) -> Context<'a> {
         Context {
             source_repo: repo,
             transaction_time: "2026-01-01T00:00:00Z",
             redact,
             file_index: idx,
+            commit_index: EMPTY_COMMIT_INDEX.get_or_init(CommitIndex::new),
         }
     }
 

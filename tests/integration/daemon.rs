@@ -4328,6 +4328,7 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::OwnedByTask
         | EdgeLabel::ExternalHandle
         | EdgeLabel::TouchesFile
+        | EdgeLabel::MergedAs
         | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange
         | EdgeLabel::ReferencesTask
@@ -5151,6 +5152,77 @@ fn agent_memory_edges_reject_user_context_only_labels() {
             .as_str()
             .is_some_and(|message| message.contains("user-context-only")),
         "error should explain that the label is user-context-only, got {body}"
+    );
+
+    daemon.stop();
+}
+
+/// Issue #333: `MERGED_AS` is a project-only edge label (Task→Commit). An
+/// agent-memory edge that carries it must be rejected, exactly like every other
+/// project-only label (`TOUCHES_FILE`, `EXTERNAL_HANDLE`, ...).
+#[test]
+fn agent_memory_edges_reject_merged_as_label() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_memory_nodes(
+        &data_dir,
+        &[
+            (
+                "agent_memory:v1:merged-as-label-source",
+                NodeKind::AgentSession,
+                "session-a",
+                "AgentSession used as malformed edge source.",
+            ),
+            (
+                "agent_memory:v1:merged-as-label-target",
+                NodeKind::AgentTurn,
+                "session-a",
+                "AgentTurn used as malformed edge target.",
+            ),
+        ],
+    );
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "agent-memory-merged-as-label-edge",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "agent-memory-merged-as-label-edge",
+            "domain": "agent_memory",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "edge",
+                    "id": "agent_memory:v1:malformed-merged-as-edge",
+                    "schema_version": AGENT_MEMORY_SCHEMA_VERSION,
+                    "label": "MERGED_AS",
+                    "source": "agent_memory:v1:merged-as-label-source",
+                    "target": "agent_memory:v1:merged-as-label-target",
+                    "summary": "Malformed project-only relation in agent-memory edge envelope"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "agent-memory edge should reject the project-only MERGED_AS label, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "project-only agent-memory edge should fail with bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("project-only")),
+        "error should explain that the label is project-only, got {body}"
     );
 
     daemon.stop();

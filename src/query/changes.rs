@@ -210,6 +210,21 @@ pub struct ContextLinkedItem<'a> {
     pub verification_record: Option<Box<Self>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<&'a str>,
+    // GitHub PR-promoted flat Task fields (issue #333; consumed by #334/#338).
+    // Plaintext substrate — surfaced verbatim by both the plain and redacted
+    // builders (never routed through redaction).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_ref: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_commit_sha: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft: Option<bool>,
 }
 
 /// Returns a copy of an `OutputHandle` with the `inline` payload stripped,
@@ -362,6 +377,12 @@ pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>
         body_handle,
         evidence_links,
         author,
+        head_sha,
+        head_ref,
+        base_ref,
+        merge_commit_sha,
+        merged_at,
+        draft,
         ..
     } = record
     else {
@@ -404,6 +425,12 @@ pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
         verification_record: None,
         author: author.as_deref(),
+        head_sha: head_sha.as_deref(),
+        head_ref: head_ref.as_deref(),
+        base_ref: base_ref.as_deref(),
+        merge_commit_sha: merge_commit_sha.as_deref(),
+        merged_at: merged_at.as_deref(),
+        draft: *draft,
     })
 }
 
@@ -444,6 +471,12 @@ pub fn redacted_context_linked_item(record: &GraphRecord) -> Option<ContextLinke
         author,
         agent_id,
         session_id,
+        head_sha,
+        head_ref,
+        base_ref,
+        merge_commit_sha,
+        merged_at,
+        draft,
         ..
     } = record
     else {
@@ -493,6 +526,13 @@ pub fn redacted_context_linked_item(record: &GraphRecord) -> Option<ContextLinke
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
         verification_record: None,
         author: author.as_deref(),
+        // Plaintext substrate; surfaced verbatim even in the redacted builder.
+        head_sha: head_sha.as_deref(),
+        head_ref: head_ref.as_deref(),
+        base_ref: base_ref.as_deref(),
+        merge_commit_sha: merge_commit_sha.as_deref(),
+        merged_at: merged_at.as_deref(),
+        draft: *draft,
     })
 }
 
