@@ -1484,6 +1484,146 @@ fn upgrading_state_format_forces_one_pulls_refresh_then_idempotent() {
     );
 }
 
+/// Route table for one MERGED PR (#30) carrying a real `merge_commit_sha`, with
+/// an overridable pulls `ETag` so a re-import can force the pulls list to
+/// re-fetch (200) while the PR payload stays byte-identical. Used to exercise the
+/// PR-resource `is_unchanged` change-detection gate independently of the pulls
+/// `ETag`/304 gate (issue #333, Codex round-4).
+fn one_merged_pr_routes(pulls_etag: &str) -> HashMap<String, Canned> {
+    let pulls = serde_json::json!([
+        {
+            "number": 30, "title":"Merged PR","body":"PR body.",
+            "state":"closed","draft":false,"labels":[],"assignees":[],
+            "user":{"login":"dev"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z",
+            "merged_at":"2026-01-02T00:00:00Z","closed_at":"2026-01-02T00:00:00Z",
+            "head":{"ref":"feature-x","sha":"headsha000000000000000000000000000000x30"},
+            "base":{"ref":"main","sha":"basesha000000000000000000000000000000b30"},
+            "merge_commit_sha":"merge30000000000000000000000000000000030",
+            "html_url":"https://github.com/o/r/pull/30"
+        }
+    ])
+    .to_string();
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/repos/o/r".to_owned(),
+        Canned::ok("{\"full_name\":\"o/r\"}", "\"repo\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues?state=all&per_page=100".to_owned(),
+        Canned::ok("[]", "\"issues-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, pulls_etag),
+    );
+    routes.insert(
+        "/repos/o/r/labels?per_page=100".to_owned(),
+        Canned::ok("[]", "\"labels-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"ic-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"prc-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/30/reviews?per_page=100".to_owned(),
+        Canned::ok("[]", "\"prr-30\""),
+    );
+    routes
+}
+
+#[test]
+fn seeded_code_graph_change_re_emits_merge_link_then_stays_idempotent() {
+    // Issue #333, Codex round-4: when a repo already has current importer state
+    // and the PR payload is unchanged, the PR-resource `is_unchanged` gate must
+    // still re-run merge-link resolution when the seed graph changes. Reported
+    // broken flow: import GitHub first WITHOUT `--code-graph` (or before the
+    // merge commit is in the code graph), then re-import WITH a seeded code graph
+    // that now contains the merge commit — the MERGED_AS edge never appeared
+    // because `pull_hash` did not depend on `ctx.commit_index`. Folding the
+    // resolution outcome into the PR change-detection hash re-emits the edge on a
+    // changed seed graph; an unchanged seed keeps re-imports idempotent (AC8).
+    //
+    // The pulls `ETag` is bumped between runs so the pulls list re-fetches (200)
+    // while PR #30's payload stays byte-identical — this isolates the
+    // change-detection hash gate from the pulls `ETag`/304 gate.
+    let sha = "merge30000000000000000000000000000000030";
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+    let code_graph = tmp.path().join("code.jsonl");
+    std::fs::write(&code_graph, commit_seed(&[sha])).unwrap();
+
+    let server = MockServer::start(one_merged_pr_routes("\"pulls-v1\""));
+
+    // 1. First import WITHOUT `--code-graph`: the merge SHA cannot resolve, so no
+    //    MERGED_AS edge. State persists the pr:30 change hash (marker "none").
+    let out1 = tmp.path().join("graph1.jsonl");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    assert_eq!(
+        edges_of_label(&j1, "MERGED_AS"),
+        0,
+        "no MERGED_AS without a seeded code graph"
+    );
+
+    // 2. Re-import the SAME unchanged PR payload but now WITH a seeded code graph
+    //    containing a Commit whose SHA == merge_commit_sha. The pulls list
+    //    re-fetches (bumped ETag → 200) but PR #30's payload is byte-identical.
+    //    Before the fix the unchanged-hash gate suppresses the new resolution and
+    //    NO MERGED_AS edge is emitted; this assertion FAILS against pre-fix code.
+    server.set_routes(one_merged_pr_routes("\"pulls-v2\""));
+    let out2 = tmp.path().join("graph2.jsonl");
+    let (j2, _, ok2) = run_import(
+        &server.base_url,
+        &out2,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok2);
+    assert_eq!(
+        edges_of_label(&j2, "MERGED_AS"),
+        1,
+        "a seed graph that newly resolves the merge SHA must re-emit the MERGED_AS edge"
+    );
+    let pr30_id = pr_task(&j2, 30)["id"].as_str().unwrap().to_owned();
+    let linked = j2
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|v| {
+            v["label"] == "MERGED_AS"
+                && v["source"] == pr30_id.as_str()
+                && v["target"] == "codegraph:v5:commit-0"
+        });
+    assert!(linked, "MERGED_AS links PR #30 to the seeded Commit");
+
+    // 3. Re-import a THIRD time with the SAME seed graph and unchanged PR. The
+    //    resolution outcome is identical, so the hash is unchanged and ZERO
+    //    per-resource records re-emit — no duplicate MERGED_AS (AC8 preserved).
+    server.set_routes(one_merged_pr_routes("\"pulls-v3\""));
+    let out3 = tmp.path().join("graph3.jsonl");
+    let (j3, _, ok3) = run_import(
+        &server.base_url,
+        &out3,
+        &state,
+        &["--code-graph", code_graph.to_str().unwrap()],
+    );
+    assert!(ok3);
+    assert_eq!(
+        nodes_of_kind(&j3, "Task").len(),
+        0,
+        "AC8: unchanged PR + unchanged seed re-emits no Task: {j3}"
+    );
+    assert_eq!(
+        edges_of_label(&j3, "MERGED_AS"),
+        0,
+        "AC8: no duplicate MERGED_AS on an unchanged re-import"
+    );
+}
+
 /// Route table for one OPEN PR (#20, `merged_at: null`) whose REST payload still
 /// carries a `merge_commit_sha` — GitHub's temporary TEST-MERGE commit for a
 /// mergeable-but-unmerged PR. The importer must treat this SHA as *not* merge

@@ -155,7 +155,12 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             advance_watermark(&mut watermark, &pr.updated_at);
             changed_pr_numbers.push(pr.number);
             let key = format!("pr:{}", pr.number);
-            let hash = state::pull_hash(&pr);
+            // The MERGED_AS resolution outcome against the seeded code graph
+            // participates in the change hash (#333, Codex round-4): a changed
+            // seed graph that now resolves this PR's merge_commit_sha must
+            // re-emit the merge edge even though the PR payload is unchanged.
+            let merge_marker = records::merge_resolution_marker(ctx.commit_index, &pr);
+            let hash = state::pull_hash(&pr, &merge_marker);
             if state.is_unchanged(&key, &hash) {
                 continue;
             }

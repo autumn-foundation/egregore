@@ -153,8 +153,17 @@ pub fn issue_hash(issue: &model::Issue) -> String {
 }
 
 /// Computes the content hash of a PR's emission-affecting key fields (§5).
+///
+/// `merge_link_marker` is the PR's `MERGED_AS` resolution outcome against the
+/// current seeded code graph (see [`crate::github::records::merge_resolution_marker`]).
+/// It participates in the change hash (issue #333, Codex round-4) because the
+/// merge-link output depends on the seed graph while the PR payload does not: a
+/// seed graph that newly resolves this PR's `merge_commit_sha` must re-emit the
+/// `MERGED_AS` edge even though the payload is unchanged, and an unchanged seed
+/// must stay idempotent (AC8). This affects only change detection — never the
+/// stable record identity ([`crate::ir::project_stable_id`]).
 #[must_use]
-pub fn pull_hash(pr: &model::PullRequest) -> String {
+pub fn pull_hash(pr: &model::PullRequest, merge_link_marker: &str) -> String {
     let key = serde_json::json!({
         "number": pr.number,
         "state": pr.state,
@@ -176,6 +185,9 @@ pub fn pull_hash(pr: &model::PullRequest) -> String {
         // the change hash — GitHub may rewrite it after finalizing a merge while
         // every other field is unchanged.
         "merge_commit_sha": pr.merge_commit_sha,
+        // MERGED_AS resolution outcome against the seeded code graph (#333,
+        // Codex round-4): a changed seed graph re-emits the merge edge.
+        "merge_link": merge_link_marker,
     });
     blake3::hash(serde_json::to_string(&key).unwrap_or_default().as_bytes())
         .to_hex()
@@ -335,9 +347,29 @@ mod tests {
         a.merge_commit_sha = Some("aaaa".to_owned());
         b.merge_commit_sha = Some("bbbb".to_owned());
         assert_ne!(
-            pull_hash(&a),
-            pull_hash(&b),
+            pull_hash(&a, "none"),
+            pull_hash(&b, "none"),
             "merge_commit_sha must affect the change hash"
+        );
+    }
+
+    #[test]
+    fn pull_hash_changes_when_merge_link_marker_changes() {
+        // Issue #333, Codex round-4: an unchanged PR payload against a seed graph
+        // that newly resolves its merge_commit_sha must produce a different change
+        // hash so the MERGED_AS edge is re-emitted; an unchanged marker stays
+        // idempotent.
+        let p = pull(1);
+        let unseeded = pull_hash(&p, "none");
+        let resolved = pull_hash(&p, "resolved:codegraph:v5:commit-0");
+        assert_ne!(
+            unseeded, resolved,
+            "a changed merge-link resolution outcome must change the hash"
+        );
+        assert_eq!(
+            resolved,
+            pull_hash(&p, "resolved:codegraph:v5:commit-0"),
+            "an unchanged marker keeps the hash stable (AC8)"
         );
     }
 }

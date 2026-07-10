@@ -225,8 +225,19 @@ state. `resource_hashes` provides that storage: it maps `"issue:<n>"` or
 (**all fields that can affect the emitted `Task` or `ExternalLink`:**
 `number`, `state`, `state_reason`, `title`, `body`, `labels`, `assignees`,
 `milestone` (full object), `updated_at`, `closed_at`, and PR-specific fields
-`merged_at`, `draft`, `head.sha`, `base.ref`; omitting any of these fields
-from the hash means a change to that field is permanently missed on re-import).
+`merged_at`, `draft`, `head.sha`, `head.ref`, `base.ref`, `merge_commit_sha`;
+omitting any of these fields from the hash means a change to that field is
+permanently missed on re-import). For a PR the hash **also** folds in the
+`MERGED_AS` merge-link **resolution outcome** against the current seeded
+`--code-graph` (issue #333): the target `Commit` record ID when the
+`merge_commit_sha` resolves, or a stable `unresolved` / `ambiguous:<count>` /
+`none` marker otherwise. The merge-link output depends on the seed graph while
+the PR payload does not, so a re-import whose seed graph now contains (or no
+longer contains) the merge commit changes this outcome, changes the hash, and
+re-emits the PR **with** its `MERGED_AS` edge/diagnostic — even though the PR
+payload is byte-identical. An unchanged seed graph produces the same marker and
+stays idempotent (AC8). This participates in change detection only; it never
+affects the stable record identity.
 On re-import, a resource selected by the `>= last_seen_updated_at` watermark is
 compared against its stored hash; if identical, no new record is emitted and the
 hash entry is left unchanged. If different, a new record is emitted and the hash

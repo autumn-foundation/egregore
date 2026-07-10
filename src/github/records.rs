@@ -331,6 +331,46 @@ pub fn pull_records(ctx: &Context<'_>, pr: &model::PullRequest) -> Emitted {
     emitted
 }
 
+/// A stable marker capturing a PR's `MERGED_AS` resolution outcome against the
+/// current commit index, for the PR change-detection hash (issue #333, Codex
+/// round-4).
+///
+/// The merge-link output depends on `ctx.commit_index`, but the PR idempotency
+/// key did not, so an unchanged PR payload against a newly-seeded code graph was
+/// wrongly suppressed by the `state.is_unchanged("pr:<n>", ...)` gate and the
+/// `MERGED_AS` edge never appeared. Folding this marker into `pull_hash` fixes
+/// that: the marker changes exactly when the emitted `MERGED_AS` edge/diagnostic
+/// outcome changes, so a seed graph that newly resolves (or stops resolving) a
+/// merge SHA re-emits the edge, while an unchanged seed keeps re-imports
+/// idempotent (AC8).
+///
+/// Mirrors [`pull_records`]/[`resolve_merge_commit`] exactly: only an
+/// actually-merged PR (`merged_at` present) with a non-empty `merge_commit_sha`
+/// against a non-empty seed graph produces an edge/diagnostic. Every other case
+/// (unmerged, no/empty SHA, or no seeded graph) is the stable `"none"` marker —
+/// no edge, no diagnostic. Resolved links carry the target `Commit` record ID so
+/// re-resolving the SAME SHA to a DIFFERENT commit also re-emits.
+#[must_use]
+pub fn merge_resolution_marker(commit_index: &CommitIndex, pr: &model::PullRequest) -> String {
+    let Some(sha) = pr
+        .merge_commit_sha
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .filter(|_| pr.merged_at.is_some())
+    else {
+        return "none".to_owned();
+    };
+    if commit_index.is_empty() {
+        return "none".to_owned();
+    }
+    match commit_index.get(sha).map(Vec::as_slice) {
+        Some([commit_id]) => format!("resolved:{commit_id}"),
+        Some(ids) if ids.len() > 1 => format!("ambiguous:{}", ids.len()),
+        // None or empty slice → unresolved (no matching Commit in the seed).
+        _ => "unresolved".to_owned(),
+    }
+}
+
 /// Resolves a PR's `merge_commit_sha` to a `MERGED_AS` edge, or a diagnostic.
 ///
 /// Returns `(record, is_diagnostic)`: exactly one matching `Commit` yields the
@@ -934,6 +974,76 @@ mod tests {
         let issue_task = issue.records[0].id();
         let pr_task = pr.records[0].id();
         assert_ne!(issue_task, pr_task);
+    }
+
+    fn merged_pr(sha: Option<&str>, merged: bool) -> model::PullRequest {
+        model::PullRequest {
+            number: 30,
+            title: "PR 30".to_owned(),
+            body: None,
+            state: "closed".to_owned(),
+            merged_at: merged.then(|| "2026-01-02T00:00:00Z".to_owned()),
+            draft: false,
+            labels: vec![],
+            assignees: vec![],
+            user: None,
+            milestone: None,
+            created_at: String::new(),
+            updated_at: "2026-01-02T00:00:00Z".to_owned(),
+            closed_at: None,
+            head: None,
+            base: None,
+            merge_commit_sha: sha.map(str::to_owned),
+            html_url: "https://github.com/o/r/pull/30".to_owned(),
+        }
+    }
+
+    #[test]
+    fn merge_resolution_marker_reflects_seed_graph_outcome() {
+        let sha = "merge30";
+        // No seeded graph → stable "none" (mirrors: no edge, no diagnostic).
+        let empty = CommitIndex::new();
+        assert_eq!(
+            merge_resolution_marker(&empty, &merged_pr(Some(sha), true)),
+            "none"
+        );
+        // Seeded graph that resolves the SHA → carries the target Commit id.
+        let mut resolves = CommitIndex::new();
+        resolves.insert(sha.to_owned(), vec!["codegraph:v5:commit-0".to_owned()]);
+        assert_eq!(
+            merge_resolution_marker(&resolves, &merged_pr(Some(sha), true)),
+            "resolved:codegraph:v5:commit-0"
+        );
+        // Seeded graph without the SHA → unresolved.
+        let mut other = CommitIndex::new();
+        other.insert(
+            "elsewhere".to_owned(),
+            vec!["codegraph:v5:commit-9".to_owned()],
+        );
+        assert_eq!(
+            merge_resolution_marker(&other, &merged_pr(Some(sha), true)),
+            "unresolved"
+        );
+        // Ambiguous SHA → ambiguous:<count>.
+        let mut ambiguous = CommitIndex::new();
+        ambiguous.insert(
+            sha.to_owned(),
+            vec!["codegraph:v5:a".to_owned(), "codegraph:v5:b".to_owned()],
+        );
+        assert_eq!(
+            merge_resolution_marker(&ambiguous, &merged_pr(Some(sha), true)),
+            "ambiguous:2"
+        );
+        // Unmerged PR carrying a test-merge SHA → "none" even with a matching seed.
+        assert_eq!(
+            merge_resolution_marker(&resolves, &merged_pr(Some(sha), false)),
+            "none"
+        );
+        // Merged PR with no merge_commit_sha → "none".
+        assert_eq!(
+            merge_resolution_marker(&resolves, &merged_pr(None, true)),
+            "none"
+        );
     }
 
     #[test]
