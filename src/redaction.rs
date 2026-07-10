@@ -1206,6 +1206,17 @@ pub fn redact_code_text(
 ) -> (String, std::collections::HashMap<SecretClass, usize>) {
     let mut counts = std::collections::HashMap::new();
     while let Some((class, start, len)) = detect_secret_span(&value) {
+        // Forward-progress guard: some span matchers (e.g. `find_env_secret_span`)
+        // strip wrapping quotes and re-detect the placeholder they just wrote as
+        // the env value on the next iteration — e.g. `KEY="<REDACTED:secret>"`.
+        // Replacing that slice with the identical placeholder leaves `value`
+        // unchanged, so the loop would spin forever. When the matched slice is
+        // already exactly the placeholder, replacing it is a no-op: stop instead
+        // of looping. This preserves the re-scan-from-0 semantics that fully
+        // redacts overlapping/nested secrets while guaranteeing termination.
+        if &value[start..start + len] == placeholder {
+            break;
+        }
         value.replace_range(start..start + len, placeholder);
         *counts.entry(class).or_insert(0) += 1;
     }
@@ -1380,4 +1391,85 @@ pub fn redact_code_graph(records: &mut Vec<GraphRecord>, raw_literals: bool, rep
 
     diags.sort_by(|a, b| a.id().cmp(b.id()));
     records.extend(diags);
+}
+
+#[cfg(test)]
+mod redact_code_text_termination_tests {
+    use super::{SecretClass, redact_code_text};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    const SECRET: &str = "hunterSECRETtokenValueLong";
+
+    /// Runs `redact_code_text` on a background thread with a hard deadline so a
+    /// termination regression FAILS the test instead of hanging the suite. Before
+    /// the forward-progress guard, a quoted env secret spun forever here: the env
+    /// span matcher strips the wrapping quotes, re-detects the `<REDACTED:secret>`
+    /// placeholder it just wrote as the value, and re-replaces it with the
+    /// identical placeholder, so `value` never changes.
+    fn redact_with_deadline(
+        input: &str,
+    ) -> (String, std::collections::HashMap<SecretClass, usize>) {
+        let owned = input.to_owned();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let out = redact_code_text(owned, "<REDACTED:secret>");
+            let _ = tx.send(out);
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("redact_code_text must terminate (no infinite loop) on a quoted env secret");
+        handle.join().expect("worker thread joins");
+        got
+    }
+
+    #[test]
+    fn terminates_and_redacts_double_quoted_env_secret() {
+        let input = format!("API_KEY=\"{SECRET}\" trailing");
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains(SECRET),
+            "double-quoted env secret must be fully redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("<REDACTED:"),
+            "a redaction marker must be present: {redacted}"
+        );
+    }
+
+    #[test]
+    fn terminates_and_redacts_single_quoted_env_secret() {
+        let input = format!("API_KEY='{SECRET}' trailing");
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains(SECRET),
+            "single-quoted env secret must be fully redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("<REDACTED:"),
+            "a redaction marker must be present: {redacted}"
+        );
+    }
+
+    #[test]
+    fn terminates_and_fully_redacts_overlapping_env_value_with_suffix() {
+        // Unquoted env value whose bytes CONTAIN a higher-priority API token plus a
+        // trailing suffix. The re-scan-from-0 loop must collapse the whole value
+        // (prefix + token + suffix) and still terminate.
+        let input = "PASSWORD=abcdefgh-sk-abcdefghijklmnopqrst!tail rest".to_owned();
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains("!tail"),
+            "the trailing suffix of the overlapping env value must not survive: {redacted}"
+        );
+        assert!(
+            redacted.contains("<REDACTED:"),
+            "a redaction marker must be present: {redacted}"
+        );
+        assert!(
+            redacted.contains("rest"),
+            "text after the env value token is preserved: {redacted}"
+        );
+    }
 }

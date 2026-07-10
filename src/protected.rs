@@ -926,13 +926,30 @@ impl ProtectedStore {
     /// prevent memory exhaustion via e.g. a symlink to `/dev/zero`.  Also
     /// bounds the read to [`MAX_STORE_FILE_BYTES`].
     fn read_manifest(&self) -> io::Result<Vec<ProtectedHandle>> {
+        Ok(self.read_manifest_partitioned()?.0)
+    }
+
+    /// Reads the manifest, partitioning it into the de-duplicated set of KNOWN
+    /// handles and the raw JSON lines of UNKNOWN-class records.
+    ///
+    /// Known-class records parse into [`ProtectedHandle`] exactly as before. An
+    /// unknown-class record — one whose `source_class` is a well-formed JSON
+    /// string OUTSIDE the closed [`ProtectedPayloadClass`] set (a class a NEWER
+    /// writer added) — is retained VERBATIM as its trimmed raw line instead of
+    /// being dropped (issue #321, Codex P2 "preserve unknown-class manifest
+    /// records when rewriting"). The capture paths thread these opaque lines back
+    /// into [`Self::write_manifest`] so a rewrite in a mixed-version store never
+    /// orphans a future writer's blobs. Typed read surfaces (`list`/`get`) call
+    /// [`Self::read_manifest`] and see only the known set, so unknown records stay
+    /// excluded from typed listing without being lost on write.
+    fn read_manifest_partitioned(&self) -> io::Result<(Vec<ProtectedHandle>, Vec<String>)> {
         let path = self.manifest_path();
         // Read through a single no-follow, regular-file, size-capped descriptor
         // so a manifest swapped/grown after a separate stat cannot make this
         // follow a symlink/FIFO or read past the cap (TOCTOU-safe).
         let content = match read_capped_regular_file(&path, MAX_STORE_FILE_BYTES) {
             Ok(c) => c,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
             Err(e) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -945,6 +962,7 @@ impl ProtectedStore {
             }
         };
         let mut handles = Vec::new();
+        let mut opaque = Vec::new();
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -956,16 +974,18 @@ impl ProtectedStore {
             // poison the whole-store read. `ProtectedHandle::source_class`
             // deserializes through the closed enum, so a strict parse of such a
             // line would fail and every pre-existing known-class record would
-            // become unreadable. Skip only the unknown-class record so known
-            // records stay fully listable/gettable — the tolerance that makes
-            // adding a payload class additive/forward-compatible. Genuinely
-            // malformed JSON (or a record missing/mistyping `source_class`) still
-            // falls through to the strict parse below and errors, so real
-            // corruption is never masked.
+            // become unreadable. RETAIN the unknown-class record verbatim as an
+            // opaque line so known records stay fully listable/gettable AND a
+            // later manifest rewrite re-emits it rather than orphaning the newer
+            // writer's blob (issue #321, Codex P2 "preserve unknown-class manifest
+            // records when rewriting"). Genuinely malformed JSON (or a record
+            // missing/mistyping `source_class`) still falls through to the strict
+            // parse below and errors, so real corruption is never masked.
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
                 && let Some(class) = value.get("source_class").and_then(|c| c.as_str())
                 && parse_class(class).is_none()
             {
+                opaque.push(line.to_owned());
                 continue;
             }
             let h: ProtectedHandle = serde_json::from_str(line).map_err(|e| {
@@ -976,7 +996,7 @@ impl ProtectedStore {
             })?;
             handles.push(h);
         }
-        Ok(handles)
+        Ok((handles, opaque))
     }
 
     /// Writes the manifest as canonical-sorted JSONL.
@@ -992,7 +1012,7 @@ impl ProtectedStore {
     /// rogue duplicate to the single canonical, authorizing record.  This matches
     /// [`Self::canonical_valid_records`], which authorizes nothing for a
     /// duplicated handle.
-    fn write_manifest(&self, handles: &[ProtectedHandle]) -> io::Result<()> {
+    fn write_manifest(&self, handles: &[ProtectedHandle], opaque: &[String]) -> io::Result<()> {
         let dir = &self.root;
         create_private_dir(dir)?;
         let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
@@ -1004,6 +1024,17 @@ impl ProtectedStore {
             .filter(|h| counts.get(h.handle.as_str()) == Some(&1))
             .map(|h| serde_json::to_string(h).expect("ProtectedHandle serialisation is infallible"))
             .collect();
+        // Re-emit the opaque UNKNOWN-class records verbatim (issue #321, Codex P2):
+        // a future writer's blob must never be orphaned by a rewrite this binary
+        // performs. Identical raw lines are de-duplicated so a re-read/re-write
+        // cycle stays byte-stable and cannot grow the manifest; unknown-class
+        // handles are disjoint from known handles (handle identity binds the
+        // class), so preserving them cannot resurrect a purged known duplicate.
+        for line in opaque {
+            if !lines.contains(line) {
+                lines.push(line.clone());
+            }
+        }
         lines.sort_unstable();
         let content = format!("{}\n", lines.join("\n"));
         check_within_read_cap(&content, "manifest.jsonl")?;
@@ -1139,10 +1170,12 @@ impl ProtectedStore {
         // Load the existing manifest before any blob or manifest writes.
         // Authorization is derived from the manifest's producer IDs (see
         // `is_authorized`), so there is no separate ACL file to load or validate.
-        let mut existing: Vec<ProtectedHandle> = if enabled {
-            self.read_manifest()?
+        // Retain opaque unknown-class records (issue #321, Codex P2) so a rewrite
+        // below re-emits them instead of orphaning a newer writer's blobs.
+        let (mut existing, opaque_records): (Vec<ProtectedHandle>, Vec<String>) = if enabled {
+            self.read_manifest_partitioned()?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         // Snapshot the content hashes referenced by the ON-DISK manifest's
         // CANONICAL valid records before this capture mutates `existing`.  Used
@@ -1525,7 +1558,7 @@ impl ProtectedStore {
             // On failure the early return drops `blob_txn`, rolling back the
             // newly written blobs; neither the handle nor the authorization
             // (which is the committed record) exists.
-            self.write_manifest(&existing)?;
+            self.write_manifest(&existing, &opaque_records)?;
             blob_txn.commit();
         }
 
@@ -1620,7 +1653,9 @@ impl ProtectedStore {
         // Serialize the read-modify-write cycle against concurrent captures.
         let _lock = StoreLock::acquire(&self.root)?;
 
-        let mut existing = self.read_manifest()?;
+        // Retain opaque unknown-class records (issue #321, Codex P2) so the
+        // rewrite below re-emits them instead of orphaning a newer writer's blobs.
+        let (mut existing, opaque_records) = self.read_manifest_partitioned()?;
         let original_blob_hashes: std::collections::HashSet<String> =
             Self::canonical_valid_records(&existing)
                 .iter()
@@ -1731,7 +1766,7 @@ impl ProtectedStore {
         // authorization; on failure the early return drops `blob_txn` and rolls
         // back the new blob, so no partial manifest and no orphan bytes remain.
         if mutated {
-            self.write_manifest(&existing)?;
+            self.write_manifest(&existing, &opaque_records)?;
             blob_txn.commit();
         }
 
@@ -2356,6 +2391,91 @@ mod tests {
             .get(&known_handle, "op-1")
             .expect("get of a known record must still succeed");
         assert_eq!(got, bytes);
+    }
+
+    // Regression (issue #321, Codex P2 "preserve unknown-class manifest records
+    // when rewriting"): the tolerant reader SKIPS unknown-class records, but the
+    // capture paths treat the read vector as the COMPLETE manifest and rewrite it
+    // after any mutation. In a mixed-version store, capturing a known-class
+    // payload therefore rewrote `manifest.jsonl` WITHOUT the skipped future-class
+    // records, orphaning their blobs and making their handles unretrievable. The
+    // reader must retain unknown records as opaque raw entries and the writer must
+    // re-emit them verbatim so a rewrite never drops them.
+    #[test]
+    fn capture_preserves_unknown_class_manifest_records_across_rewrite() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+
+        // Seed a known-class record.
+        let known1 = store
+            .capture_bytes(
+                ProtectedPayloadClass::LogPayload,
+                "app.log",
+                b"redacted known bytes\n",
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap();
+        let known1_handle = known1.entries[0].handle.clone();
+
+        // Append a synthetic FUTURE-class record (unknown to this binary) plus its
+        // blob, simulating a newer writer having captured into the same store.
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let future_handle =
+            "protected:v1:1111111111111111111111111111111111111111111111111111111111111111";
+        let future = serde_json::json!({
+            "handle": future_handle,
+            "schema_version": 1,
+            "source_class": "llm_inference_log",
+            "source_path": "future.log",
+            "content_hash": "bb",
+            "byte_len": 3,
+            "captured_at": "2026-01-01T00:00:00Z",
+            "producer_id": "future-op",
+            "producer_version": "9.9.9"
+        });
+        let future_line = serde_json::to_string(&future).unwrap();
+        let existing = fs::read_to_string(&manifest_path).unwrap();
+        fs::write(&manifest_path, format!("{existing}{future_line}\n")).unwrap();
+
+        // Capture a NEW known-class payload — a distinct handle that forces a
+        // manifest rewrite.
+        let known2 = store
+            .capture_bytes(
+                ProtectedPayloadClass::LogPayload,
+                "other.log",
+                b"redacted other bytes\n",
+                "op-1",
+                "0.1.0",
+                "2026-06-19T00:00:00Z",
+                true,
+            )
+            .unwrap();
+        let known2_handle = known2.entries[0].handle.clone();
+
+        // The unknown-class record must STILL be present after the rewrite — not
+        // dropped and orphaned.
+        let after = fs::read_to_string(&manifest_path).unwrap();
+        let lines: Vec<&str> = after.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("llm_inference_log") && l.contains(future_handle)),
+            "the unknown-class record must survive a capture-triggered rewrite, \
+             not be dropped and orphaned"
+        );
+        // Both known records are intact and listable.
+        let listed = store.list().unwrap();
+        assert!(
+            listed.iter().any(|h| h.handle == known1_handle),
+            "the first known record must survive"
+        );
+        assert!(
+            listed.iter().any(|h| h.handle == known2_handle),
+            "the newly captured known record must be present"
+        );
     }
 
     // ── Unit: capture disabled ─────────────────────────────────────────────────

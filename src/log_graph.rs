@@ -570,83 +570,35 @@ pub fn scan_log_records(
 /// normalizes and validates once, in [`scan_log_records`]; this helper never
 /// touches the filesystem and is therefore infallible.
 ///
-/// Secret detection runs over the **whole normalized text** via
-/// [`redaction::detect_secret_span`] and redaction splices by BYTE SPAN, not by
-/// line: the text is walked with [`earliest_secret_span`], and for each detected
-/// secret span `[start, end)` the verbatim non-secret prefix is emitted, then ONE
-/// `<REDACTED:class:hash>` marker for the exact secret slice, then the walk
-/// continues from `end`. Because the marker replaces the exact detected span —
+/// Secret detection and redaction delegate to the shared iterative full-text
+/// redactor [`redaction::redact_code_text`] — the same routine that scrubs
+/// code-graph node text. It repeatedly calls [`redaction::detect_secret_span`]
+/// over the WHOLE remaining text, replaces the single detected span with one
+/// `<REDACTED:…>` marker, and RE-SCANS from scratch until no secret bytes remain.
+/// This re-scan-after-replace loop is what makes overlapping and nested secrets
+/// of different classes safe: when a lower-priority env secret's value CONTAINS a
+/// higher-priority API token plus a trailing suffix (e.g.
+/// `PASSWORD=abcdefgh-sk-…!tail`), the token is redacted first, then the NEXT
+/// scan re-detects the remaining env-value bytes over the full text and collapses
+/// the prefix AND the suffix together — no byte of the value survives. An earlier
+/// hand-rolled byte-span walk (issue #321) recovered the earliest span start by
+/// probing only the strict PREFIX before a higher-priority match, which truncated
+/// such an overlapping lower-priority span and copied its suffix into the blob
+/// (Codex P1 "redact full env spans that overlap higher-priority tokens").
+/// Because each detected span is replaced whole, a multi-line secret block —
 /// internal blank lines, PEM headers, base64 body, and the `END` line and all —
-/// the WHOLE span collapses to a single marker regardless of its internal
-/// structure. There is no line marking, no maximal-run reassembly, and no
-/// dependence on a per-line secret shape reappearing, so a blank separator line
-/// INSIDE a span (e.g. an RFC-1421 encrypted PEM block) can never break the span
-/// into a redacted head and an unredacted tail. Earlier line-based forms of this
-/// function (issue #321) leaked the key body: redacting each line independently
-/// collapsed only the `BEGIN` line, and collapsing maximal runs of secret-bearing
-/// lines split the span at the blank line so the body/`END` run lost its `BEGIN`
-/// marker and passed through unredacted.
+/// still collapses to a single marker regardless of its internal structure, and a
+/// blank separator line INSIDE a span (e.g. an RFC-1421 encrypted PEM block) can
+/// never break the span into a redacted head and an unredacted tail.
 ///
 /// This materializes redacted bytes ONLY when protected capture is requested;
 /// ordinary graph extraction ([`scan_log_records`]) never calls it and is
-/// unchanged. Raw, unredacted bytes never leave this function.
+/// unchanged. Raw, unredacted bytes never leave this function. Output is
+/// deterministic and byte-stable.
 #[must_use]
 pub fn redacted_source_bytes(text: &str) -> Vec<u8> {
-    // Splice by BYTE SPAN. For each earliest-starting secret span the detector
-    // reports, emit the verbatim non-secret prefix, then ONE marker for the exact
-    // secret slice, then continue past the span. The marker is built from the
-    // span's OWN class (via [`redaction::redact_span`], never re-detected from the
-    // isolated slice), so context-dependent classes such as `EnvSecret` — whose
-    // span covers only the value bytes, not the `KEY=` prefix — still redact.
-    // Because the slice is exactly the detected span, a blank line, PEM headers,
-    // base64 body, or `END` line inside it collapse together into the single
-    // marker. Output is deterministic and byte-stable.
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0_usize;
-    while cursor < text.len() {
-        if let Some((class, rel, len)) = earliest_secret_span(&text[cursor..]) {
-            let start = cursor + rel;
-            let end = start + len;
-            out.push_str(&text[cursor..start]);
-            out.push_str(&redaction::redact_span(class, &text[start..end]));
-            // Guard against a zero-length span so the walk always advances.
-            cursor = end.max(start + 1);
-        } else {
-            out.push_str(&text[cursor..]);
-            break;
-        }
-    }
-    out.into_bytes()
-}
-
-/// Returns the class and byte span `(class, start, len)` of the EARLIEST-starting
-/// v1-policy secret in `bytes`, or `None` when there is none.
-///
-/// [`redaction::detect_secret_span`] returns the first match in secret-CLASS
-/// priority order, not the earliest byte offset (issue #321, Codex P1 "scan spans
-/// in byte order"): a lower-priority secret sitting earlier in the byte stream
-/// loses to a later higher-priority one. Driving the redaction cursor straight
-/// off that call would emit the earlier secret's bytes verbatim as a "non-secret
-/// prefix" and then advance past the later span, leaking the earlier secret into
-/// the protected blob. This helper recovers the earliest start by re-probing the
-/// strict prefix before each reported span until the prefix holds no further
-/// secret, so the caller never advances past unprocessed secret text. It reuses
-/// `detect_secret_span` unchanged. The prefix probes look only at bytes strictly
-/// before the current earliest start, so a multi-line secret block (which the
-/// priority order surfaces first, at its own start) is never truncated mid-span.
-fn earliest_secret_span(bytes: &str) -> Option<(redaction::SecretClass, usize, usize)> {
-    let (mut best_class, mut best_start, mut best_len) = redaction::detect_secret_span(bytes)?;
-    while best_start > 0 {
-        match redaction::detect_secret_span(&bytes[..best_start]) {
-            Some((class, start, len)) => {
-                best_class = class;
-                best_start = start;
-                best_len = len;
-            }
-            None => break,
-        }
-    }
-    Some((best_class, best_start, best_len))
+    let (redacted, _counts) = redaction::redact_code_text(text.to_owned(), "<REDACTED:secret>");
+    redacted.into_bytes()
 }
 
 /// Computes the repository-relative path of a log file under the repo root,

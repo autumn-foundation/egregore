@@ -937,6 +937,87 @@ fn stored_blob_redacts_earlier_lower_priority_secret_before_later_higher_priorit
     );
 }
 
+// Regression (issue #321, Codex P1 "redact full env spans that overlap
+// higher-priority tokens"): when a LOWER-priority env-secret value CONTAINS a
+// HIGHER-priority API token AND a trailing suffix, the old earliest-start prefix
+// probe redacted only the env-value bytes BEFORE the nested token, redacted the
+// nested token next, then copied the suffix bytes AFTER the token verbatim into
+// the blob — leaking the tail of the env-secret value. The iterative full-text
+// redactor re-scans after replacing the inner token and re-detects the remaining
+// env value, so prefix, nested token, AND suffix all collapse to one marker.
+#[test]
+fn stored_blob_redacts_full_env_span_overlapping_nested_higher_priority_token() {
+    const NESTED_TOKEN: &str = "sk-abcdefghijklmnopqrstuvwx";
+    const SUFFIX_MARKER: &str = "TAILLEAKMARKER";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("overlap.log");
+    let mut fixture = String::new();
+    fixture.push_str("2026-01-02T03:00:00Z INFO service starting up nominally\n");
+    // `PASSWORD=abcdefgh-<api token>!TAILLEAKMARKER` — one env secret whose value
+    // wraps a higher-priority API token and a distinctive trailing suffix.
+    fixture.push_str("2026-01-02T03:00:01Z [ERROR] auth failed PASSWORD=abcdefgh-");
+    fixture.push_str(NESTED_TOKEN);
+    fixture.push('!');
+    fixture.push_str(SUFFIX_MARKER);
+    fixture.push_str(" reason denied\n");
+    fixture.push_str("2026-01-02T03:00:05Z INFO service ready to accept traffic\n");
+    fs::write(&log, &fixture).expect("write overlap fixture");
+
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+    scan_logs_capture(&log, temp.path(), &out, &store, "op-1").success();
+
+    let handle = only_manifest_record(&store)["handle"]
+        .as_str()
+        .expect("handle")
+        .to_owned();
+    let got = egregore()
+        .args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let blob = String::from_utf8(got).expect("utf8 blob");
+
+    // The nested higher-priority token must be gone.
+    assert!(
+        !blob.contains(NESTED_TOKEN),
+        "the nested API token must be redacted"
+    );
+    // The SUFFIX after the nested token — still part of the env-secret value —
+    // must NOT survive into the blob. This is the exact leak the old prefix probe
+    // produced by truncating the overlapping lower-priority span.
+    assert!(
+        !blob.contains(SUFFIX_MARKER),
+        "the env-secret suffix PAST the nested token must be redacted, not copied verbatim"
+    );
+    // The env-secret prefix bytes must be gone too.
+    assert!(
+        !blob.contains("abcdefgh-"),
+        "the env-secret prefix bytes must be redacted"
+    );
+    // The overlapping span collapses to a redaction marker.
+    assert!(
+        blob.contains("<REDACTED:"),
+        "the secret span must be stored as a redaction marker"
+    );
+    // Non-secret lines around the secret are preserved verbatim.
+    assert!(
+        blob.contains("service starting up nominally"),
+        "normal line before the secret is preserved"
+    );
+    assert!(
+        blob.contains("service ready to accept traffic"),
+        "normal line after the secret is preserved"
+    );
+}
+
 // Regression (issue #321, Codex P1 "mark blank lines inside secret spans"): an
 // encrypted RFC-1421-style PEM block carries `Proc-Type`/`DEK-Info` headers, a
 // BLANK separator line, then the base64 body before `-----END … -----`. The old
