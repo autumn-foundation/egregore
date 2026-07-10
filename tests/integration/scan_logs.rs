@@ -936,6 +936,100 @@ fn stored_blob_redacts_earlier_lower_priority_secret_before_later_higher_priorit
     );
 }
 
+// Regression (issue #321, Codex P1 "mark blank lines inside secret spans"): an
+// encrypted RFC-1421-style PEM block carries `Proc-Type`/`DEK-Info` headers, a
+// BLANK separator line, then the base64 body before `-----END … -----`. The old
+// line-marking capture path split the detected span into two maximal runs of
+// secret-bearing lines (the blank line unmarked, breaking the run): the first run
+// held the `BEGIN` marker and redacted, but the later body/`END` run no longer
+// contained `BEGIN`, so `redact_value` passed it through and the key material
+// leaked into the protected blob. Byte-span redaction collapses the WHOLE span —
+// headers, blank line, body, and `END` — to one marker regardless of internal
+// blank lines.
+#[test]
+fn stored_blob_redacts_private_key_block_with_internal_blank_line() {
+    const KEY_BODY_MARKER: &str = "LEAKEDPEMBODYAFTERBLANKLINE";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("encrypted-pem.log");
+    let mut fixture = String::new();
+    fixture.push_str("2026-01-02T03:00:00Z INFO service starting up nominally\n");
+    fixture.push_str("2026-01-02T03:00:01Z [ERROR] loaded encrypted deploy key below\n");
+    fixture.push_str("-----BEGIN RSA PRIVATE KEY-----\n");
+    fixture.push_str("Proc-Type: 4,ENCRYPTED\n");
+    fixture.push_str("DEK-Info: AES-128-CBC,7F3A1C9E4B2D8A605E1F0C3B9D7A2E48\n");
+    // The RFC-1421 blank separator line INSIDE the secret span — the exact byte
+    // that broke the old line-run reassembly.
+    fixture.push('\n');
+    fixture.push_str("MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Q\n");
+    fixture.push_str("c2VjcmV0");
+    fixture.push_str(KEY_BODY_MARKER);
+    fixture.push_str("YmFzZTY0Qm9keU11c3RCZVJlZGFjdGVk\n");
+    fixture.push_str("uXvpFi+ExampleTrailingBodyLineBeforeEndMarkerAAAA==\n");
+    fixture.push_str("-----END RSA PRIVATE KEY-----\n");
+    fixture.push_str("2026-01-02T03:00:05Z INFO service ready to accept traffic\n");
+    fs::write(&log, &fixture).expect("write encrypted-pem fixture");
+
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+    scan_logs_capture(&log, temp.path(), &out, &store, "op-1").success();
+
+    let handle = only_manifest_record(&store)["handle"]
+        .as_str()
+        .expect("handle")
+        .to_owned();
+    let got = egregore()
+        .args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let blob = String::from_utf8(got).expect("utf8 blob");
+
+    // The whole span collapses to a redaction marker.
+    assert!(
+        blob.contains("<REDACTED:"),
+        "the key block must be stored as a redaction marker"
+    );
+    // The base64 body AFTER the internal blank line must never survive — the leak.
+    assert!(
+        !blob.contains(KEY_BODY_MARKER),
+        "base64 body after the internal blank line must be redacted"
+    );
+    // The encrypted-key header lines must be gone.
+    assert!(
+        !blob.contains("Proc-Type: 4,ENCRYPTED"),
+        "the Proc-Type header line must be redacted"
+    );
+    assert!(
+        !blob.contains("DEK-Info: AES-128-CBC"),
+        "the DEK-Info header line must be redacted"
+    );
+    // The BEGIN and END delimiter lines of the block are gone too.
+    assert!(
+        !blob.contains("-----BEGIN RSA PRIVATE KEY-----"),
+        "the BEGIN line of the key block must also be redacted"
+    );
+    assert!(
+        !blob.contains("-----END RSA PRIVATE KEY-----"),
+        "the END line of the key block must also be redacted"
+    );
+    // Non-secret lines around the block are preserved (no over-redaction).
+    assert!(
+        blob.contains("service starting up nominally"),
+        "normal lines before the key block are preserved"
+    );
+    assert!(
+        blob.contains("service ready to accept traffic"),
+        "normal lines after the key block are preserved"
+    );
+}
+
 // AC5/AC7: `protected get` verifies + returns bytes and `list` shows a
 // log_payload entry with metadata only (no raw bytes).
 #[test]

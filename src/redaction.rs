@@ -200,6 +200,25 @@ pub fn redact_value(value: &str) -> String {
     format!("<REDACTED:{}:{}>", class.as_str(), prefix)
 }
 
+/// Builds the `<REDACTED:class:hash_prefix>` marker for an already-located secret
+/// span whose [`SecretClass`] the caller obtained from [`detect_secret_span`].
+///
+/// [`redact_value`] re-detects the class from the value it is given, which is
+/// wrong for a caller that has isolated the exact detected span: some classes are
+/// only recognizable with surrounding context the span omits (an [`SecretClass::EnvSecret`]
+/// span covers only the value bytes, not the `KEY=` that identifies it, so
+/// re-detection over the bare value returns `None` and the secret would pass
+/// through unredacted). This helper collapses the exact secret slice to one
+/// marker using the class the span detector already reported, with the same
+/// BLAKE3 hash-prefix scheme [`redact_value`] emits. Byte-identical across runs.
+#[must_use]
+pub fn redact_span(class: SecretClass, secret_slice: &str) -> String {
+    let hash = blake3::hash(secret_slice.as_bytes());
+    let hex = hash.to_hex();
+    let prefix = &hex.as_str()[..HASH_PREFIX_LEN];
+    format!("<REDACTED:{}:{}>", class.as_str(), prefix)
+}
+
 // ── Validation ─────────────────────────────────────────────────────────────────
 
 /// Validates a graph record for unredacted sensitive fields.

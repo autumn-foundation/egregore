@@ -512,15 +512,21 @@ pub fn scan_log_records(
 /// protected blob.
 ///
 /// Secret detection runs over the **whole normalized text** via
-/// [`redaction::detect_secret_span`], not line by line: a multi-line secret —
-/// e.g. a PEM / OpenSSH private-key block whose base64 body and `END` line are
-/// not individually secret-shaped — is caught as one span that covers every
-/// line it touches. Each maximal run of secret-bearing lines is then collapsed
-/// to a single `<REDACTED:class:hash>` marker through [`redaction::redact_value`]
-/// (the run's joined text carries the leading secret the whole-value detector
-/// recognizes), and every non-secret line is preserved verbatim. Redacting each
-/// line independently (this function's original form, issue #321) collapsed only
-/// the `BEGIN` marker line and wrote the key body to the blob unchanged.
+/// [`redaction::detect_secret_span`] and redaction splices by BYTE SPAN, not by
+/// line: the text is walked with [`earliest_secret_span`], and for each detected
+/// secret span `[start, end)` the verbatim non-secret prefix is emitted, then ONE
+/// `<REDACTED:class:hash>` marker for the exact secret slice, then the walk
+/// continues from `end`. Because the marker replaces the exact detected span —
+/// internal blank lines, PEM headers, base64 body, and the `END` line and all —
+/// the WHOLE span collapses to a single marker regardless of its internal
+/// structure. There is no line marking, no maximal-run reassembly, and no
+/// dependence on a per-line secret shape reappearing, so a blank separator line
+/// INSIDE a span (e.g. an RFC-1421 encrypted PEM block) can never break the span
+/// into a redacted head and an unredacted tail. Earlier line-based forms of this
+/// function (issue #321) leaked the key body: redacting each line independently
+/// collapsed only the `BEGIN` line, and collapsing maximal runs of secret-bearing
+/// lines split the span at the blank line so the body/`END` run lost its `BEGIN`
+/// marker and passed through unredacted.
 ///
 /// This materializes redacted bytes ONLY when protected capture is requested;
 /// ordinary graph extraction ([`scan_log_records`]) never calls it and is
@@ -547,103 +553,61 @@ pub fn redacted_source_bytes(log_path: &Path) -> Result<Vec<u8>, LogScanError> {
             detail: format!("file is not valid UTF-8: {error}"),
         })?;
 
-    let secret_lines = secret_bearing_lines(text);
-
-    // `split('\n')` (not `lines()`) preserves the exact normalized structure,
-    // including a trailing empty segment when the file ends in a newline. Each
-    // maximal run of secret-bearing lines collapses to ONE marker so a
-    // multi-line key block does not leak its body/END lines; non-secret lines
-    // pass through verbatim. Output is deterministic and byte-stable.
-    let lines: Vec<&str> = text.split('\n').collect();
+    // Splice by BYTE SPAN. For each earliest-starting secret span the detector
+    // reports, emit the verbatim non-secret prefix, then ONE marker for the exact
+    // secret slice, then continue past the span. The marker is built from the
+    // span's OWN class (via [`redaction::redact_span`], never re-detected from the
+    // isolated slice), so context-dependent classes such as `EnvSecret` — whose
+    // span covers only the value bytes, not the `KEY=` prefix — still redact.
+    // Because the slice is exactly the detected span, a blank line, PEM headers,
+    // base64 body, or `END` line inside it collapse together into the single
+    // marker. Output is deterministic and byte-stable.
     let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    let mut first = true;
-    while i < lines.len() {
-        if !first {
-            out.push('\n');
-        }
-        first = false;
-        if secret_lines.contains(&i) {
-            let run_start = i;
-            while i < lines.len() && secret_lines.contains(&i) {
-                i += 1;
-            }
-            let run = lines[run_start..i].join("\n");
-            out.push_str(&redaction::redact_value(&run));
+    let mut cursor = 0_usize;
+    while cursor < text.len() {
+        if let Some((class, rel, len)) = earliest_secret_span(&text[cursor..]) {
+            let start = cursor + rel;
+            let end = start + len;
+            out.push_str(&text[cursor..start]);
+            out.push_str(&redaction::redact_span(class, &text[start..end]));
+            // Guard against a zero-length span so the walk always advances.
+            cursor = end.max(start + 1);
         } else {
-            out.push_str(lines[i]);
-            i += 1;
+            out.push_str(&text[cursor..]);
+            break;
         }
     }
     Ok(out.into_bytes())
 }
 
-/// Returns the set of line indices (0-based over `text.split('\n')`) that any
-/// v1-policy secret span touches.
-///
-/// Spans are detected over the WHOLE text (via [`redaction::detect_secret_span`])
-/// so a multi-line secret block marks every line its byte range covers, not just
-/// the one line that is individually secret-shaped. Zero-length (empty) line
-/// segments are never marked. Detection is deterministic left-to-right.
-fn secret_bearing_lines(text: &str) -> std::collections::BTreeSet<usize> {
-    // Absolute byte range [start, end) of each split('\n') line's content.
-    let mut line_ranges = Vec::new();
-    let mut offset = 0_usize;
-    for line in text.split('\n') {
-        let start = offset;
-        let end = start + line.len();
-        line_ranges.push((start, end));
-        offset = end + 1; // skip the '\n' separator
-    }
-
-    let mut secret = std::collections::BTreeSet::new();
-    let mut cursor = 0_usize;
-    while cursor < text.len() {
-        let Some((rel_start, len)) = earliest_secret_span(&text[cursor..]) else {
-            break;
-        };
-        let span_start = cursor + rel_start;
-        let span_end = span_start + len;
-        for (idx, &(ls, le)) in line_ranges.iter().enumerate() {
-            // A line is secret-bearing when the span overlaps its non-empty
-            // content range.
-            if le > ls && span_start < le && span_end > ls {
-                secret.insert(idx);
-            }
-        }
-        // Advance past this span; guard against a zero-length span.
-        cursor = span_end.max(span_start + 1);
-    }
-    secret
-}
-
-/// Returns the byte span `(start, len)` of the EARLIEST-starting v1-policy secret
-/// in `bytes`, or `None` when there is none.
+/// Returns the class and byte span `(class, start, len)` of the EARLIEST-starting
+/// v1-policy secret in `bytes`, or `None` when there is none.
 ///
 /// [`redaction::detect_secret_span`] returns the first match in secret-CLASS
 /// priority order, not the earliest byte offset (issue #321, Codex P1 "scan spans
-/// in byte order before marking lines"): a lower-priority secret sitting earlier
-/// in the byte stream loses to a later higher-priority one. Driving the
-/// line-marking cursor straight off that call would advance past the later span
-/// and skip the earlier secret's line entirely, leaking it into the protected
-/// blob. This helper recovers the earliest start by re-probing the strict prefix
-/// before each reported span until the prefix holds no further secret, so the
-/// caller never advances past unprocessed secret text. It reuses
+/// in byte order"): a lower-priority secret sitting earlier in the byte stream
+/// loses to a later higher-priority one. Driving the redaction cursor straight
+/// off that call would emit the earlier secret's bytes verbatim as a "non-secret
+/// prefix" and then advance past the later span, leaking the earlier secret into
+/// the protected blob. This helper recovers the earliest start by re-probing the
+/// strict prefix before each reported span until the prefix holds no further
+/// secret, so the caller never advances past unprocessed secret text. It reuses
 /// `detect_secret_span` unchanged. The prefix probes look only at bytes strictly
 /// before the current earliest start, so a multi-line secret block (which the
 /// priority order surfaces first, at its own start) is never truncated mid-span.
-fn earliest_secret_span(bytes: &str) -> Option<(usize, usize)> {
-    let (_, mut best_start, mut best_len) = redaction::detect_secret_span(bytes)?;
+fn earliest_secret_span(bytes: &str) -> Option<(redaction::SecretClass, usize, usize)> {
+    let (mut best_class, mut best_start, mut best_len) = redaction::detect_secret_span(bytes)?;
     while best_start > 0 {
         match redaction::detect_secret_span(&bytes[..best_start]) {
-            Some((_, start, len)) => {
+            Some((class, start, len)) => {
+                best_class = class;
                 best_start = start;
                 best_len = len;
             }
             None => break,
         }
     }
-    Some((best_start, best_len))
+    Some((best_class, best_start, best_len))
 }
 
 /// Computes the repository-relative path of a log file under the repo root,
