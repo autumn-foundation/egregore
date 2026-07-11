@@ -25,10 +25,26 @@
 //! * `window_start = min(commit_valid_time[sha])` over the range commits;
 //! * `window_end   = max(commit_valid_time[sha])` over the range commits.
 //!
+//! # Signature coalescing
+//!
+//! `LogSource` is a **non-identity** input for signatures: a signature's stable
+//! ID is `(repository_id, fingerprint_algorithm, template, severity)` only (see
+//! `log_stable_id` in `crate::log_graph`). A graph combining multiple
+//! `scan-logs` outputs for one repo therefore carries the same `ErrorSignature`
+//! record ID more than once, each with its own scan-local `first_seen` /
+//! `last_seen` / `occurrence_count`. Records are grouped by stable ID and merged
+//! **before** classification so exactly one row per signature ID is emitted:
+//! merged `first_seen` is the earliest and merged `last_seen` the latest across
+//! the group (by parsed instant); occurrence buckets are unioned and deduped by
+//! bucket record ID; the aggregate `occurrence_count` sums the group's per-scan
+//! counts. Without this, one stable signature could split across conflicting
+//! classes (an earlier scan → `ceased`, a later scan first-seen in-range →
+//! `new`) and double-count its occurrences.
+//!
 //! # Classification (closed, mutually exclusive, precedence-ordered)
 //!
-//! Every in-scope `ErrorSignature` is classified against the window from its
-//! `first_seen` (`fs`) and `last_seen` (`ls`):
+//! Every in-scope `ErrorSignature`, after coalescing, is classified against the
+//! window from its merged `first_seen` (`fs`) and `last_seen` (`ls`):
 //!
 //! 1. `new_signatures`   — `window_start <= fs <= window_end`. The primary
 //!    regression signal: a signature first observed inside the window, even if
@@ -47,8 +63,9 @@
 //!
 //! Per-window occurrence counts are computed from the signature's own
 //! `LogOccurrenceBucket` records, discovered through the `AGGREGATES`
-//! (bucket → signature) edges (issue #320). For a signature with at least one
-//! linked bucket:
+//! (bucket → signature) edges (issue #320) and deduped by bucket record ID
+//! across the coalesced group (the same hour re-scanned twice counts once). For
+//! a signature with at least one linked bucket:
 //!
 //! * `base_window_occurrences` = sum of bucket counts whose `bucket_start`
 //!   is `<= commit_valid_time[base]`;
@@ -72,7 +89,7 @@ use chrono::{DateTime, Utc};
 
 use super::RepositoryIndex;
 use super::deltas::{RangeDeltasError, resolve_commit_range};
-use crate::ir::{EdgeLabel, GraphRecord, LogPayload, NodeKind};
+use crate::ir::{EdgeLabel, ErrorSignaturePayload, GraphRecord, LogPayload, NodeKind};
 
 /// Always-present advisory label for [`log_deltas`] responses.
 pub const LOG_DELTAS_DISCLAIMER: &str = "Rows are runtime error-signature observations classified \
@@ -285,9 +302,13 @@ pub fn log_deltas(
     // ── Node-by-ID index + per-signature bucket / frame indices ──────────────
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
 
-    // signature_id → linked (bucket_start, occurrence_count) pairs, via
-    // AGGREGATES (bucket → signature) edges (issue #320).
-    let mut buckets_by_sig: BTreeMap<&str, Vec<(&str, u64)>> = BTreeMap::new();
+    // signature_id → linked (bucket_id, bucket_start, occurrence_count) triples,
+    // via AGGREGATES (bucket → signature) edges (issue #320). The bucket record
+    // ID is retained so buckets can be deduped by identity before summing: a
+    // graph combining multiple scan-logs outputs for one repo can re-emit the
+    // same hour bucket (identical content-addressed ID) from each scan, and that
+    // hour must count once, not once per scan.
+    let mut buckets_by_sig: BTreeMap<&str, Vec<(&str, &str, u64)>> = BTreeMap::new();
     // signature_id → resolved-frame handles, via FRAME_RESOLVES_TO edges (#322).
     let mut frames_by_sig: BTreeMap<&str, Vec<ResolvedFrameHandle>> = BTreeMap::new();
     for r in records {
@@ -309,10 +330,11 @@ pub fn log_deltas(
                     }) = by_id.get(source.as_str())
                     {
                         if let LogPayload::LogOccurrenceBucket(bucket) = payload.as_ref() {
-                            buckets_by_sig
-                                .entry(target.as_str())
-                                .or_default()
-                                .push((bucket.bucket_start.as_str(), bucket.occurrence_count));
+                            buckets_by_sig.entry(target.as_str()).or_default().push((
+                                source.as_str(),
+                                bucket.bucket_start.as_str(),
+                                bucket.occurrence_count,
+                            ));
                         }
                     }
                 }
@@ -334,11 +356,19 @@ pub fn log_deltas(
         }
     }
 
-    // ── Classify every in-scope ErrorSignature ───────────────────────────────
-    let mut new_signatures: Vec<LogSignatureDelta> = Vec::new();
-    let mut ceased_signatures: Vec<LogSignatureDelta> = Vec::new();
-    let mut continuing_signatures: Vec<LogSignatureDelta> = Vec::new();
-
+    // ── Coalesce ErrorSignature records by stable ID ─────────────────────────
+    // `LogSource` is a NON-identity input for signatures: the signature ID is
+    // `(repository_id, fingerprint_algorithm, template, severity)` only (see
+    // `log_stable_id` in `src/log_graph.rs`). A graph combining multiple
+    // scan-logs outputs for one repo therefore carries the SAME signature record
+    // ID more than once, each carrying its own scan-local `first_seen` /
+    // `last_seen` / `occurrence_count`. Iterating node records would split one
+    // stable signature across conflicting classes (e.g. an earlier scan observed
+    // before the range → `ceased`, a later scan first-seen in-range → `new`) and
+    // double its counts. Group by ID and merge BEFORE classifying so exactly one
+    // row per stable signature ID is emitted. `schema_version` and `severity` are
+    // identity-derived, hence identical within a group.
+    let mut sig_groups: BTreeMap<&str, Vec<(u32, &ErrorSignaturePayload)>> = BTreeMap::new();
     for r in records {
         let GraphRecord::Node {
             id,
@@ -356,12 +386,48 @@ pub fn log_deltas(
         let LogPayload::ErrorSignature(sig) = payload.as_ref() else {
             continue;
         };
+        sig_groups
+            .entry(id.as_str())
+            .or_default()
+            .push((*schema_version, sig));
+    }
+
+    // ── Classify each coalesced signature group ──────────────────────────────
+    // BTreeMap iteration is in sorted `record_id` order and every merge below
+    // (min/max/sum/dedupe) is order-independent, so output is byte-stable.
+    let mut new_signatures: Vec<LogSignatureDelta> = Vec::new();
+    let mut ceased_signatures: Vec<LogSignatureDelta> = Vec::new();
+    let mut continuing_signatures: Vec<LogSignatureDelta> = Vec::new();
+
+    for (id, group) in &sig_groups {
+        // Merged valid-time bounds: earliest first_seen and latest last_seen
+        // across the group, compared by parsed UTC INSTANT (never raw RFC 3339
+        // string order — the same cross-offset reason as `classify`). The emitted
+        // strings keep the original RFC 3339 text of the winning bound.
+        let firsts: Vec<(Option<DateTime<Utc>>, &str)> = group
+            .iter()
+            .map(|(_, s)| (parse_instant(&s.first_seen), s.first_seen.as_str()))
+            .collect();
+        let lasts: Vec<(Option<DateTime<Utc>>, &str)> = group
+            .iter()
+            .map(|(_, s)| (parse_instant(&s.last_seen), s.last_seen.as_str()))
+            .collect();
+        let (first_seen, first_instant) = merge_bound(&firsts, BoundKind::Earliest);
+        let (last_seen, last_instant) = merge_bound(&lasts, BoundKind::Latest);
+
+        // Aggregate count sums the group's per-scan occurrence counts. Summing
+        // across DISTINCT log sources is intended (each contributes its own
+        // observations); re-scanning the IDENTICAL source is a degenerate
+        // double-count — the bucket path (deduped by bucket ID) is the robust one.
+        let occurrence_count: u64 = group.iter().map(|(_, s)| s.occurrence_count).sum();
+        // Identity-derived, identical within the group; take the first entry.
+        let (schema_version, severity) = (group[0].0, group[0].1.severity.clone());
 
         let class = classify(
             window_start_instant,
             window_end_instant,
-            parse_instant(&sig.first_seen),
-            parse_instant(&sig.last_seen),
+            first_instant,
+            last_instant,
         );
         let change_class = match class {
             LogDeltaClass::New => "new_signature",
@@ -370,17 +436,29 @@ pub fn log_deltas(
             LogDeltaClass::OutOfRange => continue,
         };
 
-        // Per-window occurrence counts from linked buckets, when available.
-        let (occurrence_source, base_window, head_window) = match buckets_by_sig.get(id.as_str()) {
+        // Per-window occurrence counts from the group's linked buckets, deduped by
+        // bucket record ID so the same hour re-scanned twice (identical ID) counts
+        // once and distinct hours both count. Buckets are keyed on the shared
+        // signature ID, so the AGGREGATES index already unions across the group.
+        let (occurrence_source, base_window, head_window) = match buckets_by_sig.get(*id) {
             Some(buckets) if !buckets.is_empty() => {
-                let base_sum = base_instant.map(|bt| window_bucket_sum(buckets, bt));
-                let head_sum = head_instant.map(|ht| window_bucket_sum(buckets, ht));
+                let mut seen: BTreeSet<&str> = BTreeSet::new();
+                let deduped: Vec<(&str, u64)> = buckets
+                    .iter()
+                    .filter(|(bucket_id, _, _)| seen.insert(bucket_id))
+                    .map(|(_, start, count)| (*start, *count))
+                    .collect();
+                let base_sum = base_instant.map(|bt| window_bucket_sum(&deduped, bt));
+                let head_sum = head_instant.map(|ht| window_bucket_sum(&deduped, ht));
                 ("occurrence_buckets", base_sum, head_sum)
             }
             _ => ("aggregate_only", None, None),
         };
 
-        let mut resolved_frames = frames_by_sig.get(id.as_str()).cloned().unwrap_or_default();
+        // Resolved frames are keyed on the shared signature ID (issue #322), so
+        // the index already unions the group's frame targets; sort + dedupe makes
+        // the union deterministic and drops re-scanned duplicate frame edges.
+        let mut resolved_frames = frames_by_sig.get(*id).cloned().unwrap_or_default();
         resolved_frames.sort_by(|a, b| {
             a.frame_index
                 .cmp(&b.frame_index)
@@ -397,13 +475,13 @@ pub fn log_deltas(
         };
 
         let row = LogSignatureDelta {
-            record_id: id.clone(),
-            schema_version: *schema_version,
+            record_id: (*id).to_owned(),
+            schema_version,
             change_class,
-            severity: sig.severity.clone(),
-            first_seen: sig.first_seen.clone(),
-            last_seen: sig.last_seen.clone(),
-            occurrence_count: sig.occurrence_count,
+            severity,
+            first_seen,
+            last_seen,
+            occurrence_count,
             occurrence_source,
             base_window_occurrences: base_window,
             head_window_occurrences: head_window,
@@ -458,6 +536,48 @@ fn parse_instant(rfc3339: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(rfc3339)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Which end of a coalesced signature group's valid-time bounds to keep.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BoundKind {
+    /// The earliest bound (merged `first_seen`).
+    Earliest,
+    /// The latest bound (merged `last_seen`).
+    Latest,
+}
+
+/// Merges the valid-time bound across a coalesced signature group to the
+/// earliest or latest value by parsed UTC instant, returning the winning RFC
+/// 3339 string and its instant.
+///
+/// Comparison is by parsed instant, never raw RFC 3339 string order, for the
+/// same cross-offset reason as [`classify`] (Codex P1). Parseable values are
+/// preferred: a real timestamp always wins over an unparseable one, and only
+/// when nothing in the group parses does the lexically smallest/largest raw
+/// string win with a `None` instant (defensive — all values here originate from
+/// Egregore's own scanners and are parseable in practice). The input slice is
+/// non-empty by construction (a group exists only once a payload is pushed);
+/// the empty fallback is unreachable but deterministic.
+fn merge_bound(
+    values: &[(Option<DateTime<Utc>>, &str)],
+    kind: BoundKind,
+) -> (String, Option<DateTime<Utc>>) {
+    let parseable = values.iter().filter_map(|(dt, s)| dt.map(|d| (d, *s)));
+    let winner = match kind {
+        BoundKind::Earliest => parseable.min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1))),
+        BoundKind::Latest => parseable.max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1))),
+    };
+    if let Some((dt, s)) = winner {
+        return (s.to_owned(), Some(dt));
+    }
+    // Nothing parseable: deterministic lexical fallback over the raw strings.
+    let raw = values.iter().map(|(_, s)| *s);
+    let s = match kind {
+        BoundKind::Earliest => raw.min(),
+        BoundKind::Latest => raw.max(),
+    };
+    (s.unwrap_or_default().to_owned(), None)
 }
 
 /// Classifies one signature against the window from its `first_seen` /

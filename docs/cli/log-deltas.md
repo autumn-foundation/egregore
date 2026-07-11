@@ -94,11 +94,42 @@ carries no parseable timestamp cannot bound the window and is dropped from the
 derivation; if no range commit carries a parseable valid time the window is
 empty and every signature is excluded (never fabricated bounds).
 
+## Signature coalescing across scan-logs outputs
+
+`LogSource` is a **non-identity** input for signatures: a signature's stable
+record ID is derived from `(repository_id, fingerprint_algorithm, template,
+severity)` only. A graph that combines **multiple `scan-logs` outputs for the
+same repo** (e.g. logs captured on different days, each producing its own
+`ErrorSignature` for a recurring fingerprint) therefore carries the same
+signature record ID more than once, each copy with its own scan-local
+`first_seen` / `last_seen` / `occurrence_count`.
+
+`log-deltas` groups these records by stable signature ID and **merges them
+before classifying**, emitting exactly **one row per signature ID** — never
+split across conflicting classes. The merge is:
+
+- **`first_seen`** = the earliest across the group (by parsed instant);
+- **`last_seen`** = the latest across the group (by parsed instant);
+- **occurrence buckets** = the union of every copy's linked buckets, **deduped by
+  bucket record ID** so the same hour re-scanned twice counts once and distinct
+  hours both count (buckets are content-addressed on `signature_id +
+  bucket_start`);
+- **aggregate `occurrence_count`** = the sum of the group's per-scan counts.
+  Summing across **distinct** log sources is intended — each contributes its own
+  observations — but re-scanning the **identical** source degenerately
+  double-counts, so the bucket path (deduped by bucket ID) is the robust one.
+
+Without this coalescing a single stable signature could split — an earlier scan
+that observed it before the range landing in `ceased_signatures` while a later
+scan that first observed it in-range lands in `new_signatures` — and its
+occurrence counts would double. In a store built from a single `scan-logs`
+output this is moot (each signature ID appears once).
+
 ## Change classes
 
-Every in-scope `ErrorSignature` is classified against the window from its
-`first_seen` (`fs`) and `last_seen` (`ls`) valid times, into a **closed,
-mutually exclusive** set evaluated in this precedence:
+Every in-scope `ErrorSignature`, after coalescing, is classified against the
+window from its merged `first_seen` (`fs`) and `last_seen` (`ls`) valid times,
+into a **closed, mutually exclusive** set evaluated in this precedence:
 
 | Group | Class label | Condition | Meaning |
 |-------|-------------|-----------|---------|
@@ -131,7 +162,8 @@ range, never proof the change caused the failure.
 
 Per-window occurrence figures are computed from the signature's own hourly
 `LogOccurrenceBucket` records (issue #320), discovered through the `AGGREGATES`
-(bucket → signature) edges:
+(bucket → signature) edges and deduped by bucket record ID across the coalesced
+group (see [Signature coalescing](#signature-coalescing-across-scan-logs-outputs)):
 
 - `base_window_occurrences` = sum of linked bucket counts whose `bucket_start`
   is `<= commit_valid_time[BASE]`;

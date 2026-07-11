@@ -289,7 +289,13 @@ times are Z-normalized — a lexical comparison would misclassify across offsets
 scopes only the code side (commit/window resolution and the symbol-delta join): log records
 carry no retrievable repository attribution (the repo ID is only hashed into their stable
 IDs), so all in-window log signatures are always included and per-repository log separation
-requires per-repository stores. Exit codes and the error
+requires per-repository stores. Because `LogSource` is a non-identity input (a signature's
+stable ID is `(repository_id, fingerprint_algorithm, template, severity)` only), a graph
+combining multiple `scan-logs` outputs for one repo carries the same signature record ID more
+than once; those records are grouped by stable ID and merged BEFORE classifying — earliest
+`first_seen`, latest `last_seen` (by instant), buckets unioned and deduped by bucket record ID,
+aggregate `occurrence_count` summed — so exactly one row per signature ID is emitted, never
+split across conflicting classes. Exit codes and the error
 taxonomy mirror #118 exactly. Rows are regression LEADS, never proof this range caused the
 failure; a ceased signature is not proof of a fix; occurrence data only reflects scanned log
 sources. Read-only, redaction-safe (no raw log text), deterministic and byte-identical across

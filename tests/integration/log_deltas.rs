@@ -439,6 +439,113 @@ fn log_deltas_is_byte_stable_across_runs() {
 }
 
 // ---------------------------------------------------------------------------
+// Coalescing: a graph combining multiple scan-logs outputs for one repo carries
+// the SAME ErrorSignature record ID more than once. `LogSource` is a NON-identity
+// input for signatures — identity is (repo, fingerprint algorithm, template,
+// severity) — so a fingerprint re-observed in a second scan-logs output for the
+// same repo mints another ErrorSignature record with the SAME stable ID but its
+// own first_seen / last_seen / occurrence_count. log_deltas must group by record
+// ID and merge BEFORE classifying, emitting exactly ONE row per stable signature
+// ID, never split across conflicting classes.
+// ---------------------------------------------------------------------------
+
+/// Two `ErrorSignature` records with the SAME content-addressed record ID
+/// (identical seed → identical stable ID), as two `scan-logs` outputs for one
+/// repo produce: scan 1 observed the signature entirely BEFORE the `[T2, T3]`
+/// range window (alone → `ceased`); scan 2 first observed it INSIDE the window
+/// (alone → `new`). Buckets: an H1 hour before the window, an H2 hour inside it,
+/// and a re-scanned duplicate of H2 (identical bucket record ID → must dedupe to
+/// one). Merged bounds (earliest `first_seen`, latest `last_seen`) drive a
+/// single `ceased` classification.
+fn split_signature_records() -> Vec<GraphRecord> {
+    let sig = log_sig_id("split-boom");
+    let (h1_node, h1_edge) = bucket_with_edge(&sig, "2026-01-01T00:00:00Z", 3);
+    let (h2_node, h2_edge) = bucket_with_edge(&sig, NEW_BUCKET, 5);
+    // A second scan re-emits the identical H2 bucket: same content-addressed
+    // bucket record ID, so the deduped per-window count must include it once.
+    let (h2_dup_node, h2_dup_edge) = bucket_with_edge(&sig, NEW_BUCKET, 5);
+    vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        commit("c3sha0000", &["c2sha0000"], T3),
+        // Same seed → same stable ErrorSignature record ID, emitted twice.
+        error_signature(
+            "split-boom",
+            "error",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T05:00:00Z",
+            3,
+        ),
+        error_signature("split-boom", "error", NEW_FIRST, NEW_LAST, 5),
+        h1_node,
+        h1_edge,
+        h2_node,
+        h2_edge,
+        h2_dup_node,
+        h2_dup_edge,
+    ]
+}
+
+#[test]
+fn log_deltas_coalesces_split_signature_across_scan_outputs() {
+    let records = split_signature_records();
+    let deltas = log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+    let sig = log_sig_id("split-boom");
+
+    // (1) Exactly ONE row for the stable signature ID across all classes — never
+    // split into a `new` + `ceased` pair by iterating both node records.
+    let rows: Vec<&str> = deltas
+        .new_signatures
+        .iter()
+        .chain(&deltas.ceased_signatures)
+        .chain(&deltas.continuing_signatures)
+        .filter(|r| r.record_id == sig)
+        .map(|r| r.change_class)
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one row per stable signature ID, never split across classes (got {rows:?})"
+    );
+
+    // (2) Merged first_seen (earliest = before the window) → NOT `new`; merged
+    // last_seen (latest = before window_end) → `ceased`.
+    assert!(
+        deltas.new_signatures.iter().all(|r| r.record_id != sig),
+        "the merged signature must not classify as new"
+    );
+    assert_eq!(record_ids(&deltas.ceased_signatures), vec![sig.clone()]);
+    let row = &deltas.ceased_signatures[0];
+    assert_eq!(row.change_class, "ceased_signature");
+    assert_eq!(
+        row.first_seen, "2026-01-01T00:00:00Z",
+        "merged first_seen is the earliest across the group"
+    );
+    assert_eq!(
+        row.last_seen, NEW_LAST,
+        "merged last_seen is the latest across the group"
+    );
+
+    // (3) Deduped per-window bucket counts: the re-scanned H2 hour counts once.
+    assert_eq!(row.occurrence_source, "occurrence_buckets");
+    assert_eq!(
+        row.base_window_occurrences,
+        Some(3),
+        "only the H1 bucket is at/before the base endpoint (T1)"
+    );
+    assert_eq!(
+        row.head_window_occurrences,
+        Some(8),
+        "H1 (3) + H2 (5), the duplicate H2 deduped by bucket record ID"
+    );
+    // (4) Aggregate occurrence_count sums the two scan payloads.
+    assert_eq!(
+        row.occurrence_count, 8,
+        "aggregate count sums the group's per-scan occurrence counts"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Timezone-offset window: commit committer dates carry LOCAL offsets while log
 // valid times are Z-normalized (Codex P1). Classification and bucket cutoffs
 // must compare by parsed instant, not raw RFC 3339 string order.
