@@ -282,7 +282,13 @@ out-of-range and excluded from all three classes. Each `new_signatures` row join
 signature's `LogOccurrenceBucket` records via `AGGREGATES` edges (`base_window_occurrences`/
 `head_window_occurrences` = buckets at/before each endpoint's committer date); a signature
 with no linked buckets falls back to its aggregate `occurrence_count` with
-`occurrence_source: aggregate_only` — counts are never fabricated. All timestamp comparisons
+`occurrence_source: aggregate_only` — counts are never fabricated. Per-window bucket counts
+and the aggregate `occurrence_count` both SUM across all scanned sources: a
+`LogOccurrenceBucket` record ID is `(repository/signature/hour/width)` and omits `LogSource`,
+so distinct sources sharing a bucket ID are preserved by summing (never deduped by bucket ID);
+the symmetric cost is that concatenating the identical `scan-logs` output multiplies counts,
+so scan each source once (or use per-source stores). Fully source-attributed counts require
+source-aware bucket identity, a #320 schema change out of #326's scope, tracked in issue #361. All timestamp comparisons
 (window derivation, classification, bucket cutoffs) are by parsed UTC instant, never raw RFC
 3339 string order, because commit committer dates carry local offsets (`%cI`) while scan-logs
 times are Z-normalized — a lexical comparison would misclassify across offsets. `--repo`
@@ -293,8 +299,8 @@ requires per-repository stores. Because `LogSource` is a non-identity input (a s
 stable ID is `(repository_id, fingerprint_algorithm, template, severity)` only), a graph
 combining multiple `scan-logs` outputs for one repo carries the same signature record ID more
 than once; those records are grouped by stable ID and merged BEFORE classifying — earliest
-`first_seen`, latest `last_seen` (by instant), buckets unioned and deduped by bucket record ID,
-aggregate `occurrence_count` summed — so exactly one row per signature ID is emitted, never
+`first_seen`, latest `last_seen` (by instant), buckets summed across the group (not deduped by
+bucket record ID, per #361), aggregate `occurrence_count` summed — so exactly one row per signature ID is emitted, never
 split across conflicting classes. Exit codes and the error
 taxonomy mirror #118 exactly. Rows are regression LEADS, never proof this range caused the
 failure; a ceased signature is not proof of a fix; occurrence data only reflects scanned log

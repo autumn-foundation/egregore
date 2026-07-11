@@ -425,6 +425,46 @@ fn log_deltas_per_window_occurrences_from_buckets() {
 }
 
 #[test]
+fn log_deltas_sums_per_source_buckets_sharing_a_bucket_id() {
+    // Two DISTINCT scan-logs sources observe the same signature in the same hour
+    // inside the head window. `LogOccurrenceBucket` identity is
+    // (repository/signature/hour/width) and omits `LogSource` (see #361), so both
+    // sources mint the SAME bucket record ID with different per-source counts (3
+    // and 4). Per-window counts must SUM across sources (7) so they stay
+    // consistent with the aggregate `occurrence_count`, which already sums the
+    // coalesced signatures — deduping by bucket record ID would keep only one
+    // source's count and under-report.
+    let sig = log_sig_id("dual-source");
+    let (first_node, first_edge) = bucket_with_edge(&sig, NEW_BUCKET, 3);
+    let (second_node, second_edge) = bucket_with_edge(&sig, NEW_BUCKET, 4);
+    let records = vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        commit("c3sha0000", &["c2sha0000"], T3),
+        // Two scan outputs, each contributing its own per-source occurrence count.
+        error_signature("dual-source", "error", NEW_FIRST, NEW_LAST, 3),
+        error_signature("dual-source", "error", NEW_FIRST, NEW_LAST, 4),
+        first_node,
+        first_edge,
+        second_node,
+        second_edge,
+    ];
+    let deltas = log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+    assert_eq!(record_ids(&deltas.new_signatures), vec![sig]);
+    let row = &deltas.new_signatures[0];
+    assert_eq!(row.occurrence_source, "occurrence_buckets");
+    // The shared hour is after the base endpoint (T1) and at/before head (T3).
+    assert_eq!(row.base_window_occurrences, Some(0));
+    assert_eq!(
+        row.head_window_occurrences,
+        Some(7),
+        "distinct sources sharing a bucket record ID must SUM (3 + 4), not dedupe"
+    );
+    // Aggregate count sums the two per-source signature payloads, matching.
+    assert_eq!(row.occurrence_count, 7);
+}
+
+#[test]
 fn log_deltas_is_byte_stable_across_runs() {
     let records = synthetic_log_delta_records();
     let baseline = serde_json::to_string(
@@ -454,15 +494,19 @@ fn log_deltas_is_byte_stable_across_runs() {
 /// repo produce: scan 1 observed the signature entirely BEFORE the `[T2, T3]`
 /// range window (alone → `ceased`); scan 2 first observed it INSIDE the window
 /// (alone → `new`). Buckets: an H1 hour before the window, an H2 hour inside it,
-/// and a re-scanned duplicate of H2 (identical bucket record ID → must dedupe to
-/// one). Merged bounds (earliest `first_seen`, latest `last_seen`) drive a
-/// single `ceased` classification.
+/// and a re-scanned duplicate of H2 (identical bucket record ID). Per-window
+/// bucket counts SUM every linked bucket without deduping by record ID (#361) so
+/// distinct sources sharing a bucket ID are preserved; the symmetric cost is that
+/// this identical H2 rescan is counted twice. Merged bounds (earliest
+/// `first_seen`, latest `last_seen`) drive a single `ceased` classification.
 fn split_signature_records() -> Vec<GraphRecord> {
     let sig = log_sig_id("split-boom");
     let (h1_node, h1_edge) = bucket_with_edge(&sig, "2026-01-01T00:00:00Z", 3);
     let (h2_node, h2_edge) = bucket_with_edge(&sig, NEW_BUCKET, 5);
     // A second scan re-emits the identical H2 bucket: same content-addressed
-    // bucket record ID, so the deduped per-window count must include it once.
+    // bucket record ID. Per-window counts SUM every linked bucket (#361), so this
+    // identical rescan is counted again — the documented, symmetric cost of not
+    // deduping (which is what preserves distinct sources sharing a bucket ID).
     let (h2_dup_node, h2_dup_edge) = bucket_with_edge(&sig, NEW_BUCKET, 5);
     vec![
         commit("c1sha0000", &[], T1),
@@ -526,7 +570,8 @@ fn log_deltas_coalesces_split_signature_across_scan_outputs() {
         "merged last_seen is the latest across the group"
     );
 
-    // (3) Deduped per-window bucket counts: the re-scanned H2 hour counts once.
+    // (3) Summed per-window bucket counts (#361): every linked bucket is summed
+    // without deduping by record ID, so the re-scanned H2 hour is counted twice.
     assert_eq!(row.occurrence_source, "occurrence_buckets");
     assert_eq!(
         row.base_window_occurrences,
@@ -535,8 +580,8 @@ fn log_deltas_coalesces_split_signature_across_scan_outputs() {
     );
     assert_eq!(
         row.head_window_occurrences,
-        Some(8),
-        "H1 (3) + H2 (5), the duplicate H2 deduped by bucket record ID"
+        Some(13),
+        "H1 (3) + H2 (5) + duplicate H2 (5), summed without bucket-ID dedup"
     );
     // (4) Aggregate occurrence_count sums the two scan payloads.
     assert_eq!(

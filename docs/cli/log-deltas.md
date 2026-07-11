@@ -110,20 +110,27 @@ split across conflicting classes. The merge is:
 
 - **`first_seen`** = the earliest across the group (by parsed instant);
 - **`last_seen`** = the latest across the group (by parsed instant);
-- **occurrence buckets** = the union of every copy's linked buckets, **deduped by
-  bucket record ID** so the same hour re-scanned twice counts once and distinct
-  hours both count (buckets are content-addressed on `signature_id +
-  bucket_start`);
+- **occurrence buckets** = **every** linked bucket node, **summed** across the
+  group with **no dedup by bucket record ID** (see below);
 - **aggregate `occurrence_count`** = the sum of the group's per-scan counts.
-  Summing across **distinct** log sources is intended — each contributes its own
-  observations — but re-scanning the **identical** source degenerately
-  double-counts, so the bucket path (deduped by bucket ID) is the robust one.
+
+Both the per-window bucket counts and the aggregate `occurrence_count` **sum**
+across every scanned source. A `LogOccurrenceBucket` record ID is
+`(repository_id, signature_id, bucket_start, bucket_width)` and **omits
+`LogSource`**, so two **distinct** sources observing the same signature in the
+same hour mint the **same** bucket record ID with their own per-source counts.
+Summing (rather than deduping by bucket ID) preserves both sources and keeps the
+window counts consistent with the aggregate. The symmetric cost is that
+concatenating the **identical** `scan-logs` output multiplies counts (a
+degenerate, user-error input) — so **scan each source once**, or use
+per-source / per-repository stores. Fully source-attributed counts require
+source-aware bucket identity, a log-graph (#320) schema change out of this
+command's scope, tracked in **issue #361**.
 
 Without this coalescing a single stable signature could split — an earlier scan
 that observed it before the range landing in `ceased_signatures` while a later
-scan that first observed it in-range lands in `new_signatures` — and its
-occurrence counts would double. In a store built from a single `scan-logs`
-output this is moot (each signature ID appears once).
+scan that first observed it in-range lands in `new_signatures`. In a store built
+from a single `scan-logs` output this is moot (each signature ID appears once).
 
 ## Change classes
 
@@ -162,8 +169,12 @@ range, never proof the change caused the failure.
 
 Per-window occurrence figures are computed from the signature's own hourly
 `LogOccurrenceBucket` records (issue #320), discovered through the `AGGREGATES`
-(bucket → signature) edges and deduped by bucket record ID across the coalesced
-group (see [Signature coalescing](#signature-coalescing-across-scan-logs-outputs)):
+(bucket → signature) edges and **summed** across the coalesced group with **no
+dedup by bucket record ID** — so distinct sources sharing a bucket ID are
+preserved and the window counts stay consistent with the aggregate
+`occurrence_count` (see
+[Signature coalescing](#signature-coalescing-across-scan-logs-outputs) for the
+identical-rescan caveat and issue #361):
 
 - `base_window_occurrences` = sum of linked bucket counts whose `bucket_start`
   is `<= commit_valid_time[BASE]`;

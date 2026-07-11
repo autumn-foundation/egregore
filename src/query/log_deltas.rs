@@ -63,14 +63,25 @@
 //!
 //! Per-window occurrence counts are computed from the signature's own
 //! `LogOccurrenceBucket` records, discovered through the `AGGREGATES`
-//! (bucket → signature) edges (issue #320) and deduped by bucket record ID
-//! across the coalesced group (the same hour re-scanned twice counts once). For
-//! a signature with at least one linked bucket:
+//! (bucket → signature) edges (issue #320). For a signature with at least one
+//! linked bucket:
 //!
 //! * `base_window_occurrences` = sum of bucket counts whose `bucket_start`
 //!   is `<= commit_valid_time[base]`;
 //! * `head_window_occurrences` = sum of bucket counts whose `bucket_start`
 //!   is `<= commit_valid_time[head]`.
+//!
+//! These per-window counts SUM every linked bucket across the coalesced group
+//! and are never deduped by bucket record ID (issue #361). A `LogOccurrenceBucket`
+//! record ID is `(repository/signature/hour/width)` and omits `LogSource`, so two
+//! DISTINCT scan-logs sources observing the same signature in the same hour mint
+//! the SAME bucket record ID with their own per-source counts; summing preserves
+//! both sources and keeps these counts consistent with the aggregate
+//! `occurrence_count`, which likewise sums the coalesced signatures. The symmetric
+//! cost is that concatenating the IDENTICAL scan-logs output multiplies counts (a
+//! degenerate, user-error input) — scan each source once, or use per-source
+//! stores. Fully source-attributed counts require source-aware bucket identity, a
+//! #320 log-graph schema change out of #326's scope (tracked in #361).
 //!
 //! When a signature carries no linked buckets (e.g. a log graph ingested
 //! without buckets), per-window bucketization is unavailable: the two window
@@ -299,16 +310,12 @@ pub fn log_deltas(
         symbol_delta_class.insert(item.record_id, item.change_class);
     }
 
-    // ── Node-by-ID index + per-signature bucket / frame indices ──────────────
-    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
-
-    // signature_id → linked (bucket_id, bucket_start, occurrence_count) triples,
-    // via AGGREGATES (bucket → signature) edges (issue #320). The bucket record
-    // ID is retained so buckets can be deduped by identity before summing: a
-    // graph combining multiple scan-logs outputs for one repo can re-emit the
-    // same hour bucket (identical content-addressed ID) from each scan, and that
-    // hour must count once, not once per scan.
-    let mut buckets_by_sig: BTreeMap<&str, Vec<(&str, &str, u64)>> = BTreeMap::new();
+    // ── Per-signature bucket / frame indices ─────────────────────────────────
+    // bucket_id → the set of signature IDs it AGGREGATES to (issue #320). Targets
+    // are deduped per bucket ID so a rescan's duplicate edge cannot inflate the
+    // link set; per-source COUNTS are preserved by iterating bucket NODES below,
+    // not by counting edges.
+    let mut bucket_targets: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     // signature_id → resolved-frame handles, via FRAME_RESOLVES_TO edges (#322).
     let mut frames_by_sig: BTreeMap<&str, Vec<ResolvedFrameHandle>> = BTreeMap::new();
     for r in records {
@@ -325,18 +332,10 @@ pub fn log_deltas(
                 EdgeLabel::Aggregates => {
                     // No `in_scope` gate: the target is a log signature, which
                     // carries no retrievable repository attribution (Codex P2).
-                    if let Some(GraphRecord::Node {
-                        log: Some(payload), ..
-                    }) = by_id.get(source.as_str())
-                    {
-                        if let LogPayload::LogOccurrenceBucket(bucket) = payload.as_ref() {
-                            buckets_by_sig.entry(target.as_str()).or_default().push((
-                                source.as_str(),
-                                bucket.bucket_start.as_str(),
-                                bucket.occurrence_count,
-                            ));
-                        }
-                    }
+                    bucket_targets
+                        .entry(source.as_str())
+                        .or_default()
+                        .insert(target.as_str());
                 }
                 EdgeLabel::FrameResolvesTo => {
                     // No `in_scope` gate: the source is a log signature, which
@@ -352,6 +351,36 @@ pub fn log_deltas(
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    // signature_id → linked (bucket_start, occurrence_count) pairs, ONE entry per
+    // bucket NODE record (issue #361). A `LogOccurrenceBucket` record ID is
+    // (repository/signature/hour/width) and omits `LogSource`, so two DISTINCT
+    // scan-logs sources observing the same signature in the same hour emit
+    // separate bucket nodes that share a bucket record ID. Iterating NODES here —
+    // rather than resolving edges through a by-ID index that would collapse those
+    // duplicates, or deduping by bucket ID — preserves each source's own count and
+    // keeps the window sums consistent with the summed aggregate `occurrence_count`.
+    // The symmetric cost is that an identical rescanned source's duplicate bucket
+    // node is counted again (a degenerate, user-error input); source-aware bucket
+    // identity is the true fix, out of #326's scope (tracked in #361).
+    let mut buckets_by_sig: BTreeMap<&str, Vec<(&str, u64)>> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Node {
+            log: Some(payload), ..
+        } = r
+        {
+            if let LogPayload::LogOccurrenceBucket(bucket) = payload.as_ref() {
+                if let Some(sigs) = bucket_targets.get(r.id()) {
+                    for sig in sigs {
+                        buckets_by_sig
+                            .entry(*sig)
+                            .or_default()
+                            .push((bucket.bucket_start.as_str(), bucket.occurrence_count));
+                    }
+                }
             }
         }
     }
@@ -436,20 +465,20 @@ pub fn log_deltas(
             LogDeltaClass::OutOfRange => continue,
         };
 
-        // Per-window occurrence counts from the group's linked buckets, deduped by
-        // bucket record ID so the same hour re-scanned twice (identical ID) counts
-        // once and distinct hours both count. Buckets are keyed on the shared
-        // signature ID, so the AGGREGATES index already unions across the group.
+        // Per-window occurrence counts SUM every linked bucket at/before the
+        // endpoint, WITHOUT deduping by bucket record ID (issue #361). Bucket
+        // identity is (repository/signature/hour/width) and omits `LogSource`, so
+        // two DISTINCT scan-logs sources observing the same signature in the same
+        // hour mint the SAME bucket record ID with their own per-source counts;
+        // summing preserves both sources and keeps these counts consistent with
+        // the aggregate `occurrence_count`, which already sums the coalesced
+        // signatures. The symmetric cost is that concatenating the IDENTICAL
+        // scan-logs output multiplies counts (a degenerate, user-error input);
+        // source-aware bucket identity is the true fix, tracked in #361.
         let (occurrence_source, base_window, head_window) = match buckets_by_sig.get(*id) {
             Some(buckets) if !buckets.is_empty() => {
-                let mut seen: BTreeSet<&str> = BTreeSet::new();
-                let deduped: Vec<(&str, u64)> = buckets
-                    .iter()
-                    .filter(|(bucket_id, _, _)| seen.insert(bucket_id))
-                    .map(|(_, start, count)| (*start, *count))
-                    .collect();
-                let base_sum = base_instant.map(|bt| window_bucket_sum(&deduped, bt));
-                let head_sum = head_instant.map(|ht| window_bucket_sum(&deduped, ht));
+                let base_sum = base_instant.map(|bt| window_bucket_sum(buckets, bt));
+                let head_sum = head_instant.map(|ht| window_bucket_sum(buckets, ht));
                 ("occurrence_buckets", base_sum, head_sum)
             }
             _ => ("aggregate_only", None, None),
