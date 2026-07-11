@@ -816,6 +816,111 @@ fn log_deltas_repo_scope_keeps_log_signatures() {
     );
 }
 
+/// A synthetic second `Repository` node with a distinct identity, so a shared
+/// store carries more than one repository for the multi-repo caveat elevation.
+fn extra_repository(seed: &str) -> GraphRecord {
+    GraphRecord::node(
+        stable_id(&["node", "Repository", seed]),
+        NodeKind::Repository,
+        None,
+        None,
+        Some(seed.to_owned()),
+        format!("Repository {seed}"),
+    )
+}
+
+#[test]
+fn log_deltas_repo_scope_discloses_unfiltered_logs_and_elevates_for_multi_repo() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let [first, _second, third] = seed_repo(&repo);
+    let (mut records, _tweaked_id) = augmented_records(&repo);
+
+    let repo_id = records
+        .iter()
+        .find_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::Repository,
+                ..
+            } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("scan-history should emit a Repository node");
+    let base_prefix = &first[..12];
+
+    // Unscoped queries carry NO caveat — the field is absent.
+    let unscoped =
+        log_deltas(&records, base_prefix, &third, None).expect("unscoped range should resolve");
+    assert!(
+        unscoped.repo_scope_caveat.is_none(),
+        "unscoped log-deltas must not carry a repo-scope caveat"
+    );
+
+    // Single-repository store, `--repo` set: caveat present-but-benign.
+    let single = log_deltas(&records, base_prefix, &third, Some(&repo_id))
+        .expect("scoped single-repo range should resolve");
+    let caveat = single
+        .repo_scope_caveat
+        .as_ref()
+        .expect("a scoped query must disclose that logs are unfiltered");
+    assert_eq!(caveat.repo_scope, repo_id);
+    assert_eq!(caveat.distinct_repository_count, 1);
+    assert!(!caveat.multi_repository_store);
+    assert!(
+        caveat.message.contains("NOT repository-filtered"),
+        "the caveat must state log signatures are not repository-filtered"
+    );
+    assert!(
+        caveat.message.contains("single repository"),
+        "single-repo caveat must note the store holds one repository"
+    );
+
+    // Shared multi-repository store: append a distinct second `Repository` node.
+    // The repo-B signature whose `first_seen` lands in repo-A's window is still
+    // classified under `--repo A` (logs are unfiltered) — and the caveat is now
+    // ELEVATED, naming the distinct repository count and the multi-repo bleed.
+    records.push(extra_repository("other-repo"));
+    records.push(error_signature(
+        "repo-b-boom",
+        "error",
+        NEW_FIRST,
+        NEW_LAST,
+        7,
+    ));
+
+    let multi = log_deltas(&records, base_prefix, &third, Some(&repo_id))
+        .expect("scoped multi-repo range should resolve");
+    // The unrelated repo-B signature is included despite `--repo A` (unfiltered).
+    let repo_b_id = log_sig_id("repo-b-boom");
+    assert!(
+        record_ids(&multi.new_signatures).contains(&repo_b_id.as_str()),
+        "an unrelated repository's in-window signature must still be classified \
+         because logs are not repository-filtered"
+    );
+    let elevated = multi
+        .repo_scope_caveat
+        .as_ref()
+        .expect("a scoped query over a multi-repo store must disclose the caveat");
+    assert_eq!(
+        elevated.distinct_repository_count, 2,
+        "the caveat must name the distinct repository count"
+    );
+    assert!(
+        elevated.multi_repository_store,
+        "a store with two repositories must elevate the caveat"
+    );
+    assert!(
+        elevated.message.contains("MULTIPLE repositories"),
+        "the elevated caveat must name the multi-repository condition"
+    );
+    assert!(
+        elevated.message.contains("NOT repository-filtered"),
+        "the elevated caveat must still state logs are not repository-filtered"
+    );
+}
+
 #[test]
 fn query_log_deltas_cli_is_deterministic_and_redaction_safe() {
     let temp = tempfile::tempdir().expect("temp dir should be created");

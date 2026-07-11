@@ -295,7 +295,11 @@ times are Z-normalized — a lexical comparison would misclassify across offsets
 scopes only the code side (commit/window resolution and the symbol-delta join): log records
 carry no retrievable repository attribution (the repo ID is only hashed into their stable
 IDs), so all in-window log signatures are always included and per-repository log separation
-requires per-repository stores. Because `LogSource` is a non-identity input (a signature's
+requires per-repository stores. Whenever `--repo` is set the response envelope discloses this
+in a machine-readable `repo_scope_caveat` field (log signatures are NOT repository-filtered),
+elevated with the distinct `Repository` count when the store holds more than one repository —
+exactly when cross-repository log bleed can occur; the schema-level fix that would let `--repo`
+filter log signatures is tracked in #362. Because `LogSource` is a non-identity input (a signature's
 stable ID is `(repository_id, fingerprint_algorithm, template, severity)` only), a graph
 combining multiple `scan-logs` outputs for one repo carries the same signature record ID more
 than once; those records are grouped by stable ID and merged BEFORE classifying — earliest

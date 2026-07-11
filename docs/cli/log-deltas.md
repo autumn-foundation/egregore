@@ -49,6 +49,21 @@ signature and returned empty groups even for the correct repository.) In a
 single-repository store this distinction is moot. To keep log domains cleanly
 separated, keep each repository's logs in its own store.
 
+Because a scoped run over a shared multi-repository store can therefore surface
+an unrelated repository's signature as if it were repo-scoped, the response
+**envelope discloses this in a machine-readable field** rather than only in the
+docs. Whenever `--repo` is set, the response carries a `repo_scope_caveat`
+object stating that log signatures are **not** repository-filtered
+(`repo_scope`, `distinct_repository_count`, `multi_repository_store`, and a fixed
+`message`). When the store holds more than one distinct `Repository` node the
+caveat is **elevated** — `multi_repository_store: true` and the message names the
+multi-repository condition — because that is exactly when cross-repository log
+bleed can occur; a single-repository store carries the same field present but
+benign. The field is omitted entirely for unscoped queries and is deterministic
+(fixed strings, no wall clock). The schema-level fix — persisting repository
+attribution on log records so `--repo` can soundly filter log signatures and the
+caveat can be dropped — is tracked in issue #362.
+
 ## Shortest offline workflow
 
 ```sh

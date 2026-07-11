@@ -100,7 +100,9 @@ use chrono::{DateTime, Utc};
 
 use super::RepositoryIndex;
 use super::deltas::{RangeDeltasError, resolve_commit_range};
-use crate::ir::{EdgeLabel, ErrorSignaturePayload, GraphRecord, LogPayload, NodeKind};
+use crate::ir::{
+    EdgeLabel, ErrorSignaturePayload, GraphRecord, LogPayload, NodeKind, parse_codegraph_id,
+};
 
 /// Always-present advisory label for [`log_deltas`] responses.
 pub const LOG_DELTAS_DISCLAIMER: &str = "Rows are runtime error-signature observations classified \
@@ -108,6 +110,56 @@ pub const LOG_DELTAS_DISCLAIMER: &str = "Rows are runtime error-signature observ
      regression LEAD, not proof this range caused it; a ceased signature is not proof of a fix; \
      occurrence data only reflects the log sources that were scanned (a sampling artifact), never \
      the complete runtime behavior of the system.";
+
+/// Envelope caveat text emitted with `--repo` when the store holds a SINGLE
+/// repository — present-but-benign, since no cross-repository log signatures can
+/// exist to bleed in.
+pub const LOG_REPO_SCOPE_SINGLE_CAVEAT: &str = "`--repo` scopes only the code side (commit/window \
+     resolution and the symbol-delta join). Log signatures are NOT repository-filtered: log records \
+     carry no retrievable repository attribution (the repository ID is only hashed into their \
+     stable IDs), so every in-window signature is classified regardless of `--repo`. This store \
+     holds a single repository, so no other repository's log signatures can be included. Use \
+     per-repository stores for log isolation.";
+
+/// Envelope caveat text emitted with `--repo` when the store holds MORE THAN ONE
+/// repository — the elevated case.
+///
+/// This is exactly when cross-repository log bleed can occur, since an unrelated
+/// repository's in-window signature is reported here as if scoped.
+pub const LOG_REPO_SCOPE_MULTI_CAVEAT: &str = "`--repo` scopes only the code side (commit/window \
+     resolution and the symbol-delta join). Log signatures are NOT repository-filtered: log records \
+     carry no retrievable repository attribution (the repository ID is only hashed into their \
+     stable IDs), so every in-window signature is classified regardless of `--repo`. This store \
+     holds MULTIPLE repositories, so in-window log signatures from OTHER repositories may be \
+     reported here as if scoped to this one. Use per-repository stores for log isolation.";
+
+/// Advisory disclosure attached to a [`LogDeltas`] response whenever `--repo`
+/// scopes the query, stating that log signatures are never repository-filtered.
+///
+/// `--repo` scopes only the CODE side (commit/window resolution and the
+/// symbol-delta join). Because log records carry no retrievable repository
+/// attribution, every in-window signature is always classified regardless of
+/// `--repo`; the query cannot separate one repository's log signatures from
+/// another's. This field surfaces that limitation in the machine-readable
+/// envelope (not only the docs), and is ELEVATED when the store actually holds
+/// more than one distinct `Repository` node — exactly the condition under which
+/// an unrelated repository's signature can bleed into a scoped answer. It is
+/// present only when `--repo` is set; single- and multi-repository stores both
+/// carry it, differing only in `multi_repository_store` and `message`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LogRepoScopeCaveat {
+    /// The repository selector that was applied to the code side.
+    pub repo_scope: String,
+    /// Number of distinct repositories present in the store (schema-version
+    /// duplicates of one repository collapsed). `> 1` is exactly when
+    /// cross-repository log bleed can occur.
+    pub distinct_repository_count: usize,
+    /// True when the store holds more than one distinct repository.
+    pub multi_repository_store: bool,
+    /// Fixed advisory text: [`LOG_REPO_SCOPE_SINGLE_CAVEAT`] for a single-repo
+    /// store, [`LOG_REPO_SCOPE_MULTI_CAVEAT`] (elevated) for a multi-repo store.
+    pub message: &'static str,
+}
 
 /// The valid-time window a [`LogDeltas`] response classifies against, derived
 /// from the committer dates of the commits in the resolved range.
@@ -197,6 +249,11 @@ pub struct LogDeltas {
     pub range_commit_count: usize,
     /// Always-present advisory disclaimer ([`LOG_DELTAS_DISCLAIMER`]).
     pub disclaimer: &'static str,
+    /// Repository-scope caveat, present only when `--repo` is set (issue #326
+    /// follow-on): log signatures are never repository-filtered — see
+    /// [`LogRepoScopeCaveat`]. Absent (omitted from JSON) for unscoped queries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_scope_caveat: Option<LogRepoScopeCaveat>,
     /// Signatures first observed inside the window (the regression signal).
     pub new_signatures: Vec<LogSignatureDelta>,
     /// Signatures that existed before the range and went silent by its end.
@@ -252,8 +309,19 @@ pub fn log_deltas(
     // signatures by `--repo` would therefore drop EVERY signature and return
     // empty groups even for the correct repository (Codex P2). Because log nodes
     // cannot be attributed, `--repo` scopes only the code side (commit/window
-    // resolution and the symbol-delta join); all log signatures are included and
-    // this limitation is documented in `docs/cli/log-deltas.md`.
+    // resolution and the symbol-delta join); all log signatures are included.
+    //
+    // A scoped run over a SHARED multi-repository store can consequently surface
+    // an unrelated repository's in-window signature as if it were repo-scoped
+    // (Codex P2, `src/query/log_deltas.rs:421`). We DIAGNOSE rather than reject:
+    // rejecting `--repo` when logs are present would break the common
+    // single-repository store, where including every signature is correct.
+    // Instead the response envelope carries `repo_scope_caveat` whenever `--repo`
+    // is set, disclosing that logs are unfiltered and ELEVATING the message when
+    // the store holds more than one distinct `Repository` node (see the caveat
+    // construction near the return). The schema-level fix — persisting repository
+    // attribution on log records — is tracked in issue #362. This limitation is
+    // documented in `docs/cli/log-deltas.md`.
     let repo_index = repo_scope.map(|_| RepositoryIndex::build(records));
     let in_scope = |id: &str| -> bool {
         match (repo_scope, repo_index.as_ref()) {
@@ -538,6 +606,32 @@ pub fn log_deltas(
         });
     }
 
+    // Repository-scope caveat: whenever `--repo` is set, disclose in the
+    // envelope that log signatures are NOT repository-filtered (they carry no
+    // retrievable attribution), and ELEVATE the message when the store actually
+    // holds more than one distinct repository — the only condition under which an
+    // unrelated repository's signature can bleed into this scoped answer. The
+    // count collapses schema-version duplicates of one repository, mirroring the
+    // `RepositoryIndex` version remap. Deterministic: fixed strings, no wall
+    // clock. See docs/cli/log-deltas.md and the follow-up tracking issue.
+    let repo_scope_caveat = match (repo_scope, repo_index.as_ref()) {
+        (Some(scope), Some(index)) => {
+            let distinct_repository_count = distinct_repository_count(index);
+            let multi_repository_store = distinct_repository_count > 1;
+            Some(LogRepoScopeCaveat {
+                repo_scope: scope.to_owned(),
+                distinct_repository_count,
+                multi_repository_store,
+                message: if multi_repository_store {
+                    LOG_REPO_SCOPE_MULTI_CAVEAT
+                } else {
+                    LOG_REPO_SCOPE_SINGLE_CAVEAT
+                },
+            })
+        }
+        _ => None,
+    };
+
     Ok(LogDeltas {
         base: base_sha,
         head: head_sha,
@@ -547,10 +641,31 @@ pub fn log_deltas(
         },
         range_commit_count: range.range_commit_shas.len(),
         disclaimer: LOG_DELTAS_DISCLAIMER,
+        repo_scope_caveat,
         new_signatures,
         ceased_signatures,
         continuing_signatures,
     })
+}
+
+/// Counts the distinct repositories a [`RepositoryIndex`] knows, collapsing the
+/// schema-version duplicates of one repository into a single count.
+///
+/// A repository re-scanned under a newer schema version mints a new
+/// `Repository` record whose stable-ID suffix (identity) is unchanged; grouping
+/// by that suffix mirrors the index's own highest-version remap so a versioned
+/// re-scan is not miscounted as two repositories. An ID that does not parse as a
+/// code-graph handle counts as its own distinct repository (defensive — real
+/// `Repository` IDs are always code-graph handles).
+fn distinct_repository_count(index: &RepositoryIndex) -> usize {
+    let mut identities: BTreeSet<String> = BTreeSet::new();
+    for id in index.repository_ids() {
+        match parse_codegraph_id(id) {
+            Some((_, suffix)) => identities.insert(suffix.to_owned()),
+            None => identities.insert(id.to_owned()),
+        };
+    }
+    identities.len()
 }
 
 /// Parses an RFC 3339 timestamp to a UTC instant for ordering, or `None` when it
