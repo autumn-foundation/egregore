@@ -1055,8 +1055,19 @@ pub struct CoverageSubstantiation {
     pub review_id: String,
     /// The merged-in-window PR (edge target) record ID.
     pub pr_id: String,
-    /// The approving review's resolved valid time (stamped onto the edge).
+    /// The approving review's resolved valid time. This is a CITED field —
+    /// legitimate evidence of WHEN the review was submitted — but it may be
+    /// BEFORE the reporting window `from` (a pre-window approval that gated a
+    /// merge inside the window, Codex Finding A). It is therefore NOT used to
+    /// stamp the coverage edge's window-relevant valid time; it is preserved as
+    /// the edge's cited `author_time`.
     pub review_valid_time: String,
+    /// The covered PR's `merged_at` — guaranteed parseable and inside the
+    /// reporting window (the PR is in the merged-in-window set). This is the
+    /// window-relevant valid time stamped onto the coverage edge / section row so
+    /// `verify_pack`'s Window-consistency check holds even when the approving
+    /// review was submitted before the window (Codex Finding A).
+    pub merged_at: String,
 }
 
 /// The shared review-coverage derivation output (issue #339, AC7).
@@ -1425,15 +1436,28 @@ fn is_approving_review(record: &GraphRecord) -> bool {
 /// is genuine, not fabricated. The stamped edge then flows through the ordinary
 /// scrub/hash/section pipeline like any other record, passing `verify_pack`'s
 /// window-consistency, integrity, and manifest-count checks with no special case.
-fn stamp_edge_valid_time(mut edge: GraphRecord, valid_time: &str) -> GraphRecord {
+/// Stamps a coverage `REFERENCES_TASK` edge with its window-relevant valid time.
+///
+/// The edge represents the COVERAGE of a PR that merged inside the reporting
+/// window, so its window-relevant `valid_time` is the PR's in-window `merged_at`
+/// — never the approving review's own valid time, which for a pre-window approval
+/// (Codex Finding A) is BEFORE the window `from` and would push the section row
+/// outside `[from, to)`, failing `verify_pack`'s Window-consistency check. The
+/// approving review's valid time is legitimate evidence and is preserved as the
+/// edge's cited `author_time`.
+fn stamp_edge_valid_time(
+    mut edge: GraphRecord,
+    merged_at: &str,
+    review_valid_time: &str,
+) -> GraphRecord {
     if let GraphRecord::Edge { temporal, .. } = &mut edge {
         *temporal = Some(TemporalMetadata {
             git_commit: String::new(),
             git_parent_commits: Vec::new(),
-            valid_time: valid_time.to_owned(),
-            author_time: None,
-            observed_at: valid_time.to_owned(),
-            valid_time_source: Some("approving_review_valid_time".to_owned()),
+            valid_time: merged_at.to_owned(),
+            author_time: Some(review_valid_time.to_owned()),
+            observed_at: merged_at.to_owned(),
+            valid_time_source: Some("pr_merged_at".to_owned()),
         });
     }
     edge
@@ -1726,6 +1750,9 @@ pub fn derive_review_coverage(
                     review_id: link.review_id.to_owned(),
                     pr_id: pr_id.clone(),
                     review_valid_time: link.review_valid_time.clone(),
+                    // Every covered PR is in `merged_pr_ids`, so its `merged_at`
+                    // is present, parseable, and in-window.
+                    merged_at: merged_at.clone().unwrap_or_default(),
                 });
             }
         } else if links.is_empty() {
@@ -2033,17 +2060,23 @@ pub fn assemble_pack(
     let approving_targets: BTreeSet<String> = derivation.any_approving_pr_ids.clone();
 
     // Rebuild the coverage-substantiating link edges (each stamped with its
-    // approving review's valid time) and their deduped source review nodes from
-    // the shared derivation. Co-located in the `review_coverage` section so
-    // `verify_pack` resolves every coverage edge's source offline even when the
-    // catalog maps no `reviews` section (Codex round-18 Finding 2).
+    // covered PR's in-window `merged_at` as the window-relevant valid time, with
+    // the approving review's valid time preserved as the cited `author_time` —
+    // Codex Finding A) and their deduped source review nodes from the shared
+    // derivation. Co-located in the `review_coverage` section so `verify_pack`
+    // resolves every coverage edge's source offline even when the catalog maps no
+    // `reviews` section (Codex round-18 Finding 2).
     let by_id_pack: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
     let mut coverage_link_edges: Vec<GraphRecord> = Vec::new();
     let mut coverage_review_nodes: BTreeMap<String, GraphRecord> = BTreeMap::new();
     for sub in &derivation.coverage_substantiations {
         if let Some(edge) = by_id_pack.get(sub.edge_id.as_str()) {
+            // Stamp the edge's window-relevant valid time from the PR's in-window
+            // `merged_at` (Codex Finding A); the pre-window-eligible review valid
+            // time is preserved as the edge's cited `author_time`.
             coverage_link_edges.push(stamp_edge_valid_time(
                 (*edge).clone(),
+                &sub.merged_at,
                 &sub.review_valid_time,
             ));
         }
@@ -2170,6 +2203,7 @@ pub fn assemble_pack(
         window,
         &merged_pr_ids,
         &approving_targets,
+        &derivation.coverage_substantiations,
         &mut diagnostics,
     );
 
@@ -2394,6 +2428,7 @@ fn derive_gaps(
     window: &Window,
     merged_pr_ids: &[String],
     approving_targets: &BTreeSet<String>,
+    coverage_substantiations: &[CoverageSubstantiation],
     diagnostics: &mut Vec<PackDiagnostic>,
 ) -> Vec<GapRow> {
     let mut gaps: Vec<GapRow> = Vec::new();
@@ -2506,47 +2541,37 @@ fn derive_gaps(
                 || matches!(r, GraphRecord::Edge { label, .. } if label.as_str() == "REVIEWS_COMMIT")
         });
         if facts_available {
-            let merged_set: BTreeSet<&str> = merged_pr_ids.iter().map(String::as_str).collect();
-            for record in records {
-                let GraphRecord::Edge {
-                    label,
-                    source,
-                    target,
-                    ..
-                } = record
-                else {
+            // Drive the #334 gap derivation from the SAME approving-review set the
+            // coverage derivation produced (`coverage_substantiations`), never a
+            // re-derivation with a different filter (Codex Finding B). Coverage now
+            // counts a pre-window approval that gated an in-window merge (its
+            // position relative to `[from, to)` is irrelevant; only the
+            // at-or-before-`merged_at` gate applies), so requiring the review to be
+            // in-window HERE would skip the #334 defect of exactly those approvals,
+            // leaving a pack with passing coverage but no #334 gap at period
+            // boundaries. Consuming the substantiations makes coverage and gaps
+            // structurally unable to diverge: every counted approving review is
+            // checked for its #334 anchor, and only those.
+            for sub in coverage_substantiations {
+                let Some(review) = by_id.get(sub.review_id.as_str()) else {
                     continue;
                 };
-                if label.as_str() != "REFERENCES_TASK" || !merged_set.contains(target.as_str()) {
-                    continue;
-                }
-                let Some(task) = by_id.get(target.as_str()) else {
+                let Some(task) = by_id.get(sub.pr_id.as_str()) else {
                     continue;
                 };
-                let Some(merged_at) = merged_pr_merge_time(task).and_then(parse_rfc3339) else {
-                    continue;
-                };
-                let Some(review) = by_id.get(source.as_str()) else {
-                    continue;
-                };
-                if !is_approving_review(review) {
-                    continue;
-                }
-                let Some(review_vt) = resolve_valid_time(review) else {
-                    continue;
-                };
-                if !(in_window(&review_vt, window)
-                    && parse_rfc3339(&review_vt).is_some_and(|rt| rt <= merged_at))
-                {
-                    continue;
-                }
-                let mut record_ids = vec![review.id().to_owned(), (*target).clone()];
+                let mut record_ids = vec![sub.review_id.clone(), sub.pr_id.clone()];
                 record_ids.sort();
                 match (review_commit_sha_of(review), pr_head_sha(task)) {
                     (None, _) => gaps.push(GapRow {
                         gap_class: GapClass::ReviewUnanchoredNoCommitSha.as_wire().to_owned(),
                         record_ids,
-                        valid_time: Some(review_vt.clone()),
+                        // The gap's window-relevant timestamp is the covered PR's
+                        // in-window `merged_at` (Codex Finding A/B): a pre-window
+                        // review valid time would place the gap outside `[from,
+                        // to)`, so a consumer filtering gaps by the manifest window
+                        // would drop it — inconsistent with the in-window coverage
+                        // it mirrors.
+                        valid_time: Some(sub.merged_at.clone()),
                         detail: "approving review references a merged pull request but \
                                  carries no review_commit_sha anchor"
                             .to_owned(),
@@ -2554,7 +2579,7 @@ fn derive_gaps(
                     (Some(rcs), Some(head)) if rcs != head => gaps.push(GapRow {
                         gap_class: GapClass::ApprovalPrecedesFinalHead.as_wire().to_owned(),
                         record_ids,
-                        valid_time: Some(review_vt.clone()),
+                        valid_time: Some(sub.merged_at.clone()),
                         detail: "approving review anchored to a commit other than the pull \
                                  request's final head (approval precedes final head)"
                             .to_owned(),
@@ -3295,9 +3320,49 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
     };
     if let Some((from, to)) = window_bounds {
         'window: for section in &pack.sections {
+            // In the `review_coverage` section, a co-located approving-review NODE
+            // is a SOURCE-RESOLUTION aid for its coverage edge (round-18 Finding
+            // 2), not independently-windowed evidence. Its own valid time is
+            // legitimately BEFORE `from` when the approval preceded a merge inside
+            // the window (Codex Finding A): a pre-window approval that gated an
+            // in-window merge. Such a node cannot be re-stamped without falsifying
+            // its genuine review time, so its window relevance is carried by its
+            // coverage edge — which IS stamped with the in-window `merged_at` and
+            // is itself window-checked below. This exemption is TIGHTLY BOUNDED to
+            // the exact shape the Integrity membership check already admits (an
+            // approving review sourcing an included coverage edge), and the upper
+            // bound (`< to`) is still enforced, so the window check stays strict:
+            // no arbitrary out-of-window row is admitted, and Integrity separately
+            // proves each such review's valid time is at or before its target's
+            // in-window `merged_at`.
+            let coverage_edge_sources: BTreeSet<&str> =
+                if section.class == EvidenceClass::ReviewCoverage.as_wire() {
+                    section
+                        .records
+                        .iter()
+                        .filter_map(|br| match &br.record {
+                            GraphRecord::Edge { label, source, .. }
+                                if label.as_str() == "REFERENCES_TASK" =>
+                            {
+                                Some(source.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                };
             for br in &section.records {
+                // A co-located coverage source-review node is exempt from the lower
+                // window bound (its approval may legitimately predate `from`) but
+                // never the upper bound.
+                let is_coverage_source_review = section.class
+                    == EvidenceClass::ReviewCoverage.as_wire()
+                    && is_approving_review(&br.record)
+                    && coverage_edge_sources.contains(br.record.id());
                 match resolve_valid_time(&br.record).and_then(|vt| parse_rfc3339(&vt)) {
                     Some(t) if from <= t && t < to => {}
+                    Some(t) if is_coverage_source_review && t < to => {}
                     _ => {
                         window_ok = false;
                         window_detail = format!(
@@ -4870,6 +4935,226 @@ mod pack338_tests {
         assert!(rc.unapproved_pr_ids.is_empty());
     }
 
+    /// Codex Finding A: a pack assembled over a PR merged IN-WINDOW whose sole
+    /// approving review was submitted BEFORE the window `from` (but before the
+    /// merge) must PASS offline `verify_pack`. The coverage edge / section row
+    /// stamps its window-relevant valid time from the PR's in-window `merged_at`,
+    /// NOT the pre-window review valid time, so the section row falls inside the
+    /// manifest window and Window-consistency holds. Before the fix the edge was
+    /// stamped with the pre-window review valid time, so the freshly-assembled
+    /// pack for the newly-supported pre-window-approval case failed verification.
+    #[test]
+    fn pre_window_approval_pack_passes_verify() {
+        use super::fixture::{pr, references_task, review};
+        // PR merges inside the March window; its sole approving review was
+        // submitted in February — before `from` (2026-03-01) yet before the merge.
+        let records = vec![
+            pr("project:v1:prX", "2026-03-15T12:00:00Z", "cX"),
+            review("project:v1:rvX", "2026-02-20T08:00:00Z", "approved"),
+            references_task("project:v1:rvX", "project:v1:prX"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+
+        // The PR is covered (round-1 behavior) ...
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_ref())
+            .expect("review_coverage measurement");
+        assert_eq!(rc.approved_pr_count, 1);
+
+        // ... and the freshly-assembled pack must verify clean, including
+        // Window-consistency over the coverage section row.
+        let report = verify_pack(&pack);
+        assert!(
+            report.window_consistency.passed,
+            "pre-window-approval coverage row must be stamped in-window: {:?}",
+            report.window_consistency
+        );
+        assert!(
+            report.ok,
+            "pre-window-approval pack must verify clean: {report:?}"
+        );
+
+        // The coverage edge's stamped valid time is the in-window merged_at, while
+        // the pre-window review valid time is preserved as a cited field.
+        let section = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .expect("review_coverage section");
+        let edge = section
+            .records
+            .iter()
+            .find(|br| {
+                matches!(&br.record,
+                GraphRecord::Edge { label, .. } if label.as_str() == "REFERENCES_TASK")
+            })
+            .expect("coverage edge row");
+        let vt = resolve_valid_time(&edge.record).expect("edge valid time");
+        assert_eq!(
+            vt, "2026-03-15T12:00:00Z",
+            "edge valid time must be the PR merged_at (in-window)"
+        );
+        if let GraphRecord::Edge { temporal, .. } = &edge.record {
+            assert_eq!(
+                temporal.as_ref().and_then(|t| t.author_time.clone()),
+                Some("2026-02-20T08:00:00Z".to_owned()),
+                "the pre-window review valid time is preserved as a cited field"
+            );
+        }
+    }
+
+    /// Codex Finding B(i): a PR merged in-window whose sole approving review was
+    /// submitted BEFORE the window `from` (but before merge) and carries no
+    /// `review_commit_sha` must STILL yield a `review_unanchored_no_commit_sha`
+    /// gap. Coverage counts the pre-window approval, so the #334 gap join must use
+    /// the SAME at-or-before-merge filter (not require the review in-window) or
+    /// coverage and gaps diverge: the PR would read as covered with no #334 defect.
+    #[test]
+    fn pre_window_approval_unanchored_still_yields_gap() {
+        use super::fixture::{pr, references_task, review};
+        // Anchor another review so the #334 reviewed-commit facts are PRESENT in
+        // the store (the capability probe requires at least one real fact).
+        let anchored = |mut r: GraphRecord, sha: &str| -> GraphRecord {
+            if let GraphRecord::Node {
+                review_commit_sha, ..
+            } = &mut r
+            {
+                *review_commit_sha = Some(sha.to_owned());
+            }
+            r
+        };
+        let head_of = |p: &GraphRecord| -> String {
+            match p {
+                GraphRecord::Node {
+                    head_sha: Some(h), ..
+                } => h.clone(),
+                _ => panic!("no head_sha"),
+            }
+        };
+        // prA: approved by an ANCHORED-at-head review (facts present, no gap).
+        let pr_a = pr("project:v1:prA", "2026-03-15T12:00:00Z", "cA");
+        let rv_a = anchored(
+            review("project:v1:rvA", "2026-03-15T08:00:00Z", "approved"),
+            &head_of(&pr_a),
+        );
+        // prB: merged in-window, approved by a PRE-WINDOW UNANCHORED review → gap.
+        let pr_b = pr("project:v1:prB", "2026-03-16T12:00:00Z", "cB");
+        let rv_b = review("project:v1:rvB", "2026-02-16T08:00:00Z", "approved");
+        let records = vec![
+            pr_a,
+            rv_a,
+            references_task("project:v1:rvA", "project:v1:prA"),
+            pr_b,
+            rv_b,
+            references_task("project:v1:rvB", "project:v1:prB"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        let unanchored: Vec<&GapRow> = pack
+            .gaps
+            .iter()
+            .filter(|g| g.gap_class == "review_unanchored_no_commit_sha")
+            .collect();
+        assert_eq!(
+            unanchored.len(),
+            1,
+            "pre-window unanchored approval must still yield a gap: {:?}",
+            pack.gaps
+        );
+        assert!(
+            unanchored[0]
+                .record_ids
+                .contains(&"project:v1:prB".to_owned())
+        );
+        assert!(
+            unanchored[0]
+                .record_ids
+                .contains(&"project:v1:rvB".to_owned())
+        );
+    }
+
+    /// Codex Finding B(ii): a PR merged in-window whose sole approving review was
+    /// submitted BEFORE the window `from` (but before merge) and is anchored to a
+    /// commit OTHER than the PR's final head must STILL yield an
+    /// `approval_precedes_final_head` gap — the #334 gap join uses the same
+    /// at-or-before-merge filter coverage uses.
+    #[test]
+    fn pre_window_approval_stale_head_still_yields_gap() {
+        use super::fixture::{pr, references_task, review};
+        let anchored = |mut r: GraphRecord, sha: &str| -> GraphRecord {
+            if let GraphRecord::Node {
+                review_commit_sha, ..
+            } = &mut r
+            {
+                *review_commit_sha = Some(sha.to_owned());
+            }
+            r
+        };
+        // prC: merged in-window, approved by a PRE-WINDOW review anchored to a
+        // NON-head commit → stale.
+        let pr_c = pr("project:v1:prC", "2026-03-17T12:00:00Z", "cC");
+        let rv_c = anchored(
+            review("project:v1:rvC", "2026-02-17T08:00:00Z", "approved"),
+            "not-the-final-head",
+        );
+        let records = vec![
+            pr_c,
+            rv_c,
+            references_task("project:v1:rvC", "project:v1:prC"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        let precedes: Vec<&GapRow> = pack
+            .gaps
+            .iter()
+            .filter(|g| g.gap_class == "approval_precedes_final_head")
+            .collect();
+        assert_eq!(
+            precedes.len(),
+            1,
+            "pre-window stale-head approval must still yield a gap: {:?}",
+            pack.gaps
+        );
+        assert!(
+            precedes[0]
+                .record_ids
+                .contains(&"project:v1:prC".to_owned())
+        );
+        assert!(
+            precedes[0]
+                .record_ids
+                .contains(&"project:v1:rvC".to_owned())
+        );
+    }
+
     /// Codex Finding 1: a merged `github_pr` whose `merged_at` is present but
     /// UNPARSEABLE has no window-resolvable merge time. It must be routed to the
     /// counted `excluded_unresolvable_merge_time` diagnostic, never silently
@@ -6292,6 +6577,7 @@ mod pack338_tests {
         let bad = stamp_edge_valid_time(
             references_task("project:v1:rv04", "project:v1:pr04"),
             "2026-03-03T08:00:00Z",
+            "2026-03-03T08:00:00Z",
         );
         let (old_id, new_id) = swap_one_coverage_row(&mut pack, bad);
 
@@ -6326,6 +6612,7 @@ mod pack338_tests {
         // is `commented`, so it is not an approving review.
         let bad = stamp_edge_valid_time(
             references_task("project:v1:rv04", "project:v1:pr04"),
+            "2026-03-03T08:00:00Z",
             "2026-03-03T08:00:00Z",
         );
         let (old_id, new_id) = swap_one_coverage_row(&mut pack, bad);
@@ -6369,6 +6656,7 @@ mod pack338_tests {
         // which is not a pull-request task.
         let bad = stamp_edge_valid_time(
             references_task("project:v1:rv01", "codegraph:v5:c01"),
+            "2026-03-03T08:00:00Z",
             "2026-03-03T08:00:00Z",
         );
         let (old_id, new_id) = swap_one_coverage_row(&mut pack, bad);
@@ -7154,6 +7442,7 @@ mod pack338_tests {
         // merged-in-window prZ, recompute row hash + section + manifest counts.
         let bad = stamp_edge_valid_time(
             references_task("project:v1:rv01", "project:v1:prZ"),
+            "2026-03-15T08:00:00Z",
             "2026-03-15T08:00:00Z",
         );
         let (old_id, new_id) = swap_one_coverage_row(&mut pack, bad);
