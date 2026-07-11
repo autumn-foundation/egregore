@@ -1104,6 +1104,16 @@ pub fn resolve_valid_time(record: &GraphRecord) -> Option<String> {
     }
 }
 
+/// True when a record has no window-resolvable valid time: either no resolved
+/// valid time at all, or a resolved value that is not parseable RFC3339. A
+/// malformed timestamp is unresolved (routed to `missing_valid_time`), NOT
+/// merely out-of-window (Codex round-13 Finding 2), so this predicate is the
+/// single source of truth for both the section-windowing exclusion count and the
+/// `missing_valid_time` gap derivation.
+fn valid_time_unresolved(record: &GraphRecord) -> bool {
+    resolve_valid_time(record).is_none_or(|vt| parse_rfc3339(&vt).is_none())
+}
+
 /// Returns true when `valid_time` falls in the half-open window `from <= t < to`.
 fn in_window(valid_time: &str, window: &Window) -> bool {
     let (Some(t), Some(from), Some(to)) = (
@@ -1447,14 +1457,19 @@ pub fn assemble_pack(
         let Some(class) = evidence_class_for_record(record) else {
             continue;
         };
-        match resolve_valid_time(record) {
-            Some(vt) if in_window(&vt, window) => {
+        // Parse BEFORE deciding in/out of window: a resolved-but-malformed
+        // (non-RFC3339) valid time is unresolved, NOT merely out-of-window, and
+        // must route to the same `missing_valid_time` path as a truly-absent time
+        // — never silently excluded (Codex round-13 Finding 2). `parse_rfc3339`
+        // returns `None` for both an absent resolved value and a malformed one.
+        match resolve_valid_time(record).and_then(|vt| parse_rfc3339(&vt)) {
+            Some(parsed) if from_ts <= parsed && parsed < to_ts => {
                 in_window_by_class
                     .entry(class.as_wire())
                     .or_default()
                     .push(record.clone());
             }
-            Some(_) => {} // out of window: excluded, no diagnostic
+            Some(_) => {} // parsed and out of window: excluded, no diagnostic
             None => {
                 excluded_missing_valid_time += 1;
                 diagnostics.push(PackDiagnostic {
@@ -1959,7 +1974,7 @@ fn derive_gaps(
     // Generic and unconditional — it is about any class-relevant record excluded
     // for lacking valid time, so it applies to every control.
     for record in records {
-        if evidence_class_for_record(record).is_some() && resolve_valid_time(record).is_none() {
+        if evidence_class_for_record(record).is_some() && valid_time_unresolved(record) {
             gaps.push(GapRow {
                 gap_class: GapClass::MissingValidTime.as_wire().to_owned(),
                 record_ids: vec![record.id().to_owned()],
@@ -2339,6 +2354,40 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     );
                     break 'window;
                 }
+            }
+        }
+    }
+    // Gaps are timestamped rows in the exported pack and consumers filter them by
+    // the same window, so a tampered `gaps[*].valid_time` outside `[from, to)`
+    // must also fail Window-consistency (Codex round-13 Finding 1). EXCEPTION: a
+    // `missing_valid_time` gap is intentionally untimestamped (`valid_time: None`)
+    // and is allowed. A present-but-malformed timestamp is not inside the window
+    // and fails, using the same parse + half-open predicate section rows use. The
+    // failure detail is redaction-safe: the bounded gap class, which bound was
+    // violated, and the gap's own (allow-listed) valid_time — nothing else.
+    if window_ok {
+        for g in &pack.gaps {
+            let Some(vt) = &g.valid_time else {
+                continue; // untimestamped (missing_valid_time): allowed
+            };
+            let which = parse_rfc3339(vt).map_or(Some("malformed"), |t| {
+                match (
+                    parse_rfc3339(&pack.manifest.window.from),
+                    parse_rfc3339(&pack.manifest.window.to),
+                ) {
+                    (Some(from), _) if t < from => Some("before window from"),
+                    (_, Some(to)) if t >= to => Some("at or after window to"),
+                    (Some(_), Some(_)) => None, // inside the window
+                    _ => Some("malformed"),     // unparseable window bound (should not occur)
+                }
+            });
+            if let Some(bound) = which {
+                window_ok = false;
+                window_detail = format!(
+                    "gap valid_time {vt} (class {}) is outside the manifest window ({bound})",
+                    g.gap_class
+                );
+                break;
             }
         }
     }
@@ -4070,6 +4119,72 @@ mod pack338_tests {
             && g.record_ids.contains(&"codegraph:v5:c15".to_owned())));
     }
 
+    /// Codex round-13 Finding 2: a class-relevant record whose resolved valid
+    /// time is present but NON-RFC3339 (malformed) must be routed to the same
+    /// `missing_valid_time` path as a truly-absent valid time — counted,
+    /// diagnosed, and gapped — never silently excluded as merely out-of-window.
+    /// A required class whose only evidence has a malformed timestamp must not
+    /// look present-but-empty.
+    #[test]
+    fn malformed_valid_time_is_treated_as_missing_not_silently_dropped() {
+        let mut records = build_seed_records();
+        let target = "codegraph:v5:c01";
+        let mut hit = false;
+        for r in &mut records {
+            if r.id() == target
+                && let GraphRecord::Node { temporal, .. } = r
+                && let Some(t) = temporal.as_mut()
+            {
+                t.valid_time = "not-a-timestamp".to_owned();
+                hit = true;
+            }
+        }
+        assert!(hit, "corrupted the target commit's valid time");
+
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+
+        // Counted under missing_valid_time alongside the absent-vt c15 (2 total),
+        // never silently dropped as out-of-window.
+        assert_eq!(
+            pack.manifest.excluded_missing_valid_time, 2,
+            "malformed-vt record must be counted as missing, not silently dropped"
+        );
+        assert!(
+            pack.diagnostics.iter().any(
+                |d| d.code == "missing_valid_time" && d.record_ids.contains(&target.to_owned())
+            ),
+            "missing_valid_time diagnostic must cite the malformed-vt record: {:?}",
+            pack.diagnostics
+        );
+        assert!(
+            pack.gaps.iter().any(|g| g.gap_class == "missing_valid_time"
+                && g.record_ids.contains(&target.to_owned())),
+            "missing_valid_time gap must cite the malformed-vt record: {:?}",
+            pack.gaps
+        );
+
+        // It must NOT be silently placed in the commits section on the basis of a
+        // garbage timestamp.
+        let commits = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "commits")
+            .expect("commits section");
+        assert!(
+            !commits.records.iter().any(|r| r.record.id() == target),
+            "malformed-vt commit must not appear in the section"
+        );
+    }
+
     #[test]
     fn commit_outside_any_pr_gaps_are_non_merge_commits() {
         let pack = assemble_cc81();
@@ -4698,6 +4813,78 @@ mod pack338_tests {
             !report.safety.detail.contains(INJECTED_SECRET),
             "detail must never leak the secret value: {}",
             report.safety.detail
+        );
+    }
+
+    /// Codex round-13 Finding 1: Window-consistency must also reject a
+    /// `gaps[*].valid_time` present but outside the half-open manifest window.
+    /// Gaps are timestamped rows consumers filter by the same window; a tampered
+    /// gap time must not verify clean while section rows are untouched. Gaps carry
+    /// no integrity hash, so Integrity stays green with no recomputation.
+    #[test]
+    fn verify_fails_when_gap_valid_time_is_outside_window() {
+        let mut pack = assemble_cc81();
+        let report = verify_pack(&pack);
+        assert!(
+            report.window_consistency.passed,
+            "clean pack passes window-consistency: {}",
+            report.window_consistency.detail
+        );
+        assert!(
+            pack.gaps.iter().any(|g| g.valid_time.is_none()),
+            "fixture carries an untimestamped missing_valid_time gap"
+        );
+
+        let idx = pack
+            .gaps
+            .iter()
+            .position(|g| g.valid_time.is_some())
+            .expect("a timestamped gap exists");
+        let tampered_class = pack.gaps[idx].gap_class.clone();
+        pack.gaps[idx].valid_time = Some("2026-05-01T00:00:00Z".to_owned());
+
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "Integrity still passes: {}",
+            report.integrity.detail
+        );
+        assert!(
+            !report.window_consistency.passed,
+            "Window-consistency must reject a gap valid_time outside [from, to)"
+        );
+        assert!(
+            report.window_consistency.detail.contains(&tampered_class),
+            "detail names the gap class: {}",
+            report.window_consistency.detail
+        );
+        assert!(
+            report
+                .window_consistency
+                .detail
+                .contains("2026-05-01T00:00:00Z"),
+            "detail echoes the gap's own valid_time: {}",
+            report.window_consistency.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-13 Finding 1 (exception): an untimestamped
+    /// `missing_valid_time` gap (`valid_time: None`) is intentionally
+    /// unwindowed and must PASS Window-consistency, never be flagged.
+    #[test]
+    fn verify_allows_untimestamped_missing_valid_time_gap() {
+        let mut pack = assemble_cc81();
+        pack.gaps.retain(|g| g.valid_time.is_none());
+        assert!(
+            !pack.gaps.is_empty(),
+            "at least one untimestamped gap remains after the retain"
+        );
+        let report = verify_pack(&pack);
+        assert!(
+            report.window_consistency.passed,
+            "untimestamped (None) gaps must pass Window-consistency: {}",
+            report.window_consistency.detail
         );
     }
 

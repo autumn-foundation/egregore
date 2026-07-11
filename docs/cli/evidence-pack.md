@@ -64,6 +64,12 @@ pass/fail gate".
 - A class-relevant record with no resolvable valid time is **excluded** and
   counted under a `missing_valid_time` diagnostic (and a `missing_valid_time`
   gap).
+- A resolved valid time is **parsed before** the in/out-of-window decision. A
+  present-but-malformed (non-RFC-3339) valid time is treated as **unresolved** —
+  routed to the same `missing_valid_time` path (count + diagnostic + gap) as a
+  truly-absent time — never silently excluded as merely out-of-window. Only a
+  record whose valid time parses *and* falls outside `[from, to)` is a legitimate
+  no-diagnostic out-of-window exclusion.
 - `--from >= --to` exits 2 (`reversed_window`); a non-RFC-3339 bound exits 2
   (`invalid_timestamp`).
 
@@ -264,7 +270,7 @@ PR/commit/review evidence therefore emits none of those change-management gaps;
 |-----------|---------|-----------------------------------|--------|
 | `merged_pr_without_approving_review` | A merged PR Task with no linked **in-window** approving `Review` (via `REFERENCES_TASK`) that resolves **at or before** the PR's `merged_at`. An approving review that resolves outside the pack window, has no resolvable valid time, or is submitted **after** the merge (post-hoc) does **not** suppress this gap. | `pull_requests` and/or `reviews`/`review_coverage` | Fully implemented. |
 | `commit_outside_any_pr` | An in-window `Commit` not claimed by any PR via `MERGED_AS`. | `commits` and/or `pull_requests` | Fully implemented. |
-| `missing_valid_time` | A class-relevant record with no resolvable valid time. | *(generic — any control)* | Fully implemented. |
+| `missing_valid_time` | A class-relevant record with no resolvable valid time — either no valid time at all **or** a present-but-malformed (non-RFC-3339) one. A malformed timestamp is unresolved, not out-of-window. | *(generic — any control)* | Fully implemented. |
 | `review_unanchored_no_commit_sha` | A review with no anchoring reviewed-commit SHA. | `reviews`/`review_coverage` | **Needs #334.** Always `capability_unavailable`. |
 | `approval_precedes_final_head` | A recorded approval whose commit predates the PR's final head. | `reviews`/`review_coverage` | **Needs #334.** Always `capability_unavailable`. |
 
@@ -319,8 +325,15 @@ Re-verifies an assembled pack offline and read-only:
   individually enumerated is still caught. The pack's legitimate high-entropy hex
   (BLAKE3 hashes, record IDs, catalog/protected handles, `<REDACTED:email:...>`
   markers) is not flagged, so a clean scrubbed pack passes.
-- **Window-consistency** — every row's resolved valid time is inside the
-  manifest window.
+- **Window-consistency** — every section row's resolved valid time is inside the
+  manifest window, **and** every timestamped `gaps[*].valid_time` is inside the
+  same half-open window. Gaps are timestamped rows in the exported pack and
+  consumers filter them by the same window, so a tampered gap timestamp outside
+  `[from, to)` — or a present-but-malformed (non-RFC-3339) gap timestamp — fails
+  Window-consistency with a redaction-safe detail naming the gap class, which
+  bound was violated, and the gap's own (allow-listed) valid time. **Exception:**
+  a `missing_valid_time` gap is intentionally untimestamped (`valid_time: null`)
+  and is allowed, never flagged.
 
 `verify` scans the **raw supplied artifact** for secrets **before** (and
 independently of) deserialization. serde silently discards unknown object keys
