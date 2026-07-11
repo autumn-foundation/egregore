@@ -18,7 +18,9 @@
 //! # Window derivation
 //!
 //! The valid-time window is derived from the committer dates of the commits in
-//! the resolved range (`range_commit_shas`):
+//! the resolved range (`range_commit_shas`), compared by parsed UTC instant
+//! (never raw RFC 3339 string order — committer dates carry local offsets while
+//! log times are Z-normalized, so a lexical comparison is wrong across offsets):
 //!
 //! * `window_start = min(commit_valid_time[sha])` over the range commits;
 //! * `window_end   = max(commit_valid_time[sha])` over the range commits.
@@ -65,6 +67,8 @@
 //! record IDs, severities, counts, commit handles, and valid times.
 
 use std::collections::{BTreeMap, BTreeSet};
+
+use chrono::{DateTime, Utc};
 
 use super::RepositoryIndex;
 use super::deltas::{RangeDeltasError, resolve_commit_range};
@@ -206,9 +210,22 @@ pub fn log_deltas(
     head_prefix: &str,
     repo_scope: Option<&str>,
 ) -> Result<LogDeltas, RangeDeltasError> {
-    // Repository scoping mirrors `range_deltas`: in a shared store two
-    // repositories can carry the same commit SHA, so commit resolution and
-    // signature selection are gated by owning repository when a scope is set.
+    // Repository scoping mirrors `range_deltas` for the CODE side only: in a
+    // shared store two repositories can carry the same commit SHA, so commit
+    // resolution, the valid-time window, and the symbol-delta join are gated by
+    // owning repository when a scope is set.
+    //
+    // Log-domain records (`ErrorSignature`, `LogOccurrenceBucket`, and the
+    // `AGGREGATES` / `FRAME_RESOLVES_TO` edges keyed on their IDs) carry NO
+    // retrievable repository attribution: `scan-logs` only hashes the repository
+    // ID into the stable record IDs (see `log_stable_id` / `scan_log_records`)
+    // and never stores it on any payload, node, or edge field, so
+    // `RepositoryIndex::owner_of(<signature-id>)` is always `None`. Filtering
+    // signatures by `--repo` would therefore drop EVERY signature and return
+    // empty groups even for the correct repository (Codex P2). Because log nodes
+    // cannot be attributed, `--repo` scopes only the code side (commit/window
+    // resolution and the symbol-delta join); all log signatures are included and
+    // this limitation is documented in `docs/cli/log-deltas.md`.
     let repo_index = repo_scope.map(|_| RepositoryIndex::build(records));
     let in_scope = |id: &str| -> bool {
         match (repo_scope, repo_index.as_ref()) {
@@ -224,17 +241,32 @@ pub fn log_deltas(
     let base_valid_time = range.commit_valid_time.get(range.base_sha).copied();
     let head_valid_time = range.commit_valid_time.get(range.head_sha).copied();
 
-    let mut range_times: Vec<&str> = range
+    // Window bounds are derived by parsed INSTANT, never by raw RFC 3339 string
+    // order: commit committer dates carry local UTC offsets (`%cI`), while
+    // scan-logs normalizes signature/bucket times to UTC `Z`, so a lexical
+    // comparison is wrong across offsets (Codex P1). A commit whose committer
+    // date carries no parseable timestamp cannot bound the window and is dropped
+    // from the derivation; an empty window (no range commit carried a parseable
+    // valid time) degenerately excludes every signature rather than fabricating
+    // bounds. The EMITTED window strings stay the original RFC 3339 text — only
+    // the ordering is by instant.
+    let mut range_times: Vec<(DateTime<Utc>, &str)> = range
         .range_commit_shas
         .iter()
         .filter_map(|sha| range.commit_valid_time.get(sha).copied())
+        .filter_map(|s| parse_instant(s).map(|dt| (dt, s)))
         .collect();
-    range_times.sort_unstable();
-    // A commit that carries no committer date cannot bound the window; an empty
-    // window (no range commit carried a valid time) degenerately excludes every
-    // signature rather than fabricating bounds.
-    let window_start = range_times.first().copied().unwrap_or("").to_owned();
-    let window_end = range_times.last().copied().unwrap_or("").to_owned();
+    range_times.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    let window_start = range_times
+        .first()
+        .map_or_else(String::new, |(_, s)| (*s).to_owned());
+    let window_end = range_times
+        .last()
+        .map_or_else(String::new, |(_, s)| (*s).to_owned());
+    let window_start_instant = range_times.first().map(|(dt, _)| *dt);
+    let window_end_instant = range_times.last().map(|(dt, _)| *dt);
+    let base_instant = base_valid_time.and_then(parse_instant);
+    let head_instant = head_valid_time.and_then(parse_instant);
 
     // ── Symbol-delta join set (reused issue #118 `range_deltas`) ─────────────
     // The intersection is computed from the existing delta mechanics, never
@@ -270,9 +302,8 @@ pub fn log_deltas(
         {
             match label {
                 EdgeLabel::Aggregates => {
-                    if !in_scope(target.as_str()) {
-                        continue;
-                    }
+                    // No `in_scope` gate: the target is a log signature, which
+                    // carries no retrievable repository attribution (Codex P2).
                     if let Some(GraphRecord::Node {
                         log: Some(payload), ..
                     }) = by_id.get(source.as_str())
@@ -286,9 +317,8 @@ pub fn log_deltas(
                     }
                 }
                 EdgeLabel::FrameResolvesTo => {
-                    if !in_scope(source.as_str()) {
-                        continue;
-                    }
+                    // No `in_scope` gate: the source is a log signature, which
+                    // carries no retrievable repository attribution (Codex P2).
                     if let (Some(resolution), Some(index)) = (frame_resolution, frame_index) {
                         frames_by_sig.entry(source.as_str()).or_default().push(
                             ResolvedFrameHandle {
@@ -320,14 +350,19 @@ pub fn log_deltas(
         else {
             continue;
         };
-        if !in_scope(id.as_str()) {
-            continue;
-        }
+        // No `in_scope` gate on the signature: log records carry no retrievable
+        // repository attribution, so `--repo` scopes only the code side (Codex
+        // P2). See the module-level scoping note above.
         let LogPayload::ErrorSignature(sig) = payload.as_ref() else {
             continue;
         };
 
-        let class = classify(&window_start, &window_end, &sig.first_seen, &sig.last_seen);
+        let class = classify(
+            window_start_instant,
+            window_end_instant,
+            parse_instant(&sig.first_seen),
+            parse_instant(&sig.last_seen),
+        );
         let change_class = match class {
             LogDeltaClass::New => "new_signature",
             LogDeltaClass::Ceased => "ceased_signature",
@@ -338,8 +373,8 @@ pub fn log_deltas(
         // Per-window occurrence counts from linked buckets, when available.
         let (occurrence_source, base_window, head_window) = match buckets_by_sig.get(id.as_str()) {
             Some(buckets) if !buckets.is_empty() => {
-                let base_sum = base_valid_time.map(|bt| window_bucket_sum(buckets, bt));
-                let head_sum = head_valid_time.map(|ht| window_bucket_sum(buckets, ht));
+                let base_sum = base_instant.map(|bt| window_bucket_sum(buckets, bt));
+                let head_sum = head_instant.map(|ht| window_bucket_sum(buckets, ht));
                 ("occurrence_buckets", base_sum, head_sum)
             }
             _ => ("aggregate_only", None, None),
@@ -411,36 +446,70 @@ pub fn log_deltas(
     })
 }
 
+/// Parses an RFC 3339 timestamp to a UTC instant for ordering, or `None` when it
+/// cannot be parsed.
+///
+/// All timestamps compared here (commit committer dates, signature
+/// `first_seen`/`last_seen`, bucket `bucket_start`) originate from Egregore's own
+/// scanners and are always parseable in practice; `None` is a defensive,
+/// deterministic fallback that callers treat as "exclude", never a silent
+/// misclassification.
+fn parse_instant(rfc3339: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(rfc3339)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
 /// Classifies one signature against the window from its `first_seen` /
-/// `last_seen` valid times. RFC 3339 strings compare lexicographically in
-/// chronological order for the Z-normalized UTC form the extractors emit,
-/// matching the repository's existing temporal-selector comparisons.
+/// `last_seen` valid times, comparing by parsed UTC instant.
+///
+/// Comparing raw RFC 3339 strings is wrong across UTC offsets (Codex P1): commit
+/// committer dates carry local offsets (`%cI`) while scan-logs normalizes
+/// signature times to UTC `Z`, so `"...05:00:00Z"` sorts lexically after
+/// `"...00:30:00-05:00"` even though its instant precedes it. Every comparison is
+/// therefore on parsed instants.
+///
+/// An empty/unparseable window (either bound `None`) or an unparseable
+/// `first_seen`/`last_seen` yields [`LogDeltaClass::OutOfRange`] — the signature
+/// is excluded rather than misclassified. This preserves the documented
+/// empty-window behavior (no parseable range-commit time excludes every
+/// signature).
 fn classify(
-    window_start: &str,
-    window_end: &str,
-    first_seen: &str,
-    last_seen: &str,
+    window_start: Option<DateTime<Utc>>,
+    window_end: Option<DateTime<Utc>>,
+    first_seen: Option<DateTime<Utc>>,
+    last_seen: Option<DateTime<Utc>>,
 ) -> LogDeltaClass {
+    let (Some(window_start), Some(window_end), Some(first_seen)) =
+        (window_start, window_end, first_seen)
+    else {
+        return LogDeltaClass::OutOfRange;
+    };
     if window_start <= first_seen && first_seen <= window_end {
         LogDeltaClass::New
     } else if first_seen > window_end {
         LogDeltaClass::OutOfRange
     } else {
         // Not new and not after the window ⇒ first observed before the window.
-        if last_seen < window_end {
-            LogDeltaClass::Ceased
-        } else {
-            LogDeltaClass::Continuing
+        match last_seen {
+            Some(last_seen) if last_seen < window_end => LogDeltaClass::Ceased,
+            Some(_) => LogDeltaClass::Continuing,
+            // Unparseable last_seen: exclude rather than misclassify.
+            None => LogDeltaClass::OutOfRange,
         }
     }
 }
 
-/// Sums the occurrence counts of the linked buckets whose `bucket_start` is at
-/// or before `endpoint_valid_time` (the endpoint's committer date).
-fn window_bucket_sum(buckets: &[(&str, u64)], endpoint_valid_time: &str) -> u64 {
+/// Sums the occurrence counts of the linked buckets whose `bucket_start` instant
+/// is at or before `endpoint` (the endpoint's committer date as a UTC instant).
+///
+/// The comparison is by parsed instant, not raw string, for the same
+/// cross-offset reason as [`classify`] (Codex P1). A bucket whose `bucket_start`
+/// cannot be parsed is excluded from the sum rather than compared incorrectly.
+fn window_bucket_sum(buckets: &[(&str, u64)], endpoint: DateTime<Utc>) -> u64 {
     buckets
         .iter()
-        .filter(|(bucket_start, _)| *bucket_start <= endpoint_valid_time)
+        .filter(|(bucket_start, _)| parse_instant(bucket_start).is_some_and(|b| b <= endpoint))
         .map(|(_, count)| *count)
         .sum()
 }

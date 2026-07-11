@@ -32,6 +32,23 @@ resolution and error taxonomy. `BASE` must be an ancestor of `HEAD`. The query
 is purely read-time: it reads only the supplied store, never Git state, so it
 cannot mutate the working tree.
 
+### `--repo` scope (code side only)
+
+`--repo <SELECTOR>` scopes the **code side** of the query — commit/endpoint
+resolution, the valid-time window, and the symbol-delta join — to one repository
+in a shared multi-repo store. It does **not** filter the log signatures
+themselves: `scan-logs` records (`ErrorSignature`, `LogOccurrenceBucket`, and
+their `AGGREGATES` / `FRAME_RESOLVES_TO` edges) carry no retrievable repository
+attribution — the repository identity is only hashed into their stable record
+IDs, never stored as a queryable field — so there is no sound way to attribute a
+signature to a repository at read time. Every in-window log signature in the
+store is therefore classified against the scoped window regardless of `--repo`.
+(An earlier revision applied the `--repo` predicate to signature IDs directly;
+because `owner_of(<signature-id>)` is always `None`, that dropped **every**
+signature and returned empty groups even for the correct repository.) In a
+single-repository store this distinction is moot. To keep log domains cleanly
+separated, keep each repository's logs in its own store.
+
 ## Shortest offline workflow
 
 ```sh
@@ -63,10 +80,18 @@ from `HEAD` but not from `BASE`):
 - `window_start = min(commit_valid_time[sha])` over the range commits;
 - `window_end   = max(commit_valid_time[sha])` over the range commits.
 
-RFC 3339 timestamps compare lexicographically in chronological order for the
-Z-normalized UTC form the extractors emit, matching the repository's existing
-temporal-selector comparisons. A range commit that carries no committer date
-cannot bound the window; if no range commit carries a valid time the window is
+All timestamp comparisons — window derivation, signature classification, and
+occurrence-bucket cutoffs — are made on **parsed UTC instants**, never on raw
+RFC 3339 string order. Commit committer dates carry local UTC offsets (Git
+`%cI`, e.g. `2026-01-01T00:30:00-05:00`), while `scan-logs` normalizes signature
+`first_seen`/`last_seen` and bucket starts to UTC `Z`. A lexical string
+comparison is wrong across offsets (`"...05:00:00Z"` sorts after
+`"...00:30:00-05:00"` even though its instant precedes it), which would drop an
+in-window signature as out-of-range; parsing to an instant first avoids this.
+The emitted `window_start` / `window_end` fields keep the original RFC 3339
+text — only the ordering is by instant. A range commit whose committer date
+carries no parseable timestamp cannot bound the window and is dropped from the
+derivation; if no range commit carries a parseable valid time the window is
 empty and every signature is excluded (never fabricated bounds).
 
 ## Change classes

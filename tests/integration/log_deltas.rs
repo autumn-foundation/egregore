@@ -54,6 +54,21 @@ const CONT_LAST: &str = "2026-01-05T00:00:00Z";
 const FUTURE_FIRST: &str = "2026-02-01T00:00:00Z";
 const FUTURE_LAST: &str = "2026-02-01T01:00:00Z";
 
+// ── Timezone-offset window (Codex P1) ──────────────────────────────────────
+// Commit committer dates carry LOCAL offsets (`%cI`), but scan-logs normalizes
+// signature valid times and bucket starts to UTC `Z`. Comparing the two as raw
+// RFC 3339 strings is wrong across offsets; the comparisons must be by parsed
+// instant. Here the head commit's committer date is `00:30:00-05:00`, i.e.
+// `05:30:00Z`, while the in-window signature is at `05:00:00Z`. Lexically
+// `"...05:00:00Z" > "...00:30:00-05:00"`, so the buggy string comparison drops
+// the signature as out-of-range even though its instant is inside the window.
+const TZ_BASE: &str = "2025-12-31T00:00:00Z"; // c1 base
+const TZ_MID: &str = "2026-01-01T00:00:00Z"; // c2 → window_start
+const TZ_HEAD: &str = "2026-01-01T00:30:00-05:00"; // c3 head = 2026-01-01T05:30:00Z → window_end
+const TZ_SIG_FIRST: &str = "2026-01-01T05:00:00Z"; // 05:00Z, inside [00:00Z, 05:30Z]
+const TZ_SIG_LAST: &str = "2026-01-01T05:10:00Z";
+const TZ_BUCKET: &str = "2026-01-01T05:00:00Z"; // 05:00Z ≤ head 05:30Z by instant
+
 // ---------------------------------------------------------------------------
 // Synthetic record helpers (mirrors tests/integration/range_deltas.rs).
 // ---------------------------------------------------------------------------
@@ -424,6 +439,60 @@ fn log_deltas_is_byte_stable_across_runs() {
 }
 
 // ---------------------------------------------------------------------------
+// Timezone-offset window: commit committer dates carry LOCAL offsets while log
+// valid times are Z-normalized (Codex P1). Classification and bucket cutoffs
+// must compare by parsed instant, not raw RFC 3339 string order.
+// ---------------------------------------------------------------------------
+
+/// Three linear commits where the head commit's committer date carries a
+/// non-UTC offset, plus one signature whose Z-normalized `first_seen` lands
+/// just inside the window by instant but sorts AFTER the head string lexically.
+fn timezone_window_records() -> Vec<GraphRecord> {
+    let sig = log_sig_id("tz-boom");
+    let (bucket_node, bucket_edge) = bucket_with_edge(&sig, TZ_BUCKET, 7);
+    vec![
+        commit("c1sha0000", &[], TZ_BASE),
+        commit("c2sha0000", &["c1sha0000"], TZ_MID),
+        commit("c3sha0000", &["c2sha0000"], TZ_HEAD),
+        error_signature("tz-boom", "error", TZ_SIG_FIRST, TZ_SIG_LAST, 7),
+        bucket_node,
+        bucket_edge,
+    ]
+}
+
+#[test]
+fn log_deltas_classifies_across_timezone_offsets() {
+    let records = timezone_window_records();
+    let deltas = log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+
+    // window_end is the head commit's committer date (05:30:00Z as an instant).
+    assert_eq!(deltas.window.window_start, TZ_MID);
+    assert_eq!(deltas.window.window_end, TZ_HEAD);
+
+    // The signature's first_seen (05:00:00Z) is inside [00:00Z, 05:30Z] by
+    // instant, so it must classify as `new` — never dropped as out-of-range by
+    // a lexical string comparison against the offset-bearing head string.
+    assert_eq!(
+        record_ids(&deltas.new_signatures),
+        vec![log_sig_id("tz-boom")],
+        "an in-window signature must not be dropped across a non-UTC commit offset"
+    );
+    assert!(deltas.ceased_signatures.is_empty());
+    assert!(deltas.continuing_signatures.is_empty());
+
+    // Bucket cutoff is the same instant comparison: the 05:00Z bucket is at or
+    // before the head's 05:30Z instant, so it counts toward the head window.
+    let new_row = &deltas.new_signatures[0];
+    assert_eq!(new_row.occurrence_source, "occurrence_buckets");
+    assert_eq!(new_row.base_window_occurrences, Some(0));
+    assert_eq!(
+        new_row.head_window_occurrences,
+        Some(7),
+        "a bucket at/before the head instant must count despite the offset"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Seeded end-to-end CLI test (AC1, AC8, AC9): scan-history + augmented graph.
 // ---------------------------------------------------------------------------
 
@@ -456,9 +525,12 @@ fn seed_repo(repo: &Path) -> [String; 3] {
     [first, second, third]
 }
 
-/// Scans the repo, appends the synthetic log records, and writes a combined
-/// JSONL graph. Returns the graph path and the `tweaked` symbol record ID.
-fn build_augmented_graph(repo: &Path, graph_path: &Path) -> String {
+/// Scans the repo and appends the synthetic log records, returning the combined
+/// record set and the `tweaked` symbol record ID. The scan-history records carry
+/// a real `Repository` node plus its `CONTAINS` commit/file/symbol topology, so
+/// `--repo` scoping can attribute the code side; the log records deliberately
+/// carry no repository attribution (as `scan-logs` emits them).
+fn augmented_records(repo: &Path) -> (Vec<GraphRecord>, String) {
     let jsonl = scan_repository_history(repo)
         .expect("history should scan")
         .to_jsonl()
@@ -515,6 +587,13 @@ fn build_augmented_graph(repo: &Path, graph_path: &Path) -> String {
         FrameResolution::Resolved,
     ));
 
+    (records, tweaked_id)
+}
+
+/// Scans the repo, appends the synthetic log records, and writes a combined
+/// JSONL graph. Returns the graph path and the `tweaked` symbol record ID.
+fn build_augmented_graph(repo: &Path, graph_path: &Path) -> String {
+    let (records, tweaked_id) = augmented_records(repo);
     let mut out = String::new();
     for r in &records {
         out.push_str(&serde_json::to_string(r).expect("record should serialize"));
@@ -522,6 +601,67 @@ fn build_augmented_graph(repo: &Path, graph_path: &Path) -> String {
     }
     fs::write(graph_path, out).expect("graph should write");
     tweaked_id
+}
+
+#[test]
+fn log_deltas_repo_scope_keeps_log_signatures() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let [first, _second, third] = seed_repo(&repo);
+    let (records, tweaked_id) = augmented_records(&repo);
+
+    // The repository record ID that owns the scanned code topology.
+    let repo_id = records
+        .iter()
+        .find_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::Repository,
+                ..
+            } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("scan-history should emit a Repository node");
+
+    let base_prefix = &first[..12];
+
+    // Unscoped: the three in-window classes are populated.
+    let unscoped =
+        log_deltas(&records, base_prefix, &third, None).expect("unscoped range should resolve");
+    assert_eq!(
+        record_ids(&unscoped.new_signatures),
+        vec![log_sig_id("new-boom")]
+    );
+    assert_eq!(unscoped.ceased_signatures.len(), 1);
+    assert_eq!(unscoped.continuing_signatures.len(), 1);
+
+    // Scoped to the repository that owns the code side: the log signatures are
+    // NOT attributable to a repository, so scoping must not drop them. The
+    // regression this guards: `owner_of(<signature-id>)` is `None`, so a naive
+    // `--repo` predicate over signature IDs filtered out every signature and
+    // returned empty groups even for the correct repository.
+    let scoped = log_deltas(&records, base_prefix, &third, Some(&repo_id))
+        .expect("scoped range should resolve");
+    assert_eq!(
+        record_ids(&scoped.new_signatures),
+        vec![log_sig_id("new-boom")],
+        "repo scoping must keep the repo's log signatures, not drop them"
+    );
+    assert_eq!(scoped.ceased_signatures.len(), 1);
+    assert_eq!(scoped.continuing_signatures.len(), 1);
+
+    // The buckets and frame join (also keyed on signature IDs) survive scoping.
+    assert_eq!(
+        scoped.new_signatures[0].occurrence_source,
+        "occurrence_buckets"
+    );
+    assert_eq!(scoped.new_signatures[0].head_window_occurrences, Some(5));
+    assert_eq!(scoped.new_signatures[0].overlapping_symbol_deltas.len(), 1);
+    assert_eq!(
+        scoped.new_signatures[0].overlapping_symbol_deltas[0].record_id,
+        tweaked_id
+    );
 }
 
 #[test]

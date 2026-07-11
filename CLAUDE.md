@@ -282,7 +282,14 @@ out-of-range and excluded from all three classes. Each `new_signatures` row join
 signature's `LogOccurrenceBucket` records via `AGGREGATES` edges (`base_window_occurrences`/
 `head_window_occurrences` = buckets at/before each endpoint's committer date); a signature
 with no linked buckets falls back to its aggregate `occurrence_count` with
-`occurrence_source: aggregate_only` — counts are never fabricated. Exit codes and the error
+`occurrence_source: aggregate_only` — counts are never fabricated. All timestamp comparisons
+(window derivation, classification, bucket cutoffs) are by parsed UTC instant, never raw RFC
+3339 string order, because commit committer dates carry local offsets (`%cI`) while scan-logs
+times are Z-normalized — a lexical comparison would misclassify across offsets. `--repo`
+scopes only the code side (commit/window resolution and the symbol-delta join): log records
+carry no retrievable repository attribution (the repo ID is only hashed into their stable
+IDs), so all in-window log signatures are always included and per-repository log separation
+requires per-repository stores. Exit codes and the error
 taxonomy mirror #118 exactly. Rows are regression LEADS, never proof this range caused the
 failure; a ceased signature is not proof of a fix; occurrence data only reflects scanned log
 sources. Read-only, redaction-safe (no raw log text), deterministic and byte-identical across
