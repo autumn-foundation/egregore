@@ -309,9 +309,16 @@ Re-verifies an assembled pack offline and read-only:
   via `evidence_class_for_record`, to that section's class; a mismatch — or a row
   that maps to no evidence class in a class-scoped section — fails Integrity with a
   redaction-safe detail naming the record id, the section it sits in, and the class
-  it actually maps to (ids/labels only). The `review_coverage` section is exempt
-  from this row-class check: it legitimately carries the `ReviewCoverageMeasurement`
-  and `REFERENCES_TASK` link edges, which map to no evidence class.
+  it actually maps to (ids/labels only). The `review_coverage` section is not
+  class-scoped — its rows are the substantiating `REFERENCES_TASK` link edges (the
+  `ReviewCoverageMeasurement` rides the section's `measurement` field, not a row),
+  which map to no evidence class — so the row-class check cannot apply. Instead,
+  each `review_coverage` row is validated against its **expected shape**: it must
+  be a `REFERENCES_TASK` link edge. This exemption is bounded, not blanket: any
+  other row dropped into `review_coverage` — a `Commit`, a `Symbol`, any node that
+  maps to a real evidence class, or any other edge label — fails Integrity with a
+  redaction-safe detail naming the record id and `unexpected row in review_coverage
+  section`, so a tampered pack cannot present unrelated data as coverage evidence.
 - **Coverage** — recompute the #65 citation thresholds (>=95% code rows cited;
   100% non-code rows cited).
 - **Safety** — scans the **entire serialized pack artifact** for raw sensitive
@@ -335,10 +342,19 @@ Re-verifies an assembled pack offline and read-only:
   individually enumerated is still caught. The pack's legitimate high-entropy hex
   (BLAKE3 hashes, record IDs, catalog/protected handles, `<REDACTED:email:...>`
   markers) is not flagged, so a clean scrubbed pack passes.
-- **Window-consistency** — every section row's resolved valid time is inside the
-  manifest window, **and** every timestamped `gaps[*].valid_time` is inside the
-  same half-open window. Gaps are timestamped rows in the exported pack and
-  consumers filter them by the same window, so a tampered gap timestamp outside
+- **Window-consistency** — first the **manifest window bounds themselves** are
+  validated, using the same rule `assemble` enforces: both `manifest.window.from`
+  and `manifest.window.to` must parse as RFC 3339 and the window must be half-open
+  non-empty (`from < to`; a `from >= to` window is the `reversed_window` `assemble`
+  rejects). This check runs **before and independent of** the row/gap loops, so a
+  vacuous pack (no section rows, no timestamped gaps) whose `manifest.window` was
+  hand-edited to an invalid or reversed window fails Window-consistency rather than
+  passing vacuously; an unparseable or reversed manifest window fails with a
+  redaction-safe detail. Then, reusing those parsed bounds, every section row's
+  resolved valid time is inside the manifest window, **and** every timestamped
+  `gaps[*].valid_time` is inside the same half-open window. Gaps are timestamped
+  rows in the exported pack and consumers filter them by the same window, so a
+  tampered gap timestamp outside
   `[from, to)` — or a present-but-malformed (non-RFC-3339) gap timestamp — fails
   Window-consistency with a redaction-safe detail naming the gap class, which
   bound was violated, and the gap's own (allow-listed) valid time. **Exception:**

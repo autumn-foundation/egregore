@@ -1181,6 +1181,22 @@ pub fn evidence_class_for_record(record: &GraphRecord) -> Option<EvidenceClass> 
     }
 }
 
+/// Whether `record` is an expected row of the `review_coverage` section.
+///
+/// The section is not class-scoped: its only rows are the substantiating
+/// `REFERENCES_TASK` link edges built by `assemble_pack` (the coverage
+/// measurement itself rides the section's `measurement` field, never a row).
+/// `verify_pack` uses this to BOUND the section's membership exemption (Codex
+/// round-15 Finding 1) so no other hashed row can be smuggled in and presented
+/// as coverage evidence.
+#[must_use]
+fn is_expected_review_coverage_row(record: &GraphRecord) -> bool {
+    matches!(
+        record,
+        GraphRecord::Edge { label, .. } if label.as_str() == "REFERENCES_TASK"
+    )
+}
+
 /// Stable unavailable reason for a class that is not available.
 ///
 /// Three honest families:
@@ -2280,13 +2296,31 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
         // the SECTION it sits in, so a row moved into the wrong section (with
         // counts fixed) would otherwise verify clean while consumers see it filed
         // under the wrong evidence class (Codex round-14 Finding 1). Every row in
-        // a class-scoped section must map to that section's evidence class. The
-        // `review_coverage` section is exempt: it legitimately holds the
-        // `ReviewCoverageMeasurement` and `REFERENCES_TASK` link edges, which map
-        // to `None` from `evidence_class_for_record`. In any OTHER section a
-        // `None`-mapping row is itself invalid membership (a section row must map
-        // to that section's class) and fails.
-        if section.class != EvidenceClass::ReviewCoverage.as_wire() {
+        // a class-scoped section must map to that section's evidence class.
+        if section.class == EvidenceClass::ReviewCoverage.as_wire() {
+            // `review_coverage` is not class-scoped: it legitimately holds the
+            // substantiating `REFERENCES_TASK` link edges (the measurement itself
+            // rides the section's `measurement` field, not a row). Those edges map
+            // to no evidence class, so the class check above cannot be applied. But
+            // the exemption is BOUNDED to that expected shape (Codex round-15
+            // Finding 1): a blanket pass would let a tampered pack smuggle an
+            // arbitrary hashed row (a `Commit`, a `Symbol`, any node that maps to a
+            // real evidence class, or any other edge label) into the section with
+            // counts fixed and present unrelated data as coverage evidence. Every
+            // review_coverage row must be a `REFERENCES_TASK` link edge; any other
+            // row fails Integrity.
+            for br in &section.records {
+                if !is_expected_review_coverage_row(&br.record) {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "record {} is an unexpected row in review_coverage section \
+                         (only REFERENCES_TASK link edges are permitted)",
+                        br.record.id(),
+                    );
+                    break 'integrity;
+                }
+            }
+        } else {
             for br in &section.records {
                 let actual = evidence_class_for_record(&br.record).map(|c| c.as_wire());
                 if actual != Some(section.class.as_str()) {
@@ -2363,67 +2397,94 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
         detail: safety_detail,
     };
 
-    // Window consistency.
-    let mut window_ok = true;
-    let mut window_detail = "every row's valid time is inside the manifest window".to_owned();
-    'window: for section in &pack.sections {
-        for br in &section.records {
-            match resolve_valid_time(&br.record) {
-                Some(vt) if in_window(&vt, &pack.manifest.window) => {}
-                _ => {
-                    window_ok = false;
-                    window_detail = format!(
-                        "record {} in section {} is outside the manifest window",
-                        br.record.id(),
-                        section.class
-                    );
-                    break 'window;
+    // Window consistency. First validate the manifest window bounds THEMSELVES —
+    // the same parseable + half-open non-empty rule `assemble_pack` enforces (both
+    // RFC3339; `from < to`, otherwise `reversed_window`). This runs BEFORE and
+    // independent of the row/gap loops, so a vacuous pack (no section rows, no
+    // timestamped gaps) carrying a hand-edited reversed or unparseable
+    // `manifest.window` fails Window-consistency instead of passing vacuously
+    // (Codex round-15 Finding 2). The parsed bounds are then REUSED by the row and
+    // gap checks rather than re-parsed per row. Detail is redaction-safe.
+    let (mut window_ok, mut window_detail, window_bounds) = match (
+        parse_rfc3339(&pack.manifest.window.from),
+        parse_rfc3339(&pack.manifest.window.to),
+    ) {
+        (Some(from), Some(to)) if from < to => (
+            true,
+            "every row's valid time is inside the manifest window".to_owned(),
+            Some((from, to)),
+        ),
+        (None, _) | (_, None) => (
+            false,
+            "manifest window bound is not a valid RFC3339 timestamp".to_owned(),
+            None,
+        ),
+        (Some(_), Some(_)) => (
+            false,
+            "manifest window is reversed or empty (from >= to)".to_owned(),
+            None,
+        ),
+    };
+    if let Some((from, to)) = window_bounds {
+        'window: for section in &pack.sections {
+            for br in &section.records {
+                match resolve_valid_time(&br.record).and_then(|vt| parse_rfc3339(&vt)) {
+                    Some(t) if from <= t && t < to => {}
+                    _ => {
+                        window_ok = false;
+                        window_detail = format!(
+                            "record {} in section {} is outside the manifest window",
+                            br.record.id(),
+                            section.class
+                        );
+                        break 'window;
+                    }
                 }
             }
         }
-    }
-    // Gaps are timestamped rows in the exported pack and consumers filter them by
-    // the same window, so a tampered `gaps[*].valid_time` outside `[from, to)`
-    // must also fail Window-consistency (Codex round-13 Finding 1). EXCEPTION: a
-    // `missing_valid_time` gap is intentionally untimestamped (`valid_time: None`)
-    // and is allowed. A present-but-malformed timestamp is not inside the window
-    // and fails, using the same parse + half-open predicate section rows use. The
-    // failure detail is redaction-safe: the bounded gap class, which bound was
-    // violated, and the gap's own (allow-listed) valid_time — nothing else.
-    if window_ok {
-        for g in &pack.gaps {
-            let Some(vt) = &g.valid_time else {
-                // Only a `missing_valid_time` gap may be untimestamped; it is
-                // intentionally unwindowed. ANY other gap class with a null
-                // `valid_time` fails Window-consistency — consumers filter gaps by
-                // the manifest window and would drop/misplace an untimestamped one
-                // (Codex round-14 Finding 2). Detail is redaction-safe: the bounded
-                // gap class plus the reason, nothing else.
-                if g.gap_class == GapClass::MissingValidTime.as_wire() {
-                    continue; // untimestamped (missing_valid_time): allowed
+        // Gaps are timestamped rows in the exported pack and consumers filter them
+        // by the same window, so a tampered `gaps[*].valid_time` outside `[from,
+        // to)` must also fail Window-consistency (Codex round-13 Finding 1).
+        // EXCEPTION: a `missing_valid_time` gap is intentionally untimestamped
+        // (`valid_time: None`) and is allowed. A present-but-malformed timestamp is
+        // not inside the window and fails, using the same half-open predicate
+        // section rows use. The failure detail is redaction-safe: the bounded gap
+        // class, which bound was violated, and the gap's own (allow-listed)
+        // valid_time — nothing else.
+        if window_ok {
+            for g in &pack.gaps {
+                let Some(vt) = &g.valid_time else {
+                    // Only a `missing_valid_time` gap may be untimestamped; it is
+                    // intentionally unwindowed. ANY other gap class with a null
+                    // `valid_time` fails Window-consistency — consumers filter gaps
+                    // by the manifest window and would drop/misplace an untimestamped
+                    // one (Codex round-14 Finding 2). Detail is redaction-safe: the
+                    // bounded gap class plus the reason, nothing else.
+                    if g.gap_class == GapClass::MissingValidTime.as_wire() {
+                        continue; // untimestamped (missing_valid_time): allowed
+                    }
+                    window_ok = false;
+                    window_detail =
+                        format!("gap (class {}) missing required timestamp", g.gap_class);
+                    break;
+                };
+                let which = parse_rfc3339(vt).map_or(Some("malformed"), |t| {
+                    if t < from {
+                        Some("before window from")
+                    } else if t >= to {
+                        Some("at or after window to")
+                    } else {
+                        None // inside the window
+                    }
+                });
+                if let Some(bound) = which {
+                    window_ok = false;
+                    window_detail = format!(
+                        "gap valid_time {vt} (class {}) is outside the manifest window ({bound})",
+                        g.gap_class
+                    );
+                    break;
                 }
-                window_ok = false;
-                window_detail = format!("gap (class {}) missing required timestamp", g.gap_class);
-                break;
-            };
-            let which = parse_rfc3339(vt).map_or(Some("malformed"), |t| {
-                match (
-                    parse_rfc3339(&pack.manifest.window.from),
-                    parse_rfc3339(&pack.manifest.window.to),
-                ) {
-                    (Some(from), _) if t < from => Some("before window from"),
-                    (_, Some(to)) if t >= to => Some("at or after window to"),
-                    (Some(_), Some(_)) => None, // inside the window
-                    _ => Some("malformed"),     // unparseable window bound (should not occur)
-                }
-            });
-            if let Some(bound) = which {
-                window_ok = false;
-                window_detail = format!(
-                    "gap valid_time {vt} (class {}) is outside the manifest window ({bound})",
-                    g.gap_class
-                );
-                break;
             }
         }
     }
@@ -5053,6 +5114,152 @@ mod pack338_tests {
             report.window_consistency.detail
         );
         assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-15 P2 (Finding 1): the `review_coverage` section membership
+    /// exemption must be CONSTRAINED to the section's expected rows (the stamped
+    /// `REFERENCES_TASK` link edges), not a blanket pass. A tampered pack that
+    /// drops an arbitrary hashed row — a `Commit` — into `review_coverage`, fixes
+    /// the section counts, and keeps hashes + canonical order valid must FAIL
+    /// Integrity naming the record. Otherwise unrelated data is presented as
+    /// coverage evidence and offline verify certifies it clean.
+    #[test]
+    fn verify_fails_when_review_coverage_holds_unexpected_row() {
+        let mut pack = assemble_cc81();
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "baseline pack passes Integrity"
+        );
+
+        // Move a Commit row out of `commits` into `review_coverage`.
+        let commit_idx = pack
+            .sections
+            .iter()
+            .position(|s| s.class == "commits")
+            .expect("commits section");
+        assert!(
+            !pack.sections[commit_idx].records.is_empty(),
+            "commits section has rows to move"
+        );
+        let moved = pack.sections[commit_idx].records.remove(0);
+        pack.sections[commit_idx].record_count -= 1;
+        let moved_id = moved.record.id().to_owned();
+
+        let rc_idx = pack
+            .sections
+            .iter()
+            .position(|s| s.class == "review_coverage")
+            .expect("review_coverage section");
+        pack.sections[rc_idx].records.push(moved);
+        // Keep the section canonically ordered so ordering is not what fails —
+        // only the unexpected-row membership rule is violated.
+        pack.sections[rc_idx]
+            .records
+            .sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
+        pack.sections[rc_idx].record_count += 1;
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "an unexpected row in review_coverage must fail Integrity"
+        );
+        assert!(
+            report.integrity.detail.contains(&moved_id),
+            "detail names the offending record: {}",
+            report.integrity.detail
+        );
+        assert!(
+            report.integrity.detail.contains("review_coverage"),
+            "detail names the review_coverage section: {}",
+            report.integrity.detail
+        );
+        assert!(
+            report.integrity.detail.contains("unexpected row"),
+            "detail explains the offense: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-15 P2 (Finding 1, positive): the untampered pack's genuine
+    /// `review_coverage` rows (the stamped `REFERENCES_TASK` link edges) still
+    /// pass the constrained membership check.
+    #[test]
+    fn verify_allows_expected_review_coverage_link_edge_rows() {
+        let pack = assemble_cc81();
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .expect("review_coverage section");
+        assert!(
+            !rc.records.is_empty(),
+            "review_coverage carries the substantiating link edges"
+        );
+        for br in &rc.records {
+            assert!(
+                matches!(&br.record, GraphRecord::Edge { label, .. } if label.as_str() == "REFERENCES_TASK"),
+                "every expected review_coverage row is a REFERENCES_TASK edge: {:?}",
+                br.record
+            );
+        }
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "expected review_coverage rows must pass Integrity: {}",
+            verify_pack(&pack).integrity.detail
+        );
+    }
+
+    /// Codex round-15 P2 (Finding 2): Window-consistency must validate the
+    /// manifest window bounds THEMSELVES — the same parseable + non-reversed rule
+    /// `assemble_pack` enforces — even for a vacuous pack with no section rows and
+    /// no timestamped gaps. A hand-edited reversed manifest window (`from` >= `to`)
+    /// that `assemble_pack` would reject must FAIL verify's Window-consistency, not
+    /// pass vacuously.
+    #[test]
+    fn verify_fails_when_manifest_window_is_reversed_even_when_empty() {
+        let records = build_seed_records();
+        let catalog = load_default_catalog();
+        // Empty window: no in-window section rows.
+        let empty = Window {
+            from: "2026-01-01T00:00:00Z".to_owned(),
+            to: "2026-01-02T00:00:00Z".to_owned(),
+        };
+        let mut pack = assemble_pack(&records, &catalog, "CC8.1", &empty, 1.0, "v", None).unwrap();
+        // Isolate the new check: no section rows, no gaps at all, so only the
+        // manifest-window validity check can fail Window-consistency.
+        for s in &mut pack.sections {
+            assert!(s.records.is_empty(), "empty window has no section rows");
+        }
+        pack.gaps.clear();
+
+        // Baseline: the valid empty window still passes verify's Window-consistency.
+        assert!(
+            verify_pack(&pack).window_consistency.passed,
+            "a valid vacuous empty-window pack passes Window-consistency: {}",
+            verify_pack(&pack).window_consistency.detail
+        );
+
+        // Reverse the manifest window (from >= to): assemble would reject this.
+        pack.manifest.window = Window {
+            from: "2026-01-02T00:00:00Z".to_owned(),
+            to: "2026-01-01T00:00:00Z".to_owned(),
+        };
+        let report = verify_pack(&pack);
+        assert!(
+            !report.window_consistency.passed,
+            "a reversed manifest window must fail Window-consistency even with no rows"
+        );
+        assert!(!report.ok, "overall verdict fails");
+
+        // An unparseable window bound must also fail.
+        let mut bad = assemble_pack(&records, &catalog, "CC8.1", &empty, 1.0, "v", None).unwrap();
+        bad.gaps.clear();
+        bad.manifest.window.from = "not-a-time".to_owned();
+        assert!(
+            !verify_pack(&bad).window_consistency.passed,
+            "an unparseable manifest window bound must fail Window-consistency"
+        );
     }
 
     /// Codex round-10 P1: a secret injected into a `diagnostics[*].detail` (a
