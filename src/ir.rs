@@ -887,6 +887,69 @@ impl FrameResolution {
     }
 }
 
+/// Correlation basis of an `EMITTED_DURING` evidence-link edge (issue #323).
+///
+/// An `EMITTED_DURING` edge runs `ErrorSignature` → the agent run / command that
+/// produced it. Every such edge MUST carry exactly one basis from this **closed,
+/// stable** set — no edge is ever emitted without a documented basis:
+///
+/// - `content_hash_join` — the `LogSource` the signature was `CAPTURED_FROM`
+///   carries a `source_artifact_hash` equal to a `CommandRun`'s captured
+///   stdout/stderr `OutputHandle.hash`. This is exact BLAKE3 byte equality: the
+///   log artifact *is* that command's output, so the join is deterministic and
+///   inherently within one repository. Edges of this basis carry confidence
+///   `1.0`.
+/// - `temporal_correlation` — the signature's representative valid time falls
+///   inside an `AgentRun` / `AgentTurn` execution window (within the configured
+///   tolerance) for the **same repository**. This is a *correlation lead, never
+///   causation*: overlapping in time is not proof the run produced the error.
+///   Edges of this basis carry a lower confidence (`0.5`), and overlapping runs
+///   each mint their own edge — no single winner is silently chosen.
+///
+/// Adding this optional edge field is additive per
+/// `docs/schema/schema-versioning.md`; legacy edges simply lack it.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrelationBasis {
+    /// The signature's `LogSource` artifact hash equals a `CommandRun` output
+    /// handle hash (exact BLAKE3 byte equality). Confidence `1.0`.
+    ContentHashJoin,
+    /// The signature's valid time falls inside a same-repository run window.
+    /// A correlation lead, never causation. Confidence `0.5`.
+    TemporalCorrelation,
+}
+
+impl CorrelationBasis {
+    /// Returns the serialized correlation basis.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContentHashJoin => "content_hash_join",
+            Self::TemporalCorrelation => "temporal_correlation",
+        }
+    }
+
+    /// The documented confidence constant carried by an edge of this basis.
+    #[must_use]
+    pub const fn confidence(self) -> &'static str {
+        match self {
+            Self::ContentHashJoin => "1.0",
+            Self::TemporalCorrelation => "0.5",
+        }
+    }
+
+    /// Parses a correlation basis from its wire string. Returns `None` for
+    /// unknown values.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "content_hash_join" => Some(Self::ContentHashJoin),
+            "temporal_correlation" => Some(Self::TemporalCorrelation),
+            _ => None,
+        }
+    }
+}
+
 /// One structured backtrace stack frame captured from a runtime log
 /// (issues #319/#320/#322).
 ///
@@ -1326,6 +1389,12 @@ pub enum GraphRecord {
         /// absent elsewhere.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         frame_index: Option<u32>,
+        /// Correlation basis (issue #323); present only on `EMITTED_DURING`
+        /// edges minted by `eg link-logs`, drawn from the closed
+        /// [`CorrelationBasis`] set, absent elsewhere. Every `EMITTED_DURING`
+        /// edge carries exactly one basis — none is emitted without one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basis: Option<CorrelationBasis>,
         /// Git and bitemporal provenance for history-backed records.
         #[serde(skip_serializing_if = "Option::is_none")]
         temporal: Option<TemporalMetadata>,
@@ -1881,6 +1950,7 @@ impl GraphRecord {
             resolution: None,
             frame_resolution: None,
             frame_index: None,
+            basis: None,
             temporal: None,
             summary,
             producer: None,
@@ -1908,6 +1978,7 @@ impl GraphRecord {
             resolution: None,
             frame_resolution: None,
             frame_index: None,
+            basis: None,
             temporal: None,
             summary,
             producer: None,
@@ -1942,6 +2013,7 @@ impl GraphRecord {
             resolution: None,
             frame_resolution: None,
             frame_index: None,
+            basis: None,
             temporal: None,
             summary,
             producer: None,
@@ -1993,6 +2065,26 @@ impl GraphRecord {
             *fi = Some(frame_index);
         }
         self
+    }
+
+    /// Attaches a correlation basis to an edge record (issue #323). No-op on
+    /// node and tombstone records.
+    #[must_use]
+    pub const fn with_basis(mut self, correlation_basis: CorrelationBasis) -> Self {
+        if let Self::Edge { basis, .. } = &mut self {
+            *basis = Some(correlation_basis);
+        }
+        self
+    }
+
+    /// Returns the correlation basis when this record is an edge carrying one;
+    /// `None` otherwise (issue #323).
+    #[must_use]
+    pub const fn basis(&self) -> Option<CorrelationBasis> {
+        match self {
+            Self::Edge { basis, .. } => *basis,
+            Self::Node { .. } | Self::Tombstone { .. } => None,
+        }
     }
 
     /// Returns the backtrace-frame resolution status when this record is an

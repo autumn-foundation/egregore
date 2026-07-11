@@ -2375,6 +2375,7 @@ impl EmbeddedAletheiaSink {
             resolution,
             frame_resolution,
             frame_index,
+            basis,
             temporal,
             summary,
             producer,
@@ -2405,6 +2406,11 @@ impl EmbeddedAletheiaSink {
         );
         let frame_index_str = frame_index.map(|i| i.to_string());
         builder = insert_optional(builder, "frame_index", frame_index_str.as_deref());
+        builder = insert_optional(
+            builder,
+            "basis",
+            basis.map(crate::ir::CorrelationBasis::as_str),
+        );
         builder = insert_temporal(builder, temporal.as_ref());
         if let Some(p) = producer
             && let Ok(json) = serde_json::to_string(p)
@@ -3310,6 +3316,14 @@ impl EmbeddedAletheiaSink {
                 })
             })
             .transpose()?,
+            basis: optional_str_property(record_id, "basis", edge.get_property("basis"))?
+                .as_deref()
+                .map(|value| {
+                    crate::ir::CorrelationBasis::from_wire(value).ok_or_else(|| {
+                        read_back_error(record_id, format!("basis invalid: {value}"))
+                    })
+                })
+                .transpose()?,
             temporal: temporal_from_properties(record_id, |key| edge.get_property(key))?,
             summary: required_str_property(record_id, "summary", edge.get_property("summary"))?,
             producer: optional_str_property(

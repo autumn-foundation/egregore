@@ -2043,6 +2043,7 @@ fn emit_task_records(
             resolution: None,
             frame_resolution: None,
             frame_index: None,
+            basis: None,
             temporal: None,
             summary: format!(
                 "Task '{}' has local-file source ExternalLink",
@@ -2133,6 +2134,7 @@ fn emit_ac_record(
         resolution: None,
         frame_resolution: None,
         frame_index: None,
+        basis: None,
         temporal: None,
         summary: format!("AcceptanceCriterion '{}' owned by task", ac.local_id),
         producer: None,
@@ -2222,6 +2224,7 @@ fn emit_external_link_record(
         resolution: None,
         frame_resolution: None,
         frame_index: None,
+        basis: None,
         temporal: None,
         summary: format!("'{}' has ExternalLink", link.parent_local_id),
         producer: None,

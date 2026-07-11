@@ -590,6 +590,7 @@ mod tests {
             resolution: None,
             frame_resolution: None,
             frame_index: None,
+            basis: None,
             temporal: None,
             summary: "test edge".to_owned(),
             producer: None,

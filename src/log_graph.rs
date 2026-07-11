@@ -654,6 +654,7 @@ fn log_edge(
         resolution: None,
         frame_resolution: None,
         frame_index: None,
+        basis: None,
         temporal: None,
         summary: summary.to_owned(),
         producer: None,

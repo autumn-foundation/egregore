@@ -337,6 +337,8 @@ removing a label is a schema version bump.
 | `FAILED_ON` | `agent_memory`, `verification` | `codegraph` | `Failure`, `TestRun`, `CIStatus` | `Symbol`, `File` | many:many | no |
 | `EXPLAINS_CHANGE` | `agent_memory` | `codegraph` | `Observation`, `Decision` | `Commit`, `Change` | many:many | yes |
 | `REFERENCES_TASK` | `agent_memory` | `project` | `Observation`, `Decision`, `Failure`, `Lesson` | `Task` | many:many | no |
+| `REFERENCES_TASK` | `log` | `project` | `ErrorSignature` | `Task`, `GitHubIssue`, `LocalTask` | many:many | no |
+| `EMITTED_DURING` | `log` | `agent_memory`, `verification` | `ErrorSignature` | `AgentRun`, `AgentTurn`, `CommandRun` | many:many | yes |
 | `CLOSES_ACCEPTANCE_CRITERION` | `project` | `verification` | `AcceptanceCriterion` | `Verification`, `CommandRun`, `TestRun` | many:1 | no |
 | `OWNED_BY_TASK` | `project` | `project` | `AcceptanceCriterion` | `Task` | many:1 | no |
 | `EXTERNAL_HANDLE` | `project` | `project` | `Task`, `AcceptanceCriterion` | `ExternalLink` | many:1 | no |
