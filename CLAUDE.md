@@ -643,6 +643,40 @@ Safety, Window-consistency). Use `eg bundle export` instead when you want a
 record-closure-scoped bundle rather than a control/window-scoped pack. See
 `docs/cli/evidence-pack.md`.
 
+`eg audit review-coverage --from <T0> --to <T1>` (over `--graph` XOR `--data-dir`,
+issue #339) is a standing citable review-coverage gate: for every PR merged in the
+half-open valid-time window `[from, to)` keyed on `merged_at` it classifies the PR
+into the CLOSED verdict set `{covered, approval_stale_head, self_approved_only,
+uncovered}` and gates on `covered / merged_prs` against `--min-coverage` (default
+1.0). Its per-PR derivation is the SINGLE shared implementation
+(`evidence_pack::derive_review_coverage`) that #338's evidence-pack
+`review_coverage` section and `merged_pr_without_approving_review` gap also call —
+the pack with lenient options, this lane with its strict `--require-non-author` /
+`--require-final-head` defaults (both on) — so the two surfaces never diverge.
+Substrate: #333 PR fields (`merged_at`/`head_sha`/`merge_commit_sha`/
+`system_native_id`), #334 review anchors (`review_commit_sha`), imported by #46;
+#335 identity nodes are NOT merged, so the non-author check compares recorded
+author LOGINS and degrades to an `identity_unavailable` sub-label without them,
+never fabricating a self-approval and never inventing an `ExternalIdentity` kind.
+A stale approval degrades to `approval_stale_head` only under `--require-final-head`;
+a review lacking a `review_commit_sha` anchor degrades to an `approval_unanchored`
+sub-label, never guessed stale. Every row cites the PR Task ID + `system_native_id`
++ `merge_commit_sha`; covered rows also cite the approving Review ID +
+`review_commit_sha` + approver login. Windowing reuses #338's half-open
+`merged_at` semantics; a PR with no window-resolvable merge time is excluded under
+a counted diagnostic and an empty window is a vacuous pass (`empty_window`, exit 0).
+Below threshold exits 1 with the full report and a
+`below_review_coverage_threshold` diagnostic naming the ratio and failing PR IDs;
+usage/load errors (reversed window, invalid timestamp, both-or-neither input flag,
+out-of-range `--min-coverage`) exit 2. Measures RECORDED review execution — never
+GitHub branch-protection configuration, review quality, or unrecorded reviews
+elsewhere. Pure core, allow-list-only output, byte-identical across runs. Also
+wires the two #334-dependent evidence-pack gap classes
+(`review_unanchored_no_commit_sha`, `approval_precedes_final_head`) to their real
+derivation now that #334 is merged, emitting the `capability_unavailable`
+diagnostic only for a pre-#334 store with no reviewed-commit facts. See
+`docs/cli/review-coverage.md`.
+
 Embedded store write locking (issue #200):
 
 Every embedded write open takes the OS-level exclusive store lease (`egregored.lock`),

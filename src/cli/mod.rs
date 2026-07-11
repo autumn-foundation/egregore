@@ -2809,6 +2809,49 @@ pub(crate) enum AuditSubcommand {
         #[command(subcommand)]
         action: EvidencePackAction,
     },
+    /// Gate review coverage over pull requests merged in a valid-time window (issue #339).
+    ///
+    /// For every PR merged in the half-open window `[from, to)` (keyed on
+    /// `merged_at`), classifies it into the closed verdict set `{covered,
+    /// approval_stale_head, self_approved_only, uncovered}` and gates on the
+    /// `covered / merged_prs` ratio. Measures RECORDED review execution in the
+    /// graph — never GitHub branch-protection configuration, review quality, or
+    /// unrecorded reviews elsewhere. Shares its per-PR derivation with the #338
+    /// evidence-pack `review_coverage` section (single implementation).
+    ///
+    /// Exit codes:
+    ///   0 — coverage met the threshold (`ok: true`); empty windows are vacuous
+    ///       success.
+    ///   1 — coverage below threshold (`ok: false`); the full report is still
+    ///       printed with a `below_review_coverage_threshold` diagnostic.
+    ///   2 — usage/load error (reversed/invalid window, both or neither input
+    ///       flag, out-of-range --min-coverage, unreadable store/graph).
+    ReviewCoverage {
+        /// Inclusive lower bound of the valid-time window (RFC 3339).
+        #[arg(long)]
+        from: String,
+        /// Exclusive upper bound of the valid-time window (RFC 3339).
+        #[arg(long)]
+        to: String,
+        /// Graph JSONL path (mutually exclusive with `--data-dir`).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` store directory (mutually exclusive with `--graph`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Minimum `covered / merged_prs` coverage fraction the window must meet.
+        #[arg(long, default_value_t = 1.0)]
+        min_coverage: f64,
+        /// Require an approving review from a non-author identity (default on).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        require_non_author: bool,
+        /// Require the approval to be anchored at the PR's final head (default on).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        require_final_head: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 /// Actions for `eg audit evidence-pack` (issue #338).

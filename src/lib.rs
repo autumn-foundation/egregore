@@ -86,6 +86,8 @@ pub mod redaction_report;
 /// Offline repair workflow for Egregore stores (issue #49).
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod repair;
+/// Standing citable review-coverage gate over merged PRs (issue #339).
+pub mod review_coverage;
 /// Record schema-version compatibility checks.
 pub mod schema_version;
 /// Semantic search relevance evaluation harness (issue #58).

@@ -937,6 +937,151 @@ pub struct ReviewCoverageMeasurement {
     pub approval_link_edge_ids: Vec<String>,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared review-coverage derivation (issue #339)
+//
+// The single source of truth for per-PR review-coverage classification, consumed
+// by BOTH `eg audit review-coverage` (#339) and #338's evidence-pack
+// `review_coverage` section + `merged_pr_without_approving_review` gap. The two
+// surfaces MUST NOT fork this logic (AC7): they call `derive_review_coverage`
+// with the strictness options each surface documents. The evidence pack uses the
+// lenient options (any approving in-window at-or-before-merge review counts,
+// matching its established #338 semantics); the audit lane defaults to the strict
+// options below.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Strictness knobs for review-coverage classification (issue #339, AC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewCoverageOptions {
+    /// Require an approving review from a non-author identity (default on). With
+    /// #335 identity nodes unavailable this compares the review's `author` login
+    /// against the PR Task's `author` login; a missing login on either side
+    /// degrades to an `identity_unavailable` sub-label and never fabricates a
+    /// self-approval.
+    pub require_non_author: bool,
+    /// Require the approving review to be anchored at the PR's final head commit
+    /// (default on). A review whose `review_commit_sha` differs from the Task's
+    /// `head_sha` is `approval_stale_head` rather than covered; a review with no
+    /// `review_commit_sha` (issue #334 anchor absent) degrades to an
+    /// `approval_unanchored` sub-label and is never guessed to be stale.
+    pub require_final_head: bool,
+}
+
+impl Default for ReviewCoverageOptions {
+    fn default() -> Self {
+        Self {
+            require_non_author: true,
+            require_final_head: true,
+        }
+    }
+}
+
+/// The closed per-PR verdict-class set (issue #339, AC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReviewVerdict {
+    /// An approving review from a non-author identity, anchored at the final head
+    /// (subject to the enabled strictness knobs), valid at-or-before merge.
+    Covered,
+    /// Approved, but the approval's `review_commit_sha` differs from the PR's
+    /// final `head_sha` (approved-then-force-pushed); only under
+    /// `require_final_head`.
+    ApprovalStaleHead,
+    /// The only approving review(s) come from the PR author identity; only under
+    /// `require_non_author` and only when both logins are present.
+    SelfApprovedOnly,
+    /// Merged with zero approving reviews.
+    Uncovered,
+}
+
+impl ReviewVerdict {
+    /// Every verdict class, in fixed order.
+    pub const ALL: [Self; 4] = [
+        Self::Covered,
+        Self::ApprovalStaleHead,
+        Self::SelfApprovedOnly,
+        Self::Uncovered,
+    ];
+
+    /// Stable `snake_case` wire name.
+    #[must_use]
+    pub const fn as_wire(&self) -> &'static str {
+        match self {
+            Self::Covered => "covered",
+            Self::ApprovalStaleHead => "approval_stale_head",
+            Self::SelfApprovedOnly => "self_approved_only",
+            Self::Uncovered => "uncovered",
+        }
+    }
+}
+
+/// One classified merged-in-window PR (issue #339, AC).
+///
+/// Carries its full citation set (PR Task ID + `system_native_id` +
+/// `merge_commit_sha`; for covered rows also the approving review ID +
+/// `review_commit_sha` + approver login/identity).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCoverageRow {
+    /// The PR Task record ID.
+    pub pr_task_id: String,
+    /// The source-system-native PR handle (`system_native_id`), when recorded.
+    pub system_native_id: Option<String>,
+    /// The PR's merge commit SHA (`merge_commit_sha`), when recorded.
+    pub merge_commit_sha: Option<String>,
+    /// The resolved merge time (`merged_at`) used to window the PR.
+    pub merged_at: Option<String>,
+    /// The closed verdict class.
+    pub verdict: ReviewVerdict,
+    /// Sorted, closed-set sub-labels (`identity_unavailable`, `approval_unanchored`).
+    pub sub_labels: Vec<String>,
+    /// The deciding approving review record ID (covered rows; else `None`).
+    pub approving_review_id: Option<String>,
+    /// The deciding approving review's anchored `review_commit_sha` (covered rows).
+    pub review_commit_sha: Option<String>,
+    /// The deciding approving reviewer login (covered rows).
+    pub approver_login: Option<String>,
+    /// The deciding approver `ExternalIdentity` record ID — always `None` until
+    /// issue #335 lands identity nodes; the login above is the available signal.
+    pub approver_identity_id: Option<String>,
+}
+
+/// One coverage-substantiating `REFERENCES_TASK` edge linking an approving review
+/// to a covered merged-in-window PR. Consumed by the evidence pack to build its
+/// `review_coverage` section rows (AC7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageSubstantiation {
+    /// The `REFERENCES_TASK` edge record ID.
+    pub edge_id: String,
+    /// The approving review (edge source) record ID.
+    pub review_id: String,
+    /// The merged-in-window PR (edge target) record ID.
+    pub pr_id: String,
+    /// The approving review's resolved valid time (stamped onto the edge).
+    pub review_valid_time: String,
+}
+
+/// The shared review-coverage derivation output (issue #339, AC7).
+#[derive(Debug, Clone)]
+pub struct ReviewCoverageDerivation {
+    /// One classified row per merged-in-window PR, sorted by PR Task record ID.
+    pub rows: Vec<ReviewCoverageRow>,
+    /// Distinct merged-in-window PR Task record IDs, sorted.
+    pub merged_pr_ids: Vec<String>,
+    /// PR Task IDs whose verdict is `covered` under the supplied options.
+    pub covered_pr_ids: BTreeSet<String>,
+    /// PR Task IDs with at least one approving review resolving in-window at or
+    /// before merge — the OPTION-INDEPENDENT lenient set the
+    /// `merged_pr_without_approving_review` gap keys on (never the strict covered
+    /// set, so a self-approved or stale-head PR is never mislabeled as having no
+    /// approving review at all).
+    pub any_approving_pr_ids: BTreeSet<String>,
+    /// Coverage-substantiating edges for covered PRs, sorted by edge ID.
+    pub coverage_substantiations: Vec<CoverageSubstantiation>,
+    /// PR Task IDs that look merged (a `github_pr` Task carrying a
+    /// `merge_commit_sha`) but have no window-resolvable `merged_at`, excluded
+    /// from the merged set under a counted diagnostic, sorted.
+    pub excluded_unresolvable_merge_time: Vec<String>,
+}
+
 /// One evidence-class section of an assembled pack (AC1/AC7).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceSection {
@@ -1294,6 +1439,349 @@ fn stamp_edge_valid_time(mut edge: GraphRecord, valid_time: &str) -> GraphRecord
     edge
 }
 
+/// The PR Task's final head commit SHA (`head_sha`), when recorded.
+const fn pr_head_sha(record: &GraphRecord) -> Option<&str> {
+    match record {
+        GraphRecord::Node {
+            head_sha: Some(h), ..
+        } if !h.is_empty() => Some(h.as_str()),
+        _ => None,
+    }
+}
+
+/// The PR Task's source-native handle (`system_native_id`), when recorded.
+fn pr_system_native_id(record: &GraphRecord) -> Option<String> {
+    match record {
+        GraphRecord::Node {
+            system_native_id: Some(s),
+            ..
+        } if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// The PR Task's merge commit SHA (`merge_commit_sha`), when recorded.
+fn pr_merge_commit_sha(record: &GraphRecord) -> Option<String> {
+    match record {
+        GraphRecord::Node {
+            merge_commit_sha: Some(m),
+            ..
+        } if !m.is_empty() => Some(m.clone()),
+        _ => None,
+    }
+}
+
+/// The GitHub author login (`author`) recorded on a Task or Review, when present.
+const fn author_login(record: &GraphRecord) -> Option<&str> {
+    match record {
+        GraphRecord::Node {
+            author: Some(a), ..
+        } if !a.is_empty() => Some(a.as_str()),
+        _ => None,
+    }
+}
+
+/// A Review's anchored reviewed-commit SHA (`review_commit_sha`, issue #334),
+/// when present.
+const fn review_commit_sha_of(record: &GraphRecord) -> Option<&str> {
+    match record {
+        GraphRecord::Node {
+            review_commit_sha: Some(s),
+            ..
+        } if !s.is_empty() => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// True when a record LOOKS like a merged GitHub PR: a `github_pr` Task carrying
+/// a `merge_commit_sha`. Used to count PRs excluded from the merged set for
+/// lacking a window-resolvable `merged_at` (never falling back to update time).
+fn pr_looks_merged(record: &GraphRecord) -> bool {
+    matches!(
+        record,
+        GraphRecord::Node {
+            source_kind: Some(sk),
+            merge_commit_sha: Some(mc),
+            ..
+        } if sk == "github_pr" && !mc.is_empty()
+    )
+}
+
+/// Derives the shared per-PR review-coverage classification (issue #339, AC7).
+///
+/// Pure, deterministic, and byte-stable: no I/O, no wall clock, no network. This
+/// is the single implementation BOTH `eg audit review-coverage` and #338's
+/// evidence-pack `review_coverage` section / `merged_pr_without_approving_review`
+/// gap call — the pack with lenient options, the audit lane with its strict
+/// defaults — so the two surfaces can never diverge.
+///
+/// A PR is "merged in window" iff its MERGE time (`merged_at`, first-class since
+/// #333) falls in the half-open window (never its Task `valid_time`, which the
+/// importer stamps from `github_updated_at`). An approving review counts only when
+/// it is a genuine approving PR review (`review_kind` allow-list + `approved`
+/// state), references the PR via `REFERENCES_TASK`, resolves in-window, and is
+/// valid AT OR BEFORE the PR's merge time (a post-merge approval did not gate the
+/// merge).
+#[must_use]
+#[allow(
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::struct_excessive_bools
+)]
+pub fn derive_review_coverage(
+    records: &[GraphRecord],
+    window: &Window,
+    options: ReviewCoverageOptions,
+) -> ReviewCoverageDerivation {
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+
+    // Merged-in-window PRs, keyed on `merged_at` (round-5 #333 merge-time gate).
+    let mut merged_pr_ids: Vec<String> = Vec::new();
+    let mut excluded_unresolvable_merge_time: Vec<String> = Vec::new();
+    for record in records {
+        match merged_pr_merge_time(record) {
+            Some(merge_time) if in_window(merge_time, window) => {
+                merged_pr_ids.push(record.id().to_owned());
+            }
+            Some(_) => {} // parsed, out of window: excluded, no diagnostic
+            None => {
+                // A PR that LOOKS merged (carries a merge_commit_sha) but has no
+                // window-resolvable merge time is excluded under a counted
+                // diagnostic — never windowed on update time (round-5 P1).
+                if pr_looks_merged(record) {
+                    excluded_unresolvable_merge_time.push(record.id().to_owned());
+                }
+            }
+        }
+    }
+    merged_pr_ids.sort();
+    merged_pr_ids.dedup();
+    excluded_unresolvable_merge_time.sort();
+    excluded_unresolvable_merge_time.dedup();
+    let merged_set: BTreeSet<&str> = merged_pr_ids.iter().map(String::as_str).collect();
+
+    // Gather every approving-review -> merged-PR REFERENCES_TASK link, keyed by
+    // target PR. Each entry records the edge, the review, and per-review checks.
+    struct ApprovingLink<'a> {
+        edge_id: &'a str,
+        review_id: &'a str,
+        review: &'a GraphRecord,
+        review_valid_time: String,
+    }
+    let mut links_by_pr: BTreeMap<&str, Vec<ApprovingLink<'_>>> = BTreeMap::new();
+    for record in records {
+        let GraphRecord::Edge {
+            label,
+            source,
+            target,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if label.as_str() != "REFERENCES_TASK" || !merged_set.contains(target.as_str()) {
+            continue;
+        }
+        let Some(merged_at) = by_id
+            .get(target.as_str())
+            .and_then(|r| merged_pr_merge_time(r))
+            .and_then(parse_rfc3339)
+        else {
+            continue;
+        };
+        let Some(review) = by_id.get(source.as_str()).copied() else {
+            continue;
+        };
+        if !is_approving_review(review) {
+            continue;
+        }
+        let Some(review_vt) = resolve_valid_time(review) else {
+            continue;
+        };
+        if !in_window(&review_vt, window) {
+            continue;
+        }
+        let Some(review_ts) = parse_rfc3339(&review_vt) else {
+            continue;
+        };
+        if review_ts > merged_at {
+            continue; // post-merge approval never gates the merge (round-9)
+        }
+        links_by_pr
+            .entry(target.as_str())
+            .or_default()
+            .push(ApprovingLink {
+                edge_id: record.id(),
+                review_id: source.as_str(),
+                review,
+                review_valid_time: review_vt,
+            });
+    }
+
+    let mut rows: Vec<ReviewCoverageRow> = Vec::new();
+    let mut covered_pr_ids: BTreeSet<String> = BTreeSet::new();
+    let mut any_approving_pr_ids: BTreeSet<String> = BTreeSet::new();
+    let mut coverage_substantiations: Vec<CoverageSubstantiation> = Vec::new();
+
+    for pr_id in &merged_pr_ids {
+        let task = by_id.get(pr_id.as_str()).copied();
+        let system_native_id = task.and_then(pr_system_native_id);
+        let merge_commit_sha = task.and_then(pr_merge_commit_sha);
+        let merged_at = task
+            .and_then(|t| merged_pr_merge_time(t))
+            .map(str::to_owned);
+        let task_author = task.and_then(author_login);
+        let head_sha = task.and_then(pr_head_sha);
+
+        let mut links = links_by_pr.remove(pr_id.as_str()).unwrap_or_default();
+        // Deterministic evaluation order.
+        links.sort_by(|a, b| a.review_id.cmp(b.review_id));
+
+        if !links.is_empty() {
+            any_approving_pr_ids.insert(pr_id.clone());
+        }
+
+        // Per-review predicates under the enabled knobs.
+        struct Eval<'a> {
+            link: &'a ApprovingLink<'a>,
+            qualifies: bool,
+            is_self: bool,
+            head_stale: bool,
+            author_ok: bool,
+            identity_unavailable: bool,
+            unanchored: bool,
+        }
+        let evals: Vec<Eval<'_>> = links
+            .iter()
+            .map(|link| {
+                let rcs = review_commit_sha_of(link.review);
+                let rev_author = author_login(link.review);
+                let identity_unavailable =
+                    options.require_non_author && (rev_author.is_none() || task_author.is_none());
+                let is_self = options.require_non_author
+                    && matches!((rev_author, task_author), (Some(a), Some(b)) if a == b);
+                // Non-author check passes when the knob is off, when identity is
+                // unavailable (degrade — never fabricate self-approval), or when
+                // the logins genuinely differ.
+                let author_ok = !options.require_non_author || identity_unavailable || !is_self;
+                let unanchored = options.require_final_head && rcs.is_none();
+                // Head check: stale only when anchored AND the anchor differs from
+                // the final head; an unanchored review degrades (never guessed
+                // stale) and a missing head_sha cannot be compared.
+                let head_stale = options.require_final_head
+                    && matches!((rcs, head_sha), (Some(r), Some(h)) if r != h);
+                let head_ok = !head_stale;
+                Eval {
+                    link,
+                    qualifies: author_ok && head_ok,
+                    is_self,
+                    head_stale,
+                    author_ok,
+                    identity_unavailable,
+                    unanchored,
+                }
+            })
+            .collect();
+
+        // Every approving link substantiates the coverage of a covered PR; a PR is
+        // covered iff at least one link qualifies under the enabled knobs.
+        let verdict;
+        let mut deciding: Option<&Eval<'_>> = None;
+        if let Some(best) = evals
+            .iter()
+            .filter(|e| e.qualifies)
+            // Prefer a fully non-degraded qualifying review; tiebreak by review id.
+            .min_by(|a, b| {
+                let da = usize::from(a.identity_unavailable) + usize::from(a.unanchored);
+                let db = usize::from(b.identity_unavailable) + usize::from(b.unanchored);
+                da.cmp(&db)
+                    .then_with(|| a.link.review_id.cmp(b.link.review_id))
+            })
+        {
+            verdict = ReviewVerdict::Covered;
+            deciding = Some(best);
+            covered_pr_ids.insert(pr_id.clone());
+            for link in &links {
+                coverage_substantiations.push(CoverageSubstantiation {
+                    edge_id: link.edge_id.to_owned(),
+                    review_id: link.review_id.to_owned(),
+                    pr_id: pr_id.clone(),
+                    review_valid_time: link.review_valid_time.clone(),
+                });
+            }
+        } else if links.is_empty() {
+            verdict = ReviewVerdict::Uncovered;
+        } else if let Some(stale) = evals
+            .iter()
+            .filter(|e| e.author_ok && e.head_stale)
+            .min_by(|a, b| a.link.review_id.cmp(b.link.review_id))
+        {
+            // A genuine (non-author / degraded) reviewer approved a non-final head.
+            verdict = ReviewVerdict::ApprovalStaleHead;
+            deciding = Some(stale);
+        } else if let Some(self_only) = evals
+            .iter()
+            .filter(|e| e.is_self)
+            .min_by(|a, b| a.link.review_id.cmp(b.link.review_id))
+        {
+            verdict = ReviewVerdict::SelfApprovedOnly;
+            deciding = Some(self_only);
+        } else {
+            // Residual (e.g. self + stale with no independent reviewer): the
+            // self-approval is the dominant defect.
+            verdict = ReviewVerdict::SelfApprovedOnly;
+            deciding = evals
+                .iter()
+                .min_by(|a, b| a.link.review_id.cmp(b.link.review_id));
+        }
+
+        let mut sub_labels: BTreeSet<String> = BTreeSet::new();
+        if let Some(e) = deciding {
+            if e.identity_unavailable {
+                sub_labels.insert("identity_unavailable".to_owned());
+            }
+            if e.unanchored {
+                sub_labels.insert("approval_unanchored".to_owned());
+            }
+        }
+
+        let (approving_review_id, review_commit_sha, approver_login) =
+            match (verdict, deciding) {
+                (ReviewVerdict::Covered, Some(e)) => (
+                    Some(e.link.review_id.to_owned()),
+                    review_commit_sha_of(e.link.review).map(str::to_owned),
+                    author_login(e.link.review).map(str::to_owned),
+                ),
+                _ => (None, None, None),
+            };
+
+        rows.push(ReviewCoverageRow {
+            pr_task_id: pr_id.clone(),
+            system_native_id,
+            merge_commit_sha,
+            merged_at,
+            verdict,
+            sub_labels: sub_labels.into_iter().collect(),
+            approving_review_id,
+            review_commit_sha,
+            approver_login,
+            approver_identity_id: None,
+        });
+    }
+
+    rows.sort_by(|a, b| a.pr_task_id.cmp(&b.pr_task_id));
+    coverage_substantiations.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
+
+    ReviewCoverageDerivation {
+        rows,
+        merged_pr_ids,
+        covered_pr_ids,
+        any_approving_pr_ids,
+        coverage_substantiations,
+        excluded_unresolvable_merge_time,
+    }
+}
+
 /// Scrubs, hashes, and canonically orders a set of records for a section.
 fn build_section_records(records: Vec<GraphRecord>) -> Vec<BundleRecord> {
     let mut rows: Vec<BundleRecord> = records
@@ -1500,100 +1988,60 @@ pub fn assemble_pack(
     }
 
     // --- review coverage measurement over in-window merged PRs ---
-    // A PR counts as "merged in window" iff its MERGE time (`merged_at`,
-    // first-class since #333) falls in the half-open window — NOT its Task
-    // `valid_time`, which the GitHub importer stamps from `github_updated_at`
-    // (the PR's last-update time). Keying on the update time would drop a PR
-    // merged in-window but updated after it (vacuously passing coverage and
-    // suppressing the gap) and wrongly admit a PR merged before the window but
-    // updated inside it (Codex round-5 P1). The section windowing of PR evidence
-    // records (which keys on `valid_time`, per the general per-class loop above)
-    // is a separate concern and is intentionally left unchanged.
-    let mut merged_pr_ids: Vec<String> = Vec::new();
-    for record in records {
-        if let Some(merge_time) = merged_pr_merge_time(record)
-            && in_window(merge_time, window)
-        {
-            merged_pr_ids.push(record.id().to_owned());
-        }
-    }
-    merged_pr_ids.sort();
-    merged_pr_ids.dedup();
-    // A PR is approved when an approving Review references it via REFERENCES_TASK,
-    // that review resolves inside the same half-open pack window, AND its resolved
-    // valid time is AT OR BEFORE the referenced PR's merge time (`merged_at`). An
-    // approval SUBMITTED AFTER the merge did not gate it — it is post-hoc and must
-    // not count (Codex round-9 Finding 1). An approving review whose valid time
-    // falls before `from` or at/after `to`, or that has no resolvable valid time,
-    // is likewise omitted from the windowed `reviews` section, so it must not
-    // count toward approval either — otherwise the pack would suppress the gap
-    // while showing zero in-window approval. The at-or-before-merge check here
-    // uses fields available today (`merged_at`); it is distinct from the
-    // #334-degraded `approval_precedes_final_head` gap, which compares against the
-    // final HEAD commit and stays capability-unavailable.
-    // In one pass, collect both the approved-PR targets AND the specific edges
-    // that substantiate them (Codex round-11 Finding C). An edge substantiates
-    // approval when its source is an approving review resolving in-window at or
-    // before the referenced PR's merge time. Only edges whose target is an
-    // INCLUDED merged-in-window PR (`merged_pr_ids`) — the exact edges backing the
-    // coverage count — are captured for inclusion, so the pack carries neither
-    // unrelated links nor links to out-of-window PRs.
-    let mut approving_targets: BTreeSet<String> = BTreeSet::new();
+    // Delegated to the SHARED review-coverage derivation (issue #339, AC7) so the
+    // pack's `review_coverage` section / `merged_pr_without_approving_review` gap
+    // and `eg audit review-coverage` can never fork this logic. The pack uses the
+    // LENIENT options — any genuine approving review resolving in-window AT OR
+    // BEFORE the PR's `merged_at` counts as coverage, matching the established
+    // #338 semantics (round-5/round-9) — so `covered_pr_ids` equals both the
+    // approving-target set and the audit lane's covered set when that lane is run
+    // with the same lenient options. `eg audit review-coverage` calls the SAME
+    // function with its strict `--require-non-author` / `--require-final-head`
+    // defaults. A PR is "merged in window" iff its MERGE time (`merged_at`,
+    // first-class since #333) falls in the half-open window — never its Task
+    // `valid_time` (github_updated_at). Post-merge approvals never gate the merge.
+    let derivation = derive_review_coverage(
+        records,
+        window,
+        ReviewCoverageOptions {
+            require_non_author: false,
+            require_final_head: false,
+        },
+    );
+    let merged_pr_ids: Vec<String> = derivation.merged_pr_ids.clone();
+    // The `merged_pr_without_approving_review` gap keys on the OPTION-INDEPENDENT
+    // lenient any-approving set (never the strict covered set), so a self-approved
+    // or stale-head PR is never mislabeled as having no approving review at all.
+    let approving_targets: BTreeSet<String> = derivation.any_approving_pr_ids.clone();
+
+    // Rebuild the coverage-substantiating link edges (each stamped with its
+    // approving review's valid time) and their deduped source review nodes from
+    // the shared derivation. Co-located in the `review_coverage` section so
+    // `verify_pack` resolves every coverage edge's source offline even when the
+    // catalog maps no `reviews` section (Codex round-18 Finding 2).
+    let by_id_pack: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
     let mut coverage_link_edges: Vec<GraphRecord> = Vec::new();
-    // The source approving-review NODES behind the coverage link edges, deduped by
-    // record ID (a single review approving several PRs sources several edges but is
-    // one node). Co-located in the `review_coverage` section so `verify_pack` can
-    // resolve every coverage edge's source offline even when the catalog maps no
-    // `reviews` section (Codex round-18 Finding 2).
     let mut coverage_review_nodes: BTreeMap<String, GraphRecord> = BTreeMap::new();
-    for record in records {
-        let GraphRecord::Edge {
-            label,
-            source,
-            target,
-            ..
-        } = record
-        else {
-            continue;
-        };
-        if label.as_str() != "REFERENCES_TASK" {
-            continue;
+    for sub in &derivation.coverage_substantiations {
+        if let Some(edge) = by_id_pack.get(sub.edge_id.as_str()) {
+            coverage_link_edges.push(stamp_edge_valid_time(
+                (*edge).clone(),
+                &sub.review_valid_time,
+            ));
         }
-        // The referenced PR's merge time. A target with no resolvable `merged_at`
-        // is not a windowable merged PR, so no approval can be gated by it.
-        let Some(merged_at) = records
-            .iter()
-            .find(|rec| rec.id() == target)
-            .and_then(merged_pr_merge_time)
-            .and_then(parse_rfc3339)
-        else {
-            continue;
-        };
-        let approving_review = records.iter().find(|rec| {
-            rec.id() == source
-                && is_approving_review(rec)
-                && resolve_valid_time(rec).is_some_and(|vt| {
-                    in_window(&vt, window) && parse_rfc3339(&vt).is_some_and(|rt| rt <= merged_at)
-                })
-        });
-        if let Some(review) = approving_review {
-            approving_targets.insert(target.clone());
-            if merged_pr_ids.contains(target) {
-                let review_vt = resolve_valid_time(review).unwrap_or_default();
-                coverage_link_edges.push(stamp_edge_valid_time(record.clone(), &review_vt));
-                coverage_review_nodes
-                    .entry(review.id().to_owned())
-                    .or_insert_with(|| (*review).clone());
-            }
+        if let Some(review) = by_id_pack.get(sub.review_id.as_str()) {
+            coverage_review_nodes
+                .entry(sub.review_id.clone())
+                .or_insert_with(|| (*review).clone());
         }
     }
     let unapproved_pr_ids: Vec<String> = merged_pr_ids
         .iter()
-        .filter(|id| !approving_targets.contains(*id))
+        .filter(|id| !derivation.covered_pr_ids.contains(*id))
         .cloned()
         .collect();
     let merged_pr_count = merged_pr_ids.len();
-    let approved_pr_count = merged_pr_count - unapproved_pr_ids.len();
+    let approved_pr_count = derivation.covered_pr_ids.len();
     #[allow(clippy::cast_precision_loss)]
     let coverage = if merged_pr_count == 0 {
         1.0
@@ -1921,6 +2369,7 @@ fn control_requires(control: &Control, class: EvidenceClass) -> bool {
         .any(|cr| cr.class == class && cr.requirement == Requirement::Required)
 }
 
+#[allow(clippy::too_many_lines)]
 fn derive_gaps(
     records: &[GraphRecord],
     control: &Control,
@@ -2020,29 +2469,99 @@ fn derive_gaps(
 
     // #334-dependent classes: only in scope when the control requires review
     // evidence. Issue #334 (the `review_commit_sha` field / `REVIEWS_COMMIT`
-    // edge) is NOT merged: there is no such field or edge in the schema and no
-    // derivation logic exists, so the two dependent gap classes
-    // (`review_unanchored_no_commit_sha`, `approval_precedes_final_head`) cannot
-    // be derived. Emit the capability diagnostic UNCONDITIONALLY here so a pack
-    // never presents as if these two checks ran cleanly when they were actually
-    // skipped (Codex round-7 P2: input that merely resembled the #334 facts must
-    // not be mistaken for a real derivation and suppress the signal).
-    //
-    // WHEN #334 LANDS: replace this unconditional diagnostic with the real
-    // derivation of `review_unanchored_no_commit_sha` and
-    // `approval_precedes_final_head` from the reviewed-commit facts, emitting the
-    // diagnostic only if those facts are genuinely unavailable in the input.
+    // edge) is now MERGED, so the two dependent gap classes
+    // (`review_unanchored_no_commit_sha`, `approval_precedes_final_head`) are
+    // derived from the recorded reviewed-commit facts using the SAME
+    // approving-review -> merged-PR anchoring join the coverage derivation uses.
+    // The capability diagnostic now fires ONLY when those facts are genuinely
+    // unavailable in this store (a pre-#334 store carrying no `review_commit_sha`
+    // on any review AND no `REVIEWS_COMMIT` edge), so a pack over old data never
+    // presents as if the two checks ran cleanly (Codex round-7 P2: resemblance is
+    // never mistaken for a real derivation), while a pack over #334-era data
+    // reports the real defects.
     if want_review_anchored {
-        diagnostics.push(PackDiagnostic {
-            code: "capability_unavailable".to_owned(),
-            evidence_class: None,
-            unavailable_reason: Some("issue_334_reviewed_commit_facts_absent".to_owned()),
-            record_ids: Vec::new(),
-            detail: "gap classes review_unanchored_no_commit_sha and \
-                     approval_precedes_final_head require issue #334 reviewed-commit \
-                     facts (review_commit_sha / REVIEWS_COMMIT), which are not implemented"
-                .to_owned(),
+        // Presence probe on the ACTUAL typed facts, never string resemblance: a
+        // Review carrying a real `review_commit_sha`, or a real `REVIEWS_COMMIT`
+        // anchor edge.
+        let facts_available = records.iter().any(|r| {
+            review_commit_sha_of(r).is_some()
+                || matches!(r, GraphRecord::Edge { label, .. } if label.as_str() == "REVIEWS_COMMIT")
         });
+        if facts_available {
+            let merged_set: BTreeSet<&str> = merged_pr_ids.iter().map(String::as_str).collect();
+            for record in records {
+                let GraphRecord::Edge {
+                    label,
+                    source,
+                    target,
+                    ..
+                } = record
+                else {
+                    continue;
+                };
+                if label.as_str() != "REFERENCES_TASK" || !merged_set.contains(target.as_str()) {
+                    continue;
+                }
+                let Some(task) = by_id.get(target.as_str()) else {
+                    continue;
+                };
+                let Some(merged_at) = merged_pr_merge_time(task).and_then(parse_rfc3339) else {
+                    continue;
+                };
+                let Some(review) = by_id.get(source.as_str()) else {
+                    continue;
+                };
+                if !is_approving_review(review) {
+                    continue;
+                }
+                let Some(review_vt) = resolve_valid_time(review) else {
+                    continue;
+                };
+                if !(in_window(&review_vt, window)
+                    && parse_rfc3339(&review_vt).is_some_and(|rt| rt <= merged_at))
+                {
+                    continue;
+                }
+                let mut record_ids = vec![review.id().to_owned(), (*target).clone()];
+                record_ids.sort();
+                match (review_commit_sha_of(review), pr_head_sha(task)) {
+                    (None, _) => gaps.push(GapRow {
+                        gap_class: GapClass::ReviewUnanchoredNoCommitSha.as_wire().to_owned(),
+                        record_ids,
+                        valid_time: Some(review_vt.clone()),
+                        detail: "approving review references a merged pull request but \
+                                 carries no review_commit_sha anchor"
+                            .to_owned(),
+                    }),
+                    (Some(rcs), Some(head)) if rcs != head => gaps.push(GapRow {
+                        gap_class: GapClass::ApprovalPrecedesFinalHead.as_wire().to_owned(),
+                        record_ids,
+                        valid_time: Some(review_vt.clone()),
+                        detail: "approving review anchored to a commit other than the pull \
+                                 request's final head (approval precedes final head)"
+                            .to_owned(),
+                    }),
+                    _ => {}
+                }
+            }
+        } else {
+            let needs_334: Vec<&'static str> = GapClass::ALL
+                .iter()
+                .filter(|g| g.needs_issue_334())
+                .map(GapClass::as_wire)
+                .collect();
+            diagnostics.push(PackDiagnostic {
+                code: "capability_unavailable".to_owned(),
+                evidence_class: None,
+                unavailable_reason: Some("issue_334_reviewed_commit_facts_absent".to_owned()),
+                record_ids: Vec::new(),
+                detail: format!(
+                    "gap classes {} require issue #334 reviewed-commit facts \
+                     (review_commit_sha / REVIEWS_COMMIT), which are absent from this store",
+                    needs_334.join(" and "),
+                ),
+            });
+        }
     }
 
     gaps.sort_by(|a, b| {
@@ -6597,6 +7116,214 @@ mod pack338_tests {
         assert!(
             report.ok,
             "absent-target coverage edge self-verifies: {report:?}"
+        );
+    }
+
+    /// Issue #339 AC7 (SHARED-IMPLEMENTATION INVARIANT): #338's evidence-pack
+    /// `review_coverage` section MUST embed the identical derivation the
+    /// `eg audit review-coverage` lane uses — a single shared implementation.
+    /// This asserts, on the SAME store, that the pack's covered PR set (merged
+    /// minus the measurement's `unapproved_pr_ids`) and the pack section's
+    /// distinct coverage-edge targets both equal the shared derivation's covered
+    /// set under the pack's own (lenient) options, with ZERO divergence.
+    #[test]
+    fn review_coverage_shared_impl_matches_audit_lane() {
+        let records = build_seed_records();
+        let pack = assemble_cc81();
+
+        // The pack uses lenient options; run the SHARED derivation the audit lane
+        // calls with those same options.
+        let derivation = derive_review_coverage(
+            &records,
+            &win(),
+            ReviewCoverageOptions {
+                require_non_author: false,
+                require_final_head: false,
+            },
+        );
+
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .expect("review_coverage section");
+        let m = rc.measurement.as_ref().expect("measurement");
+
+        // Pack covered set = merged minus unapproved.
+        let unapproved: BTreeSet<&str> = m.unapproved_pr_ids.iter().map(String::as_str).collect();
+        let pack_covered: BTreeSet<String> = derivation
+            .merged_pr_ids
+            .iter()
+            .filter(|id| !unapproved.contains(id.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(
+            pack_covered, derivation.covered_pr_ids,
+            "pack covered set must equal the shared derivation covered set (0 divergence)"
+        );
+
+        // The pack section's distinct coverage-edge targets equal the covered set.
+        let section_targets: BTreeSet<String> = rc
+            .records
+            .iter()
+            .filter_map(|br| match &br.record {
+                GraphRecord::Edge { target, .. } => Some(target.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            section_targets, derivation.covered_pr_ids,
+            "pack coverage-edge targets must equal the shared derivation covered set"
+        );
+
+        // And the measurement's counts agree with the shared derivation.
+        assert_eq!(m.merged_pr_count, derivation.merged_pr_ids.len());
+        assert_eq!(m.approved_pr_count, derivation.covered_pr_ids.len());
+    }
+
+    /// Issue #334 is MERGED. When the reviewed-commit facts are present in the
+    /// store, `derive_gaps` derives `review_unanchored_no_commit_sha` for an
+    /// approving review of a merged PR that carries no `review_commit_sha`, and no
+    /// longer emits the capability-unavailable diagnostic.
+    #[test]
+    fn issue_334_review_unanchored_gap_is_derived_when_facts_present() {
+        use super::fixture::{pr, references_task, review};
+        let anchored = |mut r: GraphRecord, sha: &str| -> GraphRecord {
+            if let GraphRecord::Node {
+                review_commit_sha, ..
+            } = &mut r
+            {
+                *review_commit_sha = Some(sha.to_owned());
+            }
+            r
+        };
+        let head_of = |p: &GraphRecord| -> String {
+            match p {
+                GraphRecord::Node {
+                    head_sha: Some(h), ..
+                } => h.clone(),
+                _ => panic!("no head_sha"),
+            }
+        };
+        // prA: approved by an ANCHORED-at-head review (facts present, no gap).
+        let pr_a = pr("project:v1:prA", "2026-03-15T12:00:00Z", "cA");
+        let rv_a = anchored(
+            review("project:v1:rvA", "2026-03-15T08:00:00Z", "approved"),
+            &head_of(&pr_a),
+        );
+        // prB: approved by an UNANCHORED review (no review_commit_sha) → gap.
+        let pr_b = pr("project:v1:prB", "2026-03-16T12:00:00Z", "cB");
+        let rv_b = review("project:v1:rvB", "2026-03-16T08:00:00Z", "approved");
+        let records = vec![
+            pr_a,
+            rv_a,
+            references_task("project:v1:rvA", "project:v1:prA"),
+            pr_b,
+            rv_b,
+            references_task("project:v1:rvB", "project:v1:prB"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        // Facts present → capability diagnostic must NOT fire.
+        assert!(
+            !pack
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "capability_unavailable"
+                    && d.unavailable_reason.as_deref()
+                        == Some("issue_334_reviewed_commit_facts_absent")),
+            "with #334 facts present, the capability diagnostic must not fire: {:?}",
+            pack.diagnostics
+        );
+        let unanchored: Vec<&GapRow> = pack
+            .gaps
+            .iter()
+            .filter(|g| g.gap_class == "review_unanchored_no_commit_sha")
+            .collect();
+        assert_eq!(unanchored.len(), 1, "one unanchored gap: {:?}", pack.gaps);
+        assert!(
+            unanchored[0]
+                .record_ids
+                .contains(&"project:v1:prB".to_owned())
+        );
+        assert!(
+            unanchored[0]
+                .record_ids
+                .contains(&"project:v1:rvB".to_owned())
+        );
+    }
+
+    /// Issue #334 real derivation: an approving review anchored to a commit other
+    /// than the PR's final head yields an `approval_precedes_final_head` gap.
+    #[test]
+    fn issue_334_approval_precedes_final_head_gap_is_derived() {
+        use super::fixture::{pr, references_task, review};
+        let anchored = |mut r: GraphRecord, sha: &str| -> GraphRecord {
+            if let GraphRecord::Node {
+                review_commit_sha, ..
+            } = &mut r
+            {
+                *review_commit_sha = Some(sha.to_owned());
+            }
+            r
+        };
+        // prC: approved by a review anchored to a NON-head commit → stale.
+        let pr_c = pr("project:v1:prC", "2026-03-17T12:00:00Z", "cC");
+        let rv_c = anchored(
+            review("project:v1:rvC", "2026-03-17T08:00:00Z", "approved"),
+            "not-the-final-head",
+        );
+        let records = vec![
+            pr_c,
+            rv_c,
+            references_task("project:v1:rvC", "project:v1:prC"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        assert!(
+            !pack
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "capability_unavailable"),
+            "facts present → no capability diagnostic: {:?}",
+            pack.diagnostics
+        );
+        let precedes: Vec<&GapRow> = pack
+            .gaps
+            .iter()
+            .filter(|g| g.gap_class == "approval_precedes_final_head")
+            .collect();
+        assert_eq!(
+            precedes.len(),
+            1,
+            "one precedes-final-head gap: {:?}",
+            pack.gaps
+        );
+        assert!(
+            precedes[0]
+                .record_ids
+                .contains(&"project:v1:prC".to_owned())
+        );
+        assert!(
+            precedes[0]
+                .record_ids
+                .contains(&"project:v1:rvC".to_owned())
         );
     }
 
