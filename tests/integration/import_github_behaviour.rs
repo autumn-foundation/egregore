@@ -3356,3 +3356,230 @@ fn reviewed_by_identity_ids_for_pr(jsonl: &str, n: u64) -> std::collections::BTr
         .filter_map(|v| v["target"].as_str().map(str::to_owned))
         .collect()
 }
+
+// ── Issue #335 (Codex P1): removed requested reviewers are tombstoned ─────────
+//
+// The importer emits `REQUESTED_REVIEW_FROM` edges for the reviewers CURRENTLY
+// in a PR's `requested_reviewers`. When that set shrinks (a reviewer approves,
+// the PR merges/closes, or a reviewer is manually removed) the importer is
+// otherwise purely additive, so the previously-emitted edge for the removed
+// reviewer would linger LIVE in a persistent store and downstream queries would
+// still report the removed reviewer as "requested". The changed set must retract
+// each dropped reviewer's edge via a `Tombstone(deleted_id == edge_id)`,
+// mirroring the #333/#334 supersession discipline — and only the edge, never the
+// global `ExternalIdentity` node and never any immutable `REVIEWED_BY` edge.
+
+/// The `REQUESTED_REVIEW_FROM` edge record id linking PR `n`'s `Task` to
+/// `login`'s `ExternalIdentity`, read from the emitted JSONL.
+fn request_edge_id_for(jsonl: &str, n: u64, login: &str) -> String {
+    let task_id = pr_task(jsonl, n)["id"].as_str().unwrap().to_owned();
+    let identity_id = identity_id_of(jsonl, login);
+    jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| {
+            v["record_type"] == "edge"
+                && v["label"] == "REQUESTED_REVIEW_FROM"
+                && v["source"].as_str() == Some(&task_id)
+                && v["target"].as_str() == Some(&identity_id)
+        })
+        .and_then(|v| v["id"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("REQUESTED_REVIEW_FROM edge for {login} on PR#{n} must exist"))
+}
+
+/// `reviewer_identity_routes` with PR #1's requested reviewers, `updated_at`, and
+/// the `/pulls` `ETag` overridden — so a re-import can shrink or grow the request
+/// set while PR #2 stays byte-identical.
+fn reviewer_routes_pr1(
+    reviewers: &[&str],
+    updated_at: &str,
+    pulls_etag: &str,
+) -> HashMap<String, Canned> {
+    let mut routes = reviewer_identity_routes();
+    let reviewer_json: Vec<serde_json::Value> = reviewers
+        .iter()
+        .map(|l| serde_json::json!({ "login": l }))
+        .collect();
+    let pulls = serde_json::json!([
+        {
+            "number": 1, "title": "PR one", "body": null, "state": "closed",
+            "merged_at": "2026-01-05T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "carol"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": updated_at,
+            "requested_reviewers": reviewer_json,
+            "requested_teams": [{"slug": "backend"}],
+            "html_url": "https://github.com/o/r/pull/1"
+        },
+        {
+            "number": 2, "title": "PR two", "body": null, "state": "closed",
+            "merged_at": "2026-01-06T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "frank"},
+            "created_at": "2026-01-02T00:00:00Z", "updated_at": "2026-01-06T00:00:00Z",
+            "requested_reviewers": [{"login": "grace"}],
+            "requested_teams": [],
+            "html_url": "https://github.com/o/r/pull/2"
+        }
+    ])
+    .to_string();
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, pulls_etag),
+    );
+    routes
+}
+
+#[test]
+fn removed_requested_reviewer_edge_is_tombstoned_survivor_and_identity_untouched() {
+    let server = MockServer::start(reviewer_identity_routes());
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+
+    // 1. Fresh import: PR #1 requests [dave, erin], PR #2 requests [grace] → 3
+    //    REQUESTED_REVIEW_FROM edges. Capture erin's edge id and identity id.
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    assert_eq!(edges_of_label(&j1, "REQUESTED_REVIEW_FROM"), 3);
+    let erin_edge_id = request_edge_id_for(&j1, 1, "erin");
+    let erin_identity_id = identity_id_of(&j1, "erin");
+
+    // 2. Re-import with erin dropped from PR #1 (now [dave] only). The removed
+    //    reviewer's edge must be retracted via exactly one Tombstone; dave's edge
+    //    stays live; PR #2 is unchanged.
+    server.set_routes(reviewer_routes_pr1(
+        &["dave"],
+        "2026-01-07T00:00:00Z",
+        "\"pulls-335-drop-erin\"",
+    ));
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(&server.base_url, &out2, &state, &[]);
+    assert!(ok2);
+
+    let ts = tombstones(&j2);
+    assert_eq!(
+        ts.len(),
+        1,
+        "exactly one Tombstone (erin's removed request edge) must be emitted: {j2}"
+    );
+    assert_eq!(
+        ts[0]["deleted_id"].as_str(),
+        Some(erin_edge_id.as_str()),
+        "the Tombstone must retract erin's REQUESTED_REVIEW_FROM edge id"
+    );
+    // The surviving reviewer's edge is re-emitted live; PR #2 stays suppressed.
+    assert_eq!(
+        edges_of_label(&j2, "REQUESTED_REVIEW_FROM"),
+        1,
+        "only the surviving reviewer (dave) re-emits a live request edge"
+    );
+    let dave_id = identity_id_of(&j1, "dave");
+    assert!(
+        j2.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| v["record_type"] == "edge"
+                && v["label"] == "REQUESTED_REVIEW_FROM"
+                && v["target"].as_str() == Some(&dave_id)),
+        "dave's request edge stays live: {j2}"
+    );
+    // The global ExternalIdentity node is NEVER tombstoned (a login persists
+    // across PRs), and no immutable REVIEWED_BY edge is tombstoned.
+    assert!(
+        !ts.iter()
+            .any(|t| t["deleted_id"].as_str() == Some(erin_identity_id.as_str())),
+        "erin's ExternalIdentity node must NOT be tombstoned"
+    );
+    let reviewed_by_ids: std::collections::BTreeSet<String> = j1
+        .lines()
+        .chain(j2.lines())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["record_type"] == "edge" && v["label"] == "REVIEWED_BY")
+        .filter_map(|v| v["id"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        !ts.iter().any(|t| t["deleted_id"]
+            .as_str()
+            .is_some_and(|d| reviewed_by_ids.contains(d))),
+        "no REVIEWED_BY edge may be tombstoned"
+    );
+}
+
+#[test]
+fn re_requested_reviewer_edge_is_revived_and_unchanged_import_emits_no_tombstones() {
+    let server = MockServer::start(reviewer_identity_routes());
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+
+    // 1. Fresh import: PR #1 requests [dave, erin].
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    let erin_edge_id = request_edge_id_for(&j1, 1, "erin");
+
+    // 2. Drop erin → erin's edge is tombstoned.
+    server.set_routes(reviewer_routes_pr1(
+        &["dave"],
+        "2026-01-07T00:00:00Z",
+        "\"pulls-335-drop\"",
+    ));
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(&server.base_url, &out2, &state, &[]);
+    assert!(ok2);
+    assert!(
+        tombstones(&j2)
+            .iter()
+            .any(|t| t["deleted_id"].as_str() == Some(erin_edge_id.as_str())),
+        "dropping erin tombstones her request edge"
+    );
+
+    // 3. Unchanged re-import (same [dave] payload, forced 200 via a new ETag):
+    //    the reviewer set is identical, so NO tombstone is emitted and no request
+    //    edge re-emits (idempotency / AC8).
+    server.set_routes(reviewer_routes_pr1(
+        &["dave"],
+        "2026-01-07T00:00:00Z",
+        "\"pulls-335-drop-again\"",
+    ));
+    let out3 = tmp.path().join("g3.jsonl");
+    let (j3, _, ok3) = run_import(&server.base_url, &out3, &state, &[]);
+    assert!(ok3);
+    assert_eq!(
+        tombstones(&j3).len(),
+        0,
+        "an unchanged reviewer set emits zero tombstones: {j3}"
+    );
+    assert_eq!(
+        edges_of_label(&j3, "REQUESTED_REVIEW_FROM"),
+        0,
+        "an unchanged reviewer set re-emits no request edges"
+    );
+
+    // 4. Re-request erin ([dave, erin] again): her edge is REVIVED — re-emitted
+    //    live with the SAME stable id — and, because nothing was removed, no new
+    //    tombstone fires. The embedded adapter's write_edge revive-after-tombstone
+    //    (a fresh edge write post-dating the tombstone) then supersedes the
+    //    tombstone in a persistent store.
+    server.set_routes(reviewer_routes_pr1(
+        &["dave", "erin"],
+        "2026-01-08T00:00:00Z",
+        "\"pulls-335-readd\"",
+    ));
+    let out4 = tmp.path().join("g4.jsonl");
+    let (j4, _, ok4) = run_import(&server.base_url, &out4, &state, &[]);
+    assert!(ok4);
+    assert_eq!(
+        request_edge_id_for(&j4, 1, "erin"),
+        erin_edge_id,
+        "the revived edge carries the same stable id"
+    );
+    assert_eq!(
+        edges_of_label(&j4, "REQUESTED_REVIEW_FROM"),
+        2,
+        "both reviewers (dave, erin) re-emit live edges on the re-request"
+    );
+    assert!(
+        !tombstones(&j4)
+            .iter()
+            .any(|t| t["deleted_id"].as_str() == Some(erin_edge_id.as_str())),
+        "re-requesting erin emits no fresh tombstone for her edge: {j4}"
+    );
+}

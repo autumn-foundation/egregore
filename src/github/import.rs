@@ -197,13 +197,21 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             // is only ever needed on the reprocess path below (#333, round-6).
             let current_artifact =
                 records::merge_artifact_id(ctx.commit_index, opts.source_repo, &pr);
+            // The current set of REQUESTED_REVIEW_FROM edge ids this PR emits, for
+            // the requested-reviewer supersession diff (#335, Codex P1). Folded
+            // into `pull_hash`, so an unchanged hash guarantees an unchanged set.
+            let current_request_edges = records::requested_review_edge_ids(opts.source_repo, &pr);
             if state.is_unchanged(&key, &hash) {
                 // Backfill the tracked artifact id without emitting anything: a
                 // no-op on a store this build already wrote, but it populates a
                 // pre-round-6 (or legacy) store so a LATER outcome change can
                 // still retract this artifact. Safe because the unchanged hash
                 // proves `current_artifact` equals what was emitted before.
-                state.set_merge_artifact(key, current_artifact);
+                state.set_merge_artifact(key.clone(), current_artifact);
+                // Backfill the prior request set likewise (#335, Codex P1) so a
+                // legacy store gains the tracking without a re-emit; the unchanged
+                // hash proves the request set is unchanged too.
+                state.set_request_edges(key, current_request_edges);
                 continue;
             }
             // Retract a superseded merge artifact whose outcome changed on this
@@ -225,8 +233,32 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                     },
                 );
             }
+            // Retract each REQUESTED_REVIEW_FROM edge whose reviewer was removed
+            // from the PR's requested set since the last run (#335, Codex P1):
+            // the importer is otherwise purely additive, so without this a
+            // removed reviewer's edge lingers live in a persistent store and
+            // downstream queries still report them as "requested". Only the edge
+            // is tombstoned — never the global ExternalIdentity node.
+            let removed_request_edges: Vec<String> = state
+                .prior_request_edges(&key)
+                .iter()
+                .filter(|prior| !current_request_edges.iter().any(|c| c == *prior))
+                .cloned()
+                .collect();
+            for prior in &removed_request_edges {
+                push_emitted(
+                    &mut graph,
+                    &mut emitted_count,
+                    &mut seen_identities,
+                    Emitted {
+                        records: vec![records::request_review_edge_tombstone(pr.number, prior)],
+                        link_diagnostics: 0,
+                    },
+                );
+            }
             state.record_hash(key.clone(), hash);
-            state.set_merge_artifact(key, current_artifact);
+            state.set_merge_artifact(key.clone(), current_artifact);
+            state.set_request_edges(key, current_request_edges);
             push_emitted(
                 &mut graph,
                 &mut emitted_count,

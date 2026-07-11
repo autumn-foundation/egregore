@@ -290,6 +290,18 @@ a state file written before it loads normally with an empty map (an absent prior
 reads as "no known artifact" and emits no tombstone), avoiding a heavy full
 refetch that a version bump would force.
 
+**Prior requested-reviewer tracking (`pr_request_edges`, issue #335, Codex
+P1):** the state file also maps `"pr:<n>"` to the sorted **set of
+`REQUESTED_REVIEW_FROM` edge record IDs** the PR emitted last run — its "prior
+request set". On a re-import whose requested-reviewer set **shrank**, the importer
+emits a `requested_review_superseded` `Tombstone` retracting each dropped edge
+before persisting the new set (see §6, "`REQUESTED_REVIEW_FROM` removal
+lifecycle"), so a persistent store never reports a removed reviewer as still
+"requested". An empty current set clears the entry. The field is
+`#[serde(default)]` (an empty `Vec<String>` map) and is **not** its own
+`STATE_SCHEMA_VERSION` bump: a state file written before it loads normally with an
+empty map (an absent prior reads as "no known edges" and emits no tombstone).
+
 **Deferred endpoint ETag rule:** The v1 importer MUST NOT store ETags for
 deferred comment/review endpoints (`/issues/comments`, `/pulls/comments`,
 `/pulls/{n}/reviews`). Caching ETags before records are emitted would cause
@@ -569,6 +581,22 @@ a review NAMES a participant, never a verdict; a `REQUESTED_REVIEW_FROM` is an
 invitation, never proof a review happened. Consumed by #338/#339; future
 beneficiaries #245 (ownership) and #262.
 
+**`REQUESTED_REVIEW_FROM` removal lifecycle (issue #335):** a PR emits one
+`REQUESTED_REVIEW_FROM` edge per reviewer currently in `requested_reviewers`, but
+that set **shrinks** whenever a reviewer approves, the PR merges/closes, or a
+reviewer is manually removed. Because the importer is otherwise purely additive, a
+removed reviewer's edge would linger live in a persistent store and downstream
+queries would still report them as "requested". So — mirroring the `MERGED_AS`
+(§6) and `REVIEWS_COMMIT` (above) supersession discipline — the importer persists
+the PR's prior request-edge set (`pr_request_edges` in §5's state file) and, on
+each change, emits a `requested_review_superseded` `Tombstone` naming each dropped
+edge via `deleted_id` **before** persisting the new set. The generic
+revive-after-tombstone rule applies: re-requesting a removed reviewer re-emits the
+**same** edge id, whose later, higher-sequence write supersedes the tombstone.
+Only the edge is retracted — the global `ExternalIdentity` node is **never**
+tombstoned (a login is a cross-PR fact), and an immutable `REVIEWED_BY` edge is
+never tombstoned (a review that happened is a fact; dismissals are #336's concern).
+
 **`valid_time_source`:** All GitHub-sourced records use `github_updated_at`.
 **`source_kind`:** Issues use `github_issue`; PRs use `github_pr`; every `Review`
 node (issue_comment / pr_review / pr_review_comment) uses `github_review` — the
@@ -743,6 +771,7 @@ The test suite covers:
 | Review anchor resolve-or-diagnose (issue #334) | Zero/multiple `Commit` matches → `github_commit_unresolved` diagnostic (repo-scoped); absent `commit_id` → `github_review_unanchored`; `issue_comment` exempt (field absent, no diagnostic); SHA never fabricated |
 | Review anchor seed-graph invalidation (issue #334) | A code graph added/changed after import re-resolves review anchors across a would-be `304`; outcome change tombstones the superseded artifact; resolved→superseded→resolved revives; unchanged seed stays idempotent |
 | Review anchor redaction carve-out (issue #334) | `review_commit_sha` survives a redaction-on export in plaintext; never enumerated as sensitive |
+| Requested-reviewer removal lifecycle (issue #335) | A PR whose `requested_reviewers` shrinks tombstones each dropped `REQUESTED_REVIEW_FROM` edge (`requested_review_superseded`, `deleted_id == edge_id`); the surviving reviewer's edge stays live; the `ExternalIdentity` node and `REVIEWED_BY` edges are never tombstoned; removed→re-requested revives; an unchanged reviewer set emits zero tombstones |
 | Stderr summary | Documented fields present on every run |
 
 Implementation of behaviour tests is deferred to the `eg import github` CLI

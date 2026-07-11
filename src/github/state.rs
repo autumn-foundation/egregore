@@ -156,6 +156,25 @@ pub struct State {
     /// artifact" (safely emits no tombstone).
     #[serde(default)]
     pub review_commit_artifacts: BTreeMap<String, String>,
+    /// Maps `"pr:<n>"` to the sorted set of `REQUESTED_REVIEW_FROM` edge record
+    /// IDs the PR emitted on the last run — its "prior request set" (issue #335,
+    /// Codex P1, the requested-reviewer analog of `pr_merge_artifacts`).
+    ///
+    /// A PR emits one `REQUESTED_REVIEW_FROM` edge per reviewer currently in its
+    /// `requested_reviewers`. That set shrinks whenever a reviewer approves, the
+    /// PR merges/closes, or a reviewer is manually removed. The importer is
+    /// otherwise purely additive, so without tracking the prior set a removed
+    /// reviewer's edge would linger LIVE in a persistent store and downstream
+    /// queries would still report the removed reviewer as "requested". Persisting
+    /// the prior set lets a changed re-import retract each dropped edge via a
+    /// `Tombstone` (`deleted_id == edge_id`) before persisting the new set. Only
+    /// the edge is retracted — never the global `ExternalIdentity` node (a login
+    /// persists across PRs) and never an immutable `REVIEWED_BY` edge. A
+    /// `#[serde(default)]` empty map means legacy state loads without a schema
+    /// bump: a missing prior set is "no known edges", which safely emits no
+    /// tombstone.
+    #[serde(default)]
+    pub pr_request_edges: BTreeMap<String, Vec<String>>,
     /// Fingerprint of the seeded code graph relevant to PR merge-link resolution
     /// (issue #333, Codex round-5). PR merge-link resolution depends on the local
     /// seed graph, which GitHub's `/pulls` `ETag` cannot see; this gates the
@@ -183,6 +202,7 @@ impl State {
             resource_hashes: BTreeMap::new(),
             pr_merge_artifacts: BTreeMap::new(),
             review_commit_artifacts: BTreeMap::new(),
+            pr_request_edges: BTreeMap::new(),
             code_graph_fingerprint: None,
         }
     }
@@ -319,6 +339,28 @@ impl State {
             None => {
                 self.review_commit_artifacts.remove(&key);
             }
+        }
+    }
+
+    /// Returns the `REQUESTED_REVIEW_FROM` edge ids the PR keyed by `key`
+    /// (`"pr:<n>"`) emitted last run — its prior request set (issue #335, Codex
+    /// P1). An empty slice means no tracked edges (legacy state or a PR that has
+    /// never requested a reviewer), which safely emits no tombstone.
+    #[must_use]
+    pub fn prior_request_edges(&self, key: &str) -> &[String] {
+        self.pr_request_edges.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// Records the current `REQUESTED_REVIEW_FROM` edge ids for `key`
+    /// (`"pr:<n>"`). A non-empty set is stored as the new prior set; an EMPTY set
+    /// clears the entry (the PR requests no reviewers, so no stale edge can exist
+    /// to retract on a later change), keeping the map minimal and deterministic
+    /// (issue #335, Codex P1).
+    pub fn set_request_edges(&mut self, key: String, edge_ids: Vec<String>) {
+        if edge_ids.is_empty() {
+            self.pr_request_edges.remove(&key);
+        } else {
+            self.pr_request_edges.insert(key, edge_ids);
         }
     }
 }
@@ -765,6 +807,80 @@ mod tests {
         );
         s.set_review_artifact("pr_review:3:7".to_owned(), None);
         assert_eq!(s.prior_review_artifact("pr_review:3:7"), None);
+    }
+
+    #[test]
+    fn request_edges_round_trip_and_empty_set_clears_entry() {
+        let mut s = State::fresh("o/r", "x");
+        assert!(s.prior_request_edges("pr:1").is_empty());
+        s.set_request_edges(
+            "pr:1".to_owned(),
+            vec![
+                "project:v1:edge-a".to_owned(),
+                "project:v1:edge-b".to_owned(),
+            ],
+        );
+        assert_eq!(
+            s.prior_request_edges("pr:1"),
+            [
+                "project:v1:edge-a".to_owned(),
+                "project:v1:edge-b".to_owned()
+            ]
+        );
+        // An empty set clears the entry (no stale edge to retract later).
+        s.set_request_edges("pr:1".to_owned(), Vec::new());
+        assert!(s.prior_request_edges("pr:1").is_empty());
+        assert!(!s.pr_request_edges.contains_key("pr:1"));
+    }
+
+    #[test]
+    fn legacy_state_without_pr_request_edges_loads_empty() {
+        // A version-4 state file lacking `pr_request_edges` (the additive
+        // #[serde(default)] field) must load with an empty map rather than fail.
+        let dir = std::env::temp_dir().join(format!("egst-legacy-pre-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"schema_version":{STATE_SCHEMA_VERSION},"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"resource_hashes":{{"pr:1":"abc"}}}}"#
+            ),
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert!(
+            s.pr_request_edges.is_empty(),
+            "missing pr_request_edges loads as an empty map"
+        );
+        assert!(s.prior_request_edges("pr:1").is_empty());
+        assert!(s.is_unchanged("pr:1", "abc"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_old_state_retains_pr_request_edges() {
+        // Issue #335 (Codex P1): a v2/v3 store carrying a populated
+        // `pr_request_edges` map must retain it under v4 so a reviewer removed on
+        // the first v4 run is still tombstoned against the prior set.
+        let dir = std::env::temp_dir().join(format!("egst-mig-pre-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":3,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"pr_request_edges":{"pr:1":["project:v1:edge-erin","project:v1:edge-dave"]}}"#,
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
+        assert_eq!(
+            s.prior_request_edges("pr:1"),
+            [
+                "project:v1:edge-erin".to_owned(),
+                "project:v1:edge-dave".to_owned()
+            ],
+            "migration must retain pr_request_edges so removed reviewers can be tombstoned"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

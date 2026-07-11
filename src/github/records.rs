@@ -1430,6 +1430,92 @@ fn requested_review_records(
     out
 }
 
+/// The stable `project.Task` record id for a PR `number` (issue #335).
+///
+/// Factored out of the emitter's [`task_id_for`] so the requested-reviewer
+/// supersession path in [`crate::github::import`] reconstructs byte-for-byte the
+/// same `Task` handle a `REQUESTED_REVIEW_FROM` edge points from.
+#[must_use]
+pub fn pr_task_id(source_repo: &str, number: u64) -> String {
+    let number_s = number.to_string();
+    let native = format!("pr:{number}");
+    project_stable_id(&["project", "Task", source_repo, &number_s, &native])
+}
+
+/// The stable `REQUESTED_REVIEW_FROM` edge id for a `(task, identity)` pair.
+///
+/// Mirrors [`GraphRecord::project_edge`]'s id recipe exactly, so the id computed
+/// here for the prior/current request-set diff equals the id the emitter mints
+/// (issue #335, Codex P1). A unit test locks the two together.
+fn request_review_edge_id(task_id: &str, identity_id: &str) -> String {
+    project_stable_id(&[
+        "project",
+        "edge",
+        EdgeLabel::RequestedReviewFrom.as_str(),
+        task_id,
+        identity_id,
+    ])
+}
+
+/// The current set of `REQUESTED_REVIEW_FROM` edge record ids a PR would emit
+/// (issue #335, Codex P1) — one per non-empty requested-reviewer login.
+///
+/// Returned sorted and deduplicated so it is a stable set for the prior/current
+/// comparison in [`crate::github::import`]. The importer persists this as the
+/// PR's prior request set; any prior edge id NOT in the current set is a reviewer
+/// removed since the last run and is retracted via
+/// [`request_review_edge_tombstone`].
+#[must_use]
+pub fn requested_review_edge_ids(source_repo: &str, pr: &model::PullRequest) -> Vec<String> {
+    let task_id = pr_task_id(source_repo, pr.number);
+    let mut ids = std::collections::BTreeSet::new();
+    for user in &pr.requested_reviewers {
+        if user.login.is_empty() {
+            continue;
+        }
+        let identity_id = external_identity_id(SYSTEM, &user.login);
+        ids.insert(request_review_edge_id(&task_id, &identity_id));
+    }
+    ids.into_iter().collect()
+}
+
+/// Builds a `Tombstone` retracting a superseded `REQUESTED_REVIEW_FROM` edge.
+///
+/// Issue #335, Codex P1; the requested-reviewer analog of
+/// [`merge_artifact_tombstone`]. Retracts the edge for a reviewer removed from a
+/// PR's requested set since the last run.
+///
+/// The tombstone ID is derived from `(pr, deleted_id)`, so it is deterministic,
+/// byte-identical across runs, and distinct per retracted edge (a
+/// requested → removed → re-requested cycle mints one tombstone per removal).
+/// `deleted_id` (the edge id) drives the embedded adapter's current-view
+/// suppression so a persistent store stops surfacing the removed reviewer as
+/// "requested"; re-requesting the reviewer re-emits the same edge id, which the
+/// adapter's `write_edge` revive-after-tombstone then supersedes. Only the edge
+/// is retracted — never the global `ExternalIdentity` node.
+#[must_use]
+pub fn request_review_edge_tombstone(number: u64, deleted_id: &str) -> GraphRecord {
+    let native = format!("pr:{number}");
+    let id = project_stable_id(&[
+        "project",
+        "Tombstone",
+        IMPORTER_ID,
+        &native,
+        "requested_review_superseded",
+        deleted_id,
+    ]);
+    GraphRecord::Tombstone {
+        id,
+        schema_version: PROJECT_SCHEMA_VERSION,
+        deleted_id: deleted_id.to_owned(),
+        summary: format!(
+            "[requested_review_superseded] PR #{number} requested-reviewer set changed; \
+             retracting superseded REQUESTED_REVIEW_FROM edge {deleted_id}"
+        ),
+        producer: None,
+    }
+}
+
 /// Convenience that folds an iterator of [`Emitted`] into one.
 pub fn merge(parts: impl IntoIterator<Item = Emitted>) -> Emitted {
     let mut acc = Emitted::default();
@@ -2610,6 +2696,75 @@ mod tests {
         let ids_a: Vec<_> = a.records.iter().map(|r| r.id().to_owned()).collect();
         let ids_b: Vec<_> = b.records.iter().map(|r| r.id().to_owned()).collect();
         assert_eq!(ids_a, ids_b, "byte-stable across runs");
+    }
+
+    #[test]
+    fn pr_task_id_matches_emitter_task_id() {
+        // The supersession helper reconstructs the SAME PR Task handle the
+        // emitter mints; a drift would tombstone edges pointing from a phantom
+        // task and never suppress the live ones.
+        let files = FileIndex::new();
+        let c = ctx("o/r", &files, &identity);
+        assert_eq!(pr_task_id("o/r", 7), task_id_for(&c, "pr", 7));
+    }
+
+    #[test]
+    fn requested_review_edge_ids_match_emitted_edge_ids() {
+        // The prior/current diff set must equal, byte-for-byte, the ids the
+        // emitter mints for REQUESTED_REVIEW_FROM edges (#335, Codex P1).
+        let files = FileIndex::new();
+        let c = ctx("o/r", &files, &identity);
+        let pr = sample_pull(7, &["bob", "alice"], &["backend"]);
+        let emitted: std::collections::BTreeSet<String> =
+            edges_with_label(&pull_records(&c, &pr), EdgeLabel::RequestedReviewFrom)
+                .iter()
+                .map(|r| r.id().to_owned())
+                .collect();
+        let computed: std::collections::BTreeSet<String> =
+            requested_review_edge_ids("o/r", &pr).into_iter().collect();
+        assert_eq!(
+            computed, emitted,
+            "computed request-edge id set must equal the emitted edge ids"
+        );
+        // Sorted + deduplicated, one per non-empty login.
+        assert_eq!(requested_review_edge_ids("o/r", &pr).len(), 2);
+    }
+
+    #[test]
+    fn requested_review_edge_ids_skip_empty_logins() {
+        let pr = sample_pull(7, &["alice", ""], &[]);
+        assert_eq!(
+            requested_review_edge_ids("o/r", &pr).len(),
+            1,
+            "an empty login mints no edge id"
+        );
+    }
+
+    #[test]
+    fn request_review_edge_tombstone_is_deterministic_repo_scoped_and_carries_deleted_id() {
+        let deleted = "project:v1:some-request-edge";
+        let a = request_review_edge_tombstone(7, deleted);
+        let b = request_review_edge_tombstone(7, deleted);
+        assert_eq!(a.id(), b.id(), "tombstone id is deterministic");
+        let GraphRecord::Tombstone {
+            id,
+            deleted_id,
+            summary,
+            ..
+        } = &a
+        else {
+            panic!("expected a tombstone");
+        };
+        assert!(id.starts_with("project:v1:"));
+        assert_eq!(deleted_id, deleted, "deleted_id is the retracted edge id");
+        assert!(summary.contains("requested_review_superseded"));
+        // Distinct per PR (the native handle is repo-agnostic but PR-scoped) and
+        // per retracted target.
+        assert_ne!(a.id(), request_review_edge_tombstone(8, deleted).id());
+        assert_ne!(
+            a.id(),
+            request_review_edge_tombstone(7, "project:v1:other").id()
+        );
     }
 
     #[test]
