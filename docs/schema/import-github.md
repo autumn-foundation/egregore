@@ -539,11 +539,41 @@ Because reviews now emit a new field + edge that a cached review `ETag` could hi
 the state-schema version is bumped (see §5 idempotency), forcing exactly one full
 refresh on the first upgraded run.
 
+**Reviewer identity — `ExternalIdentity` node + `REVIEWED_BY` /
+`REQUESTED_REVIEW_FROM` edges (issue #335):** every review author and every
+requested reviewer is minted as one `project.ExternalIdentity` node keyed on
+`(system, login)` alone (see §9) — carrying ONLY the login (in `author`) and
+`identity_system: "github"`, never email, display name, avatar, or profile URL.
+
+| Edge | FROM | TO | Meaning |
+|------|------|----|---------|
+| `REVIEWED_BY` | `project.Review` (`source_kind: github_review`) | `project.ExternalIdentity` | The review was authored by this participant. |
+| `REQUESTED_REVIEW_FROM` | `project.Task` (`source_kind: github_pr`) | `project.ExternalIdentity` | The PR requested review from this participant. |
+
+Every emitted `Review` (all review kinds) gains exactly one `REVIEWED_BY` to its
+author's identity. Each individual requested reviewer on a PR (`requested_reviewers`
+in the already-fetched `/pulls` payload — no new endpoint) yields one
+`REQUESTED_REVIEW_FROM` edge to that login's identity. A requested TEAM
+(`requested_teams`) is **never expanded to member logins**: it is recorded as a
+`github_team_review_request_unexpanded` project `Diagnostic` carrying the team
+slug and the PR `Task` id — never silently dropped. Both edges are directly-
+submitted **project-domain edges** carrying `project:v1:` identity and are
+validated by the daemon like `MERGED_AS`/`REVIEWS_COMMIT` (the FROM node's importer
+`source_kind` is required; both terminate at `ExternalIdentity` ONLY). Within one
+run each identity is minted exactly once (deduped on `(system, login)`); across
+runs the store's idempotency and the embedded read-back skip converge to one node
+per login. Identities derive **only** from GitHub payloads (no seed graph), and a
+PR whose requested-reviewer set changes re-emits its request edges via the PR
+change hash, while an unchanged PR stays suppressed. A `REVIEWED_BY` binding proves
+a review NAMES a participant, never a verdict; a `REQUESTED_REVIEW_FROM` is an
+invitation, never proof a review happened. Consumed by #338/#339; future
+beneficiaries #245 (ownership) and #262.
+
 **`valid_time_source`:** All GitHub-sourced records use `github_updated_at`.
 **`source_kind`:** Issues use `github_issue`; PRs use `github_pr`; every `Review`
 node (issue_comment / pr_review / pr_review_comment) uses `github_review` — the
-daemon `REVIEWS_COMMIT` project-edge validator requires this exact source kind on
-the FROM node (issue #334).
+daemon `REVIEWS_COMMIT` and `REVIEWED_BY` project-edge validators require this exact
+source kind on the FROM node (issues #334/#335).
 
 ---
 
@@ -598,7 +628,9 @@ These GitHub fields pass through the redaction pipeline defined in
 
 Repo name, issue/PR number, state, author login, `created_at`, `updated_at`,
 `closed_at`, merge commit SHA, head/base branch names, review anchor commit SHA
-(`Review.review_commit_sha`, issue #334).
+(`Review.review_commit_sha`, issue #334), and participant identity login +
+system (`ExternalIdentity.author` + `ExternalIdentity.identity_system`, issue
+#335).
 
 **First-class plaintext PR `Task` fields (issue #333):** The six promoted flat
 `Task` fields — `head_sha`, `head_ref`, `base_ref`, `merge_commit_sha`,
@@ -617,6 +649,16 @@ as the #333 PR fields above: it is **deliberately NOT routed through redaction**
 is not listed in the sensitive-field index (`docs/schema/redaction.md`), and
 survives verbatim in a redaction-on export so review→commit anchors stay joinable
 and citable. `review_side` (LEFT/RIGHT) shares this treatment.
+
+**First-class plaintext `ExternalIdentity` (issue #335):** The participant login
+(`ExternalIdentity.author`) and source system (`ExternalIdentity.identity_system`)
+inherit the §8 author-login plaintext carve-out: a login is the same non-secret
+handle already carried plaintext on every `Task.author` / `Review.author`, so the
+identity node is **deliberately NOT routed through redaction**, is not listed in
+the sensitive-field index (`docs/schema/redaction.md`), and survives verbatim in a
+redaction-on export so reviewer-identity joins stay stable. The node carries no
+other identity attribute (no email, display name, avatar, or profile URL), so no
+new sensitive field is introduced.
 
 **Redacted body-stored metadata:** Milestone title (`Task.body_handle` field) is
 NOT in the plaintext carve-out. `Task.body_handle.inline` is a redactable field
@@ -658,6 +700,8 @@ Subkind identities:
 | Issue Comment `Review` | `"issue_comment:<n>:<comment_id>"` |
 | PR Review `Review` | `"pr_review:<n>:<review_id>"` |
 | PR Review Comment `Review` | `"pr_review_comment:<n>:<comment_id>"` |
+| `ExternalIdentity` (issue #335) | `project_stable_id(["project", "ExternalIdentity", "github", <login>])` — keyed on `(system, login)` ALONE, **deliberately NOT** using `source_repo` or `github_number`: a participant identity is global across repositories, so the same login in two repos maps to exactly one node. This is the one importer record whose ID is intentionally repo-independent. |
+| `github_team_review_request_unexpanded` `Diagnostic` (issue #335) | repo-scoped: `project_stable_id(["project", "Diagnostic", "github", <source_repo>, "pr:<n>", "github_team_review_request_unexpanded", <team_slug>])` |
 
 **Normative rule:** re-importing identical GitHub state produces byte-identical IDs.
 This is the idempotency invariant — if the ID changes between two runs for the

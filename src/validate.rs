@@ -152,6 +152,13 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
             NodeKind::AgentTurn,
             NodeKind::AgentSession,
         ]),
+        // A `Review` may only be authored by an `ExternalIdentity`, and a PR
+        // `Task` may only request review from an `ExternalIdentity` (issue
+        // #335). Both reviewer-identity edges terminate at `ExternalIdentity`
+        // only.
+        EdgeLabel::ReviewedBy | EdgeLabel::RequestedReviewFrom => {
+            Some(&[NodeKind::ExternalIdentity])
+        }
         _ => None,
     }
 }
@@ -1732,6 +1739,42 @@ mod tests {
         assert!(
             codes.contains(&DANGLING_EDGE_ENDPOINT),
             "missing FINGERPRINTED_AS target must dangle, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn reviewer_identity_edges_to_external_identity_are_allowed() {
+        // Issue #335: REVIEWED_BY (Review→ExternalIdentity) and
+        // REQUESTED_REVIEW_FROM (Task→ExternalIdentity) pass the target check.
+        let records = vec![
+            node("n:review", NodeKind::Review),
+            node("n:task", NodeKind::Task),
+            node("n:id", NodeKind::ExternalIdentity),
+            edge("e:rb", EdgeLabel::ReviewedBy, "n:review", "n:id"),
+            edge("e:rrf", EdgeLabel::RequestedReviewFrom, "n:task", "n:id"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&EDGE_TARGET_KIND_VIOLATION),
+            "reviewer-identity edges to ExternalIdentity must be allowed, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn reviewer_identity_edges_to_wrong_kind_are_rejected() {
+        // Issue #335: a reviewer-identity edge targeting a non-ExternalIdentity
+        // node is a target-kind violation.
+        let records = vec![
+            node("n:review", NodeKind::Review),
+            node("n:sym", NodeKind::Symbol),
+            edge("e:bad", EdgeLabel::ReviewedBy, "n:review", "n:sym"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_TARGET_KIND_VIOLATION),
+            "REVIEWED_BY→Symbol must be rejected, got {codes:?}"
         );
     }
 }

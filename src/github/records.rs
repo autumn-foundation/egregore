@@ -336,6 +336,14 @@ pub fn pull_records(ctx: &Context<'_>, pr: &model::PullRequest) -> Emitted {
             }
         }
     }
+
+    // Requested-reviewer identities + REQUESTED_REVIEW_FROM edges + team
+    // diagnostics (issue #335). Derived purely from the /pulls payload; no seed
+    // graph needed. Identity nodes dedupe to one-per-login across the run.
+    let task_id = task_id_for(ctx, "pr", number);
+    emitted
+        .records
+        .extend(requested_review_records(ctx, &task_id, number, pr));
     emitted
 }
 
@@ -712,7 +720,16 @@ pub fn issue_comment_records(ctx: &Context<'_>, c: &model::IssueComment) -> Emit
     // to a specific commit (issue #334 exemption): review_commit_sha stays None
     // and no REVIEWS_COMMIT edge or unanchored diagnostic is ever emitted.
     set_review_extra(&mut rec, None, None, None, None, None, None, None, None);
-    edge_and_pack(rec, parent, None)
+    let review_id = review_id_for(ctx, &native);
+    let mut emitted = edge_and_pack(rec, parent, None);
+    // REVIEWED_BY reviewer identity (issue #335): emitted for every review kind,
+    // including exempt issue_comment reviews.
+    emitted.records.extend(reviewed_by_records(
+        ctx,
+        &review_id,
+        c.user.as_ref().map(|u| u.login.as_str()),
+    ));
+    emitted
 }
 
 /// Emits a `Review` (`pr_review`) plus its `REFERENCES_TASK` edge.
@@ -761,6 +778,12 @@ pub fn pr_review_records(ctx: &Context<'_>, pr_number: u64, r: &model::Review) -
             emitted.link_diagnostics += 1;
         }
     }
+    // REVIEWED_BY reviewer identity (issue #335).
+    emitted.records.extend(reviewed_by_records(
+        ctx,
+        &review_id,
+        r.user.as_ref().map(|u| u.login.as_str()),
+    ));
     emitted
 }
 
@@ -823,6 +846,12 @@ pub fn review_comment_records(ctx: &Context<'_>, c: &model::ReviewComment) -> Em
             emitted.link_diagnostics += 1;
         }
     }
+    // REVIEWED_BY reviewer identity (issue #335).
+    emitted.records.extend(reviewed_by_records(
+        ctx,
+        &review_id,
+        c.user.as_ref().map(|u| u.login.as_str()),
+    ));
     emitted
 }
 
@@ -1247,6 +1276,160 @@ pub fn review_artifact_tombstone(native_id: &str, deleted_id: &str) -> GraphReco
     }
 }
 
+// ── Reviewer identity (issue #335) ───────────────────────────────────────────────
+
+/// The stable `project.ExternalIdentity` record ID for a `(system, login)` pair.
+///
+/// Deliberately NOT repo-scoped (issue #335): a participant identity is global
+/// across repositories, so the SAME login observed in two repositories maps to
+/// exactly ONE identity node. Keyed on `["project", "ExternalIdentity", system,
+/// login]` alone. Factored out so the emitter and any state-side path agree
+/// byte-for-byte on the id.
+#[must_use]
+pub fn external_identity_id(system: &str, login: &str) -> String {
+    project_stable_id(&["project", "ExternalIdentity", system, login])
+}
+
+/// Builds the `project.ExternalIdentity` node for a GitHub `login` (issue #335).
+///
+/// Carries ONLY the login (in the `author` field, the §8 plaintext-login
+/// carve-out) and the system (`identity_system`) — never email, display name,
+/// avatar, or profile URL. Valid time is the run's transaction time: an
+/// identity is a timeless first-seen fact with no natural GitHub timestamp.
+fn external_identity_node(ctx: &Context<'_>, login: &str) -> GraphRecord {
+    let id = external_identity_id(SYSTEM, login);
+    let mut rec = GraphRecord::node(
+        id.clone(),
+        NodeKind::ExternalIdentity,
+        None,
+        None,
+        None,
+        format!("{SYSTEM} identity {login}"),
+    );
+    set_common(&mut rec, &id, ctx.transaction_time, ctx);
+    if let GraphRecord::Node {
+        author,
+        identity_system,
+        ..
+    } = &mut rec
+    {
+        *author = Some(login.to_owned());
+        *identity_system = Some(SYSTEM.to_owned());
+    }
+    rec
+}
+
+/// Records the reviewer identity for a `Review`: the `ExternalIdentity` node
+/// plus the `REVIEWED_BY` project edge (issue #335).
+///
+/// Returns an empty vec when the review payload carried no author login (rare):
+/// an identity is never fabricated from a missing login. The identity node is
+/// deduplicated to one-per-login across the run by the importer's seen-set, and
+/// carries a `project:v1:` id so the daemon project-edge validator honours the
+/// edge. Emitted for every review kind (`issue_comment`, `pr_review`,
+/// `pr_review_comment`).
+fn reviewed_by_records(
+    ctx: &Context<'_>,
+    review_id: &str,
+    author: Option<&str>,
+) -> Vec<GraphRecord> {
+    let Some(login) = author.filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let identity = external_identity_node(ctx, login);
+    let identity_id = identity.id().to_owned();
+    let edge = GraphRecord::project_edge(
+        EdgeLabel::ReviewedBy,
+        review_id.to_owned(),
+        identity_id,
+        None,
+        format!("review {review_id} authored by {SYSTEM}:{login}"),
+    );
+    vec![identity, edge]
+}
+
+/// The stable `github_team_review_request_unexpanded` Diagnostic id (issue #335).
+///
+/// Repo-scoped (mirrors [`commit_diagnostic_id`]) so a shared multi-repo store
+/// never collides team diagnostics for the same PR number + slug across
+/// repositories.
+fn team_review_diagnostic_id(source_repo: &str, number: u64, slug: &str) -> String {
+    let native = format!("pr:{number}");
+    project_stable_id(&[
+        "project",
+        "Diagnostic",
+        IMPORTER_ID,
+        source_repo,
+        &native,
+        "github_team_review_request_unexpanded",
+        slug,
+    ])
+}
+
+/// Builds a project `Diagnostic` recording an unexpanded team review request
+/// (issue #335). A requested TEAM is recorded, never silently dropped and never
+/// expanded to member logins; the diagnostic carries the team slug and the PR
+/// `Task` record id.
+fn team_review_diagnostic(
+    ctx: &Context<'_>,
+    task_id: &str,
+    number: u64,
+    slug: &str,
+) -> GraphRecord {
+    let code = "github_team_review_request_unexpanded";
+    let id = team_review_diagnostic_id(ctx.source_repo, number, slug);
+    let mut rec = GraphRecord::node(
+        id.clone(),
+        NodeKind::Diagnostic,
+        None,
+        None,
+        None,
+        format!(
+            "[{code}] PR #{number} requested review from team '{slug}'; teams are recorded but \
+             never expanded to member logins; task='{task_id}'"
+        ),
+    );
+    set_common(&mut rec, &id, ctx.transaction_time, ctx);
+    rec
+}
+
+/// Records requested-reviewer identities for a PR `Task` (issue #335).
+///
+/// One `ExternalIdentity` node + `REQUESTED_REVIEW_FROM` edge (Task → identity)
+/// per requested-reviewer login, plus one
+/// `github_team_review_request_unexpanded` `Diagnostic` per requested TEAM.
+/// Identity nodes are deduplicated across the run by the importer's seen-set.
+fn requested_review_records(
+    ctx: &Context<'_>,
+    task_id: &str,
+    number: u64,
+    pr: &model::PullRequest,
+) -> Vec<GraphRecord> {
+    let mut out = Vec::new();
+    for user in &pr.requested_reviewers {
+        if user.login.is_empty() {
+            continue;
+        }
+        let identity = external_identity_node(ctx, &user.login);
+        let identity_id = identity.id().to_owned();
+        out.push(identity);
+        out.push(GraphRecord::project_edge(
+            EdgeLabel::RequestedReviewFrom,
+            task_id.to_owned(),
+            identity_id,
+            None,
+            format!("PR #{number} requested review from {SYSTEM}:{}", user.login),
+        ));
+    }
+    for team in &pr.requested_teams {
+        if team.slug.is_empty() {
+            continue;
+        }
+        out.push(team_review_diagnostic(ctx, task_id, number, &team.slug));
+    }
+    out
+}
+
 /// Convenience that folds an iterator of [`Emitted`] into one.
 pub fn merge(parts: impl IntoIterator<Item = Emitted>) -> Emitted {
     let mut acc = Emitted::default();
@@ -1358,6 +1541,8 @@ mod tests {
                 head: None,
                 base: None,
                 merge_commit_sha: None,
+                requested_reviewers: vec![],
+                requested_teams: vec![],
                 html_url: "https://github.com/o/r/pull/5".to_owned(),
             },
         );
@@ -1384,6 +1569,8 @@ mod tests {
             head: None,
             base: None,
             merge_commit_sha: sha.map(str::to_owned),
+            requested_reviewers: vec![],
+            requested_teams: vec![],
             html_url: "https://github.com/o/r/pull/30".to_owned(),
         }
     }
@@ -2199,5 +2386,279 @@ mod tests {
         let ids_a: Vec<_> = a.records.iter().map(|r| r.id().to_owned()).collect();
         let ids_b: Vec<_> = b.records.iter().map(|r| r.id().to_owned()).collect();
         assert_eq!(ids_a, ids_b);
+    }
+
+    // ── Issue #335: reviewer identity ────────────────────────────────────────────
+
+    fn identity_nodes(e: &Emitted) -> Vec<&GraphRecord> {
+        e.records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Node {
+                        kind: NodeKind::ExternalIdentity,
+                        ..
+                    }
+                )
+            })
+            .collect()
+    }
+
+    fn edges_with_label(e: &Emitted, label: EdgeLabel) -> Vec<&GraphRecord> {
+        e.records
+            .iter()
+            .filter(|r| matches!(r, GraphRecord::Edge { label: l, .. } if *l == label))
+            .collect()
+    }
+
+    fn sample_pull(number: u64, reviewers: &[&str], teams: &[&str]) -> model::PullRequest {
+        model::PullRequest {
+            number,
+            title: "A PR".to_owned(),
+            body: None,
+            state: "open".to_owned(),
+            merged_at: None,
+            draft: false,
+            labels: vec![],
+            assignees: vec![],
+            user: Some(model::User {
+                login: "author".to_owned(),
+            }),
+            milestone: None,
+            created_at: String::new(),
+            updated_at: "2026-01-02T00:00:00Z".to_owned(),
+            closed_at: None,
+            head: None,
+            base: None,
+            merge_commit_sha: None,
+            requested_reviewers: reviewers
+                .iter()
+                .map(|l| model::User {
+                    login: (*l).to_owned(),
+                })
+                .collect(),
+            requested_teams: teams
+                .iter()
+                .map(|s| model::Team {
+                    slug: (*s).to_owned(),
+                })
+                .collect(),
+            html_url: format!("https://github.com/o/r/pull/{number}"),
+        }
+    }
+
+    #[test]
+    fn external_identity_id_is_repo_independent_and_keyed_on_system_login() {
+        // The identity id is keyed ONLY on (system, login) — NOT repo-scoped —
+        // so the same login in two repos maps to one identity node.
+        let a = external_identity_id("github", "octocat");
+        let b = external_identity_id("github", "octocat");
+        assert_eq!(a, b, "same (system, login) → same id");
+        assert!(a.starts_with("project:v1:"));
+        assert_ne!(a, external_identity_id("github", "other"));
+    }
+
+    #[test]
+    fn identity_node_carries_only_login_and_system() {
+        let files = FileIndex::new();
+        let c = ctx("o/r", &files, &identity);
+        let node = external_identity_node(&c, "octocat");
+        let GraphRecord::Node {
+            kind,
+            domain,
+            author,
+            identity_system,
+            title,
+            body_handle,
+            url,
+            assignees,
+            review_commit_sha,
+            ..
+        } = &node
+        else {
+            panic!("expected node");
+        };
+        assert_eq!(*kind, NodeKind::ExternalIdentity);
+        assert_eq!(domain.as_deref(), Some("project"));
+        assert_eq!(author.as_deref(), Some("octocat"), "login lives in author");
+        assert_eq!(identity_system.as_deref(), Some("github"));
+        // No email / display name / avatar / profile URL / other attributes.
+        assert!(title.is_none());
+        assert!(body_handle.is_none());
+        assert!(url.is_none());
+        assert!(assignees.is_none());
+        assert!(review_commit_sha.is_none());
+    }
+
+    #[test]
+    fn every_review_kind_emits_reviewed_by_to_its_author() {
+        let files = FileIndex::new();
+        let c = ctx("o/r", &files, &identity);
+        // pr_review (author "rev")
+        let pr_rev = pr_review_records(&c, 3, &sample_review(100, None));
+        // pr_review_comment (author "cmt")
+        let mut comment = sample_review_comment(200, None);
+        comment.user = Some(model::User {
+            login: "cmt".to_owned(),
+        });
+        let prc = review_comment_records(&c, &comment);
+        // issue_comment (author "icm")
+        let ic = model::IssueComment {
+            id: 300,
+            body: Some("hi".to_owned()),
+            user: Some(model::User {
+                login: "icm".to_owned(),
+            }),
+            issue_url: "https://api.github.com/repos/o/r/issues/3".to_owned(),
+            created_at: String::new(),
+            updated_at: "2026-01-02T00:00:00Z".to_owned(),
+            html_url: "https://github.com/o/r/pull/3#issuecomment-300".to_owned(),
+        };
+        let icr = issue_comment_records(&c, &ic);
+
+        for (e, login) in [(&pr_rev, "rev"), (&prc, "cmt"), (&icr, "icm")] {
+            let edges = edges_with_label(e, EdgeLabel::ReviewedBy);
+            assert_eq!(edges.len(), 1, "exactly one REVIEWED_BY per review");
+            let ids = identity_nodes(e);
+            assert_eq!(ids.len(), 1, "exactly one identity node");
+            let GraphRecord::Edge {
+                id, source, target, ..
+            } = edges[0]
+            else {
+                panic!("edge");
+            };
+            assert!(
+                id.starts_with("project:v1:"),
+                "REVIEWED_BY carries project id"
+            );
+            // FROM the Review, TO the author identity.
+            assert_eq!(*source, find_review_node(e).id());
+            assert_eq!(*target, external_identity_id("github", login));
+        }
+    }
+
+    #[test]
+    fn review_without_author_mints_no_identity() {
+        // A payload with no user login never fabricates an identity.
+        let files = FileIndex::new();
+        let c = ctx("o/r", &files, &identity);
+        let mut r = sample_review(100, None);
+        r.user = None;
+        let e = pr_review_records(&c, 3, &r);
+        assert!(identity_nodes(&e).is_empty());
+        assert!(edges_with_label(&e, EdgeLabel::ReviewedBy).is_empty());
+    }
+
+    #[test]
+    fn pr_emits_requested_review_from_per_reviewer_and_team_diagnostic() {
+        let files = FileIndex::new();
+        let c = ctx("o/r", &files, &identity);
+        let pr = sample_pull(7, &["alice", "bob"], &["backend"]);
+        let e = pull_records(&c, &pr);
+
+        let edges = edges_with_label(&e, EdgeLabel::RequestedReviewFrom);
+        assert_eq!(
+            edges.len(),
+            2,
+            "one REQUESTED_REVIEW_FROM per reviewer login"
+        );
+        let task_id = task_id_for(&c, "pr", 7);
+        for edge in &edges {
+            let GraphRecord::Edge {
+                id, source, target, ..
+            } = edge
+            else {
+                panic!("edge");
+            };
+            assert!(id.starts_with("project:v1:"));
+            assert_eq!(*source, task_id, "FROM the PR Task");
+            assert!(
+                target.starts_with("project:v1:"),
+                "TO an identity: {target}"
+            );
+        }
+        // Both reviewer identities present.
+        let ids: std::collections::BTreeSet<_> = identity_nodes(&e)
+            .iter()
+            .map(|r| r.id().to_owned())
+            .collect();
+        assert!(ids.contains(&external_identity_id("github", "alice")));
+        assert!(ids.contains(&external_identity_id("github", "bob")));
+        // Team → diagnostic, never an edge, never expanded to members.
+        let team_diags = diagnostics_with_code(&e, "github_team_review_request_unexpanded");
+        assert_eq!(team_diags.len(), 1);
+        let GraphRecord::Node { summary, .. } = team_diags[0] else {
+            panic!("node");
+        };
+        assert!(
+            summary.contains("backend"),
+            "diagnostic names the team slug"
+        );
+        assert!(
+            !ids.contains(&external_identity_id("github", "backend")),
+            "a team is never expanded into a member/identity node"
+        );
+    }
+
+    #[test]
+    fn requested_reviewer_edge_and_identity_ids_are_byte_stable() {
+        let files = FileIndex::new();
+        let c = ctx("o/r", &files, &identity);
+        let a = pull_records(&c, &sample_pull(7, &["alice"], &["backend"]));
+        let b = pull_records(&c, &sample_pull(7, &["alice"], &["backend"]));
+        let ids_a: Vec<_> = a.records.iter().map(|r| r.id().to_owned()).collect();
+        let ids_b: Vec<_> = b.records.iter().map(|r| r.id().to_owned()).collect();
+        assert_eq!(ids_a, ids_b, "byte-stable across runs");
+    }
+
+    #[test]
+    fn segregation_of_duties_is_deterministically_computable() {
+        // AC8: for a merged PR, {approving identity ids} minus {author identity id}
+        // is computable, and author-approved-own-PR is distinguishable from a
+        // non-author approval with zero misclassifications.
+        let files = FileIndex::new();
+        let c = ctx("o/r", &files, &identity);
+
+        // PR #1: author "carol"; approved by a DIFFERENT reviewer "dave".
+        let mut r_dave = sample_review(10, None);
+        r_dave.user = Some(model::User {
+            login: "dave".to_owned(),
+        });
+        let e1 = pr_review_records(&c, 1, &r_dave);
+        let author1 = external_identity_id("github", "carol");
+        let approvers1: std::collections::BTreeSet<String> = identity_nodes(&e1)
+            .iter()
+            .map(|r| r.id().to_owned())
+            .collect();
+        // Segregation of duties: {approvers} minus {author} is the reviewer set;
+        // a non-author approval leaves the author OUT of the approver set.
+        assert!(
+            !approvers1.contains(&author1),
+            "non-author approval must NOT be flagged as self-approval"
+        );
+
+        // PR #2: author "erin" approved their OWN PR.
+        let mut r_erin = sample_review(20, None);
+        r_erin.user = Some(model::User {
+            login: "erin".to_owned(),
+        });
+        let e2 = pr_review_records(&c, 2, &r_erin);
+        let author2 = external_identity_id("github", "erin");
+        let approvers2: std::collections::BTreeSet<String> = identity_nodes(&e2)
+            .iter()
+            .map(|r| r.id().to_owned())
+            .collect();
+        assert!(
+            approvers2.contains(&author2),
+            "author-approved-own-PR must be detectable (author identity in approver set)"
+        );
+    }
+
+    #[test]
+    fn team_diagnostic_id_is_repo_scoped() {
+        let a = team_review_diagnostic_id("o/r", 7, "backend");
+        let b = team_review_diagnostic_id("o/other", 7, "backend");
+        assert_ne!(a, b, "team diagnostics never collide across repos");
     }
 }

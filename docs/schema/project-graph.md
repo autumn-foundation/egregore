@@ -147,6 +147,7 @@ payload definitions belong to their own slices.
 | `GitHubIssue` | GitHub-specific issue metadata - reserved; day-one shape collapses issues into `Task` with `source_kind` and `ExternalLink`. |
 | `PR` | GitHub pull-request metadata - reserved. As of issue #333 the core PR fields (`head_sha`, `head_ref`, `base_ref`, `merge_commit_sha`, `merged_at`, `draft`) are promoted to first-class flat `Task` fields; a dedicated `PR` record remains reserved only for the residual PR-only surface (requested reviewers, `mergeable_state`, …). |
 | `Review` | Review comment, finding, approval, requested change, or blocker. Shipped in issue #46 (no longer reserved): the GitHub importer emits `project.Review` records for issue comments, PR review summaries, and PR review comments. |
+| `ExternalIdentity` | A source-system participant identity — a GitHub login (issue #335). Carries ONLY the login (in `author`) and the source system (`identity_system: "github"`); never email, display name, avatar, or profile URL. Keyed on `(system, login)` ALONE (deliberately NOT repo-scoped — a participant identity is global across repositories), so the same login observed in two repos maps to exactly one node: `project_stable_id(["project", "ExternalIdentity", "github", <login>])`. Trust class `project_state`. Consumed by #338/#339 (evidence packs / reviewer joins); future beneficiaries #245 (ownership) and #262. |
 | `LocalTask` | Named in the PRD as a sibling of `GitHubIssue` - reserved; day-one shape collapses it into `Task` with `source_kind: local_jsonl`. |
 
 ## 7 - Cross-Domain Edge Rows
@@ -164,6 +165,8 @@ project-domain side of the contract, but the registry remains the one from #6.
 | `TOUCHES_FILE` | `project` | `codegraph` | `Task`; `Review` | `File` | many:many | no |
 | `MERGED_AS` | `project` | `codegraph` | `Task` *(`source_kind: github_pr`)* | `Commit` | many:1 | no |
 | `REVIEWS_COMMIT` | `project` | `codegraph` | `Review` *(`source_kind: github_review`)* | `Commit` | many:1 | no |
+| `REVIEWED_BY` | `project` | `project` | `Review` *(`source_kind: github_review`)* | `ExternalIdentity` | many:1 | no |
+| `REQUESTED_REVIEW_FROM` | `project` | `project` | `Task` *(`source_kind: github_pr`)* | `ExternalIdentity` | many:many | no |
 | `MENTIONS_SYMBOL` | `project` | `codegraph` | `Task` | `Symbol` | many:many | yes |
 
 `REFERENCES_TASK` is promoted from reserved to defined: #6 already reserved the
@@ -186,6 +189,21 @@ the FROM node must be a `Review` whose `source_kind = github_review` (Review nod
 originate solely from the GitHub importer), the TO node a `codegraph.Commit`, so a
 non-Review node can never be persisted as having reviewed a commit. It anchors a
 review to the exact commit it looked at — never a range-approval verdict.
+
+**Reviewer identity (issue #335).** `REVIEWED_BY` (FROM a `Review` whose
+`source_kind = github_review`, TO an `ExternalIdentity`) records who authored a
+review; `REQUESTED_REVIEW_FROM` (FROM a PR `Task` whose `source_kind = github_pr`,
+TO an `ExternalIdentity`) records each reviewer whose review was requested. Both
+are directly-submitted project edges carrying `project:v1:` identity, validated
+by the daemon like `MERGED_AS`/`REVIEWS_COMMIT`: the FROM node's importer
+`source_kind` is required and both terminate at `ExternalIdentity` ONLY, so a
+forged or mistyped node can never mint a reviewer binding. Every emitted `Review`
+(all review kinds) gains exactly one `REVIEWED_BY` to its author's identity; a
+requested TEAM is never expanded to member logins — it is recorded as a
+`github_team_review_request_unexpanded` project `Diagnostic` carrying the team
+slug and the PR `Task` id. A `REVIEWED_BY` binding proves a review NAMES a
+participant, never a verdict on the review; a `REQUESTED_REVIEW_FROM` is an
+invitation to review, never proof a review happened.
 
 **Merge-resolution lifecycle (issue #333, Codex round-6).** A PR's merge
 evidence is one of two artifacts: a `MERGED_AS` edge (unique `Commit` match) or a

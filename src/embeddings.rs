@@ -194,6 +194,7 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::GitHubIssue
         | NodeKind::PR
         | NodeKind::Review
+        | NodeKind::ExternalIdentity
         | NodeKind::LocalTask
         | NodeKind::Artifact
         | NodeKind::Verification

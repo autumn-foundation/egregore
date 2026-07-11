@@ -65,7 +65,25 @@ use crate::github::{model, records::CommitIndex};
 /// `REVIEWS_COMMIT` marker ([`review_hash`]) — a different formula than the v2
 /// `blake3(payload)` — so on the forced 200 refetch no stored review hash can
 /// match and every review re-emits with the anchor field exactly once.
-pub const STATE_SCHEMA_VERSION: u32 = 3;
+///
+/// Bumped 3 → 4 for issue #335 (reviewer identity): the importer began minting
+/// `ExternalIdentity` nodes and `REVIEWED_BY` / `REQUESTED_REVIEW_FROM` edges
+/// for every review author and requested reviewer. Unlike #334, these derive
+/// ONLY from GitHub payloads (no seed-graph dependency), and unlike #334 the
+/// review change-hash FORMULA is unchanged, so a v3 store's cached review/PR
+/// resource hashes would still MATCH on a forced refetch and suppress
+/// re-emission — leaving an upgraded store permanently without the new identity
+/// facts. A cached endpoint `ETag` (304) hides them even more directly. So the
+/// v3 → v4 migration ([`State::load_or_fresh`]) clears EVERY `ETag` AND EVERY
+/// per-resource hash, forcing exactly one full refresh that re-emits every
+/// issue, PR, and review with its reviewer-identity facts. Everything that
+/// provides prior-artifact tracking survives (`pr_merge_artifacts`,
+/// `review_commit_artifacts`, watermarks, the seed-graph fingerprint, the label
+/// hash) so #333/#334 tombstoning still fires across the upgrade. A pre-#334 v2
+/// file migrates the same way: clearing hashes is a superset of #334's
+/// ETag-only clear and safe because #334 relied on a hash-formula change v2
+/// hashes could not satisfy anyway.
+pub const STATE_SCHEMA_VERSION: u32 = 4;
 
 /// Per-endpoint update watermarks (inclusive `>=` selection, §5).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -182,20 +200,20 @@ impl State {
     ///
     /// Schema-version handling (see [`STATE_SCHEMA_VERSION`]):
     /// - `== STATE_SCHEMA_VERSION` → used as-is.
-    /// - `== 2` → MIGRATED to v3, not discarded (Codex #352 P2). Discarding
-    ///   would drop #333's `pr_merge_artifacts` tracking, so a PR whose merge
-    ///   resolves differently on the first v3 run could emit the fresh artifact
-    ///   yet never tombstone the stale one, leaving stale + fresh merge evidence
-    ///   live. Migration preserves every v2 field — the resource hashes,
-    ///   watermarks, the seed-graph fingerprint, and `pr_merge_artifacts` (the
-    ///   additive `review_commit_artifacts` defaults to empty via serde) — and
-    ///   CLEARS EVERY `ETag` so the first v3 run is a full refresh no endpoint can
-    ///   304. Clearing the `/pulls` list `ETag` specifically is what flips
-    ///   `pulls_changed` true in [`crate::github::import::run_import`] and drives
-    ///   the per-PR `/pulls/{n}/reviews` refetch that re-emits the #334 review
-    ///   anchors (Codex #352 P1); the preserved resource hashes keep every other
-    ///   domain idempotent across the refetch.
-    /// - anything else (`< 2`, pre-#333 with no merge artifacts to lose, or an
+    /// - `== 2` or `== 3` → MIGRATED to v4, not discarded (issue #335, extending
+    ///   Codex #352 P2). Discarding would drop #333's `pr_merge_artifacts` and
+    ///   #334's `review_commit_artifacts` tracking, so a PR/review whose outcome
+    ///   resolves differently on the first v4 run could emit the fresh artifact
+    ///   yet never tombstone the stale one. Migration CLEARS EVERY `ETag` AND
+    ///   EVERY per-resource hash, forcing a full refresh that re-fetches (200)
+    ///   and re-emits every issue, PR, and review with its #335 reviewer-identity
+    ///   facts. (The #334 review change-hash formula is unchanged, so a preserved
+    ///   hash would MATCH on the refetch and suppress the new edges — hence the
+    ///   hashes must be cleared, not preserved.) Everything providing
+    ///   prior-artifact tracking survives: `pr_merge_artifacts`,
+    ///   `review_commit_artifacts`, watermarks, the seed-graph fingerprint, and
+    ///   the label hash.
+    /// - anything else (`< 2`, pre-#333 with no artifacts to lose, or an
     ///   unsupported future value) → safe fresh-empty fallback.
     #[must_use]
     pub fn load_or_fresh(path: &Path, source_repo: &str, api_base_url: &str) -> Self {
@@ -214,15 +232,22 @@ impl State {
         if s.schema_version == STATE_SCHEMA_VERSION {
             return s;
         }
-        if s.schema_version == 2 {
-            // Migrate v2 → v3 in place rather than discarding the whole file. A
-            // schema bump is a one-time full refresh: clear EVERY conditional
-            // `ETag` (critically the `/pulls` list `ETag`, so `pulls_changed`
-            // flips true and the per-PR reviews refetch — Codex #352 P1) while
-            // preserving the resource hashes, watermarks, fingerprint, and
-            // `pr_merge_artifacts` that keep the refresh idempotent and able to
-            // tombstone a stale merge artifact.
+        if s.schema_version == 2 || s.schema_version == 3 {
+            // Migrate v2/v3 → v4 in place rather than discarding the whole file
+            // (issue #335). Discarding would drop #333's `pr_merge_artifacts`
+            // and #334's `review_commit_artifacts` tracking, so a PR/review whose
+            // outcome resolves differently on the first v4 run could emit the
+            // fresh artifact yet never tombstone the stale one. A schema bump is
+            // a one-time full refresh: clear EVERY conditional `ETag` AND EVERY
+            // per-resource hash, so the first v4 run re-fetches (200) and
+            // re-emits every issue, PR, and review with its #335 reviewer-identity
+            // facts — the review change-hash formula is unchanged since #334, so
+            // preserved hashes would otherwise MATCH and suppress the new edges.
+            // Everything providing prior-artifact tracking survives: the merge/
+            // review artifact maps, watermarks, the seed-graph fingerprint, and
+            // the label hash.
             s.etags.clear();
+            s.resource_hashes.clear();
             s.schema_version = STATE_SCHEMA_VERSION;
             return s;
         }
@@ -354,6 +379,12 @@ pub fn pull_hash(pr: &model::PullRequest, merge_link_marker: &str) -> String {
         // MERGED_AS resolution outcome against the seeded code graph (#333,
         // Codex round-4): a changed seed graph re-emits the merge edge.
         "merge_link": merge_link_marker,
+        // Requested reviewers/teams drive REQUESTED_REVIEW_FROM edges and team
+        // diagnostics (#335). A reviewer added/removed with every other field
+        // unchanged must re-emit the PR's request edges, so both participate in
+        // the change hash.
+        "requested_reviewers": pr.requested_reviewers.iter().map(|u| &u.login).collect::<Vec<_>>(),
+        "requested_teams": pr.requested_teams.iter().map(|t| &t.slug).collect::<Vec<_>>(),
     });
     blake3::hash(serde_json::to_string(&key).unwrap_or_default().as_bytes())
         .to_hex()
@@ -557,6 +588,8 @@ mod tests {
             head: None,
             base: None,
             merge_commit_sha: None,
+            requested_reviewers: vec![],
+            requested_teams: vec![],
             html_url: String::new(),
         }
     }
@@ -759,43 +792,51 @@ mod tests {
     }
 
     #[test]
-    fn migrate_v2_to_v3_preserves_resource_hashes() {
-        // Codex #352 P2: a pre-#334 (version-2) state file must be MIGRATED, not
-        // discarded — discarding drops #333's `pr_merge_artifacts` tracking. The
-        // migration preserves every v2 field except the ETags (which are cleared
-        // for a one-time full refresh); the preserved resource hashes keep the
-        // refresh idempotent for unchanged non-review resources.
-        let dir = std::env::temp_dir().join(format!("egst-mig334-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state.json");
-        std::fs::write(
-            &path,
-            r#"{"schema_version":2,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"resource_hashes":{"pr_review:3:7":"abc","pr:10":"deadbeef"}}"#,
-        )
-        .unwrap();
-        let s = State::load_or_fresh(&path, "o/r", "x");
-        assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
-        // Migrated, NOT discarded: v2 resource hashes survive (the runtime v3
-        // review hash uses a different formula, so re-emission still happens).
-        assert!(
-            s.is_unchanged("pr_review:3:7", "abc") && s.is_unchanged("pr:10", "deadbeef"),
-            "v2 state must be migrated in place, not discarded"
-        );
-        std::fs::remove_dir_all(&dir).ok();
+    fn migrate_old_state_clears_resource_hashes_for_full_reemit() {
+        // Issue #335: a pre-#335 (version-2 or version-3) state file must be
+        // MIGRATED, not discarded — discarding drops the merge/review artifact
+        // tracking. But because #335's reviewer-identity edges re-use the
+        // unchanged #334 review change-hash formula, a preserved resource hash
+        // would MATCH on the forced refetch and suppress the new edges, so the
+        // migration CLEARS every per-resource hash to force a one-time full
+        // re-emit of every issue, PR, and review.
+        for prior_version in [2, 3] {
+            let dir = std::env::temp_dir().join(format!(
+                "egst-mig335-{prior_version}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("state.json");
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"schema_version":{prior_version},"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"resource_hashes":{{"pr_review:3:7":"abc","pr:10":"deadbeef"}}}}"#
+                ),
+            )
+            .unwrap();
+            let s = State::load_or_fresh(&path, "o/r", "x");
+            assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
+            // Resource hashes are CLEARED so every resource re-emits its #335 facts.
+            assert!(
+                s.resource_hashes.is_empty(),
+                "v{prior_version}→v4 migration must clear resource hashes to force a full re-emit"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]
-    fn migrate_v2_to_v3_retains_pr_merge_artifacts() {
-        // Codex #352 P2 core: a v2 store with a populated `pr_merge_artifacts` map
-        // (a PR already carrying a prior MERGED_AS/unresolved artifact id) must
-        // retain that map under v3, so `prior_merge_artifact` is still available and
-        // the merge-retraction/tombstone path still fires on the first v3 run.
+    fn migrate_old_state_retains_pr_merge_artifacts() {
+        // Issue #335: a v2/v3 store with a populated `pr_merge_artifacts` map (a
+        // PR already carrying a prior MERGED_AS/unresolved artifact id) must
+        // retain that map under v4, so `prior_merge_artifact` is still available
+        // and the merge-retraction/tombstone path still fires on the first v4 run.
         let dir = std::env::temp_dir().join(format!("egst-mig-pma-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
         std::fs::write(
             &path,
-            r#"{"schema_version":2,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"pr_merge_artifacts":{"pr:10":"project:v1:merged-edge-10","pr:11":"project:v1:unresolved-diag-11"}}"#,
+            r#"{"schema_version":3,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"pr_merge_artifacts":{"pr:10":"project:v1:merged-edge-10","pr:11":"project:v1:unresolved-diag-11"}}"#,
         )
         .unwrap();
         let s = State::load_or_fresh(&path, "o/r", "x");
@@ -803,75 +844,63 @@ mod tests {
         assert_eq!(
             s.prior_merge_artifact("pr:10"),
             Some("project:v1:merged-edge-10"),
-            "v2→v3 migration must retain pr_merge_artifacts so the stale artifact can be tombstoned"
+            "migration must retain pr_merge_artifacts so the stale artifact can be tombstoned"
         );
         assert_eq!(
             s.prior_merge_artifact("pr:11"),
             Some("project:v1:unresolved-diag-11")
         );
-        // The additive review-artifact map defaults to empty on a v2 file.
-        assert!(s.review_commit_artifacts.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn migrate_v2_to_v3_clears_all_etags_but_preserves_hashes_watermarks_and_artifacts() {
-        // Codex #352 P1: the v2 → v3 migration must clear EVERY ETag — including
-        // the `/pulls` LIST ETag — so the first v3 run is a full refresh no
-        // endpoint can 304. Preserving the `/pulls` list ETag would let an
-        // unchanged PR list 304 → `pulls_changed == false` → the per-PR
-        // `/pulls/{n}/reviews` fetch (gated behind `if pulls_changed`) never fires
-        // → existing reviews never re-emit the #334 anchor. Everything that
-        // provides idempotency / prior-artifact tracking survives: resource
-        // hashes, watermarks, and `pr_merge_artifacts`.
+    fn migrate_old_state_clears_etags_and_hashes_but_preserves_watermarks_and_artifacts() {
+        // Issue #335: the v2/v3 → v4 migration must clear EVERY ETag AND EVERY
+        // per-resource hash, so the first v4 run is a full refresh that both
+        // re-fetches (no 304) and re-emits (no unchanged-hash suppression) every
+        // resource with its reviewer-identity facts. Everything providing
+        // prior-artifact tracking survives: watermarks, artifact maps, the
+        // fingerprint, and the label hash.
         let dir = std::env::temp_dir().join(format!("egst-mig-etag-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
         let pulls_list = "/repos/o/r/pulls?state=all&per_page=100?page=1";
-        let review_comments = "/repos/o/r/pulls/comments?per_page=100?page=1";
         let per_pr_reviews = "/repos/o/r/pulls/12/reviews?per_page=100?page=1";
-        let issues = "/repos/o/r/issues?state=all&per_page=100?page=1";
-        let issue_comments = "/repos/o/r/issues/comments?per_page=100?page=1";
-        let labels = "/repos/o/r/labels?page=1";
         let json = serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "source_repo": "o/r",
             "api_base_url": "x",
             "last_run_at_unix_ms": 0,
             "etags": {
                 pulls_list: "\"pulls-list\"",
-                review_comments: "\"prc\"",
                 per_pr_reviews: "\"reviews-12\"",
-                issues: "\"issues\"",
-                issue_comments: "\"ic\"",
-                labels: "\"labels\"",
             },
             "last_seen_updated_at": { "issues": "2026-01-03T00:00:00Z", "pulls": "2026-01-04T00:00:00Z" },
             "label_list_hash": "labhash",
             "resource_hashes": { "pr:12": "prhash", "issue:1": "ihash" },
             "pr_merge_artifacts": { "pr:12": "project:v1:merged-edge-12" },
+            "review_commit_artifacts": { "pr_review:12:5": "project:v1:review-edge-5" },
             "code_graph_fingerprint": "fp-abc"
         });
         std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
         let s = State::load_or_fresh(&path, "o/r", "x");
         assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
-        // EVERY ETag is cleared — the `/pulls` list ETag included (the P1 fix).
+        // EVERY ETag AND EVERY resource hash is cleared.
         assert!(
             s.etags.is_empty(),
-            "the v2 → v3 migration must clear every ETag (incl. the /pulls list ETag): {:?}",
+            "migration must clear every ETag: {:?}",
             s.etags
         );
-        // Everything providing idempotency / prior-artifact tracking survives.
-        assert!(s.is_unchanged("pr:12", "prhash"));
-        assert!(s.is_unchanged("issue:1", "ihash"));
+        assert!(
+            s.resource_hashes.is_empty(),
+            "migration must clear every resource hash: {:?}",
+            s.resource_hashes
+        );
+        // Everything providing prior-artifact tracking survives.
         assert_eq!(s.label_list_hash.as_deref(), Some("labhash"));
         assert_eq!(
             s.last_seen_updated_at.issues.as_deref(),
             Some("2026-01-03T00:00:00Z")
-        );
-        assert_eq!(
-            s.last_seen_updated_at.pulls.as_deref(),
-            Some("2026-01-04T00:00:00Z")
         );
         assert_eq!(
             s.prior_merge_artifact("pr:12"),
@@ -879,11 +908,66 @@ mod tests {
             "pr_merge_artifacts must survive so a changed merge outcome can tombstone the stale artifact"
         );
         assert_eq!(
+            s.prior_review_artifact("pr_review:12:5"),
+            Some("project:v1:review-edge-5"),
+            "review_commit_artifacts must survive the migration"
+        );
+        assert_eq!(
             s.code_graph_fingerprint.as_deref(),
             Some("fp-abc"),
             "the seed-graph fingerprint survives the migration"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pull_hash_changes_when_requested_reviewers_change() {
+        // Issue #335: a reviewer added/removed with every other field unchanged
+        // must change the PR change hash so REQUESTED_REVIEW_FROM edges re-emit.
+        let mut a = pull(1);
+        let mut b = pull(1);
+        a.requested_reviewers = vec![model::User {
+            login: "alice".to_owned(),
+        }];
+        b.requested_reviewers = vec![
+            model::User {
+                login: "alice".to_owned(),
+            },
+            model::User {
+                login: "bob".to_owned(),
+            },
+        ];
+        assert_ne!(
+            pull_hash(&a, "none"),
+            pull_hash(&b, "none"),
+            "a changed requested-reviewer set must change the hash"
+        );
+        // Stable when unchanged.
+        assert_eq!(
+            pull_hash(&a, "none"),
+            pull_hash(&pull_with_reviewer(1, "alice"), "none")
+        );
+    }
+
+    fn pull_with_reviewer(n: u64, login: &str) -> model::PullRequest {
+        let mut p = pull(n);
+        p.requested_reviewers = vec![model::User {
+            login: login.to_owned(),
+        }];
+        p
+    }
+
+    #[test]
+    fn pull_hash_changes_when_requested_teams_change() {
+        // Issue #335: a requested team added/removed must change the hash so the
+        // team diagnostic re-emits.
+        let mut a = pull(1);
+        let mut b = pull(1);
+        a.requested_teams = vec![];
+        b.requested_teams = vec![model::Team {
+            slug: "backend".to_owned(),
+        }];
+        assert_ne!(pull_hash(&a, "none"), pull_hash(&b, "none"));
     }
 
     #[test]

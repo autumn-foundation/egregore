@@ -198,6 +198,11 @@ pub(super) const fn is_cross_domain_label(label: EdgeLabel) -> bool {
             | EdgeLabel::Contradicts
             | EdgeLabel::Supersedes
             | EdgeLabel::OwnedByTask
+            // Reviewer-identity edges (issue #335): a reachable Review/Task
+            // links to its author/requested reviewer identity, so the BFS must
+            // follow REVIEWED_BY / REQUESTED_REVIEW_FROM to surface the identity.
+            | EdgeLabel::ReviewedBy
+            | EdgeLabel::RequestedReviewFrom
     )
 }
 
@@ -229,6 +234,11 @@ pub(super) const fn is_forward_only_label(label: EdgeLabel) -> bool {
             | EdgeLabel::ProducedPatch
             | EdgeLabel::ReferencesTask
             | EdgeLabel::ClosesAcceptanceCriterion
+            // Reviewer-identity edges point FROM a Review/Task TOWARD a shared
+            // identity sink (issue #335). Forward-only so reaching one identity
+            // never pulls in sibling reviews/tasks that share the same author.
+            | EdgeLabel::ReviewedBy
+            | EdgeLabel::RequestedReviewFrom
     )
 }
 

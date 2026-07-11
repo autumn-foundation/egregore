@@ -98,6 +98,8 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     let mut state = prior_state;
     let mut graph = Graph::new();
     let mut emitted_count = 0usize;
+    // Run-level dedup of ExternalIdentity nodes to one-per-login (issue #335).
+    let mut seen_identities: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     // Seed-graph fingerprint gating for the `/pulls` conditional request (#333,
     // Codex round-5). PR merge-link resolution depends on the local seed graph,
@@ -149,6 +151,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             push_emitted(
                 &mut graph,
                 &mut emitted_count,
+                &mut seen_identities,
                 records::issue_records(&ctx, &issue),
             );
         }
@@ -215,6 +218,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                 push_emitted(
                     &mut graph,
                     &mut emitted_count,
+                    &mut seen_identities,
                     Emitted {
                         records: vec![records::merge_artifact_tombstone(pr.number, &prior)],
                         link_diagnostics: 0,
@@ -226,6 +230,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             push_emitted(
                 &mut graph,
                 &mut emitted_count,
+                &mut seen_identities,
                 records::pull_records(&ctx, &pr),
             );
         }
@@ -264,6 +269,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             push_emitted(
                 &mut graph,
                 &mut emitted_count,
+                &mut seen_identities,
                 records::issue_comment_records(&ctx, &c),
             );
         }
@@ -328,6 +334,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                 push_emitted(
                     &mut graph,
                     &mut emitted_count,
+                    &mut seen_identities,
                     Emitted {
                         records: vec![records::review_artifact_tombstone(native, &prior)],
                         link_diagnostics: 0,
@@ -339,6 +346,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             push_emitted(
                 &mut graph,
                 &mut emitted_count,
+                &mut seen_identities,
                 records::review_comment_records(&ctx, &c),
             );
         }
@@ -401,6 +409,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                         push_emitted(
                             &mut graph,
                             &mut emitted_count,
+                            &mut seen_identities,
                             Emitted {
                                 records: vec![records::review_artifact_tombstone(&native, &prior)],
                                 link_diagnostics: 0,
@@ -412,6 +421,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                     push_emitted(
                         &mut graph,
                         &mut emitted_count,
+                        &mut seen_identities,
                         records::pr_review_records(&ctx, number, &r),
                     );
                 }
@@ -453,8 +463,32 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
 }
 
 /// Pushes every record of an [`Emitted`] batch into `graph`, counting them.
-fn push_emitted(graph: &mut Graph, count: &mut usize, emitted: Emitted) {
+///
+/// `seen_identities` deduplicates `ExternalIdentity` nodes to one-per-`(system,
+/// login)` across the whole run (issue #335): the same login can author reviews
+/// on many PRs and be a requested reviewer, so its identity node is minted by
+/// several emitters, but the run's JSONL must carry exactly one. The
+/// deduplication is keyed on the node's stable id (which embeds `(system,
+/// login)`), so the output stays byte-stable and idempotent. The
+/// `REVIEWED_BY` / `REQUESTED_REVIEW_FROM` edges are NOT deduplicated — each is
+/// a distinct (review-or-task, identity) fact.
+fn push_emitted(
+    graph: &mut Graph,
+    count: &mut usize,
+    seen_identities: &mut std::collections::BTreeSet<String>,
+    emitted: Emitted,
+) {
     for rec in emitted.records {
+        if let GraphRecord::Node {
+            kind: NodeKind::ExternalIdentity,
+            id,
+            ..
+        } = &rec
+            && !seen_identities.insert(id.clone())
+        {
+            // Already emitted this identity in this run; skip the duplicate node.
+            continue;
+        }
         *count += 1;
         graph.push(rec);
     }

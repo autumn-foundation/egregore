@@ -14,6 +14,18 @@ pub struct User {
     pub login: String,
 }
 
+/// A GitHub team as returned in a pull request's `requested_teams` array.
+///
+/// Only the `slug` is modelled (issue #335): a requested team is recorded as a
+/// `Diagnostic`, never expanded to member logins, so no other team field is
+/// consumed.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Team {
+    /// URL-safe team identifier (e.g. `backend-reviewers`).
+    #[serde(default)]
+    pub slug: String,
+}
+
 /// A GitHub label as returned by the issues/pulls and `/labels` endpoints.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Label {
@@ -152,6 +164,16 @@ pub struct PullRequest {
     /// Merge commit SHA, when merged.
     #[serde(default)]
     pub merge_commit_sha: Option<String>,
+    /// Individual reviewers whose review was requested on this PR (issue #335).
+    /// Sourced from the already-fetched `/pulls` payload — no new endpoint.
+    /// Each becomes a `REQUESTED_REVIEW_FROM` edge to the reviewer's identity.
+    #[serde(default)]
+    pub requested_reviewers: Vec<User>,
+    /// Teams whose review was requested on this PR (issue #335). Recorded as a
+    /// `github_team_review_request_unexpanded` `Diagnostic` carrying the slug —
+    /// never expanded to member logins. Sourced from the `/pulls` payload.
+    #[serde(default)]
+    pub requested_teams: Vec<Team>,
     /// Canonical HTML URL.
     #[serde(default)]
     pub html_url: String,
@@ -293,6 +315,28 @@ mod tests {
         let json = r#"{"number":1,"title":"t","some_new_field":123}"#;
         let issue: Issue = serde_json::from_str(json).unwrap();
         assert_eq!(issue.number, 1);
+    }
+
+    #[test]
+    fn pull_parses_requested_reviewers_and_teams() {
+        // Issue #335: requested reviewers/teams ride on the already-fetched
+        // /pulls payload — no new endpoint.
+        let json = r#"{"number":7,"requested_reviewers":[{"login":"alice"},{"login":"bob"}],"requested_teams":[{"slug":"backend"}]}"#;
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.requested_reviewers.len(), 2);
+        assert_eq!(pr.requested_reviewers[0].login, "alice");
+        assert_eq!(pr.requested_teams.len(), 1);
+        assert_eq!(pr.requested_teams[0].slug, "backend");
+    }
+
+    #[test]
+    fn pull_parses_without_requested_reviewers() {
+        // Issue #335: an absent requested_reviewers/requested_teams defaults to
+        // empty rather than failing.
+        let json = r#"{"number":7}"#;
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert!(pr.requested_reviewers.is_empty());
+        assert!(pr.requested_teams.is_empty());
     }
 
     #[test]

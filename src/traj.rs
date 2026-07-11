@@ -1030,6 +1030,7 @@ fn make_node(
         diff_hunk_handle: None,
         review_side: None,
         review_commit_sha: None,
+        identity_system: None,
         dependency: None,
         log: None,
         user_context: crate::ir::UserContextFields::empty(),

@@ -1909,6 +1909,7 @@ impl EmbeddedAletheiaSink {
             diff_hunk_handle,
             review_side,
             review_commit_sha,
+            identity_system,
             user_context,
             producer,
         } = record
@@ -2139,6 +2140,7 @@ impl EmbeddedAletheiaSink {
         }
         builder = insert_optional(builder, "review_side", review_side.as_deref());
         builder = insert_optional(builder, "review_commit_sha", review_commit_sha.as_deref());
+        builder = insert_optional(builder, "identity_system", identity_system.as_deref());
         if !user_context.is_empty()
             && let Ok(json) = serde_json::to_string(user_context)
         {
@@ -3141,6 +3143,11 @@ impl EmbeddedAletheiaSink {
                 "review_commit_sha",
                 node.get_property("review_commit_sha"),
             )?,
+            identity_system: optional_str_property(
+                record_id,
+                "identity_system",
+                node.get_property("identity_system"),
+            )?,
             user_context: optional_str_property(
                 record_id,
                 "user_context_json",
@@ -3726,6 +3733,7 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "GitHubIssue" => Ok(NodeKind::GitHubIssue),
         "PR" => Ok(NodeKind::PR),
         "Review" => Ok(NodeKind::Review),
+        "ExternalIdentity" => Ok(NodeKind::ExternalIdentity),
         "LocalTask" => Ok(NodeKind::LocalTask),
         "Artifact" => Ok(NodeKind::Artifact),
         "Verification" => Ok(NodeKind::Verification),
@@ -3794,6 +3802,8 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "TOUCHES_FILE" => Ok(EdgeLabel::TouchesFile),
         "MERGED_AS" => Ok(EdgeLabel::MergedAs),
         "REVIEWS_COMMIT" => Ok(EdgeLabel::ReviewsCommit),
+        "REVIEWED_BY" => Ok(EdgeLabel::ReviewedBy),
+        "REQUESTED_REVIEW_FROM" => Ok(EdgeLabel::RequestedReviewFrom),
         "FAILED_ON" => Ok(EdgeLabel::FailedOn),
         "EXPLAINS_CHANGE" => Ok(EdgeLabel::ExplainsChange),
         "REFERENCES_TASK" => Ok(EdgeLabel::ReferencesTask),
@@ -3964,6 +3974,7 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::GitHubIssue
         | NodeKind::PR
         | NodeKind::Review
+        | NodeKind::ExternalIdentity
         | NodeKind::LocalTask
         | NodeKind::Artifact
         | NodeKind::Verification
@@ -5501,6 +5512,119 @@ mod tests {
                 "byte-identical re-emit must revive the tombstoned merge edge in the current view"
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn external_identity_node_and_edges_round_trip_through_embedded_store() {
+        // Issue #335: an ExternalIdentity node (login in `author`, system in
+        // `identity_system`) plus its REVIEWED_BY / REQUESTED_REVIEW_FROM edges
+        // survive an embedded write + read-back byte-for-byte.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("external-identity-store");
+
+        let identity_id = crate::github::records::external_identity_id("github", "octocat");
+        let mut identity = GraphRecord::node(
+            identity_id.clone(),
+            NodeKind::ExternalIdentity,
+            None,
+            None,
+            None,
+            "github identity octocat".to_owned(),
+        );
+        if let GraphRecord::Node {
+            schema_version,
+            domain,
+            author,
+            identity_system,
+            ..
+        } = &mut identity
+        {
+            *schema_version = crate::ir::PROJECT_SCHEMA_VERSION;
+            *domain = Some("project".to_owned());
+            *author = Some("octocat".to_owned());
+            *identity_system = Some("github".to_owned());
+        }
+
+        let review_id = stable_id(&["node", "review", "pr_review:3:100"]);
+        let task_id = stable_id(&["node", "task", "pr:3"]);
+        let review_node = GraphRecord::node(
+            review_id.clone(),
+            NodeKind::Review,
+            None,
+            None,
+            None,
+            "review".to_owned(),
+        );
+        let task_node = GraphRecord::node(
+            task_id.clone(),
+            NodeKind::Task,
+            None,
+            None,
+            None,
+            "task".to_owned(),
+        );
+        let reviewed = GraphRecord::project_edge(
+            EdgeLabel::ReviewedBy,
+            review_id,
+            identity_id.clone(),
+            None,
+            "review by octocat".to_owned(),
+        );
+        let requested = GraphRecord::project_edge(
+            EdgeLabel::RequestedReviewFrom,
+            task_id,
+            identity_id.clone(),
+            None,
+            "requested review from octocat".to_owned(),
+        );
+        let reviewed_id = reviewed.id().to_owned();
+        let requested_id = requested.id().to_owned();
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("store should open");
+        sink.write_record(&identity).expect("identity should write");
+        sink.write_record(&review_node)
+            .expect("review node should write");
+        sink.write_record(&task_node)
+            .expect("task node should write");
+        sink.write_record(&reviewed)
+            .expect("REVIEWED_BY should write");
+        sink.write_record(&requested)
+            .expect("REQUESTED_REVIEW_FROM should write");
+
+        let records = sink.read_all_records().expect("read_all_records");
+        let read_identity = records
+            .iter()
+            .find(|r| r.id() == identity_id)
+            .expect("identity read back");
+        let GraphRecord::Node {
+            kind,
+            author,
+            identity_system,
+            ..
+        } = read_identity
+        else {
+            panic!("expected node");
+        };
+        assert_eq!(*kind, NodeKind::ExternalIdentity);
+        assert_eq!(author.as_deref(), Some("octocat"), "login round-trips");
+        assert_eq!(
+            identity_system.as_deref(),
+            Some("github"),
+            "system round-trips"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r, GraphRecord::Edge { id, label: EdgeLabel::ReviewedBy, .. } if id == &reviewed_id)),
+            "REVIEWED_BY edge round-trips (no unknown-embedded-edge-label error)"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r, GraphRecord::Edge { id, label: EdgeLabel::RequestedReviewFrom, .. } if id == &requested_id)),
+            "REQUESTED_REVIEW_FROM edge round-trips"
+        );
     }
 
     #[test]
