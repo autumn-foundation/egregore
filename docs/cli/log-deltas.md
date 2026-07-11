@@ -1,0 +1,216 @@
+# eg query log-deltas
+
+Classify **runtime error-signatures across a commit range** (issue #326) —
+answer the regression question *"between commit A and commit B, did any new
+runtime error signatures appear, and which of them touch code that changed in
+the range?"* — from a `scan-history` graph (augmented with `scan-logs` records)
+or an embedded store. Local-first; no network access, hosted indexing, remote
+crawling, or mandatory remote embeddings.
+
+> **A signature first observed in-range is a regression LEAD, not proof this
+> range caused it.** A ceased signature is not proof of a fix. Occurrence data
+> only reflects the log sources that were scanned — a sampling artifact, never
+> the complete runtime behavior of the system.
+
+This query composes three already-shipped mechanics rather than re-deriving any
+of them: the issue #118 [`eg query deltas`](./deltas.md) range mechanics
+(endpoint resolution, the commit valid-time window, and the symbol-delta join),
+the issue #319/#320 `ErrorSignature` valid-time model
+([`eg scan-logs`](./scan-logs.md)), and the issue #322 `FRAME_RESOLVES_TO`
+frame-resolution edges ([`eg resolve-frames`](./resolve-frames.md)).
+
+## Synopsis
+
+```text
+eg query log-deltas <BASE> <HEAD> --graph <PATH>    [--repo <SELECTOR>]
+eg query log-deltas <BASE> <HEAD> --data-dir <DIR>  [--repo <SELECTOR>]
+```
+
+`<BASE>` and `<HEAD>` are commit handles — full SHAs or unique prefixes —
+resolved against the store's `Commit` nodes with the exact issue #118 endpoint
+resolution and error taxonomy. `BASE` must be an ancestor of `HEAD`. The query
+is purely read-time: it reads only the supplied store, never Git state, so it
+cannot mutate the working tree.
+
+## Shortest offline workflow
+
+```sh
+# Replay history into a temporal JSONL graph (reads Git objects only)
+eg scan-history . --out history.graph.jsonl
+
+# Capture runtime error signatures from a log file
+eg scan-logs app.log --repo-path . --out log.graph.jsonl
+
+# Resolve backtrace frames onto code-graph targets (issue #322)
+eg resolve-frames log.graph.jsonl --graph history.graph.jsonl --out resolved.graph.jsonl
+
+# Concatenate the code-history and resolved-log records into one graph
+cat history.graph.jsonl resolved.graph.jsonl > combined.graph.jsonl
+
+# Classify error-signatures across a commit range
+eg query log-deltas 4f0c2b1 9ad3e77 --graph combined.graph.jsonl
+
+# Scope to one repository in a shared store
+eg query log-deltas 4f0c2b1 9ad3e77 --graph combined.graph.jsonl --repo acme/widget
+```
+
+## Window derivation
+
+The valid-time window the classification runs against is derived from the
+committer dates of the commits in the resolved range (the commits reachable
+from `HEAD` but not from `BASE`):
+
+- `window_start = min(commit_valid_time[sha])` over the range commits;
+- `window_end   = max(commit_valid_time[sha])` over the range commits.
+
+RFC 3339 timestamps compare lexicographically in chronological order for the
+Z-normalized UTC form the extractors emit, matching the repository's existing
+temporal-selector comparisons. A range commit that carries no committer date
+cannot bound the window; if no range commit carries a valid time the window is
+empty and every signature is excluded (never fabricated bounds).
+
+## Change classes
+
+Every in-scope `ErrorSignature` is classified against the window from its
+`first_seen` (`fs`) and `last_seen` (`ls`) valid times, into a **closed,
+mutually exclusive** set evaluated in this precedence:
+
+| Group | Class label | Condition | Meaning |
+|-------|-------------|-----------|---------|
+| `new_signatures` | `new_signature` | `window_start <= fs <= window_end` | First observed inside the window — the primary regression signal. A signature that appeared **and** ceased within the window still classifies as new. |
+| `ceased_signatures` | `ceased_signature` | not new, `fs < window_start` and `ls < window_end` | Existed before the range and went silent by/within it. A signature last seen before the range (`ls < window_start`) trivially satisfies this. |
+| `continuing_signatures` | `continuing_signature` | `fs < window_start` and `ls >= window_end` | Existed before the range and still occurring through its end. |
+
+**After-window exclusion.** A signature whose first observation falls strictly
+after the window (`fs > window_end`) is **out of range** and is excluded from
+all three classes — it belongs to a future range, not this one. This exclusion
+is deliberate and documented so it never silently disappears into "ceased".
+
+### Symbol-delta join (`overlapping_symbol_deltas`)
+
+For each `new_signatures` row only, the query follows the signature's
+`FRAME_RESOLVES_TO` edges (issue #322) to their code-graph target record IDs.
+Each target that also appears in the reused issue #118 `range_deltas`
+`added_symbols` / `modified_symbols` / `removed_symbols` groups is added to that
+row's `overlapping_symbol_deltas` as `{record_id, change_class}`. The
+intersection is computed entirely from the existing delta mechanics — never
+re-derived ad hoc. The list is empty when there is no overlap and is sorted
+deterministically by `(change_class, record_id)`. `ceased_signatures` and
+`continuing_signatures` rows always carry an empty join.
+
+A frame binding proves only that the frame **names** the symbol; an overlap is
+a review lead correlating a new failure with code that changed in the same
+range, never proof the change caused the failure.
+
+## Occurrence counts
+
+Per-window occurrence figures are computed from the signature's own hourly
+`LogOccurrenceBucket` records (issue #320), discovered through the `AGGREGATES`
+(bucket → signature) edges:
+
+- `base_window_occurrences` = sum of linked bucket counts whose `bucket_start`
+  is `<= commit_valid_time[BASE]`;
+- `head_window_occurrences` = sum of linked bucket counts whose `bucket_start`
+  is `<= commit_valid_time[HEAD]`.
+
+When a signature has at least one linked bucket, `occurrence_source` is
+`occurrence_buckets` and both window fields are present. When a signature
+carries **no** linked buckets (e.g. a log graph ingested without buckets),
+per-window bucketization is unavailable: the two window fields are omitted and
+`occurrence_source` is `aggregate_only`, exposing the signature's aggregate
+`occurrence_count` as the only honest count. Counts are never fabricated. The
+aggregate `occurrence_count` is always present on every row.
+
+## Exit codes and diagnostics
+
+Ambiguous prefixes, unknown commits, identical endpoints, and reversed ranges
+fail with the same stable machine-readable diagnostics as `eg query deltas`
+(`{"ok":false,"error":{"error_type":...}}` on stdout), never partial or silent
+output:
+
+| Condition | `error_type` | Exit |
+|-----------|--------------|------|
+| Success (including a resolved range with no signatures in any class) | — | `0` |
+| Commit prefix matches multiple commits | `ambiguous_commit_prefix` | `1` |
+| Both endpoints resolve to the same commit | `identical_endpoints` | `1` |
+| Base is a descendant of head | `reversed_range` | `1` |
+| No ancestor path connects the endpoints | `no_path` | `1` |
+| Commit prefix matches nothing | `missing_commit` | `2` |
+| Store has no commit history | `empty_history` | `2` |
+
+An empty result in all three classes is an explicit success (exit `0`), not an
+error.
+
+## Response shape
+
+Every group is always present (empty arrays, never omitted) and canonically
+ordered by `(first_seen, record_id)`, so repeating the same query yields
+byte-equivalent canonical output. No raw log payload text ever appears — only
+bounded template excerpts, record IDs, severities, counts, commit handles, and
+valid times.
+
+```json
+{
+  "ok": true,
+  "base": "<full base SHA>",
+  "head": "<full head SHA>",
+  "window": {
+    "window_start": "2026-01-02T00:00:00Z",
+    "window_end": "2026-01-03T00:00:00Z"
+  },
+  "range_commit_count": 2,
+  "disclaimer": "Rows are runtime error-signature observations ...",
+  "new_signatures": [
+    {
+      "record_id": "log:v1:...",
+      "schema_version": 1,
+      "change_class": "new_signature",
+      "severity": "error",
+      "first_seen": "2026-01-02T12:00:00Z",
+      "last_seen": "2026-01-02T13:00:00Z",
+      "occurrence_count": 5,
+      "occurrence_source": "occurrence_buckets",
+      "base_window_occurrences": 0,
+      "head_window_occurrences": 5,
+      "resolved_frames": [
+        {
+          "frame_index": 0,
+          "frame_resolution": "resolved",
+          "target_record_id": "codegraph:v5:..."
+        }
+      ],
+      "overlapping_symbol_deltas": [
+        { "record_id": "codegraph:v5:...", "change_class": "modified_symbol" }
+      ]
+    }
+  ],
+  "ceased_signatures": [],
+  "continuing_signatures": []
+}
+```
+
+## When to use which tool
+
+- **`eg query log-deltas`** — the runtime-regression A..B answer: which error
+  signatures newly appeared, ceased, or continued across a commit range, with
+  the new ones joined to the code deltas of the same range. Its subject is the
+  *observed runtime behavior* recorded from scanned logs.
+- **`eg query deltas` (issue #118)** — the structural A..B answer: which
+  symbols and files were added, removed, or modified. `log-deltas` reuses these
+  mechanics for its window and symbol-delta join, but its rows are error
+  signatures, not code facts.
+- **`eg query public-api-deltas` (issue #157)** — the public-surface
+  classification on top of the range mechanics (`removed`, `signature_changed`,
+  `visibility_narrowed`, …). Use it when the question is about the exported
+  *contract*, not runtime failures.
+- **Diffing grep snapshots of logs** (`grep ERROR old.log > a; grep ERROR
+  new.log > b; diff a b`) — fast and local, but it compares raw log text line
+  by line: it re-counts volatile fields (timestamps, PIDs, UUIDs, pointers) as
+  distinct, never fingerprints by `template-v1`, never anchors a signature to a
+  commit valid-time window, and emits no stable graph handles that join to code
+  deltas, agent memory, or verification evidence.
+
+And once more, because it is the sharp edge: **occurrence data only reflects the
+log sources that were scanned** — this query reports observed, sampled runtime
+signatures, never the complete runtime behavior of the system, and a signature
+first observed in-range is a regression lead, not proof this range caused it.

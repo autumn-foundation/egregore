@@ -108,6 +108,11 @@ cargo run -- query deltas <base_sha> <head_sha> --graph history.graph.jsonl  # e
 cargo run -- query deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
 cargo run -- query deltas ffffffffffff <head_sha> --graph history.graph.jsonl # exit 2 (missing_commit)
 
+# Runtime error-signature deltas across a commit range (issue #326)
+cargo run -- query log-deltas <base_sha> <head_sha> --graph combined.graph.jsonl  # exit 0 on match
+cargo run -- query log-deltas <sha> <sha> --graph combined.graph.jsonl            # exit 1 (identical_endpoints)
+cargo run -- query log-deltas ffffffffffff <head_sha> --graph combined.graph.jsonl # exit 2 (missing_commit)
+
 # A file's defined-symbol set at a past commit or instant (issue #158)
 cargo run -- query file src/lib.rs --graph history.graph.jsonl --at <commit_sha>             # exit 0 on match
 cargo run -- query file src/lib.rs --graph history.graph.jsonl --as-of 2026-01-02T00:00:00Z  # exit 0 on match
@@ -261,6 +266,27 @@ available, and the introducing commit with its valid time. Semantic drift inside
 folded in where drift records exist and marked unavailable otherwise. Rows are observed
 deltas, never proof of behavior change; the response is deterministic and byte-identical
 across runs. See `docs/cli/deltas.md`.
+
+`eg query log-deltas <base> <head>` classifies runtime error-signatures across a commit range
+(issue #326), composing the #118 range mechanics with the #319/#320 `ErrorSignature`
+valid-time model and the #322 `FRAME_RESOLVES_TO` edges. It derives a valid-time window from
+the committer dates of the range commits (`window_start`/`window_end` = min/max) and sorts
+every in-scope signature into a closed, mutually exclusive 3-class set by precedence:
+`new_signatures` (`window_start <= first_seen <= window_end` — the regression signal, even for
+a signature that also ceased in-window), `ceased_signatures` (existed before the range,
+`last_seen < window_end`), and `continuing_signatures` (existed before, `last_seen >=
+window_end`). A signature first observed after the window (`first_seen > window_end`) is
+out-of-range and excluded from all three classes. Each `new_signatures` row joins its
+`FRAME_RESOLVES_TO` targets against the reused `range_deltas` symbol groups into
+`overlapping_symbol_deltas` (never re-derived). Per-window occurrence counts come from the
+signature's `LogOccurrenceBucket` records via `AGGREGATES` edges (`base_window_occurrences`/
+`head_window_occurrences` = buckets at/before each endpoint's committer date); a signature
+with no linked buckets falls back to its aggregate `occurrence_count` with
+`occurrence_source: aggregate_only` — counts are never fabricated. Exit codes and the error
+taxonomy mirror #118 exactly. Rows are regression LEADS, never proof this range caused the
+failure; a ceased signature is not proof of a fix; occurrence data only reflects scanned log
+sources. Read-only, redaction-safe (no raw log text), deterministic and byte-identical across
+runs. See `docs/cli/log-deltas.md`.
 
 `eg query file <path> --at <commit>` / `--as-of <instant>` reconstructs the deterministic
 set of symbols a file defined at a chosen commit or valid-time instant (issue #158) from a

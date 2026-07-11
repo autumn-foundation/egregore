@@ -33,6 +33,7 @@ mod ingest;
 mod inspect;
 mod lifeline;
 mod locate;
+mod log_deltas;
 mod manifest_deps;
 mod memory;
 mod memory_audit;
@@ -95,6 +96,7 @@ pub(crate) use ingest::*;
 pub(crate) use inspect::*;
 pub(crate) use lifeline::*;
 pub(crate) use locate::*;
+pub(crate) use log_deltas::*;
 pub(crate) use manifest_deps::*;
 pub(crate) use memory::*;
 pub(crate) use memory_audit::*;
@@ -1964,6 +1966,43 @@ pub(crate) enum QuerySubcommand {
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Restrict commit resolution and delta selection to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Classify runtime error-signatures across a commit range (issue #326).
+    ///
+    /// Answers "did this commit range introduce new runtime error
+    /// signatures?" by composing the issue #118 range mechanics with the
+    /// issue #319/#320 `ErrorSignature` valid-time model and the issue #322
+    /// `FRAME_RESOLVES_TO` frame-resolution edges. Derives the valid-time
+    /// window from the committer dates of the range commits and classifies
+    /// every in-scope signature into `new_signatures` (first observed inside
+    /// the window — the regression signal), `ceased_signatures` (existed
+    /// before the range and went silent by its end), or
+    /// `continuing_signatures` (existed before and still occurring through
+    /// the end). Signatures first observed after the window are excluded as a
+    /// future range. Each `new_signatures` row joins its resolved backtrace
+    /// frames to overlapping symbol deltas from the same range.
+    ///
+    /// Rows are regression LEADS, never proof this range caused the failure;
+    /// a ceased signature is not proof of a fix; occurrence data only reflects
+    /// the scanned log sources. Reads only the supplied store; never touches
+    /// Git state or the working tree. Raw log payload text never enters the
+    /// response.
+    ///
+    /// Documented in `docs/cli/log-deltas.md`.
+    LogDeltas {
+        /// Base commit SHA or unique prefix (older endpoint).
+        base: String,
+        /// Head commit SHA or unique prefix (newer endpoint).
+        head: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict commit resolution and signature selection to one repository.
         #[arg(long)]
         repo: Option<String>,
     },
@@ -4796,6 +4835,16 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_deltas_cmd(&records, &base, &head, repo.as_deref())
+        }
+        QuerySubcommand::LogDeltas {
+            base,
+            head,
+            graph,
+            data_dir,
+            repo,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_log_deltas_cmd(&records, &base, &head, repo.as_deref())
         }
         QuerySubcommand::Coupling {
             path,

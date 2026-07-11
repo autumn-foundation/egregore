@@ -45,6 +45,7 @@ mod line_ending_determinism;
 mod link_evidence;
 mod local_project;
 mod local_project_jsonl_doc;
+mod log_deltas;
 mod manifest_deps;
 mod mcp;
 mod memory_audit;

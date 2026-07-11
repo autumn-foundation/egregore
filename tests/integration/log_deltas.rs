@@ -1,0 +1,711 @@
+//! Integration tests for `eg query log-deltas` (issue #326): runtime
+//! error-signature classification across a commit range.
+//!
+//! Two layers, mirroring `tests/integration/range_deltas.rs`:
+//!   * synthetic-record tests that build a `Vec<GraphRecord>` with three linear
+//!     commits, a modified symbol, four `ErrorSignature` nodes exercising the
+//!     new / ceased / continuing / out-of-range classes, hourly
+//!     `LogOccurrenceBucket` records linked through `AGGREGATES`, and a
+//!     `FRAME_RESOLVES_TO` edge from the new signature onto the modified symbol
+//!     (the AC4 join);
+//!   * a seeded end-to-end CLI test that scans a real git fixture with
+//!     `scan-history`, augments the graph with the same synthetic log records,
+//!     and drives `egregore query log-deltas`, asserting byte-identical output
+//!     across five runs, the documented exit codes, and a clean working tree
+//!     before and after.
+
+#![allow(missing_docs)]
+
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Stdio},
+};
+
+use aletheia_egregore::{
+    GraphRecord, LOG_SCHEMA_VERSION, NodeKind, TemporalMetadata,
+    ir::{
+        EdgeLabel, ErrorSignaturePayload, FrameResolution, LogOccurrenceBucketPayload, LogPayload,
+    },
+    query::{LogDeltas, RangeDeltasError, log_deltas},
+    scan_repository_history, stable_id,
+};
+use assert_cmd::Command as CargoCommand;
+
+// ---------------------------------------------------------------------------
+// Timestamps: commit committer dates and signature valid times.
+// ---------------------------------------------------------------------------
+
+const T1: &str = "2026-01-01T00:00:00Z"; // base commit (c1)
+const T2: &str = "2026-01-02T00:00:00Z"; // c2  → window_start for c1..c3
+const T3: &str = "2026-01-03T00:00:00Z"; // c3  → window_end   for c1..c3
+
+// New signature: first observed inside the [T2, T3] window.
+const NEW_FIRST: &str = "2026-01-02T12:00:00Z";
+const NEW_LAST: &str = "2026-01-02T13:00:00Z";
+const NEW_BUCKET: &str = "2026-01-02T12:00:00Z";
+// Ceased: existed before the range, last seen before the window end.
+const CEASED_FIRST: &str = "2026-01-01T00:00:00Z";
+const CEASED_LAST: &str = "2026-01-01T05:00:00Z";
+// Continuing: existed before the range, still occurring through the end.
+const CONT_FIRST: &str = "2026-01-01T00:00:00Z";
+const CONT_LAST: &str = "2026-01-05T00:00:00Z";
+// Out of range: first observed strictly after the window end.
+const FUTURE_FIRST: &str = "2026-02-01T00:00:00Z";
+const FUTURE_LAST: &str = "2026-02-01T01:00:00Z";
+
+// ---------------------------------------------------------------------------
+// Synthetic record helpers (mirrors tests/integration/range_deltas.rs).
+// ---------------------------------------------------------------------------
+
+fn temporal(commit: &str, parents: &[&str], valid_time: &str) -> TemporalMetadata {
+    TemporalMetadata {
+        git_commit: commit.to_owned(),
+        git_parent_commits: parents.iter().map(|s| (*s).to_owned()).collect(),
+        valid_time: valid_time.to_owned(),
+        author_time: Some(valid_time.to_owned()),
+        observed_at: valid_time.to_owned(),
+        valid_time_source: Some("git_commit_committer_date".to_owned()),
+    }
+}
+
+fn commit(sha: &str, parents: &[&str], valid_time: &str) -> GraphRecord {
+    let id = stable_id(&["node", "commit", "repo_test", sha]);
+    GraphRecord::node(
+        id,
+        NodeKind::Commit,
+        None,
+        None,
+        Some(sha.to_owned()),
+        format!("Commit {sha}"),
+    )
+    .with_temporal(temporal(sha, parents, valid_time))
+}
+
+fn symbol_snapshot(
+    name: &str,
+    path: &str,
+    body: &str,
+    commit: &str,
+    valid_time: &str,
+) -> GraphRecord {
+    let id = symbol_id(name, path);
+    GraphRecord::node(
+        id,
+        NodeKind::Symbol,
+        Some(path.to_owned()),
+        None,
+        Some(name.to_owned()),
+        format!("Symbol {name} in {path}\nSource:\n{body}"),
+    )
+    .with_temporal(temporal(commit, &[], valid_time))
+}
+
+fn symbol_id(name: &str, path: &str) -> String {
+    stable_id(&["node", "symbol", "repo_test", path, name])
+}
+
+/// Builds an `ErrorSignature` node with the given valid-time bounds. The seed
+/// keeps distinct signatures from colliding on their content-addressed ID.
+fn error_signature(
+    seed: &str,
+    severity: &str,
+    first_seen: &str,
+    last_seen: &str,
+    occurrence_count: u64,
+) -> GraphRecord {
+    let id = log_sig_id(seed);
+    GraphRecord::node(
+        id,
+        NodeKind::ErrorSignature,
+        None,
+        None,
+        Some(format!("{severity} signature")),
+        format!("Error signature ({severity}) x{occurrence_count}: {seed}"),
+    )
+    .with_domain("log", LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::ErrorSignature(ErrorSignaturePayload {
+        fingerprint_algorithm: "template-v1".to_owned(),
+        template_excerpt: format!("template {seed}"),
+        severity: severity.to_owned(),
+        occurrence_count,
+        first_seen: first_seen.to_owned(),
+        last_seen: last_seen.to_owned(),
+        frames: None,
+    }))
+    .with_valid_time(first_seen, "log_event_timestamp")
+}
+
+fn log_sig_id(seed: &str) -> String {
+    aletheia_egregore::log_stable_id(&["error_signature", "repo_test", seed])
+}
+
+/// A `LogOccurrenceBucket` node plus its `AGGREGATES` edge to the signature.
+fn bucket_with_edge(
+    signature_id: &str,
+    bucket_start: &str,
+    count: u64,
+) -> (GraphRecord, GraphRecord) {
+    let bucket_id =
+        aletheia_egregore::log_stable_id(&["log_occurrence_bucket", signature_id, bucket_start]);
+    let node = GraphRecord::node(
+        bucket_id.clone(),
+        NodeKind::LogOccurrenceBucket,
+        None,
+        None,
+        Some(format!("bucket {bucket_start}")),
+        format!("Occurrence bucket {bucket_start} x{count}"),
+    )
+    .with_domain("log", LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::LogOccurrenceBucket(
+        LogOccurrenceBucketPayload {
+            bucket_start: bucket_start.to_owned(),
+            bucket_width: "1h".to_owned(),
+            occurrence_count: count,
+        },
+    ))
+    .with_valid_time(bucket_start, "log_event_timestamp");
+    let edge = log_edge(
+        EdgeLabel::Aggregates,
+        &bucket_id,
+        signature_id,
+        "LogOccurrenceBucket aggregates ErrorSignature",
+    );
+    (node, edge)
+}
+
+/// A `FRAME_RESOLVES_TO` edge from a signature onto a code-graph target.
+fn frame_edge(
+    signature_id: &str,
+    target_id: &str,
+    frame_index: u32,
+    resolution: FrameResolution,
+) -> GraphRecord {
+    GraphRecord::Edge {
+        id: aletheia_egregore::log_stable_id(&[
+            "edge",
+            "FRAME_RESOLVES_TO",
+            signature_id,
+            &frame_index.to_string(),
+            target_id,
+            resolution.as_str(),
+        ]),
+        schema_version: LOG_SCHEMA_VERSION,
+        label: EdgeLabel::FrameResolvesTo,
+        source: signature_id.to_owned(),
+        target: target_id.to_owned(),
+        confidence: Some("1.0".to_owned()),
+        resolution: None,
+        frame_resolution: Some(resolution),
+        frame_index: Some(frame_index),
+        temporal: None,
+        summary: format!("frame {frame_index} of {signature_id} resolves to {target_id}"),
+        producer: None,
+    }
+}
+
+fn log_edge(label: EdgeLabel, source: &str, target: &str, summary: &str) -> GraphRecord {
+    GraphRecord::Edge {
+        id: aletheia_egregore::log_stable_id(&["edge", label.as_str(), source, target]),
+        schema_version: LOG_SCHEMA_VERSION,
+        label,
+        source: source.to_owned(),
+        target: target.to_owned(),
+        confidence: None,
+        resolution: None,
+        frame_resolution: None,
+        frame_index: None,
+        temporal: None,
+        summary: summary.to_owned(),
+        producer: None,
+    }
+}
+
+/// Three linear commits (`c1`→`c2`→`c3`) with `tweaked` modified between c1 and
+/// c2, plus four signatures and the new signature's bucket + frame join to the
+/// modified symbol.
+fn synthetic_log_delta_records() -> Vec<GraphRecord> {
+    let tweaked = symbol_id("tweaked", "src/lib.rs");
+    let new_sig = log_sig_id("new-boom");
+    let (bucket_node, bucket_edge) = bucket_with_edge(&new_sig, NEW_BUCKET, 5);
+    vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        commit("c3sha0000", &["c2sha0000"], T3),
+        // Modified symbol so the AC4 join has a `modified_symbol` to hit.
+        symbol_snapshot("keep", "src/lib.rs", "A", "c1sha0000", T1),
+        symbol_snapshot("tweaked", "src/lib.rs", "C1", "c1sha0000", T1),
+        symbol_snapshot("keep", "src/lib.rs", "A", "c2sha0000", T2),
+        symbol_snapshot("tweaked", "src/lib.rs", "C2", "c2sha0000", T2),
+        symbol_snapshot("keep", "src/lib.rs", "A", "c3sha0000", T3),
+        symbol_snapshot("tweaked", "src/lib.rs", "C2", "c3sha0000", T3),
+        // Signatures across the four classes.
+        error_signature("new-boom", "error", NEW_FIRST, NEW_LAST, 5),
+        error_signature("ceased-warn", "warn", CEASED_FIRST, CEASED_LAST, 3),
+        error_signature("cont-error", "error", CONT_FIRST, CONT_LAST, 9),
+        error_signature("future-fatal", "fatal", FUTURE_FIRST, FUTURE_LAST, 1),
+        // New signature's occurrence bucket + frame resolution onto `tweaked`.
+        bucket_node,
+        bucket_edge,
+        frame_edge(&new_sig, &tweaked, 0, FrameResolution::Resolved),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics: the taxonomy is reused from issue #118 verbatim.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn log_deltas_empty_history_errors() {
+    let records = vec![error_signature("lonely", "error", NEW_FIRST, NEW_LAST, 1)];
+    let err = log_deltas(&records, "c1", "c2", None).unwrap_err();
+    assert!(matches!(err, RangeDeltasError::EmptyHistory));
+}
+
+#[test]
+fn log_deltas_missing_commit_errors() {
+    let records = synthetic_log_delta_records();
+    let err = log_deltas(&records, "ffff", "c3sha0000", None).unwrap_err();
+    match err {
+        RangeDeltasError::MissingCommit { commit_prefix } => assert_eq!(commit_prefix, "ffff"),
+        other => panic!("expected MissingCommit, got {other:?}"),
+    }
+}
+
+#[test]
+fn log_deltas_identical_endpoints_error() {
+    let records = synthetic_log_delta_records();
+    let err = log_deltas(&records, "c2", "c2sha0000", None).unwrap_err();
+    match err {
+        RangeDeltasError::IdenticalEndpoints { commit } => assert_eq!(commit, "c2sha0000"),
+        other => panic!("expected IdenticalEndpoints, got {other:?}"),
+    }
+}
+
+#[test]
+fn log_deltas_reversed_range_errors() {
+    let records = synthetic_log_delta_records();
+    let err = log_deltas(&records, "c3", "c1", None).unwrap_err();
+    assert!(matches!(err, RangeDeltasError::ReversedRange { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// Classification across the closed 3-class set + the out-of-range exclusion.
+// ---------------------------------------------------------------------------
+
+fn record_ids(rows: &[aletheia_egregore::query::LogSignatureDelta]) -> Vec<&str> {
+    rows.iter().map(|r| r.record_id.as_str()).collect()
+}
+
+#[test]
+fn log_deltas_classifies_four_signature_cases() {
+    let records = synthetic_log_delta_records();
+    let deltas = log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+
+    assert_eq!(deltas.base, "c1sha0000");
+    assert_eq!(deltas.head, "c3sha0000");
+    assert_eq!(deltas.range_commit_count, 2);
+    // Window derived from the range commits (c2, c3).
+    assert_eq!(deltas.window.window_start, T2);
+    assert_eq!(deltas.window.window_end, T3);
+
+    // (a) first_seen inside the window → new.
+    assert_eq!(
+        record_ids(&deltas.new_signatures),
+        vec![log_sig_id("new-boom")]
+    );
+    assert_eq!(deltas.new_signatures[0].change_class, "new_signature");
+    // (b) last_seen before the range → ceased.
+    assert_eq!(
+        record_ids(&deltas.ceased_signatures),
+        vec![log_sig_id("ceased-warn")]
+    );
+    assert_eq!(deltas.ceased_signatures[0].change_class, "ceased_signature");
+    // (c) spanning the window → continuing.
+    assert_eq!(
+        record_ids(&deltas.continuing_signatures),
+        vec![log_sig_id("cont-error")]
+    );
+    assert_eq!(
+        deltas.continuing_signatures[0].change_class,
+        "continuing_signature"
+    );
+
+    // (d) first observed after the window is excluded from every class.
+    let future = log_sig_id("future-fatal");
+    for group in [
+        &deltas.new_signatures,
+        &deltas.ceased_signatures,
+        &deltas.continuing_signatures,
+    ] {
+        assert!(group.iter().all(|r| r.record_id != future));
+    }
+
+    // Every row carries citable identity + valid-time bounds.
+    for row in deltas
+        .new_signatures
+        .iter()
+        .chain(&deltas.ceased_signatures)
+        .chain(&deltas.continuing_signatures)
+    {
+        assert!(!row.record_id.is_empty());
+        assert!(row.schema_version >= 1);
+        assert!(!row.severity.is_empty());
+        assert!(!row.first_seen.is_empty());
+        assert!(!row.last_seen.is_empty());
+    }
+
+    // The disclaimer labels rows as leads with the sampling caveat.
+    assert!(deltas.disclaimer.contains("regression LEAD"));
+    assert!(deltas.disclaimer.contains("sampling"));
+}
+
+#[test]
+fn log_deltas_new_signature_joins_overlapping_symbol_delta() {
+    let records = synthetic_log_delta_records();
+    let deltas = log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+
+    let new_row = &deltas.new_signatures[0];
+    // The resolved frame binds the signature to the `tweaked` symbol.
+    assert_eq!(new_row.resolved_frames.len(), 1);
+    assert_eq!(new_row.resolved_frames[0].frame_resolution, "resolved");
+    let tweaked = symbol_id("tweaked", "src/lib.rs");
+    assert_eq!(new_row.resolved_frames[0].target_record_id, tweaked);
+
+    // AC4: the overlap names exactly the modified symbol, from the reused
+    // range_deltas mechanics.
+    assert_eq!(new_row.overlapping_symbol_deltas.len(), 1);
+    assert_eq!(new_row.overlapping_symbol_deltas[0].record_id, tweaked);
+    assert_eq!(
+        new_row.overlapping_symbol_deltas[0].change_class,
+        "modified_symbol"
+    );
+
+    // Only new signatures carry the join.
+    for row in deltas
+        .ceased_signatures
+        .iter()
+        .chain(&deltas.continuing_signatures)
+    {
+        assert!(row.overlapping_symbol_deltas.is_empty());
+    }
+}
+
+#[test]
+fn log_deltas_per_window_occurrences_from_buckets() {
+    let records = synthetic_log_delta_records();
+    let deltas = log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+    let new_row = &deltas.new_signatures[0];
+    assert_eq!(new_row.occurrence_source, "occurrence_buckets");
+    // The single bucket sits after the base endpoint (T1) but at/before head (T3).
+    assert_eq!(new_row.base_window_occurrences, Some(0));
+    assert_eq!(new_row.head_window_occurrences, Some(5));
+
+    // A signature with no linked buckets falls back to the aggregate count.
+    let ceased = &deltas.ceased_signatures[0];
+    assert_eq!(ceased.occurrence_source, "aggregate_only");
+    assert_eq!(ceased.base_window_occurrences, None);
+    assert_eq!(ceased.head_window_occurrences, None);
+    assert_eq!(ceased.occurrence_count, 3);
+}
+
+#[test]
+fn log_deltas_is_byte_stable_across_runs() {
+    let records = synthetic_log_delta_records();
+    let baseline = serde_json::to_string(
+        &log_deltas(&records, "c1", "c3", None).expect("range should resolve"),
+    )
+    .expect("serialize");
+    for _ in 0..4 {
+        let again: LogDeltas =
+            log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+        assert_eq!(baseline, serde_json::to_string(&again).expect("serialize"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Seeded end-to-end CLI test (AC1, AC8, AC9): scan-history + augmented graph.
+// ---------------------------------------------------------------------------
+
+/// Seeds a three-commit git repo where `tweaked` is modified between the first
+/// and second commit, returning the three full SHAs.
+fn seed_repo(repo: &Path) -> [String; 3] {
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git(repo, ["config", "user.name", "Codegraph Test"]);
+    git(repo, ["config", "core.autocrlf", "false"]);
+    git(repo, ["config", "commit.gpgsign", "false"]);
+
+    write(
+        repo,
+        "src/lib.rs",
+        "pub fn keep() -> u32 { 1 }\npub fn tweaked() -> u32 { 4 }\n",
+    );
+    let first = commit_fixture(repo, "seed", T1);
+
+    write(
+        repo,
+        "src/lib.rs",
+        "pub fn keep() -> u32 { 1 }\npub fn tweaked() -> u32 { 44 }\n",
+    );
+    let second = commit_fixture(repo, "modify tweaked", T2);
+
+    write(repo, "src/notes.txt", "third commit marker\n");
+    let third = commit_fixture(repo, "third", T3);
+
+    [first, second, third]
+}
+
+/// Scans the repo, appends the synthetic log records, and writes a combined
+/// JSONL graph. Returns the graph path and the `tweaked` symbol record ID.
+fn build_augmented_graph(repo: &Path, graph_path: &Path) -> String {
+    let jsonl = scan_repository_history(repo)
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let mut records: Vec<GraphRecord> = jsonl
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record should parse"))
+        .collect();
+
+    // The modified symbol's stable record ID, as reported by range_deltas.
+    let tweaked_id = records
+        .iter()
+        .find_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::Symbol,
+                name: Some(name),
+                ..
+            } if name == "tweaked" => Some(id.clone()),
+            _ => None,
+        })
+        .expect("tweaked symbol should be scanned");
+
+    let new_sig = log_sig_id("new-boom");
+    let (bucket_node, bucket_edge) = bucket_with_edge(&new_sig, NEW_BUCKET, 5);
+    records.push(error_signature("new-boom", "error", NEW_FIRST, NEW_LAST, 5));
+    records.push(error_signature(
+        "ceased-warn",
+        "warn",
+        CEASED_FIRST,
+        CEASED_LAST,
+        3,
+    ));
+    records.push(error_signature(
+        "cont-error",
+        "error",
+        CONT_FIRST,
+        CONT_LAST,
+        9,
+    ));
+    records.push(error_signature(
+        "future-fatal",
+        "fatal",
+        FUTURE_FIRST,
+        FUTURE_LAST,
+        1,
+    ));
+    records.push(bucket_node);
+    records.push(bucket_edge);
+    records.push(frame_edge(
+        &new_sig,
+        &tweaked_id,
+        0,
+        FrameResolution::Resolved,
+    ));
+
+    let mut out = String::new();
+    for r in &records {
+        out.push_str(&serde_json::to_string(r).expect("record should serialize"));
+        out.push('\n');
+    }
+    fs::write(graph_path, out).expect("graph should write");
+    tweaked_id
+}
+
+#[test]
+fn query_log_deltas_cli_is_deterministic_and_redaction_safe() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let [first, _second, third] = seed_repo(&repo);
+    let graph_path = temp.path().join("combined.graph.jsonl");
+
+    let status_before = git_output(&repo, ["status", "--porcelain"]);
+    assert!(status_before.is_empty(), "fixture tree must start clean");
+
+    let tweaked_id = build_augmented_graph(&repo, &graph_path);
+
+    let base_prefix = &first[..12];
+    let mut outputs = Vec::new();
+    for _ in 0..5 {
+        let assert = CargoCommand::cargo_bin("egregore")
+            .expect("binary should run")
+            .args(["query", "log-deltas", base_prefix, &third])
+            .arg("--graph")
+            .arg(&graph_path)
+            .assert()
+            .success();
+        outputs.push(String::from_utf8(assert.get_output().stdout.clone()).unwrap());
+    }
+    for output in &outputs[1..] {
+        assert_eq!(&outputs[0], output, "CLI output must be byte-identical");
+    }
+
+    let body: serde_json::Value = serde_json::from_str(&outputs[0]).expect("stdout should be JSON");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["base"], first);
+    assert_eq!(body["head"], third);
+    assert_eq!(body["window"]["window_start"], T2);
+    assert_eq!(body["window"]["window_end"], T3);
+    for group in [
+        "new_signatures",
+        "ceased_signatures",
+        "continuing_signatures",
+    ] {
+        assert!(
+            body[group].is_array(),
+            "group {group} must always be present"
+        );
+    }
+    // The new signature joins onto the modified `tweaked` symbol.
+    let new_rows = body["new_signatures"].as_array().unwrap();
+    assert_eq!(new_rows.len(), 1);
+    let overlaps = new_rows[0]["overlapping_symbol_deltas"].as_array().unwrap();
+    assert_eq!(overlaps.len(), 1);
+    assert_eq!(overlaps[0]["record_id"], tweaked_id);
+    assert_eq!(overlaps[0]["change_class"], "modified_symbol");
+    assert_eq!(body["ceased_signatures"].as_array().unwrap().len(), 1);
+    assert_eq!(body["continuing_signatures"].as_array().unwrap().len(), 1);
+
+    assert!(
+        body["disclaimer"]
+            .as_str()
+            .unwrap()
+            .contains("regression LEAD"),
+        "disclaimer must label rows as leads"
+    );
+    // No raw log payload text leaks; only bounded excerpts / handles.
+    assert!(
+        !outputs[0].contains("Source:"),
+        "raw snapshot bodies must never leak"
+    );
+
+    let status_after = git_output(&repo, ["status", "--porcelain"]);
+    assert!(
+        status_after.is_empty(),
+        "CLI query must not mutate the tree"
+    );
+}
+
+#[test]
+fn query_log_deltas_cli_exit_codes_for_diagnostics() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let [first, _second, third] = seed_repo(&repo);
+    let graph_path = temp.path().join("combined.graph.jsonl");
+    build_augmented_graph(&repo, &graph_path);
+
+    // Identical endpoints: exit 1, machine-readable diagnostic.
+    let assert = CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(["query", "log-deltas", &first, &first])
+        .arg("--graph")
+        .arg(&graph_path)
+        .assert()
+        .code(1);
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&out).expect("stdout should be JSON");
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["error"]["error_type"], "identical_endpoints");
+
+    // Unknown commit: exit 2.
+    let assert = CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(["query", "log-deltas", "ffffffffffff", &third])
+        .arg("--graph")
+        .arg(&graph_path)
+        .assert()
+        .code(2);
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&out).expect("stdout should be JSON");
+    assert_eq!(body["error"]["error_type"], "missing_commit");
+
+    // Reversed range: exit 1.
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(["query", "log-deltas", &third, &first])
+        .arg("--graph")
+        .arg(&graph_path)
+        .assert()
+        .code(1);
+}
+
+// ---------------------------------------------------------------------------
+// Git fixture helpers (mirrors tests/integration/range_deltas.rs).
+// ---------------------------------------------------------------------------
+
+fn write(repo: &Path, relative: &str, contents: &str) {
+    let path = repo.join(relative);
+    fs::create_dir_all(path.parent().expect("relative path should have parent"))
+        .expect("fixture directory should be created");
+    fs::write(path, contents).expect("fixture file should be written");
+}
+
+fn commit_fixture(repo: &Path, message: &str, date: &str) -> String {
+    git(repo, ["add", "."]);
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "-m", message])
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .stdin(Stdio::null())
+        .output()
+        .expect("git commit should execute");
+    assert!(
+        status.status.success(),
+        "git commit failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    git_output(repo, ["rev-parse", "HEAD"])
+}
+
+fn git<const N: usize>(repo: &Path, args: [&str; N]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("git should execute");
+    assert!(
+        output.status.success(),
+        "git command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_output<const N: usize>(repo: &Path, args: [&str; N]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("git should execute");
+    assert!(
+        output.status.success(),
+        "git command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output should be utf-8")
+        .trim()
+        .to_owned()
+}
