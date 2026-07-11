@@ -907,6 +907,61 @@ fn validate_detects_error_signature_missing_captured_from() {
 }
 
 #[test]
+fn validate_accepts_error_signature_spanning_multiple_sources() {
+    let (_temp, graph) = fixture_graph();
+    // The clean subgraph gives `log:v1:sig` one CAPTURED_FROM to `log:v1:source`.
+    append_clean_log_subgraph(&graph);
+    // Simulate combined output from scanning a SECOND log file in the same repo
+    // that shares the signature's normalized template/severity: scan-logs emits a
+    // second LogSource and a DISTINCT CAPTURED_FROM from the SAME ErrorSignature
+    // (a signature ID is a repo/fingerprint aggregate that excludes the source),
+    // plus that file's own well-formed exemplar. This must NOT be flagged as a
+    // duplicate — a signature may legitimately capture from multiple sources.
+    append_lines(
+        &graph,
+        &[
+            log_node_line("log:v1:source2", "LogSource", "second log source"),
+            log_node_line("log:v1:event2", "LogEvent", "second-file event"),
+            log_edge_line(
+                "log:v1:e-sig-cap2",
+                "CAPTURED_FROM",
+                "log:v1:sig",
+                "log:v1:source2",
+            ),
+            log_edge_line(
+                "log:v1:e-evt-fp2",
+                "FINGERPRINTED_AS",
+                "log:v1:event2",
+                "log:v1:sig",
+            ),
+            log_edge_line(
+                "log:v1:e-evt-cap2",
+                "CAPTURED_FROM",
+                "log:v1:event2",
+                "log:v1:source2",
+            ),
+        ],
+    );
+    let (code, lines) = run_validate(&graph);
+    assert_eq!(
+        code, 0,
+        "a signature spanning two sources is a valid aggregate, must exit 0"
+    );
+    let (diagnostics, summary) = split_output(&lines);
+    let dupes = diagnostics_with_code(diagnostics, "duplicate_log_structural_edge");
+    assert!(
+        dupes.is_empty(),
+        "multi-source signature must not be a duplicate, got {diagnostics:?}"
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "multi-source log graph must be clean, got {diagnostics:?}"
+    );
+    assert_eq!(summary["ok"], true);
+    assert_eq!(summary["defects"], 0);
+}
+
+#[test]
 fn validate_log_defects_are_canonically_ordered_with_code_defects() {
     let (_temp, graph) = fixture_graph();
     let records = graph_records(&graph);

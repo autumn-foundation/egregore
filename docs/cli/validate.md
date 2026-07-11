@@ -127,22 +127,34 @@ same input is byte-identical.
    path-equality-only behavior, so legacy/partial graphs are never
    mass-flagged.
 7. **Log-domain structural completeness** (issue #327) — every log-domain node
-   with incident edges carries exactly one of each required OUTBOUND structural
-   edge, matching what the issue #319/#320 extractor emits:
+   with incident edges carries its required OUTBOUND structural edges, matching
+   what the issue #319/#320 extractor emits, each with a per-requirement
+   cardinality:
 
    | Log node | Required outbound edges |
    |----------|-------------------------|
-   | `LogEvent` | one `FINGERPRINTED_AS` and one `CAPTURED_FROM` |
-   | `ErrorSignature` | one `CAPTURED_FROM` |
-   | `LogOccurrenceBucket` | one `AGGREGATES` (no bucket `CAPTURED_FROM` — its `LogSource` is reached via the signature) |
+   | `LogEvent` | exactly one `FINGERPRINTED_AS` **and** exactly one `CAPTURED_FROM` |
+   | `ErrorSignature` | **at least one** `CAPTURED_FROM` |
+   | `LogOccurrenceBucket` | exactly one `AGGREGATES` (no bucket `CAPTURED_FROM` — its `LogSource` is reached via the signature) |
 
-   A missing required edge is `missing_log_structural_edge`; a surplus (more
-   than one distinct edge record of a required relation — e.g. a `LogEvent`
-   captured from two `LogSource`s) is `duplicate_log_structural_edge`, listing
-   the offending edge IDs. Counting is by distinct edge record ID, so an
-   identical re-emitted edge record is not a duplicate. Only incident nodes are
-   evaluated — a zero-edge log node stays a single `orphan_node` (check 5) and
-   is never double-reported.
+   A missing required edge (count 0) is `missing_log_structural_edge` for every
+   requirement. A surplus (more than one distinct edge record of a relation)
+   is `duplicate_log_structural_edge` — listing the offending edge IDs — **only
+   for the exactly-one requirements** (`LogEvent`'s `FINGERPRINTED_AS` and
+   `CAPTURED_FROM`, `LogOccurrenceBucket`'s `AGGREGATES`; e.g. a `LogEvent`
+   captured from two `LogSource`s is malformed).
+
+   `ErrorSignature`'s `CAPTURED_FROM` is **at least one**, so
+   `duplicate_log_structural_edge` never fires for a signature's source edge: a
+   signature ID is a repo/fingerprint aggregate that **excludes** the source, and
+   `scan-logs` emits a distinct `CAPTURED_FROM` per `LogSource`, so a graph
+   combining two log files that share a normalized template/severity legitimately
+   gives one `ErrorSignature` multiple `CAPTURED_FROM` edges to different
+   `LogSource`s. That is a valid multi-source aggregate, not a duplicate.
+
+   Counting is by distinct edge record ID, so an identical re-emitted edge record
+   is not a duplicate. Only incident nodes are evaluated — a zero-edge log node
+   stays a single `orphan_node` (check 5) and is never double-reported.
 
    The bucket's `LogSource` is reached via the signature, but that transitive
    attribution is not merely assumed: the signature's own `CAPTURED_FROM` is
