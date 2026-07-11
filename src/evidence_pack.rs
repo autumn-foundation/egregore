@@ -3327,42 +3327,90 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
             // the window (Codex Finding A): a pre-window approval that gated an
             // in-window merge. Such a node cannot be re-stamped without falsifying
             // its genuine review time, so its window relevance is carried by its
-            // coverage edge — which IS stamped with the in-window `merged_at` and
-            // is itself window-checked below. This exemption is TIGHTLY BOUNDED to
-            // the exact shape the Integrity membership check already admits (an
-            // approving review sourcing an included coverage edge), and the upper
-            // bound (`< to`) is still enforced, so the window check stays strict:
-            // no arbitrary out-of-window row is admitted, and Integrity separately
-            // proves each such review's valid time is at or before its target's
-            // in-window `merged_at`.
-            let coverage_edge_sources: BTreeSet<&str> =
-                if section.class == EvidenceClass::ReviewCoverage.as_wire() {
-                    section
-                        .records
-                        .iter()
-                        .filter_map(|br| match &br.record {
-                            GraphRecord::Edge { label, source, .. }
-                                if label.as_str() == "REFERENCES_TASK" =>
-                            {
-                                Some(source.as_str())
-                            }
-                            _ => None,
-                        })
-                        .collect()
-                } else {
-                    BTreeSet::new()
-                };
+            // coverage edge.
+            //
+            // Codex round-20 P2 (SOUNDNESS HOLE): the lower-bound exemption must
+            // require a SELF-CONTAINED merge proof derived from the coverage
+            // edge's OWN stamped timestamps, NOT merely that the review sources
+            // some included edge and NOT conditional on the target PR Task being
+            // present. A merged PR whose Task `valid_time` is out of window is
+            // legitimately windowed out of every section, so the Integrity
+            // target-present merge proof (`if let Some(target_rec)`) cannot run;
+            // relying on it left the exemption admitting any pre-window review
+            // that cited an absent/rewritten target. A review NODE therefore earns
+            // the lower-bound exemption ONLY when it sources an INCLUDED coverage
+            // `REFERENCES_TASK` edge whose stamped fields themselves prove the
+            // gate: the edge's `valid_time` (the PR `merged_at`) is in-window
+            // (`from <= merged_at < to`) AND the edge's `author_time` (the review
+            // time) is at or before that `merged_at`. An edge whose merged_at is
+            // out-of-window or whose review time post-dates the merge proves
+            // nothing and grants no exemption. The upper bound (`< to`) is still
+            // enforced on every row, and the review node's own valid time must be
+            // at or before a proven merged_at, so no arbitrary out-of-window row
+            // is admitted.
+            let coverage_proven_merge_anchors: BTreeMap<
+                &str,
+                Vec<chrono::DateTime<chrono::FixedOffset>>,
+            > = if section.class == EvidenceClass::ReviewCoverage.as_wire() {
+                let mut anchors: BTreeMap<&str, Vec<chrono::DateTime<chrono::FixedOffset>>> =
+                    BTreeMap::new();
+                for br in &section.records {
+                    let GraphRecord::Edge {
+                        label,
+                        source,
+                        temporal,
+                        ..
+                    } = &br.record
+                    else {
+                        continue;
+                    };
+                    if label.as_str() != "REFERENCES_TASK" {
+                        continue;
+                    }
+                    // Derive the proof ENTIRELY from the edge's stamped fields.
+                    let Some(t) = temporal else { continue };
+                    let Some(merged_at) = parse_rfc3339(&t.valid_time) else {
+                        continue;
+                    };
+                    // (2) the merged_at anchor is itself in-window.
+                    if !(from <= merged_at && merged_at < to) {
+                        continue;
+                    }
+                    // (3) the cited review time (edge author_time) is at or
+                    //     before the merge — a post-merge approval, or a missing
+                    //     review time, proves no gate and is skipped.
+                    let Some(review_at) = t.author_time.as_deref().and_then(parse_rfc3339) else {
+                        continue;
+                    };
+                    if review_at > merged_at {
+                        continue;
+                    }
+                    anchors.entry(source.as_str()).or_default().push(merged_at);
+                }
+                anchors
+            } else {
+                BTreeMap::new()
+            };
             for br in &section.records {
                 // A co-located coverage source-review node is exempt from the lower
                 // window bound (its approval may legitimately predate `from`) but
-                // never the upper bound.
-                let is_coverage_source_review = section.class
+                // never the upper bound — and only when a proven-in-window coverage
+                // edge it sources establishes the merge it gated, with the review
+                // node's own valid time at or before that proven merged_at.
+                let coverage_source_merge_anchors = if section.class
                     == EvidenceClass::ReviewCoverage.as_wire()
                     && is_approving_review(&br.record)
-                    && coverage_edge_sources.contains(br.record.id());
+                {
+                    coverage_proven_merge_anchors.get(br.record.id())
+                } else {
+                    None
+                };
                 match resolve_valid_time(&br.record).and_then(|vt| parse_rfc3339(&vt)) {
                     Some(t) if from <= t && t < to => {}
-                    Some(t) if is_coverage_source_review && t < to => {}
+                    Some(t)
+                        if t < to
+                            && coverage_source_merge_anchors
+                                .is_some_and(|anchors| anchors.iter().any(|&m| t <= m)) => {}
                     _ => {
                         window_ok = false;
                         window_detail = format!(
@@ -5013,6 +5061,154 @@ mod pack338_tests {
                 "the pre-window review valid time is preserved as a cited field"
             );
         }
+    }
+
+    /// Round-20 legit case: a PR merged IN-WINDOW whose approving review predates
+    /// the window is covered even when the PR Task itself is WINDOWED OUT of the
+    /// pack (its `valid_time` falls outside the window, so it rides no section).
+    /// The coverage edge carries the in-window `merged_at` anchor and the
+    /// pre-window review time, so Window-consistency must PASS purely from the
+    /// edge's stamped fields — the target Task record is legitimately absent and
+    /// the exemption proof must not depend on it.
+    #[test]
+    fn pre_window_approval_windowed_out_target_passes_verify() {
+        use super::fixture::{pr_with_merge_time, references_task, review};
+        // PR's Task valid_time (Feb 10) is OUT of the March window, so it is
+        // windowed out of every section; its merge (March 15) is IN-window and its
+        // sole approving review (Feb 20) precedes the merge.
+        let records = vec![
+            pr_with_merge_time(
+                "project:v1:prX",
+                "2026-02-10T00:00:00Z",
+                "2026-03-15T12:00:00Z",
+                "cX",
+            ),
+            review("project:v1:rvX", "2026-02-20T08:00:00Z", "approved"),
+            references_task("project:v1:rvX", "project:v1:prX"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+
+        // The PR is covered even though its Task is windowed out of every section.
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .expect("review_coverage section");
+        assert_eq!(
+            rc.measurement
+                .as_ref()
+                .expect("measurement")
+                .approved_pr_count,
+            1
+        );
+        assert!(
+            !pack.sections.iter().any(|s| s
+                .records
+                .iter()
+                .any(|br| br.record.id() == "project:v1:prX")),
+            "the merged PR Task is windowed out (absent from every section)"
+        );
+
+        let report = verify_pack(&pack);
+        assert!(
+            report.window_consistency.passed,
+            "windowed-out-target pre-window-approval pack must pass Window-consistency \
+             from the edge's own stamped fields: {:?}",
+            report.window_consistency
+        );
+        assert!(
+            report.ok,
+            "windowed-out-target pack must verify clean: {report:?}"
+        );
+    }
+
+    /// Codex round-20 P2 (SOUNDNESS HOLE): the lower-bound Window-consistency
+    /// exemption for a pre-window approving-review NODE must require a
+    /// SELF-CONTAINED merge proof from its coverage edge's OWN stamped timestamps
+    /// — the edge's `valid_time` (the PR `merged_at`) in-window AND the edge's
+    /// `author_time` (the review time) at or before that `merged_at`. Here the
+    /// coverage edge's `author_time` is forged to POST-DATE the merge while the
+    /// target PR Task is windowed out (absent), so the integrity target-present
+    /// merge proof never runs. Before the fix the review NODE is exempted merely
+    /// because it sources an included edge and the pack verifies clean (the hole);
+    /// after the fix the unproven edge grants no exemption and the pre-window
+    /// review fails Window-consistency.
+    #[test]
+    fn tampered_post_merge_review_time_on_windowed_out_target_fails_verify() {
+        use super::fixture::{pr_with_merge_time, references_task, review};
+        let records = vec![
+            pr_with_merge_time(
+                "project:v1:prX",
+                "2026-02-10T00:00:00Z",
+                "2026-03-15T12:00:00Z",
+                "cX",
+            ),
+            review("project:v1:rvX", "2026-02-20T08:00:00Z", "approved"),
+            references_task("project:v1:rvX", "project:v1:prX"),
+        ];
+        let mut pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+
+        // Forge the coverage edge's `author_time` (the cited review time) to
+        // 2026-03-25 — AFTER the PR's 2026-03-15 `merged_at`. The edge's
+        // `valid_time` (merged_at) stays in-window so the edge row still clears its
+        // own window check; only the self-contained "review gated the merge" proof
+        // is now violated. Recompute the row hash so Integrity is untouched.
+        let mut touched = false;
+        for section in &mut pack.sections {
+            if section.class != "review_coverage" {
+                continue;
+            }
+            for br in &mut section.records {
+                if let GraphRecord::Edge {
+                    label, temporal, ..
+                } = &mut br.record
+                    && label.as_str() == "REFERENCES_TASK"
+                {
+                    let t = temporal.as_mut().expect("stamped coverage edge");
+                    t.author_time = Some("2026-03-25T08:00:00Z".to_owned());
+                    br.hash = blake3::hash(serde_json::to_string(&br.record).unwrap().as_bytes())
+                        .to_string();
+                    touched = true;
+                }
+            }
+            section
+                .records
+                .sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
+        }
+        assert!(touched, "coverage edge present to tamper");
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.window_consistency.passed,
+            "a pre-window review whose coverage edge does not prove it gated the \
+             in-window merge (author_time post-dates merged_at) must fail \
+             Window-consistency: {:?}",
+            report.window_consistency
+        );
+        assert!(
+            report.window_consistency.detail.contains("project:v1:rvX"),
+            "detail names the unproven review node: {}",
+            report.window_consistency.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
     }
 
     /// Codex Finding B(i): a PR merged in-window whose sole approving review was
