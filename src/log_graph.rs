@@ -123,6 +123,21 @@ pub struct LogScan {
     pub source_format_version: &'static str,
     /// Exemplar-cap diagnostics, in canonical order.
     pub diagnostics: Vec<ExemplarCapDiagnostic>,
+    /// The exact CRLF/CR→LF-normalized, UTF-8-validated source text the scan
+    /// read and hashed into `LogSource.source_artifact_hash` (issue #321, Codex
+    /// finding B). Protected capture redacts THIS buffer via
+    /// [`redacted_source_bytes`] rather than issuing a second filesystem read, so
+    /// the captured blob corresponds byte-for-byte (post-redaction) to the bytes
+    /// the graph records describe — closing the append/rotate window between the
+    /// scan read and a later capture read.
+    ///
+    /// `Some` only when the caller passes `retain_normalized_source = true` to
+    /// [`scan_log_records`] (i.e. protected capture is actually requested);
+    /// `None` on the default path (issue #321, Codex P2). The scan still hashes
+    /// the normalized buffer transiently for `source_artifact_hash` regardless,
+    /// but never RETAINS a full-log clone past the scan when capture is off — a
+    /// large-log allocation the default path never needs.
+    pub normalized_source: Option<String>,
 }
 
 /// Builds the `log_importer` producer envelope (issues #319 / #320).
@@ -230,6 +245,14 @@ struct Occurrence {
 /// to; `transaction_time` (RFC 3339) is the capture instant threaded through the
 /// deterministic override path (no wall clock enters IDs or canonical output).
 ///
+/// `retain_normalized_source` controls whether the normalized source buffer is
+/// RETAINED on the returned [`LogScan`] (as `normalized_source: Some(_)`). Pass
+/// `true` only when protected capture (issue #321) will redact that same
+/// single-read buffer via [`redacted_source_bytes`]; pass `false` on the default
+/// path so a large-log full-buffer clone is never kept alive past the scan (issue
+/// #321, Codex P2). `source_artifact_hash` is computed from the normalized buffer
+/// either way — only RETENTION is conditional, never the read or the hash.
+///
 /// # Errors
 ///
 /// Returns [`LogScanError::Read`] when the file cannot be read and
@@ -241,6 +264,7 @@ pub fn scan_log_records(
     repo_root: &Path,
     repository_id: &str,
     transaction_time: &str,
+    retain_normalized_source: bool,
 ) -> Result<LogScan, LogScanError> {
     let raw = std::fs::read(log_path).map_err(|source| LogScanError::Read {
         path: log_path.to_path_buf(),
@@ -523,7 +547,92 @@ pub fn scan_log_records(
         records,
         source_format_version,
         diagnostics,
+        // Hand back the exact normalized buffer this scan hashed so protected
+        // capture (issue #321) redacts these same bytes instead of re-reading the
+        // log file, which could observe appended/rotated bytes. Retained ONLY when
+        // capture is requested; on the default path the buffer is dropped rather
+        // than cloned, so a large log is never allocated twice (Codex P2).
+        normalized_source: retain_normalized_source.then(|| text.to_owned()),
     })
+}
+
+/// Produces the POST-REDACTION whole-file bytes of a log for protected capture
+/// (issue #321).
+///
+/// Takes the ALREADY-normalized, UTF-8-validated source text the scan produced
+/// (`LogScan::normalized_source`) — NOT a path — and applies the v1 redaction
+/// policy so a secret-bearing line is returned collapsed to its `<REDACTED:…>`
+/// marker and the raw secret never reaches the protected blob. Operating on the
+/// scan's own buffer means the redacted blob corresponds byte-for-byte
+/// (post-redaction) to the exact bytes the graph records describe: there is no
+/// second filesystem read that could observe a log being appended to or rotated
+/// between the scan and the capture (issue #321, Codex finding B). The caller
+/// normalizes and validates once, in [`scan_log_records`]; this helper never
+/// touches the filesystem and is therefore infallible.
+///
+/// Secret detection and redaction delegate to the shared iterative full-text
+/// redactor [`redaction::redact_code_text`] — the same routine that scrubs
+/// code-graph node text. It repeatedly calls [`redaction::detect_secret_span`]
+/// over the WHOLE remaining text, replaces the single detected span with one
+/// `<REDACTED:…>` marker, and RE-SCANS from scratch until no secret bytes remain.
+/// This re-scan-after-replace loop is what makes overlapping and nested secrets
+/// of different classes safe: when a lower-priority env secret's value CONTAINS a
+/// higher-priority API token plus a trailing suffix (e.g.
+/// `PASSWORD=abcdefgh-sk-…!tail`), the token is redacted first, then the NEXT
+/// scan re-detects the remaining env-value bytes over the full text and collapses
+/// the prefix AND the suffix together — no byte of the value survives. An earlier
+/// hand-rolled byte-span walk (issue #321) recovered the earliest span start by
+/// probing only the strict PREFIX before a higher-priority match, which truncated
+/// such an overlapping lower-priority span and copied its suffix into the blob
+/// (Codex P1 "redact full env spans that overlap higher-priority tokens").
+/// Because each detected span is replaced whole, a multi-line secret block —
+/// internal blank lines, PEM headers, base64 body, and the `END` line and all —
+/// still collapses to a single marker regardless of its internal structure, and a
+/// blank separator line INSIDE a span (e.g. an RFC-1421 encrypted PEM block) can
+/// never break the span into a redacted head and an unredacted tail.
+///
+/// This materializes redacted bytes ONLY when protected capture is requested;
+/// ordinary graph extraction ([`scan_log_records`]) never calls it and is
+/// unchanged. Raw, unredacted bytes never leave this function. Output is
+/// deterministic and byte-stable.
+#[must_use]
+pub fn redacted_source_bytes(text: &str) -> Vec<u8> {
+    let (redacted, _counts) = redaction::redact_code_text(text.to_owned(), "<REDACTED:secret>");
+    // Belt-and-suspenders safety net over the structure-preserving pass above. That
+    // pass redacts each detected SPAN in place and can still miss an env-value edge
+    // shape whose delimiter/quote boundary truncates the span (e.g. an unbalanced
+    // quote around a whitespace-bearing secret, where the quote-aware boundary falls
+    // back to a delimiter so a stray quote can't swallow the line). For the "never
+    // persist unredacted bytes" contract this whole-value backstop caps that entire
+    // leak class: for each LINE, run the AUTHORITATIVE whole-value redactor
+    // `redact_value` (which detects over the whole line and collapses it to one
+    // marker). If it DIFFERS from the line, the authoritative gate still found a
+    // secret the primary pass left partially unredacted, so REPLACE the whole line
+    // with the collapsed marker; otherwise keep the line verbatim. An unquoted
+    // already-redacted value (`API_KEY=<REDACTED:secret>`) begins with the placeholder
+    // and is skipped by `find_env_secret`, so `redact_value` returns it unchanged and
+    // the net does NOT fire on it — the net only fires on lines that would otherwise
+    // LEAK, at the acceptable cost of occasionally over-redacting one line. The net is
+    // per-line, so a multi-line secret block the primary pass already collapsed to a
+    // single marker is untouched (`redact_value` on each resulting line is a no-op).
+    // Newlines are preserved exactly; output stays deterministic and byte-stable.
+    let mut out = String::with_capacity(redacted.len());
+    for segment in redacted.split_inclusive('\n') {
+        let (line, newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, ""), |line| (line, "\n"));
+        out.push_str(&redaction::redact_value(line));
+        out.push_str(newline);
+    }
+    out.into_bytes()
+}
+
+/// Computes the repository-relative path of a log file under the repo root,
+/// exposed for protected capture so the blob handle uses the same repo-relative
+/// path the `LogSource` node records (issue #321).
+#[must_use]
+pub fn source_relative_path(repo_root: &Path, log_path: &Path) -> String {
+    repo_relative_path(repo_root, log_path)
 }
 
 /// Builds a log-domain edge record (`log:v1:` ID, schema version 1).

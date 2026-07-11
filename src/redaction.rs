@@ -200,6 +200,25 @@ pub fn redact_value(value: &str) -> String {
     format!("<REDACTED:{}:{}>", class.as_str(), prefix)
 }
 
+/// Builds the `<REDACTED:class:hash_prefix>` marker for an already-located secret
+/// span whose [`SecretClass`] the caller obtained from [`detect_secret_span`].
+///
+/// [`redact_value`] re-detects the class from the value it is given, which is
+/// wrong for a caller that has isolated the exact detected span: some classes are
+/// only recognizable with surrounding context the span omits (an [`SecretClass::EnvSecret`]
+/// span covers only the value bytes, not the `KEY=` that identifies it, so
+/// re-detection over the bare value returns `None` and the secret would pass
+/// through unredacted). This helper collapses the exact secret slice to one
+/// marker using the class the span detector already reported, with the same
+/// BLAKE3 hash-prefix scheme [`redact_value`] emits. Byte-identical across runs.
+#[must_use]
+pub fn redact_span(class: SecretClass, secret_slice: &str) -> String {
+    let hash = blake3::hash(secret_slice.as_bytes());
+    let hex = hash.to_hex();
+    let prefix = &hex.as_str()[..HASH_PREFIX_LEN];
+    format!("<REDACTED:{}:{}>", class.as_str(), prefix)
+}
+
 // ── Validation ─────────────────────────────────────────────────────────────────
 
 /// Validates a graph record for unredacted sensitive fields.
@@ -1079,6 +1098,24 @@ fn find_email_span(value: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// Returns true when `token` is EXACTLY one redaction placeholder and nothing
+/// else — either the `«redacted:secret»` [`REDACTION_MARKER`] or a well-formed
+/// `<REDACTED:…>` marker (matching `^<REDACTED:[^>]*>$`) with no bytes after the
+/// closing `>`. The env-secret span matcher uses this to skip a value that is
+/// ALREADY fully redacted, while still redacting a value that merely BEGINS with a
+/// placeholder and hides a secret tail after it (e.g. `<REDACTED:secret>!tail`,
+/// produced when `redact_code_text` redacts a leading higher-priority API token
+/// first). A prefix-only `starts_with("<REDACTED:")` guard leaked that tail
+/// (Codex round-9 P1).
+fn is_exact_placeholder(token: &str) -> bool {
+    if token == REDACTION_MARKER {
+        return true;
+    }
+    token
+        .strip_prefix("<REDACTED:")
+        .is_some_and(|rest| rest.ends_with('>') && !rest[..rest.len() - 1].contains('>'))
+}
+
 fn find_env_secret_span(value: &str) -> Option<(usize, usize)> {
     const KEYWORDS: &[&str] = &[
         "TOKEN",
@@ -1095,6 +1132,9 @@ fn find_env_secret_span(value: &str) -> Option<(usize, usize)> {
         "DB_URL",
         "WEBHOOK_SECRET",
     ];
+    // Delimiters that terminate an UNQUOTED env value (and the fallback boundary for
+    // an unbalanced quote).
+    const DELIMS: [char; 5] = ['\n', '\r', ';', ' ', '\t'];
     for (eq_pos, _) in value.char_indices().filter(|(_, c)| *c == '=') {
         let key_start = env_key_start(value, eq_pos);
         let key = &value[key_start..eq_pos];
@@ -1113,15 +1153,59 @@ fn find_env_secret_span(value: &str) -> Option<(usize, usize)> {
             continue;
         }
         let remaining = &value[val_start..];
-        if remaining.starts_with("<REDACTED:") || remaining.starts_with("«redacted:secret»") {
+        // Determine where the value token ends. For a QUOTED value the whole quoted
+        // run — internal whitespace and other delimiters included — is the value, so
+        // the boundary is the matching CLOSING quote, not the first delimiter. A
+        // delimiter-only boundary truncated `PASSWORD="correct horse battery staple"`
+        // at the first space, redacting only `correct`; the next pass then read the
+        // `"<REDACTED:secret>` head as an already-redacted exact placeholder and left
+        // `horse battery staple"` in the #321 protected-capture blob (Codex round-10
+        // P1). If the opening quote has no matching close on the line, fall back to
+        // the delimiter boundary so a stray/unbalanced quote can't swallow the rest
+        // of the line. For an UNQUOTED value the delimiter set (newline, CR, `;`,
+        // space, tab) terminates the token exactly as before — unquoted handling is
+        // unchanged, so a space still ends `PASSWORD=secretvalue nextword`.
+        let delim_boundary = || remaining.find(DELIMS).unwrap_or(remaining.len());
+        let opening_quote = remaining.chars().next().filter(|&c| c == '"' || c == '\'');
+        let val_len = opening_quote.map_or_else(delim_boundary, |quote| {
+            remaining[quote.len_utf8()..]
+                .find(quote)
+                .map_or_else(delim_boundary, |rel_close| {
+                    quote.len_utf8() + rel_close + quote.len_utf8()
+                })
+        });
+        if val_len < 8 {
             continue;
         }
-        let val_len = remaining
-            .find(['\n', '\r', ';', ' ', '\t', '"', '\''])
-            .unwrap_or(remaining.len());
-        if val_len >= 8 {
-            return Some((val_start, val_len));
+        // Strip a wrapping quote pair so the returned span covers the secret VALUE
+        // bytes and leaves the structural quotes in place — the quote-as-delimiter
+        // convention already used by the database-url and session-cookie span
+        // matchers. The unquoted path is unchanged (span == the whole value token).
+        let token = &remaining[..val_len];
+        let (span_start, span_len) = opening_quote.map_or((val_start, val_len), |quote| {
+            // Drop the leading quote; drop the trailing quote too only when the
+            // token is actually closed within this value token.
+            let closed = token.len() >= 2 && token.ends_with(quote);
+            (val_start + 1, val_len - 1 - usize::from(closed))
+        });
+        if span_len == 0 {
+            continue;
         }
+        // Skip (treat as already-redacted) ONLY when the ENTIRE value token — after
+        // stripping any wrapping quote pair — is EXACTLY one placeholder. A value
+        // that merely BEGINS with a placeholder but carries secret bytes AFTER the
+        // closing `>` (e.g. `PASSWORD=<REDACTED:secret>!tail`, produced when
+        // `redact_code_text` redacts a leading higher-priority API token first) is
+        // NOT already redacted: return a span covering the whole value so the
+        // re-scan loop collapses token + tail into one placeholder. A prefix-only
+        // guard (`remaining.starts_with("<REDACTED:")`) leaked that tail into the
+        // #321 protected-capture blob (Codex round-9 P1). Returning the whole value
+        // still terminates: each such pass either replaces real secret bytes or,
+        // once the value is exactly a placeholder, hits this skip.
+        if is_exact_placeholder(&value[span_start..span_start + span_len]) {
+            continue;
+        }
+        return Some((span_start, span_len));
     }
     None
 }
@@ -1163,9 +1247,34 @@ pub fn redact_code_text(
     placeholder: &str,
 ) -> (String, std::collections::HashMap<SecretClass, usize>) {
     let mut counts = std::collections::HashMap::new();
-    while let Some((class, start, len)) = detect_secret_span(&value) {
-        value.replace_range(start..start + len, placeholder);
+    // Byte cursor into `value`. Advances only PAST an already-inserted placeholder
+    // that was re-detected as a no-op match; a real replacement leaves it in place
+    // so overlapping/lower-priority secrets that just became contiguous are caught.
+    let mut scan_from = 0;
+    while let Some((class, rel_start, len)) = detect_secret_span(&value[scan_from..]) {
+        let start = scan_from + rel_start;
+        let end = start + len;
+        // Forward-progress guard: some span matchers (e.g. `find_env_secret_span`)
+        // strip wrapping quotes and re-detect the placeholder they just wrote as
+        // the env value on a later iteration — e.g. `KEY="<REDACTED:secret>"`.
+        // Replacing that slice with the identical placeholder is a no-op, so
+        // re-scanning from the same cursor would spin forever. When the matched
+        // slice is already exactly the placeholder, SKIP past it and keep scanning
+        // the rest of the text — do NOT `break`, or a second, independent secret
+        // after an already-redacted quoted placeholder (e.g.
+        // `API_KEY="a" PASSWORD=b`) would never be scanned and would survive into
+        // the protected log payload and every other `redact_code_text` caller.
+        if &value[start..end] == placeholder {
+            scan_from = end;
+            continue;
+        }
+        value.replace_range(start..end, placeholder);
         *counts.entry(class).or_insert(0) += 1;
+        // Do NOT advance `scan_from` here: re-detect from the same cursor so an
+        // overlapping lower-priority secret that just became contiguous (its span
+        // now containing this placeholder) is caught and fully redacted. The next
+        // iteration re-detects the placeholder as a no-op and advances the cursor,
+        // so the loop still makes forward progress and always terminates.
     }
     (value, counts)
 }
@@ -1338,4 +1447,248 @@ pub fn redact_code_graph(records: &mut Vec<GraphRecord>, raw_literals: bool, rep
 
     diags.sort_by(|a, b| a.id().cmp(b.id()));
     records.extend(diags);
+}
+
+#[cfg(test)]
+mod redact_code_text_termination_tests {
+    use super::{SecretClass, redact_code_text};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    const SECRET: &str = "hunterSECRETtokenValueLong";
+
+    /// Runs `redact_code_text` on a background thread with a hard deadline so a
+    /// termination regression FAILS the test instead of hanging the suite. Before
+    /// the forward-progress guard, a quoted env secret spun forever here: the env
+    /// span matcher strips the wrapping quotes, re-detects the `<REDACTED:secret>`
+    /// placeholder it just wrote as the value, and re-replaces it with the
+    /// identical placeholder, so `value` never changes.
+    fn redact_with_deadline(
+        input: &str,
+    ) -> (String, std::collections::HashMap<SecretClass, usize>) {
+        let owned = input.to_owned();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let out = redact_code_text(owned, "<REDACTED:secret>");
+            let _ = tx.send(out);
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("redact_code_text must terminate (no infinite loop) on a quoted env secret");
+        handle.join().expect("worker thread joins");
+        got
+    }
+
+    #[test]
+    fn terminates_and_redacts_double_quoted_env_secret() {
+        let input = format!("API_KEY=\"{SECRET}\" trailing");
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains(SECRET),
+            "double-quoted env secret must be fully redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("<REDACTED:"),
+            "a redaction marker must be present: {redacted}"
+        );
+    }
+
+    #[test]
+    fn terminates_and_redacts_single_quoted_env_secret() {
+        let input = format!("API_KEY='{SECRET}' trailing");
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains(SECRET),
+            "single-quoted env secret must be fully redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("<REDACTED:"),
+            "a redaction marker must be present: {redacted}"
+        );
+    }
+
+    #[test]
+    fn continues_redacting_after_quoted_placeholder() {
+        // Two INDEPENDENT env secrets, the first quoted. After the first is
+        // redacted the loop re-detects the `<REDACTED:secret>` placeholder it just
+        // wrote as the (quote-stripped) env value. The old forward-progress guard
+        // `break`-ed out of the whole loop there, so the SECOND, unquoted secret
+        // after it was never scanned and survived into the protected log payload
+        // (Codex round-8 P1). The cursor fix must skip PAST the placeholder and
+        // keep scanning, redacting the second secret too.
+        let input = "API_KEY=\"firstSecretValue\" PASSWORD=secondSecretValue".to_owned();
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains("firstSecretValue"),
+            "the first (quoted) env secret must be redacted: {redacted}"
+        );
+        assert!(
+            !redacted.contains("secondSecretValue"),
+            "the second env secret after the quoted placeholder must ALSO be redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("<REDACTED:"),
+            "a redaction marker must be present: {redacted}"
+        );
+    }
+
+    #[test]
+    fn terminates_and_fully_redacts_overlapping_env_value_with_suffix() {
+        // Unquoted env value whose bytes CONTAIN a higher-priority API token plus a
+        // trailing suffix. The re-scan-from-0 loop must collapse the whole value
+        // (prefix + token + suffix) and still terminate.
+        let input = "PASSWORD=abcdefgh-sk-abcdefghijklmnopqrst!tail rest".to_owned();
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains("!tail"),
+            "the trailing suffix of the overlapping env value must not survive: {redacted}"
+        );
+        assert!(
+            redacted.contains("<REDACTED:"),
+            "a redaction marker must be present: {redacted}"
+        );
+        assert!(
+            redacted.contains("rest"),
+            "text after the env value token is preserved: {redacted}"
+        );
+    }
+
+    #[test]
+    fn terminates_and_fully_redacts_env_value_starting_with_token() {
+        // Round-9 Codex P1: the env value BEGINS with a higher-priority API token
+        // (no prefix before it) and carries a secret suffix after it. Pass 1 redacts
+        // only the leading token, leaving `PASSWORD=<REDACTED:secret>!TAILLEAKMARKER`.
+        // A prefix-only "already redacted" guard then skips the assignment because
+        // the value STARTS WITH `<REDACTED:`, and the tail leaks into the protected
+        // blob. The exact-placeholder guard must re-detect the whole value and
+        // collapse prefix + token + tail into one placeholder — and terminate.
+        let input = "PASSWORD=sk-abcdefghijklmnopqrst!TAILLEAKMARKER".to_owned();
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains("TAILLEAKMARKER"),
+            "the secret tail after the leading token must not survive: {redacted}"
+        );
+        assert!(
+            !redacted.contains('!'),
+            "no byte of the env value may survive: {redacted}"
+        );
+        assert_eq!(
+            redacted, "PASSWORD=<REDACTED:secret>",
+            "the whole env value collapses to exactly one placeholder: {redacted}"
+        );
+    }
+
+    #[test]
+    fn terminates_and_fully_redacts_quoted_env_value_starting_with_token() {
+        // Case 4: the quoted env value begins with the token and hides a tail after
+        // it. Quotes are preserved; every secret byte inside them is redacted.
+        let input = "PASSWORD=\"sk-abcdefghijklmnopqrst!TAILLEAKMARKER\"".to_owned();
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains("TAILLEAKMARKER"),
+            "the secret tail inside the quotes must not survive: {redacted}"
+        );
+        assert_eq!(
+            redacted, "PASSWORD=\"<REDACTED:secret>\"",
+            "the quoted env value collapses to exactly one placeholder: {redacted}"
+        );
+    }
+
+    #[test]
+    fn does_not_re_redact_exact_placeholder_env_value() {
+        // Case 3: an env value that is ALREADY exactly one placeholder must be left
+        // untouched and MUST terminate — the exact-placeholder skip, not a prefix
+        // heuristic, is what prevents an infinite re-redaction loop here.
+        let input = "PASSWORD=<REDACTED:secret>".to_owned();
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert_eq!(
+            redacted, input,
+            "a value that is exactly a placeholder is not re-redacted: {redacted}"
+        );
+    }
+
+    #[test]
+    fn terminates_and_redacts_double_quoted_env_secret_with_spaces() {
+        // Round-10 Codex P1: a quoted passphrase whose value contains INTERNAL
+        // whitespace. The delimiter-only value boundary truncated the span at the
+        // first space, redacting only `correct`; the next pass then read the
+        // `"<REDACTED:secret>` head as an already-redacted exact placeholder and left
+        // `horse PASSPHRASELEAK staple` in the protected-capture blob. The quote-aware
+        // boundary must run the value span to the matching CLOSING quote so the whole
+        // passphrase — spaces included — collapses to exactly one placeholder.
+        let input = "PASSWORD=\"correct horse PASSPHRASELEAK staple\"".to_owned();
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains("PASSPHRASELEAK"),
+            "the multi-word passphrase must not survive past the first space: {redacted}"
+        );
+        assert!(
+            !redacted.contains("horse") && !redacted.contains("staple"),
+            "no whitespace-separated word of the quoted value may survive: {redacted}"
+        );
+        assert_eq!(
+            redacted, "PASSWORD=\"<REDACTED:secret>\"",
+            "the whole quoted passphrase collapses to exactly one placeholder: {redacted}"
+        );
+    }
+
+    #[test]
+    fn terminates_and_redacts_single_quoted_env_secret_with_spaces() {
+        // Same round-10 leak, single-quoted. Internal whitespace is part of the value;
+        // the matching single quote closes it.
+        let input = "PASSWORD='correct horse PASSPHRASELEAK staple'".to_owned();
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains("PASSPHRASELEAK"),
+            "the single-quoted passphrase must be fully redacted: {redacted}"
+        );
+        assert!(
+            !redacted.contains("horse") && !redacted.contains("staple"),
+            "no whitespace-separated word of the single-quoted value may survive: {redacted}"
+        );
+        assert_eq!(
+            redacted, "PASSWORD='<REDACTED:secret>'",
+            "the whole single-quoted passphrase collapses to exactly one placeholder: {redacted}"
+        );
+    }
+
+    #[test]
+    fn terminates_and_redacts_quoted_env_secret_with_token_and_trailing_words() {
+        // Round-10, trace 3: a quoted value that BEGINS with a higher-priority API
+        // token, then whitespace, then a secret tail. Pass 1 redacts the token; the
+        // quote-aware env boundary must then collapse the whole quoted run — token
+        // placeholder AND the trailing words — to one placeholder.
+        let input = "PASSWORD=\"sk-abcdefghijklmnopqrst PASSPHRASELEAK words\"".to_owned();
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains("PASSPHRASELEAK"),
+            "the trailing words after the in-value token must not survive: {redacted}"
+        );
+        assert!(
+            !redacted.contains("words"),
+            "no trailing word inside the quotes may survive: {redacted}"
+        );
+        assert_eq!(
+            redacted, "PASSWORD=\"<REDACTED:secret>\"",
+            "the whole quoted value collapses to exactly one placeholder: {redacted}"
+        );
+    }
+
+    #[test]
+    fn unquoted_env_value_space_still_delimits() {
+        // Regression guard for the quote-aware fix: an UNQUOTED env value must keep the
+        // existing behavior exactly — a space genuinely ends the value, so a following
+        // word is NOT part of the secret and must be preserved verbatim.
+        let input = "PASSWORD=secretvaluelong nextword".to_owned();
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains("secretvaluelong"),
+            "the unquoted secret value must be redacted: {redacted}"
+        );
+        assert_eq!(
+            redacted, "PASSWORD=<REDACTED:secret> nextword",
+            "the word after an unquoted env value is preserved (space delimits): {redacted}"
+        );
+    }
 }

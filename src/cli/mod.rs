@@ -247,6 +247,25 @@ pub(crate) enum Commands {
         /// tests or when the auto-detected remote is wrong (e.g. a mirror).
         #[arg(long)]
         repo_id_override: Option<String>,
+        /// Capture the scanned log's POST-REDACTION raw bytes into the protected
+        /// artifact store (issue #321). Disabled by default: without this flag no
+        /// blob and no manifest entry are written. Requires `--protected-store`
+        /// and `--producer`.
+        #[arg(long)]
+        protected_raw_artifacts: bool,
+        /// Protected store directory (required when `--protected-raw-artifacts`
+        /// is set). The graph JSONL never stores the protected handle.
+        #[arg(long)]
+        protected_store: Option<PathBuf>,
+        /// Stable producer identity recorded as the authorised operator for the
+        /// captured log blob (required when `--protected-raw-artifacts` is set).
+        #[arg(long)]
+        producer: Option<String>,
+        /// Override the capture timestamp (RFC 3339) for the protected blob, for
+        /// deterministic manifests in tests. Defaults to the scan's transaction
+        /// time. Not part of the handle identity.
+        #[arg(long)]
+        captured_at: Option<String>,
     },
     /// Resolve log backtrace frames to code-graph symbols (issue #322).
     ///
@@ -2900,7 +2919,20 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             repo_path,
             out,
             repo_id_override,
-        } => scan_logs(&log_path, &repo_path, &out, repo_id_override.as_deref()),
+            protected_raw_artifacts,
+            protected_store,
+            producer,
+            captured_at,
+        } => scan_logs(
+            &log_path,
+            &repo_path,
+            &out,
+            repo_id_override.as_deref(),
+            protected_raw_artifacts,
+            protected_store.as_deref(),
+            producer.as_deref(),
+            captured_at.as_deref(),
+        ),
         Commands::ResolveFrames {
             log_graph,
             graph,

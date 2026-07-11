@@ -32,7 +32,11 @@ claim, deterministically parsed but never verified. Raw log text never enters th
 graph; excerpts are `template-v1`-normalized, redacted, and bounded. Deterministic
 and byte-stable; CRLF and LF checkouts yield identical IDs. Unrecognized
 (binary/non-UTF-8) input exits 1 with a machine-readable diagnostic and no partial
-output. See `docs/cli/scan-logs.md` and `docs/schema/log-graph.md`.
+output. Add `--protected-raw-artifacts --protected-store <dir> --producer <id>`
+(issue #321) to also capture the log's post-redaction bytes into the #60 protected
+store as a `log_payload` blob (disabled by default; the graph never stores the
+handle; capture I/O failure exits 3 with no partial manifest). See
+`docs/cli/scan-logs.md` and `docs/schema/log-graph.md`.
 
 `eg resolve-frames <log.graph.jsonl> --graph <code.graph.jsonl> --out <out>`
 (issue #322) resolves the structured, redaction-safe backtrace frames captured

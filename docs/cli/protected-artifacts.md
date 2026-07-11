@@ -50,6 +50,7 @@ captures the listed payloads.
 | `patch` | Unified diff bytes |
 | `task_narrative` | Issue description, PR body, local task file |
 | `report` | Scan summary, eval result, analysis document |
+| `log_payload` | Post-redaction raw log bytes captured by `eg scan-logs` (issue #321) — **produced only by `eg scan-logs --protected-raw-artifacts`; rejected in a generic `protected capture` manifest** (see below) |
 
 **Flags:**
 
@@ -86,8 +87,9 @@ Per-entry problems produce diagnostics and do not abort capture:
 
 | Diagnostic code | Meaning |
 |----------------|---------|
-| `unsupported_payload_class` | The `class` field is not one of the five recognised classes |
+| `unsupported_payload_class` | The `class` field is not one of the recognised classes |
 | `stale_source_path` | The source file is not readable (moved or deleted before capture) |
+| `log_payload_requires_scan_logs` | The entry declares `class: "log_payload"`. That class is the log's **post-redaction** bytes and is produced only by `eg scan-logs --protected-raw-artifacts` (which redacts before capture). The generic manifest capture path reads `source_path` straight from disk with no redaction, so it refuses the entry — no blob and no manifest record are written for it, and any other valid entries in the same manifest still store atomically. |
 
 **Example:**
 
@@ -174,6 +176,49 @@ eg protected list --store .egregore/protected
 }
 ```
 
+## Capturing raw log payloads from `eg scan-logs` (issue #321)
+
+`eg scan-logs` can capture the scanned log's raw bytes into the protected store in the same run,
+so a runtime-observation graph (issues #319 / #320) keeps a durable, retrievable copy of the log
+even after the original file is rotated or deleted.  It is **disabled by default** and reuses this
+store, its manifest, its authorization model, and the frozen handle identity unchanged.
+
+```sh
+# Scan a log AND capture its post-redaction bytes as a log_payload blob
+eg scan-logs app.log \
+  --repo-path . \
+  --out log.graph.jsonl \
+  --protected-raw-artifacts \
+  --protected-store .egregore/protected \
+  --producer "$(git config user.email)"
+
+# Retrieve the captured log later by handle (hash verified before bytes return)
+eg protected get protected:v1:<hex> \
+  --store .egregore/protected \
+  --operator "$(git config user.email)" \
+  --out recovered.log
+```
+
+Flags (all under `eg scan-logs`; see [`docs/cli/scan-logs.md`](scan-logs.md)):
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--protected-raw-artifacts` | no | Enable capture; without it no blob and no manifest entry are written |
+| `--protected-store <DIR>` | when enabled | Protected store directory |
+| `--producer <ID>` | when enabled | Stable operator identity recorded as authorised for the log blob |
+| `--captured-at <RFC3339>` | no | Override the blob capture timestamp (deterministic manifests); not part of handle identity |
+
+On success, `scan-logs` prints a single JSON line reporting the capture handle, content hash,
+byte count, and class — never raw bytes.  A capture I/O failure prints a `store_io_error`
+envelope to stderr and exits `3`, leaving no partial manifest (single atomic manifest commit).
+
+> **Honest limit — post-redaction bytes only.**  The stored `log_payload` blob is the log with
+> the v1 redaction policy already applied line-by-line: a secret-bearing line is stored as its
+> `<REDACTED:…>` marker.  Egregore **never persists the unredacted original**.  The blob's
+> `content_hash` (BLAKE3 over the post-redaction bytes) is deliberately independent of the
+> `LogSource.source_artifact_hash` in the graph (BLAKE3 over the unredacted, newline-normalized
+> bytes); the two are never conflated and the graph never stores the protected handle.
+
 ## When to use protected mode vs path/hash-only provenance
 
 | Use | When |
@@ -257,6 +302,7 @@ No error ever echoes raw payload bytes, bearer tokens, patch hunks, secrets, or 
 | `hash_mismatch` | 1 | Stored blob bytes do not match the recorded BLAKE3 content hash |
 | `unsupported_payload_class` | n/a | Capture-manifest entry `class` is unrecognised (per-entry diagnostic, not a fatal error) |
 | `stale_source_path` | n/a | Source file is not readable at capture time (per-entry diagnostic) |
+| `log_payload_requires_scan_logs` | n/a | Capture-manifest entry declares `class: "log_payload"`, which the generic (no-redaction) capture path refuses; produce it via `eg scan-logs --protected-raw-artifacts` instead (per-entry diagnostic) |
 
 ## Scope
 

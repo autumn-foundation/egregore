@@ -20,12 +20,39 @@ characters; record IDs and content hashes are one-way BLAKE3 digests.
 
 ```text
 eg scan-logs <LOG_PATH> --repo-path <REPO> --out <OUT.jsonl> [--repo-id-override <ID>]
+             [--protected-raw-artifacts --protected-store <DIR> --producer <ID> [--captured-at <RFC3339>]]
 ```
 
 - `<LOG_PATH>` — the log file to scan.
 - `--repo-path <REPO>` — repository root for repository attribution.
 - `--out <OUT.jsonl>` — output JSONL path.
 - `--repo-id-override <ID>` — force the repository identity (fixture-stable tests).
+- `--protected-raw-artifacts` — also capture the log's **post-redaction** raw bytes into the
+  protected artifact store (issue #321). Disabled by default; requires `--protected-store` and
+  `--producer`. The graph JSONL never stores the protected handle.
+- `--protected-store <DIR>` — protected store directory (required with `--protected-raw-artifacts`).
+- `--producer <ID>` — stable operator identity recorded as authorised for the captured log blob
+  (required with `--protected-raw-artifacts`).
+- `--captured-at <RFC3339>` — override the blob capture timestamp for deterministic manifests;
+  not part of the handle identity. Defaults to the scan's transaction time.
+
+### Protected raw-log capture (issue #321)
+
+With `--protected-raw-artifacts`, the scanned log's redaction-normalized bytes are stored as a
+`log_payload` blob in the protected store, retrievable later with `eg protected get`. Redaction
+runs **before** capture (a secret-bearing line is stored as its `<REDACTED:…>` marker; the
+unredacted original is never persisted). The captured bytes are the redaction of the exact
+normalized buffer the scan read and hashed — the log file is read once, so a log being appended
+to or rotated cannot make the blob describe different bytes than the graph records (issue #321).
+Because these blobs are contractually the post-redaction bytes, `log_payload` is produced **only**
+here; a generic `eg protected capture` manifest that declares `class: "log_payload"` is rejected
+with a `log_payload_requires_scan_logs` per-entry diagnostic (that path applies no redaction). The
+blob's `content_hash` (BLAKE3 over post-redaction
+bytes) is independent of the graph's `LogSource.source_artifact_hash` (BLAKE3 over the
+unredacted, newline-normalized bytes), and the graph never carries the protected handle. On
+success `scan-logs` prints a one-line JSON capture summary (handle, hash, byte count, class —
+never raw bytes); a capture I/O failure prints a `store_io_error` envelope to stderr and exits
+`3` with no partial manifest. See [`docs/cli/protected-artifacts.md`](protected-artifacts.md).
 
 ## Workflow
 
@@ -40,8 +67,10 @@ eg inspect --data-dir .egregore   # log records appear under "Runtime Observatio
 
 | Condition | Exit | Output |
 |-----------|------|--------|
-| A recognizable text log (`plain-v1` or `jsonl-v1`) | `0` | JSONL on `--out`; exemplar-cap diagnostics (if any) to stderr |
+| A recognizable text log (`plain-v1` or `jsonl-v1`) | `0` | JSONL on `--out`; exemplar-cap diagnostics (if any) to stderr; capture summary JSON on stdout when `--protected-raw-artifacts` is set |
 | Binary / non-UTF-8 input (unrecognized format) | `1` | `{"ok":false,"error":{"code":"unrecognized_format",...}}` on stdout, **no partial output** |
+| `--protected-raw-artifacts` set without `--protected-store` or `--producer` | `1` | `{"ok":false,"error":{"code":"missing_field",...}}` on stderr |
+| Protected-capture store I/O failure (issue #321) | `3` | `{"ok":false,"error":{"code":"store_io_error",...}}` on stderr, **no partial manifest** |
 | The log file cannot be read | non-zero | Error on stderr |
 
 ### Format detection

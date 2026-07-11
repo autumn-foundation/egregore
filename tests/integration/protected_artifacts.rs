@@ -588,6 +588,93 @@ fn capture_unsupported_payload_class() {
     assert_eq!(json["stored_count"], 0);
 }
 
+/// Issue #321 (Codex finding A): the generic manifest capture path reads
+/// `source_path` bytes straight from disk and applies NO redaction, so it must
+/// REJECT a `log_payload` entry — those blobs are post-redaction bytes produced
+/// only by `eg scan-logs --protected-raw-artifacts`. A mixed manifest still
+/// stores its other valid entries atomically (no partial write for the rejected
+/// one, and no blob for the raw log bytes).
+#[test]
+fn capture_rejects_log_payload_class_in_generic_manifest() {
+    let (_guard, store) = tmp_store();
+    let src = tempfile::tempdir().expect("src dir");
+    let good = src.path().join("transcript.txt");
+    fs::write(&good, b"agent transcript body").unwrap();
+    let logf = src.path().join("app.log");
+    fs::write(&logf, b"ERROR boom secret=hunterSECRETtokenValueLong\n").unwrap();
+
+    let manifest_path = src.path().join("manifest.jsonl");
+    let lines = [
+        serde_json::json!({ "class": "transcript", "source_path": good }).to_string(),
+        serde_json::json!({ "class": "log_payload", "source_path": logf }).to_string(),
+    ];
+    fs::write(&manifest_path, lines.join("\n") + "\n").unwrap();
+
+    let output = eg()
+        .args(["protected", "capture"])
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--store")
+        .arg(&store)
+        .arg("--protected-raw-artifacts")
+        .arg("--producer")
+        .arg("op-1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("JSON");
+    let entries = json["entries"].as_array().expect("entries");
+
+    // The log_payload entry is rejected with the stable diagnostic, not stored.
+    let log_entry = entries
+        .iter()
+        .find(|e| e["source_path"].as_str().unwrap().ends_with("app.log"))
+        .expect("log entry present");
+    assert_eq!(
+        log_entry["diagnostic"]["code"], "log_payload_requires_scan_logs",
+        "log_payload must be rejected in the generic manifest path"
+    );
+    assert_eq!(log_entry["stored"], false);
+
+    // The valid transcript entry is still stored (atomic / no partial write).
+    let good_entry = entries
+        .iter()
+        .find(|e| {
+            e["source_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("transcript.txt")
+        })
+        .expect("transcript entry present");
+    assert_eq!(good_entry["stored"], true);
+    assert_eq!(json["stored_count"], 1);
+    assert_eq!(json["skipped_count"], 1);
+
+    // Manifest holds exactly the transcript record; no log_payload record.
+    let manifest = fs::read_to_string(store.join("manifest.jsonl")).expect("manifest must exist");
+    let recs: Vec<serde_json::Value> = manifest
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(recs.len(), 1, "only the transcript record is persisted");
+    assert_eq!(recs[0]["source_class"], "transcript");
+
+    // No blob was written for the rejected raw log bytes: exactly one blob (the
+    // transcript) exists. Blob file names are the 64-hex content hash.
+    let blob_count = fs::read_dir(store.join("blobs"))
+        .map(|rd| {
+            rd.filter_map(std::result::Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().len() == 64)
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(blob_count, 1, "only the transcript blob was written");
+}
+
 /// AC5: Missing source file yields `stale_source_path` diagnostic; capture
 /// continues for other entries and exits 0.
 #[test]
