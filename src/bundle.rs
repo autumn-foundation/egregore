@@ -301,6 +301,107 @@ pub fn scrub_record(mut record: GraphRecord) -> GraphRecord {
     record
 }
 
+/// Returns the name of the first field that [`scrub_record`] clears to `None`
+/// but which is still populated in `record`, or `None` when every such field is
+/// cleared.
+///
+/// This is the shared Safety predicate for offline scrub verification. It MUST
+/// stay in lockstep with [`scrub_record`]: every field that function nulls —
+/// the top-level prose (`text`, `validation_summary`, `arguments_summary`), the
+/// inline handle payloads, and the nested `user_context` prose fields — is
+/// asserted here. Any new field added to [`scrub_record`]'s clearing set must be
+/// added here too. Redaction transforms (`author_email`, `title`,
+/// `author_name`, `summary`) are not cleared to `None`, so they are not checked
+/// here; unredacted secrets are covered separately by the secret scan.
+///
+/// The returned name is redaction-safe: it is a static field label, never a
+/// record value.
+#[must_use]
+pub fn first_unscrubbed_field(record: &GraphRecord) -> Option<&'static str> {
+    let GraphRecord::Node {
+        text,
+        validation_summary,
+        arguments_summary,
+        arguments_handle,
+        result_handle,
+        stdout_handle,
+        stderr_handle,
+        patch_handle,
+        body_handle,
+        diff_hunk_handle,
+        user_context,
+        ..
+    } = record
+    else {
+        return None;
+    };
+
+    // 1. Top-level prose fields cleared by scrub_record.
+    if text.is_some() {
+        return Some("text");
+    }
+    if validation_summary.is_some() {
+        return Some("validation_summary");
+    }
+    if arguments_summary.is_some() {
+        return Some("arguments_summary");
+    }
+
+    // 2. Inline handle payloads nulled by scrub_record.
+    if arguments_handle
+        .as_ref()
+        .is_some_and(|h| h.inline.is_some())
+    {
+        return Some("arguments_handle.inline");
+    }
+    if result_handle.as_ref().is_some_and(|h| h.inline.is_some()) {
+        return Some("result_handle.inline");
+    }
+    if stdout_handle.as_ref().is_some_and(|h| h.inline.is_some()) {
+        return Some("stdout_handle.inline");
+    }
+    if stderr_handle.as_ref().is_some_and(|h| h.inline.is_some()) {
+        return Some("stderr_handle.inline");
+    }
+    if patch_handle.as_ref().is_some_and(|h| h.inline.is_some()) {
+        return Some("patch_handle.inline");
+    }
+    if body_handle.as_ref().is_some_and(|h| h.inline.is_some()) {
+        return Some("body_handle.inline");
+    }
+    if diff_hunk_handle
+        .as_ref()
+        .is_some_and(|h| h.inline.is_some())
+    {
+        return Some("diff_hunk_handle.inline");
+    }
+
+    // 3. Nested user_context prose fields cleared by scrub_record.
+    if user_context.proposed_rule_text.is_some() {
+        return Some("user_context.proposed_rule_text");
+    }
+    if user_context.prompt_text.is_some() {
+        return Some("user_context.prompt_text");
+    }
+    if user_context.decision_rationale.is_some() {
+        return Some("user_context.decision_rationale");
+    }
+    if user_context.edited_rule_text.is_some() {
+        return Some("user_context.edited_rule_text");
+    }
+    if user_context.rule_text.is_some() {
+        return Some("user_context.rule_text");
+    }
+    if user_context.action_summary.is_some() {
+        return Some("user_context.action_summary");
+    }
+    if user_context.constraint_text.is_some() {
+        return Some("user_context.constraint_text");
+    }
+
+    None
+}
+
 /// Exports an evidence bundle for a selected query result, task, memory record, etc.
 ///
 /// # Errors
@@ -735,96 +836,15 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
             break;
         }
 
-        if let GraphRecord::Node {
-            text,
-            validation_summary,
-            arguments_summary,
-            arguments_handle,
-            result_handle,
-            stdout_handle,
-            stderr_handle,
-            patch_handle,
-            body_handle,
-            diff_hunk_handle,
-            user_context,
-            ..
-        } = &br.record
-        {
-            // Assert that raw prose fields are None
-            if text.is_some() {
-                safety_passed = false;
-                safety_msg = format!("Safety failure: record {record_id} contains raw text");
-                break;
-            }
-            if validation_summary.is_some() {
-                safety_passed = false;
-                safety_msg =
-                    format!("Safety failure: record {record_id} contains raw validation_summary");
-                break;
-            }
-            if arguments_summary.is_some() {
-                safety_passed = false;
-                safety_msg =
-                    format!("Safety failure: record {record_id} contains raw arguments_summary");
-                break;
-            }
-
-            // Assert that all inline handle fields are None
-            let inline_payload_field = if let Some(h) = arguments_handle
-                && h.inline.is_some()
-            {
-                Some("arguments_handle")
-            } else if let Some(h) = result_handle
-                && h.inline.is_some()
-            {
-                Some("result_handle")
-            } else if let Some(h) = stdout_handle
-                && h.inline.is_some()
-            {
-                Some("stdout_handle")
-            } else if let Some(h) = stderr_handle
-                && h.inline.is_some()
-            {
-                Some("stderr_handle")
-            } else if let Some(h) = patch_handle
-                && h.inline.is_some()
-            {
-                Some("patch_handle")
-            } else if let Some(h) = body_handle
-                && h.inline.is_some()
-            {
-                Some("body_handle")
-            } else if let Some(h) = diff_hunk_handle
-                && h.inline.is_some()
-            {
-                Some("diff_hunk_handle")
-            } else {
-                None
-            };
-
-            if let Some(field) = inline_payload_field {
-                safety_passed = false;
-                safety_msg = format!(
-                    "Safety failure: record {record_id} carries raw inline payload in field '{field}'"
-                );
-                break;
-            }
-
-            // Assert user context fields are None
-            if user_context.proposed_rule_text.is_some()
-                || user_context.prompt_text.is_some()
-                || user_context.decision_rationale.is_some()
-                || user_context.edited_rule_text.is_some()
-                || user_context.rule_text.is_some()
-                || user_context.action_summary.is_some()
-                || user_context.constraint_text.is_some()
-            {
-                safety_passed = false;
-                safety_msg = format!(
-                    "Safety failure: record {record_id} contains unscrubbed user context fields"
-                );
-                break;
-            }
+        // Assert every field `scrub_record` clears is actually None — shared
+        // with the evidence-pack (#338) verify Safety check so the two can
+        // never drift (top-level prose, inline handle payloads, and nested
+        // user_context prose).
+        if let Some(field) = first_unscrubbed_field(&br.record) {
+            safety_passed = false;
+            safety_msg =
+                format!("Safety failure: record {record_id} retains scrubbed field '{field}'");
+            break;
         }
     }
 
