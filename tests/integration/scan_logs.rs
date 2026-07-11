@@ -1018,6 +1018,82 @@ fn stored_blob_redacts_full_env_span_overlapping_nested_higher_priority_token() 
     );
 }
 
+// Regression (issue #321, Codex round-9 P1 "redact env tails when a value starts
+// with a higher-priority token"): the round-7 overlap fix collapsed prefix +
+// nested token + suffix only when the env value had a PREFIX before the nested
+// higher-priority token. When the value STARTS WITH the token (no prefix), pass 1
+// redacts just the leading token, leaving `PASSWORD=<REDACTED:secret>!TAIL…`; the
+// env-secret matcher's prefix-based "already redacted" guard then skipped the
+// assignment because the value BEGINS with `<REDACTED:`, so the suffix leaked into
+// the blob. The exact-placeholder guard re-detects the whole value and collapses
+// token + tail into one marker.
+#[test]
+fn stored_blob_redacts_env_tail_when_value_starts_with_higher_priority_token() {
+    const NESTED_TOKEN: &str = "sk-abcdefghijklmnopqrstuvwx";
+    const SUFFIX_MARKER: &str = "TAILLEAKMARKER";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("starts-with-token.log");
+    let mut fixture = String::new();
+    fixture.push_str("2026-01-02T03:00:00Z INFO service starting up nominally\n");
+    // `PASSWORD=<api token>!TAILLEAKMARKER` — the env value BEGINS with the
+    // higher-priority token (no prefix) and hides a distinctive tail after it.
+    fixture.push_str("2026-01-02T03:00:01Z [ERROR] auth failed PASSWORD=");
+    fixture.push_str(NESTED_TOKEN);
+    fixture.push('!');
+    fixture.push_str(SUFFIX_MARKER);
+    fixture.push_str(" reason denied\n");
+    fixture.push_str("2026-01-02T03:00:05Z INFO service ready to accept traffic\n");
+    fs::write(&log, &fixture).expect("write starts-with-token fixture");
+
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+    scan_logs_capture(&log, temp.path(), &out, &store, "op-1").success();
+
+    let handle = only_manifest_record(&store)["handle"]
+        .as_str()
+        .expect("handle")
+        .to_owned();
+    let got = egregore()
+        .args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let blob = String::from_utf8(got).expect("utf8 blob");
+
+    // The leading higher-priority token must be gone.
+    assert!(
+        !blob.contains(NESTED_TOKEN),
+        "the leading API token must be redacted"
+    );
+    // The SUFFIX after the leading token — still part of the env-secret value —
+    // must NOT survive into the blob. This is the exact round-9 leak.
+    assert!(
+        !blob.contains(SUFFIX_MARKER),
+        "the env-secret suffix PAST the leading token must be redacted, not copied verbatim"
+    );
+    // The overlapping span collapses to a redaction marker.
+    assert!(
+        blob.contains("<REDACTED:"),
+        "the secret span must be stored as a redaction marker"
+    );
+    // Non-secret lines around the secret are preserved verbatim.
+    assert!(
+        blob.contains("service starting up nominally"),
+        "normal line before the secret is preserved"
+    );
+    assert!(
+        blob.contains("service ready to accept traffic"),
+        "normal line after the secret is preserved"
+    );
+}
+
 // Regression (issue #321, Codex P1 "mark blank lines inside secret spans"): an
 // encrypted RFC-1421-style PEM block carries `Proc-Type`/`DEK-Info` headers, a
 // BLANK separator line, then the base64 body before `-----END … -----`. The old
