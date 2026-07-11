@@ -2002,7 +2002,12 @@ pub(crate) enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Restrict commit resolution and signature selection to one repository.
+        /// Scope the code side only (commit/window resolution and the
+        /// symbol-delta join) to one repository. Does NOT filter log
+        /// signatures: log records carry no retrievable repository
+        /// attribution, so every in-window signature is always classified
+        /// regardless of `--repo`. Per-repository log separation requires
+        /// per-repository stores.
         #[arg(long)]
         repo: Option<String>,
     },
