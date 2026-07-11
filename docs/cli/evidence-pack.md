@@ -336,9 +336,27 @@ Re-verifies an assembled pack offline and read-only:
   **distinct PR targets** the coverage edges substantiate (a PR approved by multiple
   reviews yields multiple edges but is one approved PR). Any violation fails
   Integrity with a redaction-safe detail naming the offending edge id and its
-  unbound source/target id or the count mismatch — never a payload. A
-  `review_coverage` section carrying rows but no `measurement` to bind them is
-  likewise rejected.
+  unbound source/target id or the count mismatch — never a payload. Beyond the
+  bound rows, Integrity **recomputes and validates the full
+  `ReviewCoverageMeasurement`**, since `merged_pr_count`, `coverage`, `passed`,
+  and `unapproved_pr_ids` carry no hashed row of their own and could otherwise be
+  edited to show a passing result without disturbing any hashed row: (4)
+  `unapproved_pr_ids` must **exactly equal** the set of PR ids the pack's own
+  `merged_pr_without_approving_review` gap rows cite (both derive from the same
+  merged-but-unapproved set, so they can never legitimately diverge); (5)
+  `merged_pr_count` must equal `approved_pr_count + unapproved_pr_ids.len()`
+  (every merged-in-window PR is either approved or unapproved); (6) `coverage` is
+  recomputed with `assemble`'s exact formula and IEEE-754 arithmetic
+  (`approved_pr_count / merged_pr_count`, vacuously `1.0` when none merged) and
+  compared bit-for-bit, so no float-epsilon drift is introduced; and (7) `passed`
+  must equal `coverage >= min_required` (`min_required` is self-declared — the
+  pack carries no independent source for the `--min-review-coverage` value — so
+  this catches a lie in `passed` alone against the stored coverage/threshold).
+  Finally, the `measurement` is **required on every `review_coverage` section**:
+  `assemble` always emits it, even for a 0%-coverage window with merged PRs but no
+  approving reviews (empty rows), so an absent measurement — with or without rows —
+  fails Integrity rather than silently accepting an artifact stripped of its
+  coverage result.
 - **Coverage** — recompute the #65 citation thresholds (>=95% code rows cited;
   100% non-code rows cited).
 - **Safety** — scans the **entire serialized pack artifact** for raw sensitive

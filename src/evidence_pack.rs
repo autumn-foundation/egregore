@@ -2339,109 +2339,194 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
             // `approval_link_edge_ids` keep asserting a coverage the actual rows no
             // longer substantiate. Bind three ways so the measurement can only ride
             // the rows that back it.
-            match &section.measurement {
-                Some(m) => {
-                    // (1) The set of REFERENCES_TASK edge row IDs must EXACTLY
-                    //     equal the measurement's cited `approval_link_edge_ids`:
-                    //     no row the measurement does not cite, no cited edge
-                    //     missing from the rows.
-                    let row_ids: BTreeSet<&str> =
-                        section.records.iter().map(|br| br.record.id()).collect();
-                    let cited: BTreeSet<&str> = m
-                        .approval_link_edge_ids
-                        .iter()
-                        .map(String::as_str)
-                        .collect();
-                    if let Some(unexpected) = row_ids.difference(&cited).next() {
-                        integrity_passed = false;
-                        integrity_detail = format!(
-                            "review_coverage row {unexpected} is not cited by the \
+            // A `review_coverage` section without a measurement is always
+            // malformed (Codex round-17 P2 Finding 2). `assemble_pack` ALWAYS
+            // emits the measurement — even for a 0%-coverage window with merged
+            // PRs but no approving reviews (empty rows). An absent measurement
+            // therefore means the coverage result (`merged_pr_count` /
+            // `coverage` / threshold outcome) has been stripped from the
+            // artifact, regardless of whether rows remain, so fail Integrity in
+            // every case rather than only when rows are present.
+            let Some(m) = &section.measurement else {
+                integrity_passed = false;
+                "review_coverage section carries no measurement (required on every \
+                 review_coverage section)"
+                    .clone_into(&mut integrity_detail);
+                break 'integrity;
+            };
+            {
+                // (1) The set of REFERENCES_TASK edge row IDs must EXACTLY
+                //     equal the measurement's cited `approval_link_edge_ids`:
+                //     no row the measurement does not cite, no cited edge
+                //     missing from the rows.
+                let row_ids: BTreeSet<&str> =
+                    section.records.iter().map(|br| br.record.id()).collect();
+                let cited: BTreeSet<&str> = m
+                    .approval_link_edge_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                if let Some(unexpected) = row_ids.difference(&cited).next() {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "review_coverage row {unexpected} is not cited by the \
                              section measurement's approval_link_edge_ids"
-                        );
-                        break 'integrity;
-                    }
-                    if let Some(missing) = cited.difference(&row_ids).next() {
-                        integrity_passed = false;
-                        integrity_detail = format!(
-                            "review_coverage measurement cites approval edge {missing} \
+                    );
+                    break 'integrity;
+                }
+                if let Some(missing) = cited.difference(&row_ids).next() {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "review_coverage measurement cites approval edge {missing} \
                              that is absent from the section rows"
-                        );
-                        break 'integrity;
-                    }
-                    // (2) Each coverage edge must connect an approving review to a
-                    //     PR task, using the same source=review / target=PR
-                    //     convention `assemble_pack` used to build the edges.
-                    for br in &section.records {
-                        let GraphRecord::Edge { source, target, .. } = &br.record else {
-                            continue; // guaranteed REFERENCES_TASK edges above
-                        };
-                        // Source must be an approving review present in the pack.
-                        // An approving review always resolves in-window, so it
-                        // always rides the reviews section; its absence or wrong
-                        // shape is tampering.
-                        match node_by_id.get(source.as_str()) {
-                            Some(rec) if is_approving_review(rec) => {}
-                            _ => {
-                                integrity_passed = false;
-                                integrity_detail = format!(
-                                    "review_coverage edge {} source {source} is not an \
-                                     approving review present in the pack",
-                                    br.record.id(),
-                                );
-                                break 'integrity;
-                            }
-                        }
-                        // Target must be a PR task. A merged PR whose Task
-                        // `valid_time` falls outside the window is legitimately
-                        // absent from every section (coverage windows on
-                        // `merged_at`, the PR section on `valid_time`), so an
-                        // ABSENT target is not a defect; a PRESENT target that is
-                        // not a pull-request task is.
-                        if let Some(rec) = node_by_id.get(target.as_str())
-                            && evidence_class_for_record(rec) != Some(EvidenceClass::PullRequests)
-                        {
+                    );
+                    break 'integrity;
+                }
+                // (2) Each coverage edge must connect an approving review to a
+                //     PR task, using the same source=review / target=PR
+                //     convention `assemble_pack` used to build the edges.
+                for br in &section.records {
+                    let GraphRecord::Edge { source, target, .. } = &br.record else {
+                        continue; // guaranteed REFERENCES_TASK edges above
+                    };
+                    // Source must be an approving review present in the pack.
+                    // An approving review always resolves in-window, so it
+                    // always rides the reviews section; its absence or wrong
+                    // shape is tampering.
+                    match node_by_id.get(source.as_str()) {
+                        Some(rec) if is_approving_review(rec) => {}
+                        _ => {
                             integrity_passed = false;
                             integrity_detail = format!(
-                                "review_coverage edge {} target {target} is present in \
-                                 the pack but is not a pull-request task",
+                                "review_coverage edge {} source {source} is not an \
+                                     approving review present in the pack",
                                 br.record.id(),
                             );
                             break 'integrity;
                         }
                     }
-                    // (3) `approved_pr_count` must equal the distinct PR targets
-                    //     the coverage edges substantiate. A PR approved by
-                    //     multiple reviews yields multiple edges but is one
-                    //     approved PR, so the count keys on DISTINCT targets.
-                    let distinct_targets: BTreeSet<&str> = section
-                        .records
-                        .iter()
-                        .filter_map(|br| match &br.record {
-                            GraphRecord::Edge { target, .. } => Some(target.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    if distinct_targets.len() != m.approved_pr_count {
+                    // Target must be a PR task. A merged PR whose Task
+                    // `valid_time` falls outside the window is legitimately
+                    // absent from every section (coverage windows on
+                    // `merged_at`, the PR section on `valid_time`), so an
+                    // ABSENT target is not a defect; a PRESENT target that is
+                    // not a pull-request task is.
+                    if let Some(rec) = node_by_id.get(target.as_str())
+                        && evidence_class_for_record(rec) != Some(EvidenceClass::PullRequests)
+                    {
                         integrity_passed = false;
                         integrity_detail = format!(
-                            "review_coverage approved_pr_count {} does not equal the {} \
-                             distinct approved PR target(s) its coverage edges substantiate",
-                            m.approved_pr_count,
-                            distinct_targets.len(),
+                            "review_coverage edge {} target {target} is present in \
+                                 the pack but is not a pull-request task",
+                            br.record.id(),
                         );
                         break 'integrity;
                     }
                 }
-                None => {
-                    // Rows cannot be bound to a measurement that is absent; a
-                    // review_coverage section carrying rows but no measurement is
-                    // malformed.
-                    if !section.records.is_empty() {
-                        integrity_passed = false;
-                        "review_coverage section carries rows but no measurement to bind them"
-                            .clone_into(&mut integrity_detail);
-                        break 'integrity;
-                    }
+                // (3) `approved_pr_count` must equal the distinct PR targets
+                //     the coverage edges substantiate. A PR approved by
+                //     multiple reviews yields multiple edges but is one
+                //     approved PR, so the count keys on DISTINCT targets.
+                let distinct_targets: BTreeSet<&str> = section
+                    .records
+                    .iter()
+                    .filter_map(|br| match &br.record {
+                        GraphRecord::Edge { target, .. } => Some(target.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if distinct_targets.len() != m.approved_pr_count {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "review_coverage approved_pr_count {} does not equal the {} \
+                             distinct approved PR target(s) its coverage edges substantiate",
+                        m.approved_pr_count,
+                        distinct_targets.len(),
+                    );
+                    break 'integrity;
+                }
+                // (4) The remaining measurement fields carry NO hashed row of
+                //     their own, so tampering `merged_pr_count`, `coverage`,
+                //     `passed`, or `unapproved_pr_ids` leaves every row hash,
+                //     the row order, and the manifest counts valid while the
+                //     stored coverage result lies (Codex round-17 P2 Finding
+                //     1). Recheck each field against the assemble-time
+                //     relationships (mirroring `assemble_pack` exactly) so a
+                //     falsified result cannot verify clean.
+                //
+                //     `unapproved_pr_ids` must EXACTLY equal the set of PR ids
+                //     the pack's own `merged_pr_without_approving_review` gap
+                //     rows cite — assemble derives BOTH from the same
+                //     merged-but-unapproved set, so they can never legitimately
+                //     diverge. Bind to that gap set rather than trusting an
+                //     arbitrary list.
+                let gap_unapproved: BTreeSet<&str> = pack
+                    .gaps
+                    .iter()
+                    .filter(|g| g.gap_class == GapClass::MergedPrWithoutApprovingReview.as_wire())
+                    .flat_map(|g| g.record_ids.iter().map(String::as_str))
+                    .collect();
+                let measured_unapproved: BTreeSet<&str> =
+                    m.unapproved_pr_ids.iter().map(String::as_str).collect();
+                if gap_unapproved != measured_unapproved {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "review_coverage unapproved_pr_ids ({} id(s)) does not equal the \
+                             {} PR id(s) of the pack's merged_pr_without_approving_review gaps",
+                        measured_unapproved.len(),
+                        gap_unapproved.len(),
+                    );
+                    break 'integrity;
+                }
+                // Every merged-in-window PR is either approved or unapproved,
+                // so `merged_pr_count == approved_pr_count + unapproved_pr_ids`.
+                let expected_merged = m.approved_pr_count + m.unapproved_pr_ids.len();
+                if m.merged_pr_count != expected_merged {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "review_coverage merged_pr_count {} does not equal approved_pr_count \
+                             {} + unapproved_pr_ids.len() {} = {}",
+                        m.merged_pr_count,
+                        m.approved_pr_count,
+                        m.unapproved_pr_ids.len(),
+                        expected_merged,
+                    );
+                    break 'integrity;
+                }
+                // `coverage` recomputed with assemble's exact formula and
+                // arithmetic (`approved / merged`, vacuously 1.0 when none
+                // merged). Compare bit patterns so an identical IEEE-754
+                // division matches exactly and no float-epsilon drift is
+                // introduced.
+                #[allow(clippy::cast_precision_loss)]
+                let expected_coverage = if m.merged_pr_count == 0 {
+                    1.0_f64
+                } else {
+                    m.approved_pr_count as f64 / m.merged_pr_count as f64
+                };
+                if m.coverage.to_bits() != expected_coverage.to_bits() {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "review_coverage coverage {} does not equal the recomputed \
+                             approved_pr_count / merged_pr_count = {}",
+                        m.coverage, expected_coverage,
+                    );
+                    break 'integrity;
+                }
+                // `passed` must equal the coverage-vs-threshold predicate.
+                // `min_required` is self-declared (the pack carries no
+                // independent source for the `--min-review-coverage` value it
+                // was assembled with), so this catches a lie in `passed`
+                // alone against the stored coverage/min_required.
+                let expected_passed = m.coverage >= m.min_required;
+                if m.passed != expected_passed {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "review_coverage passed {} does not equal coverage {} >= \
+                             min_required {} ({})",
+                        m.passed, m.coverage, m.min_required, expected_passed,
+                    );
+                    break 'integrity;
                 }
             }
         } else {
@@ -5547,6 +5632,218 @@ mod pack338_tests {
             "clean bound coverage rows must pass Integrity: {}",
             verify_pack(&pack).integrity.detail
         );
+    }
+
+    /// Codex round-17 P2 (Finding 1): tampering `measurement.passed` to the
+    /// opposite (threshold-passing) value without touching any hashed row must
+    /// FAIL Integrity. `passed` must equal `coverage >= min_required`.
+    #[test]
+    fn verify_fails_when_measurement_passed_flipped() {
+        let mut pack = assemble_cc81();
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "baseline pack passes Integrity"
+        );
+        let m = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_mut())
+            .expect("review_coverage measurement");
+        assert!(!m.passed, "baseline 3-of-6 coverage did not pass the gate");
+        m.passed = true; // lie: claim the threshold was met
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a passed flag inconsistent with coverage/min_required must fail Integrity"
+        );
+        assert!(
+            report.integrity.detail.contains("passed"),
+            "detail names the field: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-17 P2 (Finding 1): tampering `measurement.coverage` to a
+    /// threshold-passing value without touching any hashed row must FAIL
+    /// Integrity. `coverage` is recomputed from the bound counts with the exact
+    /// assemble formula.
+    #[test]
+    fn verify_fails_when_measurement_coverage_tampered() {
+        let mut pack = assemble_cc81();
+        let m = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_mut())
+            .expect("review_coverage measurement");
+        m.coverage = 1.0; // lie: claim full coverage (real is 3/6 = 0.5)
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a coverage inconsistent with the bound counts must fail Integrity"
+        );
+        assert!(
+            report.integrity.detail.contains("coverage"),
+            "detail names the field: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-17 P2 (Finding 1): tampering `merged_pr_count` (every merged
+    /// PR is either approved or unapproved) without touching any hashed row must
+    /// FAIL Integrity.
+    #[test]
+    fn verify_fails_when_merged_pr_count_tampered() {
+        let mut pack = assemble_cc81();
+        let m = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_mut())
+            .expect("review_coverage measurement");
+        m.merged_pr_count = 3; // lie: 3 approved + 3 unapproved != 3
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "merged_pr_count != approved_pr_count + unapproved_pr_ids.len() must fail Integrity"
+        );
+        assert!(
+            report.integrity.detail.contains("merged_pr_count"),
+            "detail names the field: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-17 P2 (Finding 1): tampering `unapproved_pr_ids` — the list
+    /// must EXACTLY equal the PR ids of the pack's own
+    /// `merged_pr_without_approving_review` gap rows.
+    #[test]
+    fn verify_fails_when_unapproved_pr_ids_tampered() {
+        let mut pack = assemble_cc81();
+        let m = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_mut())
+            .expect("review_coverage measurement");
+        // Drop one genuinely-unapproved PR and substitute an approved one, keeping
+        // the length (and thus merged_pr_count arithmetic) intact so only the
+        // gap-set binding can catch the lie.
+        m.unapproved_pr_ids = vec![
+            "project:v1:pr01".to_owned(),
+            "project:v1:pr05".to_owned(),
+            "project:v1:pr06".to_owned(),
+        ];
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "unapproved_pr_ids not bound to the merged-PR gap set must fail Integrity"
+        );
+        assert!(
+            report.integrity.detail.contains("unapproved_pr_ids"),
+            "detail names the field: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-17 P2 (Finding 1, positive): the untampered pack's genuine
+    /// measurement fields all reconcile — the new arithmetic/list checks must not
+    /// reject a clean pack.
+    #[test]
+    fn verify_allows_consistent_measurement_fields() {
+        let pack = assemble_cc81();
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "clean measurement fields must pass Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    /// Codex round-17 P2 (Finding 2): a `review_coverage` section with ZERO
+    /// approval-link rows (merged PRs, no approving reviews → 0% coverage) still
+    /// carries the measurement when assembled; deleting it (`measurement: null`)
+    /// must FAIL Integrity — an absent measurement is a defect on EVERY
+    /// `review_coverage` section, not only when rows are present.
+    #[test]
+    fn verify_fails_when_zero_coverage_measurement_absent() {
+        use super::fixture::pr_with_merge_time;
+        // One PR merged in-window with no approving review → empty coverage rows,
+        // measurement present (coverage 0/1 = 0.0), one merged-PR gap.
+        let records = vec![pr_with_merge_time(
+            "project:v1:prZero",
+            "2026-03-15T08:00:00Z", // updated_at -> Task valid_time (in window)
+            "2026-03-15T12:00:00Z", // merged_at -> merge time (in window)
+            "cZero",
+        )];
+        let mut pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+
+        // Baseline: the 0%-coverage pack has an empty coverage row set, a present
+        // measurement, and a merged-PR gap — and it passes Integrity.
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .expect("review_coverage section");
+        assert!(
+            rc.records.is_empty(),
+            "0% coverage has no approval-link rows"
+        );
+        let m = rc.measurement.as_ref().expect("measurement present");
+        assert_eq!(m.merged_pr_count, 1);
+        assert_eq!(m.approved_pr_count, 0);
+        assert!(
+            pack.gaps
+                .iter()
+                .any(|g| g.gap_class == "merged_pr_without_approving_review"
+                    && g.record_ids.contains(&"project:v1:prZero".to_owned())),
+            "the merged-unapproved PR gap is present: gaps={:?}",
+            pack.gaps
+        );
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "the untampered 0%-coverage pack passes Integrity: {}",
+            verify_pack(&pack).integrity.detail
+        );
+
+        // Delete the measurement (and clear its record_count, which is already 0)
+        // to simulate an artifact stripped of its coverage result.
+        let rc_mut = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == "review_coverage")
+            .expect("review_coverage section");
+        rc_mut.measurement = None;
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a review_coverage section with no measurement must fail Integrity even with no rows"
+        );
+        assert!(
+            report.integrity.detail.contains("measurement"),
+            "detail names the missing measurement: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
     }
 
     /// Codex round-15 P2 (Finding 2): Window-consistency must validate the
