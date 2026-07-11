@@ -2997,7 +2997,13 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                 //     PR task, using the same source=review / target=PR
                 //     convention `assemble_pack` used to build the edges.
                 for br in &section.records {
-                    let GraphRecord::Edge { source, target, .. } = &br.record else {
+                    let GraphRecord::Edge {
+                        source,
+                        target,
+                        temporal,
+                        ..
+                    } = &br.record
+                    else {
                         continue; // guaranteed REFERENCES_TASK edges above
                     };
                     // Source must be an approving review present in the pack.
@@ -3016,6 +3022,86 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                             );
                             break 'integrity;
                         }
+                    }
+                    // TARGET-INDEPENDENT stamped-edge merge proof (Codex round-21,
+                    // the comprehensive fix for the whole windowed-out-target class).
+                    // The coverage edge's OWN stamped fields must prove the gate
+                    // whether or not the target PR Task is present in the pack. A
+                    // merged PR whose Task `valid_time` is out of window is
+                    // legitimately absent from every section, so the target-present
+                    // proof below cannot run; WITHOUT a target-independent proof a
+                    // tampered pack whose coverage edge cites an absent target could
+                    // forge the stamped anchors — or leave a source review row whose
+                    // real time post-dates the merge — and still substantiate
+                    // `approved_pr_count` offline (the four successive round-1..4
+                    // holes were all this same class). Prove the gate ENTIRELY from
+                    // the edge's stamp plus the (always-present, checked above) source
+                    // review node, independent of the target:
+                    //   (1) the stamped `valid_time` (the PR `merged_at` anchor)
+                    //       parses AND is in the half-open manifest window;
+                    //   (2) the stamped `author_time` (the review-time anchor)
+                    //       parses AND is at or before that `merged_at` (a post-merge
+                    //       approval never gated the merge); and
+                    //   (3) the SOURCE review node's OWN resolved valid time EQUALS
+                    //       the edge's stamped `author_time` (binding). This ties the
+                    //       cited review time to the review row the edge names, so an
+                    //       attacker cannot move the review row's time without also
+                    //       moving `author_time` — which then fails (2) — and cannot
+                    //       forge `author_time` without the review row disagreeing.
+                    let Some(t) = temporal.as_ref() else {
+                        integrity_passed = false;
+                        integrity_detail = format!(
+                            "review_coverage edge {} carries no stamped temporal metadata",
+                            br.record.id(),
+                        );
+                        break 'integrity;
+                    };
+                    let Some(stamped_merged_at) = parse_rfc3339(&t.valid_time)
+                        .filter(|_| in_window(&t.valid_time, &pack.manifest.window))
+                    else {
+                        integrity_passed = false;
+                        integrity_detail = format!(
+                            "review_coverage edge {} stamped merged_at is not a valid RFC3339 \
+                             instant inside the manifest window",
+                            br.record.id(),
+                        );
+                        break 'integrity;
+                    };
+                    let Some(stamped_review_at) = t.author_time.as_deref().and_then(parse_rfc3339)
+                    else {
+                        integrity_passed = false;
+                        integrity_detail = format!(
+                            "review_coverage edge {} carries no valid stamped author_time \
+                             (review-time anchor)",
+                            br.record.id(),
+                        );
+                        break 'integrity;
+                    };
+                    if stamped_review_at > stamped_merged_at {
+                        integrity_passed = false;
+                        integrity_detail = format!(
+                            "review_coverage edge {} stamped review time is after its stamped \
+                             merged_at (post-merge approval does not gate the merge)",
+                            br.record.id(),
+                        );
+                        break 'integrity;
+                    }
+                    // (3) Bind the edge's cited review time to its source review row.
+                    // The source node is present and approving (checked above).
+                    let source_valid_time = node_by_id
+                        .get(source.as_str())
+                        .and_then(|rec| resolve_valid_time(rec))
+                        .as_deref()
+                        .and_then(parse_rfc3339);
+                    if source_valid_time != Some(stamped_review_at) {
+                        integrity_passed = false;
+                        integrity_detail = format!(
+                            "review_coverage edge {} source {source} (target {target}) review \
+                             valid time does not equal the edge's stamped author_time \
+                             (review-time binding violation)",
+                            br.record.id(),
+                        );
+                        break 'integrity;
                     }
                     // Target must be a PR task. A merged PR whose Task
                     // `valid_time` falls outside the window is legitimately
@@ -3329,30 +3415,35 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
             // its genuine review time, so its window relevance is carried by its
             // coverage edge.
             //
-            // Codex round-20 P2 (SOUNDNESS HOLE): the lower-bound exemption must
-            // require a SELF-CONTAINED merge proof derived from the coverage
-            // edge's OWN stamped timestamps, NOT merely that the review sources
-            // some included edge and NOT conditional on the target PR Task being
-            // present. A merged PR whose Task `valid_time` is out of window is
-            // legitimately windowed out of every section, so the Integrity
-            // target-present merge proof (`if let Some(target_rec)`) cannot run;
-            // relying on it left the exemption admitting any pre-window review
-            // that cited an absent/rewritten target. A review NODE therefore earns
-            // the lower-bound exemption ONLY when it sources an INCLUDED coverage
-            // `REFERENCES_TASK` edge whose stamped fields themselves prove the
-            // gate: the edge's `valid_time` (the PR `merged_at`) is in-window
-            // (`from <= merged_at < to`) AND the edge's `author_time` (the review
-            // time) is at or before that `merged_at`. An edge whose merged_at is
-            // out-of-window or whose review time post-dates the merge proves
-            // nothing and grants no exemption. The upper bound (`< to`) is still
-            // enforced on every row, and the review node's own valid time must be
-            // at or before a proven merged_at, so no arbitrary out-of-window row
-            // is admitted.
-            let coverage_proven_merge_anchors: BTreeMap<
+            // Codex round-21 (SOUNDNESS HOLE, comprehensive close): a co-located
+            // coverage source-review NODE must be admitted ONLY through a coverage
+            // `REFERENCES_TASK` edge it sources whose stamped fields themselves
+            // prove the gate — NEVER merely for falling in-window, and NOT
+            // conditional on the target PR Task being present. Two things went
+            // wrong across the four successive round-1..4 holes: (i) the proof was
+            // only run when the target Task was present, and (ii) an in-window
+            // coverage-source review was silently admitted by the ordinary
+            // `from <= t < to` arm below, so a post-merge approval whose row time
+            // was moved into the window still passed. The fix derives the proof
+            // ENTIRELY from the edge's stamp and BINDS it to the review row:
+            //   (1) the edge's `valid_time` (the PR `merged_at`) parses AND is
+            //       in-window (`from <= merged_at < to`);
+            //   (2) the edge's `author_time` (the review time) parses AND is at or
+            //       before that `merged_at`; and
+            //   (3) that proven `author_time` is what the review row is matched
+            //       against — a coverage-source review is admitted IFF its OWN
+            //       resolved valid time EQUALS a proven edge's `author_time`, so
+            //       moving the review row's time (in-window post-merge, or anywhere)
+            //       without moving the edge's `author_time` (which then fails (2))
+            //       is rejected. Because a proven `author_time` is `<= merged_at <
+            //       to`, the admitted review time is always below the upper bound;
+            //       it may legitimately be BELOW `from` (a pre-window approval that
+            //       gated an in-window merge), which is the whole point of the lane.
+            let coverage_proven_review_times: BTreeMap<
                 &str,
                 Vec<chrono::DateTime<chrono::FixedOffset>>,
             > = if section.class == EvidenceClass::ReviewCoverage.as_wire() {
-                let mut anchors: BTreeMap<&str, Vec<chrono::DateTime<chrono::FixedOffset>>> =
+                let mut proven: BTreeMap<&str, Vec<chrono::DateTime<chrono::FixedOffset>>> =
                     BTreeMap::new();
                 for br in &section.records {
                     let GraphRecord::Edge {
@@ -3372,11 +3463,11 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     let Some(merged_at) = parse_rfc3339(&t.valid_time) else {
                         continue;
                     };
-                    // (2) the merged_at anchor is itself in-window.
+                    // (1) the merged_at anchor is itself in-window.
                     if !(from <= merged_at && merged_at < to) {
                         continue;
                     }
-                    // (3) the cited review time (edge author_time) is at or
+                    // (2) the cited review time (edge author_time) is at or
                     //     before the merge — a post-merge approval, or a missing
                     //     review time, proves no gate and is skipped.
                     let Some(review_at) = t.author_time.as_deref().and_then(parse_rfc3339) else {
@@ -3385,41 +3476,38 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     if review_at > merged_at {
                         continue;
                     }
-                    anchors.entry(source.as_str()).or_default().push(merged_at);
+                    // Record the PROVEN review-time anchor (never the merged_at):
+                    // (3) binds the review row's own valid time to this value.
+                    proven.entry(source.as_str()).or_default().push(review_at);
                 }
-                anchors
+                proven
             } else {
                 BTreeMap::new()
             };
             for br in &section.records {
-                // A co-located coverage source-review node is exempt from the lower
-                // window bound (its approval may legitimately predate `from`) but
-                // never the upper bound — and only when a proven-in-window coverage
-                // edge it sources establishes the merge it gated, with the review
-                // node's own valid time at or before that proven merged_at.
-                let coverage_source_merge_anchors = if section.class
-                    == EvidenceClass::ReviewCoverage.as_wire()
+                let resolved = resolve_valid_time(&br.record).and_then(|vt| parse_rfc3339(&vt));
+                // A co-located coverage source-review node is admitted EXCLUSIVELY
+                // through a proven edge it sources (never the ordinary in-window
+                // arm) — its resolved valid time must EQUAL a proven `author_time`.
+                // Every other row (the coverage edges themselves, and rows in
+                // class-scoped sections) is held to the ordinary half-open window.
+                let admitted = if section.class == EvidenceClass::ReviewCoverage.as_wire()
                     && is_approving_review(&br.record)
                 {
-                    coverage_proven_merge_anchors.get(br.record.id())
+                    matches!(resolved, Some(t) if coverage_proven_review_times
+                        .get(br.record.id())
+                        .is_some_and(|times| times.contains(&t)))
                 } else {
-                    None
+                    matches!(resolved, Some(t) if from <= t && t < to)
                 };
-                match resolve_valid_time(&br.record).and_then(|vt| parse_rfc3339(&vt)) {
-                    Some(t) if from <= t && t < to => {}
-                    Some(t)
-                        if t < to
-                            && coverage_source_merge_anchors
-                                .is_some_and(|anchors| anchors.iter().any(|&m| t <= m)) => {}
-                    _ => {
-                        window_ok = false;
-                        window_detail = format!(
-                            "record {} in section {} is outside the manifest window",
-                            br.record.id(),
-                            section.class
-                        );
-                        break 'window;
-                    }
+                if !admitted {
+                    window_ok = false;
+                    window_detail = format!(
+                        "record {} in section {} is outside the manifest window",
+                        br.record.id(),
+                        section.class
+                    );
+                    break 'window;
                 }
             }
         }
@@ -5209,6 +5297,296 @@ mod pack338_tests {
             report.window_consistency.detail
         );
         assert!(!report.ok, "overall verdict fails");
+    }
+
+    // ---------------------------------------------------------------------
+    // Codex round-21 COMPREHENSIVE CLASS COVERAGE: `verify_pack` must reject
+    // EVERY variant of a coverage edge whose merge/review proof is falsified,
+    // whether or not the target PR Task is windowed out. These tests exercise
+    // the whole class (target-independent stamped-edge proof + review-row
+    // binding + coverage-source Window-consistency binding), so no fifth
+    // adjacent variant can exist. Vectors a-e reject; f/g (existing) and h pass.
+    // ---------------------------------------------------------------------
+
+    /// A pack whose sole covered PR has its Task WINDOWED OUT of every section
+    /// (Task `valid_time` in February, merge in-window in March, approval in
+    /// February before merge). The coverage edge and its source review node are
+    /// the only `review_coverage` rows; the target PR Task is absent.
+    fn windowed_out_target_pack() -> EvidencePack {
+        use super::fixture::{pr_with_merge_time, references_task, review};
+        let records = vec![
+            pr_with_merge_time(
+                "project:v1:prX",
+                "2026-02-10T00:00:00Z",
+                "2026-03-15T12:00:00Z",
+                "cX",
+            ),
+            review("project:v1:rvX", "2026-02-20T08:00:00Z", "approved"),
+            references_task("project:v1:rvX", "project:v1:prX"),
+        ];
+        assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles")
+    }
+
+    /// A pack whose sole covered PR Task is PRESENT and merged in-window, with an
+    /// in-window approval before the merge — the ordinary happy path (vector h).
+    fn present_target_pack() -> EvidencePack {
+        use super::fixture::{pr, references_task, review};
+        let records = vec![
+            pr("project:v1:prX", "2026-03-15T12:00:00Z", "cX"),
+            review("project:v1:rvX", "2026-03-15T08:00:00Z", "approved"),
+            references_task("project:v1:rvX", "project:v1:prX"),
+        ];
+        assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles")
+    }
+
+    /// Rehashes + canonically re-sorts the `review_coverage` section after an
+    /// in-place tamper, so the ONLY thing that can fail `verify_pack` is the
+    /// merge/review proof under test (never a stale hash, count, or ordering).
+    /// Record ids / domains / kinds are unchanged by these tampers, so the
+    /// manifest aggregates stay valid without recompute.
+    fn rehash_review_coverage_section(pack: &mut EvidencePack) {
+        for section in &mut pack.sections {
+            if section.class != "review_coverage" {
+                continue;
+            }
+            for br in &mut section.records {
+                br.hash =
+                    blake3::hash(serde_json::to_string(&br.record).unwrap().as_bytes()).to_string();
+            }
+            section
+                .records
+                .sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
+        }
+    }
+
+    /// Sets a co-located review NODE's `valid_time` in the `review_coverage` section.
+    fn set_review_node_valid_time(pack: &mut EvidencePack, review_id: &str, vt: &str) {
+        let mut touched = false;
+        for section in &mut pack.sections {
+            if section.class != "review_coverage" {
+                continue;
+            }
+            for br in &mut section.records {
+                if br.record.id() == review_id
+                    && let GraphRecord::Node { valid_time, .. } = &mut br.record
+                {
+                    *valid_time = Some(vt.to_owned());
+                    touched = true;
+                }
+            }
+        }
+        assert!(touched, "review node {review_id} present to retime");
+        rehash_review_coverage_section(pack);
+    }
+
+    /// Sets the coverage `REFERENCES_TASK` edge's stamped `valid_time` (`merged_at`
+    /// anchor) and/or `author_time` (review-time anchor) in the `review_coverage`
+    /// section. `None` leaves that field as stamped.
+    fn set_coverage_edge_stamps(
+        pack: &mut EvidencePack,
+        new_valid_time: Option<&str>,
+        new_author_time: Option<&str>,
+    ) {
+        let mut touched = false;
+        for section in &mut pack.sections {
+            if section.class != "review_coverage" {
+                continue;
+            }
+            for br in &mut section.records {
+                if let GraphRecord::Edge {
+                    label, temporal, ..
+                } = &mut br.record
+                    && label.as_str() == "REFERENCES_TASK"
+                {
+                    let t = temporal.as_mut().expect("stamped coverage edge");
+                    if let Some(v) = new_valid_time {
+                        v.clone_into(&mut t.valid_time);
+                        v.clone_into(&mut t.observed_at);
+                    }
+                    if let Some(a) = new_author_time {
+                        t.author_time = Some(a.to_owned());
+                    }
+                    touched = true;
+                }
+            }
+        }
+        assert!(touched, "coverage edge present to retime");
+        rehash_review_coverage_section(pack);
+    }
+
+    /// VECTOR a (the confirmed round-4 finding). Target ABSENT + source review row
+    /// moved to an IN-WINDOW time AFTER the edge's stamped merge time (a post-merge
+    /// approval whose row time is smuggled into the window). The edge's stamped
+    /// `author_time` is left at the honest pre-window value, so the review row and
+    /// the edge disagree. Before the fix the review row was admitted by the ordinary
+    /// in-window Window-consistency arm and Integrity skipped the proof (absent
+    /// target); after the fix both the binding and the coverage-source admission
+    /// reject it.
+    #[test]
+    fn absent_target_review_row_moved_in_window_post_merge_fails_verify() {
+        let mut pack = windowed_out_target_pack();
+        assert!(verify_pack(&pack).ok, "baseline windowed-out pack verifies");
+        // rvX approved Feb 20; PR merged March 15. Move rvX in-window to March 20
+        // (post-merge). Edge author_time stays Feb 20.
+        set_review_node_valid_time(&mut pack, "project:v1:rvX", "2026-03-20T08:00:00Z");
+        let report = verify_pack(&pack);
+        assert!(
+            !report.ok,
+            "an in-window post-merge review row on an absent-target coverage edge \
+             must fail verify: {report:?}"
+        );
+        assert!(
+            !report.integrity.passed || !report.window_consistency.passed,
+            "the merge/review proof must reject it in Integrity or Window-consistency: {report:?}"
+        );
+    }
+
+    /// VECTOR b (binding violation). Target ABSENT + edge `author_time` forged to a
+    /// value at-or-before `merged_at`, but the SOURCE review row's real valid time
+    /// DIFFERS from that forged `author_time`. The edge cannot claim a review time
+    /// the review row it cites does not corroborate.
+    #[test]
+    fn absent_target_edge_author_time_unbound_from_review_row_fails_verify() {
+        let mut pack = windowed_out_target_pack();
+        assert!(verify_pack(&pack).ok, "baseline windowed-out pack verifies");
+        // Forge author_time to March 1 (<= March 15 merge) while the review row
+        // stays at Feb 20 — the edge and the row now disagree.
+        set_coverage_edge_stamps(&mut pack, None, Some("2026-03-01T00:00:00Z"));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.ok,
+            "a coverage edge whose author_time disagrees with its source review row \
+             must fail verify: {report:?}"
+        );
+        assert!(
+            !report.integrity.passed || !report.window_consistency.passed,
+            "the binding must reject it in Integrity or Window-consistency: {report:?}"
+        );
+    }
+
+    /// VECTOR c (merge anchor forged out of window). Target ABSENT + edge
+    /// `valid_time` (`merged_at` anchor) forged to `>= to`. The covered PR is supposed
+    /// to have merged in-window; an out-of-window merge anchor proves nothing.
+    #[test]
+    fn absent_target_edge_merged_at_forged_out_of_window_fails_verify() {
+        let mut pack = windowed_out_target_pack();
+        assert!(verify_pack(&pack).ok, "baseline windowed-out pack verifies");
+        // Forge merged_at to April 15 (>= window `to` 2026-04-01). Keep author_time
+        // <= that so only the in-window anchor gate is violated.
+        set_coverage_edge_stamps(&mut pack, Some("2026-04-15T12:00:00Z"), None);
+        let report = verify_pack(&pack);
+        assert!(
+            !report.ok,
+            "a coverage edge whose merged_at anchor is outside the window must fail \
+             verify: {report:?}"
+        );
+        assert!(
+            !report.integrity.passed || !report.window_consistency.passed,
+            "the in-window merge-anchor gate must reject it: {report:?}"
+        );
+    }
+
+    /// VECTOR d (honest edge, post-merge approval). Target ABSENT + edge
+    /// `author_time` > `merged_at` while the review row equals `author_time` (a
+    /// self-consistent but post-merge approval). Mirrors the existing round-20
+    /// windowed-out test; kept here so the whole class is guarded in one place.
+    #[test]
+    fn absent_target_post_merge_author_time_fails_verify() {
+        let mut pack = windowed_out_target_pack();
+        assert!(verify_pack(&pack).ok, "baseline windowed-out pack verifies");
+        // Move BOTH the edge author_time and the review row to March 25 (post the
+        // March 15 merge) so they agree but the approval did not gate the merge.
+        set_coverage_edge_stamps(&mut pack, None, Some("2026-03-25T08:00:00Z"));
+        set_review_node_valid_time(&mut pack, "project:v1:rvX", "2026-03-25T08:00:00Z");
+        let report = verify_pack(&pack);
+        assert!(
+            !report.ok,
+            "a self-consistent post-merge approval on an absent-target edge must fail \
+             verify: {report:?}"
+        );
+        assert!(
+            !report.integrity.passed || !report.window_consistency.passed,
+            "the at-or-before-merge gate must reject it: {report:?}"
+        );
+    }
+
+    /// VECTOR e(a) — the vector-a attack with the target PR Task PRESENT. Guards the
+    /// present-target path against the same in-window post-merge review-row smuggle.
+    #[test]
+    fn present_target_review_row_moved_post_merge_fails_verify() {
+        let mut pack = present_target_pack();
+        assert!(
+            verify_pack(&pack).ok,
+            "baseline present-target pack verifies"
+        );
+        // PR merged March 15; move the review row to March 20 (post-merge, still
+        // in-window). Edge author_time stays at the honest March 15 08:00.
+        set_review_node_valid_time(&mut pack, "project:v1:rvX", "2026-03-20T08:00:00Z");
+        let report = verify_pack(&pack);
+        assert!(
+            !report.ok,
+            "an in-window post-merge review row must fail verify even when the target \
+             PR Task is present: {report:?}"
+        );
+        assert!(
+            !report.integrity.passed || !report.window_consistency.passed,
+            "the proof must reject it in Integrity or Window-consistency: {report:?}"
+        );
+    }
+
+    /// VECTOR e(d) — the vector-d attack with the target PR Task PRESENT.
+    #[test]
+    fn present_target_post_merge_author_time_fails_verify() {
+        let mut pack = present_target_pack();
+        assert!(
+            verify_pack(&pack).ok,
+            "baseline present-target pack verifies"
+        );
+        // Move both edge author_time and review row to March 20 (post the March 15
+        // merge). They agree, but the approval post-dates the merge.
+        set_coverage_edge_stamps(&mut pack, None, Some("2026-03-20T08:00:00Z"));
+        set_review_node_valid_time(&mut pack, "project:v1:rvX", "2026-03-20T08:00:00Z");
+        let report = verify_pack(&pack);
+        assert!(
+            !report.ok,
+            "a self-consistent post-merge approval must fail verify even when the \
+             target PR Task is present: {report:?}"
+        );
+        assert!(
+            !report.integrity.passed || !report.window_consistency.passed,
+            "the at-or-before-merge gate must reject it: {report:?}"
+        );
+    }
+
+    /// VECTOR h (legit happy path). A normal in-window approval with the target PR
+    /// Task present must verify clean.
+    #[test]
+    fn present_target_in_window_approval_passes_verify() {
+        let pack = present_target_pack();
+        let report = verify_pack(&pack);
+        assert!(
+            report.ok,
+            "an ordinary in-window approval with a present target must verify clean: {report:?}"
+        );
+        assert!(report.integrity.passed && report.window_consistency.passed);
     }
 
     /// Codex Finding B(i): a PR merged in-window whose sole approving review was
