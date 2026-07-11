@@ -201,6 +201,26 @@ pub(crate) fn evidence_pack_assemble_cmd(
         }
     };
 
+    // A whole-artifact SAFETY failure means the pack still carries a raw secret
+    // in some field (e.g. a malicious `--catalog` title copied into
+    // `manifest.control_title`). Emitting the pack would leak it, so this case is
+    // handled BEFORE any serialization: suppress the artifact entirely and emit a
+    // redaction-safe `pack_safety_failed` envelope to stderr, exit 2 ("cannot
+    // emit a redaction-safe artifact", consistent with every other stderr-only
+    // error path here). The safety `detail` names the field label + secret class
+    // only, never the value (Codex round-12 P1 Finding 2). This special-casing
+    // applies ONLY to Safety: a non-safety verdict failure (citation shortfall,
+    // required-class unavailable, review-coverage) produces a redaction-safe pack
+    // that MUST still print the full report to stdout with exit 1 below.
+    if !pack.verdicts.safety.passed {
+        drop(store_copy);
+        evidence_pack_exit(&serde_json::json!({
+            "code": "pack_safety_failed",
+            "detail": pack.verdicts.safety.detail,
+            "message": "assembled pack failed whole-artifact safety; artifact suppressed to avoid leaking a raw secret",
+        }));
+    }
+
     let output = match format {
         OutputFormat::Json => {
             serde_json::to_string(&pack).context("failed to serialize evidence pack")?
@@ -250,7 +270,30 @@ pub(crate) fn evidence_pack_verify_cmd(path: &Path, format: OutputFormat) -> Res
         }))
     });
 
-    let report = verify_pack(&pack);
+    let mut report = verify_pack(&pack);
+    // serde silently DROPS unknown object keys when deserializing into
+    // `EvidencePack`, so a secret planted in an unknown field (top-level or
+    // nested) is gone before `verify_pack`'s whole-artifact Safety scan runs — a
+    // pack that visibly contains a secret could otherwise verify clean (exit 0),
+    // defeating the "verify scans the entire supplied artifact" guarantee. Scan
+    // the RAW file text independently of deserialization to close that gap. Only
+    // when `verify_pack` itself found the artifact safe do we consult the raw
+    // text; a known-field secret already failed Safety with a precise per-field
+    // detail we keep. The forced detail names the secret class plus a cheap byte
+    // offset location hint — never the secret value (Codex round-12 P1 Finding 1).
+    if report.safety.passed
+        && let Some((class, offset)) = crate::redaction::detect_secret(&text)
+    {
+        report.safety = crate::bundle::VerificationVerdict {
+            passed: false,
+            detail: format!(
+                "raw pack artifact contains unredacted secret class: {} at byte offset {offset}",
+                class.as_str()
+            ),
+        };
+        report.ok = false;
+    }
+
     let output = match format {
         OutputFormat::Json => {
             serde_json::to_string(&report).context("failed to serialize verify report")?

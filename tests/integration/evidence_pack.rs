@@ -462,6 +462,152 @@ fn out_of_window_nonempty_store_still_exits_0() {
     );
 }
 
+/// Codex round-12 P1 (Finding 1): `verify` must scan the RAW supplied artifact
+/// BEFORE serde drops unknown fields. serde ignores unknown object keys by
+/// default, so a secret placed in an unknown field (top-level or nested) is
+/// dropped before the whole-artifact Safety scan runs, letting verify exit 0 on
+/// an artifact that visibly contains a secret. Scanning the raw file text closes
+/// the gap: Safety FAILS (exit 1) with a redaction-safe detail, and neither
+/// stdout nor stderr echoes the secret value.
+#[test]
+fn verify_raw_scan_catches_secret_in_unknown_field() {
+    const SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
+    let temp = tempfile::tempdir().unwrap();
+    let (_code, pack) = assemble_over_graph();
+    let mut json = pack;
+    // An unknown object key serde silently discards when deserializing into
+    // `EvidencePack` — so `verify_pack`'s whole-artifact scan never sees it.
+    json["leak"] = Value::String(SECRET.to_owned());
+    let path = temp.path().join("unknown_field_leak.json");
+    fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+    let out = egregore()
+        .args(["audit", "evidence-pack", "verify"])
+        .arg(&path)
+        .output()
+        .expect("run verify");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a secret in the raw artifact fails Safety (exit 1)"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains(SECRET),
+        "verify stdout must not echo the secret: {stdout}"
+    );
+    assert!(
+        !stderr.contains(SECRET),
+        "verify stderr must not echo the secret: {stderr}"
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).expect("stdout is the JSON report");
+    assert_eq!(report["ok"], false, "raw-scan secret fails the report");
+    assert_eq!(
+        report["safety"]["passed"], false,
+        "raw-scan secret fails Safety"
+    );
+}
+
+/// Codex round-12 P1 (Finding 2): a whole-artifact SAFETY failure means the
+/// assembled pack is unsafe to emit — its offending field still carries the raw
+/// secret. The handler must NOT serialize/print the pack. Instead it emits a
+/// redaction-safe `pack_safety_failed` error to stderr naming the failing field
+/// and secret class, never the value, and exits 2 because it cannot emit a
+/// redaction-safe artifact. stdout must stay empty of the pack.
+#[test]
+fn assemble_safety_failure_suppresses_pack_and_errors() {
+    const SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
+    let temp = tempfile::tempdir().unwrap();
+    // A valid catalog whose CC8.1 title carries an AWS-key-shaped secret, as a
+    // malicious `--catalog` would. `control.title` is copied into the manifest's
+    // `control_title`, which the whole-artifact Safety scan covers.
+    let catalog = serde_json::json!({
+        "catalog_id": "soc2-v1",
+        "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+        "controls": [
+            {
+                "control_id": "CC8.1",
+                "title": format!("Change management {SECRET}"),
+                "evidence_classes": [
+                    { "class": "commits", "requirement": "required" },
+                    { "class": "pull_requests", "requirement": "required" },
+                    { "class": "reviews", "requirement": "required" },
+                    { "class": "review_coverage", "requirement": "required" }
+                ]
+            }
+        ]
+    });
+    let catalog_path = temp.path().join("evil-catalog.json");
+    fs::write(&catalog_path, serde_json::to_string(&catalog).unwrap()).unwrap();
+
+    let out = egregore()
+        .args([
+            "audit",
+            "evidence-pack",
+            "assemble",
+            "--control",
+            "CC8.1",
+            "--from",
+            FROM,
+            "--to",
+            TO,
+            "--catalog",
+        ])
+        .arg(&catalog_path)
+        .arg("--graph")
+        .arg(fixture_path())
+        .output()
+        .expect("run assemble");
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a safety failure suppresses the artifact (exit 2)"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains(SECRET),
+        "stdout must not leak the secret: {stdout}"
+    );
+    assert!(
+        !stderr.contains(SECRET),
+        "stderr must not leak the secret: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "no pack may be printed to stdout on a safety failure: {stdout}"
+    );
+    let err: Value = serde_json::from_slice(&out.stderr).expect("stderr is JSON");
+    assert_eq!(err["code"], "pack_safety_failed");
+    assert!(
+        err["detail"].as_str().unwrap().contains("control_title"),
+        "the error names the failing field: {err}"
+    );
+}
+
+/// Regression (Codex round-12 P1 Finding 2): the safety-failure suppression must
+/// apply ONLY to Safety failures. A pack that fails a NON-safety verdict (here
+/// review coverage, with no secret anywhere) must STILL print the full report to
+/// stdout at exit 1, exactly as before.
+#[test]
+fn assemble_nonsafety_verdict_failure_still_prints_report() {
+    let (code, pack) = assemble_over_graph();
+    assert_eq!(code, 1, "a review-coverage-only failure stays exit 1");
+    assert_eq!(pack["verdicts"]["ok"], false);
+    assert_eq!(
+        pack["verdicts"]["safety"]["passed"], true,
+        "no secret: Safety passes"
+    );
+    assert_eq!(pack["verdicts"]["review_coverage"]["passed"], false);
+    assert!(
+        !pack["sections"].as_array().unwrap().is_empty(),
+        "the full report (with sections) was printed to stdout"
+    );
+}
+
 /// `--graph` and `--data-dir` must produce a byte-identical pack. Only built
 /// when the embedded store backend is compiled in.
 #[cfg(feature = "embedded-aletheiadb")]

@@ -184,19 +184,29 @@ could mark the required CC8.1 `Reviews` class available and let a relaxed
 - **0** — every verdict passed (`verdicts.ok: true`). An empty window is a
   *vacuous success* (every section explicitly empty, all required classes still
   resolve as available).
-- **1** — a verdict failed: `required_class_unavailable`, citation shortfall,
-  review coverage below `--min-review-coverage` (default `1.0`) **for a control
-  that requires review evidence**, or an integrity/safety failure. The full
-  report is still printed.
-- **2** — usage/load error: `unknown_control` (naming the catalog's known IDs),
-  `reversed_window`, `invalid_timestamp`, `conflicting_input_flags`,
-  `missing_input_flag`, `invalid_min_review_coverage`, `catalog_read_error`,
-  `catalog`-parse errors, an unreadable/missing store or graph, or
-  `empty_evidence_input` (naming the source path) when the input loads **zero
-  records** — a genuinely empty or whitespace-only graph, or an initialized
-  store holding zero records. This is distinct from the exit-0 vacuous
-  `empty_window` success, which is a *non-empty* input whose records merely fall
-  outside the window.
+- **1** — a **non-safety** verdict failed: `required_class_unavailable`,
+  citation shortfall, review coverage below `--min-review-coverage` (default
+  `1.0`) **for a control that requires review evidence**, or an integrity
+  failure. Every such failure leaves a **redaction-safe** pack, so the full
+  report is still printed to stdout.
+- **2** — usage/load error, **or a whole-artifact safety failure**. A safety
+  failure means the pack still carries a raw secret in some field (e.g. a
+  `--catalog` control title copied into `manifest.control_title`), so the
+  artifact is **suppressed** — it is never serialized to stdout. Instead a
+  redaction-safe `pack_safety_failed` envelope is emitted to **stderr**, naming
+  the failing field label + secret class (via the safety verdict `detail`) but
+  **never the secret value**. Exit 2 ("cannot emit a redaction-safe artifact")
+  is used because, like every other exit-2 path, nothing is written to stdout —
+  distinct from an ordinary exit-1 verdict failure, which prints the full report.
+  The other exit-2 causes are usage/load errors: `unknown_control` (naming the
+  catalog's known IDs), `reversed_window`, `invalid_timestamp`,
+  `conflicting_input_flags`, `missing_input_flag`, `invalid_min_review_coverage`,
+  `catalog_read_error`, `catalog`-parse errors, an unreadable/missing store or
+  graph, or `empty_evidence_input` (naming the source path) when the input loads
+  **zero records** — a genuinely empty or whitespace-only graph, or an
+  initialized store holding zero records. This is distinct from the exit-0
+  vacuous `empty_window` success, which is a *non-empty* input whose records
+  merely fall outside the window.
 
 The per-verdict block is: `required_classes`, `citation` (with per-trust-class
 tallies), `review_coverage`, `integrity`, `safety`.
@@ -207,7 +217,11 @@ The assemble-time `safety` verdict runs the **same whole-artifact scan** as
 `--catalog`, gap/diagnostic details, verdict details, section and top-level
 disclaimers) — before the pack is returned. A secret injected into a non-record
 field therefore fails the assembled `safety` verdict (and `verdicts.ok`) rather
-than being serialized to stdout while `safety.passed` wrongly reads `true`.
+than being serialized to stdout while `safety.passed` wrongly reads `true`. When
+the assembled `safety` verdict fails, the pack is **not printed at all**: the
+handler suppresses the artifact and emits the redaction-safe `pack_safety_failed`
+error to stderr at exit **2** (see the exit-code list above), so the raw secret
+never reaches stdout.
 
 ### `review_coverage` gates only review-requiring controls
 
@@ -307,6 +321,19 @@ Re-verifies an assembled pack offline and read-only:
   markers) is not flagged, so a clean scrubbed pack passes.
 - **Window-consistency** — every row's resolved valid time is inside the
   manifest window.
+
+`verify` scans the **raw supplied artifact** for secrets **before** (and
+independently of) deserialization. serde silently discards unknown object keys
+when parsing into the pack type, so a secret planted in an unknown field
+(top-level or nested) — or in a known-but-mistyped field — would be dropped
+before the whole-artifact Safety scan ever ran, letting a visibly secret-bearing
+file verify clean. Scanning the raw file text closes that gap: any secret present
+in the raw bytes fails the **Safety** verdict (exit 1) with a redaction-safe
+detail naming the secret class plus a cheap byte-offset location hint, **never
+the secret value**, and neither stdout nor stderr echoes the raw secret. This is
+belt-and-suspenders with the per-field and whole-serialized-artifact scans, which
+still catch secrets in known fields; the raw scan additionally catches
+unknown/dropped fields.
 
 Exit 0 all checks pass, 1 any fails (report still printed), 2 unreadable or
 unparseable pack. A parse failure (exit 2) emits a **sanitized** `pack_parse_error`
