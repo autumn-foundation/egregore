@@ -872,9 +872,18 @@ fn log_deltas_repo_scope_discloses_unfiltered_logs_and_elevates_for_multi_repo()
         caveat.message.contains("NOT repository-filtered"),
         "the caveat must state log signatures are not repository-filtered"
     );
+    // The message must NEVER claim isolation/safety from a `Repository`-node
+    // count of one: log records add no `Repository` node, so a single-repo NODE
+    // count does not mean the store is repo-isolated for log signatures.
     assert!(
-        caveat.message.contains("single repository"),
-        "single-repo caveat must note the store holds one repository"
+        !caveat.message.contains("no other repository"),
+        "single-repo caveat must not claim no other repository's logs can be included"
+    );
+    assert!(
+        caveat
+            .message
+            .contains("cannot be guaranteed repo-specific"),
+        "single-repo caveat must honestly disclose it cannot be guaranteed repo-specific for logs"
     );
 
     // Shared multi-repository store: append a distinct second `Repository` node.
@@ -912,12 +921,110 @@ fn log_deltas_repo_scope_discloses_unfiltered_logs_and_elevates_for_multi_repo()
         "a store with two repositories must elevate the caveat"
     );
     assert!(
-        elevated.message.contains("MULTIPLE repositories"),
+        elevated
+            .message
+            .contains("MULTIPLE distinct `Repository` nodes"),
         "the elevated caveat must name the multi-repository condition"
     );
     assert!(
         elevated.message.contains("NOT repository-filtered"),
         "the elevated caveat must still state logs are not repository-filtered"
+    );
+    // Even elevated, the message must not claim isolation from any repo count.
+    assert!(
+        !elevated.message.contains("no other repository"),
+        "the elevated caveat must not claim no other repository's logs can be included"
+    );
+}
+
+/// P2 (Codex, `src/query/log_deltas.rs:121`): a store can hold repo-A history
+/// (one `Repository` node) PLUS a repo-B log graph that adds NO `Repository`
+/// node. `distinct_repository_count` is then 1, but repo-B's unfiltered
+/// signature IS classified under `--repo A`. The single-`Repository`-count
+/// caveat must therefore NEVER assert isolation ("no other repository's log
+/// signatures can be included") — that guarantee is false in this mixed-log
+/// scenario.
+#[test]
+fn log_deltas_single_repo_node_count_never_claims_log_isolation() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let [first, _second, third] = seed_repo(&repo);
+    let (mut records, _tweaked_id) = augmented_records(&repo);
+
+    let repo_id = records
+        .iter()
+        .find_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::Repository,
+                ..
+            } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("scan-history should emit a Repository node");
+    let base_prefix = &first[..12];
+
+    // A repo-B log signature whose `first_seen` lands in repo-A's window, added
+    // WITHOUT any second `Repository` node — exactly what a repo-B `scan-logs`
+    // graph contributes (log records add no `Repository` node).
+    records.push(error_signature(
+        "repo-b-log-only",
+        "error",
+        NEW_FIRST,
+        NEW_LAST,
+        9,
+    ));
+
+    let scoped = log_deltas(&records, base_prefix, &third, Some(&repo_id))
+        .expect("scoped range should resolve");
+
+    // (a) Behavior unchanged: the repo-B signature is still classified.
+    let repo_b_id = log_sig_id("repo-b-log-only");
+    assert!(
+        record_ids(&scoped.new_signatures).contains(&repo_b_id.as_str()),
+        "a log-only repository's in-window signature must still be classified \
+         because logs are not repository-filtered"
+    );
+
+    let caveat = scoped
+        .repo_scope_caveat
+        .as_ref()
+        .expect("a scoped query must disclose that logs are unfiltered");
+
+    // The store still reports exactly one distinct `Repository` node — the
+    // informational count is honest raw data — yet a repo-B signature bled in.
+    assert_eq!(caveat.distinct_repository_count, 1);
+    assert!(!caveat.multi_repository_store);
+
+    // (b) The caveat must NOT assert any isolation/safety guarantee.
+    assert!(
+        !caveat.message.contains("no other repository"),
+        "single-`Repository`-count caveat must not claim no other repository's logs \
+         can be included — a log-only repo adds no `Repository` node and bleeds in"
+    );
+    assert!(
+        !caveat.message.contains("single repository, so"),
+        "the caveat must not derive a safety guarantee from a single-repository count"
+    );
+    // And it must carry the honest, uniform disclosure.
+    assert!(
+        caveat.message.contains("NOT repository-filtered"),
+        "the caveat must state log signatures are not repository-filtered"
+    );
+    assert!(
+        caveat
+            .message
+            .contains("cannot be guaranteed repo-specific"),
+        "the caveat must disclose a scoped run cannot be guaranteed repo-specific for logs"
+    );
+    assert!(
+        caveat.message.contains("other repositories"),
+        "the caveat must warn the store may hold log records from other repositories"
+    );
+    assert!(
+        caveat.message.contains("per-repository stores"),
+        "the caveat must point to per-repository stores for log isolation"
     );
 }
 

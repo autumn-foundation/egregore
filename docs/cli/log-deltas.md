@@ -45,24 +45,33 @@ signature to a repository at read time. Every in-window log signature in the
 store is therefore classified against the scoped window regardless of `--repo`.
 (An earlier revision applied the `--repo` predicate to signature IDs directly;
 because `owner_of(<signature-id>)` is always `None`, that dropped **every**
-signature and returned empty groups even for the correct repository.) In a
-single-repository store this distinction is moot. To keep log domains cleanly
-separated, keep each repository's logs in its own store.
+signature and returned empty groups even for the correct repository.) To keep log
+domains cleanly separated, keep each repository's logs in its own store.
 
-Because a scoped run over a shared multi-repository store can therefore surface
-an unrelated repository's signature as if it were repo-scoped, the response
-**envelope discloses this in a machine-readable field** rather than only in the
-docs. Whenever `--repo` is set, the response carries a `repo_scope_caveat`
-object stating that log signatures are **not** repository-filtered
-(`repo_scope`, `distinct_repository_count`, `multi_repository_store`, and a fixed
-`message`). When the store holds more than one distinct `Repository` node the
-caveat is **elevated** — `multi_repository_store: true` and the message names the
-multi-repository condition — because that is exactly when cross-repository log
-bleed can occur; a single-repository store carries the same field present but
-benign. The field is omitted entirely for unscoped queries and is deterministic
-(fixed strings, no wall clock). The schema-level fix — persisting repository
-attribution on log records so `--repo` can soundly filter log signatures and the
-caveat can be dropped — is tracked in issue #362.
+**A single `Repository`-node count does NOT mean the run is repo-isolated for log
+signatures.** Log records add no `Repository` node — their repository identity is
+only hashed into their stable IDs — so a store that reports one distinct
+`Repository` node can still hold a second repository's log graph (for example
+repo-A `scan-history` plus a repo-B `scan-logs` graph), whose in-window signatures
+are classified here regardless of `--repo`. The disclosure therefore **never**
+guarantees repo-specificity for log signatures at any repository count.
+
+Because a scoped run cannot be guaranteed repo-specific for log signatures, the
+response **envelope discloses this in a machine-readable field** rather than only
+in the docs. Whenever `--repo` is set, the response carries a `repo_scope_caveat`
+object stating that log signatures are **not** repository-filtered and that a
+scoped run cannot be guaranteed repo-specific for them (`repo_scope`,
+`distinct_repository_count`, `multi_repository_store`, and a fixed `message`).
+`distinct_repository_count` and `multi_repository_store` are **informational**
+raw counts of `Repository` nodes, never an isolation verdict. When the store
+holds more than one distinct `Repository` node the message ADDS a
+higher-known-risk note (`multi_repository_store: true`) — multiple repositories
+are demonstrably present — but the base disclosure is identical and a single
+count is **never** downgraded to "safe". The field is omitted entirely for
+unscoped queries and is deterministic (fixed strings, no wall clock). The
+schema-level fix — persisting repository attribution on log records so `--repo`
+can soundly filter log signatures and the caveat can be dropped — is tracked in
+issue #362.
 
 ## Shortest offline workflow
 
