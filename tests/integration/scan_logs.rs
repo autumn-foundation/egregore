@@ -1593,3 +1593,74 @@ fn protected_manifest_is_byte_identical_across_runs() {
         "fixed captured_at must yield a byte-identical manifest"
     );
 }
+
+// Regression (issue #321, Codex round-10 P1 "redact quoted env values past
+// embedded whitespace"): a QUOTED env secret whose value contains INTERNAL spaces
+// (a passphrase). The delimiter-only value boundary truncated the detected span at
+// the first space, redacting only the first word; the next pass then read the
+// `"<REDACTED:secret>` head as an already-redacted exact placeholder and copied the
+// rest of the passphrase into the protected blob. The quote-aware value boundary
+// runs the span to the matching closing quote so the whole passphrase — spaces
+// included — collapses to one marker, and the per-line whole-value safety net caps
+// the leak class regardless.
+#[test]
+fn stored_blob_redacts_quoted_env_secret_with_internal_whitespace() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("quoted-passphrase.log");
+    let mut fixture = String::new();
+    fixture.push_str("2026-01-02T03:00:00Z INFO service starting up nominally\n");
+    // `PASSWORD="correct horse PASSPHRASELEAK staple"` — a quoted passphrase with
+    // internal whitespace and a distinctive multi-word secret.
+    fixture.push_str(
+        "2026-01-02T03:00:01Z [ERROR] auth failed PASSWORD=\"correct horse PASSPHRASELEAK staple\"\n",
+    );
+    fixture.push_str("2026-01-02T03:00:05Z INFO service ready to accept traffic\n");
+    fs::write(&log, &fixture).expect("write quoted-passphrase fixture");
+
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+    scan_logs_capture(&log, temp.path(), &out, &store, "op-1").success();
+
+    let handle = only_manifest_record(&store)["handle"]
+        .as_str()
+        .expect("handle")
+        .to_owned();
+    let got = egregore()
+        .args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let blob = String::from_utf8(got).expect("utf8 blob");
+
+    // The distinctive multi-word passphrase must never survive past the first space.
+    assert!(
+        !blob.contains("PASSPHRASELEAK"),
+        "the quoted passphrase must be redacted past embedded whitespace: {blob}"
+    );
+    // No whitespace-separated word of the quoted value may survive either.
+    assert!(
+        !blob.contains("horse") && !blob.contains("staple"),
+        "no word of the quoted passphrase may reach the blob: {blob}"
+    );
+    // The quoted value collapses to a redaction marker.
+    assert!(
+        blob.contains("<REDACTED:"),
+        "the quoted secret must be stored as a redaction marker: {blob}"
+    );
+    // Non-secret lines around the secret are preserved verbatim.
+    assert!(
+        blob.contains("service starting up nominally"),
+        "normal line before the secret is preserved: {blob}"
+    );
+    assert!(
+        blob.contains("service ready to accept traffic"),
+        "normal line after the secret is preserved: {blob}"
+    );
+}

@@ -598,7 +598,33 @@ pub fn scan_log_records(
 #[must_use]
 pub fn redacted_source_bytes(text: &str) -> Vec<u8> {
     let (redacted, _counts) = redaction::redact_code_text(text.to_owned(), "<REDACTED:secret>");
-    redacted.into_bytes()
+    // Belt-and-suspenders safety net over the structure-preserving pass above. That
+    // pass redacts each detected SPAN in place and can still miss an env-value edge
+    // shape whose delimiter/quote boundary truncates the span (e.g. an unbalanced
+    // quote around a whitespace-bearing secret, where the quote-aware boundary falls
+    // back to a delimiter so a stray quote can't swallow the line). For the "never
+    // persist unredacted bytes" contract this whole-value backstop caps that entire
+    // leak class: for each LINE, run the AUTHORITATIVE whole-value redactor
+    // `redact_value` (which detects over the whole line and collapses it to one
+    // marker). If it DIFFERS from the line, the authoritative gate still found a
+    // secret the primary pass left partially unredacted, so REPLACE the whole line
+    // with the collapsed marker; otherwise keep the line verbatim. An unquoted
+    // already-redacted value (`API_KEY=<REDACTED:secret>`) begins with the placeholder
+    // and is skipped by `find_env_secret`, so `redact_value` returns it unchanged and
+    // the net does NOT fire on it — the net only fires on lines that would otherwise
+    // LEAK, at the acceptable cost of occasionally over-redacting one line. The net is
+    // per-line, so a multi-line secret block the primary pass already collapsed to a
+    // single marker is untouched (`redact_value` on each resulting line is a no-op).
+    // Newlines are preserved exactly; output stays deterministic and byte-stable.
+    let mut out = String::with_capacity(redacted.len());
+    for segment in redacted.split_inclusive('\n') {
+        let (line, newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, ""), |line| (line, "\n"));
+        out.push_str(&redaction::redact_value(line));
+        out.push_str(newline);
+    }
+    out.into_bytes()
 }
 
 /// Computes the repository-relative path of a log file under the repo root,

@@ -367,3 +367,52 @@ fn fingerprint_redacts_secrets() {
     assert!(!redacted2);
     assert_eq!(plain, "nothing secret here index <NUM>");
 }
+
+#[test]
+fn safety_net_collapses_line_when_primary_pass_leaves_secret() {
+    // The whole-value backstop must catch a secret the structure-preserving primary
+    // pass leaves partially unredacted. An UNBALANCED quote around a whitespace-bearing
+    // env secret is exactly such a shape: the quote-aware value boundary finds no
+    // matching close and falls back to the delimiter boundary (so a stray quote can't
+    // swallow the line), truncating the span at the first space and leaking the tail.
+    let leaking = "PASSWORD=\"correct horse LEAKWORD staple'";
+    // Prove the PRIMARY pass alone leaves the tail — this is the miss the net exists
+    // to backstop.
+    let (primary_only, _counts) =
+        crate::redaction::redact_code_text(leaking.to_owned(), "<REDACTED:secret>");
+    assert!(
+        primary_only.contains("LEAKWORD"),
+        "precondition: the structure-preserving pass alone must leave the tail: {primary_only}"
+    );
+    // The full capture path (primary pass + per-line safety net) must leave no secret
+    // bytes: the net collapses the whole line.
+    let netted = String::from_utf8(redacted_source_bytes(leaking)).expect("utf8");
+    assert!(
+        !netted.contains("LEAKWORD") && !netted.contains("horse") && !netted.contains("staple"),
+        "the safety net must collapse the line the primary pass left leaking: {netted}"
+    );
+    assert!(
+        netted.contains("<REDACTED:"),
+        "the collapsed line carries a redaction marker: {netted}"
+    );
+}
+
+#[test]
+fn safety_net_leaves_secret_free_and_already_redacted_lines_unchanged() {
+    // A normal secret-free line is untouched by the net.
+    let clean = "2026-01-02T03:00:00Z INFO service starting up nominally\n";
+    assert_eq!(
+        String::from_utf8(redacted_source_bytes(clean)).expect("utf8"),
+        clean,
+        "a secret-free line must pass through the net verbatim"
+    );
+    // An already-redacted unquoted env value begins with the placeholder, so
+    // `find_env_secret` skips it and `redact_value` returns it unchanged — the net must
+    // NOT fire (no gratuitous over-redaction of an already-safe line).
+    let already = "API_KEY=<REDACTED:secret>\n";
+    assert_eq!(
+        String::from_utf8(redacted_source_bytes(already)).expect("utf8"),
+        already,
+        "an already-redacted placeholder line must pass through the net unchanged"
+    );
+}
