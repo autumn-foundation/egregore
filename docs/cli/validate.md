@@ -78,15 +78,16 @@ same input is byte-identical.
    still referenced by a live edge as source or target
    (`tombstone_strands_live_edge`).
 5. **Orphan nodes** — no topology node (`File`, `Module`, `Symbol`, `Import`,
-   `DependencyDeclaration`, `LogEvent`, `LogOccurrenceBucket`) has zero incident
-   edges (`orphan_node`). An orphaned symbol is invisible to edge-walking
-   queries such as `eg query file`; an unattached dependency declaration has
-   lost the `File —CONTAINS→ DependencyDeclaration` chain repository scoping
-   walks; a `LogEvent`/`LogOccurrenceBucket` is always emitted attached to its
-   `ErrorSignature`/`LogSource` (issue #319). `Repository` (the containment
-   root) and `Diagnostic` markers legitimately stand alone and are exempt, as
-   are `LogSource` (a root/sink that may legitimately be edge-less on an
-   empty-log scan), `ErrorSignature`, and non-code-graph node kinds.
+   `DependencyDeclaration`, `LogEvent`, `LogOccurrenceBucket`, `ErrorSignature`)
+   has zero incident edges (`orphan_node`). An orphaned symbol is invisible to
+   edge-walking queries such as `eg query file`; an unattached dependency
+   declaration has lost the `File —CONTAINS→ DependencyDeclaration` chain
+   repository scoping walks; a `LogEvent`/`LogOccurrenceBucket`/`ErrorSignature`
+   is always emitted attached to its `ErrorSignature`/`LogSource` (issue #319).
+   `Repository` (the containment root) and `Diagnostic` markers legitimately
+   stand alone and are exempt, as is `LogSource` (a root/sink that may
+   legitimately be edge-less on an empty-log scan) and non-code-graph node
+   kinds.
 6. **Dependency containment** — every `DependencyDeclaration` with incident
    edges is the target of a `CONTAINS` edge from a `File` node whose
    repo-relative path equals the dependency's declared manifest handle
@@ -111,6 +112,7 @@ same input is byte-identical.
    | Log node | Required outbound edges |
    |----------|-------------------------|
    | `LogEvent` | one `FINGERPRINTED_AS` and one `CAPTURED_FROM` |
+   | `ErrorSignature` | one `CAPTURED_FROM` |
    | `LogOccurrenceBucket` | one `AGGREGATES` (no bucket `CAPTURED_FROM` — its `LogSource` is reached via the signature) |
 
    A missing required edge is `missing_log_structural_edge`; a surplus (more
@@ -120,6 +122,12 @@ same input is byte-identical.
    identical re-emitted edge record is not a duplicate. Only incident nodes are
    evaluated — a zero-edge log node stays a single `orphan_node` (check 5) and
    is never double-reported.
+
+   The bucket's `LogSource` is reached via the signature, but that transitive
+   attribution is not merely assumed: the signature's own `CAPTURED_FROM` is
+   itself a required, validated edge here, so a signature that is missing or
+   duplicates its source edge is flagged rather than silently stranding both
+   its own and its buckets' source attribution.
 
 Clean `eg scan`, `eg scan-history`, and `eg scan-logs` outputs pass all checks.
 

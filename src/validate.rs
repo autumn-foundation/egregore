@@ -45,9 +45,10 @@ pub const MISSING_CONTAINMENT_EDGE: &str = "missing_containment_edge";
 /// Stable defect category: a log-domain node with incident edges missing a
 /// required outbound structural edge (issue #327).
 ///
-/// A `LogEvent` requires one `FINGERPRINTED_AS` and one `CAPTURED_FROM`; a
-/// `LogOccurrenceBucket` requires one `AGGREGATES`. Zero-edge log nodes are
-/// `orphan_node`, so this covers only incident nodes.
+/// A `LogEvent` requires one `FINGERPRINTED_AS` and one `CAPTURED_FROM`; an
+/// `ErrorSignature` requires one `CAPTURED_FROM`; a `LogOccurrenceBucket`
+/// requires one `AGGREGATES`. Zero-edge log nodes are `orphan_node`, so this
+/// covers only incident nodes.
 pub const MISSING_LOG_STRUCTURAL_EDGE: &str = "missing_log_structural_edge";
 /// Stable defect category: a log-domain node carrying more than one of a
 /// required outbound structural edge (issue #327).
@@ -66,12 +67,12 @@ pub const DUPLICATE_LOG_STRUCTURAL_EDGE: &str = "duplicate_log_structural_edge";
 /// `File —CONTAINS→ DependencyDeclaration` attribution edge — the ownership
 /// chain `--repo` scoping walks — so an unattached one is a defect
 /// (PR #314 review).
-/// `LogEvent` and `LogOccurrenceBucket` are always emitted attached to their
-/// `ErrorSignature`/`LogSource` (issue #319), so an edge-less one is a defect.
-/// `LogSource` (a root/sink that may be legitimately edge-less on an empty-log
-/// scan) and `ErrorSignature` are intentionally excluded to avoid false
-/// positives.
-const ORPHANABLE_KINDS: [NodeKind; 7] = [
+/// `LogEvent`, `LogOccurrenceBucket`, and `ErrorSignature` are always emitted
+/// attached to their `LogSource` (a signature via its own `CAPTURED_FROM`;
+/// issue #319/#327), so an edge-less one is a defect. `LogSource` (a root/sink
+/// that may be legitimately edge-less on an empty-log scan) is intentionally
+/// excluded to avoid false positives.
+const ORPHANABLE_KINDS: [NodeKind; 8] = [
     NodeKind::File,
     NodeKind::Module,
     NodeKind::Symbol,
@@ -79,6 +80,7 @@ const ORPHANABLE_KINDS: [NodeKind; 7] = [
     NodeKind::DependencyDeclaration,
     NodeKind::LogEvent,
     NodeKind::LogOccurrenceBucket,
+    NodeKind::ErrorSignature,
 ];
 
 /// Allowed target node kinds for the typed code-graph relations checked by
@@ -560,6 +562,10 @@ fn check_dependency_containment(
 /// edge (the log node is the edge `source`).
 ///
 /// * `LogEvent` requires one `FINGERPRINTED_AS` and one `CAPTURED_FROM`.
+/// * `ErrorSignature` requires one `CAPTURED_FROM` (the extractor always emits
+///   `ErrorSignature —CAPTURED_FROM→ LogSource`, so it is itself a required,
+///   validated edge — bucket source attribution reached via the signature is
+///   thus guaranteed present, not assumed).
 /// * `LogOccurrenceBucket` requires one `AGGREGATES` (the extractor does not
 ///   emit a bucket `CAPTURED_FROM`; the source is reached via the signature).
 ///
@@ -577,13 +583,15 @@ fn check_log_completeness(
 ) {
     /// Required outbound structural edges per log node kind, matching exactly
     /// what the issue #319/#320 extractor emits (`src/log_graph.rs`): a
-    /// `LogEvent` gets both `FINGERPRINTED_AS` and `CAPTURED_FROM`, but a
-    /// `LogOccurrenceBucket` gets only `AGGREGATES` (its `LogSource` is reached
-    /// transitively via the signature). Requiring a bucket `CAPTURED_FROM`
-    /// would false-positive on every real scan-logs graph.
+    /// `LogEvent` gets both `FINGERPRINTED_AS` and `CAPTURED_FROM`, an
+    /// `ErrorSignature` gets one `CAPTURED_FROM`, but a `LogOccurrenceBucket`
+    /// gets only `AGGREGATES` (its `LogSource` is reached transitively via the
+    /// signature's own required `CAPTURED_FROM`). Requiring a bucket
+    /// `CAPTURED_FROM` would false-positive on every real scan-logs graph.
     const fn required_labels(kind: NodeKind) -> &'static [EdgeLabel] {
         match kind {
             NodeKind::LogEvent => &[EdgeLabel::FingerprintedAs, EdgeLabel::CapturedFrom],
+            NodeKind::ErrorSignature => &[EdgeLabel::CapturedFrom],
             NodeKind::LogOccurrenceBucket => &[EdgeLabel::Aggregates],
             _ => &[],
         }
@@ -1223,9 +1231,13 @@ mod tests {
     #[test]
     fn log_event_missing_captured_from_is_flagged() {
         // LogEvent with only FINGERPRINTED_AS — the CAPTURED_FROM is missing.
+        // The signature carries its own CAPTURED_FROM (as the real extractor
+        // emits) so only the event offends.
         let records = vec![
             node("n:event", NodeKind::LogEvent),
             node("n:sig", NodeKind::ErrorSignature),
+            node("n:source", NodeKind::LogSource),
+            edge("e:sig-cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
             edge("e:fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
         ];
         let report = validate_records(&records);
@@ -1277,10 +1289,14 @@ mod tests {
     #[test]
     fn log_bucket_with_only_aggregates_is_complete() {
         // The extractor emits only AGGREGATES for a bucket — no CAPTURED_FROM.
-        // A bucket with just its AGGREGATES edge must not be flagged.
+        // A bucket with just its AGGREGATES edge must not be flagged. The
+        // signature carries its own CAPTURED_FROM (as the real extractor emits)
+        // so it is not itself a completeness defect.
         let records = vec![
             node("n:bucket", NodeKind::LogOccurrenceBucket),
             node("n:sig", NodeKind::ErrorSignature),
+            node("n:source", NodeKind::LogSource),
+            edge("e:sig-cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
             edge("e:agg", EdgeLabel::Aggregates, "n:bucket", "n:sig"),
         ];
         let report = validate_records(&records);
@@ -1352,6 +1368,70 @@ mod tests {
             "identical re-emitted edge records must not count twice, got {:?}",
             report.diagnostics
         );
+    }
+
+    #[test]
+    fn error_signature_missing_captured_from_is_flagged() {
+        // An ErrorSignature made incident by an inbound FINGERPRINTED_AS from a
+        // LogEvent, but carrying NO outbound CAPTURED_FROM, strands its own and
+        // (transitively) its buckets' source attribution — a completeness
+        // defect, not an orphan.
+        let records = vec![
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:event", NodeKind::LogEvent),
+            node("n:source", NodeKind::LogSource),
+            // The event is well-formed so only the signature offends.
+            edge("e:evt-fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
+            edge("e:evt-cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+        ];
+        let report = validate_records(&records);
+        let missing: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == MISSING_LOG_STRUCTURAL_EDGE)
+            .collect();
+        assert_eq!(missing.len(), 1, "got {:?}", report.diagnostics);
+        assert_eq!(missing[0].record_id.as_deref(), Some("n:sig"));
+        assert_eq!(missing[0].kind, Some("ErrorSignature"));
+        assert_eq!(missing[0].relation.as_deref(), Some("CAPTURED_FROM"));
+    }
+
+    #[test]
+    fn error_signature_duplicate_captured_from_is_flagged() {
+        // Two distinct CAPTURED_FROM edges from one ErrorSignature to two
+        // sources — the signature can only be captured from one.
+        let records = vec![
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:source-a", NodeKind::LogSource),
+            node("n:source-b", NodeKind::LogSource),
+            edge("e:cap-a", EdgeLabel::CapturedFrom, "n:sig", "n:source-a"),
+            edge("e:cap-b", EdgeLabel::CapturedFrom, "n:sig", "n:source-b"),
+        ];
+        let report = validate_records(&records);
+        let dupes: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == DUPLICATE_LOG_STRUCTURAL_EDGE)
+            .collect();
+        assert_eq!(dupes.len(), 1, "got {:?}", report.diagnostics);
+        assert_eq!(dupes[0].record_id.as_deref(), Some("n:sig"));
+        assert_eq!(dupes[0].relation.as_deref(), Some("CAPTURED_FROM"));
+        assert_eq!(
+            dupes[0].stranded_edge_ids.as_deref(),
+            Some(&["e:cap-a".to_owned(), "e:cap-b".to_owned()][..])
+        );
+    }
+
+    #[test]
+    fn orphaned_error_signature_is_flagged() {
+        // A lone ErrorSignature node with no edges at all is an orphan (a real
+        // signature always carries its outbound CAPTURED_FROM, so it is never
+        // zero-edge in practice).
+        let records = vec![node("n:sig", NodeKind::ErrorSignature)];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![ORPHAN_NODE]);
+        assert_eq!(report.diagnostics[0].kind, Some("ErrorSignature"));
     }
 
     #[test]

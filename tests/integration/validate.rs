@@ -830,6 +830,44 @@ fn validate_detects_log_event_missing_structural_edge() {
 }
 
 #[test]
+fn validate_detects_error_signature_missing_captured_from() {
+    let (_temp, graph) = fixture_graph();
+    append_clean_log_subgraph(&graph);
+    // An ErrorSignature made incident by an inbound FINGERPRINTED_AS but
+    // missing its required outbound CAPTURED_FROM (issue #327 completeness).
+    append_lines(
+        &graph,
+        &[
+            log_node_line("log:v1:sig2", "ErrorSignature", "sourceless signature"),
+            log_node_line("log:v1:event4", "LogEvent", "event four"),
+            log_edge_line(
+                "log:v1:e-fp4",
+                "FINGERPRINTED_AS",
+                "log:v1:event4",
+                "log:v1:sig2",
+            ),
+            log_edge_line(
+                "log:v1:e-cap4",
+                "CAPTURED_FROM",
+                "log:v1:event4",
+                "log:v1:source",
+            ),
+        ],
+    );
+    let (code, lines) = run_validate(&graph);
+    assert_eq!(code, 1);
+    let (diagnostics, _summary) = split_output(&lines);
+    let missing = diagnostics_with_code(diagnostics, "missing_log_structural_edge");
+    let sig: Vec<_> = missing
+        .iter()
+        .filter(|d| d["record_id"] == "log:v1:sig2")
+        .collect();
+    assert_eq!(sig.len(), 1, "got {diagnostics:?}");
+    assert_eq!(sig[0]["kind"], "ErrorSignature");
+    assert_eq!(sig[0]["relation"], "CAPTURED_FROM");
+}
+
+#[test]
 fn validate_log_defects_are_canonically_ordered_with_code_defects() {
     let (_temp, graph) = fixture_graph();
     let records = graph_records(&graph);
