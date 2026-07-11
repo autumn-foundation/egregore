@@ -1540,6 +1540,12 @@ pub fn assemble_pack(
     // unrelated links nor links to out-of-window PRs.
     let mut approving_targets: BTreeSet<String> = BTreeSet::new();
     let mut coverage_link_edges: Vec<GraphRecord> = Vec::new();
+    // The source approving-review NODES behind the coverage link edges, deduped by
+    // record ID (a single review approving several PRs sources several edges but is
+    // one node). Co-located in the `review_coverage` section so `verify_pack` can
+    // resolve every coverage edge's source offline even when the catalog maps no
+    // `reviews` section (Codex round-18 Finding 2).
+    let mut coverage_review_nodes: BTreeMap<String, GraphRecord> = BTreeMap::new();
     for record in records {
         let GraphRecord::Edge {
             label,
@@ -1575,6 +1581,9 @@ pub fn assemble_pack(
             if merged_pr_ids.contains(target) {
                 let review_vt = resolve_valid_time(review).unwrap_or_default();
                 coverage_link_edges.push(stamp_edge_valid_time(record.clone(), &review_vt));
+                coverage_review_nodes
+                    .entry(review.id().to_owned())
+                    .or_insert_with(|| (*review).clone());
             }
         }
     }
@@ -1593,12 +1602,21 @@ pub fn assemble_pack(
     };
     let review_coverage_passed = coverage >= min_review_coverage;
 
-    // Scrub + hash + canonically order the substantiating link edges once. They
-    // populate the `review_coverage` section (co-located with the measurement they
-    // back) and are cited by the measurement's `approval_link_edge_ids`.
-    let coverage_link_rows = build_section_records(coverage_link_edges);
+    // Scrub + hash + canonically order the substantiating link edges AND their
+    // source approving-review nodes once. Together they populate the
+    // `review_coverage` section (co-located with the measurement they back). The
+    // review nodes make every coverage edge's source resolvable offline regardless
+    // of whether the catalog maps a `reviews` section (Codex round-18 Finding 2);
+    // a review that also lands in a mapped `reviews` section appears in both, which
+    // the shared manifest-count recompute keeps self-consistent.
+    let mut coverage_section_input = coverage_link_edges;
+    coverage_section_input.extend(coverage_review_nodes.into_values());
+    let coverage_link_rows = build_section_records(coverage_section_input);
+    // The measurement cites ONLY the REFERENCES_TASK link edge rows — never the
+    // co-located source review nodes.
     let mut approval_link_edge_ids: Vec<String> = coverage_link_rows
         .iter()
+        .filter(|br| is_expected_review_coverage_row(&br.record))
         .map(|br| br.record.id().to_owned())
         .collect();
     approval_link_edge_ids.sort();
@@ -2316,14 +2334,39 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
             // arbitrary hashed row (a `Commit`, a `Symbol`, any node that maps to a
             // real evidence class, or any other edge label) into the section with
             // counts fixed and present unrelated data as coverage evidence. Every
-            // review_coverage row must be a `REFERENCES_TASK` link edge; any other
-            // row fails Integrity.
+            // review_coverage rows are exactly two shapes (Codex round-18 Finding
+            // 2): (a) the cited `REFERENCES_TASK` link edges, and (b) the approving
+            // review NODES that are the SOURCES of those edges, co-located so every
+            // coverage edge's source resolves offline even when the catalog maps no
+            // `reviews` section. A review node is admitted IFF it sources an included
+            // coverage edge — no arbitrary review nodes — and anything else (a
+            // `Commit`, any node mapping to a real evidence class, a non-approving
+            // review, an unrelated edge) still fails Integrity.
+            let coverage_edge_sources: BTreeSet<&str> = section
+                .records
+                .iter()
+                .filter_map(|br| match &br.record {
+                    GraphRecord::Edge { label, source, .. }
+                        if label.as_str() == "REFERENCES_TASK" =>
+                    {
+                        Some(source.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
             for br in &section.records {
-                if !is_expected_review_coverage_row(&br.record) {
+                let allowed = if is_expected_review_coverage_row(&br.record) {
+                    true
+                } else {
+                    is_approving_review(&br.record)
+                        && coverage_edge_sources.contains(br.record.id())
+                };
+                if !allowed {
                     integrity_passed = false;
                     integrity_detail = format!(
                         "record {} is an unexpected row in review_coverage section \
-                         (only REFERENCES_TASK link edges are permitted)",
+                         (only REFERENCES_TASK link edges and their source approving \
+                         reviews are permitted)",
                         br.record.id(),
                     );
                     break 'integrity;
@@ -2357,10 +2400,16 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
             {
                 // (1) The set of REFERENCES_TASK edge row IDs must EXACTLY
                 //     equal the measurement's cited `approval_link_edge_ids`:
-                //     no row the measurement does not cite, no cited edge
-                //     missing from the rows.
-                let row_ids: BTreeSet<&str> =
-                    section.records.iter().map(|br| br.record.id()).collect();
+                //     no edge the measurement does not cite, no cited edge
+                //     missing from the rows. The co-located source review
+                //     nodes are NOT approval edges and are excluded here (they
+                //     are bound to the edges by the membership check above).
+                let row_ids: BTreeSet<&str> = section
+                    .records
+                    .iter()
+                    .filter(|br| is_expected_review_coverage_row(&br.record))
+                    .map(|br| br.record.id())
+                    .collect();
                 let cited: BTreeSet<&str> = m
                     .approval_link_edge_ids
                     .iter()
@@ -2390,9 +2439,10 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                         continue; // guaranteed REFERENCES_TASK edges above
                     };
                     // Source must be an approving review present in the pack.
-                    // An approving review always resolves in-window, so it
-                    // always rides the reviews section; its absence or wrong
-                    // shape is tampering.
+                    // Its node is co-located in this review_coverage section (and
+                    // may also ride a mapped `reviews` section); `node_by_id`
+                    // spans every section, so its absence or wrong shape is
+                    // tampering.
                     match node_by_id.get(source.as_str()) {
                         Some(rec) if is_approving_review(rec) => {}
                         _ => {
@@ -2456,27 +2506,47 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                 //
                 //     `unapproved_pr_ids` must EXACTLY equal the set of PR ids
                 //     the pack's own `merged_pr_without_approving_review` gap
-                //     rows cite — assemble derives BOTH from the same
-                //     merged-but-unapproved set, so they can never legitimately
-                //     diverge. Bind to that gap set rather than trusting an
-                //     arbitrary list.
-                let gap_unapproved: BTreeSet<&str> = pack
-                    .gaps
-                    .iter()
-                    .filter(|g| g.gap_class == GapClass::MergedPrWithoutApprovingReview.as_wire())
-                    .flat_map(|g| g.record_ids.iter().map(String::as_str))
-                    .collect();
-                let measured_unapproved: BTreeSet<&str> =
-                    m.unapproved_pr_ids.iter().map(String::as_str).collect();
-                if gap_unapproved != measured_unapproved {
-                    integrity_passed = false;
-                    integrity_detail = format!(
-                        "review_coverage unapproved_pr_ids ({} id(s)) does not equal the \
-                             {} PR id(s) of the pack's merged_pr_without_approving_review gaps",
-                        measured_unapproved.len(),
-                        gap_unapproved.len(),
-                    );
-                    break 'integrity;
+                //     rows cite — BUT ONLY when those gaps can exist (Codex
+                //     round-18 Finding 1). Assemble ALWAYS fills
+                //     `unapproved_pr_ids` (merged minus approved), while it emits
+                //     the `merged_pr_without_approving_review` gaps only for a
+                //     control that requires PR/review evidence. The pack's own
+                //     discriminator is the round-8 review_coverage verdict's
+                //     `applicable` flag: gaps are emitted whenever the verdict is
+                //     applicable/gating (a required-review control), so the
+                //     `unapproved_pr_ids == gap set` equality holds and is
+                //     enforced there. When the verdict is NOT applicable (a
+                //     control that maps `review_coverage` merely OPTIONAL, or none
+                //     at all), no such gap is emitted even though
+                //     `unapproved_pr_ids` may be non-empty, so binding to the
+                //     (empty) gap set would wrongly fail a freshly-assembled
+                //     pack — skip it. This is a safe subset of the exact
+                //     gap-emission condition (`requires_pull_requests ||
+                //     requires_review`): whenever `applicable` is true the
+                //     equality holds, and skipping only relaxes the check, never
+                //     producing a false failure. The arithmetic/coverage/passed
+                //     rechecks below still run in EVERY case.
+                if pack.verdicts.review_coverage.applicable {
+                    let gap_unapproved: BTreeSet<&str> = pack
+                        .gaps
+                        .iter()
+                        .filter(|g| {
+                            g.gap_class == GapClass::MergedPrWithoutApprovingReview.as_wire()
+                        })
+                        .flat_map(|g| g.record_ids.iter().map(String::as_str))
+                        .collect();
+                    let measured_unapproved: BTreeSet<&str> =
+                        m.unapproved_pr_ids.iter().map(String::as_str).collect();
+                    if gap_unapproved != measured_unapproved {
+                        integrity_passed = false;
+                        integrity_detail = format!(
+                            "review_coverage unapproved_pr_ids ({} id(s)) does not equal the \
+                                 {} PR id(s) of the pack's merged_pr_without_approving_review gaps",
+                            measured_unapproved.len(),
+                            gap_unapproved.len(),
+                        );
+                        break 'integrity;
+                    }
                 }
                 // Every merged-in-window PR is either approved or unapproved,
                 // so `merged_pr_count == approved_pr_count + unapproved_pr_ids`.
@@ -5390,9 +5460,10 @@ mod pack338_tests {
         assert!(!report.ok, "overall verdict fails");
     }
 
-    /// Codex round-15 P2 (Finding 1, positive): the untampered pack's genuine
-    /// `review_coverage` rows (the stamped `REFERENCES_TASK` link edges) still
-    /// pass the constrained membership check.
+    /// Codex round-15 P2 (Finding 1, positive) + round-18 Finding 2: the
+    /// untampered pack's genuine `review_coverage` rows — the stamped
+    /// `REFERENCES_TASK` link edges AND the co-located source approving-review
+    /// nodes — still pass the constrained membership check.
     #[test]
     fn verify_allows_expected_review_coverage_link_edge_rows() {
         let pack = assemble_cc81();
@@ -5405,10 +5476,26 @@ mod pack338_tests {
             !rc.records.is_empty(),
             "review_coverage carries the substantiating link edges"
         );
+        // The edge sources present in the section (round-18: co-located review
+        // nodes must each source one of these edges).
+        let edge_sources: std::collections::BTreeSet<&str> = rc
+            .records
+            .iter()
+            .filter_map(|br| match &br.record {
+                GraphRecord::Edge { label, source, .. } if label.as_str() == "REFERENCES_TASK" => {
+                    Some(source.as_str())
+                }
+                _ => None,
+            })
+            .collect();
         for br in &rc.records {
+            let is_edge = matches!(&br.record, GraphRecord::Edge { label, .. } if label.as_str() == "REFERENCES_TASK");
+            let is_source_review =
+                is_approving_review(&br.record) && edge_sources.contains(br.record.id());
             assert!(
-                matches!(&br.record, GraphRecord::Edge { label, .. } if label.as_str() == "REFERENCES_TASK"),
-                "every expected review_coverage row is a REFERENCES_TASK edge: {:?}",
+                is_edge || is_source_review,
+                "every expected review_coverage row is a REFERENCES_TASK edge or a \
+                 source approving-review node: {:?}",
                 br.record
             );
         }
@@ -5419,32 +5506,59 @@ mod pack338_tests {
         );
     }
 
-    /// Replaces one `review_coverage` section row with `edge` (an already
+    /// Replaces one `review_coverage` LINK EDGE row with `edge` (an already
     /// stamped `REFERENCES_TASK` edge), recomputing the section `record_count`
     /// and manifest counts so every pre-existing Integrity check still passes.
     /// Returns `(replaced_old_id, new_id)`. The measurement is left untouched so
     /// the caller can decide whether to re-cite the new edge.
+    ///
+    /// Round-18: the section now also co-locates the source approving-review
+    /// nodes. Swapping an edge can orphan its source review (no remaining edge
+    /// sources it); to keep the section otherwise-consistent so ONLY the intended
+    /// tamper differs, any co-located review node no longer sourcing a
+    /// `REFERENCES_TASK` edge is pruned before counts are recomputed.
     fn swap_one_coverage_row(pack: &mut EvidencePack, edge: GraphRecord) -> (String, String) {
         let rc_idx = pack
             .sections
             .iter()
             .position(|s| s.class == "review_coverage")
             .expect("review_coverage section");
-        assert!(
-            !pack.sections[rc_idx].records.is_empty(),
-            "review_coverage carries coverage rows to swap"
-        );
-        let old_id = pack.sections[rc_idx].records[0].record.id().to_owned();
+        let edge_pos = pack.sections[rc_idx]
+            .records
+            .iter()
+            .position(|br| matches!(&br.record, GraphRecord::Edge { label, .. } if label.as_str() == "REFERENCES_TASK"))
+            .expect("review_coverage carries a link edge to swap");
+        let old_id = pack.sections[rc_idx].records[edge_pos]
+            .record
+            .id()
+            .to_owned();
         let new_row = build_section_records(vec![edge]).remove(0);
         let new_id = new_row.record.id().to_owned();
-        pack.sections[rc_idx].records[0] = new_row;
+        pack.sections[rc_idx].records[edge_pos] = new_row;
+        // Prune any co-located review node no longer sourcing a link edge so the
+        // section stays self-consistent apart from the intended tamper.
+        let sources: BTreeSet<String> = pack.sections[rc_idx]
+            .records
+            .iter()
+            .filter_map(|br| match &br.record {
+                GraphRecord::Edge { label, source, .. } if label.as_str() == "REFERENCES_TASK" => {
+                    Some(source.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        pack.sections[rc_idx].records.retain(|br| match &br.record {
+            GraphRecord::Node { .. } => sources.contains(br.record.id()),
+            _ => true,
+        });
         // Keep the section canonically ordered so ordering is never what fails.
         pack.sections[rc_idx]
             .records
             .sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
-        // record_count is unchanged (row-for-row swap); recompute the manifest
-        // aggregates from the swapped rows so the manifest-count check still
-        // passes and the new binding is the only thing that can fail.
+        pack.sections[rc_idx].record_count = pack.sections[rc_idx].records.len();
+        // Recompute the manifest aggregates from the swapped rows so the
+        // manifest-count check still passes and the new binding is the only thing
+        // that can fail.
         let all: Vec<&BundleRecord> = pack
             .sections
             .iter()
@@ -5977,14 +6091,14 @@ mod pack338_tests {
         );
     }
 
-    /// Codex round-11 Finding C: a merged PR approved solely via a
-    /// `REFERENCES_TASK` edge must carry that edge as PRESENT, hashed, citable
-    /// pack content backing the coverage measurement — not an absent relationship
-    /// offline verify and consumers cannot substantiate. The three seed approving
-    /// links (rv01->pr01, rv02->pr02, rv03->pr03) land in the `review_coverage`
-    /// section, are scrubbed + hashed, counted in the manifest, canonically
-    /// ordered, and referenced by the measurement. Before the fix the
-    /// `review_coverage` section held zero records.
+    /// Codex round-11 Finding C + round-18 Finding 2: a merged PR approved solely
+    /// via a `REFERENCES_TASK` edge must carry that edge AND its source approving
+    /// review as PRESENT, hashed, citable pack content backing the coverage
+    /// measurement — not an absent relationship offline verify and consumers
+    /// cannot substantiate. The three seed approving links (rv01->pr01,
+    /// rv02->pr02, rv03->pr03) and their three source review nodes land in the
+    /// `review_coverage` section, are scrubbed + hashed, counted in the manifest,
+    /// canonically ordered, and (edges only) referenced by the measurement.
     #[test]
     fn coverage_link_edges_are_included_hashed_and_substantiated() {
         let pack = assemble_cc81();
@@ -5994,61 +6108,80 @@ mod pack338_tests {
             .find(|s| s.class == "review_coverage")
             .expect("review_coverage section");
 
-        // The three approving REFERENCES_TASK edges are present as section rows.
+        // The three approving REFERENCES_TASK edges AND their three source review
+        // nodes are present as section rows (round-18: source nodes co-located).
         assert_eq!(
-            rc.record_count, 3,
-            "the three approving link edges are included"
+            rc.record_count, 6,
+            "the three approving link edges plus their three source review nodes are included"
         );
-        assert_eq!(rc.records.len(), 3);
+        assert_eq!(rc.records.len(), 6);
+        let mut edge_ids: Vec<String> = Vec::new();
+        let mut node_ids: Vec<String> = Vec::new();
         for br in &rc.records {
-            // Each is a REFERENCES_TASK edge from an approving review to a merged PR.
-            let GraphRecord::Edge {
-                label,
-                source,
-                target,
-                ..
-            } = &br.record
-            else {
-                panic!("coverage link row must be an edge, got {:?}", br.record);
-            };
-            assert_eq!(label.as_str(), "REFERENCES_TASK");
-            assert!(
-                ["project:v1:rv01", "project:v1:rv02", "project:v1:rv03"]
-                    .contains(&source.as_str()),
-                "source is an approving review: {source}"
-            );
-            assert!(
-                ["project:v1:pr01", "project:v1:pr02", "project:v1:pr03"]
-                    .contains(&target.as_str()),
-                "target is an included merged PR: {target}"
-            );
+            match &br.record {
+                GraphRecord::Edge {
+                    label,
+                    source,
+                    target,
+                    ..
+                } => {
+                    assert_eq!(label.as_str(), "REFERENCES_TASK");
+                    assert!(
+                        ["project:v1:rv01", "project:v1:rv02", "project:v1:rv03"]
+                            .contains(&source.as_str()),
+                        "source is an approving review: {source}"
+                    );
+                    assert!(
+                        ["project:v1:pr01", "project:v1:pr02", "project:v1:pr03"]
+                            .contains(&target.as_str()),
+                        "target is an included merged PR: {target}"
+                    );
+                    edge_ids.push(br.record.id().to_owned());
+                }
+                GraphRecord::Node { .. } => {
+                    assert!(
+                        is_approving_review(&br.record),
+                        "co-located node is an approving review: {:?}",
+                        br.record
+                    );
+                    assert!(
+                        ["project:v1:rv01", "project:v1:rv02", "project:v1:rv03"]
+                            .contains(&br.record.id()),
+                        "co-located review node is a seed approving review: {}",
+                        br.record.id()
+                    );
+                    node_ids.push(br.record.id().to_owned());
+                }
+                GraphRecord::Tombstone { .. } => panic!("no tombstones in review_coverage"),
+            }
             // The row hash matches a recompute over its scrubbed form (hashed).
             let recomputed =
                 blake3::hash(serde_json::to_string(&br.record).unwrap().as_bytes()).to_string();
-            assert_eq!(br.hash, recomputed, "edge row is hashed over scrubbed form");
+            assert_eq!(br.hash, recomputed, "row is hashed over scrubbed form");
         }
+        assert_eq!(edge_ids.len(), 3, "three link edges");
+        assert_eq!(node_ids.len(), 3, "three source review nodes");
 
         // Canonically ordered by (valid_time, record_id).
         for pair in rc.records.windows(2) {
             assert!(section_sort_key(&pair[0].record) <= section_sort_key(&pair[1].record));
         }
 
-        // The measurement references the included edges so a consumer can trace
-        // approved_pr_count to hashed records.
+        // The measurement references ONLY the included link EDGES (never the source
+        // review nodes) so a consumer can trace approved_pr_count to hashed records.
         let m = rc.measurement.as_ref().expect("measurement present");
-        let mut row_ids: Vec<String> = rc
-            .records
-            .iter()
-            .map(|br| br.record.id().to_owned())
-            .collect();
-        row_ids.sort();
+        edge_ids.sort();
         assert_eq!(
-            m.approval_link_edge_ids, row_ids,
+            m.approval_link_edge_ids, edge_ids,
             "measurement cites exactly the included coverage-link edge IDs"
         );
         assert_eq!(m.approved_pr_count, 3);
 
-        // Manifest counts include the edges (trust class `other`, REFERENCES_TASK tuple).
+        // Manifest counts include the edges (trust class `other`, REFERENCES_TASK
+        // tuple) and the co-located review nodes (trust class `project_state`,
+        // Review tuple; the three approving reviews also appear in the mapped
+        // `reviews` section, so their project_state/Review counts legitimately
+        // include both appearances — round-18 Finding 2).
         assert_eq!(
             pack.manifest.included_record_counts.get("other").copied(),
             Some(3),
@@ -6079,6 +6212,137 @@ mod pack338_tests {
         );
         assert!(report.safety.passed, "safety: {}", report.safety.detail);
         assert!(report.ok, "verify substantiates the pack: {report:?}");
+    }
+
+    /// Codex round-18 P2 (Finding 1): a custom catalog mapping `review_coverage`
+    /// as OPTIONAL emits NO `merged_pr_without_approving_review` gaps (they are
+    /// gated on required review/PR evidence), yet `assemble_pack` still fills the
+    /// measurement's `unapproved_pr_ids`. The round-17 `unapproved_pr_ids == gap
+    /// set` binding must therefore be gated on the `review_coverage` verdict being
+    /// applicable; an optional-coverage pack with an unapproved in-window merged PR
+    /// must verify clean against its OWN `verify_pack` instead of failing Integrity.
+    #[test]
+    fn optional_review_coverage_pack_with_unapproved_pr_self_verifies() {
+        use super::fixture::pr;
+        let catalog = parse_catalog(
+            r#"{
+                "catalog_id": "custom",
+                "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+                "controls": [
+                    { "control_id": "OPTCOV", "title": "optional coverage", "evidence_classes": [
+                        { "class": "review_coverage", "requirement": "optional" }
+                    ] }
+                ]
+            }"#,
+        )
+        .expect("custom catalog parses");
+        // One merged, in-window, UNAPPROVED PR.
+        let records = vec![pr("project:v1:prU", "2026-03-15T12:00:00Z", "cU")];
+        let pack =
+            assemble_pack(&records, &catalog, "OPTCOV", &win(), 1.0, "v", None).expect("assembles");
+
+        // The verdict is neutral (optional coverage never gates), and NO
+        // merged_pr_without_approving_review gap exists.
+        assert!(!pack.verdicts.review_coverage.applicable);
+        assert!(
+            !pack
+                .gaps
+                .iter()
+                .any(|g| g.gap_class == "merged_pr_without_approving_review"),
+            "optional-coverage control emits no merged-PR gap: {:?}",
+            pack.gaps
+        );
+        // Yet the measurement still records the unapproved PR.
+        let m = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_ref())
+            .expect("measurement");
+        assert_eq!(m.unapproved_pr_ids, vec!["project:v1:prU".to_owned()]);
+
+        // The freshly assembled pack must verify clean against its OWN verify_pack.
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "optional-coverage pack integrity: {}",
+            report.integrity.detail
+        );
+        assert!(
+            report.ok,
+            "optional-coverage pack must self-verify: {report:?}"
+        );
+    }
+
+    /// Codex round-18 P2 (Finding 2): a custom catalog mapping `review_coverage`
+    /// (required) WITHOUT a `reviews` section still emits the coverage
+    /// `REFERENCES_TASK` link edges; their source approving-review NODES must be
+    /// co-located in the `review_coverage` section so verify can resolve every edge
+    /// endpoint offline. A freshly assembled approved-PR pack must verify clean.
+    #[test]
+    fn review_coverage_without_reviews_section_includes_source_review_and_self_verifies() {
+        use super::fixture::{pr, references_task, review};
+        let catalog = parse_catalog(
+            r#"{
+                "catalog_id": "custom",
+                "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+                "controls": [
+                    { "control_id": "RCOV", "title": "coverage only", "evidence_classes": [
+                        { "class": "review_coverage", "requirement": "required" }
+                    ] }
+                ]
+            }"#,
+        )
+        .expect("custom catalog parses");
+        // Merged in-window PR approved by an in-window review submitted before merge.
+        let records = vec![
+            pr("project:v1:prA", "2026-03-15T12:00:00Z", "cA"),
+            review("project:v1:rvA", "2026-03-15T08:00:00Z", "approved"),
+            references_task("project:v1:rvA", "project:v1:prA"),
+        ];
+        let pack =
+            assemble_pack(&records, &catalog, "RCOV", &win(), 1.0, "v", None).expect("assembles");
+
+        // No reviews section is mapped by this control.
+        assert!(
+            pack.sections.iter().all(|s| s.class != "reviews"),
+            "catalog maps no reviews section"
+        );
+
+        // The approving review NODE is co-located in the review_coverage section
+        // alongside the cited link edge.
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .expect("review_coverage section");
+        assert!(
+            rc.records
+                .iter()
+                .any(|br| br.record.id() == "project:v1:rvA"
+                    && matches!(&br.record, GraphRecord::Node { .. })),
+            "the source approving review node is included in review_coverage: {:?}",
+            rc.records
+                .iter()
+                .map(|br| br.record.id().to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            rc.records
+                .iter()
+                .any(|br| matches!(&br.record, GraphRecord::Edge { label, .. }
+                if label.as_str() == "REFERENCES_TASK")),
+            "the cited coverage link edge is present"
+        );
+
+        // The freshly assembled pack must verify clean against its OWN verify_pack.
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "coverage-only pack integrity: {}",
+            report.integrity.detail
+        );
+        assert!(report.ok, "coverage-only pack must self-verify: {report:?}");
     }
 
     /// Regenerates the committed integration fixture. Runs only when the

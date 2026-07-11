@@ -111,7 +111,7 @@ PR counts as unapproved. The comparison uses fields available today (the review'
 gap, which compares an approval against the PR's final HEAD commit and stays
 `capability_unavailable` until #334 lands.
 
-### Coverage-link edges are included as citable pack content
+### Coverage-link edges and their source reviews are included as citable pack content
 
 The specific `REFERENCES_TASK` edges that substantiate an approval — each linking
 an **included** approving `Review` to an **included** merged-in-window PR — are
@@ -129,6 +129,21 @@ that actually back the coverage count are included: unrelated `REFERENCES_TASK`
 edges, and links to out-of-window or non-approving reviews, never appear. These
 edges are counted in `manifest.included_record_counts` (trust class `other`) and
 `manifest.tuple_counts` (`REFERENCES_TASK/v1`).
+
+The `review_coverage` section **also co-locates the approving-`Review` NODES that
+are the sources** of those cited link edges, so every coverage edge's source
+endpoint resolves during offline `verify` **regardless of whether the catalog maps
+a `reviews` section**. Without this, a custom `--catalog` mapping `review_coverage`
+but not `reviews` would emit the link edges but hold no source-review node, and the
+edge-endpoint check would fail on an assembled-from-an-approved-PR pack. The source
+review nodes are scrubbed, hashed, ordered, and counted like every other section
+row (trust class `project_state`, `Review/vN` tuple). A review node is admitted to
+the section **if and only if it is the source of an included cited coverage edge** —
+no arbitrary review nodes. When the control maps **both** `reviews` and
+`review_coverage` (as the default `CC8.1` does), an approving review appears in both
+sections; that double appearance is intentional (the coverage section stays
+self-contained) and the shared manifest-count recompute keeps it self-consistent
+across `assemble` and `verify`, so it never breaks Integrity or byte-identity.
 
 ## Catalog integration and the three-way class outcome
 
@@ -310,25 +325,31 @@ Re-verifies an assembled pack offline and read-only:
   that maps to no evidence class in a class-scoped section — fails Integrity with a
   redaction-safe detail naming the record id, the section it sits in, and the class
   it actually maps to (ids/labels only). The `review_coverage` section is not
-  class-scoped — its rows are the substantiating `REFERENCES_TASK` link edges (the
-  `ReviewCoverageMeasurement` rides the section's `measurement` field, not a row),
-  which map to no evidence class — so the row-class check cannot apply. Instead,
-  each `review_coverage` row is validated against its **expected shape**: it must
-  be a `REFERENCES_TASK` link edge. This exemption is bounded, not blanket: any
-  other row dropped into `review_coverage` — a `Commit`, a `Symbol`, any node that
-  maps to a real evidence class, or any other edge label — fails Integrity with a
+  class-scoped — its rows are the substantiating `REFERENCES_TASK` link edges and
+  their source approving-`Review` nodes (the `ReviewCoverageMeasurement` rides the
+  section's `measurement` field, not a row) — so the row-class check cannot apply.
+  Instead, each `review_coverage` row is validated against **two expected shapes**:
+  (a) a cited `REFERENCES_TASK` link edge, or (b) an **approving `Review` node that
+  is the source of an included cited coverage edge** (co-located so the edge
+  endpoints resolve offline even when the catalog maps no `reviews` section). This
+  exemption is bounded, not blanket: any other row dropped into `review_coverage` —
+  a `Commit`, a `Symbol`, any node that maps to a real evidence class, an
+  arbitrary/non-approving review, or any other edge label — fails Integrity with a
   redaction-safe detail naming the record id and `unexpected row in review_coverage
   section`, so a tampered pack cannot present unrelated data as coverage evidence.
   Integrity additionally **binds the `review_coverage` rows to the section's
   `ReviewCoverageMeasurement`**, so the swapped-in edge cannot be a valid-shaped
   but unrelated `REFERENCES_TASK` edge that the measurement still claims to
   substantiate. Three checks: (1) the set of `REFERENCES_TASK` edge row ids must
-  **exactly equal** the measurement's cited `approval_link_edge_ids` — no row the
-  measurement does not cite, no cited edge missing from the rows; (2) each coverage
-  edge's endpoints must connect an **approving review to a PR task**, using the same
-  convention `assemble` used to build the edges: its `source` must be an approving
-  `Review` present in the pack (an approving review always resolves in-window, so it
-  always rides the `reviews` section) and its `target`, when present in the pack,
+  **exactly equal** the measurement's cited `approval_link_edge_ids` (only the
+  `REFERENCES_TASK` edge rows are compared — the co-located source review nodes are
+  bound to the edges by the membership rule above, not cited as approval edges) —
+  no edge the measurement does not cite, no cited edge missing from the rows; (2)
+  each coverage edge's endpoints must connect an **approving review to a PR task**,
+  using the same convention `assemble` used to build the edges: its `source` must be
+  an approving `Review` present in the pack (its node is co-located in the
+  `review_coverage` section, and may also ride a mapped `reviews` section) and its
+  `target`, when present in the pack,
   must be a pull-request task (a merged PR whose Task `valid_time` falls outside the
   window is legitimately absent from every section — coverage windows on `merged_at`
   while the PR section windows on `valid_time` — so an *absent* target is not a
@@ -340,10 +361,21 @@ Re-verifies an assembled pack offline and read-only:
   bound rows, Integrity **recomputes and validates the full
   `ReviewCoverageMeasurement`**, since `merged_pr_count`, `coverage`, `passed`,
   and `unapproved_pr_ids` carry no hashed row of their own and could otherwise be
-  edited to show a passing result without disturbing any hashed row: (4)
-  `unapproved_pr_ids` must **exactly equal** the set of PR ids the pack's own
+  edited to show a passing result without disturbing any hashed row: (4) **when the
+  `review_coverage` verdict is `applicable` (gating)**, `unapproved_pr_ids` must
+  **exactly equal** the set of PR ids the pack's own
   `merged_pr_without_approving_review` gap rows cite (both derive from the same
-  merged-but-unapproved set, so they can never legitimately diverge); (5)
+  merged-but-unapproved set, so they can never legitimately diverge). This binding
+  is **gated on the verdict's `applicable` flag** because `assemble` always fills
+  `unapproved_pr_ids` (merged minus approved) but emits the
+  `merged_pr_without_approving_review` gaps **only** for a control that requires
+  PR/review evidence — the same condition under which the verdict is
+  applicable/gating. A control that maps `review_coverage` merely **optional** (or
+  not at all) therefore emits no such gap even with unapproved in-window merged PRs;
+  binding to the empty gap set would wrongly fail its own freshly-assembled pack, so
+  this check is **skipped** when the verdict is `not_applicable` (a safe relaxation —
+  whenever the verdict is applicable the equality holds and is enforced). The
+  arithmetic/coverage/`passed` rechecks (5)–(7) below run in **every** case; (5)
   `merged_pr_count` must equal `approved_pr_count + unapproved_pr_ids.len()`
   (every merged-in-window PR is either approved or unapproved); (6) `coverage` is
   recomputed with `assemble`'s exact formula and IEEE-754 arithmetic
