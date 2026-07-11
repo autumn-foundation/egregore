@@ -2276,6 +2276,31 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                 break 'integrity;
             }
         }
+        // Section membership: the per-record hash binds a row's CONTENT but not
+        // the SECTION it sits in, so a row moved into the wrong section (with
+        // counts fixed) would otherwise verify clean while consumers see it filed
+        // under the wrong evidence class (Codex round-14 Finding 1). Every row in
+        // a class-scoped section must map to that section's evidence class. The
+        // `review_coverage` section is exempt: it legitimately holds the
+        // `ReviewCoverageMeasurement` and `REFERENCES_TASK` link edges, which map
+        // to `None` from `evidence_class_for_record`. In any OTHER section a
+        // `None`-mapping row is itself invalid membership (a section row must map
+        // to that section's class) and fails.
+        if section.class != EvidenceClass::ReviewCoverage.as_wire() {
+            for br in &section.records {
+                let actual = evidence_class_for_record(&br.record).map(|c| c.as_wire());
+                if actual != Some(section.class.as_str()) {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "record {} in section {} maps to evidence class {} (section membership mismatch)",
+                        br.record.id(),
+                        section.class,
+                        actual.unwrap_or("none"),
+                    );
+                    break 'integrity;
+                }
+            }
+        }
         for pair in section.records.windows(2) {
             if section_sort_key(&pair[0].record) > section_sort_key(&pair[1].record) {
                 integrity_passed = false;
@@ -2368,7 +2393,18 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
     if window_ok {
         for g in &pack.gaps {
             let Some(vt) = &g.valid_time else {
-                continue; // untimestamped (missing_valid_time): allowed
+                // Only a `missing_valid_time` gap may be untimestamped; it is
+                // intentionally unwindowed. ANY other gap class with a null
+                // `valid_time` fails Window-consistency — consumers filter gaps by
+                // the manifest window and would drop/misplace an untimestamped one
+                // (Codex round-14 Finding 2). Detail is redaction-safe: the bounded
+                // gap class plus the reason, nothing else.
+                if g.gap_class == GapClass::MissingValidTime.as_wire() {
+                    continue; // untimestamped (missing_valid_time): allowed
+                }
+                window_ok = false;
+                window_detail = format!("gap (class {}) missing required timestamp", g.gap_class);
+                break;
             };
             let which = parse_rfc3339(vt).map_or(Some("malformed"), |t| {
                 match (
@@ -4886,6 +4922,137 @@ mod pack338_tests {
             "untimestamped (None) gaps must pass Window-consistency: {}",
             report.window_consistency.detail
         );
+    }
+
+    /// Codex round-14 P2 (Finding 1): Integrity binds each row to its section's
+    /// evidence class. A row moved into the wrong section — with both sections'
+    /// `record_count` fixed and hashes/manifest counts left valid (they are
+    /// content-addressed / content-keyed, not section-keyed) — passes every other
+    /// Integrity check yet is filed under the wrong evidence class. Membership must
+    /// fail Integrity naming the record and both classes.
+    #[test]
+    fn verify_fails_when_row_is_filed_under_wrong_section_class() {
+        let mut pack = assemble_cc81();
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "baseline pack passes Integrity"
+        );
+
+        // Move a Commit row out of `commits` into `reviews`.
+        let commit_idx = pack
+            .sections
+            .iter()
+            .position(|s| s.class == "commits")
+            .expect("commits section");
+        assert!(
+            !pack.sections[commit_idx].records.is_empty(),
+            "commits section has rows to move"
+        );
+        let moved = pack.sections[commit_idx].records.remove(0);
+        pack.sections[commit_idx].record_count -= 1;
+        let moved_id = moved.record.id().to_owned();
+
+        let reviews_idx = pack
+            .sections
+            .iter()
+            .position(|s| s.class == "reviews")
+            .expect("reviews section");
+        pack.sections[reviews_idx].records.push(moved);
+        // Keep the reviews section canonically ordered so the ordering check is
+        // not what fails — only section membership is wrong.
+        pack.sections[reviews_idx]
+            .records
+            .sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
+        pack.sections[reviews_idx].record_count += 1;
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a mis-filed row must fail Integrity via section membership"
+        );
+        assert!(
+            report.integrity.detail.contains(&moved_id),
+            "detail names the mis-filed record: {}",
+            report.integrity.detail
+        );
+        assert!(
+            report.integrity.detail.contains("reviews"),
+            "detail names the section it sits in: {}",
+            report.integrity.detail
+        );
+        assert!(
+            report.integrity.detail.contains("commits"),
+            "detail names the class the record actually maps to: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-14 P2 (Finding 1, exception): the `review_coverage` section
+    /// legitimately holds the `ReviewCoverageMeasurement` and `REFERENCES_TASK`
+    /// link edges, both of which map to `None` from `evidence_class_for_record`.
+    /// The membership check must exempt `review_coverage` so a clean pack passes.
+    #[test]
+    fn verify_allows_review_coverage_section_membership() {
+        let pack = assemble_cc81();
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .expect("review_coverage section");
+        assert!(
+            rc.records
+                .iter()
+                .any(|br| evidence_class_for_record(&br.record).is_none()),
+            "review_coverage section carries rows that map to no evidence class"
+        );
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "review_coverage membership must not fail Integrity: {}",
+            verify_pack(&pack).integrity.detail
+        );
+    }
+
+    /// Codex round-14 P2 (Finding 2): only a `missing_valid_time` gap may be
+    /// untimestamped. A `merged_pr_without_approving_review` gap whose timestamp
+    /// was stripped must FAIL Window-consistency — consumers filter gaps by the
+    /// manifest window and would drop/misplace an untimestamped one.
+    #[test]
+    fn verify_fails_when_non_missing_valid_time_gap_lacks_timestamp() {
+        let mut pack = assemble_cc81();
+        assert!(
+            verify_pack(&pack).window_consistency.passed,
+            "clean pack passes Window-consistency"
+        );
+        let idx = pack
+            .gaps
+            .iter()
+            .position(|g| g.gap_class == "merged_pr_without_approving_review")
+            .expect("fixture carries a merged_pr_without_approving_review gap");
+        pack.gaps[idx].valid_time = None;
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.window_consistency.passed,
+            "a non-missing_valid_time gap with null valid_time must fail Window-consistency"
+        );
+        assert!(
+            report
+                .window_consistency
+                .detail
+                .contains("merged_pr_without_approving_review"),
+            "detail names the gap class: {}",
+            report.window_consistency.detail
+        );
+        assert!(
+            report
+                .window_consistency
+                .detail
+                .contains("missing required timestamp"),
+            "detail states the reason: {}",
+            report.window_consistency.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
     }
 
     /// Codex round-10 P1: a secret injected into a `diagnostics[*].detail` (a

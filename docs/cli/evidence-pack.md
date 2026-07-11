@@ -302,6 +302,16 @@ Re-verifies an assembled pack offline and read-only:
   length check still matches) but the manifest aggregates left stale therefore
   fails Integrity, with a redaction-safe detail naming the divergent aggregate,
   the first divergent key, and the stored-vs-recomputed numbers (never a payload).
+  Integrity also **binds each row to its section's evidence class**: the per-record
+  hash covers a row's content but not the section it sits in, so a row moved into
+  the wrong section (with both sections' `record_count` fixed and hashes/manifest
+  counts left valid) is caught here. Every row in a class-scoped section must map,
+  via `evidence_class_for_record`, to that section's class; a mismatch — or a row
+  that maps to no evidence class in a class-scoped section — fails Integrity with a
+  redaction-safe detail naming the record id, the section it sits in, and the class
+  it actually maps to (ids/labels only). The `review_coverage` section is exempt
+  from this row-class check: it legitimately carries the `ReviewCoverageMeasurement`
+  and `REFERENCES_TASK` link edges, which map to no evidence class.
 - **Coverage** — recompute the #65 citation thresholds (>=95% code rows cited;
   100% non-code rows cited).
 - **Safety** — scans the **entire serialized pack artifact** for raw sensitive
@@ -333,7 +343,10 @@ Re-verifies an assembled pack offline and read-only:
   Window-consistency with a redaction-safe detail naming the gap class, which
   bound was violated, and the gap's own (allow-listed) valid time. **Exception:**
   a `missing_valid_time` gap is intentionally untimestamped (`valid_time: null`)
-  and is allowed, never flagged.
+  and is allowed, never flagged. Only `missing_valid_time` may be untimestamped:
+  any OTHER gap class (e.g. `merged_pr_without_approving_review`,
+  `commit_outside_any_pr`) with a `null` `valid_time` fails Window-consistency with
+  a redaction-safe detail naming the gap class and `missing required timestamp`.
 
 `verify` scans the **raw supplied artifact** for secrets **before** (and
 independently of) deserialization. serde silently discards unknown object keys
