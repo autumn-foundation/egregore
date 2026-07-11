@@ -1519,9 +1519,15 @@ fn pr_looks_merged(record: &GraphRecord) -> bool {
 /// #333) falls in the half-open window (never its Task `valid_time`, which the
 /// importer stamps from `github_updated_at`). An approving review counts only when
 /// it is a genuine approving PR review (`review_kind` allow-list + `approved`
-/// state), references the PR via `REFERENCES_TASK`, resolves in-window, and is
-/// valid AT OR BEFORE the PR's merge time (a post-merge approval did not gate the
-/// merge).
+/// state), references the PR via `REFERENCES_TASK`, and is valid AT OR BEFORE the
+/// PR's merge time (a post-merge approval did not gate the merge). The review's
+/// OWN position relative to the window does not gate it: an approval submitted
+/// before the window `from` but at or before merge still counts (Codex Finding 2).
+///
+/// A merged PR whose `merged_at` is present but unparseable (or absent while the
+/// PR otherwise looks merged) has no window-resolvable merge time and is excluded
+/// under the counted `excluded_unresolvable_merge_time` diagnostic — never
+/// silently dropped and never windowed on update time (Codex Finding 1).
 #[must_use]
 #[allow(
     clippy::too_many_lines,
@@ -1543,11 +1549,22 @@ pub fn derive_review_coverage(
             Some(merge_time) if in_window(merge_time, window) => {
                 merged_pr_ids.push(record.id().to_owned());
             }
-            Some(_) => {} // parsed, out of window: excluded, no diagnostic
+            // A RESOLVABLE (parseable) merge time that falls outside the window is
+            // correctly excluded and NOT diagnosed.
+            Some(merge_time) if parse_rfc3339(merge_time).is_some() => {}
+            // A merged github_pr whose `merged_at` is present but UNPARSEABLE has
+            // no window-resolvable merge time. It is excluded under a counted
+            // diagnostic — never silently dropped as if it were merely out of
+            // window (Codex Finding 1). `merged_pr_merge_time` only returns Some
+            // for a github_pr with a non-empty `merged_at`, so this record already
+            // qualifies as a merged PR with an unresolvable merge time.
+            Some(_) => {
+                excluded_unresolvable_merge_time.push(record.id().to_owned());
+            }
             None => {
                 // A PR that LOOKS merged (carries a merge_commit_sha) but has no
-                // window-resolvable merge time is excluded under a counted
-                // diagnostic — never windowed on update time (round-5 P1).
+                // `merged_at` at all is excluded under the same counted diagnostic
+                // — never windowed on update time (round-5 P1).
                 if pr_looks_merged(record) {
                     excluded_unresolvable_merge_time.push(record.id().to_owned());
                 }
@@ -1598,9 +1615,11 @@ pub fn derive_review_coverage(
         let Some(review_vt) = resolve_valid_time(review) else {
             continue;
         };
-        if !in_window(&review_vt, window) {
-            continue;
-        }
+        // The reporting window bounds which PRs are IN SCOPE (via `merged_at`), NOT
+        // which approvals count. An approving review submitted BEFORE the window
+        // `from` but at or before the PR's merge legitimately gated that merge, so
+        // the review's own position relative to `[from, to)` must not disqualify it
+        // (Codex Finding 2). The only temporal gate is at-or-before `merged_at`.
         let Some(review_ts) = parse_rfc3339(&review_vt) else {
             continue;
         };
@@ -1745,15 +1764,14 @@ pub fn derive_review_coverage(
             }
         }
 
-        let (approving_review_id, review_commit_sha, approver_login) =
-            match (verdict, deciding) {
-                (ReviewVerdict::Covered, Some(e)) => (
-                    Some(e.link.review_id.to_owned()),
-                    review_commit_sha_of(e.link.review).map(str::to_owned),
-                    author_login(e.link.review).map(str::to_owned),
-                ),
-                _ => (None, None, None),
-            };
+        let (approving_review_id, review_commit_sha, approver_login) = match (verdict, deciding) {
+            (ReviewVerdict::Covered, Some(e)) => (
+                Some(e.link.review_id.to_owned()),
+                review_commit_sha_of(e.link.review).map(str::to_owned),
+                author_login(e.link.review).map(str::to_owned),
+            ),
+            _ => (None, None, None),
+        };
 
         rows.push(ReviewCoverageRow {
             pr_task_id: pr_id.clone(),
@@ -4800,6 +4818,118 @@ mod pack338_tests {
             .expect("review_coverage measurement");
         assert_eq!(rc.approved_pr_count, 1);
         assert!(rc.unapproved_pr_ids.is_empty());
+    }
+
+    /// Codex Finding 2: an approving review submitted BEFORE the window `from`
+    /// (but at or before the PR's `merged_at`) legitimately gated the merge and
+    /// MUST count as coverage. The reporting window bounds which PRs are in scope
+    /// (via `merged_at`), not which approvals count. Before the fix the review's
+    /// own out-of-window position dropped it, wrongly classifying a PR approved
+    /// near a period boundary as `uncovered`.
+    #[test]
+    fn approval_before_window_but_before_merge_counts_as_covered() {
+        use super::fixture::{pr, references_task, review};
+        // PR merges inside the March window; its sole approving review was
+        // submitted in February — before `from` (2026-03-01) yet before the merge.
+        let records = vec![
+            pr("project:v1:prX", "2026-03-15T12:00:00Z", "cX"),
+            review("project:v1:rvX", "2026-02-20T08:00:00Z", "approved"),
+            references_task("project:v1:rvX", "project:v1:prX"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+
+        assert!(
+            !pack
+                .gaps
+                .iter()
+                .any(|g| g.gap_class == "merged_pr_without_approving_review"
+                    && g.record_ids.contains(&"project:v1:prX".to_owned())),
+            "pre-window approval before merge must suppress the gap: gaps={:?}",
+            pack.gaps
+        );
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_ref())
+            .expect("review_coverage measurement");
+        assert_eq!(rc.merged_pr_count, 1);
+        assert_eq!(
+            rc.approved_pr_count, 1,
+            "a review before the window but before merge legitimately gated it"
+        );
+        assert!(rc.unapproved_pr_ids.is_empty());
+    }
+
+    /// Codex Finding 1: a merged `github_pr` whose `merged_at` is present but
+    /// UNPARSEABLE has no window-resolvable merge time. It must be routed to the
+    /// counted `excluded_unresolvable_merge_time` diagnostic, never silently
+    /// dropped as if it were merely merged out of window. A PR whose `merged_at`
+    /// parses but falls outside the window stays correctly excluded WITHOUT a
+    /// diagnostic.
+    #[test]
+    fn malformed_merged_at_is_counted_unresolvable_not_dropped() {
+        use super::fixture::pr_with_merge_time;
+        let records = vec![
+            // Present-but-malformed merged_at on a merged github_pr.
+            pr_with_merge_time(
+                "project:v1:prBad",
+                "2026-03-15T08:00:00Z", // updated_at -> Task valid_time
+                "not-a-timestamp",      // merged_at -> unparseable merge time
+                "cBad",
+            ),
+            // Parseable merge time cleanly outside the window: excluded, NOT a
+            // diagnostic (guards against over-counting).
+            pr_with_merge_time(
+                "project:v1:prOut",
+                "2026-03-15T08:00:00Z",
+                "2026-02-15T12:00:00Z", // before window
+                "cOut",
+            ),
+        ];
+        let derivation = derive_review_coverage(
+            &records,
+            &win(),
+            ReviewCoverageOptions {
+                require_non_author: false,
+                require_final_head: false,
+            },
+        );
+
+        assert!(
+            derivation
+                .excluded_unresolvable_merge_time
+                .contains(&"project:v1:prBad".to_owned()),
+            "PR with malformed merged_at must be counted unresolvable: {:?}",
+            derivation.excluded_unresolvable_merge_time
+        );
+        assert!(
+            !derivation
+                .merged_pr_ids
+                .contains(&"project:v1:prBad".to_owned()),
+            "PR with malformed merged_at must not be in the merged set"
+        );
+        // The out-of-window (but parseable) PR is excluded WITHOUT a diagnostic.
+        assert!(
+            !derivation
+                .excluded_unresolvable_merge_time
+                .contains(&"project:v1:prOut".to_owned()),
+            "a resolvable out-of-window merge time must not be diagnosed unresolvable"
+        );
+        assert!(
+            !derivation
+                .merged_pr_ids
+                .contains(&"project:v1:prOut".to_owned())
+        );
     }
 
     /// Codex round-5 P1: a PR MERGED inside the window but whose Task
