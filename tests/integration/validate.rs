@@ -165,7 +165,10 @@ fn log_edge_line(id: &str, label: &str, source: &str, target: &str) -> String {
 
 /// Appends a fully well-formed log subgraph (issue #319): a `LogSource`, an
 /// `ErrorSignature` captured from it, a `LogEvent` fingerprinted+captured, and
-/// a `LogOccurrenceBucket` aggregated+captured. Clean under every check.
+/// a `LogOccurrenceBucket` aggregated. The bucket carries NO `CAPTURED_FROM`:
+/// its `LogSource` is reached via the signature, and a bucket source is a
+/// disallowed `CAPTURED_FROM` source kind (issue #327 source-kind allow-list).
+/// Clean under every check.
 fn append_clean_log_subgraph(graph: &Path) {
     append_lines(
         graph,
@@ -197,12 +200,6 @@ fn append_clean_log_subgraph(graph: &Path) {
                 "AGGREGATES",
                 "log:v1:bucket",
                 "log:v1:sig",
-            ),
-            log_edge_line(
-                "log:v1:e-bkt-cap",
-                "CAPTURED_FROM",
-                "log:v1:bucket",
-                "log:v1:source",
             ),
         ],
     );
@@ -746,6 +743,48 @@ fn validate_detects_aggregates_to_wrong_kind() {
     assert_eq!(
         agg[0]["allowed_kinds"],
         serde_json::json!(["ErrorSignature"])
+    );
+}
+
+#[test]
+fn validate_detects_bucket_captured_from_source_kind_violation() {
+    let (_temp, graph) = fixture_graph();
+    append_clean_log_subgraph(&graph);
+    // The Codex-review bug: a `LogOccurrenceBucket —CAPTURED_FROM→ LogSource`
+    // has an allowed TARGET but a disallowed SOURCE kind (a bucket is never a
+    // CAPTURED_FROM source; issue #327). The bucket keeps its required
+    // AGGREGATES so the only injected defect is the source-kind violation.
+    append_lines(
+        &graph,
+        &[
+            log_node_line("log:v1:bucket3", "LogOccurrenceBucket", "bad-source bucket"),
+            log_edge_line(
+                "log:v1:e-bkt3-agg",
+                "AGGREGATES",
+                "log:v1:bucket3",
+                "log:v1:sig",
+            ),
+            log_edge_line(
+                "log:v1:e-bkt3-cap",
+                "CAPTURED_FROM",
+                "log:v1:bucket3",
+                "log:v1:source",
+            ),
+        ],
+    );
+    let (code, lines) = run_validate(&graph);
+    assert_eq!(code, 1);
+    let (diagnostics, _summary) = split_output(&lines);
+    let violations = diagnostics_with_code(diagnostics, "edge_source_kind_violation");
+    assert_eq!(violations.len(), 1, "got {diagnostics:?}");
+    assert_eq!(violations[0]["edge_id"], "log:v1:e-bkt3-cap");
+    assert_eq!(violations[0]["relation"], "CAPTURED_FROM");
+    assert_eq!(violations[0]["endpoint"], "source");
+    assert_eq!(violations[0]["record_id"], "log:v1:bucket3");
+    assert_eq!(violations[0]["kind"], "LogOccurrenceBucket");
+    assert_eq!(
+        violations[0]["allowed_kinds"],
+        serde_json::json!(["ErrorSignature", "LogEvent"])
     );
 }
 

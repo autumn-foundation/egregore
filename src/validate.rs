@@ -23,6 +23,14 @@ pub const DANGLING_EDGE_ENDPOINT: &str = "dangling_edge_endpoint";
 /// Stable defect category: a typed edge whose target node is present but of a
 /// disallowed kind for the relation.
 pub const EDGE_TARGET_KIND_VIOLATION: &str = "edge_target_kind_violation";
+/// Stable defect category: a typed edge whose source node is present but of a
+/// disallowed kind for the relation (issue #327).
+///
+/// The source-side companion to `edge_target_kind_violation`. The log schema
+/// frames every log structural edge directionally, so a schema-correct target
+/// with a wrong-kind source — e.g. a `LogOccurrenceBucket —CAPTURED_FROM→
+/// LogSource` — is invalid attribution the pre-ingest gate must reject.
+pub const EDGE_SOURCE_KIND_VIOLATION: &str = "edge_source_kind_violation";
 /// Stable defect category: an edge endpoint that resolves only to a tombstone
 /// (the record is deleted and no node record with the same ID supersedes it).
 pub const EDGE_TO_TOMBSTONED_RECORD: &str = "edge_to_tombstoned_record";
@@ -137,6 +145,38 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
             NodeKind::AgentTurn,
             NodeKind::AgentSession,
         ]),
+        _ => None,
+    }
+}
+
+/// Allowed SOURCE node kinds for the log-domain typed relations (issue #327).
+///
+/// The SOURCE-side companion to `allowed_target_kinds`. `docs/schema/log-graph.md`
+/// frames every log structural edge directionally, so an edge whose target is a
+/// schema-correct kind but whose source is not (e.g. a `LogOccurrenceBucket
+/// —CAPTURED_FROM→ LogSource`, a source kind the schema never emits) is invalid
+/// attribution that the pre-ingest gate must reject. Only the five log labels
+/// are constrained; every other label returns `None` (unconstrained) via the
+/// `_ => None` arm, so code-graph edges keep their existing source-unconstrained
+/// behavior and cannot regress.
+const fn allowed_source_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
+    match label {
+        // `LogEvent —FINGERPRINTED_AS→ ErrorSignature`: only a log exemplar is
+        // fingerprinted as a signature (docs/schema/log-graph.md).
+        EdgeLabel::FingerprintedAs => Some(&[NodeKind::LogEvent]),
+        // `{ErrorSignature|LogEvent} —CAPTURED_FROM→ LogSource`: only a signature
+        // or an exemplar is captured from a source — NOT a `LogOccurrenceBucket`,
+        // whose `LogSource` is reached transitively via its signature's own
+        // `CAPTURED_FROM` (docs/schema/log-graph.md).
+        EdgeLabel::CapturedFrom => Some(&[NodeKind::ErrorSignature, NodeKind::LogEvent]),
+        // `LogOccurrenceBucket —AGGREGATES→ ErrorSignature`: only an hourly
+        // bucket aggregates a signature (docs/schema/log-graph.md).
+        EdgeLabel::Aggregates => Some(&[NodeKind::LogOccurrenceBucket]),
+        // `ErrorSignature —FRAME_RESOLVES_TO→ …` (#322) and
+        // `ErrorSignature —EMITTED_DURING→ …` (reserved #323) both originate at a
+        // signature only (docs/schema/log-graph.md). Combined because the source
+        // set is identical (clippy `match_same_arms`).
+        EdgeLabel::FrameResolvesTo | EdgeLabel::EmittedDuring => Some(&[NodeKind::ErrorSignature]),
         _ => None,
     }
 }
@@ -406,6 +446,27 @@ fn check_edges<'a>(
             index.cite_node(&mut diagnostic, target);
             diagnostics.insert(diagnostic);
         }
+
+        // Typed relation source-kind check (present sources only; a missing or
+        // tombstoned source is already reported above). Mirrors the target-kind
+        // check for the source endpoint: log structural edges are directional
+        // (issue #327), so a schema-correct target with a wrong-kind source is
+        // invalid attribution.
+        if let (Some(allowed), Some(kinds)) = (
+            allowed_source_kinds(*label),
+            index.node_kinds.get(source.as_str()),
+        ) && !kinds.iter().any(|kind| allowed.contains(kind))
+        {
+            let mut diagnostic = ValidationDiagnostic::new(EDGE_SOURCE_KIND_VIOLATION);
+            diagnostic.edge_id = Some(edge_id.clone());
+            diagnostic.relation = Some(label.as_str().to_owned());
+            diagnostic.endpoint = Some("source");
+            diagnostic.record_id = Some(source.clone());
+            diagnostic.kind = kinds.iter().next().map(|kind| kind.as_str());
+            diagnostic.allowed_kinds = Some(allowed.iter().map(|kind| kind.as_str()).collect());
+            index.cite_node(&mut diagnostic, source);
+            diagnostics.insert(diagnostic);
+        }
     }
     (incident, stranded_by_deleted)
 }
@@ -646,7 +707,9 @@ fn check_log_completeness(
 /// 1. every edge endpoint (source and target) resolves to a node present in
 ///    the graph (`dangling_edge_endpoint`);
 /// 2. every `DEFINES`, `CONTAINS`, `CALLS`, `IMPORTS`, and `MENTIONS` edge
-///    target is a node of an allowed kind (`edge_target_kind_violation`);
+///    target is a node of an allowed kind (`edge_target_kind_violation`), and
+///    every log-domain structural edge additionally has a source of an allowed
+///    kind (`edge_source_kind_violation`, issue #327);
 /// 3. no edge references a tombstoned-and-unsuperseded record — a tombstoned
 ///    ID with no surviving node record (`edge_to_tombstoned_record`);
 /// 4. no record is named by a tombstone yet still referenced by a live edge
@@ -988,7 +1051,10 @@ mod tests {
 
     /// Builds a minimal well-formed log graph clean under every check: a
     /// `LogSource`, an `ErrorSignature` captured from it, a `LogEvent`
-    /// fingerprinted+captured, and a `LogOccurrenceBucket` aggregated+captured.
+    /// fingerprinted+captured, and a `LogOccurrenceBucket` aggregated. The
+    /// bucket carries NO `CAPTURED_FROM`: its `LogSource` is reached via the
+    /// signature, and a bucket source is a disallowed `CAPTURED_FROM` source
+    /// kind (issue #327 source-kind allow-list).
     fn clean_log_records() -> Vec<GraphRecord> {
         vec![
             node("n:source", NodeKind::LogSource),
@@ -999,7 +1065,6 @@ mod tests {
             edge("e:evt-fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
             edge("e:evt-cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
             edge("e:bkt-agg", EdgeLabel::Aggregates, "n:bucket", "n:sig"),
-            edge("e:bkt-cap", EdgeLabel::CapturedFrom, "n:bucket", "n:source"),
         ]
     }
 
@@ -1007,6 +1072,103 @@ mod tests {
     fn well_formed_log_graph_is_clean() {
         let report = validate_records(&clean_log_records());
         assert!(report.is_clean(), "got {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn all_log_edges_with_correct_sources_are_clean() {
+        // Every log structural label exercised with a schema-correct source:
+        // FINGERPRINTED_AS(LogEvent→ErrorSignature), CAPTURED_FROM from both an
+        // ErrorSignature and a LogEvent, and AGGREGATES(bucket→ErrorSignature).
+        // No source-kind violation must fire.
+        let records = vec![
+            node("n:source", NodeKind::LogSource),
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:event", NodeKind::LogEvent),
+            node("n:bucket", NodeKind::LogOccurrenceBucket),
+            edge("e:evt-fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
+            edge("e:sig-cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
+            edge("e:evt-cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+            edge("e:bkt-agg", EdgeLabel::Aggregates, "n:bucket", "n:sig"),
+        ];
+        let report = validate_records(&records);
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn bucket_captured_from_source_is_rejected() {
+        // The Codex-review bug: a `LogOccurrenceBucket —CAPTURED_FROM→ LogSource`
+        // has an allowed TARGET (LogSource) but a disallowed SOURCE kind (a
+        // bucket is never a CAPTURED_FROM source). The bucket keeps its required
+        // AGGREGATES so the ONLY defect is the source-kind violation.
+        let records = vec![
+            node("n:bucket", NodeKind::LogOccurrenceBucket),
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:source", NodeKind::LogSource),
+            edge("e:bkt-agg", EdgeLabel::Aggregates, "n:bucket", "n:sig"),
+            edge("e:sig-cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
+            edge("e:bkt-cap", EdgeLabel::CapturedFrom, "n:bucket", "n:source"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![EDGE_SOURCE_KIND_VIOLATION], "got {codes:?}");
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.relation.as_deref(), Some("CAPTURED_FROM"));
+        assert_eq!(diagnostic.record_id.as_deref(), Some("n:bucket"));
+        assert_eq!(diagnostic.edge_id.as_deref(), Some("e:bkt-cap"));
+        assert_eq!(diagnostic.endpoint, Some("source"));
+        assert_eq!(diagnostic.kind, Some("LogOccurrenceBucket"));
+        assert_eq!(
+            diagnostic.allowed_kinds.as_deref(),
+            Some(&["ErrorSignature", "LogEvent"][..])
+        );
+    }
+
+    #[test]
+    fn fingerprinted_as_from_wrong_source_is_rejected() {
+        // FINGERPRINTED_AS must originate at a LogEvent; a LogSource source is a
+        // source-kind violation even though the ErrorSignature target is allowed.
+        let records = vec![
+            node("n:source", NodeKind::LogSource),
+            node("n:sig", NodeKind::ErrorSignature),
+            edge("e:fp", EdgeLabel::FingerprintedAs, "n:source", "n:sig"),
+            edge("e:sig-cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![EDGE_SOURCE_KIND_VIOLATION], "got {codes:?}");
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.relation.as_deref(), Some("FINGERPRINTED_AS"));
+        assert_eq!(diagnostic.record_id.as_deref(), Some("n:source"));
+        assert_eq!(diagnostic.kind, Some("LogSource"));
+        assert_eq!(diagnostic.allowed_kinds.as_deref(), Some(&["LogEvent"][..]));
+    }
+
+    #[test]
+    fn aggregates_from_wrong_source_is_rejected() {
+        // AGGREGATES must originate at a LogOccurrenceBucket; a LogEvent source
+        // is a source-kind violation even though the ErrorSignature target is
+        // allowed. The event keeps its own required edges so it is otherwise
+        // well-formed and only the aggregates source offends.
+        let records = vec![
+            node("n:event", NodeKind::LogEvent),
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:source", NodeKind::LogSource),
+            edge("e:evt-fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
+            edge("e:evt-cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+            edge("e:sig-cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
+            edge("e:agg", EdgeLabel::Aggregates, "n:event", "n:sig"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![EDGE_SOURCE_KIND_VIOLATION], "got {codes:?}");
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.relation.as_deref(), Some("AGGREGATES"));
+        assert_eq!(diagnostic.record_id.as_deref(), Some("n:event"));
+        assert_eq!(diagnostic.kind, Some("LogEvent"));
+        assert_eq!(
+            diagnostic.allowed_kinds.as_deref(),
+            Some(&["LogOccurrenceBucket"][..])
+        );
     }
 
     #[test]

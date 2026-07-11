@@ -68,6 +68,27 @@ same input is byte-identical.
    | `FRAME_RESOLVES_TO` | `Symbol`, `File`, `Diagnostic` (issue #322 resolution ladder) |
    | `EMITTED_DURING` | `CommandRun`, `AgentTurn`, `AgentSession` (reserved for issue #323) |
 
+2a. **Typed log-domain edge source kinds** (issue #327) — the log schema frames
+   every log structural edge *directionally*, so the pre-ingest gate also
+   constrains the SOURCE kind of the five log relations
+   (`edge_source_kind_violation`). Code-graph relations are source-unconstrained
+   and unaffected. Presenting the log constraints directionally
+   (source kind → relation → target kind):
+
+   | Source kind | Relation | Target kind |
+   |-------------|----------|-------------|
+   | `LogEvent` | `FINGERPRINTED_AS` | `ErrorSignature` |
+   | `ErrorSignature`, `LogEvent` | `CAPTURED_FROM` | `LogSource` |
+   | `LogOccurrenceBucket` | `AGGREGATES` | `ErrorSignature` |
+   | `ErrorSignature` | `FRAME_RESOLVES_TO` | `Symbol`, `File`, `Diagnostic` |
+   | `ErrorSignature` | `EMITTED_DURING` | `CommandRun`, `AgentTurn`, `AgentSession` (reserved) |
+
+   A `LogOccurrenceBucket` is deliberately **not** an allowed `CAPTURED_FROM`
+   source: a bucket's `LogSource` is reached transitively via its signature's
+   own `CAPTURED_FROM`, so a `LogOccurrenceBucket —CAPTURED_FROM→ LogSource`
+   edge — whose target is a legitimate `LogSource` — is invalid source
+   attribution the gate rejects rather than accepting as clean.
+
 3. **Edges to tombstoned records** — no edge references a
    tombstoned-and-unsuperseded record: an ID named by a tombstone with no
    surviving node record of the same ID (`edge_to_tombstoned_record`). A
@@ -143,6 +164,7 @@ spans, and counts.
 ```json
 {"code":"dangling_edge_endpoint","edge_id":"codegraph:v5:…","relation":"CALLS","endpoint":"target","missing_id":"codegraph:v5:…"}
 {"code":"edge_target_kind_violation","edge_id":"codegraph:v5:…","relation":"DEFINES","target_id":"codegraph:v5:…","target_kind":"Import","allowed_kinds":["Symbol"],"repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":12,"start_line":1,"end_line":1}}
+{"code":"edge_source_kind_violation","edge_id":"log:v1:…","relation":"CAPTURED_FROM","endpoint":"source","allowed_kinds":["ErrorSignature","LogEvent"],"record_id":"log:v1:…","kind":"LogOccurrenceBucket","repo_relative_path":"app.log","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
 {"code":"edge_to_tombstoned_record","edge_id":"codegraph:v5:…","relation":"CALLS","endpoint":"target","tombstoned_id":"codegraph:v5:…","tombstone_id":"codegraph:v5:…"}
 {"code":"orphan_node","record_id":"codegraph:v5:…","kind":"Symbol","repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
 {"code":"tombstone_strands_live_edge","tombstone_id":"codegraph:v5:…","deleted_id":"codegraph:v5:…","stranded_edge_ids":["codegraph:v5:…"],"repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
