@@ -2459,18 +2459,70 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     // `valid_time` falls outside the window is legitimately
                     // absent from every section (coverage windows on
                     // `merged_at`, the PR section on `valid_time`), so an
-                    // ABSENT target is not a defect; a PRESENT target that is
-                    // not a pull-request task is.
-                    if let Some(rec) = node_by_id.get(target.as_str())
-                        && evidence_class_for_record(rec) != Some(EvidenceClass::PullRequests)
-                    {
-                        integrity_passed = false;
-                        integrity_detail = format!(
-                            "review_coverage edge {} target {target} is present in \
+                    // ABSENT target is not a defect (round-16/18) and cannot be
+                    // merge-time-checked. A PRESENT target must be a
+                    // pull-request task AND additionally satisfy `assemble_pack`'s
+                    // exact coverage-edge eligibility (Codex round-19 P1): the
+                    // endpoint-shape check alone let a tampered pack re-point a
+                    // coverage edge at any approving-review -> PR pair (a
+                    // post-merge approval, or a PR present for other reasons but
+                    // not merged in-window), recompute hashes + counts, and still
+                    // substantiate `approved_pr_count` offline. Mirror assemble:
+                    //   (a) the target PR is MERGED IN-WINDOW — it carries a
+                    //       `merged_at` (round-5 merge time) whose parsed value
+                    //       falls in the half-open manifest window (the
+                    //       `merged_pr_ids` selection); and
+                    //   (b) the SOURCE review's resolved valid time is AT OR
+                    //       BEFORE that `merged_at` (the at-or-before-merge gate,
+                    //       round-9), so a post-merge approval cannot count.
+                    if let Some(target_rec) = node_by_id.get(target.as_str()) {
+                        if evidence_class_for_record(target_rec)
+                            != Some(EvidenceClass::PullRequests)
+                        {
+                            integrity_passed = false;
+                            integrity_detail = format!(
+                                "review_coverage edge {} target {target} is present in \
                                  the pack but is not a pull-request task",
-                            br.record.id(),
-                        );
-                        break 'integrity;
+                                br.record.id(),
+                            );
+                            break 'integrity;
+                        }
+                        // (a) present target must be merged in-window: it has a
+                        //     `merged_at` whose parsed time is inside the manifest
+                        //     window (assemble's `merged_pr_ids` predicate).
+                        let Some(merged_at) = merged_pr_merge_time(target_rec)
+                            .filter(|mt| in_window(mt, &pack.manifest.window))
+                            .and_then(parse_rfc3339)
+                        else {
+                            integrity_passed = false;
+                            integrity_detail = format!(
+                                "review_coverage edge {} target {target} is present but is \
+                                 not a merged-in-window PR (no merged_at inside the manifest \
+                                 window)",
+                                br.record.id(),
+                            );
+                            break 'integrity;
+                        };
+                        // (b) source review's resolved valid time must be AT OR
+                        //     BEFORE the target's `merged_at` (post-merge approval
+                        //     does not gate the merge). The source node is present
+                        //     and approving per the check above.
+                        let source_at_or_before_merge = node_by_id
+                            .get(source.as_str())
+                            .and_then(|rec| resolve_valid_time(rec))
+                            .as_deref()
+                            .and_then(parse_rfc3339)
+                            .is_some_and(|rt| rt <= merged_at);
+                        if !source_at_or_before_merge {
+                            integrity_passed = false;
+                            integrity_detail = format!(
+                                "review_coverage edge {} source {source} review valid time \
+                                 is after the target {target} merged_at (post-merge approval \
+                                 does not gate the merge)",
+                                br.record.id(),
+                            );
+                            break 'integrity;
+                        }
                     }
                 }
                 // (3) `approved_pr_count` must equal the distinct PR targets
@@ -6343,6 +6395,209 @@ mod pack338_tests {
             report.integrity.detail
         );
         assert!(report.ok, "coverage-only pack must self-verify: {report:?}");
+    }
+
+    /// Codex round-19 P1: `assemble_pack` counts a coverage edge only when the
+    /// SOURCE approving review's resolved valid time is AT OR BEFORE the target
+    /// PR's `merged_at` (the at-or-before-merge gate, round-9). `verify_pack`'s
+    /// endpoint check only proved a PRESENT target maps to `PullRequests`, so a
+    /// tampered pack could move an included review's valid time to AFTER the
+    /// merge (still in-window), recompute its row hash, and turn a post-merge
+    /// approval into apparent coverage. verify must re-enforce the gate for
+    /// PRESENT targets.
+    #[test]
+    fn verify_fails_when_coverage_source_review_is_post_merge() {
+        let mut pack = assemble_cc81();
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "baseline pack passes Integrity"
+        );
+        // pr01 merged_at == 2026-03-03T12:00:00Z; rv01 approves it at 08:00
+        // (before merge). Move rv01's valid time to 20:00 the same day: still
+        // in-window, but now AFTER pr01's merge time — a post-merge approval.
+        let post_merge = "2026-03-03T20:00:00Z";
+        let mut touched = false;
+        for section in &mut pack.sections {
+            for br in &mut section.records {
+                if br.record.id() == "project:v1:rv01" {
+                    if let GraphRecord::Node { valid_time, .. } = &mut br.record {
+                        *valid_time = Some(post_merge.to_owned());
+                    }
+                    br.hash = blake3::hash(serde_json::to_string(&br.record).unwrap().as_bytes())
+                        .to_string();
+                    touched = true;
+                }
+            }
+            section
+                .records
+                .sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
+        }
+        assert!(touched, "rv01 is present as a pack row to tamper");
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a coverage edge whose source review approves AFTER the target's merge \
+             must fail Integrity"
+        );
+        assert!(
+            report.integrity.detail.contains("project:v1:rv01")
+                && report.integrity.detail.contains("project:v1:pr01"),
+            "detail names the offending edge endpoints: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-19 P1: assemble counts a coverage edge only when its target is
+    /// a PR MERGED IN-WINDOW (`merged_pr_ids`, keyed on `merged_at`). A PR whose
+    /// `valid_time` is in-window (so it rides the `pull_requests` section) but
+    /// whose `merged_at` is OUT of window is present yet not merged in-window; a
+    /// tampered pack could re-point a coverage edge at it and recompute
+    /// hashes/counts. verify must fail such a PRESENT-but-not-merged-in-window
+    /// target.
+    #[test]
+    fn verify_fails_when_coverage_target_present_but_not_merged_in_window() {
+        use super::fixture::{pr, pr_with_merge_time, references_task, review};
+        let catalog = parse_catalog(
+            r#"{
+                "catalog_id": "custom",
+                "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+                "controls": [
+                    { "control_id": "RCOV", "title": "pr coverage", "evidence_classes": [
+                        { "class": "pull_requests", "requirement": "required" },
+                        { "class": "review_coverage", "requirement": "required" }
+                    ] }
+                ]
+            }"#,
+        )
+        .expect("custom catalog parses");
+        let records = vec![
+            // Approved, merged in-window PR -> yields one coverage edge.
+            pr("project:v1:pr01", "2026-03-15T12:00:00Z", "c01"),
+            review("project:v1:rv01", "2026-03-15T08:00:00Z", "approved"),
+            references_task("project:v1:rv01", "project:v1:pr01"),
+            // PRESENT in the pack (valid_time in-window) but merged OUT of window
+            // (merged_at in February): not a merged-in-window PR.
+            pr_with_merge_time(
+                "project:v1:prZ",
+                "2026-03-20T12:00:00Z",
+                "2026-02-15T12:00:00Z",
+                "cZ",
+            ),
+        ];
+        let mut pack =
+            assemble_pack(&records, &catalog, "RCOV", &win(), 1.0, "v", None).expect("assembles");
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "baseline custom pack passes Integrity: {}",
+            verify_pack(&pack).integrity.detail
+        );
+        assert!(
+            pack.sections.iter().any(|s| s.class == "pull_requests"
+                && s.records
+                    .iter()
+                    .any(|br| br.record.id() == "project:v1:prZ")),
+            "prZ is present in the pull_requests section"
+        );
+
+        // Re-point the sole coverage edge's target to the present-but-not-
+        // merged-in-window prZ, recompute row hash + section + manifest counts.
+        let bad = stamp_edge_valid_time(
+            references_task("project:v1:rv01", "project:v1:prZ"),
+            "2026-03-15T08:00:00Z",
+        );
+        let (old_id, new_id) = swap_one_coverage_row(&mut pack, bad);
+        let rc_idx = pack
+            .sections
+            .iter()
+            .position(|s| s.class == "review_coverage")
+            .unwrap();
+        let m = pack.sections[rc_idx].measurement.as_mut().unwrap();
+        m.approval_link_edge_ids.retain(|id| id != &old_id);
+        m.approval_link_edge_ids.push(new_id.clone());
+        m.approval_link_edge_ids.sort();
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a coverage edge whose present target is not merged in-window must fail Integrity"
+        );
+        assert!(
+            report.integrity.detail.contains(&new_id)
+                && report.integrity.detail.contains("project:v1:prZ"),
+            "detail names the offending edge and its target: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-19 P1 (positive): the round-16/18 ABSENT-target allowance must
+    /// survive. A PR merged IN-window (`merged_at`) but whose Task `valid_time`
+    /// is OUT of window is legitimately absent from every section (coverage
+    /// windows on `merged_at`, the PR section on `valid_time`); its coverage
+    /// edge's target is therefore absent, and an absent node cannot be
+    /// merge-time-checked. verify must keep allowing it.
+    #[test]
+    fn verify_allows_coverage_edge_with_legitimately_absent_target() {
+        use super::fixture::{pr_with_merge_time, references_task, review};
+        let catalog = parse_catalog(
+            r#"{
+                "catalog_id": "custom",
+                "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+                "controls": [
+                    { "control_id": "RCOV", "title": "coverage only", "evidence_classes": [
+                        { "class": "review_coverage", "requirement": "required" }
+                    ] }
+                ]
+            }"#,
+        )
+        .expect("custom catalog parses");
+        let records = vec![
+            // merged_at in-window (March) but valid_time out of window (April):
+            // legitimately absent target.
+            pr_with_merge_time(
+                "project:v1:prAbsent",
+                "2026-04-20T12:00:00Z",
+                "2026-03-15T12:00:00Z",
+                "cAbs",
+            ),
+            review("project:v1:rvAbs", "2026-03-15T08:00:00Z", "approved"),
+            references_task("project:v1:rvAbs", "project:v1:prAbsent"),
+        ];
+        let pack =
+            assemble_pack(&records, &catalog, "RCOV", &win(), 1.0, "v", None).expect("assembles");
+
+        // The target PR node is absent from every section.
+        assert!(
+            pack.sections.iter().all(|s| s
+                .records
+                .iter()
+                .all(|br| br.record.id() != "project:v1:prAbsent")),
+            "the out-of-window-valid_time PR is absent from every section"
+        );
+        // Yet its coverage edge is present.
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .expect("review_coverage section");
+        assert!(
+            rc.records.iter().any(|br| matches!(&br.record,
+                GraphRecord::Edge { target, .. } if target == "project:v1:prAbsent")),
+            "the coverage edge to the absent merged-in-window PR is present"
+        );
+
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "a coverage edge with a legitimately absent target must stay allowed: {}",
+            report.integrity.detail
+        );
+        assert!(
+            report.ok,
+            "absent-target coverage edge self-verifies: {report:?}"
+        );
     }
 
     /// Regenerates the committed integration fixture. Runs only when the

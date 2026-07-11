@@ -90,10 +90,65 @@ pub(crate) fn evidence_pack_exit(value: &serde_json::Value) -> ! {
     std::process::exit(2);
 }
 
+/// Reads and parses a `--graph` JSONL for the evidence-pack assemble path with a
+/// SANITIZED load error (Codex round-19 P2).
+///
+/// `load_query_records`/`load_records_from_jsonl` stringify the adapter error
+/// into an anyhow message; for a wrong-typed `GraphRecord` field serde's
+/// `Error::to_string()` embeds the offending VALUE (e.g.
+/// `invalid type: string "AKIA...", expected u64`), which rides
+/// `AdapterError::Parse.message` and, when printed verbatim, leaked a secret
+/// placed in a mistyped field. This reads + parses the graph directly so the
+/// serde-message-bearing `Parse` variant can be rewritten to a stable
+/// redaction-safe envelope — a value-free serde category plus the 1-based JSONL
+/// line, never the raw message — mirroring the pack/catalog parse-error
+/// sanitizer. Every other adapter error variant (unknown schema version, etc.)
+/// carries no value leak and keeps its existing safe stringified handling. Exits
+/// the process (2) on any load error.
+fn load_graph_records_sanitized(graph_path: &Path) -> Vec<GraphRecord> {
+    let jsonl = fs::read_to_string(graph_path).unwrap_or_else(|error| {
+        evidence_pack_exit(&serde_json::json!({
+            "code": "graph_read_error",
+            "path": graph_path.display().to_string(),
+            "message": error.to_string(),
+        }))
+    });
+    match crate::adapters::records_from_jsonl(&jsonl) {
+        Ok(records) => records,
+        Err(crate::adapters::AdapterError::Parse { line, .. }) => {
+            // Re-derive a value-free serde category by re-parsing the offending
+            // line as a `GraphRecord` (the same deterministic failure, minus the
+            // leaking message). Fall back to a stable generic category when the
+            // line text is unavailable.
+            use serde_json::error::Category;
+            let category = jsonl
+                .lines()
+                .nth(line.saturating_sub(1))
+                .and_then(|l| serde_json::from_str::<GraphRecord>(l).err())
+                .map_or("data", |e| match e.classify() {
+                    Category::Io => "io",
+                    Category::Syntax => "syntax",
+                    Category::Data => "data",
+                    Category::Eof => "eof",
+                });
+            evidence_pack_exit(&serde_json::json!({
+                "code": "graph_parse_error",
+                "path": graph_path.display().to_string(),
+                "jsonl_line": line,
+                "category": category,
+            }));
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    }
+}
+
 /// Handles `eg audit evidence-pack assemble` (issue #338): builds a
 /// control-scoped, time-windowed evidence pack. Exit 0 all verdicts pass, 1 any
 /// verdict fails (report still printed), 2 usage/load error.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn evidence_pack_assemble_cmd(
     control: &str,
     from: &str,
@@ -154,13 +209,17 @@ pub(crate) fn evidence_pack_assemble_cmd(
         }
     });
     let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
-    let records = match load_query_records(graph, effective_data_dir) {
-        Ok(records) => records,
-        Err(error) => {
-            eprintln!("{error}");
-            drop(store_copy);
-            std::process::exit(2);
-        }
+    #[allow(clippy::option_if_let_else)] // `--graph` uses a sanitizing reader (round-19 P2)
+    let records = match graph {
+        Some(graph_path) => load_graph_records_sanitized(graph_path),
+        None => match load_query_records(graph, effective_data_dir) {
+            Ok(records) => records,
+            Err(error) => {
+                eprintln!("{error}");
+                drop(store_copy);
+                std::process::exit(2);
+            }
+        },
     };
 
     // A genuinely empty evidence input (zero records loaded — an empty or

@@ -393,6 +393,73 @@ fn verify_unreadable_pack_exits_2() {
     assert_eq!(err["code"], "pack_read_error");
 }
 
+/// Codex round-19 P2: an `assemble --graph` whose JSON is valid and version-
+/// supported but whose `GraphRecord` carries a WRONG-TYPED field must NOT echo the
+/// offending value. serde's `Error::to_string()` embeds the value for a type
+/// error (e.g. `invalid type: string "AKIA...", expected u64`); the raw
+/// `records_from_jsonl` message was previously printed verbatim, leaking a secret
+/// placed in a mistyped field. The graph-load error must be sanitized like the
+/// pack/catalog parse errors — a stable code + safe positional hint, never the
+/// raw message. Exit code stays 2.
+#[test]
+fn assemble_malformed_graph_does_not_leak_secret_in_load_error() {
+    const SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
+    let temp = tempfile::tempdir().unwrap();
+    // A single valid-JSON, version-supported Commit node whose `disambiguator`
+    // (typed `Option<u64>`) is instead a string carrying a secret. The version
+    // tuple (codegraph / Commit / 5) stays supported, so the failure is a
+    // wrong-type deserialize whose serde message embeds the secret value.
+    let record = serde_json::json!({
+        "record_type": "node",
+        "id": "codegraph:v5:c01",
+        "kind": "Commit",
+        "schema_version": 5,
+        "disambiguator": SECRET,
+        "summary": "summary for codegraph:v5:c01"
+    });
+    let graph_path = temp.path().join("malformed.graph.jsonl");
+    fs::write(&graph_path, format!("{record}\n")).unwrap();
+
+    let out = egregore()
+        .args([
+            "audit",
+            "evidence-pack",
+            "assemble",
+            "--control",
+            "CC8.1",
+            "--from",
+            FROM,
+            "--to",
+            TO,
+            "--graph",
+        ])
+        .arg(&graph_path)
+        .output()
+        .expect("run assemble");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "malformed graph is a load error"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains(SECRET),
+        "graph load error must not leak the wrong-typed field value: {stderr}"
+    );
+    let err: Value = serde_json::from_slice(&out.stderr).expect("stderr is JSON");
+    assert_eq!(err["code"], "graph_parse_error");
+    assert!(
+        err["category"].is_string(),
+        "carries a stable category: {err}"
+    );
+    // The raw serde message (which leaks the value) must not be present.
+    assert!(
+        err.get("message").is_none(),
+        "sanitized envelope must not carry the raw serde message: {err}"
+    );
+}
+
 /// Codex finding 2 / AC6: an empty or whitespace-only `--graph` (zero records
 /// loaded) is a LOAD error — exit 2 with a machine-readable code naming the
 /// path — never the exit-1 "required class unavailable" path.

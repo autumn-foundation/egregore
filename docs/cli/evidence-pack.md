@@ -223,11 +223,17 @@ could mark the required CC8.1 `Reviews` class available and let a relaxed
   catalog's known IDs), `reversed_window`, `invalid_timestamp`,
   `conflicting_input_flags`, `missing_input_flag`, `invalid_min_review_coverage`,
   `catalog_read_error`, `catalog`-parse errors, an unreadable/missing store or
-  graph, or `empty_evidence_input` (naming the source path) when the input loads
-  **zero records** — a genuinely empty or whitespace-only graph, or an
-  initialized store holding zero records. This is distinct from the exit-0
-  vacuous `empty_window` success, which is a *non-empty* input whose records
-  merely fall outside the window.
+  graph (`graph_read_error`), or `empty_evidence_input` (naming the source path)
+  when the input loads **zero records** — a genuinely empty or whitespace-only
+  graph, or an initialized store holding zero records. This is distinct from the
+  exit-0 vacuous `empty_window` success, which is a *non-empty* input whose
+  records merely fall outside the window. A **malformed `--graph` line** — valid
+  JSON with a supported schema-version tuple but a wrong-typed `GraphRecord`
+  field — is a `graph_parse_error` (exit 2). Its envelope is **sanitized** exactly
+  like the catalog/pack parse errors: a stable value-free serde `category` plus
+  the 1-based `jsonl_line`, and **never the raw serde message**, which for a
+  type error embeds the offending field value — so a secret placed in a mistyped
+  field can never leak through the load-error path.
 
 The per-verdict block is: `required_classes`, `citation` (with per-trust-class
 tallies), `review_coverage`, `integrity`, `safety`.
@@ -349,11 +355,20 @@ Re-verifies an assembled pack offline and read-only:
   using the same convention `assemble` used to build the edges: its `source` must be
   an approving `Review` present in the pack (its node is co-located in the
   `review_coverage` section, and may also ride a mapped `reviews` section) and its
-  `target`, when present in the pack,
-  must be a pull-request task (a merged PR whose Task `valid_time` falls outside the
-  window is legitimately absent from every section — coverage windows on `merged_at`
-  while the PR section windows on `valid_time` — so an *absent* target is not a
-  defect); and (3) the measurement's `approved_pr_count` must equal the number of
+  `target`, **when present in the pack**, must be a pull-request task **that
+  additionally satisfies `assemble`'s exact coverage-edge eligibility** (so a
+  tampered pack cannot re-point a coverage edge at any approving-review→PR pair —
+  a post-merge approval, or a PR present for other reasons but not merged
+  in-window — recompute hashes/counts, and still substantiate
+  `approved_pr_count`): the target must be **merged in-window** (it carries a
+  `merged_at` whose parsed time falls inside the manifest window — the
+  `merged_pr_ids` selection), and the **source review's resolved valid time must
+  be at or before that `merged_at`** (the at-or-before-merge gate; a post-merge
+  approval does not count). A merged PR whose Task `valid_time` falls outside the
+  window is legitimately **absent** from every section — coverage windows on
+  `merged_at` while the PR section windows on `valid_time` — so an *absent* target
+  is not a defect and cannot be merge-time-checked; only a *present* target is
+  eligibility-checked. And (3) the measurement's `approved_pr_count` must equal the number of
   **distinct PR targets** the coverage edges substantiate (a PR approved by multiple
   reviews yields multiple edges but is one approved PR). Any violation fails
   Integrity with a redaction-safe detail naming the offending edge id and its
