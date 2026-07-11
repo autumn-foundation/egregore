@@ -2265,6 +2265,15 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
         }
     }
 
+    // Node lookup across the whole pack, keyed by record ID. Used below to bind
+    // `review_coverage` edge endpoints (source approving review, target PR task)
+    // to the nodes the pack actually carries (Codex round-16 P2).
+    let node_by_id: BTreeMap<&str, &GraphRecord> = all_rows
+        .iter()
+        .filter(|br| matches!(br.record, GraphRecord::Node { .. }))
+        .map(|br| (br.record.id(), &br.record))
+        .collect();
+
     // Integrity: recompute per-record hash and per-section canonical ordering.
     let mut integrity_passed = true;
     let mut integrity_detail = "recomputed hashes match; sections canonically ordered".to_owned();
@@ -2318,6 +2327,121 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                         br.record.id(),
                     );
                     break 'integrity;
+                }
+            }
+            // Bind the coverage rows to the section's `ReviewCoverageMeasurement`
+            // (Codex round-16 P2). The per-row hash proves each row's CONTENT and
+            // the check above proves each row is a REFERENCES_TASK edge, but
+            // neither binds the rows to the measurement the section presents. A
+            // tampered pack could swap the genuine coverage edges for an unrelated
+            // in-window REFERENCES_TASK edge (recomputing that row's hash + section
+            // + manifest counts) while the measurement's `approved_pr_count` /
+            // `approval_link_edge_ids` keep asserting a coverage the actual rows no
+            // longer substantiate. Bind three ways so the measurement can only ride
+            // the rows that back it.
+            match &section.measurement {
+                Some(m) => {
+                    // (1) The set of REFERENCES_TASK edge row IDs must EXACTLY
+                    //     equal the measurement's cited `approval_link_edge_ids`:
+                    //     no row the measurement does not cite, no cited edge
+                    //     missing from the rows.
+                    let row_ids: BTreeSet<&str> =
+                        section.records.iter().map(|br| br.record.id()).collect();
+                    let cited: BTreeSet<&str> = m
+                        .approval_link_edge_ids
+                        .iter()
+                        .map(String::as_str)
+                        .collect();
+                    if let Some(unexpected) = row_ids.difference(&cited).next() {
+                        integrity_passed = false;
+                        integrity_detail = format!(
+                            "review_coverage row {unexpected} is not cited by the \
+                             section measurement's approval_link_edge_ids"
+                        );
+                        break 'integrity;
+                    }
+                    if let Some(missing) = cited.difference(&row_ids).next() {
+                        integrity_passed = false;
+                        integrity_detail = format!(
+                            "review_coverage measurement cites approval edge {missing} \
+                             that is absent from the section rows"
+                        );
+                        break 'integrity;
+                    }
+                    // (2) Each coverage edge must connect an approving review to a
+                    //     PR task, using the same source=review / target=PR
+                    //     convention `assemble_pack` used to build the edges.
+                    for br in &section.records {
+                        let GraphRecord::Edge { source, target, .. } = &br.record else {
+                            continue; // guaranteed REFERENCES_TASK edges above
+                        };
+                        // Source must be an approving review present in the pack.
+                        // An approving review always resolves in-window, so it
+                        // always rides the reviews section; its absence or wrong
+                        // shape is tampering.
+                        match node_by_id.get(source.as_str()) {
+                            Some(rec) if is_approving_review(rec) => {}
+                            _ => {
+                                integrity_passed = false;
+                                integrity_detail = format!(
+                                    "review_coverage edge {} source {source} is not an \
+                                     approving review present in the pack",
+                                    br.record.id(),
+                                );
+                                break 'integrity;
+                            }
+                        }
+                        // Target must be a PR task. A merged PR whose Task
+                        // `valid_time` falls outside the window is legitimately
+                        // absent from every section (coverage windows on
+                        // `merged_at`, the PR section on `valid_time`), so an
+                        // ABSENT target is not a defect; a PRESENT target that is
+                        // not a pull-request task is.
+                        if let Some(rec) = node_by_id.get(target.as_str())
+                            && evidence_class_for_record(rec) != Some(EvidenceClass::PullRequests)
+                        {
+                            integrity_passed = false;
+                            integrity_detail = format!(
+                                "review_coverage edge {} target {target} is present in \
+                                 the pack but is not a pull-request task",
+                                br.record.id(),
+                            );
+                            break 'integrity;
+                        }
+                    }
+                    // (3) `approved_pr_count` must equal the distinct PR targets
+                    //     the coverage edges substantiate. A PR approved by
+                    //     multiple reviews yields multiple edges but is one
+                    //     approved PR, so the count keys on DISTINCT targets.
+                    let distinct_targets: BTreeSet<&str> = section
+                        .records
+                        .iter()
+                        .filter_map(|br| match &br.record {
+                            GraphRecord::Edge { target, .. } => Some(target.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    if distinct_targets.len() != m.approved_pr_count {
+                        integrity_passed = false;
+                        integrity_detail = format!(
+                            "review_coverage approved_pr_count {} does not equal the {} \
+                             distinct approved PR target(s) its coverage edges substantiate",
+                            m.approved_pr_count,
+                            distinct_targets.len(),
+                        );
+                        break 'integrity;
+                    }
+                }
+                None => {
+                    // Rows cannot be bound to a measurement that is absent; a
+                    // review_coverage section carrying rows but no measurement is
+                    // malformed.
+                    if !section.records.is_empty() {
+                        integrity_passed = false;
+                        "review_coverage section carries rows but no measurement to bind them"
+                            .clone_into(&mut integrity_detail);
+                        break 'integrity;
+                    }
                 }
             }
         } else {
@@ -5206,6 +5330,221 @@ mod pack338_tests {
         assert!(
             verify_pack(&pack).integrity.passed,
             "expected review_coverage rows must pass Integrity: {}",
+            verify_pack(&pack).integrity.detail
+        );
+    }
+
+    /// Replaces one `review_coverage` section row with `edge` (an already
+    /// stamped `REFERENCES_TASK` edge), recomputing the section `record_count`
+    /// and manifest counts so every pre-existing Integrity check still passes.
+    /// Returns `(replaced_old_id, new_id)`. The measurement is left untouched so
+    /// the caller can decide whether to re-cite the new edge.
+    fn swap_one_coverage_row(pack: &mut EvidencePack, edge: GraphRecord) -> (String, String) {
+        let rc_idx = pack
+            .sections
+            .iter()
+            .position(|s| s.class == "review_coverage")
+            .expect("review_coverage section");
+        assert!(
+            !pack.sections[rc_idx].records.is_empty(),
+            "review_coverage carries coverage rows to swap"
+        );
+        let old_id = pack.sections[rc_idx].records[0].record.id().to_owned();
+        let new_row = build_section_records(vec![edge]).remove(0);
+        let new_id = new_row.record.id().to_owned();
+        pack.sections[rc_idx].records[0] = new_row;
+        // Keep the section canonically ordered so ordering is never what fails.
+        pack.sections[rc_idx]
+            .records
+            .sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
+        // record_count is unchanged (row-for-row swap); recompute the manifest
+        // aggregates from the swapped rows so the manifest-count check still
+        // passes and the new binding is the only thing that can fail.
+        let all: Vec<&BundleRecord> = pack
+            .sections
+            .iter()
+            .flat_map(|s| s.records.iter())
+            .collect();
+        let (records, tuples) = compute_manifest_counts(all.iter().copied());
+        pack.manifest.included_record_counts = records;
+        pack.manifest.tuple_counts = tuples;
+        (old_id, new_id)
+    }
+
+    /// Codex round-16 P2: the described attack. A tampered pack REPLACES a real
+    /// coverage row with an unrelated in-window `REFERENCES_TASK` edge and
+    /// recomputes that row's hash + section `record_count` + manifest counts, but
+    /// leaves the section's `ReviewCoverageMeasurement.approval_link_edge_ids`
+    /// citing the ORIGINAL edges. The rows no longer match the measurement they
+    /// substantiate, so verify must FAIL Integrity naming the unbound id.
+    #[test]
+    fn verify_fails_when_coverage_rows_do_not_match_cited_approval_edges() {
+        use super::fixture::references_task;
+        let mut pack = assemble_cc81();
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "baseline pack passes Integrity"
+        );
+
+        // An unrelated in-window REFERENCES_TASK edge (present in the seed graph
+        // but NOT a coverage-substantiating edge). Stamp it in-window so it clears
+        // Window-consistency; measurement is deliberately left untouched.
+        let bad = stamp_edge_valid_time(
+            references_task("project:v1:rv04", "project:v1:pr04"),
+            "2026-03-03T08:00:00Z",
+        );
+        let (old_id, new_id) = swap_one_coverage_row(&mut pack, bad);
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "coverage rows unbound from the measurement must fail Integrity"
+        );
+        assert!(
+            report.integrity.detail.contains(&new_id) || report.integrity.detail.contains(&old_id),
+            "detail names the unbound edge id: {}",
+            report.integrity.detail
+        );
+        assert!(
+            report.integrity.detail.contains("review_coverage"),
+            "detail names the section: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-16 P2: a smarter attacker also re-cites the swapped edge in
+    /// `approval_link_edge_ids` (so the id-set check passes) but the substituted
+    /// `REFERENCES_TASK` edge's SOURCE is a non-approving (commented) review. The
+    /// edge does not connect an approving review to a PR, so verify must FAIL.
+    #[test]
+    fn verify_fails_when_coverage_edge_source_is_not_approving_review() {
+        use super::fixture::references_task;
+        let mut pack = assemble_cc81();
+
+        // rv04 is a genuine PR review present in the reviews section but its state
+        // is `commented`, so it is not an approving review.
+        let bad = stamp_edge_valid_time(
+            references_task("project:v1:rv04", "project:v1:pr04"),
+            "2026-03-03T08:00:00Z",
+        );
+        let (old_id, new_id) = swap_one_coverage_row(&mut pack, bad);
+
+        // Re-cite: swap old_id for new_id in the measurement so the id-set check
+        // passes and the endpoint-shape check is the only thing that can fail.
+        let rc_idx = pack
+            .sections
+            .iter()
+            .position(|s| s.class == "review_coverage")
+            .unwrap();
+        let m = pack.sections[rc_idx].measurement.as_mut().unwrap();
+        m.approval_link_edge_ids.retain(|id| id != &old_id);
+        m.approval_link_edge_ids.push(new_id.clone());
+        m.approval_link_edge_ids.sort();
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a coverage edge whose source is not an approving review must fail Integrity"
+        );
+        assert!(
+            report.integrity.detail.contains(&new_id)
+                && report.integrity.detail.contains("project:v1:rv04"),
+            "detail names the offending edge and its source: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-16 P2: the swapped edge's SOURCE is a genuine approving review
+    /// but its TARGET is a Commit present in the pack, not a PR task. A coverage
+    /// edge must connect an approving review to a pull-request task, so verify
+    /// must FAIL Integrity.
+    #[test]
+    fn verify_fails_when_coverage_edge_target_is_not_pr_task() {
+        use super::fixture::references_task;
+        let mut pack = assemble_cc81();
+
+        // Approving review rv01 -> a Commit (present in the commits section),
+        // which is not a pull-request task.
+        let bad = stamp_edge_valid_time(
+            references_task("project:v1:rv01", "codegraph:v5:c01"),
+            "2026-03-03T08:00:00Z",
+        );
+        let (old_id, new_id) = swap_one_coverage_row(&mut pack, bad);
+
+        let rc_idx = pack
+            .sections
+            .iter()
+            .position(|s| s.class == "review_coverage")
+            .unwrap();
+        let m = pack.sections[rc_idx].measurement.as_mut().unwrap();
+        m.approval_link_edge_ids.retain(|id| id != &old_id);
+        m.approval_link_edge_ids.push(new_id.clone());
+        m.approval_link_edge_ids.sort();
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a coverage edge whose target is not a PR task must fail Integrity"
+        );
+        assert!(
+            report.integrity.detail.contains(&new_id)
+                && report.integrity.detail.contains("codegraph:v5:c01"),
+            "detail names the offending edge and its target: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-16 P2: `approved_pr_count` must stay consistent with the
+    /// distinct PR targets the coverage edges substantiate. Inflating the count
+    /// alone (rows and cited ids untouched) must FAIL Integrity.
+    #[test]
+    fn verify_fails_when_approved_pr_count_mismatches_coverage_edges() {
+        let mut pack = assemble_cc81();
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "baseline pack passes Integrity"
+        );
+        let rc_idx = pack
+            .sections
+            .iter()
+            .position(|s| s.class == "review_coverage")
+            .unwrap();
+        let m = pack.sections[rc_idx].measurement.as_mut().unwrap();
+        m.approved_pr_count += 2; // 3 distinct targets, now claims 5
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "an approved_pr_count that overstates the coverage edges must fail Integrity"
+        );
+        assert!(
+            report.integrity.detail.contains("approved_pr_count"),
+            "detail names the mismatch: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Codex round-16 P2 (positive): the untampered pack's genuine coverage rows
+    /// stay bound to the measurement — the new binding must not reject a clean
+    /// pack.
+    #[test]
+    fn verify_allows_coverage_rows_bound_to_measurement() {
+        let pack = assemble_cc81();
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .expect("review_coverage section");
+        let m = rc.measurement.as_ref().expect("measurement present");
+        assert!(!m.approval_link_edge_ids.is_empty(), "cites the link edges");
+        assert_eq!(m.approved_pr_count, 3);
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "clean bound coverage rows must pass Integrity: {}",
             verify_pack(&pack).integrity.detail
         );
     }

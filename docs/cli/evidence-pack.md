@@ -319,6 +319,26 @@ Re-verifies an assembled pack offline and read-only:
   maps to a real evidence class, or any other edge label — fails Integrity with a
   redaction-safe detail naming the record id and `unexpected row in review_coverage
   section`, so a tampered pack cannot present unrelated data as coverage evidence.
+  Integrity additionally **binds the `review_coverage` rows to the section's
+  `ReviewCoverageMeasurement`**, so the swapped-in edge cannot be a valid-shaped
+  but unrelated `REFERENCES_TASK` edge that the measurement still claims to
+  substantiate. Three checks: (1) the set of `REFERENCES_TASK` edge row ids must
+  **exactly equal** the measurement's cited `approval_link_edge_ids` — no row the
+  measurement does not cite, no cited edge missing from the rows; (2) each coverage
+  edge's endpoints must connect an **approving review to a PR task**, using the same
+  convention `assemble` used to build the edges: its `source` must be an approving
+  `Review` present in the pack (an approving review always resolves in-window, so it
+  always rides the `reviews` section) and its `target`, when present in the pack,
+  must be a pull-request task (a merged PR whose Task `valid_time` falls outside the
+  window is legitimately absent from every section — coverage windows on `merged_at`
+  while the PR section windows on `valid_time` — so an *absent* target is not a
+  defect); and (3) the measurement's `approved_pr_count` must equal the number of
+  **distinct PR targets** the coverage edges substantiate (a PR approved by multiple
+  reviews yields multiple edges but is one approved PR). Any violation fails
+  Integrity with a redaction-safe detail naming the offending edge id and its
+  unbound source/target id or the count mismatch — never a payload. A
+  `review_coverage` section carrying rows but no `measurement` to bind them is
+  likewise rejected.
 - **Coverage** — recompute the #65 citation thresholds (>=95% code rows cited;
   100% non-code rows cited).
 - **Safety** — scans the **entire serialized pack artifact** for raw sensitive
