@@ -890,6 +890,118 @@ fn present_frame_target_stays_cited() {
     assert!(report.ok);
 }
 
+// ── #328 Finding A: class-wide runtime_observation provenance ──────────────
+//
+// The `runtime_observation` citation requirement is CLASS-WIDE ("every row"):
+// a log record surfaced through ANY workflow — not just `eg query log-deltas` —
+// must carry its full log citation. Here `eg query memory` returns an
+// ErrorSignature as supporting evidence; an ErrorSignature with no CAPTURED_FROM
+// LogSource has no resolvable provenance and must be a citation FAILURE, never
+// counted as cited by its own ID just because a non-log-deltas workflow reached
+// it via the context-free catch-all classifier.
+#[test]
+fn runtime_observation_via_memory_requires_provenance_classwide() {
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let log_link = EvidenceLink {
+        target_record_id: Some(sig_id.clone()),
+        target_domain: "log".to_owned(),
+        relation: "OBSERVES".to_owned(),
+        confidence: "1.0".to_owned(),
+        as_of_commit: None,
+        target_repo_relative_path: None,
+        target_span: None,
+        target_git_commit: None,
+    };
+    // The Observation is itself cited (external evidence link + source handle);
+    // the ErrorSignature it cites has NO CAPTURED_FROM edge → no LogSource.
+    let obs = observation(
+        "agent_memory:v1:obs_log",
+        Some("traj/run.traj"),
+        vec![log_link],
+    );
+    let sig = error_signature_node(&sig_id);
+    let records = vec![obs, sig];
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let memory = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == "memory")
+        .expect("memory workflow present");
+    let row = memory
+        .rows
+        .iter()
+        .find(|r| r.record_id == sig_id)
+        .expect("the ErrorSignature must surface as a memory supporting-evidence row");
+    assert_eq!(row.trust_class, "runtime_observation");
+    assert_eq!(
+        row.status,
+        CitationStatus::MissingRequiredHandle,
+        "a provenance-less runtime observation is never cited, regardless of surfacing workflow"
+    );
+    assert!(
+        !report.gate.log_gate_pass,
+        "an uncited runtime observation must fail the log gate"
+    );
+    assert!(!report.ok);
+}
+
+// ── #328 Finding B: tombstoned log provenance is not reachable ─────────────
+//
+// `LogProvenanceIndex` must ignore a TOMBSTONED CAPTURED_FROM/AGGREGATES edge and
+// a TOMBSTONED-and-unsuperseded LogSource target, mirroring the node/frame paths.
+#[test]
+fn tombstoned_captured_from_edge_is_not_provenance() {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let edge = captured_from(&sig_id, &src_id);
+    let edge_id = edge.id().to_owned();
+    let records = vec![
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        edge,
+        GraphRecord::Tombstone {
+            id: "log:v1:tomb_edge".to_owned(),
+            schema_version: crate::ir::LOG_SCHEMA_VERSION,
+            deleted_id: edge_id,
+            summary: "edge removed".to_owned(),
+            producer: None,
+        },
+    ];
+    let index = LogProvenanceIndex::build(&records);
+    let result = classify_log_handle(&index, &records[1]);
+    assert_eq!(
+        result.row.status,
+        CitationStatus::MissingRequiredHandle,
+        "a signature whose only CAPTURED_FROM edge is tombstoned has no reachable provenance"
+    );
+}
+
+#[test]
+fn tombstoned_log_source_target_is_not_provenance() {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let records = vec![
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_id),
+        GraphRecord::Tombstone {
+            id: "log:v1:tomb_src".to_owned(),
+            schema_version: crate::ir::LOG_SCHEMA_VERSION,
+            deleted_id: src_id.clone(),
+            summary: "log source removed".to_owned(),
+            producer: None,
+        },
+    ];
+    let index = LogProvenanceIndex::build(&records);
+    let result = classify_log_handle(&index, &records[1]);
+    assert_eq!(
+        result.row.status,
+        CitationStatus::MissingRequiredHandle,
+        "a CAPTURED_FROM edge to a tombstoned-and-unsuperseded LogSource is not reachable provenance"
+    );
+}
+
 // Round-9 review: with two disconnected commit chains in one store, pairing
 // root/tip extrema across chains yields a `NoPath` that disables the whole lane.
 // `changes_range` must return a base/head pair proven connected by parent topology.

@@ -550,6 +550,11 @@ struct LogProvenanceIndex<'a> {
 
 impl<'a> LogProvenanceIndex<'a> {
     fn build(records: &'a [GraphRecord]) -> Self {
+        // Deleted provenance is not reachable: a tombstoned CAPTURED_FROM /
+        // AGGREGATES edge, or a tombstoned-and-unsuperseded LogSource target, must
+        // not be accepted as a citation, mirroring the node/frame tombstone
+        // filtering the code path already applies (issue #328).
+        let tombstoned = tombstoned_ids(records);
         let mut sources = BTreeMap::new();
         let mut captured_from: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         let mut aggregates: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
@@ -558,27 +563,32 @@ impl<'a> LogProvenanceIndex<'a> {
                 GraphRecord::Node {
                     id,
                     log: Some(payload),
+                    temporal,
                     ..
                 } => {
-                    if let LogPayload::LogSource(src) = payload.as_ref() {
+                    if let LogPayload::LogSource(src) = payload.as_ref()
+                        && node_visible(id, temporal.is_some(), &tombstoned)
+                    {
                         sources.insert(id.as_str(), src);
                     }
                 }
                 GraphRecord::Edge {
+                    id,
                     label: EdgeLabel::CapturedFrom,
                     source,
                     target,
                     ..
-                } => captured_from
+                } if !tombstoned.contains(id.as_str()) => captured_from
                     .entry(source.as_str())
                     .or_default()
                     .push(target.as_str()),
                 GraphRecord::Edge {
+                    id,
                     label: EdgeLabel::Aggregates,
                     source,
                     target,
                     ..
-                } => aggregates
+                } if !tombstoned.contains(id.as_str()) => aggregates
                     .entry(source.as_str())
                     .or_default()
                     .push(target.as_str()),
@@ -877,7 +887,7 @@ fn missing(id: &str, trust: &'static str) -> Classified {
 // ---------------------------------------------------------------------------
 
 /// Accumulates de-duplicated rows and diagnostics for one workflow.
-struct WorkflowBuilder {
+struct WorkflowBuilder<'a> {
     workflow: &'static str,
     trust_class: &'static str,
     enabled: bool,
@@ -892,14 +902,26 @@ struct WorkflowBuilder {
     /// several malformed empty-ID public rows are each counted (they would
     /// otherwise collapse into one `("", temporal)` map key).
     empty_id_seq: usize,
+    /// Log-domain provenance index for the record set this workflow drives.
+    ///
+    /// The `runtime_observation` citation requirement is class-wide (issue #328,
+    /// "every row"): a log record surfaced through ANY workflow — not just
+    /// `eg query log-deltas` — must carry its full log citation. Because
+    /// [`classify_record`] is context-free (no record set), [`push_record`]
+    /// reclassifies every `runtime_observation` row through
+    /// [`classify_log_handle`] against this index so no log row can be counted
+    /// cited by its own ID via the catch-all.
+    ///
+    /// [`push_record`]: WorkflowBuilder::push_record
+    provenance: LogProvenanceIndex<'a>,
 }
 
 /// `(code, source_record_id, target_handle, relation)` — a de-dup key for one
 /// pending diagnostic before it is rendered into an [`AuditDiagnostic`].
 type DiagnosticEntry = (String, Option<String>, Option<String>, Option<String>);
 
-impl WorkflowBuilder {
-    const fn new(workflow: &'static str, trust_class: &'static str) -> Self {
+impl<'a> WorkflowBuilder<'a> {
+    fn new(workflow: &'static str, trust_class: &'static str, records: &'a [GraphRecord]) -> Self {
         Self {
             workflow,
             trust_class,
@@ -908,23 +930,40 @@ impl WorkflowBuilder {
             rows: BTreeMap::new(),
             diagnostics: BTreeSet::new(),
             empty_id_seq: 0,
+            provenance: LogProvenanceIndex::build(records),
         }
     }
 
-    const fn disabled(
+    fn disabled(
         workflow: &'static str,
         trust_class: &'static str,
         reason: &'static str,
+        records: &'a [GraphRecord],
     ) -> Self {
-        let mut builder = Self::new(workflow, trust_class);
+        let mut builder = Self::new(workflow, trust_class, records);
         builder.enabled = false;
         builder.disabled_reason = Some(reason);
         builder
     }
 
     /// Classifies a record and records its row + any diagnostic.
+    ///
+    /// A `runtime_observation` (log-domain) row is reclassified through
+    /// [`classify_log_handle`] against this workflow's [`LogProvenanceIndex`] so
+    /// the class-wide provenance requirement (issue #328) holds regardless of
+    /// which workflow surfaced the record — the context-free [`classify_record`]
+    /// catch-all would otherwise cite a provenance-less log record by its own ID.
+    /// A row already excluded (protected/unverified) keeps that status.
     fn push_record(&mut self, record: &GraphRecord) {
-        let classified = classify_record(record);
+        let mut classified = classify_record(record);
+        if classified.row.trust_class == "runtime_observation"
+            && !matches!(
+                classified.row.status,
+                CitationStatus::ExcludedProtected | CitationStatus::ExcludedUnverified
+            )
+        {
+            classified = classify_log_handle(&self.provenance, record);
+        }
         self.push_classified(classified, temporal_key(record));
     }
 
@@ -1279,8 +1318,8 @@ fn memory_claim_ids(records: &[GraphRecord]) -> BTreeSet<String> {
 // Per-workflow drivers
 // ---------------------------------------------------------------------------
 
-fn drive_symbol(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("symbol", "source_fact");
+fn drive_symbol(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("symbol", "source_fact", records);
     let tombstoned = tombstoned_ids(records);
     for record in records {
         let GraphRecord::Node {
@@ -1297,8 +1336,8 @@ fn drive_symbol(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("file", "source_fact");
+fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("file", "source_fact", records);
     let tombstoned = tombstoned_ids(records);
     let paths = file_paths(records);
     for record in records {
@@ -1326,8 +1365,8 @@ fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder {
 /// `DependencyDeclaration` row the default invocation returns must carry its
 /// stable record ID plus the repo-relative manifest handle (the path-cited
 /// spanless source-fact rule).
-fn drive_manifest_deps(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("manifest-deps", "source_fact");
+fn drive_manifest_deps(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("manifest-deps", "source_fact", records);
     let tombstoned = tombstoned_ids(records);
     for record in records {
         let GraphRecord::Node {
@@ -1345,8 +1384,8 @@ fn drive_manifest_deps(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-fn drive_drift(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("drift", "source_fact");
+fn drive_drift(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("drift", "source_fact", records);
     // Measure the DEFAULT `eg query drift` output, which returns the top
     // `DEFAULT_QUERY_LIMIT` rows; later rows are not emitted by the default
     // public invocation the gate targets.
@@ -1358,15 +1397,15 @@ fn drive_drift(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-fn drive_semantic(config: &AuditConfig) -> WorkflowBuilder {
+fn drive_semantic<'a>(records: &'a [GraphRecord], config: &AuditConfig) -> WorkflowBuilder<'a> {
     match &config.semantic {
         SemanticInput::Disabled { reason } => {
-            let mut builder = WorkflowBuilder::disabled("semantic", "source_fact", reason);
+            let mut builder = WorkflowBuilder::disabled("semantic", "source_fact", reason, records);
             builder.add_diagnostic("unsupported_workflow".to_owned(), None, None, None);
             builder
         }
         SemanticInput::Enabled { rows } => {
-            let mut builder = WorkflowBuilder::new("semantic", "source_fact");
+            let mut builder = WorkflowBuilder::new("semantic", "source_fact", records);
             for row in rows {
                 let classified = classify_code_handle(
                     &row.record_id,
@@ -1382,8 +1421,8 @@ fn drive_semantic(config: &AuditConfig) -> WorkflowBuilder {
     }
 }
 
-fn drive_context(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("context", "source_fact");
+fn drive_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("context", "source_fact", records);
     for name in symbol_names(records) {
         let ctx = symbol_context(records, name);
         for record in ctx
@@ -1410,8 +1449,8 @@ fn drive_context(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-fn drive_subsystem(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("subsystem", "source_fact");
+fn drive_subsystem(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("subsystem", "source_fact", records);
     for prefix in subsystem_prefixes(records) {
         let Ok(ctx) = subsystem_context(records, &prefix) else {
             continue;
@@ -1447,8 +1486,8 @@ fn drive_subsystem(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-fn drive_task(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("task", "project_state");
+fn drive_task(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("task", "project_state", records);
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
     for task_id in task_ids(records) {
         let ctx = task_evidence_context(records, &task_id);
@@ -1492,8 +1531,8 @@ fn drive_task(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-fn drive_memory(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("memory", "agent_authored");
+fn drive_memory(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("memory", "agent_authored", records);
     for memory_id in memory_claim_ids(records) {
         // Audit the DEFAULT `eg query memory` view (no `--verified-only`): the
         // default emits unverified supporting/contradicting claims as normal
@@ -1568,8 +1607,11 @@ fn resolve_anchors(
     }
 }
 
-fn drive_failures(records: &[GraphRecord], repo_index: &RepositoryIndex) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("failures", "verification_evidence");
+fn drive_failures<'a>(
+    records: &'a [GraphRecord],
+    repo_index: &RepositoryIndex,
+) -> WorkflowBuilder<'a> {
+    let mut builder = WorkflowBuilder::new("failures", "verification_evidence", records);
     let mut handles: BTreeSet<String> = BTreeSet::new();
     handles.extend(symbol_names(records).into_iter().map(str::to_owned));
     // History-bearing: failures linked to a now-deleted file are still reachable
@@ -1607,8 +1649,11 @@ fn drive_failures(records: &[GraphRecord], repo_index: &RepositoryIndex) -> Work
     builder
 }
 
-fn drive_change_impact(records: &[GraphRecord], repo_index: &RepositoryIndex) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("change-impact", "source_fact");
+fn drive_change_impact<'a>(
+    records: &'a [GraphRecord],
+    repo_index: &RepositoryIndex,
+) -> WorkflowBuilder<'a> {
+    let mut builder = WorkflowBuilder::new("change-impact", "source_fact", records);
     let mut handles: BTreeSet<String> = BTreeSet::new();
     handles.extend(symbol_names(records).into_iter().map(str::to_owned));
     // History-bearing handle resolution (see `all_file_paths`).
@@ -1641,8 +1686,8 @@ fn drive_change_impact(records: &[GraphRecord], repo_index: &RepositoryIndex) ->
     builder
 }
 
-fn drive_policy(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("policy", "user_context");
+fn drive_policy(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("policy", "user_context", records);
     // `eg query audit <durable_id>` audits any durable policy node, active or
     // revoked, but only when its audit trail resolves: `eg query policy` filters
     // out durables whose `audit_trail` fails and `eg query audit` returns an
@@ -1673,8 +1718,8 @@ fn drive_policy(records: &[GraphRecord]) -> WorkflowBuilder {
 /// `eg query candidates` — pending `PromoteCandidate` rows. These are
 /// user-context answers that escape the policy lane (which only sees materialized
 /// durables), so an uncited pending candidate must still be gated.
-fn drive_candidates(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("candidates", "user_context");
+fn drive_candidates(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("candidates", "user_context", records);
     for candidate in query::pending_candidates(records, None) {
         builder.push_record(candidate);
         builder.note_redaction(candidate);
@@ -1762,16 +1807,26 @@ fn changes_range(records: &[GraphRecord]) -> Option<(&str, &str)> {
     None
 }
 
-fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder {
+fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
     let Some((base, head)) = changes_range(records) else {
-        return WorkflowBuilder::disabled("changes", "source_fact", "requires_commit_range");
+        return WorkflowBuilder::disabled(
+            "changes",
+            "source_fact",
+            "requires_commit_range",
+            records,
+        );
     };
 
     let Ok(ctx) = changes_context(records, base, head, None) else {
-        return WorkflowBuilder::disabled("changes", "source_fact", "commit_range_unresolved");
+        return WorkflowBuilder::disabled(
+            "changes",
+            "source_fact",
+            "commit_range_unresolved",
+            records,
+        );
     };
 
-    let mut builder = WorkflowBuilder::new("changes", "source_fact");
+    let mut builder = WorkflowBuilder::new("changes", "source_fact", records);
     for item in &ctx.changed_files {
         builder.push_record(item.record);
         builder.note_redaction(item.record);
@@ -1855,12 +1910,13 @@ fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder {
 /// The commit range is derived from the in-set commit topology, exactly as
 /// `drive_changes` does; without at least two connected commits the lane is
 /// reported disabled rather than skipped.
-fn drive_log_deltas(records: &[GraphRecord]) -> WorkflowBuilder {
+fn drive_log_deltas(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
     let Some((base, head)) = changes_range(records) else {
         return WorkflowBuilder::disabled(
             "log-deltas",
             "runtime_observation",
             "requires_commit_range",
+            records,
         );
     };
     let Ok(deltas) = log_deltas(records, base, head, None, false) else {
@@ -1868,11 +1924,11 @@ fn drive_log_deltas(records: &[GraphRecord]) -> WorkflowBuilder {
             "log-deltas",
             "runtime_observation",
             "commit_range_unresolved",
+            records,
         );
     };
 
-    let mut builder = WorkflowBuilder::new("log-deltas", "runtime_observation");
-    let provenance = LogProvenanceIndex::build(records);
+    let mut builder = WorkflowBuilder::new("log-deltas", "runtime_observation", records);
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
     let tombstoned = tombstoned_ids(records);
     for signature in deltas
@@ -1881,11 +1937,12 @@ fn drive_log_deltas(records: &[GraphRecord]) -> WorkflowBuilder {
         .chain(&deltas.ceased_signatures)
         .chain(&deltas.continuing_signatures)
     {
-        // The signature row is a runtime observation: it must carry its full log
-        // citation (well-formed `log:v1:` ID + LogSource provenance).
+        // The signature row is a runtime observation: `push_record` reclassifies
+        // it through `classify_log_handle` against the builder's provenance index,
+        // so it must carry its full log citation (well-formed `log:v1:` ID +
+        // LogSource provenance) — the same class-wide rule every workflow uses.
         if let Some(record) = by_id.get(signature.record_id.as_str()) {
-            let classified = classify_log_handle(&provenance, record);
-            builder.push_classified(classified, temporal_key(record));
+            builder.push_record(record);
             builder.note_redaction(record);
         }
         // Resolved-frame targets and overlapping symbol deltas are code rows,
@@ -1920,8 +1977,8 @@ fn drive_log_deltas(records: &[GraphRecord]) -> WorkflowBuilder {
 /// verdict row pairs an agent-authored observation with its cited code handle;
 /// both must carry their required citation, and stale/unresolved verdicts emit a
 /// diagnostic against the original handle.
-fn drive_evidence_freshness(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("evidence-freshness", "agent_authored");
+fn drive_evidence_freshness(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("evidence-freshness", "agent_authored", records);
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
     for entry in crate::evidence_freshness::evidence_link_freshness(records) {
         if let Some(observation) = by_id.get(entry.observation_id.as_str()) {
@@ -2015,7 +2072,7 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         drive_manifest_deps(records),
         drive_memory(records),
         drive_policy(records),
-        drive_semantic(config),
+        drive_semantic(records, config),
         drive_subsystem(records),
         drive_symbol(records),
         drive_task(records),
