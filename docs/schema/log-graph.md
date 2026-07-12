@@ -70,7 +70,7 @@ Evidence-link:
 | Label | Wire string | Purpose |
 |-------|-------------|---------|
 | `FrameResolvesTo` | `FRAME_RESOLVES_TO` | A backtrace frame resolves to a code-graph `Symbol` / `File` / `Diagnostic` (issue #322, emitted by `eg resolve-frames`). |
-| `EmittedDuring` | `EMITTED_DURING` | A signature was emitted during a verification/agent run (reserved for #323, not yet emitted). |
+| `EmittedDuring` | `EMITTED_DURING` | An `ErrorSignature` was emitted during an agent run / command (issue #323, emitted by `eg link-logs`). FROM `ErrorSignature` (log) TO `AgentRun` / `AgentTurn` (agent_memory) or `CommandRun` (verification). |
 
 `FRAME_RESOLVES_TO` and `EMITTED_DURING` are valid evidence-link labels;
 `FINGERPRINTED_AS`, `CAPTURED_FROM`, and `AGGREGATES` are structural. None of the
@@ -98,6 +98,32 @@ optional fields (present only on this edge kind):
 
 Each edge is mirrored by an `EvidenceLink` (relation `FRAME_RESOLVES_TO`) on the
 source `ErrorSignature` node; the two representations agree at write time.
+
+### `EMITTED_DURING` edge fields (issue #323)
+
+An `EMITTED_DURING` edge runs `ErrorSignature` → an agent run / command and
+carries one optional field (present only on this edge kind):
+
+- `basis` — the correlation basis, a value from the **closed, stable** set. An
+  `EMITTED_DURING` edge is **never** emitted without a basis:
+
+  | Value | Meaning | Confidence |
+  |-------|---------|------------|
+  | `content_hash_join` | The `LogSource` the signature was `CAPTURED_FROM` carries a `source_artifact_hash` equal to a `CommandRun`'s captured stdout/stderr `OutputHandle.hash` (exact BLAKE3 byte equality). Deterministic and inherently within-repository. | `1.0` |
+  | `temporal_correlation` | The signature's representative valid time (`last_seen`, falling back to `first_seen`) falls inside an `AgentRun` / `AgentTurn` window `[started_at, finished_at]` (± the linker's `--tolerance`) for the **same repository**. A correlation lead, never causation. Overlapping runs each mint their own edge. | `0.5` |
+
+  Confidence is carried in the edge's `confidence` field. `temporal_correlation`
+  is repository-guarded: the signature's `LogSource` must recompute to the single
+  `Repository` anchor (see [`link-logs.md`](../cli/link-logs.md) → *Repository
+  boundary*); `content_hash_join` needs no guard (byte equality is inherently
+  within-repo).
+
+Each edge is mirrored by an `EvidenceLink` (relation `EMITTED_DURING`) on the
+source `ErrorSignature` node; the two representations agree at write time. Task
+linkage additionally reuses `REFERENCES_TASK` (`ErrorSignature` → `Task` /
+`GitHubIssue` / `LocalTask`) with no new project-facing label. An
+`EMITTED_DURING` edge is a correlation lead — never causation, root cause, or
+blame.
 
 ## Stable-ID identity
 

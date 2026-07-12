@@ -43,6 +43,7 @@ mod ingest;
 mod inspect_store;
 mod line_ending_determinism;
 mod link_evidence;
+mod link_logs;
 mod local_project;
 mod local_project_jsonl_doc;
 mod log_deltas;

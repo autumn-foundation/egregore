@@ -32,6 +32,7 @@ mod import;
 mod ingest;
 mod inspect;
 mod lifeline;
+mod link_logs;
 mod locate;
 mod log_deltas;
 mod manifest_deps;
@@ -95,6 +96,7 @@ pub(crate) use import::*;
 pub(crate) use ingest::*;
 pub(crate) use inspect::*;
 pub(crate) use lifeline::*;
+pub(crate) use link_logs::*;
 pub(crate) use locate::*;
 pub(crate) use log_deltas::*;
 pub(crate) use manifest_deps::*;
@@ -268,6 +270,50 @@ pub(crate) enum Commands {
         /// time. Not part of the handle identity.
         #[arg(long)]
         captured_at: Option<String>,
+    },
+    /// Link error signatures to the agent runs and tasks that preceded them
+    /// (issue #323).
+    ///
+    /// Reads a union graph (`--graph` may be repeated to union multiple JSONL
+    /// files, or `--data-dir`) of log records (`scan-logs`), agent-memory &
+    /// verification records (`AgentRun` / `AgentTurn` / `CommandRun`), and
+    /// project `Task` records, and emits `EMITTED_DURING` edges from each
+    /// `ErrorSignature` to the runs/commands that produced it. Each edge carries
+    /// a closed-set correlation basis: `content_hash_join` (a `CommandRun`'s
+    /// captured stdout/stderr hash equals the signature's `LogSource` artifact
+    /// hash — confidence 1.0) or `temporal_correlation` (the signature's valid
+    /// time falls inside a same-repository run window — confidence 0.5, a
+    /// correlation lead never causation). Task/issue links reuse
+    /// `REFERENCES_TASK` (no new project label). Every edge is mirrored by an
+    /// evidence link on the signature. Output is deterministic and byte-identical
+    /// across runs; raw log / transcript / command text never enters the graph.
+    /// See `docs/cli/link-logs.md`.
+    LinkLogs {
+        /// Path(s) to graph JSONL to union (log + code + agent records). Repeat
+        /// the flag to union multiple files. Mutually exclusive with
+        /// `--data-dir`.
+        #[arg(long)]
+        graph: Vec<PathBuf>,
+        /// Embedded store holding the union of records (mutually exclusive with
+        /// `--graph`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output JSONL path for the enriched records.
+        #[arg(long)]
+        out: PathBuf,
+        /// Symmetric window tolerance in seconds for `temporal_correlation`
+        /// (default 0 = strict). A run window `[start, end]` matches a signature
+        /// time `t` when `start - tolerance <= t <= end + tolerance`.
+        #[arg(long, default_value_t = 0)]
+        tolerance: i64,
+        /// Record this commit view (SHA or unique prefix) on emitted evidence
+        /// links (requires a history graph). Mutually exclusive with --as-of.
+        #[arg(long)]
+        at: Option<String>,
+        /// Record the commit view at or before this RFC 3339 instant on emitted
+        /// evidence links. Mutually exclusive with --at.
+        #[arg(long)]
+        as_of: Option<String>,
     },
     /// Resolve log backtrace frames to code-graph symbols (issue #322).
     ///
@@ -3036,6 +3082,21 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             protected_store.as_deref(),
             producer.as_deref(),
             captured_at.as_deref(),
+        ),
+        Commands::LinkLogs {
+            graph,
+            data_dir,
+            out,
+            tolerance,
+            at,
+            as_of,
+        } => link_logs_cmd(
+            &graph,
+            data_dir.as_deref(),
+            &out,
+            tolerance,
+            at.as_deref(),
+            as_of.as_deref(),
         ),
         Commands::ResolveFrames {
             log_graph,

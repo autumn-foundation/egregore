@@ -54,6 +54,29 @@ Frames are non-identity. A binding proves the frame NAMES the symbol, never that
 the symbol is at fault. Deterministic and byte-stable; raw log text never enters
 the graph. See `docs/cli/resolve-frames.md`.
 
+`eg link-logs --graph <graph.jsonl>... --out <out>` (issue #323) links each
+`ErrorSignature` (#320) to the agent runs/commands that produced it, emitting
+`EMITTED_DURING` evidence-link edges over a union graph of log + agent-memory +
+verification + project records. Every edge carries exactly one closed-set
+`basis`: `content_hash_join` (a `CommandRun`'s captured stdout/stderr
+`OutputHandle.hash` equals the signature's `CAPTURED_FROM` `LogSource`
+`source_artifact_hash` — exact byte equality, confidence `1.0`, inherently
+within-repo) or `temporal_correlation` (the signature's `last_seen`/`first_seen`
+falls inside an `AgentRun`/`AgentTurn` window `[started_at, finished_at]` ±
+`--tolerance`, default 0, for the SAME repository — confidence `0.5`, "a
+correlation lead, never causation"). Overlapping runs each mint one edge (no
+silent winner); a signature with zero edges is tallied `uncorrelated`.
+Repository boundary: `temporal_correlation` requires exactly one `Repository`
+anchor and verifies each signature's `LogSource` recomputes to it (reading the
+repository id the log ID hash already encoded — no new field); foreign or
+anchor-ambiguous candidates are tallied `cross_repo_rejected`. Task/issue links
+reuse `REFERENCES_TASK` (`ErrorSignature` → `Task`/`GitHubIssue`/`LocalTask`) —
+no new project label. Every edge is mirrored by an `EvidenceLink` on the
+signature (dual representation). Deterministic, byte-stable, idempotent; raw
+log/transcript/command text never enters the graph; `--at`/`--as-of` mutually
+exclusive (exit 1). See `docs/cli/link-logs.md` and the `EMITTED_DURING` basis
+section of `docs/schema/log-graph.md`.
+
 `eg inspect --data-dir` inspects an embedded store directly — no daemon, no
 network, no embeddings (issue #125, the daemon-free analog of #47). It reports
 totals plus per-domain/per-kind/per-schema-version counts grouped by trust

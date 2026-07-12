@@ -412,6 +412,7 @@ fn semantic_edge(
         resolution: None,
         frame_resolution: None,
         frame_index: None,
+        basis: None,
         temporal: None,
         summary,
         producer: None,
