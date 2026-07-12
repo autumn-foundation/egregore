@@ -595,9 +595,31 @@ pub fn error_context(
     // Stage A reports — resolving symbol handles from the current graph while
     // Stage A re-resolves would make `error-context <symbol> --at <commit>` miss a
     // signature whose frame only resolves to that symbol at the commit view.
+    let stripped;
     let reresolved;
     let frame_records: &[GraphRecord] = if at_commit.is_some() {
-        reresolved = log_resolve::resolve_frames(records, at_commit);
+        // Drop any pre-existing FRAME_RESOLVES_TO edges (carried through from a
+        // prior `eg resolve-frames` / `link-logs` run — the normal combined-graph
+        // input) BEFORE re-resolving, so the at-commit view REPLACES the HEAD
+        // frame view rather than merging with it. Without the strip, a frame that
+        // resolves to a DIFFERENT target at the old commit than at HEAD would
+        // report BOTH the stale HEAD target and the fresh at-commit target.
+        // `resolve_frames` reads frames from `ErrorSignature` NODES and rebuilds
+        // its own `RepositoryIndex`, both of which survive dropping the edges.
+        stripped = records
+            .iter()
+            .filter(|r| {
+                !matches!(
+                    r,
+                    GraphRecord::Edge {
+                        label: EdgeLabel::FrameResolvesTo,
+                        ..
+                    }
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        reresolved = log_resolve::resolve_frames(&stripped, at_commit);
         &reresolved.records
     } else {
         records

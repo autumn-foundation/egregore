@@ -1595,6 +1595,95 @@ fn at_commit_reresolves_frames_against_commit_view() {
     assert_eq!(at_c2.signatures[0].frames[0].target_record_id, beta_id);
 }
 
+// A frame at src/lib.rs:5 that resolves to a DIFFERENT symbol at the old commit
+// (`alpha` at c1) than at HEAD (`beta` at c2), plus a pre-existing HEAD-view
+// FRAME_RESOLVES_TO edge to `beta` — the normal combined-graph input a prior
+// `eg resolve-frames` / `link-logs` run produces.
+fn at_reresolution_fixture() -> (Vec<GraphRecord>, String, String, String) {
+    let frames = Some(vec![StackFrame {
+        frame_index: 0,
+        module_path: None,
+        file_path: Some("src/lib.rs".to_owned()),
+        line: Some(5),
+    }]);
+    let (alpha_id, alpha) = symbol_snapshot("alpha", "src/lib.rs", 1, 10, "c1sha0000", T1);
+    let (beta_id, beta) = symbol_snapshot("beta", "src/lib.rs", 1, 10, "c2sha0000", T2);
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 1, frames);
+    let records = vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        alpha,
+        beta,
+        sig,
+        // Pre-existing HEAD-view resolution to `beta`, carried through as input.
+        frame_resolves(&sig_id, &beta_id, 0, FrameResolution::Resolved),
+    ];
+    (records, sig_id, alpha_id, beta_id)
+}
+
+#[test]
+fn at_reresolution_replaces_stale_frame_edge_with_commit_view() {
+    // `--at c1` must REPLACE the frame view, not merge with it: the pre-existing
+    // HEAD edge to `beta` is dropped and the frame re-resolves to `alpha` at c1.
+    // Before the fix the carried-through `beta` edge was reported ALONGSIDE the
+    // fresh `alpha` target, silently mixing the two views.
+    let (records, sig_id, alpha_id, beta_id) = at_reresolution_fixture();
+    let at_c1 = error_context(
+        &records,
+        &sig_id,
+        None,
+        Some("c1sha0000"),
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("resolve at c1");
+    let targets: Vec<&str> = at_c1.signatures[0]
+        .frames
+        .iter()
+        .map(|f| f.target_record_id.as_str())
+        .collect();
+    assert_eq!(
+        targets,
+        vec![alpha_id.as_str()],
+        "`--at c1` must report ONLY the c1 re-resolution (alpha), not the stale HEAD target (beta)"
+    );
+    assert!(
+        !targets.contains(&beta_id.as_str()),
+        "the pre-existing HEAD frame edge must not bleed into the --at view"
+    );
+}
+
+#[test]
+fn non_at_path_preserves_preexisting_frame_edge() {
+    // Regression guard for the fix: the NON-`--at` path relies on the input
+    // graph's existing FRAME_RESOLVES_TO edges and must report the pre-existing
+    // HEAD target (beta) unchanged — the strip is confined to the `--at` arm.
+    let (records, sig_id, _alpha_id, beta_id) = at_reresolution_fixture();
+    let head = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("resolve at HEAD");
+    let targets: Vec<&str> = head.signatures[0]
+        .frames
+        .iter()
+        .map(|f| f.target_record_id.as_str())
+        .collect();
+    assert_eq!(
+        targets,
+        vec![beta_id.as_str()],
+        "the non-`--at` path must report the pre-existing HEAD frame edge (beta) unchanged"
+    );
+}
+
 #[test]
 fn symbol_mode_resolves_against_at_commit_reresolved_frames() {
     // A frame at src/lib.rs:5. At c1 the symbol `alpha` occupies lines 1-10; at
