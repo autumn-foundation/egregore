@@ -133,6 +133,32 @@ pub(crate) fn query_subsystem_cmd(
         })
         .collect();
 
+    let log_signatures: Vec<SubsystemLogSignature<'_>> = ctx
+        .log_signatures
+        .iter()
+        .map(|s| SubsystemLogSignature {
+            record_id: s.record_id,
+            kind: "ErrorSignature",
+            trust_class: "runtime_observation",
+            schema_version: s.schema_version,
+            severity: s.severity,
+            occurrence_count: s.occurrence_count,
+            template_excerpt: s.template_excerpt,
+            first_seen_valid_time: (!s.first_seen.is_empty()).then_some(s.first_seen),
+            last_seen_valid_time: (!s.last_seen.is_empty()).then_some(s.last_seen),
+            resolved_frames: s
+                .in_prefix_frames
+                .iter()
+                .map(|f| SubsystemLogFrame {
+                    frame_index: f.frame_index,
+                    frame_resolution: f.frame_resolution,
+                    target_repo_relative_path: f.target_repo_relative_path,
+                    target_span: f.target_span,
+                })
+                .collect(),
+        })
+        .collect();
+
     let response = SubsystemResponse {
         ok: true,
         prefix: ctx.prefix.as_str(),
@@ -143,6 +169,7 @@ pub(crate) fn query_subsystem_cmd(
         artifacts,
         verification_evidence,
         semantic_drift,
+        log_signatures,
         unresolved,
         excluded,
     };

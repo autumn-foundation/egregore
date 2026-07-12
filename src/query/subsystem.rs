@@ -4,7 +4,10 @@ use super::{
     ContextSection, UnresolvedRef, classify_node, evidence_link_triple_handle, is_bfs_relay_node,
     is_cross_domain_label, is_forward_only_label, resolve_drift_target, semantic_drift,
 };
-use crate::ir::{GraphRecord, NodeKind};
+use crate::ir::{
+    EdgeLabel, ErrorSignaturePayload, FrameResolution, GraphRecord, LogPayload, NodeKind,
+    SourceSpan,
+};
 
 /// Why a subsystem prefix was rejected.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -42,6 +45,54 @@ pub fn path_is_under_prefix(path: &str, prefix: &str) -> bool {
     }
 }
 
+/// One in-prefix resolved backtrace frame carried on a subsystem log-signature
+/// row (issue #325).
+///
+/// A frame is in-prefix iff its `FRAME_RESOLVES_TO` edge (issue #322) carries a
+/// `resolved` or `path_only` resolution and its code-graph target's
+/// `repo_relative_path` passes the segment-aware [`path_is_under_prefix`]
+/// matcher. Frames are non-identity leads: a binding proves the frame *names*
+/// the symbol, never that the symbol is at fault.
+#[derive(Debug, Clone)]
+pub struct SubsystemLogFrame<'a> {
+    /// Zero-based backtrace frame index the resolution applies to.
+    pub frame_index: u32,
+    /// Closed resolution class: `resolved` or `path_only`.
+    pub frame_resolution: &'static str,
+    /// Repo-relative path of the resolved code-graph target (Symbol or File).
+    pub target_repo_relative_path: &'a str,
+    /// Span of the resolved target when it is a `Symbol` (absent for a `File`).
+    pub target_span: Option<SourceSpan>,
+}
+
+/// One runtime `ErrorSignature` whose frames resolve under the prefix
+/// (issue #325).
+///
+/// Rows are runtime observations — a producing program's own claim, deterministically
+/// parsed but never verified: **leads, not proof** the subsystem is unhealthy.
+/// `occurrence_count` reflects the scanned log sources only, not all runtime
+/// reality. Records sharing a stable ID across scan sources are coalesced
+/// (earliest `first_seen`, latest `last_seen`, summed `occurrence_count`).
+#[derive(Debug, Clone)]
+pub struct SubsystemLogSignature<'a> {
+    /// Stable `ErrorSignature` record ID.
+    pub record_id: &'a str,
+    /// Schema version stamped on the signature record.
+    pub schema_version: u32,
+    /// Closed severity class: `fatal`, `error`, or `warn`.
+    pub severity: &'a str,
+    /// Total occurrences summed across the coalesced scan sources.
+    pub occurrence_count: u64,
+    /// Bounded, post-redaction template excerpt (never raw log text).
+    pub template_excerpt: &'a str,
+    /// Valid time of the earliest occurrence (empty when unrecorded).
+    pub first_seen: &'a str,
+    /// Valid time of the latest occurrence (empty when unrecorded).
+    pub last_seen: &'a str,
+    /// In-prefix resolved frames, sorted deterministically.
+    pub in_prefix_frames: Vec<SubsystemLogFrame<'a>>,
+}
+
 /// Evidence-backed subsystem context returned by [`subsystem_context`].
 ///
 /// Sections mirror [`SymbolContext`] but the entry point is a repo-relative
@@ -71,6 +122,11 @@ pub struct SubsystemContext<'a> {
     pub verification_evidence: Vec<&'a GraphRecord>,
     /// `SemanticDrift` nodes whose resolved target path is under the prefix.
     pub semantic_drift: Vec<&'a GraphRecord>,
+    /// Runtime `ErrorSignature` records whose frames resolve under the prefix
+    /// (issue #325). Always present (empty when no scanned source resolves here);
+    /// an empty section means "no scanned source resolved here", not "no errors
+    /// exist".
+    pub log_signatures: Vec<SubsystemLogSignature<'a>>,
     /// Evidence link targets referenced by agent-memory nodes that are absent
     /// from this store slice.
     pub unresolved: Vec<UnresolvedRef>,
@@ -86,6 +142,7 @@ impl SubsystemContext<'_> {
             && self.artifacts.is_empty()
             && self.verification_evidence.is_empty()
             && self.semantic_drift.is_empty()
+            && self.log_signatures.is_empty()
             && self.unresolved.is_empty()
     }
 }
@@ -654,6 +711,14 @@ pub fn subsystem_context<'a>(
         drift_records
     };
 
+    // Runtime log signatures (issue #325): ErrorSignatures whose FRAME_RESOLVES_TO
+    // frames land under the prefix. Unresolved/ambiguous-only signatures never
+    // enter this section; their in-prefix dangling targets are routed into the
+    // existing `unresolved` collection so they are never silently dropped.
+    let (log_signatures, extra_unresolved) =
+        collect_log_signatures(records, &by_id, &tombstoned_ids, normalized);
+    unresolved.extend(extra_unresolved);
+
     Ok(SubsystemContext {
         prefix: normalized.to_owned(),
         source_facts: resolve(&source_facts),
@@ -678,6 +743,7 @@ pub fn subsystem_context<'a>(
         artifacts: resolve(&artifacts),
         verification_evidence: resolve(&verification_evidence),
         semantic_drift,
+        log_signatures,
         unresolved: {
             let mut u = unresolved;
             u.sort_by(|a, b| {
@@ -696,4 +762,194 @@ pub fn subsystem_context<'a>(
             u
         },
     })
+}
+
+/// One `FRAME_RESOLVES_TO` edge (issue #322), read from the EDGE record so the
+/// resolution class comes from `frame_resolution`/`frame_index`, never the
+/// node-side `EvidenceLink` mirror (which omits the resolution enum).
+struct FrameEdge<'a> {
+    frame_index: u32,
+    resolution: FrameResolution,
+    target_id: &'a str,
+}
+
+/// The `domain:` prefix of a stable record ID (`log:v1:x` -> `log`).
+fn domain_prefix(id: &str) -> &str {
+    id.split_once(':').map_or(id, |(d, _)| d)
+}
+
+/// Collects the `log_signatures` section (issue #325) and the in-prefix dangling
+/// frame targets that must surface through the `unresolved` section (AC4).
+///
+/// A signature enters `log_signatures` iff at least one of its
+/// `FRAME_RESOLVES_TO` edges carries a `resolved` or `path_only` resolution whose
+/// code-graph target's `repo_relative_path` passes [`path_is_under_prefix`].
+/// Signatures whose only in-prefix frames are `ambiguous`/`unresolved` never
+/// enter the section; each such dangling target is returned as an
+/// [`UnresolvedRef`] so it is never silently dropped. Records sharing a stable ID
+/// across scan sources are coalesced (earliest `first_seen`, latest `last_seen`,
+/// summed `occurrence_count`) before selection, so exactly one row per signature
+/// ID is emitted. Log records are non-temporal, so a tombstoned signature is
+/// dropped by the simple `tombstoned_ids` membership test.
+fn collect_log_signatures<'a>(
+    records: &'a [GraphRecord],
+    by_id: &BTreeMap<&'a str, &'a GraphRecord>,
+    tombstoned_ids: &BTreeSet<&str>,
+    prefix: &str,
+) -> (Vec<SubsystemLogSignature<'a>>, Vec<UnresolvedRef>) {
+    // Step 1: read FRAME_RESOLVES_TO edges, grouped by signature id. The
+    // resolution and frame index come from the edge fields; edges missing either
+    // (a base edge without the #322 builders) are skipped.
+    let mut frames_by_sig: BTreeMap<&str, Vec<FrameEdge<'a>>> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Edge {
+            label: EdgeLabel::FrameResolvesTo,
+            source,
+            target,
+            frame_resolution: Some(resolution),
+            frame_index: Some(frame_index),
+            ..
+        } = r
+        {
+            frames_by_sig
+                .entry(source.as_str())
+                .or_default()
+                .push(FrameEdge {
+                    frame_index: *frame_index,
+                    resolution: *resolution,
+                    target_id: target.as_str(),
+                });
+        }
+    }
+
+    // Step 2: coalesce ErrorSignature node payloads by stable ID. `LogSource` and
+    // `frames` are non-identity, so a graph combining multiple scan-logs outputs
+    // carries the same signature ID more than once; group and merge before
+    // selecting so exactly one row per ID is emitted.
+    let mut sig_groups: BTreeMap<&str, Vec<(u32, &'a ErrorSignaturePayload)>> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::ErrorSignature,
+            schema_version,
+            log: Some(payload),
+            ..
+        } = r
+            && let LogPayload::ErrorSignature(sig) = payload.as_ref()
+        {
+            sig_groups
+                .entry(id.as_str())
+                .or_default()
+                .push((*schema_version, sig));
+        }
+    }
+
+    let mut log_signatures: Vec<SubsystemLogSignature<'a>> = Vec::new();
+    let mut extra_unresolved: Vec<UnresolvedRef> = Vec::new();
+
+    // BTreeMap iteration is sorted by record ID; every merge below is
+    // order-independent, so output is byte-stable.
+    for (sig_id, group) in &sig_groups {
+        // Log records are non-temporal: a tombstoned signature is simply dropped.
+        if tombstoned_ids.contains(*sig_id) {
+            continue;
+        }
+
+        let mut in_prefix_frames: Vec<SubsystemLogFrame<'a>> = Vec::new();
+        // Dangling (target_id, target_domain) for in-prefix ambiguous/unresolved
+        // frames, surfaced only when the signature is NOT otherwise selected.
+        let mut dangling: Vec<(&'a str, &'a str)> = Vec::new();
+
+        if let Some(frames) = frames_by_sig.get(*sig_id) {
+            for fr in frames {
+                let target = by_id.get(fr.target_id).copied();
+                let target_path = target.and_then(|r| match r {
+                    GraphRecord::Node {
+                        repo_relative_path: Some(p),
+                        ..
+                    } => Some(p.as_str()),
+                    _ => None,
+                });
+                let Some(path) = target_path else { continue };
+                if !path_is_under_prefix(path, prefix) {
+                    continue;
+                }
+                match fr.resolution {
+                    FrameResolution::Resolved | FrameResolution::PathOnly => {
+                        let span = target.and_then(|r| match r {
+                            GraphRecord::Node { span, .. } => *span,
+                            _ => None,
+                        });
+                        in_prefix_frames.push(SubsystemLogFrame {
+                            frame_index: fr.frame_index,
+                            frame_resolution: fr.resolution.as_str(),
+                            target_repo_relative_path: path,
+                            target_span: span,
+                        });
+                    }
+                    FrameResolution::Ambiguous | FrameResolution::Unresolved => {
+                        dangling.push((fr.target_id, domain_prefix(fr.target_id)));
+                    }
+                }
+            }
+        }
+
+        if in_prefix_frames.is_empty() {
+            // AC4: an unresolved/ambiguous-only signature never enters the
+            // section; its in-prefix dangling targets surface through `unresolved`.
+            for (target_id, domain) in dangling {
+                extra_unresolved.push(UnresolvedRef {
+                    source_record_id: (*sig_id).to_owned(),
+                    target_handle: target_id.to_owned(),
+                    relation: EdgeLabel::FrameResolvesTo.as_str().to_owned(),
+                    target_domain: domain.to_owned(),
+                });
+            }
+            continue;
+        }
+
+        in_prefix_frames.sort_by(|a, b| {
+            a.frame_index
+                .cmp(&b.frame_index)
+                .then_with(|| a.frame_resolution.cmp(b.frame_resolution))
+                .then_with(|| a.target_repo_relative_path.cmp(b.target_repo_relative_path))
+        });
+        in_prefix_frames.dedup_by(|a, b| {
+            a.frame_index == b.frame_index
+                && a.frame_resolution == b.frame_resolution
+                && a.target_repo_relative_path == b.target_repo_relative_path
+        });
+
+        // Coalesced payload fields. `severity`, `schema_version`, and the
+        // template excerpt are identity-derived (identical within the group);
+        // `occurrence_count` sums across scanned sources. `first_seen`/`last_seen`
+        // are Z-normalized RFC 3339 from scan-logs, so lexical min/max equals
+        // instant order.
+        let occurrence_count: u64 = group.iter().map(|(_, s)| s.occurrence_count).sum();
+        let first_seen = group
+            .iter()
+            .map(|(_, s)| s.first_seen.as_str())
+            .min()
+            .unwrap_or_default();
+        let last_seen = group
+            .iter()
+            .map(|(_, s)| s.last_seen.as_str())
+            .max()
+            .unwrap_or_default();
+        let (schema_version, sig) = (group[0].0, group[0].1);
+
+        log_signatures.push(SubsystemLogSignature {
+            record_id: sig_id,
+            schema_version,
+            severity: sig.severity.as_str(),
+            occurrence_count,
+            template_excerpt: sig.template_excerpt.as_str(),
+            first_seen,
+            last_seen,
+            in_prefix_frames,
+        });
+    }
+
+    log_signatures.sort_by(|a, b| a.record_id.cmp(b.record_id));
+    (log_signatures, extra_unresolved)
 }
