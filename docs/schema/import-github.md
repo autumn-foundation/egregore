@@ -226,9 +226,13 @@ state. `resource_hashes` provides that storage: it maps `"issue:<n>"` or
 (**all fields that can affect the emitted `Task` or `ExternalLink`:**
 `number`, `state`, `state_reason`, `title`, `body`, `labels`, `assignees`,
 `milestone` (full object), `updated_at`, `closed_at`, and PR-specific fields
-`merged_at`, `draft`, `head.sha`, `head.ref`, `base.ref`, `merge_commit_sha`;
-omitting any of these fields from the hash means a change to that field is
-permanently missed on re-import). For a PR the hash **also** folds in the
+`merged_at`, `draft`, `head.sha`, `head.ref`, `base.ref`, `merge_commit_sha`,
+the requested-review inputs `requested_reviewers` (logins) and `requested_teams`
+(slugs), and the PR **author** login `user.login` (issue #335 — minted as an
+`ExternalIdentity` and stored as `Task.author`, so an author account rename with
+every other field unchanged must re-emit the PR to mint the new identity and
+update `Task.author`); omitting any of these fields from the hash means a change
+to that field is permanently missed on re-import). For a PR the hash **also** folds in the
 `MERGED_AS` merge-link **resolution outcome** against the current seeded
 `--code-graph` (issue #333): the target `Commit` record ID when the
 `merge_commit_sha` resolves, or a stable `unresolved` / `ambiguous:<count>` /

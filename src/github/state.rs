@@ -464,11 +464,18 @@ pub fn pull_hash(pr: &model::PullRequest, merge_link_marker: &str) -> String {
         // Codex round-4): a changed seed graph re-emits the merge edge.
         "merge_link": merge_link_marker,
         // Requested reviewers/teams drive REQUESTED_REVIEW_FROM edges and team
-        // diagnostics (#335). A reviewer added/removed with every other field
-        // unchanged must re-emit the PR's request edges, so both participate in
-        // the change hash.
+        // diagnostics (#335), and the PR author is minted as an ExternalIdentity /
+        // Task.author (#335). A reviewer added/removed or an author account rename
+        // with every other field unchanged must re-emit the PR's request/author
+        // edges, so all three participate in the change hash.
         "requested_reviewers": pr.requested_reviewers.iter().map(|u| &u.login).collect::<Vec<_>>(),
         "requested_teams": pr.requested_teams.iter().map(|t| &t.slug).collect::<Vec<_>>(),
+        // The PR author (`pr.user.login`) is minted as an ExternalIdentity and
+        // stored as Task.author (#335). An author account rename with every other
+        // field unchanged must re-emit the PR so the new author identity is minted
+        // and Task.author updated — otherwise the author≠approver segregation-of-
+        // duties join keeps the stale identity.
+        "author": pr.user.as_ref().map(|u| &u.login),
     });
     blake3::hash(serde_json::to_string(&key).unwrap_or_default().as_bytes())
         .to_hex()
@@ -1200,6 +1207,43 @@ mod tests {
             slug: "backend".to_owned(),
         }];
         assert_ne!(pull_hash(&a, "none"), pull_hash(&b, "none"));
+    }
+
+    #[test]
+    fn pull_hash_changes_when_author_login_changes() {
+        // Issue #335: the PR author (`pr.user.login`) is minted as an
+        // ExternalIdentity and stored as Task.author. If the author renames their
+        // GitHub account while every other hashed field is unchanged, the PR must
+        // re-emit so the new author identity is minted and Task.author updated;
+        // otherwise `is_unchanged` suppresses the update and the author≠approver
+        // segregation-of-duties join keeps the stale identity.
+        let mut a = pull(1);
+        let mut b = pull(1);
+        a.user = Some(model::User {
+            login: "old-login".to_owned(),
+        });
+        b.user = Some(model::User {
+            login: "new-login".to_owned(),
+        });
+        assert_ne!(
+            pull_hash(&a, "none"),
+            pull_hash(&b, "none"),
+            "a changed PR author login must change the hash"
+        );
+        // Stable when the author login is unchanged.
+        assert_eq!(
+            pull_hash(&a, "none"),
+            pull_hash(
+                &{
+                    let mut p = pull(1);
+                    p.user = Some(model::User {
+                        login: "old-login".to_owned(),
+                    });
+                    p
+                },
+                "none"
+            )
+        );
     }
 
     #[test]
