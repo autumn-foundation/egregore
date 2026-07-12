@@ -44,6 +44,7 @@ eg audit evidence-pack assemble --control CC8.1 \
 | #60 protected artifacts | `protected:v1:` handles survive as citations; raw bytes never enter the pack. |
 | #333 PR head/base/merge SHAs | First-class PR Task fields drive merge-target and review joins. |
 | #334 reviewed-commit facts | *Not yet merged.* Two gap classes always report `capability_unavailable` (see below). |
+| #319/#320/#322/#326 log-graph | Runtime incident evidence folded into the CC7.x `error_signatures` / `occurrence_buckets` / `remediation_links` sections (issue #340; see below). |
 
 ## When to use `eg bundle export` instead
 
@@ -64,6 +65,10 @@ pass/fail gate".
 - A class-relevant record with no resolvable valid time is **excluded** and
   counted under a `missing_valid_time` diagnostic (and a `missing_valid_time`
   gap).
+- An in-window `LogOccurrenceBucket` with no `AGGREGATES` attribution edge is
+  **excluded** from both the `occurrence_buckets` section and its summary and
+  counted under an **`unattributed_bucket`** diagnostic (see the
+  `occurrence_buckets` section below) — it cannot be filed under any signature.
 - A resolved valid time is **parsed before** the in/out-of-window decision. A
   present-but-malformed (non-RFC-3339) valid time is treated as **unresolved** —
   routed to the same `missing_valid_time` path (count + diagnostic + gap) as a
@@ -169,7 +174,8 @@ one of three honest families:
 |---------|---------|----------------------------------|
 | `commits` (`Commit`), `pull_requests` (`Task`/`github_pr`), `reviews` (genuine PR `Review` — see below), `structural_deltas` (`Change`), `verification_evidence` (`Verification`/`CommandRun`/`TestRun`/`CIStatus`/`CommandEvidence`/`BenchmarkRun`/`CoverageReport`/`ProofResult`) | real stored node kind | `<class>_domain_absent` (e.g. `delta_domain_absent`) |
 | `public_api_deltas` (#157), `validation_runs` (#103) | computed/derived surface, **no stored node kind** | `derived_class_not_materialized` |
-| `error_signatures` (`ErrorSignature`), `occurrence_buckets` (`LogOccurrenceBucket`), `remediation_links` | log-signature domain (issues #319/#340), not yet emitted | `log_domain_absent` |
+| `error_signatures` (`ErrorSignature`), `occurrence_buckets` (`LogOccurrenceBucket`) | log-signature domain (issues #319/#320); populated by #340 when present | `log_domain_absent` |
+| `remediation_links` | **derived** join `ErrorSignature → FRAME_RESOLVES_TO → Symbol → CHANGED_IN → Commit` (issue #340), no stored node kind | `log_domain_absent` |
 | `review_coverage` | computed over merged PRs (available whenever any PR exists) | `no_pull_requests_to_measure` |
 
 `structural_deltas` is a genuine stored class: `scan-history` emits one
@@ -197,6 +203,151 @@ approving review for `merged_pr_without_approving_review` gap suppression, even 
 it carried an `approved` state. This closes a gap where unrelated issue discussion
 could mark the required CC8.1 `Reviews` class available and let a relaxed
 `--min-review-coverage` pack pass without genuine review evidence.
+
+## Log-graph incident evidence for CC7.x (issue #340)
+
+The monitoring controls **CC7.2** and **CC7.3** fold runtime log-graph incident
+evidence into their packs. The foundation is the log-graph domain — umbrella
+issue **#319**, the **#320** `ErrorSignature`/fingerprint scan (`eg scan-logs`),
+the **#322** `FRAME_RESOLVES_TO` frame resolution, and the **#326** `log-deltas`
+valid-time model. This lane is pure **pack-side population** on the **#338**
+chassis; it adds no graph domain, kind, edge, or trust class. Exemplar-payload
+discipline follows issue **#60**: the pack cites content-addressed `protected:v1:`
+handles, never raw log or exemplar bytes.
+
+Three sections carry the evidence, each with a section-level disclaimer:
+
+**`error_signatures`** — one hashed `ErrorSignature` row per in-window signature
+(the point predicate on the signature's `first_seen`), plus a `log_summary`
+carrying, per signature: the `log:v1:` record ID, `severity`, a `template_hash`
+(BLAKE3 of the normalized template excerpt — a redaction-safe fingerprint, never
+raw text), a `frame_chain_hash` when frames were captured, the **first/last-seen
+valid times clipped to the window** (`first_seen_in_window`/`last_seen_in_window`),
+content-addressed **exemplar handles** (`protected:v1:<hash>` + content hash +
+source line — handle and hash ONLY, never exemplar text), and each
+`FRAME_RESOLVES_TO` join with its `frame_resolution` label **propagated verbatim**
+(the #152/#134 precedent). Rows are ordered by `signature_id`.
+
+The exported `ErrorSignature` section rows are **log-text-scrubbed** before they
+are hashed (issue #340, Codex round-4 P2): `bundle::scrub_record` never touches
+the `log` payload, so a pack-side, log-aware scrub replaces the node's normalized
+`template_excerpt` with its own BLAKE3 fingerprint (the exact value the summary
+carries as `template_hash`) and replaces each captured backtrace frame's
+`module_path`/`file_path` text with its BLAKE3 fingerprint (the structural
+`frame_index`/`line` are retained and back `frame_chain_hash`). No raw normalized
+template text or readable frame path ever rides a hashed section row — only the
+redaction-safe fingerprints the summary already exposes. `LogEvent` exemplar
+`event_excerpt` text is likewise fingerprinted (exemplars ride the summary as
+content-addressed handles, never as section text).
+
+**Concatenated multi-scan coalescing** (issue #340, Codex round-6). A `LogSource`
+is a **non-identity** input: an `ErrorSignature`'s stable ID is
+`(repository_id, fingerprint_algorithm, template, severity)` and a
+`LogOccurrenceBucket`'s ID omits `LogSource` likewise. A graph built by
+concatenating several `scan-logs` outputs for one repo (a documented, legitimate
+multi-scan workflow) therefore carries the **same stable log ID once per scan**.
+`assemble` **coalesces duplicate log records by stable ID at assemble time**,
+BEFORE window filtering and summary building, mirroring the `query log-deltas`
+cross-scan semantics: `ErrorSignature` records sharing an ID merge to one node
+with the **earliest `first_seen`, latest `last_seen`** (by parsed UTC instant) and
+**summed `occurrence_count`**; `LogOccurrenceBucket` records sharing an ID have
+their counts **summed** (never deduped by bucket record ID, per issue #361);
+`LogSource`/`LogEvent` nodes and log-domain edges collapse to their first
+occurrence. Exactly **one summary row and one hashed section node per stable ID**
+results, so the concatenated pack still passes its own offline `verify` — the
+hard assemble↔verify consistency invariant. A single-scan graph has no duplicate
+log IDs, so coalescing is a no-op and every existing pack is byte-identical.
+
+**`occurrence_buckets`** — the **bucket window rule differs from the point
+predicate every other class uses**. A `LogOccurrenceBucket` row is in-window iff
+its hour `[bucket_start, bucket_start + 1h)` **intersects** the half-open window
+`[from, to)`: a partial-overlap hour (its `bucket_start` before `from`, or its
+hour extending past `to`) is **included whole, with no interpolation**. The
+`log_summary` reports per-signature `in_window_occurrences` — the sum over ONLY
+the in-window buckets — with the contributing buckets ordered by `(signature
+record_id, hour)`. `verify` applies the same interval-intersection predicate so a
+partial-overlap bucket whose `bucket_start` precedes `from` still passes
+Window-consistency.
+
+The section **co-locates each bucket's `LogOccurrenceBucket --AGGREGATES-->
+ErrorSignature` attribution edge** as a hash-bound row (issue #340, Codex round-3).
+The bucket *node* payload carries **no signature field** — the signature is only an
+identity input hashed into the bucket's stable ID — so the bucket→signature
+attribution that `total.signature_id` asserts must ride a tamper-evident row for
+`verify` to re-derive it offline. An `AGGREGATES` edge carries no valid time of its
+own; its window relevance rides the bucket it binds, and Window-consistency admits
+it on that basis. An **in-window bucket that carries no `AGGREGATES` attribution
+edge** cannot be filed under any signature, so it is **excluded from BOTH the
+section records and the summary** under a counted **`unattributed_bucket`**
+diagnostic (mirroring the `missing_valid_time` exclusion idiom) — never silently
+mis-summed, and never left in the section where the reverse-coverage guard would
+reject the freshly assembled pack. This upholds a hard invariant: **every pack
+`assemble` produces passes its own offline `verify` clean** (the assemble↔verify
+consistency invariant).
+
+**`remediation_links`** — a **derived** join, available (capability probe) when
+`ErrorSignature` + `FRAME_RESOLVES_TO` + `CHANGED_IN` facts all exist. Each lead
+runs `ErrorSignature → FRAME_RESOLVES_TO → Symbol → CHANGED_IN → Commit` where the
+commit's valid time is **at or after the signature's window activity**, carries the
+`frame_resolution` label verbatim, and cites the signature, symbol, commit, and any
+verification records linked to that commit. The section carries **zero hashed
+rows** — the leads ride `log_summary` because a remediation commit may legitimately
+fall outside the evidence window — and `verify` enforces that empty-row bound as
+the section's membership exemption (mirroring `review_coverage`), so no hashed row
+can be smuggled in as a remediation "row".
+
+**Integrity binds the log summaries.** The `log_summary` values are the derived
+evidence a consumer reads, yet they ride **outside** the hashed `records`. So each
+log section carries a `log_summary_hash` — the BLAKE3 of its canonical
+`log_summary` — that `verify`'s Integrity recomputes and asserts, exactly as it
+binds `review_coverage`'s `measurement`. A tampered summary value (an inflated
+`in_window_occurrences`, a swapped `template_hash`/`frame_chain_hash`, a forged
+remediation `commit_id`, or a rewritten exemplar handle) whose binding hash was not
+also recomputed fails Integrity. On top of that whole-summary hash, the fields with
+backing hashed rows are bound to them independently: `error_signatures` rows must
+be an exact one-to-one match with the section's `ErrorSignature` nodes and each
+row's `template_hash`/`frame_chain_hash`/`severity`/clipped span is bound to that
+node's (log-text-scrubbed) payload — `template_hash` binds directly to the node's
+stored template fingerprint and `frame_chain_hash` recomputes over the node's
+redacted (fingerprinted-path) frame chain, so the per-node bind still catches a
+forged summary fingerprint even with the whole-summary hash recomputed, without any
+raw log or frame text surviving in the pack — and each `occurrence_buckets` bucket
+must resolve to a present
+hashed `LogOccurrenceBucket` node with a matching count and hour while every
+`in_window_occurrences` must equal the recomputed sum — so the occurrence total
+cannot be inflated without adding real, count-matching hashed bucket rows. Each
+summary bucket must additionally be **filed under the same signature its co-located
+`AGGREGATES` attribution edge names**: moving a bucket under a different
+`signature_id` — the node count/hour still bind and both per-signature sums still
+balance — fails Integrity because no `AGGREGATES` edge in the section binds that
+bucket to the claimed signature, so consumers can never read per-signature
+occurrence counts for the **wrong incident**. The
+bucket binding is an **exact bijection in both directions**: not only must every
+summary bucket resolve to a present hashed node, but every hashed
+`LogOccurrenceBucket` node the section carries must be listed by the summary — so a
+bucket cannot be silently **dropped** from the summary (under-reporting
+`in_window_occurrences` while its hashed row lingers) with the binding hash
+recomputed over the reduced summary. The `AGGREGATES` edges the section co-locates
+are held to a **bounded membership exemption** (mirroring `review_coverage`): only
+an `AGGREGATES` edge whose source is a `LogOccurrenceBucket` node present in the
+same section is admitted; any other edge, or an attribution edge for an absent
+bucket, fails Integrity. Each summary variant is additionally **bound
+to its section class** — `error_signatures`↔`error_signatures`,
+`occurrence_buckets`↔`occurrence_buckets`, `remediation_links`↔`remediation_links` —
+so a `log_summary` on a non-log section, or a variant relocated onto a mismatched
+log section, fails Integrity (the derived `remediation_links` join has no backing
+hashed row to catch such a swap, so this class bind is its only guard against
+riding the wrong section). The derived `remediation_links` join has no backing
+hashed row, so the whole-summary hash plus this class bind are its sole binding
+surface.
+
+**Epistemic boundary.** Occurrence counts are **recorded ingestion of the scanned
+log sources, not guaranteed-complete telemetry** — absence of a signature is not
+proof the error did not occur. Remediation links are **leads, never causal
+claims**: a frame binding proves the frame NAMES the symbol, never that the symbol
+was at fault, and a changing commit is never asserted to have fixed the error. Log
+rows are trust class `runtime_observation` — a program's own claim, parsed but
+never verified — and are never tallied as `source_fact` or `verification_evidence`.
 
 ## Verdicts and exit codes
 
@@ -403,7 +554,42 @@ Re-verifies an assembled pack offline and read-only:
   `assemble` always emits it, even for a 0%-coverage window with merged PRs but no
   approving reviews (empty rows), so an absent measurement — with or without rows —
   fails Integrity rather than silently accepting an artifact stripped of its
-  coverage result.
+  coverage result. Integrity likewise **binds each log section's derived
+  `log_summary`** (issue #340), which — like the `measurement` — is the evidence a
+  consumer reads yet rides outside the hashed `records`. Every log section carries a
+  `log_summary_hash` (BLAKE3 of the canonical `log_summary`); Integrity recomputes
+  it and fails on any divergence, and requires the hash to be present iff the
+  summary is (a stripped hash, or a hash without a summary, fails). A **present**
+  log section (`error_signatures` / `occurrence_buckets` / `remediation_links`)
+  must carry **both** a `log_summary` and its `log_summary_hash` (issue #340, Codex
+  round-4 P1): `assemble` always emits the derived summary for a present log
+  section, and `remediation_links` evidence exists ONLY in the summary (zero hashed
+  rows), so stripping **both** the summary and its hash would silently drop all that
+  derived evidence yet still verify — absence of either on a present log section is
+  now an Integrity defect (an `unavailable` section legitimately carries neither).
+  So a tampered
+  summary value — an inflated `in_window_occurrences`, a swapped
+  `template_hash`/`frame_chain_hash`, a forged remediation `commit_id`, or a
+  rewritten exemplar handle — whose binding hash was not also recomputed fails
+  Integrity. On top of that whole-summary hash, the fields with backing hashed rows
+  are bound to them independently: `error_signatures` rows must be an **exact
+  one-to-one match** with the section's `ErrorSignature` nodes, and each row's
+  `template_hash`/`frame_chain_hash`/`severity`/window-clipped span is recomputed
+  from that node's payload; each `occurrence_buckets` bucket must resolve to a
+  present hashed `LogOccurrenceBucket` node with a matching `occurrence_count` and
+  hour (no bucket double-counted), and each `in_window_occurrences` must equal the
+  recomputed sum — so the occurrence total cannot be inflated without adding real,
+  count-matching hashed bucket rows. The bucket binding is an **exact bijection in
+  both directions**: every hashed `LogOccurrenceBucket` node the section carries
+  must also be listed by the summary, so a bucket cannot be silently **dropped**
+  (under-reporting `in_window_occurrences`) with the binding hash recomputed over
+  the reduced summary. Finally, each summary **variant is bound to its section
+  class** (`error_signatures`↔`error_signatures`,
+  `occurrence_buckets`↔`occurrence_buckets`,
+  `remediation_links`↔`remediation_links`): a `log_summary` on a non-log section, or
+  a variant relocated onto a mismatched log section, fails Integrity. The derived
+  `remediation_links` join has no backing hashed row, so the whole-summary hash plus
+  this class bind are its sole binding surface.
 - **Coverage** — recompute the #65 citation thresholds (>=95% code rows cited;
   100% non-code rows cited).
 - **Safety** — scans the **entire serialized pack artifact** for raw sensitive

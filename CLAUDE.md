@@ -742,8 +742,31 @@ effectiveness, compliance, or completeness; absence of a record means no
 imported evidence, not no event; not an auditor opinion". `eg audit
 evidence-pack verify <path>` re-checks a pack offline (Integrity, Coverage,
 Safety, Window-consistency). Use `eg bundle export` instead when you want a
-record-closure-scoped bundle rather than a control/window-scoped pack. See
-`docs/cli/evidence-pack.md`.
+record-closure-scoped bundle rather than a control/window-scoped pack.
+Issue #340 folds runtime log-graph incident evidence (foundation: umbrella #319,
+#320 `ErrorSignature`/fingerprint scan, #322 `FRAME_RESOLVES_TO`, #326
+log-deltas) into the CC7.2/CC7.3 sections — pure pack-side population, no new
+graph domain/kind/edge/trust class. `error_signatures` rows carry each signature's
+`log:v1:` ID, severity, `template_hash`, `frame_chain_hash`, first/last-seen
+**clipped to the window**, content-addressed `protected:v1:` exemplar handles
+(handle + hash only, never log text, #60 discipline), and each `FRAME_RESOLVES_TO`
+join with its `frame_resolution` label propagated verbatim (#152/#134).
+`occurrence_buckets` use a **class-specialized interval-intersection** window rule
+(a bucket whose hour `[bucket_start, +1h)` intersects `[from, to)` is included
+whole, no interpolation — NOT the point predicate), summing occurrences over
+in-window buckets only, ordered by `(signature record_id, hour)`.
+`remediation_links` is a derived join `ErrorSignature -> FRAME_RESOLVES_TO ->
+Symbol -> CHANGED_IN -> Commit` (capability probe: available when all three fact
+kinds exist) with commit valid_time >= the signature's window activity, carrying
+`frame_resolution` verbatim and citing signature+symbol+commit+verification IDs;
+its leads ride the section `log_summary` with zero hashed rows (a remediation
+commit may fall outside the window), and `verify` enforces that empty-row bound as
+the section's membership exemption. Log rows are trust class `runtime_observation`,
+never tallied `source_fact`/`verification_evidence`. Epistemic boundary: occurrence
+counts are recorded ingestion of the scanned sources, not guaranteed-complete
+telemetry; remediation links are leads, never causal claims. No catalog change
+(the CC7.x classes stay optional in `soc2-v1`; a `required` flip is deferred to a
+future soc2-v2). See `docs/cli/evidence-pack.md`.
 
 `eg audit review-coverage --from <T0> --to <T1>` (over `--graph` XOR `--data-dir`,
 issue #339) is a standing citable review-coverage gate: for every PR merged in the

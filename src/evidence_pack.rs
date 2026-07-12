@@ -752,6 +752,19 @@ pub const PACK_DISCLAIMER: &str = "rows are recorded observations of process exe
 /// Section-level disclaimer for delta classes, propagated verbatim (#118/#157).
 pub const DELTA_SECTION_DISCLAIMER: &str = "rows are observed deltas, never proof of behavior change; absence of a delta is not proof of stability";
 
+/// Section-level disclaimer for the log-evidence classes (issue #340).
+///
+/// For the `error_signatures` / `occurrence_buckets` runtime classes: occurrence
+/// counts reflect the scanned log sources as ingested, never guaranteed-complete
+/// telemetry.
+pub const LOG_SECTION_DISCLAIMER: &str = "rows are runtime observations parsed from ingested logs, never verified; occurrence counts reflect only the scanned log sources as recorded, not guaranteed-complete telemetry; absence of a signature is not proof the error did not occur";
+
+/// Section-level disclaimer for the derived `remediation_links` class (#340).
+///
+/// Every link is a review LEAD, never a causal claim that the named commit fixed
+/// the named error.
+pub const REMEDIATION_SECTION_DISCLAIMER: &str = "rows are derived remediation LEADS (error signature -> resolved frame symbol -> changing commit), never proof that the commit fixed the error; a frame binding proves only that the frame NAMES the symbol, never fault";
+
 /// The closed set of gap classes an evidence pack reports (AC5).
 ///
 /// Two variants (`ReviewUnanchoredNoCommitSha`, `ApprovalPrecedesFinalHead`)
@@ -1118,9 +1131,160 @@ pub struct EvidenceSection {
     /// Computed review-coverage measurement (only the `review_coverage` section).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measurement: Option<ReviewCoverageMeasurement>,
+    /// Derived, redaction-safe summary for the log-graph evidence classes
+    /// (issue #340: `error_signatures` / `occurrence_buckets` /
+    /// `remediation_links`). Absent on every other section.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_summary: Option<LogEvidenceSummary>,
+    /// BLAKE3 hash binding the derived `log_summary` into Integrity (issue #340).
+    /// Present iff `log_summary` is present. `verify_pack` recomputes it and fails
+    /// Integrity on any divergence, so a tampered summary value — an inflated
+    /// `in_window_occurrences`, a swapped `template_hash`/`frame_chain_hash`, a
+    /// forged remediation `commit_id`, or a rewritten exemplar handle — cannot ride
+    /// the pack undetected. This mirrors how `review_coverage`'s `measurement` is
+    /// bound: the recomputable fields (`error_signatures` template/frame-chain
+    /// hashes + clipped span, `occurrence_buckets` totals) are additionally bound to
+    /// their backing hashed section rows, while this whole-summary hash is the ONLY
+    /// binding surface for the derived `remediation_links` join, which by design
+    /// carries no backing hashed row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_summary_hash: Option<String>,
     /// Verbatim section-level disclaimer, when the class carries one (#118/#157).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disclaimer: Option<String>,
+}
+
+/// Derived, redaction-safe summary rows for a log-graph evidence section (#340).
+///
+/// Carried on the section alongside the scrubbed backing rows, analogous to
+/// `review_coverage`'s `measurement`. Every field is an ID, a hash, a bounded
+/// label, a clipped RFC3339 instant, or a count — never raw log or exemplar text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "log_section", rename_all = "snake_case")]
+pub enum LogEvidenceSummary {
+    /// `error_signatures`: one row per in-window `ErrorSignature`.
+    ErrorSignatures {
+        /// Signature rows, ordered by `signature_id`.
+        signatures: Vec<ErrorSignatureRow>,
+    },
+    /// `occurrence_buckets`: per-signature in-window occurrence totals.
+    OccurrenceBuckets {
+        /// Per-signature totals, ordered by `signature_id`; each row's buckets
+        /// ordered by hour (AC2 `(signature record_id, hour)`).
+        signature_totals: Vec<SignatureOccurrenceTotal>,
+    },
+    /// `remediation_links`: derived `ErrorSignature -> Symbol -> Commit` leads.
+    RemediationLinks {
+        /// Link rows, ordered by `(signature_id, symbol_id, commit_id)`.
+        links: Vec<RemediationLinkRow>,
+    },
+}
+
+/// One `error_signatures` summary row (AC1): fingerprint identity, window-clipped
+/// activity span, exemplar handles, and `FRAME_RESOLVES_TO` joins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorSignatureRow {
+    /// Stable `log:v1:` signature record ID.
+    pub signature_id: String,
+    /// Closed severity class (`fatal` / `error` / `warn`).
+    pub severity: String,
+    /// BLAKE3 of the normalized template excerpt — a redaction-safe fingerprint,
+    /// never the raw template text.
+    pub template_hash: String,
+    /// BLAKE3 of the captured backtrace frame chain, when the signature carried
+    /// parseable frames; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_chain_hash: Option<String>,
+    /// First-seen valid time, clipped to the window lower bound.
+    pub first_seen_in_window: String,
+    /// Last-seen valid time, clipped to the window upper bound.
+    pub last_seen_in_window: String,
+    /// Content-addressed exemplar references (handle + hash only, never text),
+    /// ordered by `(source_line, content_hash)`.
+    pub exemplars: Vec<ExemplarHandle>,
+    /// `FRAME_RESOLVES_TO` joins carrying the verbatim resolution label
+    /// (issues #152/#134), ordered by `(frame_index, target_id)`.
+    pub frame_resolutions: Vec<FrameResolutionJoin>,
+}
+
+/// A content-addressed exemplar reference (AC1): a `protected:v1:` handle plus
+/// its BLAKE3 content hash.
+///
+/// NEVER carries exemplar/log text — the raw bytes are retrievable only from the
+/// #60 protected store when captured; absence there is documented, never
+/// fabricated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExemplarHandle {
+    /// Content-addressed `protected:v1:<blake3>` handle for the exemplar bytes.
+    pub protected_handle: String,
+    /// BLAKE3 hex of the normalized exemplar content.
+    pub content_hash: String,
+    /// One-based source line the exemplar began on.
+    pub source_line: u64,
+}
+
+/// A `FRAME_RESOLVES_TO` join propagated verbatim onto a signature row (AC1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameResolutionJoin {
+    /// Zero-based backtrace frame index the edge resolved, when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_index: Option<u32>,
+    /// Verbatim closed-set resolution label (`resolved` / `ambiguous` /
+    /// `path_only` / `unresolved`), when the edge carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    /// Stable record ID the frame resolved to (Symbol / File / Diagnostic).
+    pub target_id: String,
+}
+
+/// Per-signature in-window occurrence total (AC2): the sum over ONLY the buckets
+/// whose hour intersects the window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureOccurrenceTotal {
+    /// Stable `log:v1:` signature record ID.
+    pub signature_id: String,
+    /// Sum of `occurrence_count` over the in-window buckets only.
+    pub in_window_occurrences: u64,
+    /// The contributing buckets, ordered by hour.
+    pub buckets: Vec<BucketCount>,
+}
+
+/// One occurrence bucket contributing to a signature's in-window total (AC2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketCount {
+    /// Stable `log:v1:` bucket record ID.
+    pub bucket_id: String,
+    /// Hour-aligned bucket start (RFC3339 UTC).
+    pub hour: String,
+    /// Occurrences in this bucket.
+    pub occurrence_count: u64,
+}
+
+/// A derived remediation LEAD (AC3): `ErrorSignature --FRAME_RESOLVES_TO-->
+/// Symbol --CHANGED_IN--> Commit`, with any linked verification evidence. Never
+/// a causal claim that the commit fixed the error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemediationLinkRow {
+    /// Stable `log:v1:` signature record ID.
+    pub signature_id: String,
+    /// Stable record ID of the frame-resolved symbol.
+    pub symbol_id: String,
+    /// Stable record ID of the changing commit.
+    pub commit_id: String,
+    /// Valid time of the changing commit (>= the signature's window activity).
+    pub commit_valid_time: String,
+    /// Zero-based backtrace frame index the resolving edge named, when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_index: Option<u32>,
+    /// Verbatim `FRAME_RESOLVES_TO` resolution label, propagated (issues
+    /// #152/#134), when the edge carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_resolution: Option<String>,
+    /// Verification record IDs linked to the changing commit, sorted; empty when
+    /// none linked.
+    pub verification_ids: Vec<String>,
+    /// Verbatim lead-not-proof disclaimer.
+    pub disclaimer: String,
 }
 
 /// The assembled pack's manifest (AC7/AC10).
@@ -1852,11 +2016,18 @@ pub fn derive_review_coverage(
 }
 
 /// Scrubs, hashes, and canonically orders a set of records for a section.
+///
+/// Applies the shared bundle scrub (prose/handles/PII) and, for log-graph nodes,
+/// the pack-side log-aware text scrub (issue #340, Codex round-4 P2), so no raw
+/// runtime log content — the normalized `template_excerpt`, exemplar
+/// `event_excerpt`, or backtrace-frame path text — rides a section's hashed rows.
+/// `bundle::scrub_record` never touches the `log` payload, so this is the pack's
+/// only defense for those fields.
 fn build_section_records(records: Vec<GraphRecord>) -> Vec<BundleRecord> {
     let mut rows: Vec<BundleRecord> = records
         .into_iter()
         .map(|r| {
-            let scrubbed = scrub_record(r);
+            let scrubbed = scrub_log_node_text(scrub_record(r));
             let json = serde_json::to_string(&scrubbed).unwrap_or_default();
             let hash = blake3::hash(json.as_bytes()).to_string();
             BundleRecord {
@@ -1869,12 +2040,1145 @@ fn build_section_records(records: Vec<GraphRecord>) -> Vec<BundleRecord> {
     rows
 }
 
+/// Pack-side, log-aware text scrub for one exported log node (issue #340, Codex
+/// round-4 P2). Strips raw runtime log content from an `ErrorSignature` /
+/// `LogEvent` node before it enters a hashed section row, WITHOUT weakening the
+/// derived summary's Integrity binding:
+///
+/// * `ErrorSignature.template_excerpt` (the normalized log-line text) is REPLACED
+///   by its own BLAKE3 fingerprint — the exact value the summary carries as
+///   `template_hash`. `bind_error_signature_rows` then binds the summary's
+///   `template_hash` to this stored fingerprint directly, so the per-node bind
+///   still catches a forged fingerprint even with the whole-summary hash
+///   recomputed, but no raw template text survives.
+/// * Each backtrace `StackFrame`'s `module_path` / `file_path` (redaction-safe by
+///   construction, but still frame text) is REPLACED by its BLAKE3 fingerprint,
+///   preserving the `frame_chain_hash` fingerprint's discriminating power while
+///   removing the readable path. `frame_index` / `line` (non-text) are retained.
+/// * `LogEvent.event_excerpt` is REPLACED by its fingerprint (exemplars already
+///   ride the summary as content-addressed handles, never as section text).
+///
+/// A no-op for every non-log node (`log: None`) and for `LogSource` /
+/// `LogOccurrenceBucket` payloads, which carry no free-text field.
+fn scrub_log_node_text(mut record: GraphRecord) -> GraphRecord {
+    if let GraphRecord::Node {
+        log: Some(payload), ..
+    } = &mut record
+    {
+        match payload.as_mut() {
+            crate::ir::LogPayload::ErrorSignature(p) => {
+                p.template_excerpt = blake3::hash(p.template_excerpt.as_bytes()).to_string();
+                if let Some(frames) = p.frames.as_mut() {
+                    redact_frame_text_in_place(frames);
+                }
+            }
+            crate::ir::LogPayload::LogEvent(p) => {
+                p.event_excerpt = blake3::hash(p.event_excerpt.as_bytes()).to_string();
+            }
+            crate::ir::LogPayload::LogSource(_) | crate::ir::LogPayload::LogOccurrenceBucket(_) => {
+            }
+        }
+    }
+    record
+}
+
+/// Replaces each backtrace frame's `module_path` / `file_path` text with its
+/// BLAKE3 fingerprint in place (issue #340, Codex round-4 P2). Shared by the
+/// section-node scrub and the `frame_chain_hash` derivation so the exported node
+/// and the summary hash bind against an identical, redaction-safe frame chain.
+fn redact_frame_text_in_place(frames: &mut [crate::ir::StackFrame]) {
+    for f in frames.iter_mut() {
+        f.module_path = f
+            .module_path
+            .as_deref()
+            .map(|m| blake3::hash(m.as_bytes()).to_string());
+        f.file_path = f
+            .file_path
+            .as_deref()
+            .map(|p| blake3::hash(p.as_bytes()).to_string());
+    }
+}
+
+/// The redaction-safe frame chain a signature's `frame_chain_hash` binds: the
+/// captured frames with their path text replaced by fingerprints (issue #340,
+/// Codex round-4 P2). Derived from the ORIGINAL node, it is byte-identical to the
+/// scrubbed frames the exported section node carries, so the summary's
+/// `frame_chain_hash` and `bind_error_signature_rows`' node recompute agree.
+fn redacted_frame_chain(frames: &[crate::ir::StackFrame]) -> Vec<crate::ir::StackFrame> {
+    let mut cloned = frames.to_vec();
+    redact_frame_text_in_place(&mut cloned);
+    cloned
+}
+
+/// True when a section's evidence-class wire name is one of the log-graph classes
+/// (issue #340): `error_signatures`, `occurrence_buckets`, `remediation_links`.
+fn is_log_evidence_class(class: &str) -> bool {
+    matches!(
+        EvidenceClass::from_wire(class),
+        Some(
+            EvidenceClass::ErrorSignatures
+                | EvidenceClass::OccurrenceBuckets
+                | EvidenceClass::RemediationLinks
+        )
+    )
+}
+
 /// Canonical `(valid_time_or_empty, record_id)` sort key for a section row.
 fn section_sort_key(record: &GraphRecord) -> (String, String) {
     (
         resolve_valid_time(record).unwrap_or_default(),
         record.id().to_owned(),
     )
+}
+
+// ── issue #340: log-graph incident evidence (CC7.x) ────────────────────────────
+
+/// Hour width, in seconds, of a `LogOccurrenceBucket` (issue #320 emits `1h`
+/// buckets; `bucket_width` is the constant `"1h"`).
+const BUCKET_HOUR_SECONDS: i64 = 3600;
+
+/// AC2 interval-intersection predicate for one occurrence bucket: the bucket's
+/// hour `[bucket_start, bucket_start + 1h)` intersects the half-open window
+/// `[from, to)`. A bucket straddling `from` is included WHOLE (documented; no
+/// interpolation). This is DELIBERATELY NOT the point predicate every other
+/// class uses (`from <= t < to`): a bucket whose hour began before `from` but
+/// carries in-window occurrences must still count, so it is admitted whole and
+/// its full count is summed.
+fn bucket_hour_intersects_window(
+    bucket_start: chrono::DateTime<chrono::FixedOffset>,
+    from: chrono::DateTime<chrono::FixedOffset>,
+    to: chrono::DateTime<chrono::FixedOffset>,
+) -> bool {
+    let hour_end = bucket_start + chrono::Duration::seconds(BUCKET_HOUR_SECONDS);
+    bucket_start < to && hour_end > from
+}
+
+/// The log payload of a node record, when it carries one.
+fn node_log_payload(record: &GraphRecord) -> Option<&crate::ir::LogPayload> {
+    match record {
+        GraphRecord::Node { log: Some(p), .. } => Some(p.as_ref()),
+        _ => None,
+    }
+}
+
+/// True when a node has been superseded by a newer version (lifecycle filter):
+/// such a record must not count as live evidence, mirroring the tombstone
+/// exclusion `evidence_class_for_record` already applies to `Tombstone` records.
+const fn is_superseded_node(record: &GraphRecord) -> bool {
+    matches!(
+        record,
+        GraphRecord::Node { superseded_by: Some(s), .. } if !s.is_empty()
+    )
+}
+
+/// Clips a valid-time instant to the window's lower bound (`max(ts, from)`),
+/// returning the RFC3339 string to present. `from`/`to` are the canonical window
+/// strings; `ts_parsed`/`from_parsed` the corresponding parsed instants.
+fn clip_lower(
+    ts: &str,
+    ts_parsed: DateTimeFixed,
+    from: &str,
+    from_parsed: DateTimeFixed,
+) -> String {
+    if ts_parsed < from_parsed {
+        from.to_owned()
+    } else {
+        ts.to_owned()
+    }
+}
+
+/// Clips a valid-time instant to the window's upper bound (`min(ts, to)`).
+fn clip_upper(ts: &str, ts_parsed: DateTimeFixed, to: &str, to_parsed: DateTimeFixed) -> String {
+    if ts_parsed > to_parsed {
+        to.to_owned()
+    } else {
+        ts.to_owned()
+    }
+}
+
+/// Convenience alias for the parsed-instant type.
+type DateTimeFixed = chrono::DateTime<chrono::FixedOffset>;
+
+/// True when an edge label is one of the log-domain edges a concatenated
+/// multi-scan graph duplicates (issue #340, Codex round-6 P2): a duplicate is an
+/// exact copy (deterministic edge ID, identical endpoints/label), so deduping by
+/// stable ID is loss-free.
+fn is_log_domain_edge(label: &str) -> bool {
+    matches!(
+        label,
+        "CAPTURED_FROM" | "FINGERPRINTED_AS" | "AGGREGATES" | "FRAME_RESOLVES_TO"
+    )
+}
+
+/// Merges one RFC 3339 valid-time bound across a coalesced signature group to the
+/// earliest (`earliest = true`) or latest value by parsed UTC INSTANT, returning
+/// the winning raw RFC 3339 string. Mirrors `log_deltas::merge_bound` exactly:
+/// comparison is by parsed instant (never raw string order — the same
+/// cross-offset reason as classification), a parseable value always wins over an
+/// unparseable one, an instant tie breaks lexically over the raw strings, and
+/// only when NEITHER value parses does the lexically smallest/largest raw string
+/// win. Both inputs originate from Egregore's own scanners and parse in practice.
+fn merge_bound_pair(a: &str, b: &str, earliest: bool) -> String {
+    match (parse_rfc3339(a), parse_rfc3339(b)) {
+        (Some(pa), Some(pb)) => {
+            let pick_b = if earliest {
+                pb < pa || (pb == pa && b < a)
+            } else {
+                pb > pa || (pb == pa && b > a)
+            };
+            if pick_b { b.to_owned() } else { a.to_owned() }
+        }
+        // A parseable bound always beats an unparseable one.
+        (Some(_), None) => a.to_owned(),
+        (None, Some(_)) => b.to_owned(),
+        // Nothing parseable: deterministic lexical fallback.
+        (None, None) => {
+            let pick_b = if earliest { b < a } else { b > a };
+            if pick_b { b.to_owned() } else { a.to_owned() }
+        }
+    }
+}
+
+/// Merges `other`'s `ErrorSignature` valid-time span and occurrence count into the
+/// accumulator node (issue #340, Codex round-6 P2). Earliest `first_seen`, latest
+/// `last_seen` (by parsed UTC instant), summed `occurrence_count` — the exact
+/// `log_deltas` cross-scan coalescing semantics. `template_excerpt` / `severity` /
+/// `frames` are identity components (or identity-derived), so they are identical
+/// across the group and left as the accumulator carries them. The node's
+/// `valid_time` (which `resolve_valid_time` reports for window membership) is kept
+/// consistent with the merged earliest `first_seen`.
+fn merge_error_signature_into(acc: &mut GraphRecord, other: &GraphRecord) {
+    let (o_first, o_last, o_count) = {
+        let Some(crate::ir::LogPayload::ErrorSignature(o)) = node_log_payload(other) else {
+            return;
+        };
+        (
+            o.first_seen.clone(),
+            o.last_seen.clone(),
+            o.occurrence_count,
+        )
+    };
+    let GraphRecord::Node {
+        log: Some(payload),
+        valid_time,
+        temporal,
+        ..
+    } = acc
+    else {
+        return;
+    };
+    let crate::ir::LogPayload::ErrorSignature(a) = payload.as_mut() else {
+        return;
+    };
+    a.first_seen = merge_bound_pair(&a.first_seen, &o_first, true);
+    a.last_seen = merge_bound_pair(&a.last_seen, &o_last, false);
+    a.occurrence_count = a.occurrence_count.saturating_add(o_count);
+    let merged_first = a.first_seen.clone();
+    // Keep the node's window-membership valid time aligned with the merged
+    // earliest `first_seen` (scan-logs nodes stamp `valid_time` == `first_seen`).
+    *valid_time = Some(merged_first.clone());
+    if let Some(t) = temporal.as_mut()
+        && !t.valid_time.is_empty()
+    {
+        t.valid_time = merged_first;
+    }
+}
+
+/// Merges `other`'s `LogOccurrenceBucket` occurrence count into the accumulator
+/// node (issue #340, Codex round-6 P2). Bucket identity is
+/// `(repository/signature/hour/width)` and omits `LogSource`, so two distinct
+/// scans observing the same signature in the same hour mint the SAME bucket
+/// record ID with their own per-source counts; the counts are SUMMED across the
+/// group (never deduped by bucket record ID, per issue #361), keeping them
+/// consistent with the summed aggregate `occurrence_count`. `bucket_start` /
+/// `bucket_width` are identity, hence identical across the group.
+fn merge_bucket_into(acc: &mut GraphRecord, other: &GraphRecord) {
+    let o_count = {
+        let Some(crate::ir::LogPayload::LogOccurrenceBucket(o)) = node_log_payload(other) else {
+            return;
+        };
+        o.occurrence_count
+    };
+    let GraphRecord::Node {
+        log: Some(payload), ..
+    } = acc
+    else {
+        return;
+    };
+    let crate::ir::LogPayload::LogOccurrenceBucket(a) = payload.as_mut() else {
+        return;
+    };
+    a.occurrence_count = a.occurrence_count.saturating_add(o_count);
+}
+
+/// Coalesces duplicate log-domain records by stable ID at ASSEMBLE time (issue
+/// #340, Codex round-6 P2), mirroring the documented `query log-deltas` cross-scan
+/// coalescing semantics so a concatenated multi-scan graph produces exactly ONE
+/// row per stable log ID.
+///
+/// A `LogSource` is a NON-identity input for a signature — the `ErrorSignature`
+/// stable ID is `(repository_id, fingerprint_algorithm, template, severity)` only
+/// (and a `LogOccurrenceBucket` ID omits `LogSource` likewise) — so a graph made
+/// by concatenating several `scan-logs` outputs for one repo (a documented,
+/// legitimate workflow) carries the SAME stable log ID once per scan. Without
+/// coalescing, `assemble_pack` would emit one summary row per PHYSICAL record and
+/// its own offline `verify_pack` (which requires exactly one row per signature)
+/// would reject the freshly assembled pack. This restores the hard invariant that
+/// every assembled pack passes its own verify.
+///
+/// Merge rules (match `log_deltas` exactly):
+/// * `ErrorSignature` records sharing an ID → one node: earliest `first_seen`,
+///   latest `last_seen` (by parsed UTC instant), summed `occurrence_count`.
+/// * `LogOccurrenceBucket` records sharing an ID → one node: summed
+///   `occurrence_count` (never deduped by bucket ID, per #361).
+/// * `LogSource` / `LogEvent` nodes and log-domain edges sharing an ID → deduped
+///   to the first occurrence (an exact duplicate carries identical content).
+///
+/// Every NON-log record passes through unchanged, in order. Applied BEFORE window
+/// filtering and summary building so first/last-seen clipping and window
+/// membership use the merged extents. Deterministic: output preserves
+/// first-occurrence order and every downstream section/summary re-sorts, so the
+/// pack is byte-identical across runs regardless of input concatenation order. A
+/// single-scan graph has no duplicate log IDs, so this is a no-op there and every
+/// existing pack is unchanged.
+fn coalesce_log_records(records: &[GraphRecord]) -> Vec<GraphRecord> {
+    let mut out: Vec<GraphRecord> = Vec::with_capacity(records.len());
+    let mut sig_slot: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut bucket_slot: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut seen_dedup: BTreeSet<&str> = BTreeSet::new();
+    for record in records {
+        match record {
+            GraphRecord::Node {
+                id,
+                log: Some(payload),
+                ..
+            } => match payload.as_ref() {
+                crate::ir::LogPayload::ErrorSignature(_) => {
+                    if let Some(&idx) = sig_slot.get(id.as_str()) {
+                        merge_error_signature_into(&mut out[idx], record);
+                    } else {
+                        sig_slot.insert(id.as_str(), out.len());
+                        out.push(record.clone());
+                    }
+                }
+                crate::ir::LogPayload::LogOccurrenceBucket(_) => {
+                    if let Some(&idx) = bucket_slot.get(id.as_str()) {
+                        merge_bucket_into(&mut out[idx], record);
+                    } else {
+                        bucket_slot.insert(id.as_str(), out.len());
+                        out.push(record.clone());
+                    }
+                }
+                crate::ir::LogPayload::LogSource(_) | crate::ir::LogPayload::LogEvent(_) => {
+                    if seen_dedup.insert(id.as_str()) {
+                        out.push(record.clone());
+                    }
+                }
+            },
+            GraphRecord::Edge { id, label, .. } if is_log_domain_edge(label.as_str()) => {
+                if seen_dedup.insert(id.as_str()) {
+                    out.push(record.clone());
+                }
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
+/// Builds the `error_signatures` summary rows (AC1) from the in-window signature
+/// nodes plus the exemplar (`FINGERPRINTED_AS`) and frame-resolution
+/// (`FRAME_RESOLVES_TO`) joins over the whole record set. Redaction-safe: every
+/// field is an ID, a hash, a bounded label, a clipped instant, or a count.
+fn build_error_signature_rows(
+    in_window_signatures: &[GraphRecord],
+    exemplars_by_signature: &BTreeMap<String, Vec<&GraphRecord>>,
+    frame_edges_by_signature: &BTreeMap<String, Vec<&GraphRecord>>,
+    window: &Window,
+    from_ts: DateTimeFixed,
+    to_ts: DateTimeFixed,
+) -> Vec<ErrorSignatureRow> {
+    let mut rows: Vec<ErrorSignatureRow> = Vec::new();
+    for sig in in_window_signatures {
+        let Some(crate::ir::LogPayload::ErrorSignature(payload)) = node_log_payload(sig) else {
+            continue;
+        };
+        let signature_id = sig.id().to_owned();
+        let template_hash = blake3::hash(payload.template_excerpt.as_bytes()).to_string();
+        // Fingerprint the REDACTED frame chain (path text -> BLAKE3), the exact
+        // frames the exported section node carries after `scrub_log_node_text`, so
+        // the summary's `frame_chain_hash` and `bind_error_signature_rows`' node
+        // recompute bind against identical, redaction-safe bytes (issue #340,
+        // Codex round-4 P2).
+        let frame_chain_hash = payload.frames.as_ref().map(|frames| {
+            let serialized =
+                serde_json::to_string(&redacted_frame_chain(frames)).unwrap_or_default();
+            blake3::hash(serialized.as_bytes()).to_string()
+        });
+        // Clip the activity span to the window. first_seen is the signature's
+        // valid time, which the point predicate already placed in-window, so the
+        // lower clip is a no-op in practice; last_seen may extend past `to`.
+        let first_seen_in_window = parse_rfc3339(&payload.first_seen).map_or_else(
+            || payload.first_seen.clone(),
+            |p| clip_lower(&payload.first_seen, p, &window.from, from_ts),
+        );
+        let last_seen_in_window = parse_rfc3339(&payload.last_seen).map_or_else(
+            || payload.last_seen.clone(),
+            |p| clip_upper(&payload.last_seen, p, &window.to, to_ts),
+        );
+
+        // Exemplars: content-addressed handle + hash ONLY, never text.
+        let mut exemplars: Vec<ExemplarHandle> = exemplars_by_signature
+            .get(&signature_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|ev| match node_log_payload(ev) {
+                Some(crate::ir::LogPayload::LogEvent(evp)) => Some(ExemplarHandle {
+                    protected_handle: format!(
+                        "{}{}",
+                        crate::protected::PROTECTED_HANDLE_PREFIX,
+                        evp.event_content_hash
+                    ),
+                    content_hash: evp.event_content_hash.clone(),
+                    source_line: evp.source_line,
+                }),
+                _ => None,
+            })
+            .collect();
+        exemplars.sort_by(|a, b| {
+            a.source_line
+                .cmp(&b.source_line)
+                .then_with(|| a.content_hash.cmp(&b.content_hash))
+        });
+        exemplars.dedup();
+
+        // Frame joins: propagate the resolution label verbatim (#152/#134).
+        let mut frame_resolutions: Vec<FrameResolutionJoin> = frame_edges_by_signature
+            .get(&signature_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|edge| match edge {
+                GraphRecord::Edge { target, .. } => Some(FrameResolutionJoin {
+                    frame_index: edge.frame_index(),
+                    resolution: edge.frame_resolution().map(|r| r.as_str().to_owned()),
+                    target_id: target.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        frame_resolutions.sort_by(|a, b| {
+            a.frame_index
+                .cmp(&b.frame_index)
+                .then_with(|| a.target_id.cmp(&b.target_id))
+        });
+
+        rows.push(ErrorSignatureRow {
+            signature_id,
+            severity: payload.severity.clone(),
+            template_hash,
+            frame_chain_hash,
+            first_seen_in_window,
+            last_seen_in_window,
+            exemplars,
+            frame_resolutions,
+        });
+    }
+    rows.sort_by(|a, b| a.signature_id.cmp(&b.signature_id));
+    rows
+}
+
+/// Builds the `occurrence_buckets` per-signature totals (AC2): sums ONLY the
+/// in-window buckets, grouped by the signature the bucket `AGGREGATES`, ordered
+/// by `(signature record_id, hour)`.
+fn build_occurrence_totals(
+    in_window_buckets: &[GraphRecord],
+    bucket_to_signature: &BTreeMap<String, String>,
+) -> Vec<SignatureOccurrenceTotal> {
+    let mut by_signature: BTreeMap<String, Vec<BucketCount>> = BTreeMap::new();
+    for bucket in in_window_buckets {
+        let Some(crate::ir::LogPayload::LogOccurrenceBucket(payload)) = node_log_payload(bucket)
+        else {
+            continue;
+        };
+        let bucket_id = bucket.id().to_owned();
+        let Some(signature_id) = bucket_to_signature.get(&bucket_id) else {
+            // A bucket with no AGGREGATES edge cannot be attributed to a
+            // signature; excluded from totals rather than mis-summed.
+            continue;
+        };
+        by_signature
+            .entry(signature_id.clone())
+            .or_default()
+            .push(BucketCount {
+                bucket_id,
+                hour: payload.bucket_start.clone(),
+                occurrence_count: payload.occurrence_count,
+            });
+    }
+    by_signature
+        .into_iter()
+        .map(|(signature_id, mut buckets)| {
+            buckets.sort_by(|a, b| {
+                a.hour
+                    .cmp(&b.hour)
+                    .then_with(|| a.bucket_id.cmp(&b.bucket_id))
+            });
+            let in_window_occurrences = buckets.iter().map(|b| b.occurrence_count).sum();
+            SignatureOccurrenceTotal {
+                signature_id,
+                in_window_occurrences,
+                buckets,
+            }
+        })
+        .collect()
+}
+
+/// Builds the derived `remediation_links` leads (AC3):
+/// `ErrorSignature --FRAME_RESOLVES_TO--> Symbol --CHANGED_IN--> Commit`, with
+/// the commit's valid time at or after the signature's window activity, carrying
+/// the verbatim frame-resolution label and any verification records linked to
+/// the commit. Never a causal claim. Lifecycle filter: superseded/tombstoned
+/// endpoints are skipped.
+fn build_remediation_links(
+    frame_edges_by_signature: &BTreeMap<String, Vec<&GraphRecord>>,
+    changed_in_by_source: &BTreeMap<String, Vec<&GraphRecord>>,
+    node_by_id: &BTreeMap<&str, &GraphRecord>,
+    verification_ids_by_commit: &BTreeMap<String, Vec<String>>,
+    signature_activity: &BTreeMap<String, DateTimeFixed>,
+) -> Vec<RemediationLinkRow> {
+    let mut rows: Vec<RemediationLinkRow> = Vec::new();
+    for (signature_id, edges) in frame_edges_by_signature {
+        // Only signatures active in-window anchor a remediation lead.
+        let Some(activity) = signature_activity.get(signature_id) else {
+            continue;
+        };
+        for frame_edge in edges {
+            let GraphRecord::Edge {
+                target: symbol_id, ..
+            } = frame_edge
+            else {
+                continue;
+            };
+            // The frame must resolve to a live Symbol node (not File/Diagnostic,
+            // not a superseded/absent record).
+            let Some(symbol_node) = node_by_id.get(symbol_id.as_str()) else {
+                continue;
+            };
+            if is_superseded_node(symbol_node) || symbol_node.node_kind_name() != Some("Symbol") {
+                continue;
+            }
+            let Some(changed_in_edges) = changed_in_by_source.get(symbol_id.as_str()) else {
+                continue;
+            };
+            for changed_in in changed_in_edges {
+                let GraphRecord::Edge {
+                    target: commit_id, ..
+                } = changed_in
+                else {
+                    continue;
+                };
+                // Target must be a live Commit node.
+                let Some(commit_node) = node_by_id.get(commit_id.as_str()) else {
+                    continue;
+                };
+                if is_superseded_node(commit_node) || commit_node.node_kind_name() != Some("Commit")
+                {
+                    continue;
+                }
+                // Commit valid time must be at or after the signature's window
+                // activity: a remediation cannot pre-date the error it addresses.
+                let Some(commit_vt) =
+                    resolve_valid_time(changed_in).or_else(|| resolve_valid_time(commit_node))
+                else {
+                    continue;
+                };
+                let Some(commit_parsed) = parse_rfc3339(&commit_vt) else {
+                    continue;
+                };
+                if commit_parsed < *activity {
+                    continue;
+                }
+                let verification_ids = verification_ids_by_commit
+                    .get(commit_id.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                rows.push(RemediationLinkRow {
+                    signature_id: signature_id.clone(),
+                    symbol_id: symbol_id.clone(),
+                    commit_id: commit_id.clone(),
+                    commit_valid_time: commit_vt,
+                    frame_index: frame_edge.frame_index(),
+                    frame_resolution: frame_edge.frame_resolution().map(|r| r.as_str().to_owned()),
+                    verification_ids,
+                    disclaimer: REMEDIATION_SECTION_DISCLAIMER.to_owned(),
+                });
+            }
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.signature_id
+            .cmp(&b.signature_id)
+            .then_with(|| a.symbol_id.cmp(&b.symbol_id))
+            .then_with(|| a.commit_id.cmp(&b.commit_id))
+            .then_with(|| a.commit_valid_time.cmp(&b.commit_valid_time))
+    });
+    rows.dedup();
+    rows
+}
+
+/// All log-graph derived summaries for one window, plus the capability flag for
+/// the derived `remediation_links` class (issue #340).
+struct LogSummaries {
+    error_signatures: Vec<ErrorSignatureRow>,
+    occurrence_totals: Vec<SignatureOccurrenceTotal>,
+    remediation_links: Vec<RemediationLinkRow>,
+    /// True when `ErrorSignature` + `FRAME_RESOLVES_TO` + `CHANGED_IN` facts all
+    /// exist (the remediation capability probe).
+    remediation_capable: bool,
+}
+
+/// Computes every log-graph summary (AC1/AC2/AC3) from the whole record set and
+/// the in-window per-class collections.
+#[allow(clippy::too_many_lines)]
+fn build_log_summaries(
+    records: &[GraphRecord],
+    in_window_by_class: &BTreeMap<&'static str, Vec<GraphRecord>>,
+    window: &Window,
+    from_ts: DateTimeFixed,
+    to_ts: DateTimeFixed,
+) -> LogSummaries {
+    let node_by_id: BTreeMap<&str, &GraphRecord> = records
+        .iter()
+        .filter(|r| matches!(r, GraphRecord::Node { .. }))
+        .map(|r| (r.id(), r))
+        .collect();
+
+    // Join indices over the whole record set.
+    let mut exemplars_by_signature: BTreeMap<String, Vec<&GraphRecord>> = BTreeMap::new();
+    let mut frame_edges_by_signature: BTreeMap<String, Vec<&GraphRecord>> = BTreeMap::new();
+    let mut changed_in_by_source: BTreeMap<String, Vec<&GraphRecord>> = BTreeMap::new();
+    let mut bucket_to_signature: BTreeMap<String, String> = BTreeMap::new();
+    let mut has_frame_resolves_to = false;
+    let mut has_changed_in = false;
+    let mut has_error_signature = false;
+
+    // Verification-class records, and the commit they are edge-linked to.
+    let verification_ids: BTreeSet<&str> = records
+        .iter()
+        .filter(|r| {
+            !is_superseded_node(r)
+                && evidence_class_for_record(r) == Some(EvidenceClass::VerificationEvidence)
+        })
+        .map(GraphRecord::id)
+        .collect();
+    let commit_ids: BTreeSet<&str> = records
+        .iter()
+        .filter(|r| r.node_kind_name() == Some("Commit"))
+        .map(GraphRecord::id)
+        .collect();
+    let mut verification_ids_by_commit: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for record in records {
+        if record.node_kind_name() == Some("ErrorSignature") {
+            has_error_signature = true;
+        }
+        let GraphRecord::Edge {
+            label,
+            source,
+            target,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        match label.as_str() {
+            "FINGERPRINTED_AS" => {
+                // LogEvent --FINGERPRINTED_AS--> ErrorSignature
+                if let Some(ev) = node_by_id.get(source.as_str()) {
+                    exemplars_by_signature
+                        .entry(target.clone())
+                        .or_default()
+                        .push(ev);
+                }
+            }
+            "FRAME_RESOLVES_TO" => {
+                has_frame_resolves_to = true;
+                frame_edges_by_signature
+                    .entry(source.clone())
+                    .or_default()
+                    .push(record);
+            }
+            "CHANGED_IN" => {
+                has_changed_in = true;
+                changed_in_by_source
+                    .entry(source.clone())
+                    .or_default()
+                    .push(record);
+            }
+            "AGGREGATES" => {
+                // LogOccurrenceBucket --AGGREGATES--> ErrorSignature
+                bucket_to_signature.insert(source.clone(), target.clone());
+            }
+            _ => {
+                // Any edge linking a commit to a verification-class record makes
+                // that verification linked to the commit (direction-agnostic).
+                let (commit, other) = if commit_ids.contains(source.as_str()) {
+                    (source.as_str(), target.as_str())
+                } else if commit_ids.contains(target.as_str()) {
+                    (target.as_str(), source.as_str())
+                } else {
+                    continue;
+                };
+                if verification_ids.contains(other) {
+                    verification_ids_by_commit
+                        .entry(commit.to_owned())
+                        .or_default()
+                        .push(other.to_owned());
+                }
+            }
+        }
+    }
+    for ids in verification_ids_by_commit.values_mut() {
+        ids.sort();
+        ids.dedup();
+    }
+
+    let empty: Vec<GraphRecord> = Vec::new();
+    let in_window_signatures = in_window_by_class
+        .get(EvidenceClass::ErrorSignatures.as_wire())
+        .unwrap_or(&empty);
+    let in_window_buckets = in_window_by_class
+        .get(EvidenceClass::OccurrenceBuckets.as_wire())
+        .unwrap_or(&empty);
+
+    // Per-signature window activity anchor (clipped first_seen) for remediation.
+    let mut signature_activity: BTreeMap<String, DateTimeFixed> = BTreeMap::new();
+    for sig in in_window_signatures {
+        if let Some(crate::ir::LogPayload::ErrorSignature(payload)) = node_log_payload(sig) {
+            let anchor = parse_rfc3339(&payload.first_seen)
+                .map_or(from_ts, |p| if p < from_ts { from_ts } else { p });
+            signature_activity.insert(sig.id().to_owned(), anchor);
+        }
+    }
+
+    let error_signatures = build_error_signature_rows(
+        in_window_signatures,
+        &exemplars_by_signature,
+        &frame_edges_by_signature,
+        window,
+        from_ts,
+        to_ts,
+    );
+    let occurrence_totals = build_occurrence_totals(in_window_buckets, &bucket_to_signature);
+    let remediation_links = build_remediation_links(
+        &frame_edges_by_signature,
+        &changed_in_by_source,
+        &node_by_id,
+        &verification_ids_by_commit,
+        &signature_activity,
+    );
+    LogSummaries {
+        error_signatures,
+        occurrence_totals,
+        remediation_links,
+        remediation_capable: has_error_signature && has_frame_resolves_to && has_changed_in,
+    }
+}
+
+/// Canonical BLAKE3 hash of a derived log summary (issue #340). Assembled onto the
+/// section as `log_summary_hash` and recomputed by `verify_pack`'s Integrity so a
+/// tampered summary value fails verification — the whole-summary analogue of the
+/// per-record `BundleRecord.hash` and the only binding surface for the derived
+/// `remediation_links` join (which carries no backing hashed row).
+fn hash_log_summary(summary: &LogEvidenceSummary) -> String {
+    let serialized = serde_json::to_string(summary).unwrap_or_default();
+    blake3::hash(serialized.as_bytes()).to_string()
+}
+
+/// Binds a section's derived `log_summary` (issue #340) into `verify_pack`'s
+/// Integrity so a tampered summary value fails verification, mirroring the
+/// `review_coverage` `measurement` bind. Returns `Err(detail)` on any mismatch.
+///
+/// Two layers:
+///   1. A whole-summary BLAKE3 bind (`log_summary_hash`): the summary must be
+///      present iff the hash is, and the recomputed hash must match. This is the
+///      ONLY bind available for `remediation_links` — a derived join whose
+///      `commit_id`/`symbol_id`/`verification_ids` are the highest-risk tamper
+///      target yet have NO backing hashed row — and for the exemplar/frame-join
+///      fields that ride edges absent from the pack.
+///   2. An independent recompute bind for the fields with backing hashed rows in
+///      the section: the `error_signatures` template/frame-chain hashes, severity,
+///      and window-clipped span (recomputed from the section's `ErrorSignature`
+///      nodes), and the `occurrence_buckets` per-signature totals (recomputed from
+///      the section's `LogOccurrenceBucket` nodes). These cannot be made to diverge
+///      from the hashed evidence they summarize even by recomputing the summary
+///      hash.
+fn bind_log_summary_integrity(section: &EvidenceSection, window: &Window) -> Result<(), String> {
+    // P1 (Codex round-4): a PRESENT log-class section MUST carry BOTH a
+    // `log_summary` and its binding `log_summary_hash`. `assemble_pack` ALWAYS
+    // emits the derived summary for a present `error_signatures` /
+    // `occurrence_buckets` / `remediation_links` section, and `remediation_links`
+    // evidence exists ONLY in the summary (the section carries zero hashed rows) —
+    // so stripping BOTH the summary and its hash would silently drop all
+    // remediation evidence yet still verify clean. Absence of either on a present
+    // log section is an Integrity defect. (An `unavailable` section legitimately
+    // carries no summary, so this only guards present log sections.)
+    if section.status == "present" && is_log_evidence_class(&section.class) {
+        if section.log_summary.is_none() {
+            return Err(format!(
+                "present log section {} carries no log_summary (derived log evidence \
+                 stripped)",
+                section.class
+            ));
+        }
+        if section.log_summary_hash.is_none() {
+            return Err(format!(
+                "present log section {} carries no binding log_summary_hash",
+                section.class
+            ));
+        }
+    }
+    let Some(summary) = &section.log_summary else {
+        // No summary: the bind hash must also be absent. A hash without a summary
+        // is a stripped-summary tamper (the derived evidence removed while its
+        // binding lingered).
+        if section.log_summary_hash.is_some() {
+            return Err(format!(
+                "section {} carries a log_summary_hash but no log_summary",
+                section.class
+            ));
+        }
+        return Ok(());
+    };
+    // (1) whole-summary hash bind.
+    let Some(stored) = &section.log_summary_hash else {
+        return Err(format!(
+            "section {} carries a log_summary but no binding log_summary_hash",
+            section.class
+        ));
+    };
+    if *stored != hash_log_summary(summary) {
+        return Err(format!(
+            "section {} log_summary_hash does not bind its log_summary \
+             (recomputed hash differs)",
+            section.class
+        ));
+    }
+    // (2) independent recompute binds for fields with backing hashed rows.
+    let node_by_id: BTreeMap<&str, &GraphRecord> = section
+        .records
+        .iter()
+        .filter(|br| matches!(br.record, GraphRecord::Node { .. }))
+        .map(|br| (br.record.id(), &br.record))
+        .collect();
+    // (3) variant <-> section.class bind. Each log_summary variant must sit on its
+    // matching log section; a log_summary on any other section, or a mismatched log
+    // section (e.g. a RemediationLinks summary smuggled onto an error_signatures
+    // section, or any log_summary on a non-log section), is an Integrity defect.
+    // assemble never emits that, but verify must reject it.
+    match summary {
+        LogEvidenceSummary::ErrorSignatures { signatures } => {
+            require_summary_on_class(&section.class, "error_signatures")?;
+            bind_error_signature_rows(&section.class, signatures, &node_by_id, window)
+        }
+        LogEvidenceSummary::OccurrenceBuckets { signature_totals } => {
+            require_summary_on_class(&section.class, "occurrence_buckets")?;
+            // The bucket->signature attribution rides the co-located
+            // `LogOccurrenceBucket --AGGREGATES--> ErrorSignature` edges (issue #340,
+            // Codex round-3 P1): the bucket NODE payload carries no signature field,
+            // so `total.signature_id` is bound against these hash-bound edge
+            // endpoints, not the node.
+            let mut aggregates_by_bucket: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+            for br in &section.records {
+                if let GraphRecord::Edge {
+                    label,
+                    source,
+                    target,
+                    ..
+                } = &br.record
+                    && label.as_str() == "AGGREGATES"
+                {
+                    aggregates_by_bucket
+                        .entry(source.as_str())
+                        .or_default()
+                        .insert(target.as_str());
+                }
+            }
+            bind_occurrence_totals(
+                &section.class,
+                signature_totals,
+                &node_by_id,
+                &aggregates_by_bucket,
+            )
+        }
+        // The derived join has no backing hashed row; the whole-summary hash above
+        // is its binding surface.
+        LogEvidenceSummary::RemediationLinks { .. } => {
+            require_summary_on_class(&section.class, "remediation_links")?;
+            Ok(())
+        }
+    }
+}
+
+/// Requires a `log_summary` variant to sit on its own section class (issue #340):
+/// `ErrorSignatures` <-> `error_signatures`, `OccurrenceBuckets` <->
+/// `occurrence_buckets`, `RemediationLinks` <-> `remediation_links`. A summary on a
+/// non-log section or on a mismatched log section is an Integrity defect.
+fn require_summary_on_class(class: &str, expected: &str) -> Result<(), String> {
+    if class != expected {
+        return Err(format!(
+            "section {class} carries a {expected} log_summary whose variant does not \
+             match its class"
+        ));
+    }
+    Ok(())
+}
+
+/// Binds every `error_signatures` summary row to its backing hashed `ErrorSignature`
+/// node in the section (issue #340): an exact one-to-one correspondence, and each
+/// row's `template_hash`, `frame_chain_hash`, `severity`, and window-clipped span
+/// recomputed from the node payload. The exemplar/frame-resolution fields ride
+/// edges absent from the pack and are bound by the whole-summary hash only.
+fn bind_error_signature_rows(
+    class: &str,
+    signatures: &[ErrorSignatureRow],
+    node_by_id: &BTreeMap<&str, &GraphRecord>,
+    window: &Window,
+) -> Result<(), String> {
+    // Exact bijection: one summary row per section ErrorSignature node, so a
+    // signature cannot be dropped from — or a phantom one smuggled into — the
+    // summary while every hashed row stays valid.
+    let section_sig_ids: BTreeSet<&str> = node_by_id
+        .iter()
+        .filter(|(_, rec)| {
+            matches!(
+                node_log_payload(rec),
+                Some(crate::ir::LogPayload::ErrorSignature(_))
+            )
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    // Reject a repeated `signature_id` BEFORE the dedup set collapses it (issue
+    // #373, Codex round-5 P2). A `BTreeSet` would silently merge two rows sharing a
+    // `signature_id` — both then bind the same hashed `ErrorSignature` node and the
+    // bijection still balances — but the summary would no longer have exactly one
+    // row per signature, and a duplicate row can carry divergent exemplar handles or
+    // frame-resolution targets bound only by the whole-summary hash. Detect the
+    // collision explicitly instead of silently absorbing it.
+    let mut summary_ids: BTreeSet<&str> = BTreeSet::new();
+    for row in signatures {
+        if !summary_ids.insert(row.signature_id.as_str()) {
+            return Err(format!(
+                "error_signatures summary lists signature {} more than once in \
+                 section {class} (one row per signature required)",
+                row.signature_id
+            ));
+        }
+    }
+    if let Some(extra) = summary_ids.difference(&section_sig_ids).next() {
+        return Err(format!(
+            "error_signatures summary row {extra} has no backing hashed ErrorSignature \
+             node in section {class}"
+        ));
+    }
+    if let Some(missing) = section_sig_ids.difference(&summary_ids).next() {
+        return Err(format!(
+            "error_signatures section {class} carries ErrorSignature node {missing} \
+             absent from the summary"
+        ));
+    }
+    let from_ts = parse_rfc3339(&window.from);
+    let to_ts = parse_rfc3339(&window.to);
+    for row in signatures {
+        let Some(crate::ir::LogPayload::ErrorSignature(payload)) = node_by_id
+            .get(row.signature_id.as_str())
+            .copied()
+            .and_then(node_log_payload)
+        else {
+            return Err(format!(
+                "error_signatures summary row {} has no ErrorSignature payload to bind against",
+                row.signature_id
+            ));
+        };
+        // The exported section node's `template_excerpt` has been scrubbed to hold
+        // the template fingerprint itself (issue #340, Codex round-4 P2), which is
+        // exactly the value the summary carries as `template_hash`. Bind them
+        // directly: a forged summary `template_hash` still fails even with the
+        // whole-summary hash recomputed, and no raw template text is required.
+        if row.template_hash != payload.template_excerpt {
+            return Err(format!(
+                "error_signatures row {} template_hash does not bind its \
+                 ErrorSignature template fingerprint",
+                row.signature_id
+            ));
+        }
+        // The section node's frames are already redaction-scrubbed (path text ->
+        // fingerprint), identical to what `build_error_signature_rows` hashed, so
+        // recomputing over them reproduces the summary's `frame_chain_hash`.
+        let expect_frame_chain = payload.frames.as_ref().map(|frames| {
+            let serialized = serde_json::to_string(frames).unwrap_or_default();
+            blake3::hash(serialized.as_bytes()).to_string()
+        });
+        if row.frame_chain_hash != expect_frame_chain {
+            return Err(format!(
+                "error_signatures row {} frame_chain_hash does not bind its \
+                 ErrorSignature frames",
+                row.signature_id
+            ));
+        }
+        if row.severity != payload.severity {
+            return Err(format!(
+                "error_signatures row {} severity does not bind its ErrorSignature node",
+                row.signature_id
+            ));
+        }
+        // Window-clipped span recompute (only when both bounds parse; a malformed
+        // window is caught independently by Window-consistency).
+        if let (Some(from_ts), Some(to_ts)) = (from_ts, to_ts) {
+            let expect_first = parse_rfc3339(&payload.first_seen).map_or_else(
+                || payload.first_seen.clone(),
+                |p| clip_lower(&payload.first_seen, p, &window.from, from_ts),
+            );
+            let expect_last = parse_rfc3339(&payload.last_seen).map_or_else(
+                || payload.last_seen.clone(),
+                |p| clip_upper(&payload.last_seen, p, &window.to, to_ts),
+            );
+            if row.first_seen_in_window != expect_first || row.last_seen_in_window != expect_last {
+                return Err(format!(
+                    "error_signatures row {} window-clipped span does not bind its \
+                     ErrorSignature valid times",
+                    row.signature_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Binds every `occurrence_buckets` summary total to its backing hashed
+/// `LogOccurrenceBucket` nodes in the section (issue #340): each listed bucket must
+/// resolve to a present hashed node whose `occurrence_count`/`bucket_start` match,
+/// no bucket may be double-counted, and each `in_window_occurrences` must equal the
+/// recomputed sum — so the occurrence total (the tamper target flagged by the P1)
+/// cannot be inflated without adding real, count-matching hashed bucket rows.
+fn bind_occurrence_totals(
+    class: &str,
+    totals: &[SignatureOccurrenceTotal],
+    node_by_id: &BTreeMap<&str, &GraphRecord>,
+    aggregates_by_bucket: &BTreeMap<&str, BTreeSet<&str>>,
+) -> Result<(), String> {
+    // Exact bijection (mirrors `bind_error_signature_rows`): the set of hashed
+    // `LogOccurrenceBucket` nodes actually present in the section must equal the set
+    // of buckets the summary lists. The per-bucket backing-node check below rejects
+    // a phantom summary bucket (summary \ section); the reverse guard after the loop
+    // rejects a hashed bucket dropped from the summary (section \ summary), which
+    // would under-report `in_window_occurrences` while its hashed row lingers.
+    let section_bucket_ids: BTreeSet<&str> = node_by_id
+        .iter()
+        .filter(|(_, rec)| {
+            matches!(
+                node_log_payload(rec),
+                Some(crate::ir::LogPayload::LogOccurrenceBucket(_))
+            )
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut seen_signatures: BTreeSet<&str> = BTreeSet::new();
+    for total in totals {
+        // Reject a duplicate `signature_id` across totals (issue #373, Codex
+        // round-5 P2): one occurrence total per signature. Two totals for one
+        // signature — splitting its buckets, or an appended empty zero total — each
+        // balance their own bucket sum and leave the reverse bucket-coverage guard
+        // satisfied, so without this a consumer reading a per-signature total sees
+        // the count under-reported. This is the round-3 under-reporting failure
+        // re-expressed via row duplication rather than bucket omission.
+        if !seen_signatures.insert(total.signature_id.as_str()) {
+            return Err(format!(
+                "occurrence_buckets summary lists signature {} more than once in \
+                 section {class} (one occurrence total per signature required)",
+                total.signature_id
+            ));
+        }
+        let mut sum: u64 = 0;
+        for bucket in &total.buckets {
+            if !seen.insert(bucket.bucket_id.as_str()) {
+                return Err(format!(
+                    "occurrence_buckets bucket {} appears more than once in section {class}",
+                    bucket.bucket_id
+                ));
+            }
+            let Some(crate::ir::LogPayload::LogOccurrenceBucket(payload)) = node_by_id
+                .get(bucket.bucket_id.as_str())
+                .copied()
+                .and_then(node_log_payload)
+            else {
+                return Err(format!(
+                    "occurrence_buckets bucket {} has no backing hashed \
+                     LogOccurrenceBucket node in section {class}",
+                    bucket.bucket_id
+                ));
+            };
+            if bucket.occurrence_count != payload.occurrence_count {
+                return Err(format!(
+                    "occurrence_buckets bucket {} occurrence_count does not bind its \
+                     LogOccurrenceBucket node",
+                    bucket.bucket_id
+                ));
+            }
+            if bucket.hour != payload.bucket_start {
+                return Err(format!(
+                    "occurrence_buckets bucket {} hour does not bind its \
+                     LogOccurrenceBucket node",
+                    bucket.bucket_id
+                ));
+            }
+            // Signature attribution bind (issue #340, Codex round-3 P1): the bucket
+            // must be filed under the SAME signature its co-located
+            // `LogOccurrenceBucket --AGGREGATES--> ErrorSignature` edge names. Without
+            // this a tampered pack could move a bucket under another signature — the
+            // node count/hour still bind and both sums still balance — and consumers
+            // would read per-signature occurrence counts for the WRONG incident.
+            match aggregates_by_bucket.get(bucket.bucket_id.as_str()) {
+                Some(sigs) if sigs.contains(total.signature_id.as_str()) => {}
+                Some(_) => {
+                    return Err(format!(
+                        "occurrence_buckets bucket {} is filed under signature {} but its \
+                         AGGREGATES attribution edge(s) name a different signature in \
+                         section {class}",
+                        bucket.bucket_id, total.signature_id
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "occurrence_buckets bucket {} has no co-located AGGREGATES \
+                         attribution edge binding it to signature {} in section {class}",
+                        bucket.bucket_id, total.signature_id
+                    ));
+                }
+            }
+            sum = sum.saturating_add(payload.occurrence_count);
+        }
+        if total.in_window_occurrences != sum {
+            return Err(format!(
+                "occurrence_buckets signature {} in_window_occurrences {} does not equal \
+                 the sum {} of its bound buckets",
+                total.signature_id, total.in_window_occurrences, sum
+            ));
+        }
+    }
+    // Reverse guard: every hashed `LogOccurrenceBucket` node the section carries must
+    // be covered by the summary. `seen` holds exactly the summary buckets that
+    // resolved to a backing node (a phantom bucket already returned above), so any
+    // hashed bucket in `section_bucket_ids` missing from `seen` is a bucket silently
+    // dropped from the summary — Integrity must reject it.
+    if let Some(missing) = section_bucket_ids.difference(&seen).next() {
+        return Err(format!(
+            "occurrence_buckets section {class} carries LogOccurrenceBucket node {missing} \
+             absent from the summary"
+        ));
+    }
+    Ok(())
 }
 
 /// The trust-class citation view of a set of section rows, reused for both the
@@ -1999,9 +3303,23 @@ pub fn assemble_pack(
 
     let mut diagnostics: Vec<PackDiagnostic> = Vec::new();
 
+    // --- coalesce duplicate log records by stable ID (issue #340, round-6 P2) ---
+    // A concatenated multi-scan graph carries the SAME stable log ID once per scan
+    // (a `LogSource` is a non-identity input). Merge those BEFORE window filtering
+    // and summary building so exactly one row per signature/bucket ID flows into
+    // both the hashed section nodes AND the derived summary — otherwise assemble
+    // would emit duplicate rows its own `verify_pack` rejects. No-op for a
+    // single-scan graph (no duplicate log IDs), so every existing pack is
+    // byte-identical.
+    let coalesced = coalesce_log_records(records);
+    let records = coalesced.as_slice();
+
     // --- capability availability (whole record set) ---
     let mut any_pr = false;
     let mut present_classes: BTreeSet<&'static str> = BTreeSet::new();
+    let mut has_error_signature = false;
+    let mut has_frame_resolves_to = false;
+    let mut has_changed_in = false;
     for record in records {
         if let Some(class) = evidence_class_for_record(record) {
             present_classes.insert(class.as_wire());
@@ -2009,6 +3327,26 @@ pub fn assemble_pack(
                 any_pr = true;
             }
         }
+        match record {
+            GraphRecord::Node { kind, .. } if kind.as_str() == "ErrorSignature" => {
+                has_error_signature = true;
+            }
+            GraphRecord::Edge { label, .. } if label.as_str() == "FRAME_RESOLVES_TO" => {
+                has_frame_resolves_to = true;
+            }
+            GraphRecord::Edge { label, .. } if label.as_str() == "CHANGED_IN" => {
+                has_changed_in = true;
+            }
+            _ => {}
+        }
+    }
+    // `remediation_links` (issue #340) has no backing node kind, so its
+    // availability rides a capability probe: the derived
+    // `ErrorSignature --FRAME_RESOLVES_TO--> Symbol --CHANGED_IN--> Commit` join
+    // is available iff all three fact kinds exist in the record set.
+    let remediation_capable = has_error_signature && has_frame_resolves_to && has_changed_in;
+    if remediation_capable {
+        present_classes.insert(EvidenceClass::RemediationLinks.as_wire());
     }
     let class_available = |class: EvidenceClass| -> Availability {
         let present = if class == EvidenceClass::ReviewCoverage {
@@ -2036,7 +3374,17 @@ pub fn assemble_pack(
         // — never silently excluded (Codex round-13 Finding 2). `parse_rfc3339`
         // returns `None` for both an absent resolved value and a malformed one.
         match resolve_valid_time(record).and_then(|vt| parse_rfc3339(&vt)) {
-            Some(parsed) if from_ts <= parsed && parsed < to_ts => {
+            // `occurrence_buckets` use the AC2 interval-intersection rule, NOT the
+            // point predicate: a bucket whose hour `[bucket_start, +1h)`
+            // intersects the window is included WHOLE (issue #340). Every other
+            // class uses the half-open point predicate `from <= t < to`.
+            Some(parsed)
+                if if class == EvidenceClass::OccurrenceBuckets {
+                    bucket_hour_intersects_window(parsed, from_ts, to_ts)
+                } else {
+                    from_ts <= parsed && parsed < to_ts
+                } =>
+            {
                 in_window_by_class
                     .entry(class.as_wire())
                     .or_default()
@@ -2052,6 +3400,65 @@ pub fn assemble_pack(
                     record_ids: vec![record.id().to_owned()],
                     detail: "class-relevant record excluded: no resolvable valid time".to_owned(),
                 });
+            }
+        }
+    }
+
+    // --- occurrence-bucket signature attribution (issue #340, Codex round-3) ---
+    // Each `occurrence_buckets` summary total attributes its buckets to a signature
+    // (`total.signature_id`), but the `LogOccurrenceBucket` NODE payload carries no
+    // signature field — the signature is only an identity input hashed into the
+    // bucket's stable ID. So the bucket->signature binding must be carried by a
+    // HASH-BOUND row for `verify_pack` to re-derive it offline: the
+    // `LogOccurrenceBucket --AGGREGATES--> ErrorSignature` edge. Those edges are
+    // co-located into the occurrence_buckets section here (P1). An in-window bucket
+    // with NO attribution edge cannot be filed under any signature, so it is
+    // EXCLUDED from BOTH the section records and the summary under a counted
+    // `unattributed_bucket` diagnostic — never silently mis-summed and never left in
+    // the section where the reverse-coverage guard would reject the freshly
+    // assembled pack (P2, the assemble<->verify consistency invariant). Mirrors the
+    // `missing_valid_time` exclusion-diagnostic idiom.
+    {
+        let bucket_ids_with_edge: BTreeSet<&str> = records
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Edge { label, source, .. } if label.as_str() == "AGGREGATES" => {
+                    Some(source.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        if let Some(buckets) =
+            in_window_by_class.get_mut(EvidenceClass::OccurrenceBuckets.as_wire())
+        {
+            let existing = std::mem::take(buckets);
+            let mut included_ids: BTreeSet<String> = BTreeSet::new();
+            for bucket in existing {
+                if bucket_ids_with_edge.contains(bucket.id()) {
+                    included_ids.insert(bucket.id().to_owned());
+                    buckets.push(bucket);
+                } else {
+                    diagnostics.push(PackDiagnostic {
+                        code: "unattributed_bucket".to_owned(),
+                        evidence_class: Some(EvidenceClass::OccurrenceBuckets.as_wire().to_owned()),
+                        unavailable_reason: None,
+                        record_ids: vec![bucket.id().to_owned()],
+                        detail: "in-window LogOccurrenceBucket excluded: no AGGREGATES \
+                                 attribution edge names its signature"
+                            .to_owned(),
+                    });
+                }
+            }
+            // Co-locate every AGGREGATES attribution edge whose source is an included
+            // bucket as a hash-bound row, so verify re-derives the bucket->signature
+            // binding from tamper-evident evidence.
+            for record in records {
+                if let GraphRecord::Edge { label, source, .. } = record
+                    && label.as_str() == "AGGREGATES"
+                    && included_ids.contains(source.as_str())
+                {
+                    buckets.push(record.clone());
+                }
             }
         }
     }
@@ -2155,6 +3562,12 @@ pub fn assemble_pack(
         approval_link_edge_ids,
     };
 
+    // --- log-graph derived summaries (issue #340) ---
+    // Computed from the whole record set + the in-window per-class collections
+    // BEFORE the section loop consumes `in_window_by_class` via `remove`.
+    let log_summaries = build_log_summaries(records, &in_window_by_class, window, from_ts, to_ts);
+    debug_assert_eq!(log_summaries.remediation_capable, remediation_capable);
+
     // --- build sections in catalog-class order ---
     let mut sections: Vec<EvidenceSection> = Vec::new();
     let mut all_section_rows: Vec<BundleRecord> = Vec::new();
@@ -2202,11 +3615,38 @@ pub fn assemble_pack(
         for br in &records_for_class {
             all_section_rows.push(br.clone());
         }
-        let disclaimer = matches!(
-            class,
-            EvidenceClass::StructuralDeltas | EvidenceClass::PublicApiDeltas
-        )
-        .then(|| DELTA_SECTION_DISCLAIMER.to_owned());
+        let disclaimer = match class {
+            EvidenceClass::StructuralDeltas | EvidenceClass::PublicApiDeltas => {
+                Some(DELTA_SECTION_DISCLAIMER.to_owned())
+            }
+            EvidenceClass::ErrorSignatures | EvidenceClass::OccurrenceBuckets => {
+                Some(LOG_SECTION_DISCLAIMER.to_owned())
+            }
+            EvidenceClass::RemediationLinks => Some(REMEDIATION_SECTION_DISCLAIMER.to_owned()),
+            _ => None,
+        };
+        // Attach the derived log summary (issue #340) only on a Present log
+        // section; an unavailable section stays clean (`log_summary: None`) so the
+        // degradation markers read exactly as before.
+        let log_summary = if availability == Availability::Present {
+            match class {
+                EvidenceClass::ErrorSignatures => Some(LogEvidenceSummary::ErrorSignatures {
+                    signatures: log_summaries.error_signatures.clone(),
+                }),
+                EvidenceClass::OccurrenceBuckets => Some(LogEvidenceSummary::OccurrenceBuckets {
+                    signature_totals: log_summaries.occurrence_totals.clone(),
+                }),
+                EvidenceClass::RemediationLinks => Some(LogEvidenceSummary::RemediationLinks {
+                    links: log_summaries.remediation_links.clone(),
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // Bind the derived summary into Integrity (issue #340): the whole-summary
+        // BLAKE3 hash `verify_pack` recomputes so a tampered summary value fails.
+        let log_summary_hash = log_summary.as_ref().map(hash_log_summary);
         sections.push(EvidenceSection {
             class: class.as_wire().to_owned(),
             requirement: cr.requirement.as_wire().to_owned(),
@@ -2216,6 +3656,8 @@ pub fn assemble_pack(
             record_count: records_for_class.len(),
             records: records_for_class,
             measurement: is_review_coverage.then(|| review_measurement.clone()),
+            log_summary,
+            log_summary_hash,
             disclaimer,
         });
     }
@@ -2790,6 +4232,7 @@ fn pack_artifact_safety(pack: &EvidencePack, rows: &[BundleRecord]) -> (bool, St
 /// backstop in [`pack_artifact_safety`] still catches a field missed here, but
 /// only this enumeration gives a precise WHERE. Section RECORDS are covered by
 /// the per-record [`pack_safety`] scan and are intentionally excluded here.
+#[allow(clippy::too_many_lines)]
 fn nonrecord_text_fields(pack: &EvidencePack) -> Vec<(String, &str)> {
     let mut out: Vec<(String, &str)> = Vec::new();
 
@@ -2827,6 +4270,84 @@ fn nonrecord_text_fields(pack: &EvidencePack) -> Vec<(String, &str)> {
         }
         if let Some(d) = s.disclaimer.as_deref() {
             out.push((format!("sections[{i}].disclaimer"), d));
+        }
+        // Log-summary text fields (issue #340). Every field is an ID, hash,
+        // bounded label, clipped instant, or count — never raw log/exemplar text —
+        // but enumerate them anyway so a `WHERE` detail can name them precisely
+        // (LOCKSTEP contract). The whole-artifact backstop still catches any field
+        // missed here.
+        match &s.log_summary {
+            Some(LogEvidenceSummary::ErrorSignatures { signatures }) => {
+                for (j, r) in signatures.iter().enumerate() {
+                    let base = format!("sections[{i}].log_summary.signatures[{j}]");
+                    out.push((format!("{base}.signature_id"), r.signature_id.as_str()));
+                    out.push((format!("{base}.severity"), r.severity.as_str()));
+                    out.push((format!("{base}.template_hash"), r.template_hash.as_str()));
+                    if let Some(h) = r.frame_chain_hash.as_deref() {
+                        out.push((format!("{base}.frame_chain_hash"), h));
+                    }
+                    out.push((
+                        format!("{base}.first_seen_in_window"),
+                        r.first_seen_in_window.as_str(),
+                    ));
+                    out.push((
+                        format!("{base}.last_seen_in_window"),
+                        r.last_seen_in_window.as_str(),
+                    ));
+                    for (k, ex) in r.exemplars.iter().enumerate() {
+                        out.push((
+                            format!("{base}.exemplars[{k}].protected_handle"),
+                            ex.protected_handle.as_str(),
+                        ));
+                        out.push((
+                            format!("{base}.exemplars[{k}].content_hash"),
+                            ex.content_hash.as_str(),
+                        ));
+                    }
+                    for (k, fr) in r.frame_resolutions.iter().enumerate() {
+                        if let Some(res) = fr.resolution.as_deref() {
+                            out.push((format!("{base}.frame_resolutions[{k}].resolution"), res));
+                        }
+                        out.push((
+                            format!("{base}.frame_resolutions[{k}].target_id"),
+                            fr.target_id.as_str(),
+                        ));
+                    }
+                }
+            }
+            Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) => {
+                for (j, t) in signature_totals.iter().enumerate() {
+                    let base = format!("sections[{i}].log_summary.signature_totals[{j}]");
+                    out.push((format!("{base}.signature_id"), t.signature_id.as_str()));
+                    for (k, b) in t.buckets.iter().enumerate() {
+                        out.push((
+                            format!("{base}.buckets[{k}].bucket_id"),
+                            b.bucket_id.as_str(),
+                        ));
+                        out.push((format!("{base}.buckets[{k}].hour"), b.hour.as_str()));
+                    }
+                }
+            }
+            Some(LogEvidenceSummary::RemediationLinks { links }) => {
+                for (j, l) in links.iter().enumerate() {
+                    let base = format!("sections[{i}].log_summary.links[{j}]");
+                    out.push((format!("{base}.signature_id"), l.signature_id.as_str()));
+                    out.push((format!("{base}.symbol_id"), l.symbol_id.as_str()));
+                    out.push((format!("{base}.commit_id"), l.commit_id.as_str()));
+                    out.push((
+                        format!("{base}.commit_valid_time"),
+                        l.commit_valid_time.as_str(),
+                    ));
+                    if let Some(res) = l.frame_resolution.as_deref() {
+                        out.push((format!("{base}.frame_resolution"), res));
+                    }
+                    for (k, v) in l.verification_ids.iter().enumerate() {
+                        out.push((format!("{base}.verification_ids[{k}]"), v.as_str()));
+                    }
+                    out.push((format!("{base}.disclaimer"), l.disclaimer.as_str()));
+                }
+            }
+            None => {}
         }
     }
 
@@ -3364,6 +4885,69 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     break 'integrity;
                 }
             }
+        } else if section.class == EvidenceClass::RemediationLinks.as_wire() {
+            // `remediation_links` (issue #340) is a DERIVED join with no backing
+            // node kind: its leads ride the section's `log_summary`, never hashed
+            // rows (a remediation commit may legitimately fall OUTSIDE the evidence
+            // window, so it cannot be a windowed section row). The bounded
+            // membership exemption is therefore the tightest possible — the
+            // section carries ZERO hashed rows — mirroring `review_coverage`'s
+            // bounded exemption so nothing can be smuggled in as a hashed
+            // remediation "row" (a `Commit`, a `Symbol`, any node mapping to a real
+            // evidence class, or any edge) with counts recomputed.
+            if !section.records.is_empty() {
+                integrity_passed = false;
+                integrity_detail = format!(
+                    "remediation_links section carries {} hashed row(s); the derived \
+                     join rides `log_summary` and permits no hashed rows",
+                    section.records.len(),
+                );
+                break 'integrity;
+            }
+        } else if section.class == EvidenceClass::OccurrenceBuckets.as_wire() {
+            // `occurrence_buckets` legitimately co-locates the bucket->signature
+            // attribution edges (issue #340, Codex round-3 P1): `LogOccurrenceBucket
+            // --AGGREGATES--> ErrorSignature`, the hash-bound binding verify
+            // re-derives. Those edges map to no evidence class, so the class check
+            // cannot apply to them — but the exemption is BOUNDED (mirroring
+            // review_coverage): an edge is admitted IFF it is an AGGREGATES edge whose
+            // SOURCE is a LogOccurrenceBucket node present in the section. Anything
+            // else (a node mapping to a non-occurrence_buckets class, an unrelated
+            // edge label, an AGGREGATES edge sourced at a non-present bucket) still
+            // fails Integrity, so nothing can be smuggled in as a fake attribution.
+            let bucket_node_ids: BTreeSet<&str> = section
+                .records
+                .iter()
+                .filter(|br| {
+                    matches!(
+                        node_log_payload(&br.record),
+                        Some(crate::ir::LogPayload::LogOccurrenceBucket(_))
+                    )
+                })
+                .map(|br| br.record.id())
+                .collect();
+            for br in &section.records {
+                let admitted = match &br.record {
+                    GraphRecord::Edge { label, source, .. } => {
+                        label.as_str() == "AGGREGATES" && bucket_node_ids.contains(source.as_str())
+                    }
+                    _ => {
+                        evidence_class_for_record(&br.record).map(|c| c.as_wire())
+                            == Some(section.class.as_str())
+                    }
+                };
+                if !admitted {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "record {} in section {} is neither an occurrence_buckets record nor \
+                         an AGGREGATES attribution edge for a present bucket (section \
+                         membership mismatch)",
+                        br.record.id(),
+                        section.class,
+                    );
+                    break 'integrity;
+                }
+            }
         } else {
             for br in &section.records {
                 let actual = evidence_class_for_record(&br.record).map(|c| c.as_wire());
@@ -3386,6 +4970,16 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     format!("section {} rows are not canonically ordered", section.class);
                 break 'integrity;
             }
+        }
+        // Bind the derived log summary (issue #340) so a tampered summary value —
+        // e.g. an inflated `in_window_occurrences`, a swapped `template_hash`, or a
+        // forged remediation `commit_id`, none of which the per-record/manifest/
+        // window/safety checks reach — fails Integrity, mirroring the
+        // `review_coverage` `measurement` bind above.
+        if let Err(detail) = bind_log_summary_integrity(section, &pack.manifest.window) {
+            integrity_passed = false;
+            integrity_detail = detail;
+            break 'integrity;
         }
     }
     // Recompute the manifest aggregates from the actual included section rows and
@@ -3562,6 +5156,25 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     matches!(resolved, Some(t) if coverage_proven_review_times
                         .get(br.record.id())
                         .is_some_and(|times| times.contains(&t)))
+                } else if section.class == EvidenceClass::OccurrenceBuckets.as_wire() {
+                    if matches!(&br.record, GraphRecord::Edge { label, .. } if label.as_str() == "AGGREGATES")
+                    {
+                        // A co-located `AGGREGATES` attribution edge (issue #340,
+                        // Codex round-3 P1) carries no valid time of its own; its
+                        // window relevance rides the bucket it binds (the bucket row
+                        // IS held to the interval rule below). Section membership
+                        // already restricts it to edges sourced at a present bucket.
+                        true
+                    } else {
+                        // `occurrence_buckets` bucket rows are admitted by the AC2
+                        // interval-intersection rule, NOT the point predicate (issue
+                        // #340): a bucket whose hour `[bucket_start, +1h)` intersects
+                        // the window is legitimately included even when its
+                        // `bucket_start` precedes `from` (a partial-overlap hour is
+                        // counted whole). The SAME predicate `assemble_pack` selected
+                        // it with, so assemble and verify agree.
+                        matches!(resolved, Some(t) if bucket_hour_intersects_window(t, from, to))
+                    }
                 } else {
                     matches!(resolved, Some(t) if from <= t && t < to)
                 };
@@ -3934,6 +5547,346 @@ pub(crate) mod fixture {
         lines.push(String::new());
         lines.join("\n")
     }
+
+    // ── issue #340: log-graph incident-evidence fixture builders ───────────────
+
+    use crate::ir::{
+        ErrorSignaturePayload, FrameResolution, LOG_SCHEMA_VERSION, LogEventPayload,
+        LogOccurrenceBucketPayload, LogPayload, StackFrame,
+    };
+
+    /// A benign, redaction-safe normalized template for a signature (NOT raw log
+    /// text — these are the bounded excerpts the shipping log domain stores).
+    fn log_node(
+        id: &str,
+        kind: NodeKind,
+        summary: String,
+        payload: LogPayload,
+        valid_time: &str,
+    ) -> GraphRecord {
+        GraphRecord::node(id.to_owned(), kind, None, None, None, summary)
+            .with_domain("log", LOG_SCHEMA_VERSION)
+            .with_log(payload)
+            .with_valid_time(valid_time.to_owned(), "log_event_timestamp")
+    }
+
+    /// An `ErrorSignature` node (issue #320). `frames` optional.
+    pub fn error_signature(
+        id: &str,
+        severity: &str,
+        template_excerpt: &str,
+        first_seen: &str,
+        last_seen: &str,
+        occurrence_count: u64,
+        frames: Option<Vec<StackFrame>>,
+    ) -> GraphRecord {
+        log_node(
+            id,
+            NodeKind::ErrorSignature,
+            format!("{severity} signature x{occurrence_count}"),
+            LogPayload::ErrorSignature(ErrorSignaturePayload {
+                fingerprint_algorithm: "template-v1".to_owned(),
+                template_excerpt: template_excerpt.to_owned(),
+                severity: severity.to_owned(),
+                occurrence_count,
+                first_seen: first_seen.to_owned(),
+                last_seen: last_seen.to_owned(),
+                frames,
+            }),
+            first_seen,
+        )
+    }
+
+    /// A `LogEvent` exemplar node whose `event_excerpt` carries a caller-supplied
+    /// (possibly sentinel) string — used to prove exemplar text NEVER enters the
+    /// assembled pack (only content-addressed handles do).
+    pub fn log_event(
+        id: &str,
+        severity: &str,
+        event_excerpt: &str,
+        content_hash: &str,
+        source_line: u64,
+        valid_time: &str,
+    ) -> GraphRecord {
+        log_node(
+            id,
+            NodeKind::LogEvent,
+            format!("{severity} event at line {source_line}"),
+            LogPayload::LogEvent(LogEventPayload {
+                event_excerpt: event_excerpt.to_owned(),
+                event_content_hash: content_hash.to_owned(),
+                source_line,
+                severity: severity.to_owned(),
+            }),
+            valid_time,
+        )
+    }
+
+    /// An hourly `LogOccurrenceBucket` node (issue #320).
+    pub fn occurrence_bucket(id: &str, bucket_start: &str, occurrence_count: u64) -> GraphRecord {
+        log_node(
+            id,
+            NodeKind::LogOccurrenceBucket,
+            format!("bucket {bucket_start} x{occurrence_count}"),
+            LogPayload::LogOccurrenceBucket(LogOccurrenceBucketPayload {
+                bucket_start: bucket_start.to_owned(),
+                bucket_width: "1h".to_owned(),
+                occurrence_count,
+            }),
+            bucket_start,
+        )
+    }
+
+    /// A `LogEvent --FINGERPRINTED_AS--> ErrorSignature` edge.
+    pub fn fingerprinted_as(event_id: &str, signature_id: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::FingerprintedAs,
+            event_id.to_owned(),
+            signature_id.to_owned(),
+            None,
+            "LogEvent fingerprinted as ErrorSignature".to_owned(),
+        )
+    }
+
+    /// A `LogOccurrenceBucket --AGGREGATES--> ErrorSignature` edge.
+    pub fn aggregates(bucket_id: &str, signature_id: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::Aggregates,
+            bucket_id.to_owned(),
+            signature_id.to_owned(),
+            None,
+            "LogOccurrenceBucket aggregates ErrorSignature".to_owned(),
+        )
+    }
+
+    /// An `ErrorSignature --FRAME_RESOLVES_TO--> Symbol` edge (issue #322).
+    pub fn frame_resolves_to(
+        signature_id: &str,
+        target_id: &str,
+        resolution: FrameResolution,
+        frame_index: u32,
+    ) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::FrameResolvesTo,
+            signature_id.to_owned(),
+            target_id.to_owned(),
+            None,
+            "ErrorSignature frame resolves to symbol".to_owned(),
+        )
+        .with_frame_resolution(resolution)
+        .with_frame_index(frame_index)
+    }
+
+    /// A `Symbol` node.
+    pub fn symbol(id: &str, path: &str, name: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some(path.to_owned()),
+            None,
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    /// A `Symbol --CHANGED_IN--> Commit` edge stamped with the commit's temporal.
+    pub fn changed_in(symbol_id: &str, commit_id: &str, vt: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::ChangedIn,
+            symbol_id.to_owned(),
+            commit_id.to_owned(),
+            Some("1.0".to_owned()),
+            "symbol changed in commit".to_owned(),
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: format!("sha-{commit_id}"),
+            git_parent_commits: Vec::new(),
+            valid_time: vt.to_owned(),
+            author_time: Some(vt.to_owned()),
+            observed_at: vt.to_owned(),
+            valid_time_source: Some("git_committer".to_owned()),
+        })
+    }
+
+    /// A `Commit --VALIDATED_BY--> Verification` edge linking passing verification
+    /// evidence to a commit (direction-agnostic in the remediation derivation).
+    pub fn validated_by(commit_id: &str, verification_id: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::ValidatedBy,
+            commit_id.to_owned(),
+            verification_id.to_owned(),
+            None,
+            "commit validated by verification run".to_owned(),
+        )
+    }
+
+    /// A passing verification (`CommandRun`) node.
+    pub fn verification_run(id: &str, executed: &str) -> GraphRecord {
+        let mut r = node(id, NodeKind::CommandRun, VERIFICATION_SCHEMA_VERSION);
+        if let GraphRecord::Node {
+            executed_at,
+            verification_kind,
+            status,
+            ..
+        } = &mut r
+        {
+            *executed_at = Some(executed.to_owned());
+            *verification_kind = Some("command_run".to_owned());
+            *status = Some("passed".to_owned());
+        }
+        r
+    }
+
+    /// A `Commit` node (public alias of the private helper).
+    pub fn commit_node(id: &str, vt: &str) -> GraphRecord {
+        commit(id, vt)
+    }
+
+    /// Sentinel string planted ONLY in exemplar `event_excerpt` fields; the
+    /// assembled pack must NEVER contain it (exemplars surface as handles+hashes).
+    pub const EXEMPLAR_SENTINEL: &str = "SENTINEL_RAW_EXEMPLAR_TEXT_9f3a1c";
+
+    /// Builds a deterministic log-graph incident-evidence fixture (issue #340).
+    ///
+    /// Three distinct signatures, >=48 hourly buckets (incl. out-of-window
+    /// buckets), exemplar `LogEvent`s carrying the raw-text sentinel, and a
+    /// planted `sig1 -> symbol -> in-window commit -> passing verification`
+    /// remediation chain. Window is March 2026 (`WINDOW_FROM`/`WINDOW_TO`).
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn build_log_incident_records() -> Vec<GraphRecord> {
+        let mut records: Vec<GraphRecord> = Vec::new();
+
+        // ── Three distinct signatures ─────────────────────────────────────────
+        // sig1: last_seen extends PAST the window `to` (upper-clip test) and
+        //       carries backtrace frames (frame_chain_hash + remediation anchor).
+        let frames = vec![
+            StackFrame {
+                frame_index: 0,
+                module_path: Some("app::db".to_owned()),
+                file_path: Some("src/db.rs".to_owned()),
+                line: Some(42),
+            },
+            StackFrame {
+                frame_index: 1,
+                module_path: Some("app::main".to_owned()),
+                file_path: Some("src/main.rs".to_owned()),
+                line: Some(10),
+            },
+        ];
+        records.push(error_signature(
+            "log:v1:sig1",
+            "error",
+            "connection refused to HOST",
+            &march(2, 9),           // first_seen in-window
+            "2026-04-05T09:00:00Z", // last_seen AFTER `to` -> clipped
+            120,
+            Some(frames),
+        ));
+        // sig2: entirely in-window, no frames.
+        records.push(error_signature(
+            "log:v1:sig2",
+            "warn",
+            "deprecated config key KEY",
+            &march(3, 10),
+            &march(20, 10),
+            30,
+            None,
+        ));
+        // sig3: entirely in-window.
+        records.push(error_signature(
+            "log:v1:sig3",
+            "fatal",
+            "panic at NUMBER",
+            &march(4, 11),
+            &march(4, 15),
+            3,
+            None,
+        ));
+
+        // ── Exemplars (LogEvent), carrying the raw-text sentinel ──────────────
+        for (sig, line) in [
+            ("log:v1:sig1", 42u64),
+            ("log:v1:sig2", 7),
+            ("log:v1:sig3", 99),
+        ] {
+            let content_hash = "ab".repeat(32); // 64-hex benign content hash
+            let ev_id = format!("log:v1:ev-{}", sig.trim_start_matches("log:v1:"));
+            records.push(log_event(
+                &ev_id,
+                "error",
+                &format!("{EXEMPLAR_SENTINEL} raw line for {sig} value=hunter2"),
+                &content_hash,
+                line,
+                &march(5, 12),
+            ));
+            records.push(fingerprinted_as(&ev_id, sig));
+        }
+
+        // ── >=48 hourly buckets: 16 per signature ─────────────────────────────
+        // sig1: a partial-overlap bucket that STARTS one hour BEFORE `from`
+        // (2026-02-28T23:00) whose hour [23:00, 00:00) touches `from` boundary —
+        // actually intersects [from, to) only if hour_end > from; hour_end =
+        // 2026-03-01T00:00 == from, so it does NOT intersect (half-open). Use a
+        // bucket at 2026-02-28T23:30? Buckets are hour-floored, so instead plant a
+        // bucket at exactly `from`'s hour minus 30m is impossible. Model the
+        // partial-overlap case with a window that is NOT hour-aligned in the
+        // dedicated test; here every bucket is hour-aligned.
+        // 15 in-window hourly buckets for sig1 (Mar 2, hours 0..15), counts 1..15.
+        for h in 0..15u32 {
+            let start = march(2, h);
+            let bid = format!("log:v1:b1-{h:02}");
+            records.push(occurrence_bucket(&bid, &start, u64::from(h) + 1));
+            records.push(aggregates(&bid, "log:v1:sig1"));
+        }
+        // 1 OUT-OF-window bucket for sig1 (Feb 20) — must NOT be summed.
+        records.push(occurrence_bucket(
+            "log:v1:b1-oobefore",
+            "2026-02-20T09:00:00Z",
+            999,
+        ));
+        records.push(aggregates("log:v1:b1-oobefore", "log:v1:sig1"));
+        // 1 OUT-OF-window bucket for sig1 (Apr 10) — must NOT be summed.
+        records.push(occurrence_bucket(
+            "log:v1:b1-ooafter",
+            "2026-04-10T09:00:00Z",
+            888,
+        ));
+        records.push(aggregates("log:v1:b1-ooafter", "log:v1:sig1"));
+
+        // 16 in-window hourly buckets for sig2 and sig3 (Mar 3 / Mar 4).
+        for h in 0..16u32 {
+            let b2 = format!("log:v1:b2-{h:02}");
+            records.push(occurrence_bucket(&b2, &march(3, h), 2));
+            records.push(aggregates(&b2, "log:v1:sig2"));
+            let b3 = format!("log:v1:b3-{h:02}");
+            records.push(occurrence_bucket(&b3, &march(4, h), 5));
+            records.push(aggregates(&b3, "log:v1:sig3"));
+        }
+
+        // ── Remediation chain: sig1 -> symbol -> in-window commit -> verify ────
+        records.push(symbol("codegraph:v5:sym-db", "src/db.rs", "connect"));
+        records.push(frame_resolves_to(
+            "log:v1:sig1",
+            "codegraph:v5:sym-db",
+            FrameResolution::Resolved,
+            0,
+        ));
+        // Fix commit valid time is AFTER sig1 first_seen and IN-window.
+        records.push(commit_node("codegraph:v5:fixc", &march(10, 9)));
+        records.push(changed_in(
+            "codegraph:v5:sym-db",
+            "codegraph:v5:fixc",
+            &march(10, 9),
+        ));
+        records.push(verification_run("verification:v1:fixver", &march(10, 10)));
+        records.push(validated_by("codegraph:v5:fixc", "verification:v1:fixver"));
+
+        records
+    }
+
+    /// The three planted signature record IDs.
+    pub const LOG_SIGNATURE_IDS: [&str; 3] = ["log:v1:sig1", "log:v1:sig2", "log:v1:sig3"];
 }
 
 #[cfg(test)]
@@ -8637,5 +10590,1521 @@ mod pack338_tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/evidence_pack");
         std::fs::create_dir_all(&dir).expect("create fixture dir");
         std::fs::write(dir.join("seed.graph.jsonl"), seed_jsonl()).expect("write fixture");
+    }
+}
+
+#[cfg(test)]
+mod pack340_tests {
+    use super::fixture::{
+        EXEMPLAR_SENTINEL, LOG_SIGNATURE_IDS, WINDOW_FROM, WINDOW_TO, build_log_incident_records,
+        build_seed_records, error_signature,
+    };
+    use super::*;
+
+    fn win() -> Window {
+        Window {
+            from: WINDOW_FROM.to_owned(),
+            to: WINDOW_TO.to_owned(),
+        }
+    }
+
+    fn assemble_cc73(records: &[GraphRecord]) -> EvidencePack {
+        assemble_pack(
+            records,
+            &load_default_catalog(),
+            "CC7.3",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles")
+    }
+
+    fn section(pack: &EvidencePack, class: EvidenceClass) -> &EvidenceSection {
+        pack.sections
+            .iter()
+            .find(|s| s.class == class.as_wire())
+            .unwrap_or_else(|| panic!("section {} present", class.as_wire()))
+    }
+
+    // ── AC1: error_signatures ─────────────────────────────────────────────────
+    #[test]
+    fn error_signatures_populate_with_clipped_span_and_frame_joins() {
+        let records = build_log_incident_records();
+        let pack = assemble_cc73(&records);
+        let sec = section(&pack, EvidenceClass::ErrorSignatures);
+        assert_eq!(sec.status, "present");
+        assert_eq!(sec.outcome, ClassOutcome::Pass);
+        assert!(sec.unavailable_reason.is_none());
+        // All three in-window signatures surface as hashed rows.
+        assert_eq!(sec.record_count, 3);
+        // Zero `unavailable` markers when records present (AC1).
+        assert!(
+            !pack
+                .diagnostics
+                .iter()
+                .any(|d| d.evidence_class.as_deref() == Some("error_signatures")
+                    && d.code == "evidence_class_unavailable"),
+            "no unavailable marker when signatures present: {:?}",
+            pack.diagnostics
+        );
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = &sec.log_summary else {
+            panic!("error_signatures summary present");
+        };
+        assert_eq!(signatures.len(), 3);
+        let ids: Vec<&str> = signatures.iter().map(|s| s.signature_id.as_str()).collect();
+        assert_eq!(ids, LOG_SIGNATURE_IDS, "rows ordered by record_id");
+
+        let sig1 = &signatures[0];
+        assert_eq!(sig1.signature_id, "log:v1:sig1");
+        assert_eq!(sig1.severity, "error");
+        // first_seen is in-window -> unchanged; last_seen (Apr 5) clipped to `to`.
+        assert_eq!(sig1.first_seen_in_window, "2026-03-02T09:00:00Z");
+        assert_eq!(
+            sig1.last_seen_in_window, WINDOW_TO,
+            "last_seen clipped to window"
+        );
+        // template_hash is a redaction-safe fingerprint of the excerpt.
+        assert_eq!(
+            sig1.template_hash,
+            blake3::hash(b"connection refused to HOST").to_string()
+        );
+        assert!(
+            sig1.frame_chain_hash.is_some(),
+            "frames -> frame_chain_hash"
+        );
+        // Exemplar: handle + hash only, never text.
+        assert_eq!(sig1.exemplars.len(), 1);
+        let ex = &sig1.exemplars[0];
+        assert!(ex.protected_handle.starts_with("protected:v1:"));
+        assert_eq!(ex.content_hash, "ab".repeat(32));
+        // FRAME_RESOLVES_TO join propagated verbatim.
+        assert_eq!(sig1.frame_resolutions.len(), 1);
+        assert_eq!(
+            sig1.frame_resolutions[0].resolution.as_deref(),
+            Some("resolved")
+        );
+        assert_eq!(sig1.frame_resolutions[0].frame_index, Some(0));
+        assert_eq!(sig1.frame_resolutions[0].target_id, "codegraph:v5:sym-db");
+        // sig2/sig3 carry no frames.
+        assert!(signatures[1].frame_chain_hash.is_none());
+        assert!(signatures[1].frame_resolutions.is_empty());
+    }
+
+    // ── AC2: occurrence_buckets ───────────────────────────────────────────────
+    #[test]
+    fn occurrence_buckets_sum_only_in_window_ordered() {
+        let records = build_log_incident_records();
+        let pack = assemble_cc73(&records);
+        let sec = section(&pack, EvidenceClass::OccurrenceBuckets);
+        assert_eq!(sec.status, "present");
+        // 15 (sig1) + 16 (sig2) + 16 (sig3) = 47 in-window bucket NODES; the 2
+        // out-of-window sig1 buckets never appear (0 leakage). Each bucket also
+        // co-locates its `AGGREGATES` attribution edge (issue #340, Codex round-3),
+        // so the section carries 47 nodes + 47 edges = 94 hashed rows.
+        assert_eq!(sec.record_count, 94);
+        let node_rows = sec
+            .records
+            .iter()
+            .filter(|br| matches!(br.record, GraphRecord::Node { .. }))
+            .count();
+        let edge_rows = sec
+            .records
+            .iter()
+            .filter(|br| {
+                matches!(&br.record,
+                GraphRecord::Edge { label, .. } if label.as_str() == "AGGREGATES")
+            })
+            .count();
+        assert_eq!(node_rows, 47, "47 in-window bucket nodes");
+        assert_eq!(edge_rows, 47, "one AGGREGATES attribution edge per bucket");
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        let by_sig: BTreeMap<&str, &SignatureOccurrenceTotal> = signature_totals
+            .iter()
+            .map(|t| (t.signature_id.as_str(), t))
+            .collect();
+        // sig1: sum(1..=15) = 120; the 999 + 888 out-of-window buckets excluded.
+        let s1 = by_sig["log:v1:sig1"];
+        assert_eq!(s1.in_window_occurrences, 120);
+        assert_eq!(s1.buckets.len(), 15);
+        // Buckets ordered by hour.
+        let hours: Vec<&str> = s1.buckets.iter().map(|b| b.hour.as_str()).collect();
+        let mut sorted = hours.clone();
+        sorted.sort_unstable();
+        assert_eq!(hours, sorted, "buckets ordered by (signature, hour)");
+        // sig2: 16 * 2 = 32; sig3: 16 * 5 = 80.
+        assert_eq!(by_sig["log:v1:sig2"].in_window_occurrences, 32);
+        assert_eq!(by_sig["log:v1:sig3"].in_window_occurrences, 80);
+    }
+
+    #[test]
+    fn occurrence_bucket_partial_overlap_included_whole() {
+        // A NON-hour-aligned window so a bucket's hour straddles `from`.
+        // Window from 2026-03-02T05:30 to 2026-03-02T07:30.
+        let window = Window {
+            from: "2026-03-02T05:30:00Z".to_owned(),
+            to: "2026-03-02T07:30:00Z".to_owned(),
+        };
+        let mut records = vec![error_signature(
+            "log:v1:sigp",
+            "error",
+            "partial overlap probe",
+            "2026-03-02T05:00:00Z",
+            "2026-03-02T08:00:00Z",
+            10,
+            Some(Vec::new()),
+        )];
+        // bucket at 04:00 -> hour [04:00,05:00): hour_end 05:00 <= from 05:30 -> EXCLUDED.
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:bp-04",
+            "2026-03-02T04:00:00Z",
+            100,
+        ));
+        records.push(super::fixture::aggregates("log:v1:bp-04", "log:v1:sigp"));
+        // bucket at 05:00 -> hour [05:00,06:00): straddles from (05:00 < 05:30 < 06:00) -> INCLUDED WHOLE.
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:bp-05",
+            "2026-03-02T05:00:00Z",
+            7,
+        ));
+        records.push(super::fixture::aggregates("log:v1:bp-05", "log:v1:sigp"));
+        // bucket at 06:00 -> fully inside -> INCLUDED.
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:bp-06",
+            "2026-03-02T06:00:00Z",
+            3,
+        ));
+        records.push(super::fixture::aggregates("log:v1:bp-06", "log:v1:sigp"));
+        // bucket at 07:00 -> hour [07:00,08:00): straddles to (07:00 < 07:30 < 08:00) -> INCLUDED WHOLE.
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:bp-07",
+            "2026-03-02T07:00:00Z",
+            5,
+        ));
+        records.push(super::fixture::aggregates("log:v1:bp-07", "log:v1:sigp"));
+        // bucket at 08:00 -> starts at/after to -> EXCLUDED.
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:bp-08",
+            "2026-03-02T08:00:00Z",
+            200,
+        ));
+        records.push(super::fixture::aggregates("log:v1:bp-08", "log:v1:sigp"));
+
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC7.2",
+            &window,
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        let sec = section(&pack, EvidenceClass::OccurrenceBuckets);
+        // 05:00 (whole), 06:00, 07:00 (whole) included; 04:00 and 08:00 excluded.
+        // Each of the 3 included buckets co-locates its AGGREGATES attribution edge
+        // (issue #340, Codex round-3): 3 nodes + 3 edges = 6 hashed rows.
+        assert_eq!(sec.record_count, 6);
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
+        else {
+            panic!("summary present");
+        };
+        assert_eq!(signature_totals[0].in_window_occurrences, 7 + 3 + 5);
+        // The partial-overlap bucket survives verify Window-consistency.
+        let report = verify_pack(&pack);
+        assert!(
+            report.window_consistency.passed,
+            "{:?}",
+            report.window_consistency
+        );
+        assert!(report.ok, "verify passes for partial-overlap buckets");
+    }
+
+    // ── AC3: remediation_links ────────────────────────────────────────────────
+    #[test]
+    fn remediation_links_derive_planted_chain() {
+        let records = build_log_incident_records();
+        let pack = assemble_cc73(&records);
+        let sec = section(&pack, EvidenceClass::RemediationLinks);
+        assert_eq!(sec.status, "present", "capability probe -> present");
+        assert_eq!(
+            sec.record_count, 0,
+            "no hashed rows; leads ride log_summary"
+        );
+        let Some(LogEvidenceSummary::RemediationLinks { links }) = &sec.log_summary else {
+            panic!("remediation summary present");
+        };
+        assert_eq!(links.len(), 1, "exactly the planted chain");
+        let link = &links[0];
+        assert_eq!(link.signature_id, "log:v1:sig1");
+        assert_eq!(link.symbol_id, "codegraph:v5:sym-db");
+        assert_eq!(link.commit_id, "codegraph:v5:fixc");
+        assert_eq!(link.commit_valid_time, "2026-03-10T09:00:00Z");
+        assert_eq!(link.frame_resolution.as_deref(), Some("resolved"));
+        assert_eq!(
+            link.verification_ids,
+            vec!["verification:v1:fixver".to_owned()]
+        );
+        assert_eq!(link.disclaimer, REMEDIATION_SECTION_DISCLAIMER);
+    }
+
+    #[test]
+    fn remediation_excludes_commit_before_signature_activity() {
+        // A commit that pre-dates the signature's first_seen is not a remediation.
+        let mut records = build_log_incident_records();
+        // Repoint the fix commit's valid time to BEFORE sig1 first_seen (Mar 2 09).
+        records.push(super::fixture::commit_node(
+            "codegraph:v5:oldc",
+            "2026-03-01T00:30:00Z",
+        ));
+        records.push(super::fixture::changed_in(
+            "codegraph:v5:sym-db",
+            "codegraph:v5:oldc",
+            "2026-03-01T00:30:00Z",
+        ));
+        let pack = assemble_cc73(&records);
+        let Some(LogEvidenceSummary::RemediationLinks { links }) =
+            &section(&pack, EvidenceClass::RemediationLinks).log_summary
+        else {
+            panic!("summary present");
+        };
+        assert!(
+            links.iter().all(|l| l.commit_id != "codegraph:v5:oldc"),
+            "pre-activity commit is not a remediation lead"
+        );
+        assert_eq!(links.len(), 1);
+    }
+
+    // ── AC4: trust separation ─────────────────────────────────────────────────
+    #[test]
+    fn log_rows_reported_runtime_observation_never_source_or_verification() {
+        let records = build_log_incident_records();
+        let pack = assemble_cc73(&records);
+        // All error_signatures + occurrence_buckets rows tallied runtime_observation.
+        let counts = &pack.manifest.included_record_counts;
+        assert_eq!(counts.get("runtime_observation").copied(), Some(3 + 47));
+        assert!(
+            !counts.contains_key("source_fact"),
+            "log rows never tallied source_fact"
+        );
+        assert!(
+            !counts.contains_key("verification_evidence"),
+            "log rows never tallied verification_evidence"
+        );
+        // Non-code 100%-handle rule: every runtime_observation row is cited.
+        let tally = pack
+            .verdicts
+            .citation_tallies
+            .iter()
+            .find(|t| t.trust_class == "runtime_observation")
+            .expect("runtime_observation tally");
+        assert_eq!(tally.total, 50);
+        assert_eq!(tally.cited, 50);
+        assert_eq!(tally.missing, 0);
+    }
+
+    // ── AC5: degradation, both directions ─────────────────────────────────────
+    #[test]
+    fn degrades_to_log_domain_absent_when_no_log_records() {
+        // A no-log store (the #338 seed): optional classes -> unavailable, exit 0.
+        let records = build_seed_records();
+        let pack = assemble_cc73(&records);
+        for class in [
+            EvidenceClass::ErrorSignatures,
+            EvidenceClass::OccurrenceBuckets,
+            EvidenceClass::RemediationLinks,
+        ] {
+            let sec = section(&pack, class);
+            assert_eq!(sec.status, "unavailable", "{}", class.as_wire());
+            assert_eq!(sec.unavailable_reason.as_deref(), Some("log_domain_absent"));
+            assert_eq!(sec.outcome, ClassOutcome::ReportedOptionalUnavailable);
+            assert!(sec.log_summary.is_none());
+        }
+        assert!(pack.verdicts.required_classes.passed, "optional -> ok");
+        assert!(pack.verdicts.ok, "no-log optional degradation is a pass");
+    }
+
+    #[test]
+    fn required_flip_gate_fails_when_log_domain_absent() {
+        // A catalog variant marking the log classes REQUIRED (NOT the shipped
+        // soc2-v1.json) gate-fails over a no-log store.
+        let mut catalog = load_default_catalog();
+        let cc73 = catalog
+            .controls
+            .iter_mut()
+            .find(|c| c.control_id == "CC7.3")
+            .expect("CC7.3");
+        for cr in &mut cc73.evidence_classes {
+            if matches!(
+                cr.class,
+                EvidenceClass::ErrorSignatures
+                    | EvidenceClass::OccurrenceBuckets
+                    | EvidenceClass::RemediationLinks
+            ) {
+                cr.requirement = Requirement::Required;
+            }
+        }
+        let records = build_seed_records();
+        let pack = assemble_pack(&records, &catalog, "CC7.3", &win(), 1.0, "test-0.0.0", None)
+            .expect("assembles");
+        assert!(!pack.verdicts.ok, "required + absent -> gate fail");
+        assert!(!pack.verdicts.required_classes.passed);
+        for class in [
+            "error_signatures",
+            "occurrence_buckets",
+            "remediation_links",
+        ] {
+            assert!(
+                pack.diagnostics
+                    .iter()
+                    .any(|d| d.code == "required_class_unavailable"
+                        && d.evidence_class.as_deref() == Some(class)),
+                "required_class_unavailable for {class}"
+            );
+        }
+    }
+
+    // ── AC6: determinism ──────────────────────────────────────────────────────
+    #[test]
+    fn packs_byte_identical_across_five_runs() {
+        let records = build_log_incident_records();
+        let baseline = serde_json::to_string(&assemble_cc73(&records)).expect("serializes");
+        for _ in 0..5 {
+            let again = serde_json::to_string(&assemble_cc73(&records)).expect("serializes");
+            assert_eq!(again, baseline, "byte-identical across runs");
+        }
+    }
+
+    // ── AC7: verify covers new sections + safety (zero raw log bytes) ──────────
+    #[test]
+    fn verify_passes_and_no_raw_log_or_exemplar_text_in_pack() {
+        let records = build_log_incident_records();
+        let pack = assemble_cc73(&records);
+        let report = verify_pack(&pack);
+        assert!(report.integrity.passed, "{:?}", report.integrity);
+        assert!(report.safety.passed, "{:?}", report.safety);
+        assert!(
+            report.window_consistency.passed,
+            "{:?}",
+            report.window_consistency
+        );
+        assert!(report.coverage.passed, "{:?}", report.coverage);
+        assert!(report.ok, "verify clean over log sections");
+        // Scanner assertion: exemplar raw text never enters the pack.
+        let serialized = serde_json::to_string(&pack).expect("serializes");
+        assert!(
+            !serialized.contains(EXEMPLAR_SENTINEL),
+            "exemplar raw text must never appear in the assembled pack"
+        );
+        assert!(
+            !serialized.contains("hunter2"),
+            "raw exemplar payload value must never appear"
+        );
+        // Codex round-4 P2: no normalized template text or backtrace-frame path
+        // text may ride the hashed section records either. The fixture's template
+        // excerpts and frame-only path/module text must be absent from the whole
+        // serialized pack. ("src/db.rs" is deliberately excluded here: a legitimate
+        // Symbol node in the remediation chain carries that code path, unrelated to
+        // the frame leak; the frame-only strings below are exclusive to frames.)
+        for raw in [
+            "connection refused to HOST",
+            "deprecated config key KEY",
+            "panic at NUMBER",
+            "app::db",
+            "app::main",
+            "src/main.rs",
+        ] {
+            assert!(
+                !serialized.contains(raw),
+                "raw log template/frame text `{raw}` must never appear in the pack"
+            );
+        }
+    }
+
+    /// Codex round-4 P2: the `error_signatures` section's hashed records must NOT
+    /// carry the `ErrorSignature` node's raw `template_excerpt` or backtrace-frame
+    /// path text. The summary already carries the redaction-safe
+    /// `template_hash` / `frame_chain_hash` fingerprints, so nothing functional
+    /// depends on the excerpt/frame text, and stripping it keeps verify clean.
+    #[test]
+    fn error_signatures_section_records_carry_no_raw_template_or_frame_text() {
+        let records = build_log_incident_records();
+        let pack = assemble_cc73(&records);
+        let sec = section(&pack, EvidenceClass::ErrorSignatures);
+        let sec_json = serde_json::to_string(&sec.records).expect("serializes section records");
+        for raw in [
+            "connection refused to HOST",
+            "deprecated config key KEY",
+            "panic at NUMBER",
+            "app::db",
+            "app::main",
+            "src/db.rs",
+            "src/main.rs",
+        ] {
+            assert!(
+                !sec_json.contains(raw),
+                "error_signatures section record leaks raw log text `{raw}`"
+            );
+        }
+        // The scrubbed node's `template_excerpt` now holds the fingerprint that the
+        // summary carries as `template_hash`, and the section still verifies clean.
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = &sec.log_summary else {
+            panic!("error_signatures summary present");
+        };
+        for br in &sec.records {
+            if let GraphRecord::Node { log: Some(p), .. } = &br.record
+                && let crate::ir::LogPayload::ErrorSignature(payload) = p.as_ref()
+            {
+                let row = signatures
+                    .iter()
+                    .find(|r| r.signature_id == br.record.id())
+                    .expect("every section signature has a summary row");
+                assert_eq!(
+                    payload.template_excerpt, row.template_hash,
+                    "scrubbed node carries the template fingerprint, not raw text"
+                );
+                // Frame path text, if any, is a BLAKE3 fingerprint (64 hex chars),
+                // never a readable path.
+                if let Some(frames) = &payload.frames {
+                    for f in frames {
+                        for text in [f.module_path.as_deref(), f.file_path.as_deref()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            assert_eq!(text.len(), 64, "frame path scrubbed to a hash");
+                            assert!(
+                                text.chars().all(|c| c.is_ascii_hexdigit()),
+                                "frame path fingerprint is hex"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(verify_pack(&pack).ok, "scrubbed pack still verifies clean");
+    }
+
+    #[test]
+    fn verify_rejects_smuggled_remediation_row() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        // Smuggle a hashed row into the remediation_links section.
+        let commit = records
+            .iter()
+            .find(|r| r.id() == "codegraph:v5:fixc")
+            .expect("commit")
+            .clone();
+        let scrubbed = crate::bundle::scrub_record(commit);
+        let json = serde_json::to_string(&scrubbed).unwrap();
+        let hash = blake3::hash(json.as_bytes()).to_string();
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::RemediationLinks.as_wire())
+            .expect("remediation section");
+        sec.records.push(BundleRecord {
+            record: scrubbed,
+            hash,
+        });
+        sec.record_count = sec.records.len();
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a smuggled hashed remediation row must fail Integrity"
+        );
+    }
+
+    // ── AC7: verify BINDS the derived log summaries (tamper-evidence, issue #340)
+    // The `log_summary` values are the derived evidence consumers read, but they
+    // ride OUTSIDE the hashed `records`. Without an Integrity bind an attacker can
+    // edit an occurrence total, a template fingerprint, or a remediation commit id
+    // in a serialized pack and every other check (record hash, manifest counts,
+    // window, safety) still passes. These tests tamper a summary value WITHOUT
+    // updating its binding hash and assert `verify_pack` now reports an Integrity
+    // defect — exactly as `review_coverage.measurement` is bound.
+
+    #[test]
+    fn assembled_log_sections_carry_a_binding_hash() {
+        let records = build_log_incident_records();
+        let pack = assemble_cc73(&records);
+        for class in [
+            EvidenceClass::ErrorSignatures,
+            EvidenceClass::OccurrenceBuckets,
+            EvidenceClass::RemediationLinks,
+        ] {
+            let sec = section(&pack, class);
+            assert!(sec.log_summary.is_some(), "{class:?} carries a summary");
+            let stored = sec
+                .log_summary_hash
+                .as_deref()
+                .unwrap_or_else(|| panic!("{class:?} carries a binding log_summary_hash"));
+            assert_eq!(
+                stored,
+                hash_log_summary(sec.log_summary.as_ref().unwrap()),
+                "{class:?} log_summary_hash binds its summary"
+            );
+        }
+        // Baseline: the untampered pack verifies clean over the new bind.
+        assert!(verify_pack(&pack).ok, "untampered pack verifies clean");
+    }
+
+    #[test]
+    fn verify_rejects_tampered_in_window_occurrences() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) =
+            sec.log_summary.as_mut()
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        // Inflate a signature's occurrence total (leave the binding hash stale).
+        signature_totals[0].in_window_occurrences += 1_000;
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a tampered in_window_occurrences must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_tampered_template_hash() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+            .expect("error_signatures section");
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = sec.log_summary.as_mut()
+        else {
+            panic!("error_signatures summary present");
+        };
+        // Swap a template fingerprint (leave the binding hash stale).
+        signatures[0].template_hash = blake3::hash(b"forged template").to_string();
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a tampered template_hash must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_tampered_frame_chain_hash() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+            .expect("error_signatures section");
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = sec.log_summary.as_mut()
+        else {
+            panic!("error_signatures summary present");
+        };
+        // sig1 carries frames -> a frame_chain_hash; forge it.
+        let sig1 = signatures
+            .iter_mut()
+            .find(|s| s.signature_id == "log:v1:sig1")
+            .expect("sig1 carries frames");
+        sig1.frame_chain_hash = Some(blake3::hash(b"forged frames").to_string());
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a tampered frame_chain_hash must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_forged_remediation_commit_id() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::RemediationLinks.as_wire())
+            .expect("remediation_links section");
+        let Some(LogEvidenceSummary::RemediationLinks { links }) = sec.log_summary.as_mut() else {
+            panic!("remediation_links summary present");
+        };
+        // Forge the remediation commit id — the highest-risk tamper: the link has
+        // NO backing hashed row, so only the whole-summary bind can catch it.
+        links[0].commit_id = "codegraph:v5:attacker-commit".to_owned();
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a forged remediation commit_id must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_stripped_log_summary_hash() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::RemediationLinks.as_wire())
+            .expect("remediation_links section");
+        // Stripping the binding hash while keeping the summary is itself tamper.
+        sec.log_summary_hash = None;
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a stripped log_summary_hash must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    // ── Codex round-2 P1: reverse bucket-coverage bijection ───────────────────
+    // `bind_occurrence_totals` must reject a hashed `LogOccurrenceBucket` node that
+    // is dropped from the summary. Recomputing `log_summary_hash` over the reduced
+    // summary defeats the whole-summary (layer-1) bind, so only the reverse
+    // coverage bijection can catch the under-report.
+
+    #[test]
+    fn verify_rejects_bucket_dropped_from_summary() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        {
+            let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) =
+                sec.log_summary.as_mut()
+            else {
+                panic!("occurrence_buckets summary present");
+            };
+            let total = signature_totals
+                .iter_mut()
+                .find(|t| t.signature_id == "log:v1:sig1")
+                .expect("sig1 total");
+            // Drop one in-window bucket and reduce the reported total to match, so
+            // the sum check passes and the reverse coverage guard is the ONLY
+            // failing check. Its hashed row lingers in `section.records`.
+            let dropped = total.buckets.remove(0);
+            total.in_window_occurrences -= dropped.occurrence_count;
+        }
+        // Recompute the binding hash over the reduced summary (defeats layer 1).
+        sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a hashed bucket dropped from the summary must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_whole_signature_total_dropped_from_summary() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        {
+            let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) =
+                sec.log_summary.as_mut()
+            else {
+                panic!("occurrence_buckets summary present");
+            };
+            // Drop an entire signature's total; every one of its hashed buckets
+            // lingers in `section.records` but is now uncovered by the summary.
+            let idx = signature_totals
+                .iter()
+                .position(|t| t.signature_id == "log:v1:sig1")
+                .expect("sig1 total");
+            signature_totals.remove(idx);
+        }
+        sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a whole signature total dropped from the summary must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    // ── Codex round-2 P2: variant <-> section.class bind ──────────────────────
+    // Each `log_summary` variant must sit on its matching section class. The
+    // genuinely exploitable hole is the `RemediationLinks` arm, which returned
+    // `Ok(())` unconditionally: a `RemediationLinks` summary (with its hash
+    // recomputed) rides ANY section — a mismatched log section or a non-log
+    // section — with no backing hashed row to catch it, so ONLY the variant<->class
+    // bind can reject it (the node-backed `ErrorSignatures`/`OccurrenceBuckets`
+    // variants are additionally netted by the section-membership and backing-row
+    // checks above).
+
+    #[test]
+    fn verify_rejects_remediation_summary_on_mismatched_log_section() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let remediation = pack
+            .sections
+            .iter()
+            .find(|s| s.class == EvidenceClass::RemediationLinks.as_wire())
+            .and_then(|s| s.log_summary.clone())
+            .expect("remediation_links summary");
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+            .expect("error_signatures section");
+        // A RemediationLinks summary on the error_signatures log section: recompute
+        // its hash so layer 1 passes and only the variant<->class bind can reject it
+        // (the arm formerly returned Ok unconditionally).
+        sec.log_summary = Some(remediation);
+        sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a RemediationLinks summary on the error_signatures section must fail \
+             Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_occurrence_summary_on_wrong_section() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let buckets = pack
+            .sections
+            .iter()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .and_then(|s| s.log_summary.clone())
+            .expect("occurrence_buckets summary");
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::RemediationLinks.as_wire())
+            .expect("remediation_links section");
+        // An OccurrenceBuckets summary on the remediation_links section: the
+        // variant<->class bind rejects it (and the backing-row net would too — this
+        // node-backed variant cannot slip past on the wrong section).
+        sec.log_summary = Some(buckets);
+        sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "an OccurrenceBuckets summary on the remediation_links section must fail \
+             Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    // ── CC7.2 also carries the two available log classes ──────────────────────
+    #[test]
+    fn cc72_carries_error_signatures_and_buckets() {
+        let records = build_log_incident_records();
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC7.2",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        assert_eq!(
+            section(&pack, EvidenceClass::ErrorSignatures).status,
+            "present"
+        );
+        assert_eq!(
+            section(&pack, EvidenceClass::OccurrenceBuckets).status,
+            "present"
+        );
+        // CC7.2 maps no remediation_links class.
+        assert!(
+            !pack.sections.iter().any(|s| s.class == "remediation_links"),
+            "CC7.2 does not map remediation_links"
+        );
+        assert!(verify_pack(&pack).ok);
+    }
+
+    // ── Codex round-3 P1/P2: bucket <-> signature binding + assemble<->verify ──
+    // The occurrence-bucket summary attributes each bucket to a signature via
+    // `total.signature_id`, but the bucket NODE payload carries no signature field
+    // (the signature is only an identity input of the bucket's stable ID hash). The
+    // fix co-locates the `LogOccurrenceBucket --AGGREGATES--> ErrorSignature` edges
+    // as hash-bound rows so verify can re-derive the binding offline, and excludes
+    // an in-window bucket that lacks an attribution edge from BOTH the section and
+    // the summary under a counted `unattributed_bucket` diagnostic.
+
+    /// A minimal fixture: one signature with one ATTRIBUTED in-window bucket and one
+    /// UNATTRIBUTED in-window bucket (no `AGGREGATES` edge).
+    fn records_with_unattributed_bucket() -> Vec<GraphRecord> {
+        let mut records = vec![error_signature(
+            "log:v1:siga",
+            "error",
+            "boom on start",
+            "2026-03-02T00:00:00Z",
+            "2026-03-02T05:00:00Z",
+            10,
+            Some(Vec::new()),
+        )];
+        // An attributed in-window bucket.
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:ba-00",
+            "2026-03-02T00:00:00Z",
+            3,
+        ));
+        records.push(super::fixture::aggregates("log:v1:ba-00", "log:v1:siga"));
+        // An UNATTRIBUTED in-window bucket: no AGGREGATES edge names its signature.
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:ba-unattr",
+            "2026-03-02T01:00:00Z",
+            99,
+        ));
+        records
+    }
+
+    #[test]
+    fn assemble_with_unattributed_bucket_excludes_it_and_passes_verify() {
+        let records = records_with_unattributed_bucket();
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC7.2",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        // REGRESSION GUARD (P2): every pack `assemble_pack` produces MUST pass its
+        // own offline `verify_pack`. Before the fix the unattributed bucket rode
+        // section.records but was skipped from the summary, so the reverse-coverage
+        // guard rejected the freshly-assembled pack.
+        let report = verify_pack(&pack);
+        assert!(
+            report.ok,
+            "assemble<->verify consistency: {:?} / {:?}",
+            report.integrity, report.window_consistency
+        );
+        // The unattributed bucket is excluded from the section records.
+        let sec = section(&pack, EvidenceClass::OccurrenceBuckets);
+        assert!(
+            !sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:ba-unattr"),
+            "unattributed bucket excluded from section records"
+        );
+        // ... and surfaced under a counted `unattributed_bucket` diagnostic.
+        assert!(
+            pack.diagnostics
+                .iter()
+                .any(|d| d.code == "unattributed_bucket"
+                    && d.evidence_class.as_deref() == Some("occurrence_buckets")
+                    && d.record_ids.iter().any(|id| id == "log:v1:ba-unattr")),
+            "unattributed bucket tallied under a diagnostic: {:?}",
+            pack.diagnostics
+        );
+        // ... and excluded from the summary totals.
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        assert!(
+            signature_totals
+                .iter()
+                .all(|t| t.buckets.iter().all(|b| b.bucket_id != "log:v1:ba-unattr")),
+            "unattributed bucket excluded from the summary"
+        );
+        // The attributed bucket is retained and its AGGREGATES edge co-located.
+        assert!(
+            sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:ba-00"),
+            "attributed bucket retained"
+        );
+        assert!(
+            sec.records.iter().any(|br| matches!(&br.record,
+                GraphRecord::Edge { label, source, target, .. }
+                    if label.as_str() == "AGGREGATES"
+                        && source == "log:v1:ba-00"
+                        && target == "log:v1:siga")),
+            "attribution edge co-located as a hashed row"
+        );
+    }
+
+    // ── Codex round-6 P2: concatenated multi-scan coalescing ─────────────────
+    // A `LogSource` is a NON-identity input, so the SAME repo's `scan-logs` output
+    // concatenated (a documented, legitimate multi-scan workflow) carries the same
+    // stable `ErrorSignature` / `LogOccurrenceBucket` ID once per scan. Before the
+    // fix, assemble emitted one summary row per PHYSICAL record and its own offline
+    // `verify_pack` (one row per signature) rejected the freshly assembled pack.
+    // The fix coalesces duplicate log records by stable ID at assemble time.
+
+    /// The `build_log_incident_records()` graph concatenated with itself: every
+    /// stable log ID appears TWICE, exactly as `cat scanA.jsonl scanB.jsonl` of one
+    /// repo's identical scans would produce. Summed occurrence counts double; merged
+    /// first/last-seen are unchanged (identical copies).
+    fn concatenated_multi_scan_records() -> Vec<GraphRecord> {
+        let mut records = build_log_incident_records();
+        let dup = build_log_incident_records();
+        records.extend(dup);
+        records
+    }
+
+    /// Two DISTINCT scans of one repo producing the SAME stable `ErrorSignature`
+    /// ID (`log:v1:sigX`) with DIFFERENT `LogSource`, DIFFERENT first/last-seen, and
+    /// an overlapping/summable bucket (`log:v1:bx-00`, same hour, per-scan counts).
+    /// Proves the merge keeps the earliest `first_seen`, the latest `last_seen`, and
+    /// the SUMMED occurrence counts — not a doubled-then-rejected or halved value.
+    fn two_scan_differing_extents_records() -> Vec<GraphRecord> {
+        vec![
+            // Scan A: narrow span, count 10; bucket count 4.
+            error_signature(
+                "log:v1:sigX",
+                "error",
+                "flaky upstream TIMEOUT",
+                "2026-03-03T09:00:00Z",
+                "2026-03-03T12:00:00Z",
+                10,
+                None,
+            ),
+            super::fixture::occurrence_bucket("log:v1:bx-00", "2026-03-03T00:00:00Z", 4),
+            super::fixture::aggregates("log:v1:bx-00", "log:v1:sigX"),
+            // Scan B: EARLIER first_seen, LATER last_seen, count 25; SAME bucket ID,
+            // count 6 (distinct scan of the same hour).
+            error_signature(
+                "log:v1:sigX",
+                "error",
+                "flaky upstream TIMEOUT",
+                "2026-03-02T08:00:00Z",
+                "2026-03-04T15:00:00Z",
+                25,
+                None,
+            ),
+            super::fixture::occurrence_bucket("log:v1:bx-00", "2026-03-03T00:00:00Z", 6),
+            super::fixture::aggregates("log:v1:bx-00", "log:v1:sigX"),
+        ]
+    }
+
+    #[test]
+    fn assemble_coalesces_concatenated_multi_scan_and_passes_verify() {
+        // REGRESSION GUARD (Codex round-6 P2): a concatenated multi-scan graph must
+        // assemble into a pack that passes its OWN offline verify. Before the fix the
+        // duplicate physical records produced duplicate summary rows that
+        // `verify_pack` rejected.
+        let records = concatenated_multi_scan_records();
+        let pack = assemble_cc73(&records);
+        let report = verify_pack(&pack);
+        assert!(
+            report.ok,
+            "concatenated multi-scan pack must pass its own verify: {:?} / {:?}",
+            report.integrity, report.window_consistency
+        );
+
+        // Exactly ONE error_signatures row per stable signature ID (three, not six).
+        let sig_sec = section(&pack, EvidenceClass::ErrorSignatures);
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = &sig_sec.log_summary else {
+            panic!("error_signatures summary present");
+        };
+        let mut ids: Vec<&str> = signatures.iter().map(|r| r.signature_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            ["log:v1:sig1", "log:v1:sig2", "log:v1:sig3"],
+            "one coalesced row per signature ID"
+        );
+        assert_eq!(
+            sig_sec.record_count, 3,
+            "one hashed ErrorSignature node per stable ID"
+        );
+
+        // Summed (doubled) occurrence counts on the merged section nodes.
+        for br in &sig_sec.records {
+            if let Some(crate::ir::LogPayload::ErrorSignature(p)) = node_log_payload(&br.record) {
+                let expected = match br.record.id() {
+                    "log:v1:sig1" => 240, // 120 x 2 scans
+                    "log:v1:sig2" => 60,  // 30 x 2
+                    "log:v1:sig3" => 6,   // 3 x 2
+                    other => panic!("unexpected signature {other}"),
+                };
+                assert_eq!(
+                    p.occurrence_count,
+                    expected,
+                    "merged occurrence_count summed across scans for {}",
+                    br.record.id()
+                );
+            }
+        }
+
+        // Occurrence-bucket totals are SUMMED across the scans, never rejected as
+        // duplicates. sig1's 15 in-window buckets carry counts (1..15) x 2 scans.
+        let occ_sec = section(&pack, EvidenceClass::OccurrenceBuckets);
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &occ_sec.log_summary
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        let sig1_total = signature_totals
+            .iter()
+            .find(|t| t.signature_id == "log:v1:sig1")
+            .expect("sig1 total");
+        // Single-scan sum is 1+2+..+15 = 120; concatenated twice = 240.
+        assert_eq!(
+            sig1_total.in_window_occurrences, 240,
+            "sig1 in_window_occurrences summed across the two scans"
+        );
+        // One bucket row per stable bucket ID (15 for sig1), never doubled rows.
+        assert_eq!(sig1_total.buckets.len(), 15, "one row per stable bucket ID");
+    }
+
+    #[test]
+    fn assemble_merges_differing_extents_across_two_scans() {
+        // Two DISTINCT scans of the same signature ID: earliest first_seen, latest
+        // last_seen, SUMMED occurrence counts.
+        let records = two_scan_differing_extents_records();
+        let pack = assemble_cc73(&records);
+        assert!(
+            verify_pack(&pack).ok,
+            "two-scan merged pack must pass its own verify"
+        );
+
+        let sig_sec = section(&pack, EvidenceClass::ErrorSignatures);
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = &sig_sec.log_summary else {
+            panic!("error_signatures summary present");
+        };
+        assert_eq!(signatures.len(), 1, "one coalesced signature row");
+        let row = &signatures[0];
+        assert_eq!(row.signature_id, "log:v1:sigX");
+        assert_eq!(
+            row.first_seen_in_window, "2026-03-02T08:00:00Z",
+            "merged first_seen is the EARLIEST across scans"
+        );
+        assert_eq!(
+            row.last_seen_in_window, "2026-03-04T15:00:00Z",
+            "merged last_seen is the LATEST across scans"
+        );
+
+        // Merged node occurrence_count = 10 + 25 = 35 (summed, not halved/doubled).
+        let merged_count = sig_sec
+            .records
+            .iter()
+            .find_map(|br| match node_log_payload(&br.record) {
+                Some(crate::ir::LogPayload::ErrorSignature(p)) => Some(p.occurrence_count),
+                _ => None,
+            })
+            .expect("merged signature node");
+        assert_eq!(
+            merged_count, 35,
+            "occurrence_count summed across the two scans"
+        );
+
+        // Bucket total = 4 + 6 = 10 (summed across the same-hour scans).
+        let occ_sec = section(&pack, EvidenceClass::OccurrenceBuckets);
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &occ_sec.log_summary
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        assert_eq!(signature_totals.len(), 1);
+        assert_eq!(
+            signature_totals[0].in_window_occurrences, 10,
+            "bucket count summed across the two scans"
+        );
+        assert_eq!(
+            signature_totals[0].buckets.len(),
+            1,
+            "one row per stable bucket ID"
+        );
+    }
+
+    #[test]
+    fn assemble_output_always_passes_verify_across_fixtures() {
+        // The assemble->verify-clean invariant across every #340 fixture and both
+        // log-bearing controls: assemble must never produce a pack its own offline
+        // verify rejects. Includes the concatenated multi-scan fixtures — the hole
+        // that let the round-6 regression through (the suite had only single-scan
+        // fixtures).
+        let fixtures = [
+            build_log_incident_records(),
+            records_with_unattributed_bucket(),
+            concatenated_multi_scan_records(),
+            two_scan_differing_extents_records(),
+        ];
+        for records in &fixtures {
+            for control in ["CC7.2", "CC7.3"] {
+                let pack = assemble_pack(
+                    records,
+                    &load_default_catalog(),
+                    control,
+                    &win(),
+                    1.0,
+                    "test-0.0.0",
+                    None,
+                )
+                .expect("assembles");
+                let report = verify_pack(&pack);
+                assert!(
+                    report.ok,
+                    "assemble<->verify invariant broken for {control}: {:?} / {:?}",
+                    report.integrity, report.window_consistency
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verify_rejects_bucket_moved_to_wrong_signature() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        {
+            let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) =
+                sec.log_summary.as_mut()
+            else {
+                panic!("occurrence_buckets summary present");
+            };
+            // Move one of sig1's buckets under sig2, adjusting BOTH sums so every
+            // per-bucket count/hour/id still binds its node and both `sum` checks
+            // still pass. The ONLY inconsistency is the signature the bucket is
+            // filed under — which nothing bound before the AGGREGATES co-location.
+            let sig1_idx = signature_totals
+                .iter()
+                .position(|t| t.signature_id == "log:v1:sig1")
+                .expect("sig1 total");
+            let moved = signature_totals[sig1_idx].buckets.remove(0);
+            signature_totals[sig1_idx].in_window_occurrences -= moved.occurrence_count;
+            let sig2 = signature_totals
+                .iter_mut()
+                .find(|t| t.signature_id == "log:v1:sig2")
+                .expect("sig2 total");
+            sig2.in_window_occurrences += moved.occurrence_count;
+            sig2.buckets.push(moved);
+            sig2.buckets.sort_by(|a, b| {
+                a.hour
+                    .cmp(&b.hour)
+                    .then_with(|| a.bucket_id.cmp(&b.bucket_id))
+            });
+        }
+        // Recompute the binding hash over the tampered summary (defeats layer 1).
+        sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a bucket moved to the wrong signature must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_resignatured_bucket_total() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        {
+            let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) =
+                sec.log_summary.as_mut()
+            else {
+                panic!("occurrence_buckets summary present");
+            };
+            // Re-label a whole total's signature_id. Its buckets still bind their
+            // nodes, but the AGGREGATES edges name the ORIGINAL signature.
+            let total = signature_totals
+                .iter_mut()
+                .find(|t| t.signature_id == "log:v1:sig2")
+                .expect("sig2 total");
+            total.signature_id = "log:v1:sig1".to_owned();
+            // Merge into one total per signature id would break bijection; keep it a
+            // second sig1-labelled total to isolate the attribution check.
+        }
+        sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a re-signatured bucket total must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn systematic_occurrence_bucket_summary_mutations_fail_verify() {
+        // For EVERY node-backed occurrence-bucket summary field and row operation,
+        // mutate it, recompute `log_summary_hash` (so the whole-summary hash cannot
+        // be what catches it), and assert verify reports an Integrity defect.
+        type Mutation = fn(&mut Vec<SignatureOccurrenceTotal>);
+        let cases: &[(&str, Mutation)] = &[
+            ("inflate_total", |t| {
+                t[0].in_window_occurrences += 1_000;
+            }),
+            ("deflate_total", |t| {
+                t[0].in_window_occurrences = t[0].in_window_occurrences.saturating_sub(1);
+            }),
+            ("bucket_occurrence_count", |t| {
+                t[0].buckets[0].occurrence_count += 7;
+            }),
+            ("bucket_hour", |t| {
+                t[0].buckets[0].hour = "2026-03-20T00:00:00Z".to_owned();
+            }),
+            ("phantom_bucket_id", |t| {
+                t[0].buckets[0].bucket_id = "log:v1:ghost-bucket".to_owned();
+            }),
+            ("drop_bucket", |t| {
+                let dropped = t[0].buckets.remove(0);
+                t[0].in_window_occurrences -= dropped.occurrence_count;
+            }),
+            ("drop_total", |t| {
+                t.remove(0);
+            }),
+            ("rename_signature", |t| {
+                t[0].signature_id = "log:v1:ghost-signature".to_owned();
+            }),
+            ("add_phantom_bucket_entry", |t| {
+                let ghost = BucketCount {
+                    bucket_id: "log:v1:ghost-bucket".to_owned(),
+                    hour: "2026-03-02T00:00:00Z".to_owned(),
+                    occurrence_count: 5,
+                };
+                t[0].in_window_occurrences += ghost.occurrence_count;
+                t[0].buckets.push(ghost);
+            }),
+            ("move_bucket_between_signatures", |t| {
+                let moved = t[0].buckets.remove(0);
+                t[0].in_window_occurrences -= moved.occurrence_count;
+                t[1].in_window_occurrences += moved.occurrence_count;
+                t[1].buckets.push(moved);
+                t[1].buckets.sort_by(|a, b| {
+                    a.hour
+                        .cmp(&b.hour)
+                        .then_with(|| a.bucket_id.cmp(&b.bucket_id))
+                });
+            }),
+            // Split one signature's buckets across two totals for the SAME
+            // `signature_id`. Before the fix each partial total equalled its own
+            // bucket sum and the reverse bucket-coverage guard still saw every
+            // bucket, so Integrity passed while a consumer reading per-signature
+            // totals saw the count under-reported by whichever total it read —
+            // the round-3 under-reporting failure via row duplication (issue #373,
+            // Codex round-5 P2).
+            ("duplicate_total_split_buckets", |t| {
+                let half = t[0].buckets.len() / 2;
+                let moved: Vec<BucketCount> = t[0].buckets.split_off(half);
+                let moved_sum: u64 = moved.iter().map(|b| b.occurrence_count).sum();
+                let mut dup = t[0].clone();
+                t[0].in_window_occurrences -= moved_sum;
+                dup.in_window_occurrences = moved_sum;
+                dup.buckets = moved;
+                t.push(dup);
+            }),
+            // Append an empty zero total for an existing `signature_id`. Its sum
+            // (0) trivially equals `in_window_occurrences` and it touches no bucket,
+            // so before the fix Integrity passed even though the summary now carries
+            // two totals for one signature.
+            ("duplicate_total_empty_zero", |t| {
+                let mut dup = t[0].clone();
+                dup.buckets.clear();
+                dup.in_window_occurrences = 0;
+                t.push(dup);
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut pack = assemble_cc73(&build_log_incident_records());
+            let sec = pack
+                .sections
+                .iter_mut()
+                .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+                .expect("occurrence_buckets section");
+            if let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) =
+                sec.log_summary.as_mut()
+            {
+                mutate(signature_totals);
+            }
+            sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+            let report = verify_pack(&pack);
+            assert!(
+                !report.integrity.passed,
+                "occurrence-bucket mutation `{name}` must fail Integrity (hash recomputed)"
+            );
+        }
+    }
+
+    #[test]
+    fn systematic_error_signature_summary_mutations_fail_verify() {
+        // Every NODE-BACKED error-signature summary field + row operation must fail
+        // verify even with the whole-summary hash recomputed. (The exemplar and
+        // frame-resolution fields ride edges/nodes that CANNOT be co-located — the
+        // LogEvent exemplar node carries redaction-scrubbed excerpt text whose
+        // presence would violate the zero-raw-log Safety invariant — so those are
+        // bound solely by the whole-summary hash and are exercised separately.)
+        type Mutation = fn(&mut Vec<ErrorSignatureRow>);
+        let cases: &[(&str, Mutation)] = &[
+            ("template_hash", |s| {
+                s[0].template_hash = blake3::hash(b"forged template").to_string();
+            }),
+            ("frame_chain_hash", |s| {
+                let sig1 = s
+                    .iter_mut()
+                    .find(|r| r.signature_id == "log:v1:sig1")
+                    .expect("sig1 carries frames");
+                sig1.frame_chain_hash = Some(blake3::hash(b"forged frames").to_string());
+            }),
+            ("severity", |s| {
+                s[0].severity = "warn".to_owned();
+            }),
+            ("first_seen", |s| {
+                s[0].first_seen_in_window = "2026-03-15T00:00:00Z".to_owned();
+            }),
+            ("last_seen", |s| {
+                s[0].last_seen_in_window = "2026-03-15T00:00:00Z".to_owned();
+            }),
+            ("drop_signature_row", |s| {
+                s.remove(0);
+            }),
+            ("add_phantom_signature_row", |s| {
+                let mut ghost = s[0].clone();
+                ghost.signature_id = "log:v1:ghost-signature".to_owned();
+                s.push(ghost);
+            }),
+            // Duplicate an existing signature row verbatim (same `signature_id`).
+            // Before the fix the `BTreeSet` of summary IDs collapsed the pair, so
+            // the bijection still balanced and each duplicate bound the same node —
+            // yet the summary no longer had one row per signature and a duplicate
+            // could carry divergent exemplar/frame-resolution fields bound only by
+            // the whole-summary hash (issue #373, Codex round-5 P2).
+            ("duplicate_signature_row", |s| {
+                let dup = s[0].clone();
+                s.push(dup);
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut pack = assemble_cc73(&build_log_incident_records());
+            let sec = pack
+                .sections
+                .iter_mut()
+                .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+                .expect("error_signatures section");
+            if let Some(LogEvidenceSummary::ErrorSignatures { signatures }) =
+                sec.log_summary.as_mut()
+            {
+                mutate(signatures);
+            }
+            sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+            let report = verify_pack(&pack);
+            assert!(
+                !report.integrity.passed,
+                "error-signature mutation `{name}` must fail Integrity (hash recomputed)"
+            );
+        }
+    }
+
+    // ── Binding-surface boundary for the non-node-backed fields ───────────────
+    // The exemplar (`protected_handle`/`content_hash`/`source_line`) and
+    // `frame_resolutions` fields on an `error_signatures` row, and EVERY
+    // `remediation_links` field, ride edges/nodes that CANNOT be co-located as
+    // hashed rows: the `LogEvent` exemplar node carries redaction-scrubbed excerpt
+    // text whose presence would violate the zero-raw-log Safety invariant, and the
+    // `remediation_links` section is defined to carry ZERO hashed rows (a
+    // remediation commit may legitimately fall OUTSIDE the evidence window). Their
+    // SOLE binding surface is therefore the whole-summary `log_summary_hash`: a
+    // tamper that does NOT recompute that hash fails Integrity (asserted here); a
+    // tamper that also recomputes it is equivalent to re-deriving the summary and is
+    // the pack's general fabricate-a-consistent-artifact threat, out of scope for an
+    // offline internal-consistency check.
+
+    #[test]
+    fn exemplar_handle_tamper_is_caught_by_whole_summary_hash() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+            .expect("error_signatures section");
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = sec.log_summary.as_mut()
+        else {
+            panic!("error_signatures summary present");
+        };
+        let sig1 = signatures
+            .iter_mut()
+            .find(|s| s.signature_id == "log:v1:sig1")
+            .expect("sig1 carries an exemplar");
+        // Rewrite the exemplar content hash WITHOUT recomputing log_summary_hash.
+        sig1.exemplars[0].content_hash = "cd".repeat(32);
+        // (Deliberately leave `sec.log_summary_hash` stale — layer 1 must catch it.)
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a rewritten exemplar handle must fail Integrity via the whole-summary hash: {}",
+            report.integrity.detail
+        );
+    }
+
+    // ── Whole-summary tamper suite (Codex round-4 P1) ─────────────────────────
+    // The prior mutation suites tamper INDIVIDUAL summary fields; they never
+    // stripped a present log section's `log_summary` / `log_summary_hash`
+    // wholesale. Stripping BOTH on a present log section — especially
+    // `remediation_links`, whose evidence exists ONLY in the summary (zero hashed
+    // rows) — silently dropped all that derived evidence yet still verified. Verify
+    // must reject a present log section missing either the summary or its hash.
+
+    #[test]
+    fn verify_rejects_present_log_section_with_summary_stripped() {
+        for class in [
+            EvidenceClass::ErrorSignatures,
+            EvidenceClass::OccurrenceBuckets,
+            EvidenceClass::RemediationLinks,
+        ] {
+            for (name, mutate) in [
+                (
+                    "summary_only",
+                    (|s: &mut EvidenceSection| s.log_summary = None) as fn(&mut EvidenceSection),
+                ),
+                (
+                    "hash_only",
+                    (|s: &mut EvidenceSection| s.log_summary_hash = None)
+                        as fn(&mut EvidenceSection),
+                ),
+                (
+                    "both",
+                    (|s: &mut EvidenceSection| {
+                        s.log_summary = None;
+                        s.log_summary_hash = None;
+                    }) as fn(&mut EvidenceSection),
+                ),
+            ] {
+                let mut pack = assemble_cc73(&build_log_incident_records());
+                let sec = pack
+                    .sections
+                    .iter_mut()
+                    .find(|s| s.class == class.as_wire())
+                    .unwrap_or_else(|| panic!("{} section", class.as_wire()));
+                assert_eq!(sec.status, "present", "{} is present", class.as_wire());
+                mutate(sec);
+                let report = verify_pack(&pack);
+                assert!(
+                    !report.integrity.passed,
+                    "present {} section with `{name}` stripped must fail Integrity: {}",
+                    class.as_wire(),
+                    report.integrity.detail
+                );
+            }
+        }
     }
 }
