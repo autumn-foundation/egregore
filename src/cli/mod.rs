@@ -20,6 +20,7 @@ mod deltas;
 mod deps;
 mod doctor;
 mod drift;
+mod error_context;
 mod eval;
 mod evidence;
 mod evidence_freshness;
@@ -84,6 +85,7 @@ pub(crate) use deltas::*;
 pub(crate) use deps::*;
 pub(crate) use doctor::*;
 pub(crate) use drift::*;
+pub(crate) use error_context::*;
 pub(crate) use eval::*;
 pub(crate) use evidence::*;
 pub(crate) use evidence_freshness::*;
@@ -2056,6 +2058,56 @@ pub(crate) enum QuerySubcommand {
         /// per-repository stores.
         #[arg(long)]
         repo: Option<String>,
+    },
+    /// Assemble one trust-separated cross-domain error-context bundle (issue #324).
+    ///
+    /// Resolves an `ErrorSignature` handle — a `log:v1:<hex>` record ID, a
+    /// unique fingerprint prefix, or an exact `Symbol` name whose backtrace
+    /// frames resolved to it — and emits a single deterministic envelope: the
+    /// signature identity plus its occurrence buckets and resolved frames
+    /// (`runtime_observation`), the code source facts its frames name
+    /// (`source_fact`), the agent runs/commands it was `EMITTED_DURING`
+    /// (`agent_observation` / `verification`), the tasks it references
+    /// (`project_state`), a history `first_seen_range`, and — behind an opt-in
+    /// `--protected-store` — protected raw-payload handles matched by content
+    /// hash. One cited envelope replaces four separate tool round-trips.
+    ///
+    /// Rows are CORRELATION LEADS, never proof of cause. Read-only; raw
+    /// log/transcript/command text never enters the response beyond the
+    /// signature's bounded template excerpt. Documented in
+    /// `docs/cli/error-context.md`.
+    ErrorContext {
+        /// `log:v1:<hex>` `ErrorSignature` ID, unique fingerprint prefix, or
+        /// exact symbol name.
+        handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Scope the code side of the history join to one repository. Log
+        /// records carry no retrievable repository attribution.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Bound the occurrence/bucket view at an RFC 3339 instant (mutually
+        /// exclusive with --at — enforced at runtime with a machine-readable
+        /// `unsupported_combination` envelope, mirroring `eg resolve-frames`).
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Re-resolve backtrace frames against a commit view (mutually
+        /// exclusive with --as-of).
+        #[arg(long)]
+        at: Option<String>,
+        /// Supersession policy: exclude superseded rows (default) or keep and
+        /// flag them.
+        #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
+        supersession: crate::temporal_status::SupersessionMode,
+        /// Read-time protected-store directory; matches a signature's
+        /// `source_artifact_hash` to a `protected:v1:` handle. Raw bytes are
+        /// never read.
+        #[arg(long)]
+        protected_store: Option<PathBuf>,
     },
     /// Rank the files that historically changed in the same commits as a target file (issue #153).
     ///
@@ -4975,6 +5027,101 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
             };
             query_log_deltas_cmd(&records, &base, &head, repo.as_deref(), embedded_source)
+        }
+        QuerySubcommand::ErrorContext {
+            handle,
+            graph,
+            data_dir,
+            repo,
+            as_of,
+            at,
+            supersession,
+            protected_store,
+        } => {
+            // `--at` and `--as-of` key the same valid-time axis; combining them
+            // is an unsupported workflow (mirrors the other temporal verbs).
+            if at.is_some() && as_of.is_some() {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "unsupported_combination",
+                        "message": "--at cannot be combined with --as-of; pass at most one temporal pin",
+                    },
+                });
+                println!("{}", serde_json::to_string(&envelope)?);
+                std::process::exit(1);
+            }
+            // `--as-of` bounds the occurrence view on the valid axis but is NOT
+            // routed through the commit resolver (which validates `--at`), so a
+            // malformed instant would otherwise be silently no-op'd by the core's
+            // `parse_instant` (returning None → no cutoff → every bucket kept).
+            // Validate it up front so a bad `--as-of` fails loudly with a
+            // machine-readable error, mirroring the sibling temporal verbs.
+            if let Some(vt) = as_of.as_deref()
+                && chrono::DateTime::parse_from_rfc3339(vt).is_err()
+            {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "invalid_as_of_timestamp",
+                        "message": format!("--as-of must be an RFC 3339 instant, got '{vt}'"),
+                    },
+                });
+                println!("{}", serde_json::to_string(&envelope)?);
+                std::process::exit(1);
+            }
+            // Strictly read-only lane: opening the embedded engine in place
+            // re-persists its index files, so `--data-dir` reads a throwaway
+            // copy. `--at`/`--as-of` need the history-inclusive read (superseded
+            // versions + the Commit timeline) for frame re-resolution and the
+            // first_seen_range.
+            // Whether records came from an embedded (`--data-dir`) store: gates
+            // the embedded log-retention caveat (issue #363). The `--graph` path
+            // preserves every ingested line, so it is `false`.
+            let embedded_source = data_dir.is_some();
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) if at.is_some() || as_of.is_some() => {
+                    load_records_from_db_history_readonly(dir)?
+                }
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let repo_scope = resolve_repo_scope(&index, repo.as_deref());
+            // Resolve `--at` ONLY to a single commit SHA for frame re-resolution
+            // (reuses the shared temporal-view resolver). `--as-of` is NOT
+            // resolved to a commit here: per issue #324, `--at` re-resolves frames
+            // against a commit view while `--as-of` bounds ONLY the occurrence
+            // view on the valid axis (applied by the core's bucket filter). Piping
+            // `--as-of` through the commit resolver would (a) die with
+            // `empty_history` on a commit-less log graph — the natural
+            // bucket-bearing `scan-logs` input — and (b) silently re-resolve
+            // frames, a behavior the AC assigns only to `--at`.
+            let at_commit = if at.is_some() {
+                Some(resolve_transitive_commit_view(
+                    &records,
+                    &index,
+                    repo_scope.as_deref(),
+                    at.as_deref(),
+                    None,
+                )?)
+            } else {
+                None
+            };
+            query_error_context_cmd(
+                &records,
+                &handle,
+                repo_scope.as_deref(),
+                at_commit.as_deref(),
+                as_of.as_deref(),
+                supersession,
+                protected_store.as_deref(),
+                embedded_source,
+            )
         }
         QuerySubcommand::Coupling {
             path,

@@ -136,6 +136,15 @@ cargo run -- query log-deltas <base_sha> <head_sha> --graph combined.graph.jsonl
 cargo run -- query log-deltas <sha> <sha> --graph combined.graph.jsonl            # exit 1 (identical_endpoints)
 cargo run -- query log-deltas ffffffffffff <head_sha> --graph combined.graph.jsonl # exit 2 (missing_commit)
 
+# One error signature's full cross-domain context bundle (issue #324)
+cargo run -- query error-context log:v1:<hex> --graph combined.graph.jsonl        # exit 0 (record ID)
+cargo run -- query error-context <hex_prefix> --graph combined.graph.jsonl        # exit 0 unique / exit 1 ambiguous
+cargo run -- query error-context <symbol_name> --graph combined.graph.jsonl       # exit 0 (frames resolved to it)
+cargo run -- query error-context <handle> --graph combined.graph.jsonl --at <sha> # re-resolve frames at a commit view
+cargo run -- query error-context <handle> --graph combined.graph.jsonl --as-of <instant>  # bound occurrence view
+cargo run -- query error-context <handle> --graph g.jsonl --protected-store .egregore/protected  # read-time protected join
+cargo run -- query error-context does_not_exist --graph combined.graph.jsonl      # exit 2 (no_match)
+
 # A file's defined-symbol set at a past commit or instant (issue #158)
 cargo run -- query file src/lib.rs --graph history.graph.jsonl --at <commit_sha>             # exit 0 on match
 cargo run -- query file src/lib.rs --graph history.graph.jsonl --as-of 2026-01-02T00:00:00Z  # exit 0 on match
@@ -352,6 +361,44 @@ unaffected. When run over `--data-dir` with log records present, the envelope ca
 outputs at the `--graph` level (concatenated JSONL) or use per-source stores (the adapter-level
 retention fix is tracked in #363). Read-only, redaction-safe (no raw log text), deterministic and
 byte-identical across runs. See `docs/cli/log-deltas.md`.
+
+`eg query error-context <handle>` resolves ONE `ErrorSignature` and assembles a single
+deterministic, trust-separated cross-domain envelope (issue #324) — one cited answer where an
+agent otherwise runs four tools. It is a read-time JOIN that mints no edge and adds no node
+kind, edge label, or trust class: the `query context` (#38) cross-domain bundle for the code
+half (seeded from each resolved frame target via `record_context`), the #322
+`FRAME_RESOLVES_TO` / #323 `EMITTED_DURING`+`REFERENCES_TASK` / #320 `AGGREGATES`+`CAPTURED_FROM`
+log-edge topology for the runtime half, and the #118 `range_deltas` mechanics for the history
+`first_seen_range`. Handle resolution has three precedence-ordered modes: exact `log:v1:<hex>`
+record ID; a fingerprint/template-hash hex prefix (unique → resolve; ≥2 → `ambiguous` exit 1
+with all candidate IDs; a bare hex prefix matching none falls through to symbol-name mode); and
+an exact `Symbol` name whose frames resolved to it (a symbol named by MANY signatures returns
+ALL of them, exit 0 — not ambiguity). A well-formed `log:v1:` handle that is not an
+`ErrorSignature` (absent, or a `LogSource`/bucket ID) is `no_match` (exit 2), never silently
+prefix-matched. Sections are trust-separated with a `trust_class` on every row: `signatures`
+(`runtime_observation` — identity + `template_excerpt` + occurrence buckets + resolved frames),
+`source_facts` (`source_fact`), `observations` (`agent_observation`, `EMITTED_DURING` runs
+carrying their closed `correlation_basis` — `content_hash_join`/`temporal_correlation` — with
+overlapping runs each kept, no silent winner), `project_state` (`REFERENCES_TASK` targets),
+`artifacts`, `verification_evidence` (`EMITTED_DURING` `CommandRun`s carry their basis too), plus
+`unresolved` and `excluded`. Runtime rows live ONLY in `signatures` — zero cross-class leakage
+into `source_facts`. `first_seen_range` brackets the earliest signature `first_seen` in the
+narrowest commit window (base = newest commit at/before it, head = oldest at/after, ties by
+ascending SHA) and joins the reused `range_deltas` symbol groups against the frame targets into
+`overlapping_symbol_deltas`; a plain `scan` graph reports `history_unavailable`, never a
+fabricated window. `--at <commit>` re-resolves frames against that commit view; `--as-of
+<instant>` bounds the occurrence-bucket view (both are mutually exclusive → exit 1
+`unsupported_combination`). `--supersession exclude` (default) drops superseded/contradicted
+agent rows into `excluded`; `include-but-flag` keeps and flags them. `--repo` scopes only the
+code side of the history join (log records carry no retrievable repository attribution).
+`--protected-store <dir>` matches each signature's `LogSource` `source_artifact_hash` to a
+`protected:v1:` handle at READ time (class + byte length only; raw bytes never read); the graph
+must carry zero protected handles or the run exits 1 (`protected_handle_in_graph`). All
+timestamp ordering is by parsed UTC instant, never raw RFC 3339 string order. Rows are
+CORRELATION LEADS, never proof of cause: a resolved frame proves the backtrace NAMES a symbol,
+an `EMITTED_DURING` edge is a correlation. Read-only, redaction-safe (only the bounded
+`template_excerpt` escapes as free text), deterministic and byte-identical across runs.
+See `docs/cli/error-context.md`.
 
 `eg query file <path> --at <commit>` / `--as-of <instant>` reconstructs the deterministic
 set of symbols a file defined at a chosen commit or valid-time instant (issue #158) from a
