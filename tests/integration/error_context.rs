@@ -424,6 +424,7 @@ fn resolves_exact_signature_record_id() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("exact record ID must resolve");
     assert_eq!(ctx.signature_ids, vec![sig_id.clone()]);
@@ -446,6 +447,7 @@ fn well_formed_absent_signature_id_is_no_match() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     ) {
         Err(ErrorContextError::NoMatch { handle }) => assert_eq!(handle, absent),
         other => panic!("expected NoMatch, got {other:?}"),
@@ -459,6 +461,7 @@ fn well_formed_absent_signature_id_is_no_match() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     ) {
         Err(ErrorContextError::NoMatch { handle }) => assert_eq!(handle, src_id),
         other => panic!("expected NoMatch for LogSource ID, got {other:?}"),
@@ -479,6 +482,7 @@ fn resolves_unique_fingerprint_prefix() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("unique fingerprint prefix must resolve");
     assert_eq!(ctx.signature_ids, vec![sig_id]);
@@ -527,6 +531,7 @@ fn ambiguous_fingerprint_prefix_lists_candidates_exit_1() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     ) {
         Err(ErrorContextError::Ambiguous { mut candidates }) => {
             candidates.sort();
@@ -557,6 +562,7 @@ fn resolves_symbol_name_via_frame_targets() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("symbol name naming two signatures resolves both, not ambiguous");
     let mut expected = vec![sig_a, sig_b];
@@ -576,6 +582,7 @@ fn unknown_handle_is_no_match_exit_2() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     ) {
         Err(ErrorContextError::NoMatch { handle }) => {
             assert_eq!(handle, "no_such_symbol_or_prefix_zzz");
@@ -602,6 +609,7 @@ fn symbol_name_with_underscore_never_hits_fingerprint_mode() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("underscore name resolves via frame targets");
     assert_eq!(ctx.signature_ids, vec![sig_id]);
@@ -623,6 +631,7 @@ fn signature_block_carries_severity_occurrence_template_excerpt() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     let block = &ctx.signatures[0];
@@ -649,6 +658,7 @@ fn buckets_populated_via_aggregates() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     let buckets = &ctx.signatures[0].buckets;
@@ -693,6 +703,7 @@ fn frames_populated_via_frame_resolves_to_with_labels() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     let frames = &ctx.signatures[0].frames;
@@ -727,6 +738,7 @@ fn frame_targets_seed_source_facts() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     assert!(
@@ -772,6 +784,7 @@ fn observations_via_emitted_during_carry_basis() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     // Both overlapping agent runs get an observation row (no silent winner).
@@ -815,6 +828,7 @@ fn project_state_via_references_task() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     assert!(
@@ -846,6 +860,7 @@ fn no_runtime_observation_rows_leak_into_source_facts() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     assert!(
@@ -892,6 +907,7 @@ fn unresolved_section_surfaces_absent_evidence_targets() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     assert!(
@@ -937,6 +953,7 @@ fn history_backed_graph_yields_narrowest_window() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     match ctx.first_seen_range {
@@ -969,6 +986,7 @@ fn plain_scan_graph_reports_history_unavailable() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     match ctx.first_seen_range {
@@ -993,6 +1011,7 @@ fn first_seen_before_all_commits_gives_partial_window() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     match ctx.first_seen_range {
@@ -1045,6 +1064,7 @@ fn first_seen_window_is_scoped_to_repo() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     match unscoped.first_seen_range {
@@ -1064,6 +1084,7 @@ fn first_seen_window_is_scoped_to_repo() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     match scoped.first_seen_range {
@@ -1131,6 +1152,7 @@ fn protected_off_lists_content_hashes_only() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     assert!(ctx.protected_payloads.is_none());
@@ -1157,6 +1179,7 @@ fn protected_on_matches_source_artifact_hash_to_handle() {
         None,
         SupersessionMode::Exclude,
         Some(&store),
+        false,
     )
     .expect("resolve");
     let payloads = ctx.protected_payloads.expect("flag on yields Some");
@@ -1190,6 +1213,7 @@ fn protected_on_no_match_yields_empty_list() {
         None,
         SupersessionMode::Exclude,
         Some(&store),
+        false,
     )
     .expect("resolve");
     let payloads = ctx.protected_payloads.expect("flag on yields Some");
@@ -1229,6 +1253,7 @@ fn graph_with_protected_handle_rejected_exit_1() {
         None,
         SupersessionMode::Exclude,
         Some(&store),
+        false,
     ) {
         Err(ErrorContextError::ProtectedHandleInGraph) => {}
         other => panic!("expected ProtectedHandleInGraph, got {other:?}"),
@@ -1281,6 +1306,7 @@ fn supersession_exclude_drops_and_reports_in_excluded() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     assert!(
@@ -1307,6 +1333,7 @@ fn supersession_include_but_flag_keeps_and_flags() {
         None,
         SupersessionMode::IncludeButFlag,
         None,
+        false,
     )
     .expect("resolve");
     let row = ctx
@@ -1356,6 +1383,7 @@ fn at_commit_reresolves_frames_against_commit_view() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve at c1");
     assert_eq!(at_c1.signatures[0].frames.len(), 1);
@@ -1369,6 +1397,7 @@ fn at_commit_reresolves_frames_against_commit_view() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve at c2");
     assert_eq!(at_c2.signatures[0].frames[0].target_record_id, beta_id);
@@ -1408,6 +1437,7 @@ fn symbol_mode_resolves_against_at_commit_reresolved_frames() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("symbol-mode under --at c1 must resolve the frame to alpha");
     assert_eq!(alpha_at_c1.signature_ids, vec![sig_id.clone()]);
@@ -1421,6 +1451,7 @@ fn symbol_mode_resolves_against_at_commit_reresolved_frames() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     ) {
         Err(ErrorContextError::NoMatch { handle }) => assert_eq!(handle, "beta"),
         other => panic!("beta must not spuriously match at c1, got {other:?}"),
@@ -1435,6 +1466,7 @@ fn symbol_mode_resolves_against_at_commit_reresolved_frames() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("symbol-mode under --at c2 must resolve the frame to beta");
     assert_eq!(beta_at_c2.signature_ids, vec![sig_id]);
@@ -1446,6 +1478,7 @@ fn symbol_mode_resolves_against_at_commit_reresolved_frames() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     ) {
         Err(ErrorContextError::NoMatch { handle }) => assert_eq!(handle, "alpha"),
         other => panic!("alpha must not spuriously match at c2, got {other:?}"),
@@ -1466,6 +1499,7 @@ fn as_of_bounds_occurrence_view() {
         Some("2026-01-02T13:00:00Z"),
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     let buckets = &ctx.signatures[0].buckets;
@@ -1552,6 +1586,7 @@ fn no_raw_payload_text_in_envelope() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     // The Observation carrying SECRET_OBSERVATION_MARKER must actually reach the
@@ -1591,6 +1626,7 @@ fn disclaimer_always_present_and_fixed() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     assert_eq!(
@@ -1613,6 +1649,7 @@ fn byte_identical_across_5_runs() {
             None,
             SupersessionMode::Exclude,
             None,
+            false,
         )
         .expect("resolve"),
     )
@@ -1627,6 +1664,7 @@ fn byte_identical_across_5_runs() {
                 None,
                 SupersessionMode::Exclude,
                 None,
+                false,
             )
             .expect("resolve"),
         )
@@ -1649,6 +1687,7 @@ fn sections_sorted_by_record_id() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     for section in [
@@ -1710,6 +1749,7 @@ fn stronger_basis_wins_over_weaker_for_same_run_regardless_of_order() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     let row = ctx
@@ -1741,6 +1781,7 @@ fn repo_scope_caveat_present_only_when_repo_set() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     assert!(unscoped.repo_scope_caveat.is_none());
@@ -1753,6 +1794,7 @@ fn repo_scope_caveat_present_only_when_repo_set() {
         None,
         SupersessionMode::Exclude,
         None,
+        false,
     )
     .expect("resolve");
     assert_eq!(
@@ -1766,6 +1808,109 @@ fn repo_scope_caveat_present_only_when_repo_set() {
             .contains("NOT repository-filtered"),
         "the caveat must disclose the runtime sections are unfiltered"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Embedded-store log-retention caveat (issue #363 disclosure), mirroring the
+// sibling `eg query log-deltas` disclosure. When error-context runs over an
+// embedded (`--data-dir`) store the current-state read surface retains one
+// record per stable non-temporal log ID (last-write-wins), so multi-scan
+// coalescing is not reconstructable there. The `--graph` path preserves every
+// ingested line and must NOT carry the caveat.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn embedded_source_discloses_log_retention_caveat() {
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 3, None);
+    let records = vec![sig];
+    let ctx = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        true, // embedded_source
+    )
+    .expect("resolve");
+
+    let caveat = ctx
+        .embedded_log_retention_caveat
+        .as_ref()
+        .expect("embedded path with an ErrorSignature must disclose the retention caveat");
+    // Reuses the lane-agnostic `log-deltas` (#326) disclosure verbatim.
+    assert_eq!(
+        caveat.message,
+        aletheia_egregore::query::LOG_EMBEDDED_RETENTION_CAVEAT
+    );
+    assert!(
+        caveat.message.contains("last-write-wins"),
+        "the caveat must state embedded stores retain one record per stable ID (last-write-wins)"
+    );
+    assert!(
+        caveat.message.contains("`--graph`"),
+        "the caveat must point to the `--graph` path for multi-scan coalescing"
+    );
+    assert!(
+        caveat.message.contains("per-source stores"),
+        "the caveat must offer per-source stores as the alternative"
+    );
+    assert!(
+        caveat.message.contains("#363"),
+        "the caveat must reference the follow-up issue tracking the real fix"
+    );
+
+    // Disclosure-only: resolution is unchanged by the flag.
+    assert_eq!(ctx.signature_ids, vec![sig_id]);
+}
+
+#[test]
+fn graph_source_never_carries_log_retention_caveat() {
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 3, None);
+    let records = vec![sig];
+    let ctx = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false, // embedded_source: the --graph path
+    )
+    .expect("resolve");
+    assert!(
+        ctx.embedded_log_retention_caveat.is_none(),
+        "the --graph path preserves every ingested line and must not carry the retention caveat"
+    );
+}
+
+#[test]
+fn embedded_source_over_pure_scan_graph_carries_no_caveat_envelope() {
+    // The caveat is gated on at least one `ErrorSignature` node being present.
+    // A pure `scan` graph (code symbols only, zero log records) can never
+    // resolve a handle — handle resolution requires an `ErrorSignature` id — so
+    // an embedded query over such a store returns `no_match` and emits NO
+    // envelope at all, hence never the caveat. This exercises the guard's
+    // rationale: the disclosure is content-gated, never emitted merely because
+    // the read path was embedded.
+    let (_id, sym) = code_symbol("only_code", "src/lib.rs", 1, 10);
+    let records = vec![sym];
+    let bogus = log_stable_id(&["error_signature", ANCHOR, FINGERPRINT, "ghost", "error"]);
+    match error_context(
+        &records,
+        &bogus,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        true, // embedded_source, yet zero ErrorSignature records
+    ) {
+        Err(ErrorContextError::NoMatch { .. }) => {}
+        other => panic!("expected NoMatch over a pure scan graph, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1793,6 +1938,7 @@ fn corrupt_protected_manifest_fails_loudly() {
         None,
         SupersessionMode::Exclude,
         Some(&store),
+        false,
     ) {
         Err(ErrorContextError::ProtectedStoreUnreadable { message }) => {
             assert!(

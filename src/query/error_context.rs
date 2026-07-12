@@ -36,7 +36,10 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use super::{OverlappingSymbolDelta, ResolvedFrameHandle, UnresolvedRef, range_deltas};
+use super::{
+    LOG_EMBEDDED_RETENTION_CAVEAT, LogEmbeddedRetentionCaveat, OverlappingSymbolDelta,
+    ResolvedFrameHandle, UnresolvedRef, range_deltas,
+};
 use crate::ir::{
     CorrelationBasis, EdgeLabel, ErrorSignaturePayload, GraphRecord, LogPayload, NodeKind,
     SourceSpan,
@@ -264,6 +267,19 @@ pub struct ErrorContext {
     /// the log/runtime sections ([`REPO_SCOPE_CAVEAT`]). Omitted when unscoped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_scope_caveat: Option<&'static str>,
+    /// Embedded-store retention caveat, present only when the query ran over the
+    /// embedded (`--data-dir`) read path AND the store holds at least one
+    /// `ErrorSignature` record (issue #363): the embedded current-state read
+    /// surface retains one record per stable non-temporal log ID
+    /// (last-write-wins for `ErrorSignature` / `LogOccurrenceBucket`), so
+    /// multiple `scan-logs` ingests of the same stable ID are collapsed before
+    /// this query runs and the `--graph` cross-scan view is not reconstructable
+    /// here — see [`LogEmbeddedRetentionCaveat`]. Absent (omitted from JSON) for
+    /// `--graph` queries and for embedded stores with no `ErrorSignature`
+    /// records (a plain `scan` store, where no disclosure is warranted). Reuses
+    /// the `log-deltas` (#326) disclosure verbatim; the string is lane-agnostic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedded_log_retention_caveat: Option<LogEmbeddedRetentionCaveat>,
     /// Always-present advisory ([`ERROR_CONTEXT_DISCLAIMER`]).
     pub disclaimer: &'static str,
 }
@@ -542,14 +558,22 @@ fn prefix_resolution(sig_ids: &BTreeSet<&str>, needle: &str) -> HandleResolution
 /// the code side of the `first_seen_range` symbol-delta join (log records carry
 /// no retrievable repository attribution). `supersession` chooses whether
 /// superseded rows are excluded or flagged. `protected_store`, when set,
-/// resolves protected payload handles at read time.
+/// resolves protected payload handles at read time. `embedded_source` is `true`
+/// only when the caller loaded the records from an embedded (`--data-dir`) store
+/// rather than a `--graph` JSONL: the embedded current-state read surface
+/// retains one record per stable non-temporal log ID (last-write-wins for
+/// `ErrorSignature` / `LogOccurrenceBucket`), so cross-scan coalescing cannot be
+/// reconstructed; when it is set AND the store holds at least one
+/// `ErrorSignature`, the response carries [`LogEmbeddedRetentionCaveat`]
+/// disclosing this (issue #363). It never changes resolution or section
+/// contents — only whether the caveat is emitted.
 ///
 /// # Errors
 ///
 /// Returns [`ErrorContextError`] on an ambiguous fingerprint prefix, an
 /// unmatched handle, or a graph that already carries a protected handle while
 /// `--protected-store` is set.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn error_context(
     records: &[GraphRecord],
     handle: &str,
@@ -558,6 +582,7 @@ pub fn error_context(
     as_of: Option<&str>,
     supersession: SupersessionMode,
     protected_store: Option<&Path>,
+    embedded_source: bool,
 ) -> Result<ErrorContext, ErrorContextError> {
     // §5: the graph must carry ZERO protected handles when the store is set.
     if protected_store.is_some() && graph_has_protected_handle(records) {
@@ -1043,6 +1068,35 @@ pub fn error_context(
         }
     };
 
+    // Embedded-store retention caveat (issue #363), mirroring `log-deltas`
+    // (#326): the embedded `--data-dir` current-state read surface returns one
+    // record per stable ID, and `ErrorSignature` / `LogOccurrenceBucket` are
+    // non-temporal, so multiple `scan-logs` ingests of the same stable ID are
+    // collapsed (last-write-wins) BEFORE this query runs — the `--graph`
+    // cross-scan view is not reconstructable here. DIAGNOSE rather than reject:
+    // a single-ingest store is correct and must keep working, and error-context
+    // also runs over pure `scan` graphs with zero log records, so the caveat is
+    // gated on at least one `ErrorSignature` node being present in the store.
+    // The `--graph` path preserves every ingested line, so it never carries this
+    // caveat. Fixed string, no wall clock — byte-stable. See issue #363 and
+    // docs/cli/error-context.md.
+    let embedded_log_retention_caveat = if embedded_source
+        && records.iter().any(|r| {
+            matches!(
+                r,
+                GraphRecord::Node {
+                    kind: NodeKind::ErrorSignature,
+                    ..
+                }
+            )
+        }) {
+        Some(LogEmbeddedRetentionCaveat {
+            message: LOG_EMBEDDED_RETENTION_CAVEAT,
+        })
+    } else {
+        None
+    };
+
     Ok(ErrorContext {
         handle: handle.to_owned(),
         signature_ids,
@@ -1057,6 +1111,7 @@ pub fn error_context(
         excluded,
         protected_payloads,
         repo_scope_caveat: repo_scope.map(|_| REPO_SCOPE_CAVEAT),
+        embedded_log_retention_caveat,
         disclaimer: ERROR_CONTEXT_DISCLAIMER,
     })
 }

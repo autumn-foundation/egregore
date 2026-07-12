@@ -94,6 +94,21 @@ emits a `protected:v1:<hex>` handle with its class and byte length in
 protected handles (they are resolved only at read time); a graph carrying one
 while the flag is set exits 1 with `protected_handle_in_graph`.
 
+### Embedded-store log-retention caveat (`--data-dir`)
+
+When the query runs over an embedded (`--data-dir`) store that holds at least one
+`ErrorSignature`, the response carries an `embedded_log_retention_caveat`
+disclosing that the embedded current-state read surface retains exactly one
+record per stable non-temporal log ID (last-write-wins for `ErrorSignature` /
+`LogOccurrenceBucket`). Multiple `scan-logs` ingests of the same stable ID are
+therefore collapsed **before** this query runs, so the cross-scan coalescing the
+`--graph` path performs is not reconstructable there. The `--graph` path
+preserves every ingested line and never carries the caveat; a pure `scan` store
+with no log records never carries it either. This mirrors the identical
+disclosure on [`eg query log-deltas`](./log-deltas.md); the underlying
+adapter-layer fix is tracked in issue #363. This is a disclosure only — it never
+changes handle resolution or section contents.
+
 ## Shortest offline workflow
 
 ```powershell
@@ -160,6 +175,9 @@ eg query error-context log:v1:<hex> --graph combined.graph.jsonl
 - `first_seen_range` is `{"status":"unavailable","diagnostic":"history_unavailable"}`
   on a plain `scan` graph — never a fabricated window.
 - `protected_payloads` is present only under `--protected-store`.
+- `embedded_log_retention_caveat` is present only on the embedded (`--data-dir`)
+  read path when the store holds at least one `ErrorSignature`; omitted for
+  `--graph` queries and pure `scan` stores (issue #363, see above).
 - Every row carries a `trust_class`; runtime observations live only in
   `signatures`, never in `source_facts` (zero cross-class leakage).
 - Output is deterministic and byte-identical across runs: every section is

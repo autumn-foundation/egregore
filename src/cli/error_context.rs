@@ -7,6 +7,7 @@ use super::*;
 /// `1` on an ambiguous fingerprint prefix or a graph carrying a protected handle
 /// while `--protected-store` is set; `2` on an unmatched handle (a `no_match`
 /// envelope on stdout). Load errors surface via `?` (exit 2 through the loader).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn query_error_context_cmd(
     records: &[GraphRecord],
     handle: &str,
@@ -15,6 +16,7 @@ pub(crate) fn query_error_context_cmd(
     as_of: Option<&str>,
     supersession: crate::temporal_status::SupersessionMode,
     protected_store: Option<&Path>,
+    embedded_source: bool,
 ) -> Result<()> {
     match query::error_context(
         records,
@@ -24,6 +26,7 @@ pub(crate) fn query_error_context_cmd(
         as_of,
         supersession,
         protected_store,
+        embedded_source,
     ) {
         Ok(ctx) => {
             #[derive(serde::Serialize)]

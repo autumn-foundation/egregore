@@ -5071,6 +5071,10 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // copy. `--at`/`--as-of` need the history-inclusive read (superseded
             // versions + the Commit timeline) for frame re-resolution and the
             // first_seen_range.
+            // Whether records came from an embedded (`--data-dir`) store: gates
+            // the embedded log-retention caveat (issue #363). The `--graph` path
+            // preserves every ingested line, so it is `false`.
+            let embedded_source = data_dir.is_some();
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) if at.is_some() || as_of.is_some() => {
@@ -5112,6 +5116,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 as_of.as_deref(),
                 supersession,
                 protected_store.as_deref(),
+                embedded_source,
             )
         }
         QuerySubcommand::Coupling {
