@@ -83,7 +83,24 @@ use crate::github::{model, records::CommitIndex};
 /// file migrates the same way: clearing hashes is a superset of #334's
 /// ETag-only clear and safe because #334 relied on a hash-formula change v2
 /// hashes could not satisfy anyway.
-pub const STATE_SCHEMA_VERSION: u32 = 4;
+///
+/// Bumped 4 → 5 for issue #336 (review-state history): the importer began
+/// fetching each changed PR's `GET /issues/{n}/timeline`, filtering it to the
+/// closed review-state-transition kinds, and minting append-only
+/// `ReviewStateTransition` nodes (and, for a dismissal, a `TRANSITIONS_REVIEW`
+/// edge). Per-event change detection uses new `timeline_event:<id>` resource-hash
+/// keys, and the timeline endpoint contributes its own per-page `ETag` entries.
+/// A pre-#336 (v2/v3/v4) store never fetched the timeline, so its cached `/pulls`
+/// list `ETag` (304 → `pulls_changed == false`) would keep the per-PR timeline
+/// fetch from ever firing, and its cached resource hashes would suppress review
+/// re-emission. So the v2/v3/v4 → v5 migration ([`State::load_or_fresh`]) clears
+/// EVERY `ETag` AND EVERY per-resource hash — the same full-refresh discipline as
+/// the #335 bump — forcing exactly one pass that re-fetches every endpoint, walks
+/// each changed PR's timeline, and records its transition history. Everything that
+/// provides prior-artifact tracking survives (`pr_merge_artifacts`,
+/// `review_commit_artifacts`, `pr_request_edges`, `pr_team_diagnostics`,
+/// watermarks, the seed-graph fingerprint, the label hash).
+pub const STATE_SCHEMA_VERSION: u32 = 5;
 
 /// Per-endpoint update watermarks (inclusive `>=` selection, §5).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -240,19 +257,22 @@ impl State {
     ///
     /// Schema-version handling (see [`STATE_SCHEMA_VERSION`]):
     /// - `== STATE_SCHEMA_VERSION` → used as-is.
-    /// - `== 2` or `== 3` → MIGRATED to v4, not discarded (issue #335, extending
-    ///   Codex #352 P2). Discarding would drop #333's `pr_merge_artifacts` and
-    ///   #334's `review_commit_artifacts` tracking, so a PR/review whose outcome
-    ///   resolves differently on the first v4 run could emit the fresh artifact
+    /// - `== 2`, `== 3`, or `== 4` → MIGRATED to v5, not discarded (issue #336,
+    ///   extending #335 / Codex #352 P2). Discarding would drop #333's
+    ///   `pr_merge_artifacts`, #334's `review_commit_artifacts`, and #335's
+    ///   `pr_request_edges` / `pr_team_diagnostics` tracking, so an outcome that
+    ///   resolves differently on the first v5 run could emit the fresh artifact
     ///   yet never tombstone the stale one. Migration CLEARS EVERY `ETag` AND
-    ///   EVERY per-resource hash, forcing a full refresh that re-fetches (200)
-    ///   and re-emits every issue, PR, and review with its #335 reviewer-identity
-    ///   facts. (The #334 review change-hash formula is unchanged, so a preserved
-    ///   hash would MATCH on the refetch and suppress the new edges — hence the
-    ///   hashes must be cleared, not preserved.) Everything providing
-    ///   prior-artifact tracking survives: `pr_merge_artifacts`,
-    ///   `review_commit_artifacts`, watermarks, the seed-graph fingerprint, and
-    ///   the label hash.
+    ///   EVERY per-resource hash, forcing a full refresh that re-fetches (200),
+    ///   re-emits every issue/PR/review, and — new in #336 — walks each changed
+    ///   PR's timeline to record its review-state transition history. (A preserved
+    ///   `/pulls` list `ETag` would 304 → `pulls_changed == false` → the per-PR
+    ///   timeline fetch never fires; a preserved resource hash would suppress the
+    ///   review re-emission the transition history rides alongside — hence both
+    ///   must be cleared.) Everything providing prior-artifact tracking survives:
+    ///   `pr_merge_artifacts`, `review_commit_artifacts`, `pr_request_edges`,
+    ///   `pr_team_diagnostics`, watermarks, the seed-graph fingerprint, and the
+    ///   label hash.
     /// - anything else (`< 2`, pre-#333 with no artifacts to lose, or an
     ///   unsupported future value) → safe fresh-empty fallback.
     #[must_use]
@@ -272,20 +292,21 @@ impl State {
         if s.schema_version == STATE_SCHEMA_VERSION {
             return s;
         }
-        if s.schema_version == 2 || s.schema_version == 3 {
-            // Migrate v2/v3 → v4 in place rather than discarding the whole file
-            // (issue #335). Discarding would drop #333's `pr_merge_artifacts`
-            // and #334's `review_commit_artifacts` tracking, so a PR/review whose
-            // outcome resolves differently on the first v4 run could emit the
-            // fresh artifact yet never tombstone the stale one. A schema bump is
-            // a one-time full refresh: clear EVERY conditional `ETag` AND EVERY
-            // per-resource hash, so the first v4 run re-fetches (200) and
-            // re-emits every issue, PR, and review with its #335 reviewer-identity
-            // facts — the review change-hash formula is unchanged since #334, so
-            // preserved hashes would otherwise MATCH and suppress the new edges.
+        if (2..=4).contains(&s.schema_version) {
+            // Migrate v2/v3/v4 → v5 in place rather than discarding the whole
+            // file (issue #336, extending #335). Discarding would drop the
+            // merge/review artifact and request/team tracking, so an outcome that
+            // resolves differently on the first v5 run could emit the fresh
+            // artifact yet never tombstone the stale one. A schema bump is a
+            // one-time full refresh: clear EVERY conditional `ETag` AND EVERY
+            // per-resource hash, so the first v5 run re-fetches (200), re-emits
+            // every issue/PR/review, and walks each changed PR's timeline to
+            // record its review-state transition history — a preserved `/pulls`
+            // list `ETag` would 304 and skip the timeline fetch entirely, and a
+            // preserved resource hash would suppress the review re-emission.
             // Everything providing prior-artifact tracking survives: the merge/
-            // review artifact maps, watermarks, the seed-graph fingerprint, and
-            // the label hash.
+            // review artifact maps, `pr_request_edges`, `pr_team_diagnostics`,
+            // watermarks, the seed-graph fingerprint, and the label hash.
             s.etags.clear();
             s.resource_hashes.clear();
             s.schema_version = STATE_SCHEMA_VERSION;
@@ -1039,7 +1060,7 @@ mod tests {
         // would MATCH on the forced refetch and suppress the new edges, so the
         // migration CLEARS every per-resource hash to force a one-time full
         // re-emit of every issue, PR, and review.
-        for prior_version in [2, 3] {
+        for prior_version in [2, 3, 4] {
             let dir = std::env::temp_dir().join(format!(
                 "egst-mig335-{prior_version}-{}",
                 std::process::id()
@@ -1055,13 +1076,78 @@ mod tests {
             .unwrap();
             let s = State::load_or_fresh(&path, "o/r", "x");
             assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
-            // Resource hashes are CLEARED so every resource re-emits its #335 facts.
+            // Resource hashes are CLEARED so every resource re-emits its facts.
             assert!(
                 s.resource_hashes.is_empty(),
-                "v{prior_version}→v4 migration must clear resource hashes to force a full re-emit"
+                "v{prior_version}→v5 migration must clear resource hashes to force a full re-emit"
             );
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    #[test]
+    fn migrate_v4_to_v5_clears_etags_hashes_and_records_timeline_key_freshly() {
+        // Issue #336: a v4 store predates the timeline fetch, so its cached
+        // `/pulls` list ETag (304 → pulls_changed == false) would keep the per-PR
+        // timeline fetch from ever firing, and its cached resource hashes would
+        // suppress the review re-emission the transition history rides alongside.
+        // The v4 → v5 migration clears both, so a full re-fetch converges: every
+        // timeline_event:<id> key is recomputed from scratch and each changed PR's
+        // transition history is recorded exactly once.
+        let dir = std::env::temp_dir().join(format!("egst-mig336-v4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let pulls_list = "/repos/o/r/pulls?state=all&per_page=100?page=1";
+        let json = serde_json::json!({
+            "schema_version": 4,
+            "source_repo": "o/r",
+            "api_base_url": "x",
+            "last_run_at_unix_ms": 0,
+            "etags": { pulls_list: "\"pulls-list\"" },
+            "last_seen_updated_at": { "issues": "2026-01-03T00:00:00Z", "pulls": "2026-01-04T00:00:00Z" },
+            "label_list_hash": "labhash",
+            "resource_hashes": { "pr:12": "prhash", "timeline_event:5001": "thash" },
+            "pr_merge_artifacts": { "pr:12": "project:v1:merged-edge-12" },
+            "review_commit_artifacts": { "pr_review:12:5": "project:v1:review-edge-5" },
+            "pr_request_edges": { "pr:12": ["project:v1:edge-a"] },
+            "pr_team_diagnostics": { "pr:12": ["project:v1:diag-a"] },
+            "code_graph_fingerprint": "fp-abc"
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
+        // EVERY ETag and resource hash cleared — the stale timeline_event hash too,
+        // so the transition re-derives on the first v5 run.
+        assert!(
+            s.etags.is_empty(),
+            "v4→v5 must clear every ETag: {:?}",
+            s.etags
+        );
+        assert!(
+            s.resource_hashes.is_empty(),
+            "v4→v5 must clear every resource hash (incl. timeline_event keys): {:?}",
+            s.resource_hashes
+        );
+        // Everything providing prior-artifact tracking survives.
+        assert_eq!(s.label_list_hash.as_deref(), Some("labhash"));
+        assert_eq!(
+            s.prior_merge_artifact("pr:12"),
+            Some("project:v1:merged-edge-12")
+        );
+        assert_eq!(
+            s.prior_review_artifact("pr_review:12:5"),
+            Some("project:v1:review-edge-5")
+        );
+        assert_eq!(
+            s.prior_request_edges("pr:12"),
+            ["project:v1:edge-a".to_owned()]
+        );
+        assert_eq!(
+            s.prior_team_diagnostics("pr:12"),
+            ["project:v1:diag-a".to_owned()]
+        );
+        assert_eq!(s.code_graph_fingerprint.as_deref(), Some("fp-abc"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

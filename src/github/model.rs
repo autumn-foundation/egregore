@@ -277,6 +277,59 @@ pub struct ReviewComment {
     pub html_url: String,
 }
 
+/// The dismissed-review payload carried on a `review_dismissed` timeline event
+/// (issue #336).
+///
+/// GitHub nests the id of the review that was dismissed, its resulting state,
+/// and the optional operator-supplied dismissal message. `review_id` is what
+/// binds the transition back to the `Review` record the importer already minted.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DismissedReview {
+    /// Server id of the dismissed review (== the `pr_review` review id).
+    #[serde(default)]
+    pub review_id: u64,
+    /// Resulting review state (`dismissed`).
+    #[serde(default)]
+    pub state: String,
+    /// Optional free-text dismissal message; redacted into a `body_handle`,
+    /// never stored raw in the graph.
+    #[serde(default)]
+    pub dismissal_message: Option<String>,
+}
+
+/// A GitHub PR-timeline event from `GET /repos/{o}/{r}/issues/{n}/timeline`
+/// (issue #336).
+///
+/// Only the closed review-state-transition event kinds are consumed
+/// (`review_dismissed`, `review_requested`, `review_request_removed`); all other
+/// timeline events are filtered out before parsing. Unknown fields are ignored.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TimelineEvent {
+    /// Event kind discriminator (e.g. `review_dismissed`).
+    #[serde(default)]
+    pub event: String,
+    /// Server-native event id; seeds the `ReviewStateTransition` stable id as
+    /// `timeline:<id>`.
+    #[serde(default)]
+    pub id: u64,
+    /// Event timestamp (RFC 3339); the transition's `valid_time`.
+    #[serde(default)]
+    pub created_at: String,
+    /// Actor who performed the transition (the dismisser / requester login).
+    #[serde(default)]
+    pub actor: Option<User>,
+    /// Present on `review_dismissed`; names the dismissed review.
+    #[serde(default)]
+    pub dismissed_review: Option<DismissedReview>,
+    /// Present on `review_requested` / `review_request_removed` for an
+    /// individual reviewer.
+    #[serde(default)]
+    pub requested_reviewer: Option<User>,
+    /// Present on `review_requested` / `review_request_removed` for a team.
+    #[serde(default)]
+    pub requested_team: Option<Team>,
+}
+
 /// Parses the trailing numeric path segment of a GitHub API URL.
 ///
 /// `issue_url` looks like `.../issues/42`; `pull_request_url` like
@@ -355,6 +408,31 @@ mod tests {
         let json = r#"{"id":11,"state":"PENDING"}"#;
         let review: Review = serde_json::from_str(json).unwrap();
         assert_eq!(review.commit_id, None);
+    }
+
+    #[test]
+    fn timeline_review_dismissed_parses() {
+        // Issue #336: a review_dismissed timeline event carries the dismissed
+        // review id, the actor, and an optional dismissal message.
+        let json = r#"{"event":"review_dismissed","id":5001,"created_at":"2026-01-03T00:00:00Z","actor":{"login":"maintainer"},"dismissed_review":{"review_id":301,"state":"dismissed","dismissal_message":"stale"}}"#;
+        let ev: TimelineEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(ev.event, "review_dismissed");
+        assert_eq!(ev.id, 5001);
+        assert_eq!(ev.actor.as_ref().unwrap().login, "maintainer");
+        let dr = ev.dismissed_review.unwrap();
+        assert_eq!(dr.review_id, 301);
+        assert_eq!(dr.dismissal_message.as_deref(), Some("stale"));
+    }
+
+    #[test]
+    fn timeline_review_requested_parses_without_dismissed_review() {
+        // Issue #336: a review_requested event has a requested_reviewer and no
+        // dismissed_review; the absent field deserializes to None, not an error.
+        let json = r#"{"event":"review_requested","id":42,"created_at":"2026-01-02T00:00:00Z","actor":{"login":"author"},"requested_reviewer":{"login":"alice"}}"#;
+        let ev: TimelineEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(ev.event, "review_requested");
+        assert!(ev.dismissed_review.is_none());
+        assert_eq!(ev.requested_reviewer.unwrap().login, "alice");
     }
 
     #[test]

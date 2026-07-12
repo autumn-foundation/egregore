@@ -99,7 +99,11 @@ pub(super) const fn classify_node(kind: NodeKind) -> Option<ContextSection> {
         // project-state section, and the ExternalIdentity reached via
         // REVIEWED_BY / REQUESTED_REVIEW_FROM carries the participant login.
         | NodeKind::Review
-        | NodeKind::ExternalIdentity => Some(ContextSection::ProjectState),
+        | NodeKind::ExternalIdentity
+        // Review-state history (issue #336): a ReviewStateTransition is a
+        // project-state fact — the append-only record of a review's dismissal or
+        // request transition — so it surfaces alongside the Review it concerns.
+        | NodeKind::ReviewStateTransition => Some(ContextSection::ProjectState),
         // artifact domain
         NodeKind::Artifact | NodeKind::PatchArtifact | NodeKind::FileEdit => {
             Some(ContextSection::Artifact)

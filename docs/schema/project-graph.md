@@ -148,6 +148,7 @@ payload definitions belong to their own slices.
 | `PR` | GitHub pull-request metadata - reserved. As of issue #333 the core PR fields (`head_sha`, `head_ref`, `base_ref`, `merge_commit_sha`, `merged_at`, `draft`) are promoted to first-class flat `Task` fields; a dedicated `PR` record remains reserved only for the residual PR-only surface (requested reviewers, `mergeable_state`, …). |
 | `Review` | Review comment, finding, approval, requested change, or blocker. Shipped in issue #46 (no longer reserved): the GitHub importer emits `project.Review` records for issue comments, PR review summaries, and PR review comments. |
 | `ExternalIdentity` | A source-system participant identity — a GitHub login (issue #335). Carries ONLY the login (in `author`) and the source system (`identity_system: "github"`); never email, display name, avatar, or profile URL. Keyed on `(system, login)` ALONE (deliberately NOT repo-scoped — a participant identity is global across repositories), so the same login observed in two repos maps to exactly one node: `project_stable_id(["project", "ExternalIdentity", "github", <login>])`. Trust class `project_state`. Consumed by #338/#339 (evidence packs / reviewer joins); future beneficiaries #245 (ownership) and #262. |
+| `ReviewStateTransition` | One append-only review-state TRANSITION event minted from a GitHub PR-timeline event (issue #336). Carries the closed `transition_kind` (`review_dismissed` / `review_requested` / `review_request_removed`), the actor login (in `author`), the timeline event handle (`system_native_id: "timeline:<id>"`), and — for a dismissal that supplied one — the redacted dismissal message in `body_handle`. `valid_time` is the event's `created_at`. Keyed on the timeline event's own id: `project_stable_id(["project", "ReviewStateTransition", <source_repo>, "<n>", "timeline:<event_id>"])`, so it is append-only and **never participates in the parent `Review`'s identity**. Trust class `project_state`. The `Review.review_state` field is a last-write-wins current-state SUMMARY; these transitions are the HISTORY a dismissal would otherwise erase. Consumers needing "state as of T" (e.g. #339) join the transitions, not the summary. |
 | `LocalTask` | Named in the PRD as a sibling of `GitHubIssue` - reserved; day-one shape collapses it into `Task` with `source_kind: local_jsonl`. |
 
 ## 7 - Cross-Domain Edge Rows
@@ -167,6 +168,7 @@ project-domain side of the contract, but the registry remains the one from #6.
 | `REVIEWS_COMMIT` | `project` | `codegraph` | `Review` *(`source_kind: github_review`)* | `Commit` | many:1 | no |
 | `REVIEWED_BY` | `project` | `project` | `Review` *(`source_kind: github_review`)* | `ExternalIdentity` | many:1 | no |
 | `REQUESTED_REVIEW_FROM` | `project` | `project` | `Task` *(`source_kind: github_pr`)* | `ExternalIdentity` | many:many | no |
+| `TRANSITIONS_REVIEW` | `project` | `project` | `ReviewStateTransition` | `Review` | many:1 | no |
 | `MENTIONS_SYMBOL` | `project` | `codegraph` | `Task` | `Symbol` | many:many | yes |
 
 `REFERENCES_TASK` is promoted from reserved to defined: #6 already reserved the
@@ -212,6 +214,22 @@ requested TEAM is never expanded to member logins — it is recorded as a
 slug and the PR `Task` id. A `REVIEWED_BY` binding proves a review NAMES a
 participant, never a verdict on the review; a `REQUESTED_REVIEW_FROM` is an
 invitation to review, never proof a review happened.
+
+**Review-state history (issue #336).** `TRANSITIONS_REVIEW` (FROM a
+`ReviewStateTransition`, TO the `Review` it acted on) records that a review was
+dismissed. It exists so a dismissal never erases that an approval once existed:
+`Review.review_state` is a **last-write-wins current-state summary** (a dismissal
+overwrites `"approved"` → `"dismissed"` under the SAME review record id), while
+each `ReviewStateTransition` is an **append-only history** record keyed on the
+timeline event's own id — so the transition never participates in the review's
+identity. The edge is minted ONLY for a `review_dismissed` timeline event (which
+names the dismissed review); `review_requested` / `review_request_removed`
+transitions name no single review and stand alone with no edge. `eg validate` and
+the daemon both frame the edge directionally — source `ReviewStateTransition`,
+target `Review` only. A `TRANSITIONS_REVIEW` binding proves WHICH review a
+transition acted on, never that the dismissal was correct. **A consumer that needs
+"review state as of time T" MUST join the transitions, not read the summary
+field.**
 
 **Merge-resolution lifecycle (issue #333, Codex round-6).** A PR's merge
 evidence is one of two artifacts: a `MERGED_AS` edge (unique `Commit` match) or a

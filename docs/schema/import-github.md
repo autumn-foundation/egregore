@@ -44,6 +44,16 @@ Coordination links:
 Future multi-repo shapes (`--org <name>`, `--file <repos.txt>`) are reserved
 in section 10 and are not implemented in v1.
 
+**Amendment (issue #336 — review-state history):** the network boundary is
+extended by exactly ONE additional read endpoint,
+`GET /repos/{owner}/{repo}/issues/{n}/timeline?per_page=100`, fetched per changed
+PR under the same trigger as the per-PR review summaries (`/pulls/{n}/reviews`,
+section 5). It reuses the SAME CLI verb, the SAME auth surface (section 2), and
+the SAME ETag / backoff / watermark machinery (sections 4–5). It adds NO polling,
+NO webhooks, and NO repository enumeration — the timeline of the same explicitly
+named `<owner>/<repo>` PRs only. See section 3 for the endpoint row and section 6
+for the `ReviewStateTransition` mapping.
+
 ---
 
 ## 2 - Auth Surface
@@ -117,6 +127,7 @@ GitHub's default is 30 items; omitting `per_page=100` breaks the single-page bud
 | `GET /repos/{owner}/{repo}/issues?state=all&per_page=100` | All issues. **Note:** GitHub's issues API includes pull-request objects; the importer MUST discard any response item where `pull_request` key is present. |
 | `GET /repos/{owner}/{repo}/pulls?state=all&per_page=100` | All pull requests |
 | `GET /repos/{owner}/{repo}/labels?per_page=100` | Label list (flattened into Task records) |
+| `GET /repos/{owner}/{repo}/issues/{n}/timeline?per_page=100` | (Issue #336) Per-PR event timeline, fetched per changed PR under the same `pulls_changed` trigger as `/pulls/{n}/reviews`. Filtered to the closed review-state-transition kinds `{review_dismissed, review_requested, review_request_removed}` → `ReviewStateTransition` records. Every other timeline event kind is skipped. |
 
 **Endpoints deferred with `Review` kind promotion:**
 These are the intended full v1 surface once `Review` is promoted from reserved.
@@ -427,6 +438,22 @@ Single normative reference. The target record kinds are defined in
 | PR Review Comment | `Review` (`review_kind: "pr_review_comment"`, `file_path`, `line`, `start_line`, `side`, `diff_hunk` summary, `in_reply_to_id`) → `REFERENCES_TASK` + `TOUCHES_FILE` | Attached to parent PR `Task` and `File` node when file exists at PR head SHA |
 | Label | Flattened into `Task.labels` array | No separate record kind in v1 |
 | Milestone | Stored in `Task.body_handle` as part of the GitHub-only metadata blob (no `Task.milestone` field exists in the v1 `Task` schema — see [`docs/schema/project-graph.md`](project-graph.md) section 3; `Task.milestone` is undefined in v1 and emitting it would be rejected) | No separate record kind in v1 |
+| Timeline `review_dismissed` event (issue #336) | `ReviewStateTransition` (`transition_kind: "review_dismissed"`, `author` = actor login, `system_native_id: "timeline:<id>"`, dismissal message → `body_handle`) → `TRANSITIONS_REVIEW` to the dismissed `Review`, **resolve-or-diagnose**: the edge is minted only when the dismissed review is present in this run's reviews; an absent review (GitHub omitted it) yields a `github_dismissed_review_absent` `Diagnostic` instead of a dangling edge, with the transition node still emitted | Append-only history; keyed on the timeline event id, never on the review's id |
+| Timeline `review_requested` / `review_request_removed` event (issue #336) | `ReviewStateTransition` (standalone node, no edge — it names no single review) | Same append-only, timeline-event-keyed identity |
+
+**Review-state epistemic contract (issue #336, normative):** a `Review`'s
+`review_state` field is a **current-state summary, last-write-wins by design** —
+a dismissal overwrites `"approved"` → `"dismissed"` under the SAME review record
+id, so the summary alone cannot tell you an approval ever existed. The
+`ReviewStateTransition` records are the **history**: each state transition is a
+separate append-only record, so a dismissal never erases the earlier approval.
+The importer does NOT change `review_state`'s last-write-wins semantics; it adds
+the transition history alongside it. **A consumer that needs "review state as of
+time T" (e.g. #339 review-coverage retroactively) MUST join the transitions, not
+read the summary field.** A `review_dismissed` transition carries a
+`TRANSITIONS_REVIEW` edge to the review it dismissed (proving WHICH review it
+acted on — never that the dismissal was correct); `review_requested` /
+`review_request_removed` transitions name no single review and stand alone.
 
 **v1 emission scope (what the first implementation actually emits):**
 
@@ -739,6 +766,17 @@ redaction-on export so reviewer-identity joins stay stable. The node carries no
 other identity attribute (no email, display name, avatar, or profile URL), so no
 new sensitive field is introduced.
 
+**`ReviewStateTransition` fields (issue #336):** the transition kind
+(`transition_kind`, a closed vocabulary — `review_dismissed` / `review_requested`
+/ `review_request_removed`), the actor login (`author`), the timestamps
+(`valid_time` = the timeline event's `created_at`), and the target review record
+id (cited by the `TRANSITIONS_REVIEW` edge) are all plaintext — none is routed
+through redaction, and none is a new sensitive field (the actor login inherits the
+same author-login carve-out). The one free-text field, a dismissal **message**,
+IS treated as a secret-bearing body: when present it is routed through
+`redact_lines` into a `body_handle` exactly like a comment body, so raw timeline
+text never enters the graph.
+
 **Redacted body-stored metadata:** Milestone title (`Task.body_handle` field) is
 NOT in the plaintext carve-out. `Task.body_handle.inline` is a redactable field
 per [`docs/schema/project-graph.md`](project-graph.md) section 8; milestone
@@ -781,6 +819,9 @@ Subkind identities:
 | PR Review Comment `Review` | `"pr_review_comment:<n>:<comment_id>"` |
 | `ExternalIdentity` (issue #335) | `project_stable_id(["project", "ExternalIdentity", "github", <login>])` — keyed on `(system, login)` ALONE, **deliberately NOT** using `source_repo` or `github_number`: a participant identity is global across repositories, so the same login in two repos maps to exactly one node. This is the one importer record whose ID is intentionally repo-independent. |
 | `github_team_review_request_unexpanded` `Diagnostic` (issue #335) | repo-scoped: `project_stable_id(["project", "Diagnostic", "github", <source_repo>, "pr:<n>", "github_team_review_request_unexpanded", <team_slug>])` |
+| `ReviewStateTransition` (issue #336) | `project_stable_id(["project", "ReviewStateTransition", <source_repo>, "<n>", "timeline:<event_id>"])` — seeded from the timeline event's OWN server-native id, so the transition is append-only and **never participates in the parent `Review`'s identity**. Re-importing the same event mints the same id; a distinct event mints a distinct id; changing the *dismissed review's* id does NOT change the transition id. |
+| `github_timeline_event_unparseable` `Diagnostic` (issue #336) | repo-scoped: `project_stable_id(["project", "Diagnostic", "github", <source_repo>, "pr:<n>", "github_timeline_event_unparseable", "timeline:<event_id>"])` — a fetched, KNOWN-kind timeline event that could not be turned into a transition is recorded here, never silently dropped. |
+| `github_dismissed_review_absent` `Diagnostic` (issue #336) | repo-scoped: `project_stable_id(["project", "Diagnostic", "github", <source_repo>, "pr:<n>", "github_dismissed_review_absent", "timeline:<event_id>"])` — a well-formed `review_dismissed` event whose dismissed `Review` is NOT present in this run's reviews (GitHub omitted it: deleted account or a very old review). Resolve-or-diagnose (mirrors #334's `REVIEWS_COMMIT`): the transition node is still emitted (history preserved) but the `TRANSITIONS_REVIEW` edge is replaced by this diagnostic so no dangling edge to an absent `Review` ever enters the graph. |
 
 **Normative rule:** re-importing identical GitHub state produces byte-identical IDs.
 This is the idempotency invariant — if the ID changes between two runs for the

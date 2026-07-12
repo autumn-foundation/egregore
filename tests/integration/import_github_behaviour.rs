@@ -218,6 +218,12 @@ fn handle_conn(stream: &mut std::net::TcpStream, routes: &SharedRoutes, requests
                     build_response(c.status, &c.body, c.etag.as_deref(), link.as_deref())
                 }
             }
+            // Issue #336: every changed PR now triggers a per-PR timeline fetch.
+            // A fixture that does not care about review-state transitions need not
+            // register a timeline route: an unmatched `/timeline` path defaults to
+            // an empty array (no transitions), keeping pre-#336 fixtures green.
+            // Tests that DO exercise transitions register an explicit route.
+            None if lookup.contains("/timeline") => build_response(200, "[]", None, None),
             None => build_response(404, r#"{"message":"Not Found"}"#, None, None),
         }
     };
@@ -452,6 +458,296 @@ fn edges_of_label(jsonl: &str, label: &str) -> usize {
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter(|v| v["record_type"] == "edge" && v["label"] == label)
         .count()
+}
+
+/// All edge records carrying `label`, as JSON values (issue #336 helpers).
+fn edge_values(jsonl: &str, label: &str) -> Vec<serde_json::Value> {
+    jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["record_type"] == "edge" && v["label"] == label)
+        .collect()
+}
+
+/// The single `pr_review`-kind Review node in a handoff JSONL (issue #336).
+fn pr_review_node(jsonl: &str) -> serde_json::Value {
+    let mut found: Vec<serde_json::Value> = nodes_of_kind(jsonl, "Review")
+        .into_iter()
+        .filter(|v| v["review_kind"] == "pr_review")
+        .collect();
+    assert_eq!(found.len(), 1, "expected exactly one pr_review Review node");
+    found.pop().unwrap()
+}
+
+// ── Issue #336: review-state transition history fixtures ─────────────────────────
+
+/// A PR whose `updated_at` advanced (so a re-import sees `pulls_changed`).
+fn one_pull_updated_json() -> String {
+    serde_json::json!([
+        {
+            "number": 7, "title":"A pull request","body":"PR body.",
+            "state":"open","draft":false,"labels":[],"assignees":[{"login":"dev"}],
+            "user":{"login":"dev"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-05T00:00:00Z",
+            "head":{"ref":"feature","sha":"abc123"},
+            "base":{"ref":"main","sha":"def456"},
+            "html_url":"https://github.com/o/r/pull/7"
+        }
+    ])
+    .to_string()
+}
+
+/// Review 301 in its post-dismissal state (`DISMISSED`).
+fn one_pr_review_dismissed_json() -> String {
+    serde_json::json!([
+        {
+            "id": 301, "body":"Looks good overall.", "state":"DISMISSED",
+            "user":{"login":"reviewer"},"submitted_at":"2026-01-02T03:00:00Z",
+            "html_url":"https://github.com/o/r/pull/7#pullrequestreview-301"
+        }
+    ])
+    .to_string()
+}
+
+/// The PR-7 timeline carrying the dismissal of review 301.
+fn timeline_with_dismissal_json() -> String {
+    serde_json::json!([
+        { "event": "labeled", "id": 4000, "created_at": "2026-01-04T00:00:00Z" },
+        {
+            "event": "review_dismissed", "id": 5001,
+            "created_at": "2026-01-04T12:00:00Z",
+            "actor": {"login": "maintainer"},
+            "dismissed_review": {
+                "review_id": 301, "state": "dismissed",
+                "dismissal_message": "stale after force-push"
+            }
+        }
+    ])
+    .to_string()
+}
+
+/// The canonical fixture plus an explicit PR-7 timeline route carrying the
+/// dismissal, with the PR and its review already in the dismissed state.
+fn routes_with_dismissal() -> HashMap<String, Canned> {
+    let mut routes = full_routes();
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&one_pull_updated_json(), "\"pulls-v2\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/7/reviews?per_page=100".to_owned(),
+        Canned::ok(&one_pr_review_dismissed_json(), "\"prr-v2\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues/7/timeline?per_page=100".to_owned(),
+        Canned::ok(&timeline_with_dismissal_json(), "\"tl-v2\""),
+    );
+    routes
+}
+
+/// The canonical fixture with the dismissal in the timeline but the dismissed
+/// review ABSENT from the reviews list (GitHub omitted it — deleted account or a
+/// very old review). Exercises the resolve-or-diagnose ladder (#336 S1).
+fn routes_with_absent_dismissed_review() -> HashMap<String, Canned> {
+    let mut routes = full_routes();
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&one_pull_updated_json(), "\"pulls-v2\""),
+    );
+    // Reviews list no longer contains review 301 (GitHub omitted it).
+    routes.insert(
+        "/repos/o/r/pulls/7/reviews?per_page=100".to_owned(),
+        Canned::ok("[]", "\"prr-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues/7/timeline?per_page=100".to_owned(),
+        Canned::ok(&timeline_with_dismissal_json(), "\"tl-v2\""),
+    );
+    routes
+}
+
+/// Runs `eg validate <graph>` and returns whether it exited clean (exit 0).
+fn validate_graph(path: &std::path::Path) -> (bool, String) {
+    let output = egregore()
+        .args(["validate", path.to_str().unwrap()])
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .expect("run validate");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    (output.status.success(), stdout)
+}
+
+// ── #336 S1: dismissal of an absent review → diagnostic, never a dangling edge ───
+
+#[test]
+fn dismissal_of_absent_review_emits_diagnostic_and_validates_clean() {
+    // S1: the dismissed review is omitted from the reviews list but the timeline
+    // still reports the review_dismissed event. The importer must record the
+    // transition (history preserved), mint NO TRANSITIONS_REVIEW edge (its target
+    // is not in the graph), emit exactly one github_dismissed_review_absent
+    // Diagnostic, and produce a graph `eg validate` accepts with no dangling edge.
+    let server = MockServer::start(routes_with_absent_dismissed_review());
+    let dir = TempDir::new().expect("temp dir");
+    let out = dir.path().join("graph.jsonl");
+    let state = dir.path().join("state.json");
+    let (jsonl, _stderr, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok, "import should succeed");
+
+    // The transition node is still emitted — history is preserved.
+    assert_eq!(
+        nodes_of_kind(&jsonl, "ReviewStateTransition").len(),
+        1,
+        "the dismissal transition is recorded even when its review is absent"
+    );
+    // NO edge is minted to the absent Review.
+    assert_eq!(
+        edges_of_label(&jsonl, "TRANSITIONS_REVIEW"),
+        0,
+        "no dangling TRANSITIONS_REVIEW edge to an omitted Review"
+    );
+    // Exactly one absent-review diagnostic replaces the edge.
+    let absent_diags = jsonl
+        .lines()
+        .filter(|l| l.contains("github_dismissed_review_absent"))
+        .count();
+    assert_eq!(
+        absent_diags, 1,
+        "one github_dismissed_review_absent diagnostic"
+    );
+
+    // `eg validate` over the resulting graph is clean — no dangling edge defect.
+    let (valid, report) = validate_graph(&out);
+    assert!(valid, "graph must validate clean, got: {report}");
+}
+
+// ── AC1/AC2/AC8/AC9: two-snapshot dismissal preserves the approval ───────────────
+
+#[test]
+fn dismissal_snapshot_records_transition_without_erasing_the_approval() {
+    // AC1: import the pre-dismissal snapshot, then the post-dismissal snapshot.
+    // The Review keeps its stable record id (identity unchanged) with current
+    // review_state "dismissed", PLUS one ReviewStateTransition for the dismissal
+    // (valid_time = the timeline event's created_at, actor login, transition kind
+    // review_dismissed) and a TRANSITIONS_REVIEW edge to that Review.
+    let server = MockServer::start(full_routes());
+    let dir = TempDir::new().expect("temp dir");
+    let out = dir.path().join("graph.jsonl");
+    let state = dir.path().join("state.json");
+
+    // Pre-dismissal snapshot: review 301 is APPROVED, timeline empty.
+    let (pre_jsonl, _stderr, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok, "pre-dismissal import should succeed");
+    let pre_review = pr_review_node(&pre_jsonl);
+    let review_id = pre_review["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        pre_review["review_state"], "approved",
+        "pre-state is approved"
+    );
+    assert_eq!(
+        nodes_of_kind(&pre_jsonl, "ReviewStateTransition").len(),
+        0,
+        "no transition before the dismissal"
+    );
+
+    // Post-dismissal snapshot: review 301 DISMISSED + a review_dismissed timeline
+    // event. The PR's updated_at advanced so the per-PR review + timeline fetches
+    // fire (same `pulls_changed` gate).
+    server.set_routes(routes_with_dismissal());
+    let (post_jsonl, _stderr, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok, "post-dismissal import should succeed");
+
+    // The Review re-emits with current review_state "dismissed" and the SAME id —
+    // the original approval's record id is unchanged in identity.
+    let post_review = pr_review_node(&post_jsonl);
+    assert_eq!(
+        post_review["id"].as_str().unwrap(),
+        review_id,
+        "the Review record id is unchanged by the dismissal"
+    );
+    assert_eq!(
+        post_review["review_state"], "dismissed",
+        "review_state is now the last-write-wins dismissed summary"
+    );
+
+    // Exactly one ReviewStateTransition for the dismissal, fully attributed.
+    let transitions = nodes_of_kind(&post_jsonl, "ReviewStateTransition");
+    assert_eq!(transitions.len(), 1, "one dismissal transition");
+    let t = &transitions[0];
+    assert_eq!(t["transition_kind"], "review_dismissed");
+    assert_eq!(t["author"], "maintainer", "actor login");
+    assert_eq!(
+        t["valid_time"], "2026-01-04T12:00:00Z",
+        "valid_time is the timeline event's created_at"
+    );
+    // AC8: citable via system_native_id timeline:<id>.
+    assert_eq!(t["system_native_id"], "timeline:5001");
+
+    // A TRANSITIONS_REVIEW edge binds the transition to the dismissed Review.
+    let edges = edge_values(&post_jsonl, "TRANSITIONS_REVIEW");
+    assert_eq!(edges.len(), 1, "one TRANSITIONS_REVIEW edge");
+    assert_eq!(
+        edges[0]["source"].as_str().unwrap(),
+        t["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        edges[0]["target"].as_str().unwrap(),
+        review_id,
+        "the edge targets the dismissed Review, its approval identity intact"
+    );
+
+    // AC9 (load-bearing): the transition's valid_time is strictly after the
+    // review's, so a pre-dismissal valid-time window still finds the approval and
+    // no dismissal; the dismissal never erases the earlier approval evidence.
+    let review_vt = post_review["valid_time"].as_str().unwrap();
+    let trans_vt = t["valid_time"].as_str().unwrap();
+    assert!(
+        review_vt < trans_vt,
+        "approval valid_time {review_vt} precedes dismissal valid_time {trans_vt}"
+    );
+}
+
+#[test]
+fn dismissal_import_is_byte_identical_across_five_runs() {
+    // AC2/determinism: a fresh import carrying the dismissal is byte-identical
+    // across five runs (transition ids seed from the timeline event id).
+    let server = MockServer::start(routes_with_dismissal());
+    let mut prev: Option<String> = None;
+    for _ in 0..5 {
+        let dir = TempDir::new().expect("temp dir");
+        let out = dir.path().join("graph.jsonl");
+        let state = dir.path().join("state.json");
+        let (jsonl, _stderr, ok) = run_import(&server.base_url, &out, &state, &[]);
+        assert!(ok, "import should succeed");
+        // The dismissal transition is present on a fresh import too.
+        assert_eq!(nodes_of_kind(&jsonl, "ReviewStateTransition").len(), 1);
+        if let Some(p) = &prev {
+            assert_eq!(
+                *p, jsonl,
+                "import output must be byte-identical across runs"
+            );
+        }
+        prev = Some(jsonl);
+    }
+}
+
+#[test]
+fn unknown_timeline_event_kinds_are_filtered_without_diagnostic() {
+    // AC3: an out-of-scope timeline kind (labeled) is skipped by the filter and
+    // never becomes a transition or a diagnostic; only the 3 closed kinds count.
+    let server = MockServer::start(routes_with_dismissal());
+    let dir = TempDir::new().expect("temp dir");
+    let out = dir.path().join("graph.jsonl");
+    let state = dir.path().join("state.json");
+    let (jsonl, _stderr, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok);
+    // The fixture timeline also carries a `labeled` event; exactly one transition
+    // (the dismissal) is recorded, and no timeline diagnostic is emitted.
+    assert_eq!(nodes_of_kind(&jsonl, "ReviewStateTransition").len(), 1);
+    assert!(
+        !jsonl.contains("github_timeline_event_unparseable"),
+        "a well-formed timeline emits no unparseable diagnostic"
+    );
 }
 
 // ── AC1 / AC2 / Success metric: fresh import shapes + source handles ─────────────

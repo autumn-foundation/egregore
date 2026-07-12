@@ -141,6 +141,70 @@ fn dir_snapshot(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     out
 }
 
+/// A graph carrying a project `ReviewStateTransition` node (issue #336) so
+/// `eg inspect --data-dir` can be asserted to count it under
+/// `(project, ReviewStateTransition, 1)`.
+#[cfg(feature = "embedded-aletheiadb")]
+fn review_state_transition_jsonl() -> String {
+    let mut transition = node_with_version(
+        "project:v1:review-state-transition-5001",
+        NodeKind::ReviewStateTransition,
+        PROJECT_SCHEMA_VERSION,
+        "review_dismissed",
+        "review_dismissed on PR #7",
+    );
+    if let GraphRecord::Node {
+        domain,
+        transition_kind,
+        author,
+        system_native_id,
+        ..
+    } = &mut transition
+    {
+        *domain = Some("project".to_owned());
+        *transition_kind = Some("review_dismissed".to_owned());
+        *author = Some("maintainer".to_owned());
+        *system_native_id = Some("timeline:5001".to_owned());
+    }
+    let task = node_with_version(
+        "project:v1:task-1",
+        NodeKind::Task,
+        PROJECT_SCHEMA_VERSION,
+        "task1",
+        "project task record",
+    );
+    let mut jsonl = String::new();
+    for record in [&transition, &task] {
+        jsonl.push_str(&serde_json::to_string(record).expect("record should serialize"));
+        jsonl.push('\n');
+    }
+    jsonl
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn inspect_data_dir_counts_review_state_transition_under_project_v1() {
+    // Issue #336: a persisted ReviewStateTransition is counted by
+    // `eg inspect --data-dir` under the (project, ReviewStateTransition, 1) tuple.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let graph_path = temp.path().join("graph.jsonl");
+    let data_dir = temp.path().join("store");
+    fs::write(&graph_path, review_state_transition_jsonl()).expect("fixture should write");
+    ingest_embedded(&graph_path, &data_dir);
+
+    let stdout = inspect_data_dir_stdout(&data_dir, Some("json"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("inspect output must be valid JSON");
+    let versions = parsed["schema_versions"]
+        .as_object()
+        .expect("schema_versions must be an object");
+    assert_eq!(
+        versions[&format!("project:ReviewStateTransition:{PROJECT_SCHEMA_VERSION}")],
+        1,
+        "inspect must count the transition under (project, ReviewStateTransition, 1): {stdout}"
+    );
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn inspect_data_dir_defaults_to_single_line_json_with_trust_class_counts() {

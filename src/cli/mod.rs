@@ -5577,6 +5577,7 @@ pub(crate) fn trust_class_for(record: &GraphRecord) -> &'static str {
         | "PR"
         | "Review"
         | "ExternalIdentity"
+        | "ReviewStateTransition"
         | "ExternalLink"
         | "Product"
         | "Project"
