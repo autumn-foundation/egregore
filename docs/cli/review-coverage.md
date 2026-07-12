@@ -47,7 +47,7 @@ The verbatim disclaimer appears in every report.
 | Verdict | Meaning |
 | --- | --- |
 | `covered` | An approving review from a non-author identity, anchored at-or-after the reviewed head (`review_commit_sha == head_sha` when `--require-final-head` is on), valid at-or-before `merged_at`. |
-| `approval_stale_head` | Approved, but the approval's `review_commit_sha` differs from the PR's final `head_sha` (approved-then-force-pushed). Only classified as stale when `--require-final-head` is on (default). |
+| `approval_stale_head` | Approved, but the approval's `review_commit_sha` differs from the PR's final `head_sha` (approved-then-force-pushed), or the approval is anchored but the PR carries no `head_sha` so the final head is unverifiable (`head_sha_unavailable` sub-label). Only classified as stale when `--require-final-head` is on (default). |
 | `self_approved_only` | The only approving review(s) come from the PR author identity. Requires both logins present; if a login is missing the row degrades to `covered` + `identity_unavailable` rather than a fabricated self-approval. |
 | `uncovered` | Merged with zero approving reviews. |
 
@@ -61,6 +61,13 @@ Sub-labels annotate a row without leaving the closed verdict set:
 - `approval_unanchored` — the deciding approval carries no `review_commit_sha`
   (#334 anchor absent), so the final-head check could not run; the row is not
   guessed to be stale.
+- `head_sha_unavailable` — the deciding approval IS anchored (has a
+  `review_commit_sha`), but the PR `Task` carries no `head_sha` (e.g. a pre-#333
+  or partial import), so the review cannot be confirmed as reviewing the final
+  head. Under `--require-final-head` (default on) the row degrades to
+  `approval_stale_head` with this sub-label rather than silently passing the
+  final-head check and being counted `covered`. With `--require-final-head` off
+  the head is not checked and the row is unaffected.
 
 ## Citation set per row
 

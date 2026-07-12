@@ -292,6 +292,13 @@ mod tests {
         r
     }
 
+    fn without_head_sha(mut r: GraphRecord) -> GraphRecord {
+        if let GraphRecord::Node { head_sha, .. } = &mut r {
+            *head_sha = None;
+        }
+        r
+    }
+
     fn head_sha_of(pr: &GraphRecord) -> String {
         match pr {
             GraphRecord::Node {
@@ -649,6 +656,64 @@ mod tests {
         let report = run_review_coverage(&records, &win(), options, 1.0);
         // pr03 (stale) is now covered because the final-head knob is off.
         assert_eq!(row(&report, "project:v1:pr03").verdict, "covered");
+    }
+
+    #[test]
+    fn anchored_approval_with_missing_head_sha_is_not_covered_under_require_final_head() {
+        // A PR merged in-window with an ANCHORED approving review (has a
+        // `review_commit_sha`) from a non-author, but the PR record carries NO
+        // `head_sha` (e.g. a pre-#333 or partial import). Under
+        // `--require-final-head` (default on) the final head cannot be confirmed,
+        // so the approval must NOT be classified `covered` — it degrades to
+        // `approval_stale_head` + `head_sha_unavailable`, never a silent pass
+        // (Codex P2 false-`covered` bug).
+        let pr = without_head_sha(with_author(
+            with_system_native_id(
+                fixture::pr("project:v1:prX", "2026-03-15T09:00:00Z", "cX"),
+                "9",
+            ),
+            "author-X",
+        ));
+        let review = with_review_commit(
+            with_author(
+                fixture::review("project:v1:rX", "2026-03-15T08:00:00Z", "approved"),
+                "rev-X",
+            ),
+            "any-anchor-sha",
+        );
+        let records = vec![
+            fixture::references_task("project:v1:rX", "project:v1:prX"),
+            pr,
+            review,
+        ];
+
+        // require_final_head ON (default): unverifiable final head is not covered.
+        let report = run_review_coverage(&records, &win(), ReviewCoverageOptions::default(), 1.0);
+        let r = row(&report, "project:v1:prX");
+        assert_eq!(
+            r.verdict, "approval_stale_head",
+            "an unverifiable final head must not be classified covered"
+        );
+        assert!(
+            r.sub_labels.iter().any(|s| s == "head_sha_unavailable"),
+            "the missing-head_sha degradation must be reported, got {:?}",
+            r.sub_labels
+        );
+        assert_eq!(report.covered_count, 0, "must not count toward covered");
+
+        // require_final_head OFF (lenient/pack path): head is not checked, so the
+        // same PR stays covered — #338 pack numbers and the AC7 divergence
+        // fixture are unaffected.
+        let lenient = ReviewCoverageOptions {
+            require_non_author: true,
+            require_final_head: false,
+        };
+        let report_off = run_review_coverage(&records, &win(), lenient, 1.0);
+        assert_eq!(
+            row(&report_off, "project:v1:prX").verdict,
+            "covered",
+            "with --require-final-head off the missing head_sha is not checked"
+        );
     }
 
     #[test]

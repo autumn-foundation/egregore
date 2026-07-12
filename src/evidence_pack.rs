@@ -963,7 +963,10 @@ pub struct ReviewCoverageOptions {
     /// (default on). A review whose `review_commit_sha` differs from the Task's
     /// `head_sha` is `approval_stale_head` rather than covered; a review with no
     /// `review_commit_sha` (issue #334 anchor absent) degrades to an
-    /// `approval_unanchored` sub-label and is never guessed to be stale.
+    /// `approval_unanchored` sub-label and is never guessed to be stale. An
+    /// anchored review whose PR carries no `head_sha` cannot be confirmed as
+    /// reviewing the final head, so it degrades to `approval_stale_head` +
+    /// a `head_sha_unavailable` sub-label rather than silently passing the check.
     pub require_final_head: bool,
 }
 
@@ -1690,6 +1693,7 @@ pub fn derive_review_coverage(
             qualifies: bool,
             is_self: bool,
             head_stale: bool,
+            head_unavailable: bool,
             author_ok: bool,
             identity_unavailable: bool,
             unanchored: bool,
@@ -1710,15 +1714,30 @@ pub fn derive_review_coverage(
                 let unanchored = options.require_final_head && rcs.is_none();
                 // Head check: stale only when anchored AND the anchor differs from
                 // the final head; an unanchored review degrades (never guessed
-                // stale) and a missing head_sha cannot be compared.
+                // stale).
                 let head_stale = options.require_final_head
                     && matches!((rcs, head_sha), (Some(r), Some(h)) if r != h);
-                let head_ok = !head_stale;
+                // Head unavailable: an ANCHORED approval (has a `review_commit_sha`)
+                // whose PR carries no `head_sha` (e.g. a pre-#333 or partial import)
+                // cannot be confirmed as reviewing the final head. Under
+                // `--require-final-head` this must NOT silently pass — otherwise the
+                // approval is classified `covered`, overstating coverage exactly
+                // when the final head is unverifiable (Codex P2). It degrades to
+                // `approval_stale_head` + a reported `head_sha_unavailable`
+                // sub-label, never a guess. Guarded on `rcs.is_some()` so an
+                // unanchored review keeps its `approval_unanchored` degradation
+                // (no double-classification). When the knob is OFF (the lenient
+                // #338 pack path) the head is not checked at all, preserving the
+                // pack numbers and the AC7 zero-divergence fixture.
+                let head_unavailable =
+                    options.require_final_head && rcs.is_some() && head_sha.is_none();
+                let head_ok = !head_stale && !head_unavailable;
                 Eval {
                     link,
                     qualifies: author_ok && head_ok,
                     is_self,
                     head_stale,
+                    head_unavailable,
                     author_ok,
                     identity_unavailable,
                     unanchored,
@@ -1759,10 +1778,12 @@ pub fn derive_review_coverage(
             verdict = ReviewVerdict::Uncovered;
         } else if let Some(stale) = evals
             .iter()
-            .filter(|e| e.author_ok && e.head_stale)
+            .filter(|e| e.author_ok && (e.head_stale || e.head_unavailable))
             .min_by(|a, b| a.link.review_id.cmp(b.link.review_id))
         {
-            // A genuine (non-author / degraded) reviewer approved a non-final head.
+            // A genuine (non-author / degraded) reviewer approved a non-final head,
+            // or an anchored approval whose PR head_sha is missing so the final
+            // head cannot be confirmed (`head_unavailable`).
             verdict = ReviewVerdict::ApprovalStaleHead;
             deciding = Some(stale);
         } else if let Some(self_only) = evals
@@ -1788,6 +1809,9 @@ pub fn derive_review_coverage(
             }
             if e.unanchored {
                 sub_labels.insert("approval_unanchored".to_owned());
+            }
+            if e.head_unavailable {
+                sub_labels.insert("head_sha_unavailable".to_owned());
             }
         }
 

@@ -26,6 +26,13 @@ fn task_line(pr: &str, day: &str, native: &str) -> String {
     )
 }
 
+/// A PR `Task` line with no `head_sha` field (e.g. a pre-#333 or partial import).
+fn task_line_no_head_sha(pr: &str, day: &str, native: &str) -> String {
+    format!(
+        r#"{{"record_type":"node","id":"project:v1:{pr}","kind":"Task","schema_version":1,"valid_time":"2026-03-{day}T12:00:00Z","entity_id":"pr-entity-{pr}","source_kind":"github_pr","author":"author-{pr}","head_ref":"feature/{pr}","base_ref":"trunk","merge_commit_sha":"mc-{pr}","merged_at":"2026-03-{day}T12:00:00Z","system_native_id":"{native}","summary":"pr {pr}"}}"#
+    )
+}
+
 /// A `Review` line. `author` and `review_commit_sha` are optional (empty = omit).
 fn review_line(rv: &str, day: &str, author: &str, review_commit: &str) -> String {
     let author_field = if author.is_empty() {
@@ -301,6 +308,47 @@ fn output_is_byte_identical_across_runs() {
         let (_c, _v, out) = run_graph(&path, &[]);
         assert_eq!(out1, out, "review-coverage stdout must be byte-identical");
     }
+}
+
+/// An anchored approving review by a non-author, but the PR record carries no
+/// `head_sha`. Under `--require-final-head` (default on) the final head cannot be
+/// confirmed, so the PR must NOT be classified `covered`; it degrades to
+/// `approval_stale_head` + a reported `head_sha_unavailable` sub-label. With the
+/// knob off the head is not checked and the PR stays covered (Codex P2).
+#[test]
+fn anchored_approval_without_head_sha_degrades_and_flips_with_knob() {
+    let lines: Vec<String> = vec![
+        task_line_no_head_sha("pr01", "05", "1"),
+        review_line("r01", "05", "rev-1", "any-anchor-sha"),
+        edge_line("r01", "pr01"),
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("no-head.graph.jsonl");
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // require_final_head ON (default): not covered, degraded.
+    let (code_on, report_on, _) = run_graph(&path, &[]);
+    let row_on = report_on["rows"].as_array().unwrap()[0].clone();
+    assert_eq!(row_on["verdict"], "approval_stale_head");
+    assert!(
+        row_on["sub_labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s == "head_sha_unavailable"),
+        "expected head_sha_unavailable sub-label, got {row_on:?}"
+    );
+    assert_eq!(report_on["covered_count"], 0);
+    assert_eq!(code_on, 1, "0 covered of 1 merged is below 1.0");
+
+    // require_final_head OFF: head not checked, PR stays covered.
+    let (code_off, report_off, _) = run_graph(&path, &["--require-final-head", "false"]);
+    assert_eq!(
+        report_off["rows"].as_array().unwrap()[0]["verdict"],
+        "covered"
+    );
+    assert_eq!(report_off["covered_count"], 1);
+    assert_eq!(code_off, 0, "fully covered exits 0");
 }
 
 #[test]

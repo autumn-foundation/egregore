@@ -660,7 +660,9 @@ author LOGINS and degrades to an `identity_unavailable` sub-label without them,
 never fabricating a self-approval and never inventing an `ExternalIdentity` kind.
 A stale approval degrades to `approval_stale_head` only under `--require-final-head`;
 a review lacking a `review_commit_sha` anchor degrades to an `approval_unanchored`
-sub-label, never guessed stale. Every row cites the PR Task ID + `system_native_id`
+sub-label, never guessed stale; an anchored approval whose PR carries no `head_sha`
+cannot confirm the final head, so it degrades to `approval_stale_head` +
+`head_sha_unavailable` rather than silently counting `covered`. Every row cites the PR Task ID + `system_native_id`
 + `merge_commit_sha`; covered rows also cite the approving Review ID +
 `review_commit_sha` + approver login. Windowing reuses #338's half-open
 `merged_at` semantics; a PR with no window-resolvable merge time is excluded under
