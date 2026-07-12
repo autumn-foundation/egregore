@@ -240,6 +240,24 @@ redaction-safe fingerprints the summary already exposes. `LogEvent` exemplar
 `event_excerpt` text is likewise fingerprinted (exemplars ride the summary as
 content-addressed handles, never as section text).
 
+**Concatenated multi-scan coalescing** (issue #340, Codex round-6). A `LogSource`
+is a **non-identity** input: an `ErrorSignature`'s stable ID is
+`(repository_id, fingerprint_algorithm, template, severity)` and a
+`LogOccurrenceBucket`'s ID omits `LogSource` likewise. A graph built by
+concatenating several `scan-logs` outputs for one repo (a documented, legitimate
+multi-scan workflow) therefore carries the **same stable log ID once per scan**.
+`assemble` **coalesces duplicate log records by stable ID at assemble time**,
+BEFORE window filtering and summary building, mirroring the `query log-deltas`
+cross-scan semantics: `ErrorSignature` records sharing an ID merge to one node
+with the **earliest `first_seen`, latest `last_seen`** (by parsed UTC instant) and
+**summed `occurrence_count`**; `LogOccurrenceBucket` records sharing an ID have
+their counts **summed** (never deduped by bucket record ID, per issue #361);
+`LogSource`/`LogEvent` nodes and log-domain edges collapse to their first
+occurrence. Exactly **one summary row and one hashed section node per stable ID**
+results, so the concatenated pack still passes its own offline `verify` — the
+hard assemble↔verify consistency invariant. A single-scan graph has no duplicate
+log IDs, so coalescing is a no-op and every existing pack is byte-identical.
+
 **`occurrence_buckets`** — the **bucket window rule differs from the point
 predicate every other class uses**. A `LogOccurrenceBucket` row is in-window iff
 its hour `[bucket_start, bucket_start + 1h)` **intersects** the half-open window

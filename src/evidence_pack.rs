@@ -2199,6 +2199,193 @@ fn clip_upper(ts: &str, ts_parsed: DateTimeFixed, to: &str, to_parsed: DateTimeF
 /// Convenience alias for the parsed-instant type.
 type DateTimeFixed = chrono::DateTime<chrono::FixedOffset>;
 
+/// True when an edge label is one of the log-domain edges a concatenated
+/// multi-scan graph duplicates (issue #340, Codex round-6 P2): a duplicate is an
+/// exact copy (deterministic edge ID, identical endpoints/label), so deduping by
+/// stable ID is loss-free.
+fn is_log_domain_edge(label: &str) -> bool {
+    matches!(
+        label,
+        "CAPTURED_FROM" | "FINGERPRINTED_AS" | "AGGREGATES" | "FRAME_RESOLVES_TO"
+    )
+}
+
+/// Merges one RFC 3339 valid-time bound across a coalesced signature group to the
+/// earliest (`earliest = true`) or latest value by parsed UTC INSTANT, returning
+/// the winning raw RFC 3339 string. Mirrors `log_deltas::merge_bound` exactly:
+/// comparison is by parsed instant (never raw string order — the same
+/// cross-offset reason as classification), a parseable value always wins over an
+/// unparseable one, an instant tie breaks lexically over the raw strings, and
+/// only when NEITHER value parses does the lexically smallest/largest raw string
+/// win. Both inputs originate from Egregore's own scanners and parse in practice.
+fn merge_bound_pair(a: &str, b: &str, earliest: bool) -> String {
+    match (parse_rfc3339(a), parse_rfc3339(b)) {
+        (Some(pa), Some(pb)) => {
+            let pick_b = if earliest {
+                pb < pa || (pb == pa && b < a)
+            } else {
+                pb > pa || (pb == pa && b > a)
+            };
+            if pick_b { b.to_owned() } else { a.to_owned() }
+        }
+        // A parseable bound always beats an unparseable one.
+        (Some(_), None) => a.to_owned(),
+        (None, Some(_)) => b.to_owned(),
+        // Nothing parseable: deterministic lexical fallback.
+        (None, None) => {
+            let pick_b = if earliest { b < a } else { b > a };
+            if pick_b { b.to_owned() } else { a.to_owned() }
+        }
+    }
+}
+
+/// Merges `other`'s `ErrorSignature` valid-time span and occurrence count into the
+/// accumulator node (issue #340, Codex round-6 P2). Earliest `first_seen`, latest
+/// `last_seen` (by parsed UTC instant), summed `occurrence_count` — the exact
+/// `log_deltas` cross-scan coalescing semantics. `template_excerpt` / `severity` /
+/// `frames` are identity components (or identity-derived), so they are identical
+/// across the group and left as the accumulator carries them. The node's
+/// `valid_time` (which `resolve_valid_time` reports for window membership) is kept
+/// consistent with the merged earliest `first_seen`.
+fn merge_error_signature_into(acc: &mut GraphRecord, other: &GraphRecord) {
+    let (o_first, o_last, o_count) = {
+        let Some(crate::ir::LogPayload::ErrorSignature(o)) = node_log_payload(other) else {
+            return;
+        };
+        (
+            o.first_seen.clone(),
+            o.last_seen.clone(),
+            o.occurrence_count,
+        )
+    };
+    let GraphRecord::Node {
+        log: Some(payload),
+        valid_time,
+        temporal,
+        ..
+    } = acc
+    else {
+        return;
+    };
+    let crate::ir::LogPayload::ErrorSignature(a) = payload.as_mut() else {
+        return;
+    };
+    a.first_seen = merge_bound_pair(&a.first_seen, &o_first, true);
+    a.last_seen = merge_bound_pair(&a.last_seen, &o_last, false);
+    a.occurrence_count = a.occurrence_count.saturating_add(o_count);
+    let merged_first = a.first_seen.clone();
+    // Keep the node's window-membership valid time aligned with the merged
+    // earliest `first_seen` (scan-logs nodes stamp `valid_time` == `first_seen`).
+    *valid_time = Some(merged_first.clone());
+    if let Some(t) = temporal.as_mut()
+        && !t.valid_time.is_empty()
+    {
+        t.valid_time = merged_first;
+    }
+}
+
+/// Merges `other`'s `LogOccurrenceBucket` occurrence count into the accumulator
+/// node (issue #340, Codex round-6 P2). Bucket identity is
+/// `(repository/signature/hour/width)` and omits `LogSource`, so two distinct
+/// scans observing the same signature in the same hour mint the SAME bucket
+/// record ID with their own per-source counts; the counts are SUMMED across the
+/// group (never deduped by bucket record ID, per issue #361), keeping them
+/// consistent with the summed aggregate `occurrence_count`. `bucket_start` /
+/// `bucket_width` are identity, hence identical across the group.
+fn merge_bucket_into(acc: &mut GraphRecord, other: &GraphRecord) {
+    let o_count = {
+        let Some(crate::ir::LogPayload::LogOccurrenceBucket(o)) = node_log_payload(other) else {
+            return;
+        };
+        o.occurrence_count
+    };
+    let GraphRecord::Node {
+        log: Some(payload), ..
+    } = acc
+    else {
+        return;
+    };
+    let crate::ir::LogPayload::LogOccurrenceBucket(a) = payload.as_mut() else {
+        return;
+    };
+    a.occurrence_count = a.occurrence_count.saturating_add(o_count);
+}
+
+/// Coalesces duplicate log-domain records by stable ID at ASSEMBLE time (issue
+/// #340, Codex round-6 P2), mirroring the documented `query log-deltas` cross-scan
+/// coalescing semantics so a concatenated multi-scan graph produces exactly ONE
+/// row per stable log ID.
+///
+/// A `LogSource` is a NON-identity input for a signature — the `ErrorSignature`
+/// stable ID is `(repository_id, fingerprint_algorithm, template, severity)` only
+/// (and a `LogOccurrenceBucket` ID omits `LogSource` likewise) — so a graph made
+/// by concatenating several `scan-logs` outputs for one repo (a documented,
+/// legitimate workflow) carries the SAME stable log ID once per scan. Without
+/// coalescing, `assemble_pack` would emit one summary row per PHYSICAL record and
+/// its own offline `verify_pack` (which requires exactly one row per signature)
+/// would reject the freshly assembled pack. This restores the hard invariant that
+/// every assembled pack passes its own verify.
+///
+/// Merge rules (match `log_deltas` exactly):
+/// * `ErrorSignature` records sharing an ID → one node: earliest `first_seen`,
+///   latest `last_seen` (by parsed UTC instant), summed `occurrence_count`.
+/// * `LogOccurrenceBucket` records sharing an ID → one node: summed
+///   `occurrence_count` (never deduped by bucket ID, per #361).
+/// * `LogSource` / `LogEvent` nodes and log-domain edges sharing an ID → deduped
+///   to the first occurrence (an exact duplicate carries identical content).
+///
+/// Every NON-log record passes through unchanged, in order. Applied BEFORE window
+/// filtering and summary building so first/last-seen clipping and window
+/// membership use the merged extents. Deterministic: output preserves
+/// first-occurrence order and every downstream section/summary re-sorts, so the
+/// pack is byte-identical across runs regardless of input concatenation order. A
+/// single-scan graph has no duplicate log IDs, so this is a no-op there and every
+/// existing pack is unchanged.
+fn coalesce_log_records(records: &[GraphRecord]) -> Vec<GraphRecord> {
+    let mut out: Vec<GraphRecord> = Vec::with_capacity(records.len());
+    let mut sig_slot: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut bucket_slot: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut seen_dedup: BTreeSet<&str> = BTreeSet::new();
+    for record in records {
+        match record {
+            GraphRecord::Node {
+                id,
+                log: Some(payload),
+                ..
+            } => match payload.as_ref() {
+                crate::ir::LogPayload::ErrorSignature(_) => {
+                    if let Some(&idx) = sig_slot.get(id.as_str()) {
+                        merge_error_signature_into(&mut out[idx], record);
+                    } else {
+                        sig_slot.insert(id.as_str(), out.len());
+                        out.push(record.clone());
+                    }
+                }
+                crate::ir::LogPayload::LogOccurrenceBucket(_) => {
+                    if let Some(&idx) = bucket_slot.get(id.as_str()) {
+                        merge_bucket_into(&mut out[idx], record);
+                    } else {
+                        bucket_slot.insert(id.as_str(), out.len());
+                        out.push(record.clone());
+                    }
+                }
+                crate::ir::LogPayload::LogSource(_) | crate::ir::LogPayload::LogEvent(_) => {
+                    if seen_dedup.insert(id.as_str()) {
+                        out.push(record.clone());
+                    }
+                }
+            },
+            GraphRecord::Edge { id, label, .. } if is_log_domain_edge(label.as_str()) => {
+                if seen_dedup.insert(id.as_str()) {
+                    out.push(record.clone());
+                }
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
 /// Builds the `error_signatures` summary rows (AC1) from the in-window signature
 /// nodes plus the exemplar (`FINGERPRINTED_AS`) and frame-resolution
 /// (`FRAME_RESOLVES_TO`) joins over the whole record set. Redaction-safe: every
@@ -3115,6 +3302,17 @@ pub fn assemble_pack(
     };
 
     let mut diagnostics: Vec<PackDiagnostic> = Vec::new();
+
+    // --- coalesce duplicate log records by stable ID (issue #340, round-6 P2) ---
+    // A concatenated multi-scan graph carries the SAME stable log ID once per scan
+    // (a `LogSource` is a non-identity input). Merge those BEFORE window filtering
+    // and summary building so exactly one row per signature/bucket ID flows into
+    // both the hashed section nodes AND the derived summary — otherwise assemble
+    // would emit duplicate rows its own `verify_pack` rejects. No-op for a
+    // single-scan graph (no duplicate log IDs), so every existing pack is
+    // byte-identical.
+    let coalesced = coalesce_log_records(records);
+    let records = coalesced.as_slice();
 
     // --- capability availability (whole record set) ---
     let mut any_pr = false;
@@ -11347,14 +11545,201 @@ mod pack340_tests {
         );
     }
 
+    // ── Codex round-6 P2: concatenated multi-scan coalescing ─────────────────
+    // A `LogSource` is a NON-identity input, so the SAME repo's `scan-logs` output
+    // concatenated (a documented, legitimate multi-scan workflow) carries the same
+    // stable `ErrorSignature` / `LogOccurrenceBucket` ID once per scan. Before the
+    // fix, assemble emitted one summary row per PHYSICAL record and its own offline
+    // `verify_pack` (one row per signature) rejected the freshly assembled pack.
+    // The fix coalesces duplicate log records by stable ID at assemble time.
+
+    /// The `build_log_incident_records()` graph concatenated with itself: every
+    /// stable log ID appears TWICE, exactly as `cat scanA.jsonl scanB.jsonl` of one
+    /// repo's identical scans would produce. Summed occurrence counts double; merged
+    /// first/last-seen are unchanged (identical copies).
+    fn concatenated_multi_scan_records() -> Vec<GraphRecord> {
+        let mut records = build_log_incident_records();
+        let dup = build_log_incident_records();
+        records.extend(dup);
+        records
+    }
+
+    /// Two DISTINCT scans of one repo producing the SAME stable `ErrorSignature`
+    /// ID (`log:v1:sigX`) with DIFFERENT `LogSource`, DIFFERENT first/last-seen, and
+    /// an overlapping/summable bucket (`log:v1:bx-00`, same hour, per-scan counts).
+    /// Proves the merge keeps the earliest `first_seen`, the latest `last_seen`, and
+    /// the SUMMED occurrence counts — not a doubled-then-rejected or halved value.
+    fn two_scan_differing_extents_records() -> Vec<GraphRecord> {
+        vec![
+            // Scan A: narrow span, count 10; bucket count 4.
+            error_signature(
+                "log:v1:sigX",
+                "error",
+                "flaky upstream TIMEOUT",
+                "2026-03-03T09:00:00Z",
+                "2026-03-03T12:00:00Z",
+                10,
+                None,
+            ),
+            super::fixture::occurrence_bucket("log:v1:bx-00", "2026-03-03T00:00:00Z", 4),
+            super::fixture::aggregates("log:v1:bx-00", "log:v1:sigX"),
+            // Scan B: EARLIER first_seen, LATER last_seen, count 25; SAME bucket ID,
+            // count 6 (distinct scan of the same hour).
+            error_signature(
+                "log:v1:sigX",
+                "error",
+                "flaky upstream TIMEOUT",
+                "2026-03-02T08:00:00Z",
+                "2026-03-04T15:00:00Z",
+                25,
+                None,
+            ),
+            super::fixture::occurrence_bucket("log:v1:bx-00", "2026-03-03T00:00:00Z", 6),
+            super::fixture::aggregates("log:v1:bx-00", "log:v1:sigX"),
+        ]
+    }
+
+    #[test]
+    fn assemble_coalesces_concatenated_multi_scan_and_passes_verify() {
+        // REGRESSION GUARD (Codex round-6 P2): a concatenated multi-scan graph must
+        // assemble into a pack that passes its OWN offline verify. Before the fix the
+        // duplicate physical records produced duplicate summary rows that
+        // `verify_pack` rejected.
+        let records = concatenated_multi_scan_records();
+        let pack = assemble_cc73(&records);
+        let report = verify_pack(&pack);
+        assert!(
+            report.ok,
+            "concatenated multi-scan pack must pass its own verify: {:?} / {:?}",
+            report.integrity, report.window_consistency
+        );
+
+        // Exactly ONE error_signatures row per stable signature ID (three, not six).
+        let sig_sec = section(&pack, EvidenceClass::ErrorSignatures);
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = &sig_sec.log_summary else {
+            panic!("error_signatures summary present");
+        };
+        let mut ids: Vec<&str> = signatures.iter().map(|r| r.signature_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            ["log:v1:sig1", "log:v1:sig2", "log:v1:sig3"],
+            "one coalesced row per signature ID"
+        );
+        assert_eq!(
+            sig_sec.record_count, 3,
+            "one hashed ErrorSignature node per stable ID"
+        );
+
+        // Summed (doubled) occurrence counts on the merged section nodes.
+        for br in &sig_sec.records {
+            if let Some(crate::ir::LogPayload::ErrorSignature(p)) = node_log_payload(&br.record) {
+                let expected = match br.record.id() {
+                    "log:v1:sig1" => 240, // 120 x 2 scans
+                    "log:v1:sig2" => 60,  // 30 x 2
+                    "log:v1:sig3" => 6,   // 3 x 2
+                    other => panic!("unexpected signature {other}"),
+                };
+                assert_eq!(
+                    p.occurrence_count,
+                    expected,
+                    "merged occurrence_count summed across scans for {}",
+                    br.record.id()
+                );
+            }
+        }
+
+        // Occurrence-bucket totals are SUMMED across the scans, never rejected as
+        // duplicates. sig1's 15 in-window buckets carry counts (1..15) x 2 scans.
+        let occ_sec = section(&pack, EvidenceClass::OccurrenceBuckets);
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &occ_sec.log_summary
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        let sig1_total = signature_totals
+            .iter()
+            .find(|t| t.signature_id == "log:v1:sig1")
+            .expect("sig1 total");
+        // Single-scan sum is 1+2+..+15 = 120; concatenated twice = 240.
+        assert_eq!(
+            sig1_total.in_window_occurrences, 240,
+            "sig1 in_window_occurrences summed across the two scans"
+        );
+        // One bucket row per stable bucket ID (15 for sig1), never doubled rows.
+        assert_eq!(sig1_total.buckets.len(), 15, "one row per stable bucket ID");
+    }
+
+    #[test]
+    fn assemble_merges_differing_extents_across_two_scans() {
+        // Two DISTINCT scans of the same signature ID: earliest first_seen, latest
+        // last_seen, SUMMED occurrence counts.
+        let records = two_scan_differing_extents_records();
+        let pack = assemble_cc73(&records);
+        assert!(
+            verify_pack(&pack).ok,
+            "two-scan merged pack must pass its own verify"
+        );
+
+        let sig_sec = section(&pack, EvidenceClass::ErrorSignatures);
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = &sig_sec.log_summary else {
+            panic!("error_signatures summary present");
+        };
+        assert_eq!(signatures.len(), 1, "one coalesced signature row");
+        let row = &signatures[0];
+        assert_eq!(row.signature_id, "log:v1:sigX");
+        assert_eq!(
+            row.first_seen_in_window, "2026-03-02T08:00:00Z",
+            "merged first_seen is the EARLIEST across scans"
+        );
+        assert_eq!(
+            row.last_seen_in_window, "2026-03-04T15:00:00Z",
+            "merged last_seen is the LATEST across scans"
+        );
+
+        // Merged node occurrence_count = 10 + 25 = 35 (summed, not halved/doubled).
+        let merged_count = sig_sec
+            .records
+            .iter()
+            .find_map(|br| match node_log_payload(&br.record) {
+                Some(crate::ir::LogPayload::ErrorSignature(p)) => Some(p.occurrence_count),
+                _ => None,
+            })
+            .expect("merged signature node");
+        assert_eq!(
+            merged_count, 35,
+            "occurrence_count summed across the two scans"
+        );
+
+        // Bucket total = 4 + 6 = 10 (summed across the same-hour scans).
+        let occ_sec = section(&pack, EvidenceClass::OccurrenceBuckets);
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &occ_sec.log_summary
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        assert_eq!(signature_totals.len(), 1);
+        assert_eq!(
+            signature_totals[0].in_window_occurrences, 10,
+            "bucket count summed across the two scans"
+        );
+        assert_eq!(
+            signature_totals[0].buckets.len(),
+            1,
+            "one row per stable bucket ID"
+        );
+    }
+
     #[test]
     fn assemble_output_always_passes_verify_across_fixtures() {
         // The assemble->verify-clean invariant across every #340 fixture and both
         // log-bearing controls: assemble must never produce a pack its own offline
-        // verify rejects.
+        // verify rejects. Includes the concatenated multi-scan fixtures — the hole
+        // that let the round-6 regression through (the suite had only single-scan
+        // fixtures).
         let fixtures = [
             build_log_incident_records(),
             records_with_unattributed_bucket(),
+            concatenated_multi_scan_records(),
+            two_scan_differing_extents_records(),
         ];
         for records in &fixtures {
             for control in ["CC7.2", "CC7.3"] {
