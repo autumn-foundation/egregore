@@ -5,8 +5,8 @@ use std::{fs, path::PathBuf};
 
 use aletheia_egregore::{
     EdgeLabel, EmbeddingModel, ErrorSignaturePayload, EvidenceLink, GraphRecord,
-    LOG_SCHEMA_VERSION, LogPayload, MetricKind, NodeKind, SelectionBasis, SemanticDriftMetadata,
-    TemporalMetadata,
+    LOG_SCHEMA_VERSION, LogPayload, MetricKind, NodeKind, SCHEMA_VERSION, SelectionBasis,
+    SemanticDriftMetadata, TemporalMetadata,
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, FrameResolution, Graph,
         PROJECT_SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION,
@@ -981,4 +981,92 @@ fn query_subsystem_log_signatures_output_is_deterministic_5x() {
             "log_signatures output must be byte-identical across 5 runs (AC6)"
         );
     }
+}
+
+/// Build a fixture mirroring [`fixture_subsystem_with_logs`] where the resolved
+/// frame target (`alpha_sym`) is tombstoned while a live sibling (`alpha_file`)
+/// keeps `src/alpha` matched. A tombstoned non-temporal code target is deleted,
+/// so its signature must never surface in `log_signatures` (nor in `unresolved`).
+fn fixture_subsystem_tombstoned_frame_target() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("subsystem-logs-tombstoned.jsonl");
+
+    let alpha_sym_id = "codegraph:v4:intsublog_alpha_sym001".to_owned();
+    // Live sibling File keeps the prefix matched after the symbol is deleted.
+    let alpha_file = GraphRecord::node(
+        "file:sublog:alpha_a".to_owned(),
+        NodeKind::File,
+        Some("src/alpha/a.rs".to_owned()),
+        None,
+        Some("src/alpha/a.rs".to_owned()),
+        "file src/alpha/a.rs".to_owned(),
+    );
+    let alpha_sym = GraphRecord::symbol(
+        alpha_sym_id.clone(),
+        "fn",
+        "src/alpha/a.rs".to_owned(),
+        span(1, 20),
+        "alpha_handler".to_owned(),
+        "fn alpha_handler in src/alpha/a.rs".to_owned(),
+    );
+    // The tombstone that deletes the resolved frame target.
+    let alpha_sym_tombstone = GraphRecord::Tombstone {
+        id: "codegraph:v5:tombstone_alpha_sym".to_owned(),
+        schema_version: SCHEMA_VERSION,
+        deleted_id: alpha_sym_id.clone(),
+        summary: "alpha_handler was deleted".to_owned(),
+        producer: None,
+    };
+
+    let sig_alpha_id = "log:v1:sig_alpha";
+    let sig_alpha = error_signature(
+        sig_alpha_id,
+        "fatal",
+        7,
+        "2026-01-02T00:00:00Z",
+        "2026-01-03T00:00:00Z",
+    );
+    let sig_alpha_edge = frame_edge(sig_alpha_id, &alpha_sym_id, FrameResolution::Resolved, 0);
+
+    let mut graph = Graph::new();
+    for r in [
+        alpha_file,
+        alpha_sym,
+        alpha_sym_tombstone,
+        sig_alpha,
+        sig_alpha_edge,
+    ] {
+        graph.push(r);
+    }
+
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+    (temp, path)
+}
+
+#[test]
+fn query_subsystem_tombstoned_frame_target_excluded_from_log_signatures() {
+    let (_temp, graph) = fixture_subsystem_tombstoned_frame_target();
+    let parsed = run_subsystem("src/alpha", &graph);
+
+    // The signature's only resolved frame targets a tombstoned non-temporal code
+    // node: the deletion gate must drop the frame, so no signature surfaces.
+    let sigs = parsed["log_signatures"]
+        .as_array()
+        .expect("log_signatures array");
+    assert!(
+        sigs.is_empty(),
+        "a signature whose only frame targets a tombstoned code node must not \
+         appear in log_signatures, got {sigs:?}"
+    );
+
+    // The tombstoned target must not leak through the unresolved section either.
+    let unresolved = parsed["unresolved"].as_array().expect("unresolved array");
+    assert!(
+        unresolved.iter().all(|u| {
+            u["target_handle"] != "codegraph:v4:intsublog_alpha_sym001"
+                && u["source_record_id"] != "log:v1:sig_alpha"
+        }),
+        "tombstoned frame target must not surface in unresolved: {unresolved:?}"
+    );
 }

@@ -715,8 +715,13 @@ pub fn subsystem_context<'a>(
     // frames land under the prefix. Unresolved/ambiguous-only signatures never
     // enter this section; their in-prefix dangling targets are routed into the
     // existing `unresolved` collection so they are never silently dropped.
-    let (log_signatures, extra_unresolved) =
-        collect_log_signatures(records, &by_id, &tombstoned_ids, normalized);
+    let (log_signatures, extra_unresolved) = collect_log_signatures(
+        records,
+        &by_id,
+        &tombstoned_ids,
+        &has_any_temporal_version,
+        normalized,
+    );
     unresolved.extend(extra_unresolved);
 
     Ok(SubsystemContext {
@@ -795,6 +800,7 @@ fn collect_log_signatures<'a>(
     records: &'a [GraphRecord],
     by_id: &BTreeMap<&'a str, &'a GraphRecord>,
     tombstoned_ids: &BTreeSet<&str>,
+    has_any_temporal_version: &BTreeSet<&str>,
     prefix: &str,
 ) -> (Vec<SubsystemLogSignature<'a>>, Vec<UnresolvedRef>) {
     // Step 1: read FRAME_RESOLVES_TO edges, grouped by signature id. The
@@ -863,6 +869,14 @@ fn collect_log_signatures<'a>(
         if let Some(frames) = frames_by_sig.get(*sig_id) {
             for fr in frames {
                 let target = by_id.get(fr.target_id).copied();
+                // A tombstoned non-temporal code target is deleted: never surface a
+                // frame (or a dangling handle) against it — mirror the tombstone gate
+                // the rest of subsystem_context applies to code nodes.
+                if tombstoned_ids.contains(fr.target_id)
+                    && !has_any_temporal_version.contains(fr.target_id)
+                {
+                    continue;
+                }
                 let target_path = target.and_then(|r| match r {
                     GraphRecord::Node {
                         repo_relative_path: Some(p),
