@@ -302,6 +302,19 @@ lifecycle"), so a persistent store never reports a removed reviewer as still
 `STATE_SCHEMA_VERSION` bump: a state file written before it loads normally with an
 empty map (an absent prior reads as "no known edges" and emits no tombstone).
 
+**Prior requested-team tracking (`pr_team_diagnostics`, issue #335, Codex P2):**
+the exact sibling of `pr_request_edges` for the team lane. The state file also maps
+`"pr:<n>"` to the sorted **set of `github_team_review_request_unexpanded`
+`Diagnostic` record IDs** the PR emitted last run — its "prior team set". On a
+re-import whose `requested_teams` set **shrank**, the importer emits a
+`team_review_request_superseded` `Tombstone` retracting each dropped team diagnostic
+before persisting the new set (see §6, "REQUESTED team-diagnostic removal
+lifecycle"), so a persistent store never reports a removed team's review request as
+still live. An empty current set clears the entry. The field is `#[serde(default)]`
+(an empty `Vec<String>` map) and is **not** its own `STATE_SCHEMA_VERSION` bump: a
+state file written before it loads normally with an empty map (an absent prior reads
+as "no known diagnostics" and emits no tombstone).
+
 **Deferred endpoint ETag rule:** The v1 importer MUST NOT store ETags for
 deferred comment/review endpoints (`/issues/comments`, `/pulls/comments`,
 `/pulls/{n}/reviews`). Caching ETags before records are emitted would cause
@@ -597,6 +610,22 @@ Only the edge is retracted — the global `ExternalIdentity` node is **never**
 tombstoned (a login is a cross-PR fact), and an immutable `REVIEWED_BY` edge is
 never tombstoned (a review that happened is a fact; dismissals are #336's concern).
 
+**REQUESTED team-diagnostic removal lifecycle (issue #335, Codex P2):** the exact
+sibling of the `REQUESTED_REVIEW_FROM` removal lifecycle above, for the team lane. A
+PR emits one `github_team_review_request_unexpanded` `Diagnostic` per team currently
+in `requested_teams`, but that set **shrinks** whenever a team is removed or
+replaced. Because the importer is otherwise purely additive, a removed team's
+diagnostic would linger live in a persistent store and current-state queries would
+still report the removed team's review request. So — mirroring the reviewer-edge
+supersession discipline — the importer persists the PR's prior team-diagnostic set
+(`pr_team_diagnostics` in §5's state file) and, on each change, emits a
+`team_review_request_superseded` `Tombstone` naming each dropped diagnostic via
+`deleted_id` **before** persisting the new set. The generic revive-after-tombstone
+rule applies: re-requesting a removed team re-emits the **same** diagnostic id,
+whose later, higher-sequence node write supersedes the tombstone. Only the team
+diagnostic is retracted — never a `REQUESTED_REVIEW_FROM` edge, an `ExternalIdentity`
+node, or an immutable `REVIEWED_BY` edge.
+
 **`valid_time_source`:** All GitHub-sourced records use `github_updated_at`.
 **`source_kind`:** Issues use `github_issue`; PRs use `github_pr`; every `Review`
 node (issue_comment / pr_review / pr_review_comment) uses `github_review` — the
@@ -772,6 +801,7 @@ The test suite covers:
 | Review anchor seed-graph invalidation (issue #334) | A code graph added/changed after import re-resolves review anchors across a would-be `304`; outcome change tombstones the superseded artifact; resolved→superseded→resolved revives; unchanged seed stays idempotent |
 | Review anchor redaction carve-out (issue #334) | `review_commit_sha` survives a redaction-on export in plaintext; never enumerated as sensitive |
 | Requested-reviewer removal lifecycle (issue #335) | A PR whose `requested_reviewers` shrinks tombstones each dropped `REQUESTED_REVIEW_FROM` edge (`requested_review_superseded`, `deleted_id == edge_id`); the surviving reviewer's edge stays live; the `ExternalIdentity` node and `REVIEWED_BY` edges are never tombstoned; removed→re-requested revives; an unchanged reviewer set emits zero tombstones |
+| Requested-team removal lifecycle (issue #335, Codex P2) | A PR whose `requested_teams` shrinks tombstones each dropped `github_team_review_request_unexpanded` `Diagnostic` (`team_review_request_superseded`, `deleted_id == diagnostic_id`); the surviving team's diagnostic stays live; no `REQUESTED_REVIEW_FROM` edge, `ExternalIdentity` node, or `REVIEWED_BY` edge is tombstoned; removed→re-requested revives; an unchanged team set emits zero tombstones; changing both reviewers and teams tombstones both |
 | Stderr summary | Documented fields present on every run |
 
 Implementation of behaviour tests is deferred to the `eg import github` CLI

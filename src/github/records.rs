@@ -1516,6 +1516,73 @@ pub fn request_review_edge_tombstone(number: u64, deleted_id: &str) -> GraphReco
     }
 }
 
+/// The current set of `github_team_review_request_unexpanded` `Diagnostic` record
+/// ids a PR would emit (issue #335, Codex P2) — one per non-empty requested-team
+/// slug.
+///
+/// Returned sorted and deduplicated so it is a stable set for the prior/current
+/// comparison in [`crate::github::import`]. Reuses [`team_review_diagnostic_id`]'s
+/// exact recipe, so the id computed here equals the id the emitter mints; the
+/// importer persists this as the PR's prior team set and any prior diagnostic id
+/// NOT in the current set is a team removed since the last run, retracted via
+/// [`team_review_diagnostic_tombstone`].
+#[must_use]
+pub fn team_review_diagnostic_ids(source_repo: &str, pr: &model::PullRequest) -> Vec<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    for team in &pr.requested_teams {
+        if team.slug.is_empty() {
+            continue;
+        }
+        ids.insert(team_review_diagnostic_id(
+            source_repo,
+            pr.number,
+            &team.slug,
+        ));
+    }
+    ids.into_iter().collect()
+}
+
+/// Builds a `Tombstone` retracting a superseded
+/// `github_team_review_request_unexpanded` `Diagnostic`.
+///
+/// Issue #335, Codex P2; the requested-team sibling of
+/// [`request_review_edge_tombstone`]. Retracts the diagnostic for a team removed
+/// from a PR's requested-team set since the last run.
+///
+/// The tombstone ID is derived from `(pr, deleted_id)`, so it is deterministic,
+/// byte-identical across runs, and distinct per retracted diagnostic (a
+/// requested → removed → re-requested cycle mints one tombstone per removal). Its
+/// supersession reason (`team_review_request_superseded`) differs from the
+/// reviewer-edge reason, so the two tombstone families never collide.
+/// `deleted_id` (the diagnostic id) drives the embedded adapter's current-view
+/// suppression so a persistent store stops surfacing the removed team's review
+/// request; re-requesting the team re-emits the same diagnostic id, which the
+/// adapter's node write revive-after-tombstone then supersedes. Only the team
+/// diagnostic is retracted — never a reviewer edge, an identity node, or a
+/// `REVIEWED_BY` edge.
+#[must_use]
+pub fn team_review_diagnostic_tombstone(number: u64, deleted_id: &str) -> GraphRecord {
+    let native = format!("pr:{number}");
+    let id = project_stable_id(&[
+        "project",
+        "Tombstone",
+        IMPORTER_ID,
+        &native,
+        "team_review_request_superseded",
+        deleted_id,
+    ]);
+    GraphRecord::Tombstone {
+        id,
+        schema_version: PROJECT_SCHEMA_VERSION,
+        deleted_id: deleted_id.to_owned(),
+        summary: format!(
+            "[team_review_request_superseded] PR #{number} requested-team set changed; \
+             retracting superseded github_team_review_request_unexpanded diagnostic {deleted_id}"
+        ),
+        producer: None,
+    }
+}
+
 /// Convenience that folds an iterator of [`Emitted`] into one.
 pub fn merge(parts: impl IntoIterator<Item = Emitted>) -> Emitted {
     let mut acc = Emitted::default();
@@ -2764,6 +2831,78 @@ mod tests {
         assert_ne!(
             a.id(),
             request_review_edge_tombstone(7, "project:v1:other").id()
+        );
+    }
+
+    #[test]
+    fn team_review_diagnostic_ids_match_emitted_diagnostic_ids() {
+        // The prior/current diff set must equal, byte-for-byte, the ids the
+        // emitter mints for github_team_review_request_unexpanded diagnostics
+        // (#335, Codex P2 — the requested-team analog of the reviewer-edge case).
+        let files = FileIndex::new();
+        let c = ctx("o/r", &files, &identity);
+        let pr = sample_pull(7, &["alice"], &["frontend", "backend"]);
+        let emitted: std::collections::BTreeSet<String> = diagnostics_with_code(
+            &pull_records(&c, &pr),
+            "github_team_review_request_unexpanded",
+        )
+        .iter()
+        .map(|r| r.id().to_owned())
+        .collect();
+        let computed: std::collections::BTreeSet<String> =
+            team_review_diagnostic_ids("o/r", &pr).into_iter().collect();
+        assert_eq!(
+            computed, emitted,
+            "computed team-diagnostic id set must equal the emitted diagnostic ids"
+        );
+        // Sorted + deduplicated, one per non-empty slug.
+        assert_eq!(team_review_diagnostic_ids("o/r", &pr).len(), 2);
+    }
+
+    #[test]
+    fn team_review_diagnostic_ids_skip_empty_slugs() {
+        let pr = sample_pull(7, &[], &["backend", ""]);
+        assert_eq!(
+            team_review_diagnostic_ids("o/r", &pr).len(),
+            1,
+            "an empty team slug mints no diagnostic id"
+        );
+    }
+
+    #[test]
+    fn team_review_diagnostic_tombstone_is_deterministic_repo_scoped_and_carries_deleted_id() {
+        let deleted = "project:v1:some-team-diagnostic";
+        let a = team_review_diagnostic_tombstone(7, deleted);
+        let b = team_review_diagnostic_tombstone(7, deleted);
+        assert_eq!(a.id(), b.id(), "tombstone id is deterministic");
+        let GraphRecord::Tombstone {
+            id,
+            deleted_id,
+            summary,
+            ..
+        } = &a
+        else {
+            panic!("expected a tombstone");
+        };
+        assert!(id.starts_with("project:v1:"));
+        assert_eq!(
+            deleted_id, deleted,
+            "deleted_id is the retracted diagnostic id"
+        );
+        assert!(summary.contains("team_review_request_superseded"));
+        // Distinct per PR (the native handle is repo-agnostic but PR-scoped) and
+        // per retracted target.
+        assert_ne!(a.id(), team_review_diagnostic_tombstone(8, deleted).id());
+        assert_ne!(
+            a.id(),
+            team_review_diagnostic_tombstone(7, "project:v1:other").id()
+        );
+        // The team-diagnostic supersession reason is distinct from the
+        // reviewer-edge one, so the two tombstone families never collide.
+        assert_ne!(
+            a.id(),
+            request_review_edge_tombstone(7, deleted).id(),
+            "team-diagnostic and request-edge tombstones never share an id"
         );
     }
 

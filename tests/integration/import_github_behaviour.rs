@@ -3583,3 +3583,337 @@ fn re_requested_reviewer_edge_is_revived_and_unchanged_import_emits_no_tombstone
         "re-requesting erin emits no fresh tombstone for her edge: {j4}"
     );
 }
+
+// ── Issue #335 (Codex P2): removed requested teams are tombstoned ─────────────
+//
+// The importer emits one `github_team_review_request_unexpanded` Diagnostic per
+// team CURRENTLY in a PR's `requested_teams` — the exact sibling of the
+// REQUESTED_REVIEW_FROM edge case above, and with the exact same staleness gap.
+// When that team set shrinks (a team is removed or replaced) the importer is
+// otherwise purely additive, so the previously-emitted diagnostic for the removed
+// team would linger LIVE in a persistent store and current-state queries would
+// still report the removed team's review request. The changed set must retract
+// each dropped team's diagnostic via a `Tombstone(deleted_id == diagnostic_id)`,
+// mirroring the reviewer-edge supersession discipline — and only the team
+// diagnostic, never a reviewer edge, identity node, or REVIEWED_BY edge.
+
+/// The `github_team_review_request_unexpanded` Diagnostic record id for team
+/// `slug` on PR `n`, read from the emitted JSONL.
+fn team_diagnostic_id_for(jsonl: &str, n: u64, slug: &str) -> String {
+    let needle_pr = format!("PR #{n} ");
+    let needle_team = format!("team '{slug}'");
+    nodes_of_kind(jsonl, "Diagnostic")
+        .into_iter()
+        .find(|v| {
+            v["summary"].as_str().is_some_and(|s| {
+                s.contains("github_team_review_request_unexpanded")
+                    && s.contains(&needle_pr)
+                    && s.contains(&needle_team)
+            })
+        })
+        .and_then(|v| v["id"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("team diagnostic for {slug} on PR#{n} must exist"))
+}
+
+/// Count of live `github_team_review_request_unexpanded` Diagnostic nodes in the
+/// JSONL (across all PRs).
+fn team_diagnostic_count(jsonl: &str) -> usize {
+    nodes_of_kind(jsonl, "Diagnostic")
+        .into_iter()
+        .filter(|v| {
+            v["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("github_team_review_request_unexpanded"))
+        })
+        .count()
+}
+
+/// The tombstones whose own summary marks them as team-diagnostic supersessions.
+fn team_tombstones(jsonl: &str) -> Vec<serde_json::Value> {
+    tombstones(jsonl)
+        .into_iter()
+        .filter(|t| {
+            t["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("team_review_request_superseded"))
+        })
+        .collect()
+}
+
+/// `reviewer_identity_routes` with PR #1's requested TEAMS, `updated_at`, and the
+/// `/pulls` `ETag` overridden — reviewers stay [dave, erin] so the team set can be
+/// shrunk or grown while the reviewer edges stay constant and PR #2 stays
+/// byte-identical.
+fn reviewer_routes_pr1_teams(
+    teams: &[&str],
+    updated_at: &str,
+    pulls_etag: &str,
+) -> HashMap<String, Canned> {
+    let mut routes = reviewer_identity_routes();
+    let team_json: Vec<serde_json::Value> = teams
+        .iter()
+        .map(|s| serde_json::json!({ "slug": s }))
+        .collect();
+    let pulls = serde_json::json!([
+        {
+            "number": 1, "title": "PR one", "body": null, "state": "closed",
+            "merged_at": "2026-01-05T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "carol"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": updated_at,
+            "requested_reviewers": [{"login": "dave"}, {"login": "erin"}],
+            "requested_teams": team_json,
+            "html_url": "https://github.com/o/r/pull/1"
+        },
+        {
+            "number": 2, "title": "PR two", "body": null, "state": "closed",
+            "merged_at": "2026-01-06T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "frank"},
+            "created_at": "2026-01-02T00:00:00Z", "updated_at": "2026-01-06T00:00:00Z",
+            "requested_reviewers": [{"login": "grace"}],
+            "requested_teams": [],
+            "html_url": "https://github.com/o/r/pull/2"
+        }
+    ])
+    .to_string();
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, pulls_etag),
+    );
+    routes
+}
+
+#[test]
+fn removed_requested_team_diagnostic_is_tombstoned_survivor_and_reviewers_untouched() {
+    let server = MockServer::start(reviewer_routes_pr1_teams(
+        &["backend", "frontend"],
+        "2026-01-05T00:00:00Z",
+        "\"pulls-335-teams-both\"",
+    ));
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+
+    // 1. Fresh import: PR #1 requests teams [backend, frontend] → 2 team
+    //    diagnostics. Capture backend's diagnostic id.
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    assert_eq!(team_diagnostic_count(&j1), 2, "two team diagnostics: {j1}");
+    let backend_diag_id = team_diagnostic_id_for(&j1, 1, "backend");
+    let frontend_diag_id = team_diagnostic_id_for(&j1, 1, "frontend");
+
+    // 2. Re-import with backend dropped from PR #1 (now [frontend] only). The
+    //    removed team's diagnostic must be retracted via exactly one Tombstone;
+    //    frontend's diagnostic stays live; reviewers/identities are untouched.
+    server.set_routes(reviewer_routes_pr1_teams(
+        &["frontend"],
+        "2026-01-07T00:00:00Z",
+        "\"pulls-335-teams-drop-backend\"",
+    ));
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(&server.base_url, &out2, &state, &[]);
+    assert!(ok2);
+
+    let team_ts = team_tombstones(&j2);
+    assert_eq!(
+        team_ts.len(),
+        1,
+        "exactly one team Tombstone (backend's removed diagnostic) must be emitted: {j2}"
+    );
+    assert_eq!(
+        team_ts[0]["deleted_id"].as_str(),
+        Some(backend_diag_id.as_str()),
+        "the Tombstone must retract backend's team-review diagnostic id"
+    );
+    // No REQUESTED_REVIEW_FROM edge is tombstoned — only the team diagnostic.
+    assert_eq!(
+        tombstones(&j2).len(),
+        1,
+        "only the team diagnostic is tombstoned, no reviewer edge: {j2}"
+    );
+    // The surviving team's diagnostic is re-emitted live with its same stable id.
+    assert_eq!(
+        team_diagnostic_id_for(&j2, 1, "frontend"),
+        frontend_diag_id,
+        "the surviving team's diagnostic keeps its stable id"
+    );
+    assert_eq!(
+        team_diagnostic_count(&j2),
+        1,
+        "only the surviving team (frontend) re-emits a live diagnostic: {j2}"
+    );
+    // Reviewers on PR #1 are unchanged, so their identities and edges re-emit
+    // exactly as before and none is tombstoned.
+    assert_eq!(
+        edges_of_label(&j2, "REQUESTED_REVIEW_FROM"),
+        2,
+        "both reviewers (dave, erin) re-emit their live edges; none is tombstoned"
+    );
+    let dave_edge = request_edge_id_for(&j1, 1, "dave");
+    let erin_edge = request_edge_id_for(&j1, 1, "erin");
+    assert!(
+        !tombstones(&j2).iter().any(|t| {
+            let d = t["deleted_id"].as_str();
+            d == Some(dave_edge.as_str()) || d == Some(erin_edge.as_str())
+        }),
+        "no reviewer edge may be tombstoned: {j2}"
+    );
+}
+
+#[test]
+fn re_requested_team_diagnostic_is_revived_and_unchanged_import_emits_no_team_tombstones() {
+    let server = MockServer::start(reviewer_routes_pr1_teams(
+        &["backend", "frontend"],
+        "2026-01-05T00:00:00Z",
+        "\"pulls-335-teams-both-2\"",
+    ));
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+
+    // 1. Fresh import: PR #1 requests teams [backend, frontend].
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    let backend_diag_id = team_diagnostic_id_for(&j1, 1, "backend");
+
+    // 2. Drop backend → backend's diagnostic is tombstoned.
+    server.set_routes(reviewer_routes_pr1_teams(
+        &["frontend"],
+        "2026-01-07T00:00:00Z",
+        "\"pulls-335-teams-drop\"",
+    ));
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(&server.base_url, &out2, &state, &[]);
+    assert!(ok2);
+    assert!(
+        team_tombstones(&j2)
+            .iter()
+            .any(|t| t["deleted_id"].as_str() == Some(backend_diag_id.as_str())),
+        "dropping backend tombstones its team diagnostic"
+    );
+
+    // 3. Unchanged re-import (same [frontend] payload, forced 200 via a new ETag):
+    //    the team set is identical, so NO team tombstone is emitted and no team
+    //    diagnostic re-emits (idempotency).
+    server.set_routes(reviewer_routes_pr1_teams(
+        &["frontend"],
+        "2026-01-07T00:00:00Z",
+        "\"pulls-335-teams-drop-again\"",
+    ));
+    let out3 = tmp.path().join("g3.jsonl");
+    let (j3, _, ok3) = run_import(&server.base_url, &out3, &state, &[]);
+    assert!(ok3);
+    assert_eq!(
+        team_tombstones(&j3).len(),
+        0,
+        "an unchanged team set emits zero team tombstones: {j3}"
+    );
+    assert_eq!(
+        team_diagnostic_count(&j3),
+        0,
+        "an unchanged team set re-emits no team diagnostics"
+    );
+
+    // 4. Re-request backend ([backend, frontend] again): its diagnostic is
+    //    REVIVED — re-emitted live with the SAME stable id — and, because nothing
+    //    was removed, no new team tombstone fires. The embedded adapter's
+    //    revive-after-tombstone (a fresh node write post-dating the tombstone)
+    //    then supersedes the tombstone in a persistent store.
+    server.set_routes(reviewer_routes_pr1_teams(
+        &["backend", "frontend"],
+        "2026-01-08T00:00:00Z",
+        "\"pulls-335-teams-readd\"",
+    ));
+    let out4 = tmp.path().join("g4.jsonl");
+    let (j4, _, ok4) = run_import(&server.base_url, &out4, &state, &[]);
+    assert!(ok4);
+    assert_eq!(
+        team_diagnostic_id_for(&j4, 1, "backend"),
+        backend_diag_id,
+        "the revived team diagnostic carries the same stable id"
+    );
+    assert_eq!(
+        team_diagnostic_count(&j4),
+        2,
+        "both teams (backend, frontend) re-emit live diagnostics on the re-request"
+    );
+    assert!(
+        !team_tombstones(&j4)
+            .iter()
+            .any(|t| t["deleted_id"].as_str() == Some(backend_diag_id.as_str())),
+        "re-requesting backend emits no fresh tombstone for its diagnostic: {j4}"
+    );
+}
+
+#[test]
+fn changing_both_reviewers_and_teams_tombstones_both() {
+    // Bonus combined case: a PR that changes BOTH its reviewer set and its team
+    // set on one re-import must tombstone the removed reviewer's edge AND the
+    // removed team's diagnostic — the two supersession lanes are independent.
+    let server = MockServer::start(reviewer_routes_pr1_teams(
+        &["backend", "frontend"],
+        "2026-01-05T00:00:00Z",
+        "\"pulls-335-both-lanes\"",
+    ));
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    let erin_edge_id = request_edge_id_for(&j1, 1, "erin");
+    let backend_diag_id = team_diagnostic_id_for(&j1, 1, "backend");
+
+    // Drop erin (reviewers → [dave]) AND drop backend (teams → [frontend]).
+    let mut routes = reviewer_routes_pr1_teams(
+        &["frontend"],
+        "2026-01-09T00:00:00Z",
+        "\"pulls-335-both-lanes-v2\"",
+    );
+    let pulls = serde_json::json!([
+        {
+            "number": 1, "title": "PR one", "body": null, "state": "closed",
+            "merged_at": "2026-01-05T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "carol"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-09T00:00:00Z",
+            "requested_reviewers": [{"login": "dave"}],
+            "requested_teams": [{"slug": "frontend"}],
+            "html_url": "https://github.com/o/r/pull/1"
+        },
+        {
+            "number": 2, "title": "PR two", "body": null, "state": "closed",
+            "merged_at": "2026-01-06T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "frank"},
+            "created_at": "2026-01-02T00:00:00Z", "updated_at": "2026-01-06T00:00:00Z",
+            "requested_reviewers": [{"login": "grace"}],
+            "requested_teams": [],
+            "html_url": "https://github.com/o/r/pull/2"
+        }
+    ])
+    .to_string();
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, "\"pulls-335-both-lanes-v2\""),
+    );
+    server.set_routes(routes);
+
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(&server.base_url, &out2, &state, &[]);
+    assert!(ok2);
+
+    let ts = tombstones(&j2);
+    assert!(
+        ts.iter()
+            .any(|t| t["deleted_id"].as_str() == Some(erin_edge_id.as_str())),
+        "erin's removed request edge is tombstoned: {j2}"
+    );
+    assert!(
+        ts.iter()
+            .any(|t| t["deleted_id"].as_str() == Some(backend_diag_id.as_str())),
+        "backend's removed team diagnostic is tombstoned: {j2}"
+    );
+    assert_eq!(
+        ts.len(),
+        2,
+        "exactly two tombstones: one reviewer edge + one team diagnostic: {j2}"
+    );
+}

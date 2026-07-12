@@ -175,6 +175,25 @@ pub struct State {
     /// tombstone.
     #[serde(default)]
     pub pr_request_edges: BTreeMap<String, Vec<String>>,
+    /// Maps `"pr:<n>"` to the sorted set of `github_team_review_request_unexpanded`
+    /// `Diagnostic` record IDs the PR emitted on the last run — its "prior team
+    /// set" (issue #335, Codex P2, the requested-team sibling of
+    /// `pr_request_edges`).
+    ///
+    /// A PR emits one `github_team_review_request_unexpanded` diagnostic per team
+    /// currently in its `requested_teams`. That set shrinks whenever a team is
+    /// removed or replaced. The importer is otherwise purely additive, so without
+    /// tracking the prior set a removed team's diagnostic would linger LIVE in a
+    /// persistent store and current-state queries would still report the removed
+    /// team's review request. Persisting the prior set lets a changed re-import
+    /// retract each dropped diagnostic via a `Tombstone`
+    /// (`deleted_id == diagnostic_id`) before persisting the new set. Only the
+    /// team diagnostic is retracted — never a reviewer edge, an identity node, or
+    /// an immutable `REVIEWED_BY` edge. A `#[serde(default)]` empty map means
+    /// legacy state loads without a schema bump: a missing prior set is "no known
+    /// diagnostics", which safely emits no tombstone.
+    #[serde(default)]
+    pub pr_team_diagnostics: BTreeMap<String, Vec<String>>,
     /// Fingerprint of the seeded code graph relevant to PR merge-link resolution
     /// (issue #333, Codex round-5). PR merge-link resolution depends on the local
     /// seed graph, which GitHub's `/pulls` `ETag` cannot see; this gates the
@@ -203,6 +222,7 @@ impl State {
             pr_merge_artifacts: BTreeMap::new(),
             review_commit_artifacts: BTreeMap::new(),
             pr_request_edges: BTreeMap::new(),
+            pr_team_diagnostics: BTreeMap::new(),
             code_graph_fingerprint: None,
         }
     }
@@ -361,6 +381,28 @@ impl State {
             self.pr_request_edges.remove(&key);
         } else {
             self.pr_request_edges.insert(key, edge_ids);
+        }
+    }
+
+    /// Returns the `github_team_review_request_unexpanded` diagnostic ids the PR
+    /// keyed by `key` (`"pr:<n>"`) emitted last run — its prior team set (issue
+    /// #335, Codex P2). An empty slice means no tracked diagnostics (legacy state
+    /// or a PR that has never requested a team), which safely emits no tombstone.
+    #[must_use]
+    pub fn prior_team_diagnostics(&self, key: &str) -> &[String] {
+        self.pr_team_diagnostics.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// Records the current `github_team_review_request_unexpanded` diagnostic ids
+    /// for `key` (`"pr:<n>"`). A non-empty set is stored as the new prior set; an
+    /// EMPTY set clears the entry (the PR requests no teams, so no stale
+    /// diagnostic can exist to retract on a later change), keeping the map minimal
+    /// and deterministic (issue #335, Codex P2).
+    pub fn set_team_diagnostics(&mut self, key: String, diagnostic_ids: Vec<String>) {
+        if diagnostic_ids.is_empty() {
+            self.pr_team_diagnostics.remove(&key);
+        } else {
+            self.pr_team_diagnostics.insert(key, diagnostic_ids);
         }
     }
 }
@@ -879,6 +921,80 @@ mod tests {
                 "project:v1:edge-dave".to_owned()
             ],
             "migration must retain pr_request_edges so removed reviewers can be tombstoned"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn team_diagnostics_round_trip_and_empty_set_clears_entry() {
+        let mut s = State::fresh("o/r", "x");
+        assert!(s.prior_team_diagnostics("pr:1").is_empty());
+        s.set_team_diagnostics(
+            "pr:1".to_owned(),
+            vec![
+                "project:v1:diag-a".to_owned(),
+                "project:v1:diag-b".to_owned(),
+            ],
+        );
+        assert_eq!(
+            s.prior_team_diagnostics("pr:1"),
+            [
+                "project:v1:diag-a".to_owned(),
+                "project:v1:diag-b".to_owned()
+            ]
+        );
+        // An empty set clears the entry (no stale diagnostic to retract later).
+        s.set_team_diagnostics("pr:1".to_owned(), Vec::new());
+        assert!(s.prior_team_diagnostics("pr:1").is_empty());
+        assert!(!s.pr_team_diagnostics.contains_key("pr:1"));
+    }
+
+    #[test]
+    fn legacy_state_without_pr_team_diagnostics_loads_empty() {
+        // A version-4 state file lacking `pr_team_diagnostics` (the additive
+        // #[serde(default)] field) must load with an empty map rather than fail.
+        let dir = std::env::temp_dir().join(format!("egst-legacy-team-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"schema_version":{STATE_SCHEMA_VERSION},"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"resource_hashes":{{"pr:1":"abc"}}}}"#
+            ),
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert!(
+            s.pr_team_diagnostics.is_empty(),
+            "missing pr_team_diagnostics loads as an empty map"
+        );
+        assert!(s.prior_team_diagnostics("pr:1").is_empty());
+        assert!(s.is_unchanged("pr:1", "abc"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_old_state_retains_pr_team_diagnostics() {
+        // Issue #335 (Codex P2): a v2/v3 store carrying a populated
+        // `pr_team_diagnostics` map must retain it under v4 so a team removed on
+        // the first v4 run is still tombstoned against the prior set.
+        let dir = std::env::temp_dir().join(format!("egst-mig-team-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":3,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"pr_team_diagnostics":{"pr:1":["project:v1:diag-backend","project:v1:diag-frontend"]}}"#,
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
+        assert_eq!(
+            s.prior_team_diagnostics("pr:1"),
+            [
+                "project:v1:diag-backend".to_owned(),
+                "project:v1:diag-frontend".to_owned()
+            ],
+            "migration must retain pr_team_diagnostics so removed teams can be tombstoned"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

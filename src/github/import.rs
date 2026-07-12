@@ -201,6 +201,13 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             // the requested-reviewer supersession diff (#335, Codex P1). Folded
             // into `pull_hash`, so an unchanged hash guarantees an unchanged set.
             let current_request_edges = records::requested_review_edge_ids(opts.source_repo, &pr);
+            // The current set of github_team_review_request_unexpanded Diagnostic
+            // ids this PR emits, for the requested-team supersession diff (#335,
+            // Codex P2 — the exact sibling of the reviewer-edge case above). Folded
+            // into `pull_hash` (via requested_teams), so an unchanged hash
+            // guarantees an unchanged set.
+            let current_team_diagnostics =
+                records::team_review_diagnostic_ids(opts.source_repo, &pr);
             if state.is_unchanged(&key, &hash) {
                 // Backfill the tracked artifact id without emitting anything: a
                 // no-op on a store this build already wrote, but it populates a
@@ -211,7 +218,11 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                 // Backfill the prior request set likewise (#335, Codex P1) so a
                 // legacy store gains the tracking without a re-emit; the unchanged
                 // hash proves the request set is unchanged too.
-                state.set_request_edges(key, current_request_edges);
+                state.set_request_edges(key.clone(), current_request_edges);
+                // Backfill the prior team-diagnostic set likewise (#335, Codex P2)
+                // so a legacy store gains the tracking without a re-emit; the
+                // unchanged hash proves the team set is unchanged too.
+                state.set_team_diagnostics(key, current_team_diagnostics);
                 continue;
             }
             // Retract a superseded merge artifact whose outcome changed on this
@@ -256,9 +267,34 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                     },
                 );
             }
+            // Retract each github_team_review_request_unexpanded diagnostic whose
+            // team was removed from the PR's requested-team set since the last run
+            // (#335, Codex P2): the exact sibling of the reviewer-edge case above.
+            // Without this a removed team's diagnostic lingers live in a persistent
+            // store and current-state queries still report the removed team's
+            // review request. Only the diagnostic is tombstoned — never a reviewer
+            // edge, an identity node, or a REVIEWED_BY edge.
+            let removed_team_diagnostics: Vec<String> = state
+                .prior_team_diagnostics(&key)
+                .iter()
+                .filter(|prior| !current_team_diagnostics.iter().any(|c| c == *prior))
+                .cloned()
+                .collect();
+            for prior in &removed_team_diagnostics {
+                push_emitted(
+                    &mut graph,
+                    &mut emitted_count,
+                    &mut seen_identities,
+                    Emitted {
+                        records: vec![records::team_review_diagnostic_tombstone(pr.number, prior)],
+                        link_diagnostics: 0,
+                    },
+                );
+            }
             state.record_hash(key.clone(), hash);
             state.set_merge_artifact(key.clone(), current_artifact);
-            state.set_request_edges(key, current_request_edges);
+            state.set_request_edges(key.clone(), current_request_edges);
+            state.set_team_diagnostics(key, current_team_diagnostics);
             push_emitted(
                 &mut graph,
                 &mut emitted_count,
