@@ -44,6 +44,7 @@ eg audit evidence-pack assemble --control CC8.1 \
 | #60 protected artifacts | `protected:v1:` handles survive as citations; raw bytes never enter the pack. |
 | #333 PR head/base/merge SHAs | First-class PR Task fields drive merge-target and review joins. |
 | #334 reviewed-commit facts | *Not yet merged.* Two gap classes always report `capability_unavailable` (see below). |
+| #319/#320/#322/#326 log-graph | Runtime incident evidence folded into the CC7.x `error_signatures` / `occurrence_buckets` / `remediation_links` sections (issue #340; see below). |
 
 ## When to use `eg bundle export` instead
 
@@ -169,7 +170,8 @@ one of three honest families:
 |---------|---------|----------------------------------|
 | `commits` (`Commit`), `pull_requests` (`Task`/`github_pr`), `reviews` (genuine PR `Review` — see below), `structural_deltas` (`Change`), `verification_evidence` (`Verification`/`CommandRun`/`TestRun`/`CIStatus`/`CommandEvidence`/`BenchmarkRun`/`CoverageReport`/`ProofResult`) | real stored node kind | `<class>_domain_absent` (e.g. `delta_domain_absent`) |
 | `public_api_deltas` (#157), `validation_runs` (#103) | computed/derived surface, **no stored node kind** | `derived_class_not_materialized` |
-| `error_signatures` (`ErrorSignature`), `occurrence_buckets` (`LogOccurrenceBucket`), `remediation_links` | log-signature domain (issues #319/#340), not yet emitted | `log_domain_absent` |
+| `error_signatures` (`ErrorSignature`), `occurrence_buckets` (`LogOccurrenceBucket`) | log-signature domain (issues #319/#320); populated by #340 when present | `log_domain_absent` |
+| `remediation_links` | **derived** join `ErrorSignature → FRAME_RESOLVES_TO → Symbol → CHANGED_IN → Commit` (issue #340), no stored node kind | `log_domain_absent` |
 | `review_coverage` | computed over merged PRs (available whenever any PR exists) | `no_pull_requests_to_measure` |
 
 `structural_deltas` is a genuine stored class: `scan-history` emits one
@@ -197,6 +199,60 @@ approving review for `merged_pr_without_approving_review` gap suppression, even 
 it carried an `approved` state. This closes a gap where unrelated issue discussion
 could mark the required CC8.1 `Reviews` class available and let a relaxed
 `--min-review-coverage` pack pass without genuine review evidence.
+
+## Log-graph incident evidence for CC7.x (issue #340)
+
+The monitoring controls **CC7.2** and **CC7.3** fold runtime log-graph incident
+evidence into their packs. The foundation is the log-graph domain — umbrella
+issue **#319**, the **#320** `ErrorSignature`/fingerprint scan (`eg scan-logs`),
+the **#322** `FRAME_RESOLVES_TO` frame resolution, and the **#326** `log-deltas`
+valid-time model. This lane is pure **pack-side population** on the **#338**
+chassis; it adds no graph domain, kind, edge, or trust class. Exemplar-payload
+discipline follows issue **#60**: the pack cites content-addressed `protected:v1:`
+handles, never raw log or exemplar bytes.
+
+Three sections carry the evidence, each with a section-level disclaimer:
+
+**`error_signatures`** — one hashed `ErrorSignature` row per in-window signature
+(the point predicate on the signature's `first_seen`), plus a `log_summary`
+carrying, per signature: the `log:v1:` record ID, `severity`, a `template_hash`
+(BLAKE3 of the normalized template excerpt — a redaction-safe fingerprint, never
+raw text), a `frame_chain_hash` when frames were captured, the **first/last-seen
+valid times clipped to the window** (`first_seen_in_window`/`last_seen_in_window`),
+content-addressed **exemplar handles** (`protected:v1:<hash>` + content hash +
+source line — handle and hash ONLY, never exemplar text), and each
+`FRAME_RESOLVES_TO` join with its `frame_resolution` label **propagated verbatim**
+(the #152/#134 precedent). Rows are ordered by `signature_id`.
+
+**`occurrence_buckets`** — the **bucket window rule differs from the point
+predicate every other class uses**. A `LogOccurrenceBucket` row is in-window iff
+its hour `[bucket_start, bucket_start + 1h)` **intersects** the half-open window
+`[from, to)`: a partial-overlap hour (its `bucket_start` before `from`, or its
+hour extending past `to`) is **included whole, with no interpolation**. The
+`log_summary` reports per-signature `in_window_occurrences` — the sum over ONLY
+the in-window buckets — with the contributing buckets ordered by `(signature
+record_id, hour)`. `verify` applies the same interval-intersection predicate so a
+partial-overlap bucket whose `bucket_start` precedes `from` still passes
+Window-consistency.
+
+**`remediation_links`** — a **derived** join, available (capability probe) when
+`ErrorSignature` + `FRAME_RESOLVES_TO` + `CHANGED_IN` facts all exist. Each lead
+runs `ErrorSignature → FRAME_RESOLVES_TO → Symbol → CHANGED_IN → Commit` where the
+commit's valid time is **at or after the signature's window activity**, carries the
+`frame_resolution` label verbatim, and cites the signature, symbol, commit, and any
+verification records linked to that commit. The section carries **zero hashed
+rows** — the leads ride `log_summary` because a remediation commit may legitimately
+fall outside the evidence window — and `verify` enforces that empty-row bound as
+the section's membership exemption (mirroring `review_coverage`), so no hashed row
+can be smuggled in as a remediation "row".
+
+**Epistemic boundary.** Occurrence counts are **recorded ingestion of the scanned
+log sources, not guaranteed-complete telemetry** — absence of a signature is not
+proof the error did not occur. Remediation links are **leads, never causal
+claims**: a frame binding proves the frame NAMES the symbol, never that the symbol
+was at fault, and a changing commit is never asserted to have fixed the error. Log
+rows are trust class `runtime_observation` — a program's own claim, parsed but
+never verified — and are never tallied as `source_fact` or `verification_evidence`.
 
 ## Verdicts and exit codes
 
