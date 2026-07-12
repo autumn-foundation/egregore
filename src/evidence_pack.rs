@@ -2016,11 +2016,18 @@ pub fn derive_review_coverage(
 }
 
 /// Scrubs, hashes, and canonically orders a set of records for a section.
+///
+/// Applies the shared bundle scrub (prose/handles/PII) and, for log-graph nodes,
+/// the pack-side log-aware text scrub (issue #340, Codex round-4 P2), so no raw
+/// runtime log content — the normalized `template_excerpt`, exemplar
+/// `event_excerpt`, or backtrace-frame path text — rides a section's hashed rows.
+/// `bundle::scrub_record` never touches the `log` payload, so this is the pack's
+/// only defense for those fields.
 fn build_section_records(records: Vec<GraphRecord>) -> Vec<BundleRecord> {
     let mut rows: Vec<BundleRecord> = records
         .into_iter()
         .map(|r| {
-            let scrubbed = scrub_record(r);
+            let scrubbed = scrub_log_node_text(scrub_record(r));
             let json = serde_json::to_string(&scrubbed).unwrap_or_default();
             let hash = blake3::hash(json.as_bytes()).to_string();
             BundleRecord {
@@ -2031,6 +2038,89 @@ fn build_section_records(records: Vec<GraphRecord>) -> Vec<BundleRecord> {
         .collect();
     rows.sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
     rows
+}
+
+/// Pack-side, log-aware text scrub for one exported log node (issue #340, Codex
+/// round-4 P2). Strips raw runtime log content from an `ErrorSignature` /
+/// `LogEvent` node before it enters a hashed section row, WITHOUT weakening the
+/// derived summary's Integrity binding:
+///
+/// * `ErrorSignature.template_excerpt` (the normalized log-line text) is REPLACED
+///   by its own BLAKE3 fingerprint — the exact value the summary carries as
+///   `template_hash`. `bind_error_signature_rows` then binds the summary's
+///   `template_hash` to this stored fingerprint directly, so the per-node bind
+///   still catches a forged fingerprint even with the whole-summary hash
+///   recomputed, but no raw template text survives.
+/// * Each backtrace `StackFrame`'s `module_path` / `file_path` (redaction-safe by
+///   construction, but still frame text) is REPLACED by its BLAKE3 fingerprint,
+///   preserving the `frame_chain_hash` fingerprint's discriminating power while
+///   removing the readable path. `frame_index` / `line` (non-text) are retained.
+/// * `LogEvent.event_excerpt` is REPLACED by its fingerprint (exemplars already
+///   ride the summary as content-addressed handles, never as section text).
+///
+/// A no-op for every non-log node (`log: None`) and for `LogSource` /
+/// `LogOccurrenceBucket` payloads, which carry no free-text field.
+fn scrub_log_node_text(mut record: GraphRecord) -> GraphRecord {
+    if let GraphRecord::Node {
+        log: Some(payload), ..
+    } = &mut record
+    {
+        match payload.as_mut() {
+            crate::ir::LogPayload::ErrorSignature(p) => {
+                p.template_excerpt = blake3::hash(p.template_excerpt.as_bytes()).to_string();
+                if let Some(frames) = p.frames.as_mut() {
+                    redact_frame_text_in_place(frames);
+                }
+            }
+            crate::ir::LogPayload::LogEvent(p) => {
+                p.event_excerpt = blake3::hash(p.event_excerpt.as_bytes()).to_string();
+            }
+            crate::ir::LogPayload::LogSource(_) | crate::ir::LogPayload::LogOccurrenceBucket(_) => {
+            }
+        }
+    }
+    record
+}
+
+/// Replaces each backtrace frame's `module_path` / `file_path` text with its
+/// BLAKE3 fingerprint in place (issue #340, Codex round-4 P2). Shared by the
+/// section-node scrub and the `frame_chain_hash` derivation so the exported node
+/// and the summary hash bind against an identical, redaction-safe frame chain.
+fn redact_frame_text_in_place(frames: &mut [crate::ir::StackFrame]) {
+    for f in frames.iter_mut() {
+        f.module_path = f
+            .module_path
+            .as_deref()
+            .map(|m| blake3::hash(m.as_bytes()).to_string());
+        f.file_path = f
+            .file_path
+            .as_deref()
+            .map(|p| blake3::hash(p.as_bytes()).to_string());
+    }
+}
+
+/// The redaction-safe frame chain a signature's `frame_chain_hash` binds: the
+/// captured frames with their path text replaced by fingerprints (issue #340,
+/// Codex round-4 P2). Derived from the ORIGINAL node, it is byte-identical to the
+/// scrubbed frames the exported section node carries, so the summary's
+/// `frame_chain_hash` and `bind_error_signature_rows`' node recompute agree.
+fn redacted_frame_chain(frames: &[crate::ir::StackFrame]) -> Vec<crate::ir::StackFrame> {
+    let mut cloned = frames.to_vec();
+    redact_frame_text_in_place(&mut cloned);
+    cloned
+}
+
+/// True when a section's evidence-class wire name is one of the log-graph classes
+/// (issue #340): `error_signatures`, `occurrence_buckets`, `remediation_links`.
+fn is_log_evidence_class(class: &str) -> bool {
+    matches!(
+        EvidenceClass::from_wire(class),
+        Some(
+            EvidenceClass::ErrorSignatures
+                | EvidenceClass::OccurrenceBuckets
+                | EvidenceClass::RemediationLinks
+        )
+    )
 }
 
 /// Canonical `(valid_time_or_empty, record_id)` sort key for a section row.
@@ -2128,8 +2218,14 @@ fn build_error_signature_rows(
         };
         let signature_id = sig.id().to_owned();
         let template_hash = blake3::hash(payload.template_excerpt.as_bytes()).to_string();
+        // Fingerprint the REDACTED frame chain (path text -> BLAKE3), the exact
+        // frames the exported section node carries after `scrub_log_node_text`, so
+        // the summary's `frame_chain_hash` and `bind_error_signature_rows`' node
+        // recompute bind against identical, redaction-safe bytes (issue #340,
+        // Codex round-4 P2).
         let frame_chain_hash = payload.frames.as_ref().map(|frames| {
-            let serialized = serde_json::to_string(frames).unwrap_or_default();
+            let serialized =
+                serde_json::to_string(&redacted_frame_chain(frames)).unwrap_or_default();
             blake3::hash(serialized.as_bytes()).to_string()
         });
         // Clip the activity span to the window. first_seen is the signature's
@@ -2531,6 +2627,30 @@ fn hash_log_summary(summary: &LogEvidenceSummary) -> String {
 ///      from the hashed evidence they summarize even by recomputing the summary
 ///      hash.
 fn bind_log_summary_integrity(section: &EvidenceSection, window: &Window) -> Result<(), String> {
+    // P1 (Codex round-4): a PRESENT log-class section MUST carry BOTH a
+    // `log_summary` and its binding `log_summary_hash`. `assemble_pack` ALWAYS
+    // emits the derived summary for a present `error_signatures` /
+    // `occurrence_buckets` / `remediation_links` section, and `remediation_links`
+    // evidence exists ONLY in the summary (the section carries zero hashed rows) —
+    // so stripping BOTH the summary and its hash would silently drop all
+    // remediation evidence yet still verify clean. Absence of either on a present
+    // log section is an Integrity defect. (An `unavailable` section legitimately
+    // carries no summary, so this only guards present log sections.)
+    if section.status == "present" && is_log_evidence_class(&section.class) {
+        if section.log_summary.is_none() {
+            return Err(format!(
+                "present log section {} carries no log_summary (derived log evidence \
+                 stripped)",
+                section.class
+            ));
+        }
+        if section.log_summary_hash.is_none() {
+            return Err(format!(
+                "present log section {} carries no binding log_summary_hash",
+                section.class
+            ));
+        }
+    }
     let Some(summary) = &section.log_summary else {
         // No summary: the bind hash must also be absent. A hash without a summary
         // is a stripped-summary tamper (the derived evidence removed while its
@@ -2677,14 +2797,21 @@ fn bind_error_signature_rows(
                 row.signature_id
             ));
         };
-        let expect_template = blake3::hash(payload.template_excerpt.as_bytes()).to_string();
-        if row.template_hash != expect_template {
+        // The exported section node's `template_excerpt` has been scrubbed to hold
+        // the template fingerprint itself (issue #340, Codex round-4 P2), which is
+        // exactly the value the summary carries as `template_hash`. Bind them
+        // directly: a forged summary `template_hash` still fails even with the
+        // whole-summary hash recomputed, and no raw template text is required.
+        if row.template_hash != payload.template_excerpt {
             return Err(format!(
                 "error_signatures row {} template_hash does not bind its \
-                 ErrorSignature template_excerpt",
+                 ErrorSignature template fingerprint",
                 row.signature_id
             ));
         }
+        // The section node's frames are already redaction-scrubbed (path text ->
+        // fingerprint), identical to what `build_error_signature_rows` hashed, so
+        // recomputing over them reproduces the summary's `frame_chain_hash`.
         let expect_frame_chain = payload.frames.as_ref().map(|frames| {
             let serialized = serde_json::to_string(frames).unwrap_or_default();
             blake3::hash(serialized.as_bytes()).to_string()
@@ -10648,6 +10775,88 @@ mod pack340_tests {
             !serialized.contains("hunter2"),
             "raw exemplar payload value must never appear"
         );
+        // Codex round-4 P2: no normalized template text or backtrace-frame path
+        // text may ride the hashed section records either. The fixture's template
+        // excerpts and frame-only path/module text must be absent from the whole
+        // serialized pack. ("src/db.rs" is deliberately excluded here: a legitimate
+        // Symbol node in the remediation chain carries that code path, unrelated to
+        // the frame leak; the frame-only strings below are exclusive to frames.)
+        for raw in [
+            "connection refused to HOST",
+            "deprecated config key KEY",
+            "panic at NUMBER",
+            "app::db",
+            "app::main",
+            "src/main.rs",
+        ] {
+            assert!(
+                !serialized.contains(raw),
+                "raw log template/frame text `{raw}` must never appear in the pack"
+            );
+        }
+    }
+
+    /// Codex round-4 P2: the `error_signatures` section's hashed records must NOT
+    /// carry the `ErrorSignature` node's raw `template_excerpt` or backtrace-frame
+    /// path text. The summary already carries the redaction-safe
+    /// `template_hash` / `frame_chain_hash` fingerprints, so nothing functional
+    /// depends on the excerpt/frame text, and stripping it keeps verify clean.
+    #[test]
+    fn error_signatures_section_records_carry_no_raw_template_or_frame_text() {
+        let records = build_log_incident_records();
+        let pack = assemble_cc73(&records);
+        let sec = section(&pack, EvidenceClass::ErrorSignatures);
+        let sec_json = serde_json::to_string(&sec.records).expect("serializes section records");
+        for raw in [
+            "connection refused to HOST",
+            "deprecated config key KEY",
+            "panic at NUMBER",
+            "app::db",
+            "app::main",
+            "src/db.rs",
+            "src/main.rs",
+        ] {
+            assert!(
+                !sec_json.contains(raw),
+                "error_signatures section record leaks raw log text `{raw}`"
+            );
+        }
+        // The scrubbed node's `template_excerpt` now holds the fingerprint that the
+        // summary carries as `template_hash`, and the section still verifies clean.
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = &sec.log_summary else {
+            panic!("error_signatures summary present");
+        };
+        for br in &sec.records {
+            if let GraphRecord::Node { log: Some(p), .. } = &br.record
+                && let crate::ir::LogPayload::ErrorSignature(payload) = p.as_ref()
+            {
+                let row = signatures
+                    .iter()
+                    .find(|r| r.signature_id == br.record.id())
+                    .expect("every section signature has a summary row");
+                assert_eq!(
+                    payload.template_excerpt, row.template_hash,
+                    "scrubbed node carries the template fingerprint, not raw text"
+                );
+                // Frame path text, if any, is a BLAKE3 fingerprint (64 hex chars),
+                // never a readable path.
+                if let Some(frames) = &payload.frames {
+                    for f in frames {
+                        for text in [f.module_path.as_deref(), f.file_path.as_deref()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            assert_eq!(text.len(), 64, "frame path scrubbed to a hash");
+                            assert!(
+                                text.chars().all(|c| c.is_ascii_hexdigit()),
+                                "frame path fingerprint is hex"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(verify_pack(&pack).ok, "scrubbed pack still verifies clean");
     }
 
     #[test]
@@ -11392,5 +11601,57 @@ mod pack340_tests {
             "a rewritten exemplar handle must fail Integrity via the whole-summary hash: {}",
             report.integrity.detail
         );
+    }
+
+    // ── Whole-summary tamper suite (Codex round-4 P1) ─────────────────────────
+    // The prior mutation suites tamper INDIVIDUAL summary fields; they never
+    // stripped a present log section's `log_summary` / `log_summary_hash`
+    // wholesale. Stripping BOTH on a present log section — especially
+    // `remediation_links`, whose evidence exists ONLY in the summary (zero hashed
+    // rows) — silently dropped all that derived evidence yet still verified. Verify
+    // must reject a present log section missing either the summary or its hash.
+
+    #[test]
+    fn verify_rejects_present_log_section_with_summary_stripped() {
+        for class in [
+            EvidenceClass::ErrorSignatures,
+            EvidenceClass::OccurrenceBuckets,
+            EvidenceClass::RemediationLinks,
+        ] {
+            for (name, mutate) in [
+                (
+                    "summary_only",
+                    (|s: &mut EvidenceSection| s.log_summary = None) as fn(&mut EvidenceSection),
+                ),
+                (
+                    "hash_only",
+                    (|s: &mut EvidenceSection| s.log_summary_hash = None)
+                        as fn(&mut EvidenceSection),
+                ),
+                (
+                    "both",
+                    (|s: &mut EvidenceSection| {
+                        s.log_summary = None;
+                        s.log_summary_hash = None;
+                    }) as fn(&mut EvidenceSection),
+                ),
+            ] {
+                let mut pack = assemble_cc73(&build_log_incident_records());
+                let sec = pack
+                    .sections
+                    .iter_mut()
+                    .find(|s| s.class == class.as_wire())
+                    .unwrap_or_else(|| panic!("{} section", class.as_wire()));
+                assert_eq!(sec.status, "present", "{} is present", class.as_wire());
+                mutate(sec);
+                let report = verify_pack(&pack);
+                assert!(
+                    !report.integrity.passed,
+                    "present {} section with `{name}` stripped must fail Integrity: {}",
+                    class.as_wire(),
+                    report.integrity.detail
+                );
+            }
+        }
     }
 }

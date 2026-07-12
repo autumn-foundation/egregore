@@ -228,6 +228,18 @@ source line — handle and hash ONLY, never exemplar text), and each
 `FRAME_RESOLVES_TO` join with its `frame_resolution` label **propagated verbatim**
 (the #152/#134 precedent). Rows are ordered by `signature_id`.
 
+The exported `ErrorSignature` section rows are **log-text-scrubbed** before they
+are hashed (issue #340, Codex round-4 P2): `bundle::scrub_record` never touches
+the `log` payload, so a pack-side, log-aware scrub replaces the node's normalized
+`template_excerpt` with its own BLAKE3 fingerprint (the exact value the summary
+carries as `template_hash`) and replaces each captured backtrace frame's
+`module_path`/`file_path` text with its BLAKE3 fingerprint (the structural
+`frame_index`/`line` are retained and back `frame_chain_hash`). No raw normalized
+template text or readable frame path ever rides a hashed section row — only the
+redaction-safe fingerprints the summary already exposes. `LogEvent` exemplar
+`event_excerpt` text is likewise fingerprinted (exemplars ride the summary as
+content-addressed handles, never as section text).
+
 **`occurrence_buckets`** — the **bucket window rule differs from the point
 predicate every other class uses**. A `LogOccurrenceBucket` row is in-window iff
 its hour `[bucket_start, bucket_start + 1h)` **intersects** the half-open window
@@ -276,8 +288,13 @@ remediation `commit_id`, or a rewritten exemplar handle) whose binding hash was 
 also recomputed fails Integrity. On top of that whole-summary hash, the fields with
 backing hashed rows are bound to them independently: `error_signatures` rows must
 be an exact one-to-one match with the section's `ErrorSignature` nodes and each
-row's `template_hash`/`frame_chain_hash`/`severity`/clipped span is recomputed from
-that node's payload, and each `occurrence_buckets` bucket must resolve to a present
+row's `template_hash`/`frame_chain_hash`/`severity`/clipped span is bound to that
+node's (log-text-scrubbed) payload — `template_hash` binds directly to the node's
+stored template fingerprint and `frame_chain_hash` recomputes over the node's
+redacted (fingerprinted-path) frame chain, so the per-node bind still catches a
+forged summary fingerprint even with the whole-summary hash recomputed, without any
+raw log or frame text surviving in the pack — and each `occurrence_buckets` bucket
+must resolve to a present
 hashed `LogOccurrenceBucket` node with a matching count and hour while every
 `in_window_occurrences` must equal the recomputed sum — so the occurrence total
 cannot be inflated without adding real, count-matching hashed bucket rows. Each
@@ -524,7 +541,15 @@ Re-verifies an assembled pack offline and read-only:
   consumer reads yet rides outside the hashed `records`. Every log section carries a
   `log_summary_hash` (BLAKE3 of the canonical `log_summary`); Integrity recomputes
   it and fails on any divergence, and requires the hash to be present iff the
-  summary is (a stripped hash, or a hash without a summary, fails). So a tampered
+  summary is (a stripped hash, or a hash without a summary, fails). A **present**
+  log section (`error_signatures` / `occurrence_buckets` / `remediation_links`)
+  must carry **both** a `log_summary` and its `log_summary_hash` (issue #340, Codex
+  round-4 P1): `assemble` always emits the derived summary for a present log
+  section, and `remediation_links` evidence exists ONLY in the summary (zero hashed
+  rows), so stripping **both** the summary and its hash would silently drop all that
+  derived evidence yet still verify — absence of either on a present log section is
+  now an Integrity defect (an `unavailable` section legitimately carries neither).
+  So a tampered
   summary value — an inflated `in_window_occurrences`, a swapped
   `template_hash`/`frame_chain_hash`, a forged remediation `commit_id`, or a
   rewritten exemplar handle — whose binding hash was not also recomputed fails
