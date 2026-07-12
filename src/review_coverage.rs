@@ -63,9 +63,9 @@ pub struct ReviewCoverageRowJson {
     /// The deciding approver login (covered rows).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approver_login: Option<String>,
-    /// The deciding approver `ExternalIdentity` record ID — always `None` until
-    /// issue #335 lands identity nodes.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The deciding approver `ExternalIdentity` record ID — a reserved slot that
+    /// is always present and serializes as an explicit `null` until issue #335
+    /// lands identity nodes, so filling it later is not a breaking shape change.
     pub approver_identity_id: Option<String>,
 }
 
@@ -643,6 +643,25 @@ mod tests {
             ))
             .unwrap();
             assert_eq!(a, b, "review-coverage output must be byte-identical");
+        }
+    }
+
+    #[test]
+    fn reserved_approver_identity_id_serializes_as_explicit_null() {
+        // Pre-#335: every `approver_identity_id` is `None`, but the documented
+        // contract reserves the slot as an always-present `null` field so adding
+        // identity nodes later fills the slot rather than being a breaking shape
+        // change. The key must appear even when the value is `None`.
+        let records = planted_records();
+        let report = run_review_coverage(&records, &win(), ReviewCoverageOptions::default(), 1.0);
+        assert!(!report.rows.is_empty(), "fixture must produce rows");
+        for r in &report.rows {
+            assert!(r.approver_identity_id.is_none(), "pre-#335 rows carry None");
+            let json = serde_json::to_string(r).unwrap();
+            assert!(
+                json.contains("\"approver_identity_id\":null"),
+                "reserved key must serialize as explicit null: {json}"
+            );
         }
     }
 
