@@ -2558,11 +2558,32 @@ fn derive_gaps(
     // reports the real defects.
     if want_review_anchored {
         // Presence probe on the ACTUAL typed facts, never string resemblance: a
-        // Review carrying a real `review_commit_sha`, or a real `REVIEWS_COMMIT`
-        // anchor edge.
+        // Review carrying a real `review_commit_sha`, a real `REVIEWS_COMMIT`
+        // anchor edge, OR the importer's own `github_review_unanchored`
+        // `Diagnostic` (Codex P2). The diagnostic is a #334-era importer artifact:
+        // when an approving review genuinely carries no `commit_id`, the #334
+        // importer emits neither a `review_commit_sha` nor a `REVIEWS_COMMIT` edge,
+        // only that diagnostic. Without this branch a store whose reviews are ALL
+        // unanchored would look pre-#334 and wrongly degrade to
+        // `capability_unavailable`, hiding the real `review_unanchored_no_commit_sha`
+        // gap behind apparently-satisfied coverage. It is matched as a
+        // `NodeKind::Diagnostic` node whose summary carries the importer's
+        // `[github_review_unanchored]` bracket-code prefix — the same structured
+        // signal `diagnostics_with_code` matches (see `src/github/records.rs`), a
+        // deterministic extractor artifact, not user-authored string resemblance.
+        // A genuinely PRE-#334 store carries none of the three signals and still
+        // degrades.
         let facts_available = records.iter().any(|r| {
             review_commit_sha_of(r).is_some()
                 || matches!(r, GraphRecord::Edge { label, .. } if label.as_str() == "REVIEWS_COMMIT")
+                || matches!(
+                    r,
+                    GraphRecord::Node {
+                        kind: crate::ir::NodeKind::Diagnostic,
+                        summary,
+                        ..
+                    } if summary.contains("[github_review_unanchored]")
+                )
         });
         if facts_available {
             // Drive the #334 gap derivation from the SAME approving-review set the
@@ -8341,6 +8362,138 @@ mod pack338_tests {
             precedes[0]
                 .record_ids
                 .contains(&"project:v1:rvC".to_owned())
+        );
+    }
+
+    /// Builds a #334-era `github_review_unanchored` project `Diagnostic` node the
+    /// GitHub importer emits when an approving review carries no `commit_id` (see
+    /// `src/github/records.rs::review_diagnostic`). Its `NodeKind::Diagnostic`
+    /// summary carries the `[github_review_unanchored]` bracket-code prefix the
+    /// importer stamps, matched exactly like `diagnostics_with_code` does.
+    fn review_unanchored_diagnostic(review_id: &str) -> GraphRecord {
+        GraphRecord::node(
+            format!("project:v1:diag-{review_id}"),
+            crate::ir::NodeKind::Diagnostic,
+            None,
+            None,
+            None,
+            format!(
+                "[github_review_unanchored] review carries no commit_id; cannot anchor it to a \
+                 commit; review='{review_id}'"
+            ),
+        )
+    }
+
+    /// Codex P2 (#334 capability probe): a genuine #334-era import whose approving
+    /// reviews are ALL unanchored emits a `github_review_unanchored` diagnostic but
+    /// no `review_commit_sha` and no `REVIEWS_COMMIT` edge. The capability probe
+    /// must recognize that diagnostic as #334-era evidence, so `derive_gaps`
+    /// emits the real `review_unanchored_no_commit_sha` gap instead of degrading
+    /// to `capability_unavailable`. Before the fix the probe saw neither a
+    /// `review_commit_sha` nor a `REVIEWS_COMMIT` edge and wrongly concluded
+    /// "pre-#334", suppressing the gap — a pack that looked like satisfied
+    /// coverage with the anchor check merely unavailable.
+    #[test]
+    fn issue_334_all_unanchored_reviews_with_diagnostic_yield_gap_not_capability_unavailable() {
+        use super::fixture::{pr, references_task, review};
+        // prB: merged in window, approved by an UNANCHORED review (no
+        // review_commit_sha, no REVIEWS_COMMIT edge) — the sole #334 signal is the
+        // importer's github_review_unanchored diagnostic.
+        let pr_b = pr("project:v1:prB", "2026-03-16T12:00:00Z", "cB");
+        let rv_b = review("project:v1:rvB", "2026-03-16T08:00:00Z", "approved");
+        let records = vec![
+            pr_b,
+            rv_b,
+            references_task("project:v1:rvB", "project:v1:prB"),
+            review_unanchored_diagnostic("project:v1:rvB"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        // The github_review_unanchored diagnostic is #334-era evidence: the
+        // capability-unavailable degradation must NOT fire.
+        assert!(
+            !pack
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "capability_unavailable"
+                    && d.unavailable_reason.as_deref()
+                        == Some("issue_334_reviewed_commit_facts_absent")),
+            "a github_review_unanchored diagnostic proves #334-era extraction; the \
+             capability diagnostic must not fire: {:?}",
+            pack.diagnostics
+        );
+        let unanchored: Vec<&GapRow> = pack
+            .gaps
+            .iter()
+            .filter(|g| g.gap_class == "review_unanchored_no_commit_sha")
+            .collect();
+        assert_eq!(
+            unanchored.len(),
+            1,
+            "the all-unanchored #334 store must yield the real gap: {:?}",
+            pack.gaps
+        );
+        assert!(
+            unanchored[0]
+                .record_ids
+                .contains(&"project:v1:prB".to_owned())
+        );
+        assert!(
+            unanchored[0]
+                .record_ids
+                .contains(&"project:v1:rvB".to_owned())
+        );
+    }
+
+    /// The mirror of the case above: a genuinely PRE-#334 store carrying the SAME
+    /// all-unanchored approving review but NO `github_review_unanchored`
+    /// diagnostic (and no anchors, no `REVIEWS_COMMIT` edge) must STILL degrade to
+    /// `capability_unavailable` with no fabricated #334 gap. This is the boundary
+    /// the fix must not erase: absence of every #334 signal stays pre-#334.
+    #[test]
+    fn issue_334_pre_334_store_without_diagnostic_still_degrades() {
+        use super::fixture::{pr, references_task, review};
+        let pr_b = pr("project:v1:prB", "2026-03-16T12:00:00Z", "cB");
+        let rv_b = review("project:v1:rvB", "2026-03-16T08:00:00Z", "approved");
+        let records = vec![
+            pr_b,
+            rv_b,
+            references_task("project:v1:rvB", "project:v1:prB"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        assert!(
+            pack.diagnostics
+                .iter()
+                .any(|d| d.code == "capability_unavailable"
+                    && d.unavailable_reason.as_deref()
+                        == Some("issue_334_reviewed_commit_facts_absent")),
+            "a pre-#334 store with no #334 signal must degrade: {:?}",
+            pack.diagnostics
+        );
+        assert!(
+            !pack
+                .gaps
+                .iter()
+                .any(|g| g.gap_class == "review_unanchored_no_commit_sha"),
+            "no #334 gap can be fabricated for a pre-#334 store: {:?}",
+            pack.gaps
         );
     }
 
