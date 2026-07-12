@@ -2657,6 +2657,11 @@ const PROJECT_FULL_NODE_KINDS: &[NodeKind] = &[
     NodeKind::Task,
     NodeKind::AcceptanceCriterion,
     NodeKind::ExternalLink,
+    // Source-system participant identity (issue #335): a login-less or
+    // system-less identity node is not a citable identity, so it must clear a
+    // required-field check before a REVIEWED_BY/REQUESTED_REVIEW_FROM edge can
+    // bind to it.
+    NodeKind::ExternalIdentity,
 ];
 
 const PROJECT_EDGE_LABELS: &[EdgeLabel] = &[
@@ -2704,6 +2709,8 @@ fn validate_project_domain_records(
                 url,
                 system_native_id,
                 discovered_at,
+                author,
+                identity_system,
                 valid_time,
                 valid_time_source,
                 transaction_time,
@@ -2802,6 +2809,10 @@ fn validate_project_domain_records(
                         url.as_deref(),
                         system_native_id.as_deref(),
                         discovered_at.as_deref(),
+                    )?,
+                    NodeKind::ExternalIdentity => validate_project_external_identity(
+                        author.as_deref(),
+                        identity_system.as_deref(),
                     )?,
                     _ => {}
                 }
@@ -3308,6 +3319,22 @@ fn validate_project_external_link(
         "ExternalLink.discovered_at",
         required_str(discovered_at, "ExternalLink.discovered_at")?,
     )
+}
+
+/// Required-field check for a `project.ExternalIdentity` node (issue #335).
+///
+/// A source-system participant identity is keyed on `(identity_system, author)`,
+/// where `author` carries the plaintext login. A login-less or system-less node
+/// is not a citable identity — accepting one would let a later
+/// `REVIEWED_BY`/`REQUESTED_REVIEW_FROM` edge bind to an anonymous target and
+/// break the reviewer-identity joins. Require both before persistence.
+fn validate_project_external_identity(
+    author: Option<&str>,
+    identity_system: Option<&str>,
+) -> WriteResult<()> {
+    required_str(author, "ExternalIdentity.author")?;
+    required_str(identity_system, "ExternalIdentity.identity_system")?;
+    Ok(())
 }
 
 fn validate_project_ref(

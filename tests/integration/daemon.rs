@@ -7377,6 +7377,147 @@ fn project_reviewed_by_rejects_non_github_review_source() {
     );
 }
 
+// Issue #335: an ExternalIdentity node that omits its login (`author`) carries
+// no citable identity, so a later REVIEWED_BY/REQUESTED_REVIEW_FROM edge would
+// bind to an anonymous node. The daemon must REQUIRE `author` before accepting.
+#[test]
+fn project_external_identity_missing_author_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let identity_id = "project:v1:test-identity-no-author";
+    let mut identity = project_external_identity_json(identity_id, "octocat");
+    identity.as_object_mut().unwrap().remove("author");
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-identity-missing-author",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-identity-missing-author-key",
+            "domain": "project",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": { "records": [ identity ] }
+        }),
+    );
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "ExternalIdentity missing author (login) should be rejected, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        !records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::ExternalIdentity,
+                ..
+            }
+        )),
+        "the login-less ExternalIdentity node must not be persisted"
+    );
+}
+
+// Issue #335: an ExternalIdentity node that omits its `identity_system` is not a
+// well-formed source-system participant identity; the daemon must REQUIRE it.
+#[test]
+fn project_external_identity_missing_identity_system_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let identity_id = "project:v1:test-identity-no-system";
+    let mut identity = project_external_identity_json(identity_id, "octocat");
+    identity.as_object_mut().unwrap().remove("identity_system");
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-identity-missing-system",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-identity-missing-system-key",
+            "domain": "project",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": { "records": [ identity ] }
+        }),
+    );
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "ExternalIdentity missing identity_system should be rejected, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        !records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::ExternalIdentity,
+                ..
+            }
+        )),
+        "the system-less ExternalIdentity node must not be persisted"
+    );
+}
+
+// Issue #335: a well-formed ExternalIdentity node (author + identity_system
+// present) is ACCEPTED on its own and round-trips into the store.
+#[test]
+fn project_external_identity_well_formed_is_accepted() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let identity_id = "project:v1:test-identity-ok";
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-identity-well-formed",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-identity-well-formed-key",
+            "domain": "project",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": { "records": [ project_external_identity_json(identity_id, "octocat") ] }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "a well-formed ExternalIdentity should be accepted, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Node { kind: NodeKind::ExternalIdentity, id, .. }
+                if id == identity_id
+        )),
+        "the well-formed ExternalIdentity node should be persisted"
+    );
+}
+
 #[test]
 fn project_trust_class_rejects_wrong_domain_and_wrong_verification_target() {
     let temp = tempfile::tempdir().expect("temp dir should be created");

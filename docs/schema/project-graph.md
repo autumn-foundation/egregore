@@ -197,7 +197,15 @@ TO an `ExternalIdentity`) records each reviewer whose review was requested. Both
 are directly-submitted project edges carrying `project:v1:` identity, validated
 by the daemon like `MERGED_AS`/`REVIEWS_COMMIT`: the FROM node's importer
 `source_kind` is required and both terminate at `ExternalIdentity` ONLY, so a
-forged or mistyped node can never mint a reviewer binding. Every emitted `Review`
+forged or mistyped node can never mint a reviewer binding. The daemon also
+requires an `ExternalIdentity` node to carry a non-empty `author` (the login)
+and a non-empty `identity_system` before it is persisted, so a reviewer edge can
+never bind to a login-less anonymous identity. The offline `eg validate` gate
+mirrors this directionally: beyond the `ExternalIdentity`-only target rule, it
+constrains the reviewer edges' SOURCE kinds — `REVIEWED_BY` must originate from a
+`Review` and `REQUESTED_REVIEW_FROM` from a `Task` — so a wrong-source reviewer
+edge (e.g. `Task —REVIEWED_BY→ ExternalIdentity`) is a named
+`edge_source_kind_violation` defect. Every emitted `Review`
 (all review kinds) gains exactly one `REVIEWED_BY` to its author's identity; a
 requested TEAM is never expanded to member logins — it is recorded as a
 `github_team_review_request_unexpanded` project `Diagnostic` carrying the team

@@ -191,6 +191,16 @@ const fn allowed_source_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
         // signature only (docs/schema/log-graph.md). Combined because the source
         // set is identical (clippy `match_same_arms`).
         EdgeLabel::FrameResolvesTo | EdgeLabel::EmittedDuring => Some(&[NodeKind::ErrorSignature]),
+        // ── Reviewer-identity domain (issue #335) ───────────────────────────
+        // `Review —REVIEWED_BY→ ExternalIdentity`: only a `Review` is authored
+        // by a reviewer identity. `Task —REQUESTED_REVIEW_FROM→
+        // ExternalIdentity`: only the PR `Task` requests a review. The schema
+        // and daemon frame both edges directionally, so a schema-correct
+        // `ExternalIdentity` target reached from a wrong-kind source (e.g. a
+        // `Task —REVIEWED_BY→` or a `Review —REQUESTED_REVIEW_FROM→`) is invalid
+        // attribution the pre-ingest gate must reject.
+        EdgeLabel::ReviewedBy => Some(&[NodeKind::Review]),
+        EdgeLabel::RequestedReviewFrom => Some(&[NodeKind::Task]),
         _ => None,
     }
 }
@@ -1775,6 +1785,60 @@ mod tests {
         assert!(
             codes.contains(&EDGE_TARGET_KIND_VIOLATION),
             "REVIEWED_BY→Symbol must be rejected, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn reviewer_identity_edges_from_correct_source_are_allowed() {
+        // Issue #335: REVIEWED_BY originates from a `Review` and
+        // REQUESTED_REVIEW_FROM originates from the PR `Task`; well-sourced
+        // reviewer-identity edges pass the source-kind check.
+        let records = vec![
+            node("n:review", NodeKind::Review),
+            node("n:task", NodeKind::Task),
+            node("n:id", NodeKind::ExternalIdentity),
+            edge("e:rb", EdgeLabel::ReviewedBy, "n:review", "n:id"),
+            edge("e:rrf", EdgeLabel::RequestedReviewFrom, "n:task", "n:id"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "well-sourced reviewer-identity edges must be allowed, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn reviewed_by_from_wrong_source_is_rejected() {
+        // Issue #335: REVIEWED_BY must originate from a `Review`; a `Task`
+        // source is invalid attribution the gate must reject.
+        let records = vec![
+            node("n:task", NodeKind::Task),
+            node("n:id", NodeKind::ExternalIdentity),
+            edge("e:bad", EdgeLabel::ReviewedBy, "n:task", "n:id"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "Task—REVIEWED_BY→ExternalIdentity must be rejected, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn requested_review_from_wrong_source_is_rejected() {
+        // Issue #335: REQUESTED_REVIEW_FROM must originate from the PR `Task`;
+        // a `Review` source is invalid attribution the gate must reject.
+        let records = vec![
+            node("n:review", NodeKind::Review),
+            node("n:id", NodeKind::ExternalIdentity),
+            edge("e:bad", EdgeLabel::RequestedReviewFrom, "n:review", "n:id"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "Review—REQUESTED_REVIEW_FROM→ExternalIdentity must be rejected, got {codes:?}"
         );
     }
 }

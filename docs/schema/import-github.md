@@ -599,7 +599,14 @@ in the already-fetched `/pulls` payload — no new endpoint) yields one
 slug and the PR `Task` id — never silently dropped. Both edges are directly-
 submitted **project-domain edges** carrying `project:v1:` identity and are
 validated by the daemon like `MERGED_AS`/`REVIEWS_COMMIT` (the FROM node's importer
-`source_kind` is required; both terminate at `ExternalIdentity` ONLY). Within one
+`source_kind` is required; both terminate at `ExternalIdentity` ONLY). The daemon
+additionally requires every `ExternalIdentity` node to carry a non-empty `author`
+(login) and `identity_system` before it is accepted, so a reviewer edge can never
+bind to a login-less anonymous identity; the importer's own identity nodes always
+carry both. The offline `eg validate` gate enforces the same directions on the
+edges — `REVIEWED_BY` must originate from a `Review` and `REQUESTED_REVIEW_FROM`
+from a `Task` — reporting a wrong-source reviewer edge as an
+`edge_source_kind_violation` defect. Within one
 run each identity is minted exactly once (deduped on `(system, login)`); across
 runs the store's idempotency and the embedded read-back skip converge to one node
 per login. Identities derive **only** from GitHub payloads (no seed graph), and a
