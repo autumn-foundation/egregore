@@ -46,6 +46,7 @@ mod link_evidence;
 mod link_logs;
 mod local_project;
 mod local_project_jsonl_doc;
+mod log_deltas;
 mod manifest_deps;
 mod mcp;
 mod memory_audit;

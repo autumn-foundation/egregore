@@ -131,6 +131,11 @@ cargo run -- query deltas <base_sha> <head_sha> --graph history.graph.jsonl  # e
 cargo run -- query deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
 cargo run -- query deltas ffffffffffff <head_sha> --graph history.graph.jsonl # exit 2 (missing_commit)
 
+# Runtime error-signature deltas across a commit range (issue #326)
+cargo run -- query log-deltas <base_sha> <head_sha> --graph combined.graph.jsonl  # exit 0 on match
+cargo run -- query log-deltas <sha> <sha> --graph combined.graph.jsonl            # exit 1 (identical_endpoints)
+cargo run -- query log-deltas ffffffffffff <head_sha> --graph combined.graph.jsonl # exit 2 (missing_commit)
+
 # A file's defined-symbol set at a past commit or instant (issue #158)
 cargo run -- query file src/lib.rs --graph history.graph.jsonl --at <commit_sha>             # exit 0 on match
 cargo run -- query file src/lib.rs --graph history.graph.jsonl --as-of 2026-01-02T00:00:00Z  # exit 0 on match
@@ -284,6 +289,69 @@ available, and the introducing commit with its valid time. Semantic drift inside
 folded in where drift records exist and marked unavailable otherwise. Rows are observed
 deltas, never proof of behavior change; the response is deterministic and byte-identical
 across runs. See `docs/cli/deltas.md`.
+
+`eg query log-deltas <base> <head>` classifies runtime error-signatures across a commit range
+(issue #326), composing the #118 range mechanics with the #319/#320 `ErrorSignature`
+valid-time model and the #322 `FRAME_RESOLVES_TO` edges. It derives a valid-time window from
+the committer dates of the range commits (`window_start`/`window_end` = min/max) and sorts
+every in-scope signature into a closed, mutually exclusive 3-class set by precedence:
+`new_signatures` (`window_start <= first_seen <= window_end` — the regression signal, even for
+a signature that also ceased in-window), `ceased_signatures` (existed before the range,
+`last_seen < window_end`), and `continuing_signatures` (existed before, `last_seen >=
+window_end`). A signature first observed after the window (`first_seen > window_end`) is
+out-of-range and excluded from all three classes. Each `new_signatures` row joins its
+`FRAME_RESOLVES_TO` targets against the reused `range_deltas` symbol groups into
+`overlapping_symbol_deltas` (never re-derived). Per-window occurrence counts come from the
+signature's `LogOccurrenceBucket` records via `AGGREGATES` edges (`base_window_occurrences`/
+`head_window_occurrences` = buckets at/before each endpoint's committer date); a signature
+with no linked buckets falls back to its aggregate `occurrence_count` with
+`occurrence_source: aggregate_only` — counts are never fabricated. These per-window counts are
+hour-bucket-granular, not endpoint-exact (the envelope carries
+`occurrence_count_granularity: "hourly_bucket"` and the disclaimer states it): a
+`LogOccurrenceBucket` retains only an hour-aligned `bucket_start` and an aggregate count (no
+per-occurrence timestamps), so a bucket straddling a commit instant cannot be sub-divided and a
+count may include occurrences up to one bucket width (1 hour) past the exact endpoint when it
+falls mid-hour; the "fully-before" predicate is deliberately not used (it would under-count
+instead), and endpoint-exact counts require a #320 schema change tracked in #364. Per-window bucket counts
+and the aggregate `occurrence_count` both SUM across all scanned sources: a
+`LogOccurrenceBucket` record ID is `(repository/signature/hour/width)` and omits `LogSource`,
+so distinct sources sharing a bucket ID are preserved by summing (never deduped by bucket ID);
+the symmetric cost is that concatenating the identical `scan-logs` output multiplies counts,
+so scan each source once (or use per-source stores). Fully source-attributed counts require
+source-aware bucket identity, a #320 schema change out of #326's scope, tracked in issue #361. All timestamp comparisons
+(window derivation, classification, bucket cutoffs) are by parsed UTC instant, never raw RFC
+3339 string order, because commit committer dates carry local offsets (`%cI`) while scan-logs
+times are Z-normalized — a lexical comparison would misclassify across offsets. `--repo`
+scopes only the code side (commit/window resolution and the symbol-delta join): log records
+carry no retrievable repository attribution (the repo ID is only hashed into their stable
+IDs), so all in-window log signatures are always included and per-repository log separation
+requires per-repository stores. Whenever `--repo` is set the response envelope discloses this
+in a machine-readable `repo_scope_caveat` field (log signatures are NOT repository-filtered and
+a scoped run cannot be guaranteed repo-specific for them). The disclosure NEVER asserts log
+isolation from the `Repository`-node count: log records add no `Repository` node, so a store
+reporting a single `Repository` node can still hold another repository's log graph (repo-A
+history plus a repo-B `scan-logs` graph) whose in-window signatures classify here regardless of
+`--repo`. `distinct_repository_count`/`multi_repository_store` are informational raw counts, not
+an isolation verdict; the multi-repository case only ADDS a higher-known-risk note and a single
+count is never downgraded to "safe". The schema-level fix that would let `--repo` filter log
+signatures is tracked in #362. Because `LogSource` is a non-identity input (a signature's
+stable ID is `(repository_id, fingerprint_algorithm, template, severity)` only), a graph
+combining multiple `scan-logs` outputs for one repo carries the same signature record ID more
+than once; those records are grouped by stable ID and merged BEFORE classifying — earliest
+`first_seen`, latest `last_seen` (by instant), buckets summed across the group (not deduped by
+bucket record ID, per #361), aggregate `occurrence_count` summed — so exactly one row per signature ID is emitted, never
+split across conflicting classes. Exit codes and the error
+taxonomy mirror #118 exactly. Rows are regression LEADS, never proof this range caused the
+failure; a ceased signature is not proof of a fix; occurrence data only reflects scanned log
+sources. Cross-scan signature coalescing is a `--graph` capability: the embedded (`--data-dir`)
+read path retains one record per stable non-temporal log ID (last-write-wins for
+`ErrorSignature`/`LogOccurrenceBucket`), so multiple `scan-logs` ingests of the same stable ID
+collapse before the query runs and coalescing is not reconstructable there — a single ingest is
+unaffected. When run over `--data-dir` with log records present, the envelope carries an
+`embedded_log_retention_caveat` disclosing this; for multi-scan aggregation combine `scan-logs`
+outputs at the `--graph` level (concatenated JSONL) or use per-source stores (the adapter-level
+retention fix is tracked in #363). Read-only, redaction-safe (no raw log text), deterministic and
+byte-identical across runs. See `docs/cli/log-deltas.md`.
 
 `eg query file <path> --at <commit>` / `--as-of <instant>` reconstructs the deterministic
 set of symbols a file defined at a chosen commit or valid-time instant (issue #158) from a

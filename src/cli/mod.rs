@@ -34,6 +34,7 @@ mod inspect;
 mod lifeline;
 mod link_logs;
 mod locate;
+mod log_deltas;
 mod manifest_deps;
 mod memory;
 mod memory_audit;
@@ -97,6 +98,7 @@ pub(crate) use inspect::*;
 pub(crate) use lifeline::*;
 pub(crate) use link_logs::*;
 pub(crate) use locate::*;
+pub(crate) use log_deltas::*;
 pub(crate) use manifest_deps::*;
 pub(crate) use memory::*;
 pub(crate) use memory_audit::*;
@@ -2010,6 +2012,48 @@ pub(crate) enum QuerySubcommand {
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Restrict commit resolution and delta selection to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Classify runtime error-signatures across a commit range (issue #326).
+    ///
+    /// Answers "did this commit range introduce new runtime error
+    /// signatures?" by composing the issue #118 range mechanics with the
+    /// issue #319/#320 `ErrorSignature` valid-time model and the issue #322
+    /// `FRAME_RESOLVES_TO` frame-resolution edges. Derives the valid-time
+    /// window from the committer dates of the range commits and classifies
+    /// every in-scope signature into `new_signatures` (first observed inside
+    /// the window — the regression signal), `ceased_signatures` (existed
+    /// before the range and went silent by its end), or
+    /// `continuing_signatures` (existed before and still occurring through
+    /// the end). Signatures first observed after the window are excluded as a
+    /// future range. Each `new_signatures` row joins its resolved backtrace
+    /// frames to overlapping symbol deltas from the same range.
+    ///
+    /// Rows are regression LEADS, never proof this range caused the failure;
+    /// a ceased signature is not proof of a fix; occurrence data only reflects
+    /// the scanned log sources. Reads only the supplied store; never touches
+    /// Git state or the working tree. Raw log payload text never enters the
+    /// response.
+    ///
+    /// Documented in `docs/cli/log-deltas.md`.
+    LogDeltas {
+        /// Base commit SHA or unique prefix (older endpoint).
+        base: String,
+        /// Head commit SHA or unique prefix (newer endpoint).
+        head: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Scope the code side only (commit/window resolution and the
+        /// symbol-delta join) to one repository. Does NOT filter log
+        /// signatures: log records carry no retrievable repository
+        /// attribution, so every in-window signature is always classified
+        /// regardless of `--repo`. Per-repository log separation requires
+        /// per-repository stores.
         #[arg(long)]
         repo: Option<String>,
     },
@@ -4857,6 +4901,33 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_deltas_cmd(&records, &base, &head, repo.as_deref())
+        }
+        QuerySubcommand::LogDeltas {
+            base,
+            head,
+            graph,
+            data_dir,
+            repo,
+        } => {
+            // `data_dir.is_some()` marks the embedded read path, whose
+            // current-state read surface retains one record per stable
+            // non-temporal log ID (last-write-wins); threaded into
+            // `query_log_deltas_cmd` so the envelope can disclose that cross-scan
+            // coalescing is not reconstructable there (issue #363).
+            let embedded_source = data_dir.is_some();
+            // Strictly read-only lane (PR #356 review): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            query_log_deltas_cmd(&records, &base, &head, repo.as_deref(), embedded_source)
         }
         QuerySubcommand::Coupling {
             path,
