@@ -2629,6 +2629,26 @@ fn derive_gaps(
                                  request's final head (approval precedes final head)"
                             .to_owned(),
                     }),
+                    // An ANCHORED approval whose PR carries no `head_sha` (a
+                    // pre-#333 or partial import): the final head cannot be
+                    // verified, so the anchor check must NOT appear to have run
+                    // cleanly through the catch-all. This mirrors the coverage
+                    // side (9c639f7), which degrades exactly this PR to
+                    // `approval_stale_head` + a `head_sha_unavailable` sub-label
+                    // rather than `covered`; the gap side surfaces the
+                    // corresponding `approval_precedes_final_head` defect, flagged
+                    // `head_sha_unavailable` so it reports "final head
+                    // unverifiable" — never a fabricated specific mismatch, since
+                    // the PR head is absent (there is no head to differ from).
+                    (Some(_), None) => gaps.push(GapRow {
+                        gap_class: GapClass::ApprovalPrecedesFinalHead.as_wire().to_owned(),
+                        record_ids,
+                        valid_time: Some(sub.merged_at.clone()),
+                        detail: "approving review is anchored but the pull request has no \
+                                 recorded head_sha, so the final head cannot be verified \
+                                 (head_sha_unavailable)"
+                            .to_owned(),
+                    }),
                     _ => {}
                 }
             }
@@ -8362,6 +8382,115 @@ mod pack338_tests {
             precedes[0]
                 .record_ids
                 .contains(&"project:v1:rvC".to_owned())
+        );
+    }
+
+    /// Issue #334 / Codex P2 (gap-side sibling of the coverage fix 9c639f7): an
+    /// approving review that IS anchored (`review_commit_sha` present) but whose
+    /// covered PR carries NO `head_sha` (a pre-#333 or partial import) cannot be
+    /// confirmed as reviewing the final head. The `(Some, None)` case must
+    /// surface an `approval_precedes_final_head` gap flagged `head_sha_unavailable`
+    /// — never fall silently through the catch-all — otherwise the #334 final-head
+    /// check appears to have run cleanly while strict coverage degrades the same
+    /// PR to `approval_stale_head` + `head_sha_unavailable`. The gap must NOT
+    /// claim a specific head mismatch: the point is "final head unverifiable".
+    #[test]
+    fn issue_334_anchored_approval_missing_head_sha_yields_gap_not_silent_pass() {
+        use super::fixture::{pr, references_task, review};
+        let anchored = |mut r: GraphRecord, sha: &str| -> GraphRecord {
+            if let GraphRecord::Node {
+                review_commit_sha, ..
+            } = &mut r
+            {
+                *review_commit_sha = Some(sha.to_owned());
+            }
+            r
+        };
+        let without_head = |mut r: GraphRecord| -> GraphRecord {
+            if let GraphRecord::Node { head_sha, .. } = &mut r {
+                *head_sha = None;
+            }
+            r
+        };
+        // prD: merged in-window, approved by an ANCHORED review, but the PR record
+        // carries no head_sha (final head unverifiable).
+        let pr_d = without_head(pr("project:v1:prD", "2026-03-17T12:00:00Z", "cD"));
+        let rv_d = anchored(
+            review("project:v1:rvD", "2026-03-17T08:00:00Z", "approved"),
+            "any-anchor-sha",
+        );
+        let records = vec![
+            pr_d,
+            rv_d,
+            references_task("project:v1:rvD", "project:v1:prD"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        // #334 facts present → no capability diagnostic.
+        assert!(
+            !pack
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "capability_unavailable"),
+            "facts present → no capability diagnostic: {:?}",
+            pack.diagnostics
+        );
+        let precedes: Vec<&GapRow> = pack
+            .gaps
+            .iter()
+            .filter(|g| g.gap_class == "approval_precedes_final_head")
+            .collect();
+        assert_eq!(
+            precedes.len(),
+            1,
+            "a missing head_sha must surface an approval_precedes_final_head gap, \
+             not a silent catch-all pass: {:?}",
+            pack.gaps
+        );
+        assert!(
+            precedes[0]
+                .record_ids
+                .contains(&"project:v1:prD".to_owned())
+        );
+        assert!(
+            precedes[0]
+                .record_ids
+                .contains(&"project:v1:rvD".to_owned())
+        );
+        assert!(
+            precedes[0].detail.contains("head_sha_unavailable"),
+            "the gap must flag the head as unavailable, never claim a specific \
+             mismatch: {}",
+            precedes[0].detail
+        );
+
+        // Consistency with the coverage side (9c639f7): strict coverage degrades
+        // the SAME PR to approval_stale_head + head_sha_unavailable, and the gap
+        // side now surfaces the corresponding defect — the two agree.
+        let strict =
+            derive_review_coverage(records.as_slice(), &win(), ReviewCoverageOptions::default());
+        let row = strict
+            .rows
+            .iter()
+            .find(|r| r.pr_task_id == "project:v1:prD")
+            .expect("prD classified");
+        assert_eq!(
+            row.verdict,
+            ReviewVerdict::ApprovalStaleHead,
+            "strict coverage must degrade the unverifiable final head"
+        );
+        assert!(
+            row.sub_labels.iter().any(|s| s == "head_sha_unavailable"),
+            "coverage must report head_sha_unavailable, got {:?}",
+            row.sub_labels
         );
     }
 
