@@ -159,6 +159,9 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
         EdgeLabel::ReviewedBy | EdgeLabel::RequestedReviewFrom => {
             Some(&[NodeKind::ExternalIdentity])
         }
+        // A `ReviewStateTransition` transitions exactly one `Review` (issue
+        // #336): the `TRANSITIONS_REVIEW` edge terminates at a `Review` only.
+        EdgeLabel::TransitionsReview => Some(&[NodeKind::Review]),
         _ => None,
     }
 }
@@ -201,6 +204,12 @@ const fn allowed_source_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
         // attribution the pre-ingest gate must reject.
         EdgeLabel::ReviewedBy => Some(&[NodeKind::Review]),
         EdgeLabel::RequestedReviewFrom => Some(&[NodeKind::Task]),
+        // ── Review-state history (issue #336) ───────────────────────────────
+        // `ReviewStateTransition —TRANSITIONS_REVIEW→ Review`: only a
+        // `ReviewStateTransition` transitions a review, so a schema-correct
+        // `Review` target reached from a wrong-kind source is invalid
+        // attribution the pre-ingest gate must reject.
+        EdgeLabel::TransitionsReview => Some(&[NodeKind::ReviewStateTransition]),
         _ => None,
     }
 }
@@ -1839,6 +1848,62 @@ mod tests {
         assert!(
             codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
             "Review—REQUESTED_REVIEW_FROM→ExternalIdentity must be rejected, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn transitions_review_edge_from_transition_to_review_is_allowed() {
+        // Issue #336: TRANSITIONS_REVIEW (ReviewStateTransition→Review) passes
+        // both the source-kind and target-kind checks.
+        let records = vec![
+            node("n:trans", NodeKind::ReviewStateTransition),
+            node("n:review", NodeKind::Review),
+            edge("e:tr", EdgeLabel::TransitionsReview, "n:trans", "n:review"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&EDGE_TARGET_KIND_VIOLATION)
+                && !codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "well-formed TRANSITIONS_REVIEW must be allowed, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn transitions_review_to_wrong_target_is_rejected() {
+        // Issue #336: TRANSITIONS_REVIEW must terminate at a Review.
+        let records = vec![
+            node("n:trans", NodeKind::ReviewStateTransition),
+            node("n:id", NodeKind::ExternalIdentity),
+            edge("e:bad", EdgeLabel::TransitionsReview, "n:trans", "n:id"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_TARGET_KIND_VIOLATION),
+            "TRANSITIONS_REVIEW→ExternalIdentity must be rejected, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn transitions_review_from_wrong_source_is_rejected() {
+        // Issue #336: TRANSITIONS_REVIEW must originate from a
+        // ReviewStateTransition; a Review source is invalid attribution.
+        let records = vec![
+            node("n:review", NodeKind::Review),
+            node("n:review2", NodeKind::Review),
+            edge(
+                "e:bad",
+                EdgeLabel::TransitionsReview,
+                "n:review",
+                "n:review2",
+            ),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "Review—TRANSITIONS_REVIEW→Review must be rejected, got {codes:?}"
         );
     }
 }

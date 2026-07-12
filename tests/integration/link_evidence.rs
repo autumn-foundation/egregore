@@ -208,6 +208,7 @@ fn make_agent_memory_node(
         review_side: None,
         review_commit_sha: None,
         identity_system: None,
+        transition_kind: None,
         dependency: None,
         log: None,
         user_context: aletheia_egregore::UserContextFields::empty(),

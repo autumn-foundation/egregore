@@ -21,6 +21,8 @@ This CLI is also reachable as `egregore import github`.
 | Issue comment | one `Review` (`review_kind: issue_comment`) | `REFERENCES_TASK` Review→Task |
 | PR review summary | one `Review` (`review_kind: pr_review`) | `REFERENCES_TASK` Review→Task |
 | PR review comment | one `Review` (`review_kind: pr_review_comment`) | `REFERENCES_TASK` Review→Task, `TOUCHES_FILE` Review→File* |
+| PR timeline `review_dismissed` (issue #336) | one `ReviewStateTransition` (`transition_kind: review_dismissed`) | `TRANSITIONS_REVIEW` Transition→Review |
+| PR timeline `review_requested` / `review_request_removed` (issue #336) | one standalone `ReviewStateTransition` | none |
 
 \* `TOUCHES_FILE` is emitted only when the comment's file resolves
 **unambiguously** against a seeded code-graph store (see `--code-graph`).
@@ -31,6 +33,29 @@ GitHub-only metadata that has no dedicated v1 `Task` field (`state_reason`,
 milestone title, PR `merged_at`/`draft`/head SHA/base ref, merge commit SHA,
 `closed_at`) is preserved in the redacted `Task.body_handle` blob for
 round-trip fidelity.
+
+## Review-state history (issue #336)
+
+For each PR whose `/pulls` list entry changed, the importer also fetches
+`GET /repos/{owner}/{repo}/issues/{n}/timeline` — the same per-PR trigger that
+drives the review-summary fetch — and records the closed set of review-state
+transitions `{review_dismissed, review_requested, review_request_removed}` as
+append-only `ReviewStateTransition` records. Every other timeline event kind is
+skipped. Raw timeline text never enters the graph: a dismissal message is
+redacted into a `body_handle`, and the actor login and event kind are stored
+plaintext.
+
+**Epistemic contract.** A `Review`'s `review_state` field is a **current-state
+summary, last-write-wins by design** — a dismissal overwrites `"approved"` →
+`"dismissed"` under the SAME review record id. That summary alone cannot tell you
+an approval ever existed. The `ReviewStateTransition` records are the **history**:
+each transition is a separate append-only record keyed on the timeline event's own
+id (never the review's id), so a dismissal never erases the earlier approval. A
+`review_dismissed` transition carries a `TRANSITIONS_REVIEW` edge to the review it
+dismissed. **A consumer that needs "review state as of time T" (e.g. review
+coverage evaluated retroactively) must join the transitions, not read the summary
+field.** A transition names *which* review changed and *when* — never that the
+change was correct.
 
 ## Authentication
 

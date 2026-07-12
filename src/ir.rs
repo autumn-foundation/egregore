@@ -1359,6 +1359,19 @@ pub enum GraphRecord {
         /// redacted. Legacy records lacking the field deserialize to `None`.
         #[serde(skip_serializing_if = "Option::is_none")]
         identity_system: Option<String>,
+        /// Transition kind for a `ReviewStateTransition` node (issue #336). One
+        /// of the closed set `review_dismissed` / `review_requested` /
+        /// `review_request_removed`, sourced from a GitHub PR-timeline event.
+        /// A `ReviewStateTransition` is an append-only history record: the
+        /// current `review_state` on a `Review` is a last-write-wins summary,
+        /// while each state TRANSITION is preserved here so a dismissal never
+        /// erases that an approval once existed. Plaintext query substrate (the
+        /// event kind is a closed vocabulary, never free text); never redacted.
+        /// The actor login rides in `author`; the timeline event id in
+        /// `system_native_id`; the dismissal message (when present) is redacted
+        /// into `body_handle`. Legacy/other-kind records deserialize to `None`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transition_kind: Option<String>,
         /// User-context domain fields, flattened into node JSON.
         #[serde(flatten)]
         user_context: UserContextFields,
@@ -1564,6 +1577,7 @@ impl GraphRecord {
             review_side: None,
             review_commit_sha: None,
             identity_system: None,
+            transition_kind: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -1687,6 +1701,7 @@ impl GraphRecord {
             review_side: None,
             review_commit_sha: None,
             identity_system: None,
+            transition_kind: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -1809,6 +1824,7 @@ impl GraphRecord {
             review_side: None,
             review_commit_sha: None,
             identity_system: None,
+            transition_kind: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -1936,6 +1952,7 @@ impl GraphRecord {
             review_side: None,
             review_commit_sha: None,
             identity_system: None,
+            transition_kind: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -2719,6 +2736,18 @@ pub enum NodeKind {
     /// display name, avatar, or profile URL. Consumed by #338/#339;
     /// beneficiaries #245/#262.
     ExternalIdentity,
+    /// One append-only review-state TRANSITION event (issue #336). Project
+    /// domain, trust class `project_state`. Minted from a GitHub PR-timeline
+    /// event (`review_dismissed` / `review_requested` / `review_request_removed`)
+    /// and keyed on that event's server-native id, so it never participates in
+    /// the parent `Review`'s identity. The `Review.review_state` field is a
+    /// last-write-wins current-state SUMMARY; these transitions are the HISTORY,
+    /// so a dismissal recorded here never erases that an approval once existed.
+    /// A `review_dismissed` transition carries a `TRANSITIONS_REVIEW` edge to the
+    /// dismissed `Review`; `review_requested` / `review_request_removed`
+    /// transitions stand alone. Consumers needing "state as of T" join
+    /// transitions rather than reading the summary field.
+    ReviewStateTransition,
     /// Local project/task JSONL work item (project domain, reserved).
     LocalTask,
     /// File, patch, report, or generated output linked to work.
@@ -2825,6 +2854,7 @@ impl NodeKind {
             Self::PR => "PR",
             Self::Review => "Review",
             Self::ExternalIdentity => "ExternalIdentity",
+            Self::ReviewStateTransition => "ReviewStateTransition",
             Self::LocalTask => "LocalTask",
             Self::Artifact => "Artifact",
             Self::Verification => "Verification",
@@ -2937,6 +2967,14 @@ pub enum EdgeLabel {
     /// `project.ExternalIdentity`; one edge per requested-reviewer login on the
     /// PR. A request is an invitation to review, never proof a review happened.
     RequestedReviewFrom,
+    /// A `ReviewStateTransition` transitions a `Review` (issue #336). FROM
+    /// `project.ReviewStateTransition` TO `project.Review`; emitted only for a
+    /// `review_dismissed` timeline event (which names the dismissed review). The
+    /// edge names WHICH review a transition acted on — it never re-writes the
+    /// review's current `review_state` summary and never asserts the transition
+    /// was correct. `review_requested` / `review_request_removed` transitions
+    /// name no review and mint no edge.
+    TransitionsReview,
     /// Agent-memory node describes a failure on a code entity.
     FailedOn,
     /// Agent-memory node explains a code change.
@@ -3011,6 +3049,7 @@ impl EdgeLabel {
             "REVIEWS_COMMIT" => Some(Self::ReviewsCommit),
             "REVIEWED_BY" => Some(Self::ReviewedBy),
             "REQUESTED_REVIEW_FROM" => Some(Self::RequestedReviewFrom),
+            "TRANSITIONS_REVIEW" => Some(Self::TransitionsReview),
             "FAILED_ON" => Some(Self::FailedOn),
             "EXPLAINS_CHANGE" => Some(Self::ExplainsChange),
             "REFERENCES_TASK" => Some(Self::ReferencesTask),
@@ -3055,6 +3094,7 @@ impl EdgeLabel {
                 | Self::ReviewsCommit
                 | Self::ReviewedBy
                 | Self::RequestedReviewFrom
+                | Self::TransitionsReview
                 | Self::FailedOn
                 | Self::ExplainsChange
                 | Self::ReferencesTask
@@ -3124,6 +3164,7 @@ impl EdgeLabel {
             Self::ReviewsCommit => "REVIEWS_COMMIT",
             Self::ReviewedBy => "REVIEWED_BY",
             Self::RequestedReviewFrom => "REQUESTED_REVIEW_FROM",
+            Self::TransitionsReview => "TRANSITIONS_REVIEW",
             Self::FailedOn => "FAILED_ON",
             Self::ExplainsChange => "EXPLAINS_CHANGE",
             Self::ReferencesTask => "REFERENCES_TASK",

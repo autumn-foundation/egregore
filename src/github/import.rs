@@ -494,6 +494,59 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                     );
                 }
             }
+
+            // ── PR review-state transitions → ReviewStateTransition (issue #336) ─
+            // Gated on the SAME `if pulls_changed` trigger as the per-PR review
+            // summaries above. The timeline records the append-only history a
+            // dismissal would otherwise erase: `review_state` stays last-write-
+            // wins, while each transition event is preserved. The stream is
+            // filtered to the closed review-state-transition kinds; every other
+            // timeline event kind is skipped. Timeline events depend on no seed
+            // graph, so — unlike the reviews endpoint — this fetch always uses the
+            // stored `ETags` directly (no seed-graph suppression).
+            let timeline_path = format!(
+                "/repos/{}/issues/{number}/timeline?per_page=100",
+                opts.source_repo
+            );
+            if let FetchOutcome::Modified { items, etags } =
+                client.fetch_paginated("timeline", &timeline_path, &state.etags)?
+            {
+                state.etags.extend(etags);
+                for item in &items {
+                    // Filter to the closed transition kinds; an unknown event
+                    // kind is skipped silently (out of scope, never a diagnostic).
+                    let kind = item.get("event").and_then(Value::as_str).unwrap_or("");
+                    if !records::is_review_state_transition_kind(kind) {
+                        continue;
+                    }
+                    // Per-event change gate. Transitions are append-only and
+                    // immutable, so an unchanged event never re-emits.
+                    let event_id = item.get("id").and_then(Value::as_u64).unwrap_or(0);
+                    let key = format!("timeline_event:{event_id}");
+                    let hash = blake3_hash_value(item);
+                    if state.is_unchanged(&key, &hash) {
+                        continue;
+                    }
+                    state.record_hash(key, hash);
+                    // A KNOWN-kind event that fails to parse emits a diagnostic,
+                    // never a silent drop (mirrors commit/review diagnostics).
+                    let emitted = serde_json::from_value::<model::TimelineEvent>(item.clone())
+                        .map_or_else(
+                            |_| {
+                                records::timeline_transition_unparseable(
+                                    &ctx, number, event_id, kind,
+                                )
+                            },
+                            |ev| records::timeline_transition_records(&ctx, number, &ev),
+                        );
+                    push_emitted(
+                        &mut graph,
+                        &mut emitted_count,
+                        &mut seen_identities,
+                        emitted,
+                    );
+                }
+            }
         }
     }
 

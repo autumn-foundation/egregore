@@ -2647,6 +2647,8 @@ const PROJECT_NODE_KINDS: &[NodeKind] = &[
     // Source-system participant identity (issue #335); carries only a login +
     // system and is keyed on `(system, login)`.
     NodeKind::ExternalIdentity,
+    // Append-only review-state transition history (issue #336).
+    NodeKind::ReviewStateTransition,
     NodeKind::LocalTask,
     // Importer diagnostics are valid project records; they carry entity_id == id
     // and valid_time == transaction_time so partial imports remain ingestible.
@@ -2662,6 +2664,10 @@ const PROJECT_FULL_NODE_KINDS: &[NodeKind] = &[
     // required-field check before a REVIEWED_BY/REQUESTED_REVIEW_FROM edge can
     // bind to it.
     NodeKind::ExternalIdentity,
+    // Review-state transition (issue #336): a transition with no kind or no
+    // actor login is not a citable history record, so it must clear a
+    // required-field check before a TRANSITIONS_REVIEW edge can bind to it.
+    NodeKind::ReviewStateTransition,
 ];
 
 const PROJECT_EDGE_LABELS: &[EdgeLabel] = &[
@@ -2673,6 +2679,7 @@ const PROJECT_EDGE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::ReviewsCommit,
     EdgeLabel::ReviewedBy,
     EdgeLabel::RequestedReviewFrom,
+    EdgeLabel::TransitionsReview,
     EdgeLabel::MentionsSymbol,
 ];
 
@@ -2711,6 +2718,7 @@ fn validate_project_domain_records(
                 discovered_at,
                 author,
                 identity_system,
+                transition_kind,
                 valid_time,
                 valid_time_source,
                 transaction_time,
@@ -2729,6 +2737,7 @@ fn validate_project_domain_records(
                             | NodeKind::PR
                             | NodeKind::Review
                             | NodeKind::ExternalIdentity
+                            | NodeKind::ReviewStateTransition
                             | NodeKind::LocalTask
                     );
                 if !is_project {
@@ -2813,6 +2822,10 @@ fn validate_project_domain_records(
                     NodeKind::ExternalIdentity => validate_project_external_identity(
                         author.as_deref(),
                         identity_system.as_deref(),
+                    )?,
+                    NodeKind::ReviewStateTransition => validate_project_review_state_transition(
+                        transition_kind.as_deref(),
+                        author.as_deref(),
                     )?,
                     _ => {}
                 }
@@ -3337,6 +3350,22 @@ fn validate_project_external_identity(
     Ok(())
 }
 
+/// Required-field check for a `project.ReviewStateTransition` node (issue #336).
+///
+/// A review-state transition is an append-only history event keyed on a timeline
+/// event id. A transition with no `transition_kind` (the closed event vocabulary)
+/// or no `author` (the actor login) is not a citable history record — accepting
+/// one would let a later `TRANSITIONS_REVIEW` edge bind to an anonymous event and
+/// break the review-state-history joins. Require both before persistence.
+fn validate_project_review_state_transition(
+    transition_kind: Option<&str>,
+    author: Option<&str>,
+) -> WriteResult<()> {
+    required_str(transition_kind, "ReviewStateTransition.transition_kind")?;
+    required_str(author, "ReviewStateTransition.author")?;
+    Ok(())
+}
+
 fn validate_project_ref(
     field: &'static str,
     value: &str,
@@ -3507,6 +3536,20 @@ fn validate_project_edge(
                 from_source_kind,
                 records,
                 sink,
+            )?;
+        }
+        // Review-state transition edge (issue #336). TRANSITIONS_REVIEW
+        // originates from a `ReviewStateTransition` and targets the `Review` it
+        // acted on. The kind check frames the edge directionally so a wrong-kind
+        // source or target can never mint a review-state-history binding.
+        EdgeLabel::TransitionsReview => {
+            validate_project_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                &[NodeKind::ReviewStateTransition],
+                target_kind,
+                &[NodeKind::Review],
             )?;
         }
         EdgeLabel::MentionsSymbol => {
@@ -4310,7 +4353,8 @@ pub fn validate_agent_memory_record_for_cli(
                 | EdgeLabel::MergedAs
                 | EdgeLabel::ReviewsCommit
                 | EdgeLabel::ReviewedBy
-                | EdgeLabel::RequestedReviewFrom => {
+                | EdgeLabel::RequestedReviewFrom
+                | EdgeLabel::TransitionsReview => {
                     anyhow::bail!(
                         "evidence link relation '{}' is project-only and must be written as a project edge",
                         edge_label.as_str()
@@ -6552,6 +6596,7 @@ fn validate_agent_memory_edge_endpoints(
             | EdgeLabel::ReviewsCommit
             | EdgeLabel::ReviewedBy
             | EdgeLabel::RequestedReviewFrom
+            | EdgeLabel::TransitionsReview
     ) {
         return Err(ApiError::bad_request(format!(
             "agent-memory edge '{edge_id}' label '{}' is project-only; use a project:v1: edge",
@@ -7086,7 +7131,8 @@ fn validate_and_synthesize_evidence_edges(
                         | EdgeLabel::MergedAs
                         | EdgeLabel::ReviewsCommit
                         | EdgeLabel::ReviewedBy
-                        | EdgeLabel::RequestedReviewFrom => {
+                        | EdgeLabel::RequestedReviewFrom
+                        | EdgeLabel::TransitionsReview => {
                             return Err(ApiError::bad_request(format!(
                                 "evidence link relation '{}' is project-only and must be written as a project edge",
                                 edge_label.as_str()

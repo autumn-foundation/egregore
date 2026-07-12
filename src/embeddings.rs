@@ -195,6 +195,7 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::PR
         | NodeKind::Review
         | NodeKind::ExternalIdentity
+        | NodeKind::ReviewStateTransition
         | NodeKind::LocalTask
         | NodeKind::Artifact
         | NodeKind::Verification

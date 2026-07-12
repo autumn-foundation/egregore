@@ -1635,6 +1635,7 @@ fn make_node(
         review_side: None,
         review_commit_sha: None,
         identity_system: None,
+        transition_kind: None,
         dependency: None,
         log: None,
         user_context: crate::ir::UserContextFields::empty(),

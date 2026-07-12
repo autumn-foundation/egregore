@@ -1910,6 +1910,7 @@ impl EmbeddedAletheiaSink {
             review_side,
             review_commit_sha,
             identity_system,
+            transition_kind,
             user_context,
             producer,
         } = record
@@ -2141,6 +2142,7 @@ impl EmbeddedAletheiaSink {
         builder = insert_optional(builder, "review_side", review_side.as_deref());
         builder = insert_optional(builder, "review_commit_sha", review_commit_sha.as_deref());
         builder = insert_optional(builder, "identity_system", identity_system.as_deref());
+        builder = insert_optional(builder, "transition_kind", transition_kind.as_deref());
         if !user_context.is_empty()
             && let Ok(json) = serde_json::to_string(user_context)
         {
@@ -3148,6 +3150,11 @@ impl EmbeddedAletheiaSink {
                 "identity_system",
                 node.get_property("identity_system"),
             )?,
+            transition_kind: optional_str_property(
+                record_id,
+                "transition_kind",
+                node.get_property("transition_kind"),
+            )?,
             user_context: optional_str_property(
                 record_id,
                 "user_context_json",
@@ -3734,6 +3741,7 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "PR" => Ok(NodeKind::PR),
         "Review" => Ok(NodeKind::Review),
         "ExternalIdentity" => Ok(NodeKind::ExternalIdentity),
+        "ReviewStateTransition" => Ok(NodeKind::ReviewStateTransition),
         "LocalTask" => Ok(NodeKind::LocalTask),
         "Artifact" => Ok(NodeKind::Artifact),
         "Verification" => Ok(NodeKind::Verification),
@@ -3804,6 +3812,7 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "REVIEWS_COMMIT" => Ok(EdgeLabel::ReviewsCommit),
         "REVIEWED_BY" => Ok(EdgeLabel::ReviewedBy),
         "REQUESTED_REVIEW_FROM" => Ok(EdgeLabel::RequestedReviewFrom),
+        "TRANSITIONS_REVIEW" => Ok(EdgeLabel::TransitionsReview),
         "FAILED_ON" => Ok(EdgeLabel::FailedOn),
         "EXPLAINS_CHANGE" => Ok(EdgeLabel::ExplainsChange),
         "REFERENCES_TASK" => Ok(EdgeLabel::ReferencesTask),
@@ -3975,6 +3984,7 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::PR
         | NodeKind::Review
         | NodeKind::ExternalIdentity
+        | NodeKind::ReviewStateTransition
         | NodeKind::LocalTask
         | NodeKind::Artifact
         | NodeKind::Verification
@@ -5624,6 +5634,113 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, GraphRecord::Edge { id, label: EdgeLabel::RequestedReviewFrom, .. } if id == &requested_id)),
             "REQUESTED_REVIEW_FROM edge round-trips"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_state_transition_node_and_edge_round_trip_through_embedded_store() {
+        // Issue #336: a ReviewStateTransition node (transition_kind, actor login
+        // in `author`, timeline:<id> in system_native_id, redacted message in
+        // body_handle) plus its TRANSITIONS_REVIEW edge survive an embedded write
+        // + read-back byte-for-byte, and inspect counts it under
+        // (project, ReviewStateTransition, 1).
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("review-state-transition-store");
+
+        let trans_id = crate::github::records::review_state_transition_id("o/r", 7, 5001);
+        let review_id = crate::github::records::dismissed_review_record_id("o/r", 7, 301);
+        let mut trans = GraphRecord::node(
+            trans_id.clone(),
+            NodeKind::ReviewStateTransition,
+            None,
+            None,
+            None,
+            "review_dismissed on PR #7".to_owned(),
+        );
+        if let GraphRecord::Node {
+            schema_version,
+            domain,
+            author,
+            transition_kind,
+            system_native_id,
+            ..
+        } = &mut trans
+        {
+            *schema_version = crate::ir::PROJECT_SCHEMA_VERSION;
+            *domain = Some("project".to_owned());
+            *author = Some("maintainer".to_owned());
+            *transition_kind = Some("review_dismissed".to_owned());
+            *system_native_id = Some("timeline:5001".to_owned());
+        }
+        let mut review_node = GraphRecord::node(
+            review_id.clone(),
+            NodeKind::Review,
+            None,
+            None,
+            None,
+            "review".to_owned(),
+        );
+        if let GraphRecord::Node {
+            schema_version,
+            domain,
+            ..
+        } = &mut review_node
+        {
+            *schema_version = crate::ir::PROJECT_SCHEMA_VERSION;
+            *domain = Some("project".to_owned());
+        }
+        let edge = GraphRecord::project_edge(
+            EdgeLabel::TransitionsReview,
+            trans_id.clone(),
+            review_id,
+            None,
+            "review 301 dismissed".to_owned(),
+        );
+        let edge_id = edge.id().to_owned();
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("store should open");
+        sink.write_record(&trans).expect("transition should write");
+        sink.write_record(&review_node)
+            .expect("review node should write");
+        sink.write_record(&edge)
+            .expect("TRANSITIONS_REVIEW should write");
+
+        let records = sink.read_all_records().expect("read_all_records");
+        let read = records
+            .iter()
+            .find(|r| r.id() == trans_id)
+            .expect("transition read back");
+        let GraphRecord::Node {
+            kind,
+            author,
+            transition_kind,
+            system_native_id,
+            ..
+        } = read
+        else {
+            panic!("expected node");
+        };
+        assert_eq!(*kind, NodeKind::ReviewStateTransition);
+        assert_eq!(author.as_deref(), Some("maintainer"), "actor round-trips");
+        assert_eq!(
+            transition_kind.as_deref(),
+            Some("review_dismissed"),
+            "transition_kind round-trips"
+        );
+        assert_eq!(system_native_id.as_deref(), Some("timeline:5001"));
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r, GraphRecord::Edge { id, label: EdgeLabel::TransitionsReview, .. } if id == &edge_id)),
+            "TRANSITIONS_REVIEW edge round-trips"
+        );
+        // The read-back record classifies as a known (project, ReviewStateTransition,
+        // 1) tuple — the exact tuple `eg inspect --data-dir` groups it under (AC6;
+        // the CLI-level inspect assertion lives in the import behaviour suite).
+        assert!(
+            crate::schema_version::validate_record_version(read).is_ok(),
+            "the transition is a known project schema-version tuple"
         );
     }
 

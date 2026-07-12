@@ -3021,6 +3021,26 @@ fn project_external_identity_json(id: &str, login: &str) -> serde_json::Value {
     })
 }
 
+fn project_review_state_transition_json(id: &str) -> serde_json::Value {
+    // Issue #336: a GitHub-imported ReviewStateTransition node — transition_kind
+    // (closed vocabulary) + actor login (author) + timeline:<id> native handle.
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "ReviewStateTransition",
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "domain": "project",
+        "entity_id": id,
+        "transition_kind": "review_dismissed",
+        "author": "maintainer",
+        "system_native_id": "timeline:5001",
+        "valid_time": "2026-05-18T05:49:32Z",
+        "valid_time_source": "github_updated_at",
+        "transaction_time": "2026-07-10T00:00:00Z",
+        "summary": "review_dismissed on PR #14"
+    })
+}
+
 fn project_acceptance_criterion_json(
     id: &str,
     parent_task_id: &str,
@@ -4327,6 +4347,9 @@ fn all_node_kinds_have_documented_schema() {
         // Reviewer identity (issue #335), documented in
         // docs/schema/project-graph.md + docs/schema/import-github.md.
         | NodeKind::ExternalIdentity
+        // Review-state transition history (issue #336), documented in
+        // docs/schema/project-graph.md + docs/schema/import-github.md.
+        | NodeKind::ReviewStateTransition
         | NodeKind::LocalTask => "project-domain-reserved",
         // Reserved with one-line definitions in docs/schema/agent-memory.md §4b
         NodeKind::Artifact | NodeKind::CommandEvidence => "agent-memory-reserved",
@@ -4402,6 +4425,7 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::ReviewsCommit
         | EdgeLabel::ReviewedBy
         | EdgeLabel::RequestedReviewFrom
+        | EdgeLabel::TransitionsReview
         | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange
         | EdgeLabel::ReferencesTask
@@ -7516,6 +7540,127 @@ fn project_external_identity_well_formed_is_accepted() {
         )),
         "the well-formed ExternalIdentity node should be persisted"
     );
+}
+
+// Issue #336: the daemon must ACCEPT a TRANSITIONS_REVIEW
+// (ReviewStateTransition→Review) project edge and persist it and the transition
+// node.
+#[test]
+fn project_transitions_review_edge_is_accepted() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let review_id = "project:v1:test-review-tr";
+    let trans_id = "project:v1:test-transition-5001";
+    let edge = serde_json::json!({
+        "record_type": "edge",
+        "id": "project:v1:transitions-review-edge",
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "label": "TRANSITIONS_REVIEW",
+        "source": trans_id,
+        "target": review_id,
+        "summary": "review 301 dismissed"
+    });
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-transitions-review",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-transitions-review-key",
+            "domain": "project",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": {
+                "records": [
+                    project_review_json(review_id, "github_review"),
+                    project_review_state_transition_json(trans_id),
+                    edge
+                ]
+            }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "TRANSITIONS_REVIEW edge should be accepted, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Edge { label: EdgeLabel::TransitionsReview, id, .. } if id.starts_with("project:v1:")
+        )),
+        "the TRANSITIONS_REVIEW edge should be persisted"
+    );
+    assert!(
+        records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::ReviewStateTransition,
+                ..
+            }
+        )),
+        "the ReviewStateTransition node should be persisted"
+    );
+}
+
+// Issue #336: a ReviewStateTransition node missing its transition_kind (or actor
+// login) is not a citable history record, so a later TRANSITIONS_REVIEW edge
+// would bind to an anonymous event — the daemon must REJECT it before persistence.
+#[test]
+fn project_review_state_transition_missing_fields_are_rejected() {
+    for missing in ["transition_kind", "author"] {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("store");
+        let mut daemon = start_daemon(&data_dir);
+        let metadata = read_metadata(&data_dir);
+
+        let trans_id = "project:v1:test-transition-missing";
+        let mut node = project_review_state_transition_json(trans_id);
+        node.as_object_mut().unwrap().remove(missing);
+        let response = http_json(
+            &metadata,
+            "POST",
+            "/v1/records/ingest",
+            &serde_json::json!({
+                "request_id": "project-transition-missing",
+                "agent_id": "project-test-agent",
+                "session_id": "project-test-session",
+                "idempotency_key": format!("project-transition-missing-{missing}-key"),
+                "domain": "project",
+                "created_at": "2026-07-10T00:00:00Z",
+                "payload": { "records": [ node ] }
+            }),
+        );
+        assert!(
+            !response.starts_with("HTTP/1.1 200"),
+            "ReviewStateTransition missing {missing} should be rejected, got {response}"
+        );
+        daemon.stop();
+
+        let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+        let records = sink
+            .read_all_records()
+            .expect("read_all_records should succeed");
+        assert!(
+            !records.iter().any(|r| matches!(
+                r,
+                GraphRecord::Node {
+                    kind: NodeKind::ReviewStateTransition,
+                    ..
+                }
+            )),
+            "the {missing}-less ReviewStateTransition node must not be persisted"
+        );
+    }
 }
 
 #[test]

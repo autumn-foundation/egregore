@@ -770,6 +770,36 @@ derivation now that #334 is merged, emitting the `capability_unavailable`
 diagnostic only for a pre-#334 store with no reviewed-commit facts. See
 `docs/cli/review-coverage.md`.
 
+`eg import github <owner>/<repo>` preserves review-state HISTORY so a dismissal
+never erases an approval (issue #336). For each PR whose `/pulls` list entry
+changed — the SAME `pulls_changed` trigger that drives the per-PR review
+summaries — the importer also fetches `GET /repos/{o}/{r}/issues/{n}/timeline`,
+filtered to the closed transition kinds `{review_dismissed, review_requested,
+review_request_removed}` (every other timeline kind skipped), and mints one
+append-only `ReviewStateTransition` node per event. A `review_dismissed` event
+also mints a `TRANSITIONS_REVIEW` edge (ReviewStateTransition → Review) to the
+dismissed review, reconstructed from `dismissed_review.review_id`;
+`review_requested`/`review_request_removed` stand alone with no edge. Each
+transition is keyed on the timeline event's OWN server-native id
+(`project_stable_id(["project","ReviewStateTransition", repo, number,
+"timeline:<event_id>"])`), so it NEVER participates in the parent `Review`'s
+identity and is byte-stable across re-imports. Epistemic contract:
+`Review.review_state` stays a **last-write-wins current-state summary** (a
+dismissal overwrites `approved`→`dismissed` under the same record id); the
+transitions are the **history**. A consumer needing "review state as of T" (e.g.
+#339 review-coverage evaluated retroactively) MUST join the transitions, not read
+the summary field. Trust class `project_state`. Raw timeline text never enters the
+graph: the dismissal message is redacted via `redact_lines` into a `body_handle`;
+event kind, actor login, timestamps, and target review id are plaintext. A
+KNOWN-kind event that cannot be turned into a citable transition (no actor, no
+event id, or a dismissal with no `dismissed_review`) emits a
+`github_timeline_event_unparseable` `Diagnostic`, never a silent drop. The state
+file schema bumps 4→5 (new `timeline_event:<id>` resource-hash keys + timeline
+ETag entries), migrate-not-discard from v2/v3/v4. Deterministic, byte-stable,
+pull-only, per-named-repo — no polling, no webhooks. See
+`docs/cli/github-import.md`, `docs/schema/import-github.md` §1/§6/§8/§9, and
+`docs/schema/project-graph.md`.
+
 Embedded store write locking (issue #200):
 
 Every embedded write open takes the OS-level exclusive store lease (`egregored.lock`),
