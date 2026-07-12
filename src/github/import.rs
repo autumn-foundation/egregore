@@ -438,6 +438,12 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             } else {
                 state.etags.clone()
             };
+            // Reviews actually EMITTED for this PR on this run. The timeline
+            // dismissal resolver (#336) binds a TRANSITIONS_REVIEW edge only to a
+            // Review present here; a dismissal whose target is absent (GitHub
+            // omitted it) becomes a diagnostic instead of a dangling edge.
+            let mut present_review_ids: std::collections::BTreeSet<u64> =
+                std::collections::BTreeSet::new();
             if let FetchOutcome::Modified { items, etags } =
                 client.fetch_paginated("pr_reviews", &path, &reviews_prior_etags)?
             {
@@ -486,6 +492,9 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                     }
                     state.record_hash(key.clone(), hash);
                     state.set_review_artifact(key, current_artifact);
+                    // This Review is emitted into the graph this run, so a
+                    // dismissal timeline event may safely bind an edge to it.
+                    present_review_ids.insert(r.id);
                     push_emitted(
                         &mut graph,
                         &mut emitted_count,
@@ -521,6 +530,10 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                     }
                     // Per-event change gate. Transitions are append-only and
                     // immutable, so an unchanged event never re-emits.
+                    // GitHub always sends a non-zero timeline event `id`; the
+                    // `unwrap_or(0)` is a defensive floor only. Two id-less events
+                    // would coalesce on `timeline_event:0` / `timeline:0`, an
+                    // accepted degradation for an input GitHub never produces.
                     let event_id = item.get("id").and_then(Value::as_u64).unwrap_or(0);
                     let key = format!("timeline_event:{event_id}");
                     let hash = blake3_hash_value(item);
@@ -537,7 +550,14 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                                     &ctx, number, event_id, kind,
                                 )
                             },
-                            |ev| records::timeline_transition_records(&ctx, number, &ev),
+                            |ev| {
+                                records::timeline_transition_records(
+                                    &ctx,
+                                    number,
+                                    &ev,
+                                    &present_review_ids,
+                                )
+                            },
                         );
                     push_emitted(
                         &mut graph,

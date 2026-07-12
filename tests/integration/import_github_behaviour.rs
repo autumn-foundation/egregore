@@ -545,6 +545,82 @@ fn routes_with_dismissal() -> HashMap<String, Canned> {
     routes
 }
 
+/// The canonical fixture with the dismissal in the timeline but the dismissed
+/// review ABSENT from the reviews list (GitHub omitted it — deleted account or a
+/// very old review). Exercises the resolve-or-diagnose ladder (#336 S1).
+fn routes_with_absent_dismissed_review() -> HashMap<String, Canned> {
+    let mut routes = full_routes();
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&one_pull_updated_json(), "\"pulls-v2\""),
+    );
+    // Reviews list no longer contains review 301 (GitHub omitted it).
+    routes.insert(
+        "/repos/o/r/pulls/7/reviews?per_page=100".to_owned(),
+        Canned::ok("[]", "\"prr-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues/7/timeline?per_page=100".to_owned(),
+        Canned::ok(&timeline_with_dismissal_json(), "\"tl-v2\""),
+    );
+    routes
+}
+
+/// Runs `eg validate <graph>` and returns whether it exited clean (exit 0).
+fn validate_graph(path: &std::path::Path) -> (bool, String) {
+    let output = egregore()
+        .args(["validate", path.to_str().unwrap()])
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .expect("run validate");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    (output.status.success(), stdout)
+}
+
+// ── #336 S1: dismissal of an absent review → diagnostic, never a dangling edge ───
+
+#[test]
+fn dismissal_of_absent_review_emits_diagnostic_and_validates_clean() {
+    // S1: the dismissed review is omitted from the reviews list but the timeline
+    // still reports the review_dismissed event. The importer must record the
+    // transition (history preserved), mint NO TRANSITIONS_REVIEW edge (its target
+    // is not in the graph), emit exactly one github_dismissed_review_absent
+    // Diagnostic, and produce a graph `eg validate` accepts with no dangling edge.
+    let server = MockServer::start(routes_with_absent_dismissed_review());
+    let dir = TempDir::new().expect("temp dir");
+    let out = dir.path().join("graph.jsonl");
+    let state = dir.path().join("state.json");
+    let (jsonl, _stderr, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok, "import should succeed");
+
+    // The transition node is still emitted — history is preserved.
+    assert_eq!(
+        nodes_of_kind(&jsonl, "ReviewStateTransition").len(),
+        1,
+        "the dismissal transition is recorded even when its review is absent"
+    );
+    // NO edge is minted to the absent Review.
+    assert_eq!(
+        edges_of_label(&jsonl, "TRANSITIONS_REVIEW"),
+        0,
+        "no dangling TRANSITIONS_REVIEW edge to an omitted Review"
+    );
+    // Exactly one absent-review diagnostic replaces the edge.
+    let absent_diags = jsonl
+        .lines()
+        .filter(|l| l.contains("github_dismissed_review_absent"))
+        .count();
+    assert_eq!(
+        absent_diags, 1,
+        "one github_dismissed_review_absent diagnostic"
+    );
+
+    // `eg validate` over the resulting graph is clean — no dangling edge defect.
+    let (valid, report) = validate_graph(&out);
+    assert!(valid, "graph must validate clean, got: {report}");
+}
+
 // ── AC1/AC2/AC8/AC9: two-snapshot dismissal preserves the approval ───────────────
 
 #[test]

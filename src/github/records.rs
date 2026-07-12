@@ -1663,12 +1663,24 @@ pub fn dismissed_review_record_id(source_repo: &str, number: u64, review_id: u64
     review_record_id(source_repo, &native)
 }
 
-/// The stable `github_timeline_event_unparseable` `Diagnostic` id (issue #336).
+/// The two timeline-diagnostic codes (issue #336).
 ///
-/// Repo- and PR-scoped (mirrors [`commit_diagnostic_id`]) so a fetched-but-
-/// unparseable timeline event of a KNOWN kind is recorded, never silently
-/// dropped, and never collides across repos in a shared store.
-fn timeline_diagnostic_id(source_repo: &str, number: u64, event_id: u64) -> String {
+/// `github_timeline_event_unparseable` — a fetched, KNOWN-kind event that could
+/// not be turned into a transition (no actor, no event id, or a dismissal with no
+/// `dismissed_review`). `github_dismissed_review_absent` — a well-formed
+/// dismissal whose target `Review` is NOT present in this run's reviews (GitHub
+/// omits it: deleted account or a very old review), so a `TRANSITIONS_REVIEW`
+/// edge would dangle. Distinct codes so the two diagnostic families never collide.
+const TIMELINE_DIAG_UNPARSEABLE: &str = "github_timeline_event_unparseable";
+const TIMELINE_DIAG_REVIEW_ABSENT: &str = "github_dismissed_review_absent";
+
+/// The stable timeline `Diagnostic` id for `(repo, PR, event, code)` (issue #336).
+///
+/// Repo- and PR-scoped (mirrors [`commit_diagnostic_id`]) so a timeline
+/// diagnostic is recorded, never silently dropped, and never collides across
+/// repos in a shared store. `code` is part of the id so the two diagnostic
+/// families never share a record id for the same event.
+fn timeline_diagnostic_id(source_repo: &str, number: u64, event_id: u64, code: &str) -> String {
     let native = format!("pr:{number}");
     let handle = timeline_native_id(event_id);
     project_stable_id(&[
@@ -1677,28 +1689,26 @@ fn timeline_diagnostic_id(source_repo: &str, number: u64, event_id: u64) -> Stri
         IMPORTER_ID,
         source_repo,
         &native,
-        "github_timeline_event_unparseable",
+        code,
         &handle,
     ])
 }
 
-/// Builds a project `Diagnostic` recording a timeline event of a KNOWN
-/// review-state-transition kind that could not be turned into a transition
-/// record (issue #336) — e.g. a `review_dismissed` event with no
-/// `dismissed_review`, a zero event id, or a missing actor login.
+/// Builds a project `Diagnostic` recording a timeline event that could not be
+/// turned into the intended record (issue #336).
 ///
 /// Mirrors [`commit_diagnostic`]/[`review_diagnostic`]: the gap is recorded, not
-/// silently dropped, and never fabricated into a transition. Raw timeline text
-/// never enters the summary.
+/// silently dropped, and never fabricated. Raw timeline text never enters the
+/// summary. `code` selects the diagnostic family (see the code constants above).
 fn timeline_diagnostic(
     ctx: &Context<'_>,
     number: u64,
     event_id: u64,
     event_kind: &str,
+    code: &str,
     detail: &str,
 ) -> GraphRecord {
-    let code = "github_timeline_event_unparseable";
-    let id = timeline_diagnostic_id(ctx.source_repo, number, event_id);
+    let id = timeline_diagnostic_id(ctx.source_repo, number, event_id, code);
     let mut rec = GraphRecord::node(
         id.clone(),
         NodeKind::Diagnostic,
@@ -1707,7 +1717,7 @@ fn timeline_diagnostic(
         None,
         format!(
             "[{code}] PR #{number} timeline event '{event_kind}' (id {event_id}) could not be \
-             recorded as a review-state transition: {detail}"
+             recorded as intended: {detail}"
         ),
     );
     set_common(&mut rec, &id, ctx.transaction_time, ctx);
@@ -1783,6 +1793,7 @@ pub fn timeline_transition_unparseable(
             number,
             event_id,
             event_kind,
+            TIMELINE_DIAG_UNPARSEABLE,
             "timeline event JSON could not be deserialized",
         )],
         link_diagnostics: 1,
@@ -1791,21 +1802,32 @@ pub fn timeline_transition_unparseable(
 
 /// Records a PR-timeline review-state transition (issue #336).
 ///
-/// For a `review_dismissed` event: one `ReviewStateTransition` node + one
-/// `TRANSITIONS_REVIEW` edge to the dismissed `Review` (reconstructed from
-/// `dismissed_review.review_id`). For `review_requested` /
-/// `review_request_removed`: one standalone `ReviewStateTransition` node (no
-/// edge — these name no review). A KNOWN-kind event missing the fields needed to
-/// mint a citable transition (no actor login, a zero event id, or a dismissal
-/// with no `dismissed_review`) yields a `github_timeline_event_unparseable`
-/// `Diagnostic` instead — never a silent drop and never a fabricated transition.
-/// An event kind outside the closed set returns nothing (it is filtered upstream;
-/// this is a defensive no-op).
+/// For a `review_dismissed` event whose target `Review` is present in this run
+/// (`present_review_ids` — the `Review.id` set from the SAME PR's reviews fetch):
+/// one `ReviewStateTransition` node + one `TRANSITIONS_REVIEW` edge to that
+/// review. For `review_requested` / `review_request_removed`: one standalone
+/// `ReviewStateTransition` node (no edge — these name no review).
+///
+/// Resolve-or-diagnose (mirrors #334's `REVIEWS_COMMIT` ladder): a
+/// `review_dismissed` event whose dismissed review is ABSENT from this run's
+/// reviews — GitHub omits it (deleted account, a very old review) — would
+/// otherwise mint a `TRANSITIONS_REVIEW` edge to a `Review` that never enters the
+/// graph, i.e. a dangling edge `eg validate` flags. Instead the transition NODE
+/// is still emitted (history preserved) and the edge is replaced by a
+/// `github_dismissed_review_absent` `Diagnostic`. An edge is NEVER minted to a
+/// review not present this run.
+///
+/// A KNOWN-kind event missing the fields needed to mint a citable transition (no
+/// actor login, a zero event id, or a dismissal with no `dismissed_review`)
+/// yields a `github_timeline_event_unparseable` `Diagnostic` instead — never a
+/// silent drop and never a fabricated transition. An event kind outside the
+/// closed set returns nothing (it is filtered upstream; a defensive no-op).
 #[must_use]
 pub fn timeline_transition_records(
     ctx: &Context<'_>,
     number: u64,
     ev: &model::TimelineEvent,
+    present_review_ids: &std::collections::BTreeSet<u64>,
 ) -> Emitted {
     if !is_review_state_transition_kind(&ev.event) {
         return Emitted::default();
@@ -1820,6 +1842,7 @@ pub fn timeline_transition_records(
                 number,
                 ev.id,
                 &ev.event,
+                TIMELINE_DIAG_UNPARSEABLE,
                 "missing event id or actor login",
             )],
             link_diagnostics: 1,
@@ -1833,13 +1856,39 @@ pub fn timeline_transition_records(
                     number,
                     ev.id,
                     &ev.event,
+                    TIMELINE_DIAG_UNPARSEABLE,
                     "review_dismissed event carried no dismissed_review.review_id",
                 )],
                 link_diagnostics: 1,
             };
         };
+        // History is preserved regardless of whether the edge can be minted.
         let node =
             review_state_transition_node(ctx, number, ev, dismissed.dismissal_message.as_deref());
+        // Resolve-or-diagnose: only bind the edge to a Review present in this run.
+        // An absent target (GitHub omitted the dismissed review) becomes a
+        // diagnostic, never a dangling edge.
+        if !present_review_ids.contains(&dismissed.review_id) {
+            return Emitted {
+                records: vec![
+                    node,
+                    timeline_diagnostic(
+                        ctx,
+                        number,
+                        ev.id,
+                        &ev.event,
+                        TIMELINE_DIAG_REVIEW_ABSENT,
+                        &format!(
+                            "dismissed review {} is not present in this run's reviews \
+                             (GitHub omitted it); the transition is recorded without a \
+                             TRANSITIONS_REVIEW edge to avoid a dangling reference",
+                            dismissed.review_id
+                        ),
+                    ),
+                ],
+                link_diagnostics: 1,
+            };
+        }
         let node_id = node.id().to_owned();
         let review_id = dismissed_review_record_id(ctx.source_repo, number, dismissed.review_id);
         let edge = GraphRecord::project_edge(
@@ -3357,6 +3406,11 @@ mod tests {
         }
     }
 
+    /// Builds a present-review-id set for the timeline dismissal resolver.
+    fn present(ids: &[u64]) -> std::collections::BTreeSet<u64> {
+        ids.iter().copied().collect()
+    }
+
     fn transition_nodes(e: &Emitted) -> Vec<&GraphRecord> {
         e.records
             .iter()
@@ -3396,6 +3450,7 @@ mod tests {
             &c,
             7,
             &dismissal_event(5001, 301, "maintainer", Some("stale")),
+            &present(&[301]),
         );
 
         let nodes = transition_nodes(&e);
@@ -3460,7 +3515,12 @@ mod tests {
             commit_index: EMPTY_COMMIT_INDEX.get_or_init(CommitIndex::new),
         };
         let secret = format!("token ghp_{}", "A".repeat(40));
-        let e = timeline_transition_records(&c, 7, &dismissal_event(9, 301, "op", Some(&secret)));
+        let e = timeline_transition_records(
+            &c,
+            7,
+            &dismissal_event(9, 301, "op", Some(&secret)),
+            &present(&[301]),
+        );
         let node = transition_nodes(&e)[0];
         let GraphRecord::Node { body_handle, .. } = node else {
             panic!("node");
@@ -3495,7 +3555,7 @@ mod tests {
                 }),
                 requested_team: None,
             };
-            let e = timeline_transition_records(&c, 7, &ev);
+            let e = timeline_transition_records(&c, 7, &ev, &present(&[]));
             assert_eq!(transition_nodes(&e).len(), 1, "{kind}: one node");
             assert!(
                 edges_with_label(&e, EdgeLabel::TransitionsReview).is_empty(),
@@ -3514,7 +3574,7 @@ mod tests {
 
         let mut no_dismissed = dismissal_event(5001, 301, "maintainer", None);
         no_dismissed.dismissed_review = None;
-        let e = timeline_transition_records(&c, 7, &no_dismissed);
+        let e = timeline_transition_records(&c, 7, &no_dismissed, &present(&[301]));
         assert!(transition_nodes(&e).is_empty());
         assert_eq!(
             diagnostics_with_code(&e, "github_timeline_event_unparseable").len(),
@@ -3524,7 +3584,7 @@ mod tests {
 
         let mut no_actor = dismissal_event(5001, 301, "", None);
         no_actor.actor = None;
-        let e2 = timeline_transition_records(&c, 7, &no_actor);
+        let e2 = timeline_transition_records(&c, 7, &no_actor, &present(&[301]));
         assert!(transition_nodes(&e2).is_empty());
         assert_eq!(
             diagnostics_with_code(&e2, "github_timeline_event_unparseable").len(),
@@ -3541,13 +3601,14 @@ mod tests {
         let files = FileIndex::new();
         let c = ctx("o/r", &files, &identity);
         let ev = dismissal_event(5001, 301, "maintainer", Some("stale"));
-        let first: Vec<String> = timeline_transition_records(&c, 7, &ev)
+        let present = present(&[301, 999]);
+        let first: Vec<String> = timeline_transition_records(&c, 7, &ev, &present)
             .records
             .iter()
             .map(|r| r.id().to_owned())
             .collect();
         for _ in 0..5 {
-            let again: Vec<String> = timeline_transition_records(&c, 7, &ev)
+            let again: Vec<String> = timeline_transition_records(&c, 7, &ev, &present)
                 .records
                 .iter()
                 .map(|r| r.id().to_owned())
@@ -3567,7 +3628,7 @@ mod tests {
         // Changing the dismissed review id does NOT change the transition id.
         let ev_other_review = dismissal_event(5001, 999, "maintainer", Some("stale"));
         assert_eq!(
-            timeline_transition_records(&c, 7, &ev_other_review).records[0].id(),
+            timeline_transition_records(&c, 7, &ev_other_review, &present).records[0].id(),
             review_state_transition_id("o/r", 7, 5001),
             "transition identity is the timeline event, never the review"
         );
@@ -3584,7 +3645,7 @@ mod tests {
             dismissal_event(5002, 302, "bob", None),
         ];
         for ev in &events {
-            let e = timeline_transition_records(&c, 7, ev);
+            let e = timeline_transition_records(&c, 7, ev, &present(&[301, 302]));
             let node = transition_nodes(&e)[0];
             let GraphRecord::Node {
                 id,
@@ -3623,6 +3684,61 @@ mod tests {
     }
 
     #[test]
+    fn dismissal_of_absent_review_emits_diagnostic_not_dangling_edge() {
+        // S1 (review): a review_dismissed event whose target Review is ABSENT
+        // from this run's reviews (GitHub omitted it — deleted account / very old
+        // review) must NOT mint a TRANSITIONS_REVIEW edge to a Review that never
+        // enters the graph. Instead the transition NODE is still emitted (history
+        // preserved) and the edge is replaced by a github_dismissed_review_absent
+        // Diagnostic. Mirrors #334's REVIEWS_COMMIT resolve-or-diagnose ladder.
+        let files = FileIndex::new();
+        let c = ctx("o/r", &files, &identity);
+        // Present set does NOT contain review 301 → the target is absent.
+        let e = timeline_transition_records(
+            &c,
+            7,
+            &dismissal_event(5001, 301, "maintainer", Some("stale")),
+            &present(&[]),
+        );
+
+        // The transition node is still emitted — history is preserved.
+        let nodes = transition_nodes(&e);
+        assert_eq!(nodes.len(), 1, "the transition node is still emitted");
+        assert_eq!(
+            nodes[0].id(),
+            review_state_transition_id("o/r", 7, 5001),
+            "same append-only transition id"
+        );
+        // NO edge is minted to the absent Review.
+        assert!(
+            edges_with_label(&e, EdgeLabel::TransitionsReview).is_empty(),
+            "no TRANSITIONS_REVIEW edge to an absent Review"
+        );
+        // Exactly one absent-review diagnostic replaces the edge.
+        let diags = diagnostics_with_code(&e, "github_dismissed_review_absent");
+        assert_eq!(
+            diags.len(),
+            1,
+            "one github_dismissed_review_absent diagnostic"
+        );
+        // It is a distinct family from the unparseable diagnostic.
+        assert!(
+            diagnostics_with_code(&e, "github_timeline_event_unparseable").is_empty(),
+            "not an unparseable diagnostic"
+        );
+        // Determinism: byte-stable across runs.
+        let again = timeline_transition_records(
+            &c,
+            7,
+            &dismissal_event(5001, 301, "maintainer", Some("stale")),
+            &present(&[]),
+        );
+        let ids_a: Vec<_> = e.records.iter().map(|r| r.id().to_owned()).collect();
+        let ids_b: Vec<_> = again.records.iter().map(|r| r.id().to_owned()).collect();
+        assert_eq!(ids_a, ids_b, "absent-review path is byte-stable");
+    }
+
+    #[test]
     fn windowed_valid_time_still_finds_the_approval_after_dismissal() {
         // AC9: the load-bearing property. The Review (valid_time = approval
         // submitted_at) and the dismissal transition (valid_time = created_at)
@@ -3644,7 +3760,12 @@ mod tests {
         };
 
         // Dismissal at T1 (strictly later).
-        let dismissal = timeline_transition_records(&c, 7, &dismissal_event(5001, 301, "op", None));
+        let dismissal = timeline_transition_records(
+            &c,
+            7,
+            &dismissal_event(5001, 301, "op", None),
+            &present(&[301]),
+        );
         let trans = transition_nodes(&dismissal)[0];
         let trans_vt = match trans {
             GraphRecord::Node { valid_time, .. } => valid_time.clone().unwrap(),

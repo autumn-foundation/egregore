@@ -778,8 +778,13 @@ filtered to the closed transition kinds `{review_dismissed, review_requested,
 review_request_removed}` (every other timeline kind skipped), and mints one
 append-only `ReviewStateTransition` node per event. A `review_dismissed` event
 also mints a `TRANSITIONS_REVIEW` edge (ReviewStateTransition → Review) to the
-dismissed review, reconstructed from `dismissed_review.review_id`;
-`review_requested`/`review_request_removed` stand alone with no edge. Each
+dismissed review, reconstructed from `dismissed_review.review_id`, on a
+resolve-or-diagnose ladder (mirrors #334's `REVIEWS_COMMIT`): the edge is minted
+only when that review is present in this run's reviews; an absent review (GitHub
+omitted it — deleted account / very old review) yields a
+`github_dismissed_review_absent` `Diagnostic` instead of a dangling edge, with the
+transition node still emitted. `review_requested`/`review_request_removed` stand
+alone with no edge. Each
 transition is keyed on the timeline event's OWN server-native id
 (`project_stable_id(["project","ReviewStateTransition", repo, number,
 "timeline:<event_id>"])`), so it NEVER participates in the parent `Review`'s
