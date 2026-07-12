@@ -2564,17 +2564,41 @@ fn bind_log_summary_integrity(section: &EvidenceSection, window: &Window) -> Res
         .filter(|br| matches!(br.record, GraphRecord::Node { .. }))
         .map(|br| (br.record.id(), &br.record))
         .collect();
+    // (3) variant <-> section.class bind. Each log_summary variant must sit on its
+    // matching log section; a log_summary on any other section, or a mismatched log
+    // section (e.g. a RemediationLinks summary smuggled onto an error_signatures
+    // section, or any log_summary on a non-log section), is an Integrity defect.
+    // assemble never emits that, but verify must reject it.
     match summary {
         LogEvidenceSummary::ErrorSignatures { signatures } => {
+            require_summary_on_class(&section.class, "error_signatures")?;
             bind_error_signature_rows(&section.class, signatures, &node_by_id, window)
         }
         LogEvidenceSummary::OccurrenceBuckets { signature_totals } => {
+            require_summary_on_class(&section.class, "occurrence_buckets")?;
             bind_occurrence_totals(&section.class, signature_totals, &node_by_id)
         }
         // The derived join has no backing hashed row; the whole-summary hash above
         // is its binding surface.
-        LogEvidenceSummary::RemediationLinks { .. } => Ok(()),
+        LogEvidenceSummary::RemediationLinks { .. } => {
+            require_summary_on_class(&section.class, "remediation_links")?;
+            Ok(())
+        }
     }
+}
+
+/// Requires a `log_summary` variant to sit on its own section class (issue #340):
+/// `ErrorSignatures` <-> `error_signatures`, `OccurrenceBuckets` <->
+/// `occurrence_buckets`, `RemediationLinks` <-> `remediation_links`. A summary on a
+/// non-log section or on a mismatched log section is an Integrity defect.
+fn require_summary_on_class(class: &str, expected: &str) -> Result<(), String> {
+    if class != expected {
+        return Err(format!(
+            "section {class} carries a {expected} log_summary whose variant does not \
+             match its class"
+        ));
+    }
+    Ok(())
 }
 
 /// Binds every `error_signatures` summary row to its backing hashed `ErrorSignature`
@@ -2686,6 +2710,22 @@ fn bind_occurrence_totals(
     totals: &[SignatureOccurrenceTotal],
     node_by_id: &BTreeMap<&str, &GraphRecord>,
 ) -> Result<(), String> {
+    // Exact bijection (mirrors `bind_error_signature_rows`): the set of hashed
+    // `LogOccurrenceBucket` nodes actually present in the section must equal the set
+    // of buckets the summary lists. The per-bucket backing-node check below rejects
+    // a phantom summary bucket (summary \ section); the reverse guard after the loop
+    // rejects a hashed bucket dropped from the summary (section \ summary), which
+    // would under-report `in_window_occurrences` while its hashed row lingers.
+    let section_bucket_ids: BTreeSet<&str> = node_by_id
+        .iter()
+        .filter(|(_, rec)| {
+            matches!(
+                node_log_payload(rec),
+                Some(crate::ir::LogPayload::LogOccurrenceBucket(_))
+            )
+        })
+        .map(|(id, _)| *id)
+        .collect();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for total in totals {
         let mut sum: u64 = 0;
@@ -2730,6 +2770,17 @@ fn bind_occurrence_totals(
                 total.signature_id, total.in_window_occurrences, sum
             ));
         }
+    }
+    // Reverse guard: every hashed `LogOccurrenceBucket` node the section carries must
+    // be covered by the summary. `seen` holds exactly the summary buckets that
+    // resolved to a backing node (a phantom bucket already returned above), so any
+    // hashed bucket in `section_bucket_ids` missing from `seen` is a bucket silently
+    // dropped from the summary — Integrity must reject it.
+    if let Some(missing) = section_bucket_ids.difference(&seen).next() {
+        return Err(format!(
+            "occurrence_buckets section {class} carries LogOccurrenceBucket node {missing} \
+             absent from the summary"
+        ));
     }
     Ok(())
 }
@@ -10592,6 +10643,147 @@ mod pack340_tests {
         assert!(
             !report.integrity.passed,
             "a stripped log_summary_hash must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    // ── Codex round-2 P1: reverse bucket-coverage bijection ───────────────────
+    // `bind_occurrence_totals` must reject a hashed `LogOccurrenceBucket` node that
+    // is dropped from the summary. Recomputing `log_summary_hash` over the reduced
+    // summary defeats the whole-summary (layer-1) bind, so only the reverse
+    // coverage bijection can catch the under-report.
+
+    #[test]
+    fn verify_rejects_bucket_dropped_from_summary() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        {
+            let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) =
+                sec.log_summary.as_mut()
+            else {
+                panic!("occurrence_buckets summary present");
+            };
+            let total = signature_totals
+                .iter_mut()
+                .find(|t| t.signature_id == "log:v1:sig1")
+                .expect("sig1 total");
+            // Drop one in-window bucket and reduce the reported total to match, so
+            // the sum check passes and the reverse coverage guard is the ONLY
+            // failing check. Its hashed row lingers in `section.records`.
+            let dropped = total.buckets.remove(0);
+            total.in_window_occurrences -= dropped.occurrence_count;
+        }
+        // Recompute the binding hash over the reduced summary (defeats layer 1).
+        sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a hashed bucket dropped from the summary must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_whole_signature_total_dropped_from_summary() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        {
+            let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) =
+                sec.log_summary.as_mut()
+            else {
+                panic!("occurrence_buckets summary present");
+            };
+            // Drop an entire signature's total; every one of its hashed buckets
+            // lingers in `section.records` but is now uncovered by the summary.
+            let idx = signature_totals
+                .iter()
+                .position(|t| t.signature_id == "log:v1:sig1")
+                .expect("sig1 total");
+            signature_totals.remove(idx);
+        }
+        sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a whole signature total dropped from the summary must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    // ── Codex round-2 P2: variant <-> section.class bind ──────────────────────
+    // Each `log_summary` variant must sit on its matching section class. The
+    // genuinely exploitable hole is the `RemediationLinks` arm, which returned
+    // `Ok(())` unconditionally: a `RemediationLinks` summary (with its hash
+    // recomputed) rides ANY section — a mismatched log section or a non-log
+    // section — with no backing hashed row to catch it, so ONLY the variant<->class
+    // bind can reject it (the node-backed `ErrorSignatures`/`OccurrenceBuckets`
+    // variants are additionally netted by the section-membership and backing-row
+    // checks above).
+
+    #[test]
+    fn verify_rejects_remediation_summary_on_mismatched_log_section() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let remediation = pack
+            .sections
+            .iter()
+            .find(|s| s.class == EvidenceClass::RemediationLinks.as_wire())
+            .and_then(|s| s.log_summary.clone())
+            .expect("remediation_links summary");
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+            .expect("error_signatures section");
+        // A RemediationLinks summary on the error_signatures log section: recompute
+        // its hash so layer 1 passes and only the variant<->class bind can reject it
+        // (the arm formerly returned Ok unconditionally).
+        sec.log_summary = Some(remediation);
+        sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a RemediationLinks summary on the error_signatures section must fail \
+             Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_occurrence_summary_on_wrong_section() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let buckets = pack
+            .sections
+            .iter()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .and_then(|s| s.log_summary.clone())
+            .expect("occurrence_buckets summary");
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::RemediationLinks.as_wire())
+            .expect("remediation_links section");
+        // An OccurrenceBuckets summary on the remediation_links section: the
+        // variant<->class bind rejects it (and the backing-row net would too — this
+        // node-backed variant cannot slip past on the wrong section).
+        sec.log_summary = Some(buckets);
+        sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "an OccurrenceBuckets summary on the remediation_links section must fail \
+             Integrity: {}",
             report.integrity.detail
         );
     }

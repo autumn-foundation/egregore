@@ -261,8 +261,20 @@ that node's payload, and each `occurrence_buckets` bucket must resolve to a pres
 hashed `LogOccurrenceBucket` node with a matching count and hour while every
 `in_window_occurrences` must equal the recomputed sum — so the occurrence total
 cannot be inflated without adding real, count-matching hashed bucket rows. The
-derived `remediation_links` join has no backing hashed row, so the whole-summary
-hash is its sole binding surface.
+bucket binding is an **exact bijection in both directions**: not only must every
+summary bucket resolve to a present hashed node, but every hashed
+`LogOccurrenceBucket` node the section carries must be listed by the summary — so a
+bucket cannot be silently **dropped** from the summary (under-reporting
+`in_window_occurrences` while its hashed row lingers) with the binding hash
+recomputed over the reduced summary. Each summary variant is additionally **bound
+to its section class** — `error_signatures`↔`error_signatures`,
+`occurrence_buckets`↔`occurrence_buckets`, `remediation_links`↔`remediation_links` —
+so a `log_summary` on a non-log section, or a variant relocated onto a mismatched
+log section, fails Integrity (the derived `remediation_links` join has no backing
+hashed row to catch such a swap, so this class bind is its only guard against
+riding the wrong section). The derived `remediation_links` join has no backing
+hashed row, so the whole-summary hash plus this class bind are its sole binding
+surface.
 
 **Epistemic boundary.** Occurrence counts are **recorded ingestion of the scanned
 log sources, not guaranteed-complete telemetry** — absence of a signature is not
@@ -494,8 +506,17 @@ Re-verifies an assembled pack offline and read-only:
   present hashed `LogOccurrenceBucket` node with a matching `occurrence_count` and
   hour (no bucket double-counted), and each `in_window_occurrences` must equal the
   recomputed sum — so the occurrence total cannot be inflated without adding real,
-  count-matching hashed bucket rows. The derived `remediation_links` join has no
-  backing hashed row, so the whole-summary hash is its sole binding surface.
+  count-matching hashed bucket rows. The bucket binding is an **exact bijection in
+  both directions**: every hashed `LogOccurrenceBucket` node the section carries
+  must also be listed by the summary, so a bucket cannot be silently **dropped**
+  (under-reporting `in_window_occurrences`) with the binding hash recomputed over
+  the reduced summary. Finally, each summary **variant is bound to its section
+  class** (`error_signatures`↔`error_signatures`,
+  `occurrence_buckets`↔`occurrence_buckets`,
+  `remediation_links`↔`remediation_links`): a `log_summary` on a non-log section, or
+  a variant relocated onto a mismatched log section, fails Integrity. The derived
+  `remediation_links` join has no backing hashed row, so the whole-summary hash plus
+  this class bind are its sole binding surface.
 - **Coverage** — recompute the #65 citation thresholds (>=95% code rows cited;
   100% non-code rows cited).
 - **Safety** — scans the **entire serialized pack artifact** for raw sensitive
