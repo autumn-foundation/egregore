@@ -1077,6 +1077,22 @@ fn node_visible(id: &str, temporal_present: bool, tombstoned: &BTreeSet<&str>) -
     temporal_present || !tombstoned.contains(id)
 }
 
+/// True when a record carries a Git/bitemporal anchor — a scan-history version
+/// that stays visible even after a later tombstone (mirrors the `temporal.is_some()`
+/// check the visible-symbol/file seeds use).
+const fn has_temporal_anchor(record: &GraphRecord) -> bool {
+    matches!(
+        record,
+        GraphRecord::Node {
+            temporal: Some(_),
+            ..
+        } | GraphRecord::Edge {
+            temporal: Some(_),
+            ..
+        }
+    )
+}
+
 fn symbol_names(records: &[GraphRecord]) -> BTreeSet<&str> {
     let tombstoned = tombstoned_ids(records);
     records
@@ -1858,6 +1874,7 @@ fn drive_log_deltas(records: &[GraphRecord]) -> WorkflowBuilder {
     let mut builder = WorkflowBuilder::new("log-deltas", "runtime_observation");
     let provenance = LogProvenanceIndex::build(records);
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let tombstoned = tombstoned_ids(records);
     for signature in deltas
         .new_signatures
         .iter()
@@ -1873,11 +1890,21 @@ fn drive_log_deltas(records: &[GraphRecord]) -> WorkflowBuilder {
         }
         // Resolved-frame targets and overlapping symbol deltas are code rows,
         // audited under the existing code-handle rule. A `Diagnostic`-targeting
-        // (`unresolved`) frame passes via its Diagnostic handle; a dangling
-        // target (no present record) is never counted as cited.
+        // (`unresolved`) frame passes via its present Diagnostic handle. A frame
+        // whose target is DANGLING (absent from the record set) or
+        // tombstoned-and-unsuperseded is still a public code row, but carries no
+        // resolvable citation handle: AC3 ("dangling never counts as cited")
+        // requires it be counted as a `MissingRequiredHandle` code-lane failure,
+        // never silently dropped out of the totals.
         for frame in &signature.resolved_frames {
-            if let Some(record) = by_id.get(frame.target_record_id.as_str()) {
-                builder.push_record(record);
+            let target_id = frame.target_record_id.as_str();
+            match by_id.get(target_id) {
+                Some(record)
+                    if node_visible(target_id, has_temporal_anchor(record), &tombstoned) =>
+                {
+                    builder.push_record(record);
+                }
+                _ => builder.push_classified(missing(target_id, "source_fact"), String::new()),
             }
         }
         for overlap in &signature.overlapping_symbol_deltas {

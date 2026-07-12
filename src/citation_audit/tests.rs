@@ -696,6 +696,200 @@ fn subsystem_prefixes_include_root_level_paths() {
     );
 }
 
+// ── #328 AC3: dangling / tombstoned FRAME_RESOLVES_TO targets ──────────────
+//
+// A resolved backtrace frame is a CODE row audited under the code-handle rule.
+// When log-deltas surfaces a frame whose target record is DANGLING (absent from
+// the record set) or TOMBSTONED-and-unsuperseded, the frame is still a public
+// code row with no resolvable citation handle: AC3 ("dangling never counts as
+// cited") requires it be counted as a `MissingRequiredHandle` code-lane failure,
+// never silently dropped.
+
+fn commit_node(sha: &str, parents: &[&str], valid_time: &str) -> GraphRecord {
+    GraphRecord::node(
+        format!("codegraph:v1:commit_{sha}"),
+        NodeKind::Commit,
+        None,
+        None,
+        Some(sha.to_owned()),
+        format!("commit {sha}"),
+    )
+    .with_temporal(crate::ir::TemporalMetadata {
+        git_commit: sha.to_owned(),
+        git_parent_commits: parents.iter().map(|p| (*p).to_owned()).collect(),
+        valid_time: valid_time.to_owned(),
+        author_time: Some(valid_time.to_owned()),
+        observed_at: valid_time.to_owned(),
+        valid_time_source: Some("git_commit_committer_date".to_owned()),
+    })
+}
+
+fn frame_resolves_to(signature_id: &str, target: &str) -> GraphRecord {
+    GraphRecord::Edge {
+        id: crate::ir::log_stable_id(&[
+            "edge",
+            "FRAME_RESOLVES_TO",
+            signature_id,
+            "0",
+            target,
+            "resolved",
+        ]),
+        schema_version: crate::ir::LOG_SCHEMA_VERSION,
+        label: EdgeLabel::FrameResolvesTo,
+        source: signature_id.to_owned(),
+        target: target.to_owned(),
+        confidence: Some("1.0".to_owned()),
+        resolution: None,
+        frame_resolution: Some(crate::ir::FrameResolution::Resolved),
+        frame_index: Some(0),
+        basis: None,
+        temporal: None,
+        summary: format!("frame 0 resolves to {target}"),
+        producer: None,
+    }
+}
+
+// A two-commit range plus one `new`-in-window ErrorSignature (default first_seen
+// 2026-01-02T12:00:00Z falls inside the [c1, c3] window) cited by its
+// CAPTURED_FROM LogSource, plus a FRAME_RESOLVES_TO edge onto `frame_target`.
+// `extra` carries any additional records (e.g. the frame target node + tombstone).
+fn log_deltas_frame_scenario(frame_target: &str, extra: Vec<GraphRecord>) -> Vec<GraphRecord> {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let mut records = vec![
+        commit_node("c1sha", &[], "2026-01-01T00:00:00Z"),
+        commit_node("c3sha", &["c1sha"], "2026-01-03T00:00:00Z"),
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_id),
+        frame_resolves_to(&sig_id, frame_target),
+    ];
+    records.extend(extra);
+    records
+}
+
+fn log_deltas_frame_row<'a>(
+    report: &'a CitationAuditReport,
+    target: &str,
+) -> &'a RowClassification {
+    let workflow = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == "log-deltas")
+        .expect("log-deltas is a registered audit workflow");
+    assert!(
+        workflow.enabled,
+        "log-deltas lane must be enabled for the seeded range"
+    );
+    workflow
+        .rows
+        .iter()
+        .find(|r| r.record_id == target)
+        .unwrap_or_else(|| {
+            panic!(
+                "frame target {target} must surface as a log-deltas row, never be dropped; rows: {:?}",
+                workflow.rows
+            )
+        })
+}
+
+// #328 AC3 (the bug): a FRAME_RESOLVES_TO edge whose target record is ABSENT
+// from the graph must count as a missing-handle CODE-lane citation failure, not
+// be silently skipped out of the totals.
+#[test]
+fn dangling_frame_target_counts_as_missing_citation() {
+    let ghost = "codegraph:v1:ghost_symbol";
+    let records = log_deltas_frame_scenario(ghost, vec![]);
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let row = log_deltas_frame_row(&report, ghost);
+    assert_eq!(
+        row.status,
+        CitationStatus::MissingRequiredHandle,
+        "a dangling frame target is never cited"
+    );
+    assert_eq!(
+        row.trust_class, "source_fact",
+        "a frame row is a code row and lands in the code-citation lane"
+    );
+    // The missing row carries a classifying diagnostic (never an unclassified miss).
+    assert_eq!(report.gate.unclassified_missing_rows, 0);
+    // The dangling code row drags the code lane below the default gate.
+    assert!(
+        !report.gate.code_gate_pass,
+        "an uncited public code row must fail the code gate"
+    );
+    assert!(!report.ok);
+}
+
+// #328 AC3: a FRAME_RESOLVES_TO edge whose target is present but
+// TOMBSTONED-and-unsuperseded is likewise not a valid citation.
+#[test]
+fn tombstoned_frame_target_counts_as_missing_citation() {
+    let dead = "codegraph:v1:retracted_symbol";
+    let mut dead_symbol = node(dead, NodeKind::Symbol);
+    if let GraphRecord::Node {
+        repo_relative_path,
+        span,
+        ..
+    } = &mut dead_symbol
+    {
+        // Even with a well-formed file/span, a tombstoned-and-unsuperseded target
+        // is not a live citation.
+        repo_relative_path.replace("src/gone.rs".to_owned());
+        *span = Some(mk_span(1, 5));
+    }
+    let tombstone = GraphRecord::Tombstone {
+        id: "codegraph:v1:tomb_retracted".to_owned(),
+        schema_version: 1,
+        deleted_id: dead.to_owned(),
+        summary: "symbol removed".to_owned(),
+        producer: None,
+    };
+    let records = log_deltas_frame_scenario(dead, vec![dead_symbol, tombstone]);
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let row = log_deltas_frame_row(&report, dead);
+    assert_eq!(
+        row.status,
+        CitationStatus::MissingRequiredHandle,
+        "a tombstoned-and-unsuperseded frame target is never cited"
+    );
+    assert_eq!(row.trust_class, "source_fact");
+    assert!(!report.gate.code_gate_pass);
+    assert!(!report.ok);
+}
+
+// #328 AC3 (guard the correct case): a frame resolving to a PRESENT node is
+// audited under the code-handle rule and stays cited — the fix for the dangling
+// case must not regress a genuinely-resolved frame.
+#[test]
+fn present_frame_target_stays_cited() {
+    let live = "codegraph:v1:live_symbol";
+    let mut live_symbol = node(live, NodeKind::Symbol);
+    if let GraphRecord::Node {
+        repo_relative_path,
+        span,
+        ..
+    } = &mut live_symbol
+    {
+        repo_relative_path.replace("src/lib.rs".to_owned());
+        *span = Some(mk_span(10, 20));
+    }
+    let records = log_deltas_frame_scenario(live, vec![live_symbol]);
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let row = log_deltas_frame_row(&report, live);
+    assert_eq!(
+        row.status,
+        CitationStatus::Cited,
+        "a resolved frame onto a present symbol is cited by its file/span"
+    );
+    assert_eq!(row.trust_class, "source_fact");
+    assert!(report.gate.code_gate_pass);
+    assert!(report.ok);
+}
+
 // Round-9 review: with two disconnected commit chains in one store, pairing
 // root/tip extrema across chains yields a `NoPath` that disables the whole lane.
 // `changes_range` must return a base/head pair proven connected by parent topology.
