@@ -84,6 +84,22 @@
 //! * `head_window_occurrences` = sum of bucket counts whose `bucket_start`
 //!   is `<= commit_valid_time[head]`.
 //!
+//! These per-window counts are HOUR-BUCKET-GRANULAR, not endpoint-exact (Codex
+//! P2). A `LogOccurrenceBucket` carries only an hour-aligned `bucket_start` and
+//! an aggregate count — no per-occurrence timestamps (issue #320) — so a bucket
+//! straddling the base/head commit instant cannot be sub-divided at that instant.
+//! Including a bucket whenever `bucket_start <= endpoint` therefore counts the
+//! WHOLE hour, which may pull in occurrences up to one bucket width (1 hour) past
+//! the exact commit instant when the endpoint falls mid-hour. This is disclosed,
+//! not silently absorbed: the response carries `occurrence_count_granularity ==
+//! "hourly_bucket"` ([`OCCURRENCE_COUNT_GRANULARITY`]) and the always-present
+//! disclaimer states it. The alternative "fully-before" predicate
+//! (`bucket_start + width <= endpoint`) would UNDER-count by dropping pre-endpoint
+//! occurrences in the same partial bucket — trading over-count for under-count
+//! with no honesty gain — so disclosure is preferred over changing the predicate.
+//! Endpoint-exact counts would require sub-hour per-occurrence timestamps the
+//! bucket model does not retain.
+//!
 //! These per-window counts SUM every linked bucket across the coalesced group
 //! and are never deduped by bucket record ID (issue #361). A `LogOccurrenceBucket`
 //! record ID is `(repository/signature/hour/width)` and omits `LogSource`, so two
@@ -122,7 +138,23 @@ pub const LOG_DELTAS_DISCLAIMER: &str = "Rows are runtime error-signature observ
      against the commit range's valid-time window. A signature first observed in-range is a \
      regression LEAD, not proof this range caused it; a ceased signature is not proof of a fix; \
      occurrence data only reflects the log sources that were scanned (a sampling artifact), never \
-     the complete runtime behavior of the system.";
+     the complete runtime behavior of the system. Per-window occurrence counts \
+     (`base_window_occurrences`/`head_window_occurrences`) are hour-bucket-granular, not \
+     endpoint-exact: they sum every hourly `LogOccurrenceBucket` whose start is at or before the \
+     endpoint, so when the endpoint falls mid-hour a count may include occurrences up to one \
+     bucket width (1 hour) past the exact commit instant; endpoint-exact counts would require \
+     per-occurrence timestamps the bucket model does not retain.";
+
+/// Machine-readable granularity marker for the per-window occurrence counts.
+///
+/// `LogOccurrenceBucket` records carry only an hour-aligned `bucket_start` and an
+/// aggregate count — no per-occurrence timestamps (issue #320) — so a bucket
+/// straddling the base/head commit instant cannot be sub-divided. The per-window
+/// sums are therefore hour-bucket-granular: [`window_bucket_sum`] includes every
+/// bucket whose start is at/before the endpoint, which may pull in occurrences up
+/// to one bucket width past the exact instant when the endpoint falls mid-hour.
+/// This constant discloses that semantics without fabricating sub-hour precision.
+pub const OCCURRENCE_COUNT_GRANULARITY: &str = "hourly_bucket";
 
 /// Envelope caveat text emitted with `--repo` when the store holds a single
 /// distinct `Repository` node.
@@ -333,6 +365,13 @@ pub struct LogDeltas {
     pub range_commit_count: usize,
     /// Always-present advisory disclaimer ([`LOG_DELTAS_DISCLAIMER`]).
     pub disclaimer: &'static str,
+    /// Always-present granularity marker for the per-window occurrence counts
+    /// ([`OCCURRENCE_COUNT_GRANULARITY`], `"hourly_bucket"`): `base_window_occurrences`
+    /// / `head_window_occurrences` are hour-bucket-granular, not endpoint-exact.
+    /// The bucket model (issue #320) retains no per-occurrence timestamps, so a
+    /// bucket straddling a commit instant cannot be sub-divided; a count may include
+    /// occurrences up to one bucket width (1 hour) past the exact endpoint.
+    pub occurrence_count_granularity: &'static str,
     /// Repository-scope caveat, present only when `--repo` is set (issue #326
     /// follow-on): log signatures are never repository-filtered — see
     /// [`LogRepoScopeCaveat`]. Absent (omitted from JSON) for unscoped queries.
@@ -765,6 +804,7 @@ pub fn log_deltas(
         },
         range_commit_count: range.range_commit_shas.len(),
         disclaimer: LOG_DELTAS_DISCLAIMER,
+        occurrence_count_granularity: OCCURRENCE_COUNT_GRANULARITY,
         repo_scope_caveat,
         embedded_log_retention_caveat,
         new_signatures,

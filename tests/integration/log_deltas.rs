@@ -425,6 +425,64 @@ fn log_deltas_per_window_occurrences_from_buckets() {
 }
 
 #[test]
+fn log_deltas_window_occurrences_are_hour_bucket_granular() {
+    // HEAD's committer date falls MID-BUCKET: head is 12:30 but the linked
+    // `LogOccurrenceBucket` is hour-aligned at 12:00 and holds an aggregate count
+    // for the whole 12:00–13:00 hour (occurrences after 12:30 are indistinguishable
+    // from ones before — the bucket retains no per-occurrence timestamps). The sum
+    // predicate includes any bucket whose start is at/before the endpoint, so the
+    // WHOLE 12:00 bucket counts toward head_window_occurrences even though part of
+    // the hour is past the exact head instant. We cannot sub-divide the bucket, so
+    // (a) the count stays whole-bucket-granular (behavior unchanged) and (b) the
+    // envelope DISCLOSES that window occurrence counts are hour-bucket-granular,
+    // not endpoint-exact.
+    const BASE_T: &str = "2026-01-01T00:00:00Z"; // c1 base
+    const START_T: &str = "2026-01-02T00:00:00Z"; // c2 → window_start
+    const HEAD_T: &str = "2026-01-02T12:30:00Z"; // c3 head → window_end, MID 12:00 bucket
+    const SIG_FIRST: &str = "2026-01-02T12:00:00Z"; // inside [00:00, 12:30]
+    const SIG_LAST: &str = "2026-01-02T12:55:00Z";
+    const BUCKET_HOUR: &str = "2026-01-02T12:00:00Z"; // hour-aligned; spans 12:00–13:00
+
+    let sig = log_sig_id("mid-bucket-head");
+    let (bucket_node, bucket_edge) = bucket_with_edge(&sig, BUCKET_HOUR, 5);
+    let records = vec![
+        commit("c1sha0000", &[], BASE_T),
+        commit("c2sha0000", &["c1sha0000"], START_T),
+        commit("c3sha0000", &["c2sha0000"], HEAD_T),
+        error_signature("mid-bucket-head", "error", SIG_FIRST, SIG_LAST, 5),
+        bucket_node,
+        bucket_edge,
+    ];
+    let deltas = log_deltas(&records, "c1", "c3", None, false).expect("range should resolve");
+
+    // (a) Behavior unchanged: the whole hour-aligned 12:00 bucket is counted at head
+    // even though head is 12:30 — occurrences in 12:30–13:00 are included.
+    assert_eq!(record_ids(&deltas.new_signatures), vec![sig]);
+    let row = &deltas.new_signatures[0];
+    assert_eq!(row.occurrence_source, "occurrence_buckets");
+    assert_eq!(
+        row.head_window_occurrences,
+        Some(5),
+        "the whole hour-aligned bucket is counted even though head falls mid-hour"
+    );
+
+    // (b) Disclosure: the counts are explicitly labeled hour-bucket-granular, not
+    // endpoint-exact — both as a compact machine-readable marker and in the
+    // always-present disclaimer sentence.
+    assert_eq!(deltas.occurrence_count_granularity, "hourly_bucket");
+    assert!(
+        deltas.disclaimer.contains("hour-bucket-granular"),
+        "disclaimer must disclose hour-bucket granularity, got: {}",
+        deltas.disclaimer
+    );
+    assert!(
+        deltas.disclaimer.contains("endpoint-exact"),
+        "disclaimer must clarify counts are not endpoint-exact, got: {}",
+        deltas.disclaimer
+    );
+}
+
+#[test]
 fn log_deltas_sums_per_source_buckets_sharing_a_bucket_id() {
     // Two DISTINCT scan-logs sources observe the same signature in the same hour
     // inside the head window. `LogOccurrenceBucket` identity is

@@ -235,6 +235,23 @@ identical-rescan caveat and issue #361):
 - `head_window_occurrences` = sum of linked bucket counts whose `bucket_start`
   is `<= commit_valid_time[HEAD]`.
 
+These per-window counts are **hour-bucket-granular, not endpoint-exact**. A
+`LogOccurrenceBucket` carries only an hour-aligned `bucket_start` and an
+aggregate count — **no per-occurrence timestamps** (issue #320) — so a bucket
+that straddles the base/head commit instant **cannot be sub-divided** at that
+instant. Because a bucket is counted whenever `bucket_start <= endpoint`, when
+the endpoint falls **mid-hour** the **whole** hour is counted: a window count
+may include occurrences up to one bucket width (**1 hour**) past the exact
+commit instant. This is disclosed, never silently absorbed — every response
+carries `"occurrence_count_granularity": "hourly_bucket"` and the always-present
+`disclaimer` states it. Endpoint-exact counts would require sub-hour
+per-occurrence timestamps the bucket model does not retain; the alternative
+"fully-before" predicate (`bucket_start + width <= endpoint`) is **not** used
+because it would under-count by dropping pre-endpoint occurrences in the same
+partial bucket — trading over-count for under-count with no honesty gain.
+Endpoint-exact occurrence counts require a #319/#320 log-graph schema change
+(sub-hour per-occurrence timestamps) and are tracked in issue #364.
+
 When a signature has at least one linked bucket, `occurrence_source` is
 `occurrence_buckets` and both window fields are present. When a signature
 carries **no** linked buckets (e.g. a log graph ingested without buckets),
@@ -282,6 +299,7 @@ valid times.
   },
   "range_commit_count": 2,
   "disclaimer": "Rows are runtime error-signature observations ...",
+  "occurrence_count_granularity": "hourly_bucket",
   "new_signatures": [
     {
       "record_id": "log:v1:...",

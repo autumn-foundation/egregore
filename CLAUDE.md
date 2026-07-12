@@ -282,7 +282,14 @@ out-of-range and excluded from all three classes. Each `new_signatures` row join
 signature's `LogOccurrenceBucket` records via `AGGREGATES` edges (`base_window_occurrences`/
 `head_window_occurrences` = buckets at/before each endpoint's committer date); a signature
 with no linked buckets falls back to its aggregate `occurrence_count` with
-`occurrence_source: aggregate_only` — counts are never fabricated. Per-window bucket counts
+`occurrence_source: aggregate_only` — counts are never fabricated. These per-window counts are
+hour-bucket-granular, not endpoint-exact (the envelope carries
+`occurrence_count_granularity: "hourly_bucket"` and the disclaimer states it): a
+`LogOccurrenceBucket` retains only an hour-aligned `bucket_start` and an aggregate count (no
+per-occurrence timestamps), so a bucket straddling a commit instant cannot be sub-divided and a
+count may include occurrences up to one bucket width (1 hour) past the exact endpoint when it
+falls mid-hour; the "fully-before" predicate is deliberately not used (it would under-count
+instead), and endpoint-exact counts require a #320 schema change tracked in #364. Per-window bucket counts
 and the aggregate `occurrence_count` both SUM across all scanned sources: a
 `LogOccurrenceBucket` record ID is `(repository/signature/hour/width)` and omits `LogSource`,
 so distinct sources sharing a bucket ID are preserved by summing (never deduped by bucket ID);
