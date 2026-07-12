@@ -22,18 +22,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::evidence_freshness::FreshnessVerdict;
-use crate::ir::{GraphRecord, SourceSpan};
+use crate::ir::{EdgeLabel, GraphRecord, LogPayload, LogSourcePayload, SourceSpan};
 use crate::query::{
     self, FailureHandleError, RepositoryIndex, ResolvedFailureTarget, change_impact_context,
-    changes_context, failure_history_context, largest_semantic_drifts, memory_audit_context,
-    resolve_drift_target, resolve_failure_handle, subsystem_context, symbol_context,
-    task_evidence_context,
+    changes_context, failure_history_context, largest_semantic_drifts, log_deltas,
+    memory_audit_context, resolve_drift_target, resolve_failure_handle, subsystem_context,
+    symbol_context, task_evidence_context,
 };
 
 /// Default gate threshold: fraction of code-answer rows that must carry a
 /// stable record ID plus a repo-relative file/span handle or a documented
 /// absent-span reason (AC4).
 pub const DEFAULT_MIN_CODE_CITATION: f64 = 0.95;
+
+/// Default gate threshold for the `runtime_observation` lane (issue #328).
+///
+/// `1.0` (strictest): a runtime observation is the least-trusted trust class —
+/// a program's own claim about its execution, deterministically parsed but never
+/// verified — so every returned log row must carry its full citation (a
+/// well-formed `log:v1:` record ID plus its `LogSource` provenance) or the gate
+/// fails. There is no acceptable fraction of uncited runtime observations.
+pub const DEFAULT_MIN_LOG_CITATION: f64 = 1.0;
 
 /// Tolerance applied when comparing the measured completeness against the gate
 /// threshold so that an exact `0.95` fixture is not rejected by float drift.
@@ -95,6 +104,9 @@ pub struct SemanticRow {
 pub struct AuditConfig {
     /// Gate threshold for code-answer citation completeness (AC4).
     pub min_code_citation: f64,
+    /// Gate threshold for the `runtime_observation` (log-domain) lane (issue
+    /// #328). Every returned log row must be cited at or above this fraction.
+    pub min_log_citation: f64,
     /// How the `semantic` workflow is supplied.
     pub semantic: SemanticInput,
     /// Optional history-inclusive record set for the `evidence-freshness` lane.
@@ -112,6 +124,7 @@ impl Default for AuditConfig {
     fn default() -> Self {
         Self {
             min_code_citation: DEFAULT_MIN_CODE_CITATION,
+            min_log_citation: DEFAULT_MIN_LOG_CITATION,
             semantic: SemanticInput::default(),
             freshness_records: None,
         }
@@ -262,6 +275,11 @@ pub struct GateOutcome {
     pub code_gate_pass: bool,
     /// Whether every non-code trust-class row carries a required handle (AC5).
     pub non_code_handle_gate_pass: bool,
+    /// Measured fraction of `runtime_observation` (log-domain) rows that are
+    /// cited or documented-absent (issue #328). `1.0` when no log rows exist.
+    pub log_citation_completeness: f64,
+    /// Whether the `runtime_observation` lane met `min_log_citation` (issue #328).
+    pub log_gate_pass: bool,
     /// Count of missing-handle rows that lack a classifying diagnostic — must be 0.
     pub unclassified_missing_rows: usize,
 }
@@ -273,6 +291,8 @@ pub struct CitationAuditReport {
     pub ok: bool,
     /// Gate threshold in effect.
     pub min_code_citation: f64,
+    /// `runtime_observation` gate threshold in effect (issue #328).
+    pub min_log_citation: f64,
     /// Per-workflow reports, canonically ordered by workflow name.
     pub workflows: Vec<WorkflowReport>,
     /// Overall tallies across enabled workflows.
@@ -487,6 +507,176 @@ fn classify_code_handle(
     }
 }
 
+/// True when `id` is a well-formed `log:v<N>:<hex>` runtime-log record ID.
+///
+/// The `log:v1:` template hash is not stored as a standalone field: the
+/// `ErrorSignature` template is hashed into this content-addressed record ID
+/// (identity = repository, algorithm, normalized template, severity — see
+/// `log_stable_id` / `docs/schema/log-graph.md`), so a well-formed `log:v1:` ID
+/// is the citation of the template-hash requirement (issue #328; the disclosed
+/// schema shape of the #361–#364 known-limitation cluster). Not a schema change.
+fn is_well_formed_log_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("log:v") else {
+        return false;
+    };
+    let Some((version, hex)) = rest.split_once(':') else {
+        return false;
+    };
+    !version.is_empty()
+        && version.bytes().all(|b| b.is_ascii_digit())
+        && hex.len() >= 16
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Resolves a `runtime_observation` record's `LogSource` provenance over the
+/// log-domain edges (issue #328).
+///
+/// Log node IDs exclude the source (a signature's identity is repository +
+/// algorithm + template + severity), so one signature may carry MULTIPLE
+/// `CAPTURED_FROM` edges to distinct `LogSource` records; provenance is resolved
+/// as AT-LEAST-ONE present `LogSource` carrying a `source_artifact_hash`, never
+/// exactly-one. `LogSource` nodes cite themselves from their own payload; an
+/// `ErrorSignature` / `LogEvent` resolves through its `CAPTURED_FROM` edges; a
+/// `LogOccurrenceBucket` resolves through `AGGREGATES` → signature →
+/// `CAPTURED_FROM`.
+struct LogProvenanceIndex<'a> {
+    /// `LogSource` node ID → its payload (path + `source_artifact_hash`).
+    sources: BTreeMap<&'a str, &'a LogSourcePayload>,
+    /// Node ID → `CAPTURED_FROM` edge targets (candidate `LogSource` IDs).
+    captured_from: BTreeMap<&'a str, Vec<&'a str>>,
+    /// Node ID → `AGGREGATES` edge targets (candidate `ErrorSignature` IDs).
+    aggregates: BTreeMap<&'a str, Vec<&'a str>>,
+}
+
+impl<'a> LogProvenanceIndex<'a> {
+    fn build(records: &'a [GraphRecord]) -> Self {
+        // Deleted provenance is not reachable: a tombstoned CAPTURED_FROM /
+        // AGGREGATES edge, or a tombstoned-and-unsuperseded LogSource target, must
+        // not be accepted as a citation, mirroring the node/frame tombstone
+        // filtering the code path already applies (issue #328).
+        let tombstoned = tombstoned_ids(records);
+        let mut sources = BTreeMap::new();
+        let mut captured_from: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let mut aggregates: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for record in records {
+            match record {
+                GraphRecord::Node {
+                    id,
+                    log: Some(payload),
+                    temporal,
+                    ..
+                } => {
+                    if let LogPayload::LogSource(src) = payload.as_ref()
+                        && node_visible(id, temporal.is_some(), &tombstoned)
+                    {
+                        sources.insert(id.as_str(), src);
+                    }
+                }
+                GraphRecord::Edge {
+                    id,
+                    label: EdgeLabel::CapturedFrom,
+                    source,
+                    target,
+                    ..
+                } if !tombstoned.contains(id.as_str()) => captured_from
+                    .entry(source.as_str())
+                    .or_default()
+                    .push(target.as_str()),
+                GraphRecord::Edge {
+                    id,
+                    label: EdgeLabel::Aggregates,
+                    source,
+                    target,
+                    ..
+                } if !tombstoned.contains(id.as_str()) => aggregates
+                    .entry(source.as_str())
+                    .or_default()
+                    .push(target.as_str()),
+                _ => {}
+            }
+        }
+        Self {
+            sources,
+            captured_from,
+            aggregates,
+        }
+    }
+
+    /// Returns an at-least-one present `LogSource` (with a non-empty
+    /// `source_artifact_hash`) reachable from `id`, or `None`.
+    fn resolve_source(&self, id: &str) -> Option<&'a LogSourcePayload> {
+        if let Some(src) = self.captured_via(id) {
+            return Some(src);
+        }
+        // A bucket AGGREGATES a signature, not a source; hop one level to the
+        // signature's own CAPTURED_FROM edges.
+        self.aggregates
+            .get(id)
+            .into_iter()
+            .flatten()
+            .find_map(|sig| self.captured_via(sig))
+    }
+
+    /// First `CAPTURED_FROM` target of `id` that is a present `LogSource` with a
+    /// non-empty `source_artifact_hash`.
+    fn captured_via(&self, id: &str) -> Option<&'a LogSourcePayload> {
+        self.captured_from.get(id)?.iter().find_map(|target| {
+            self.sources
+                .get(target)
+                .copied()
+                .filter(|src| !src.source_artifact_hash.is_empty())
+        })
+    }
+}
+
+/// Classifies a `runtime_observation` (log-domain) row (issue #328).
+///
+/// Every runtime-observation row must carry a well-formed `log:v1:` record ID
+/// AND its `LogSource` provenance (source path + `source_artifact_hash`). A
+/// `LogSource` is cited from its own payload; every other log kind resolves
+/// provenance through its `CAPTURED_FROM` / `AGGREGATES` edges to an
+/// at-least-one present `LogSource`. A row with no resolvable source is a
+/// `MissingRequiredHandle` citation failure — never counted as cited by its own
+/// ID (a runtime observation is never counted as verification of itself).
+fn classify_log_handle(index: &LogProvenanceIndex, record: &GraphRecord) -> Classified {
+    let id = record.id();
+    let trust = "runtime_observation";
+    if !is_well_formed_log_id(id) {
+        return Classified {
+            row: RowClassification {
+                record_id: id.to_owned(),
+                trust_class: trust,
+                status: CitationStatus::MissingRequiredHandle,
+                primary_handle: None,
+                absent_handle_reason: None,
+            },
+            diagnostic: Some(("missing_record_id".to_owned(), None)),
+        };
+    }
+    // A LogSource is cited from its own payload; other kinds resolve upstream.
+    let own_source = match record {
+        GraphRecord::Node {
+            log: Some(payload), ..
+        } => match payload.as_ref() {
+            LogPayload::LogSource(src) => Some(src),
+            _ => None,
+        },
+        _ => None,
+    };
+    match own_source.or_else(|| index.resolve_source(id)) {
+        Some(src)
+            if !src.source_artifact_hash.is_empty() && !src.source_relative_path.is_empty() =>
+        {
+            cited(
+                id,
+                trust,
+                format!("{}@{}", src.source_relative_path, src.source_artifact_hash),
+            )
+        }
+        _ => missing(id, trust),
+    }
+}
+
 /// Returns the first agent-authored provenance handle that points at something
 /// **other than** the claim itself (AC6: a claim is never its own evidence).
 ///
@@ -697,7 +887,7 @@ fn missing(id: &str, trust: &'static str) -> Classified {
 // ---------------------------------------------------------------------------
 
 /// Accumulates de-duplicated rows and diagnostics for one workflow.
-struct WorkflowBuilder {
+struct WorkflowBuilder<'a> {
     workflow: &'static str,
     trust_class: &'static str,
     enabled: bool,
@@ -712,14 +902,26 @@ struct WorkflowBuilder {
     /// several malformed empty-ID public rows are each counted (they would
     /// otherwise collapse into one `("", temporal)` map key).
     empty_id_seq: usize,
+    /// Log-domain provenance index for the record set this workflow drives.
+    ///
+    /// The `runtime_observation` citation requirement is class-wide (issue #328,
+    /// "every row"): a log record surfaced through ANY workflow — not just
+    /// `eg query log-deltas` — must carry its full log citation. Because
+    /// [`classify_record`] is context-free (no record set), [`push_record`]
+    /// reclassifies every `runtime_observation` row through
+    /// [`classify_log_handle`] against this index so no log row can be counted
+    /// cited by its own ID via the catch-all.
+    ///
+    /// [`push_record`]: WorkflowBuilder::push_record
+    provenance: LogProvenanceIndex<'a>,
 }
 
 /// `(code, source_record_id, target_handle, relation)` — a de-dup key for one
 /// pending diagnostic before it is rendered into an [`AuditDiagnostic`].
 type DiagnosticEntry = (String, Option<String>, Option<String>, Option<String>);
 
-impl WorkflowBuilder {
-    const fn new(workflow: &'static str, trust_class: &'static str) -> Self {
+impl<'a> WorkflowBuilder<'a> {
+    fn new(workflow: &'static str, trust_class: &'static str, records: &'a [GraphRecord]) -> Self {
         Self {
             workflow,
             trust_class,
@@ -728,23 +930,40 @@ impl WorkflowBuilder {
             rows: BTreeMap::new(),
             diagnostics: BTreeSet::new(),
             empty_id_seq: 0,
+            provenance: LogProvenanceIndex::build(records),
         }
     }
 
-    const fn disabled(
+    fn disabled(
         workflow: &'static str,
         trust_class: &'static str,
         reason: &'static str,
+        records: &'a [GraphRecord],
     ) -> Self {
-        let mut builder = Self::new(workflow, trust_class);
+        let mut builder = Self::new(workflow, trust_class, records);
         builder.enabled = false;
         builder.disabled_reason = Some(reason);
         builder
     }
 
     /// Classifies a record and records its row + any diagnostic.
+    ///
+    /// A `runtime_observation` (log-domain) row is reclassified through
+    /// [`classify_log_handle`] against this workflow's [`LogProvenanceIndex`] so
+    /// the class-wide provenance requirement (issue #328) holds regardless of
+    /// which workflow surfaced the record — the context-free [`classify_record`]
+    /// catch-all would otherwise cite a provenance-less log record by its own ID.
+    /// A row already excluded (protected/unverified) keeps that status.
     fn push_record(&mut self, record: &GraphRecord) {
-        let classified = classify_record(record);
+        let mut classified = classify_record(record);
+        if classified.row.trust_class == "runtime_observation"
+            && !matches!(
+                classified.row.status,
+                CitationStatus::ExcludedProtected | CitationStatus::ExcludedUnverified
+            )
+        {
+            classified = classify_log_handle(&self.provenance, record);
+        }
         self.push_classified(classified, temporal_key(record));
     }
 
@@ -895,6 +1114,22 @@ fn tombstoned_ids(records: &[GraphRecord]) -> BTreeSet<&str> {
 /// returns even after the symbol was later deleted).
 fn node_visible(id: &str, temporal_present: bool, tombstoned: &BTreeSet<&str>) -> bool {
     temporal_present || !tombstoned.contains(id)
+}
+
+/// True when a record carries a Git/bitemporal anchor — a scan-history version
+/// that stays visible even after a later tombstone (mirrors the `temporal.is_some()`
+/// check the visible-symbol/file seeds use).
+const fn has_temporal_anchor(record: &GraphRecord) -> bool {
+    matches!(
+        record,
+        GraphRecord::Node {
+            temporal: Some(_),
+            ..
+        } | GraphRecord::Edge {
+            temporal: Some(_),
+            ..
+        }
+    )
 }
 
 fn symbol_names(records: &[GraphRecord]) -> BTreeSet<&str> {
@@ -1083,8 +1318,8 @@ fn memory_claim_ids(records: &[GraphRecord]) -> BTreeSet<String> {
 // Per-workflow drivers
 // ---------------------------------------------------------------------------
 
-fn drive_symbol(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("symbol", "source_fact");
+fn drive_symbol(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("symbol", "source_fact", records);
     let tombstoned = tombstoned_ids(records);
     for record in records {
         let GraphRecord::Node {
@@ -1101,8 +1336,8 @@ fn drive_symbol(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("file", "source_fact");
+fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("file", "source_fact", records);
     let tombstoned = tombstoned_ids(records);
     let paths = file_paths(records);
     for record in records {
@@ -1130,8 +1365,8 @@ fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder {
 /// `DependencyDeclaration` row the default invocation returns must carry its
 /// stable record ID plus the repo-relative manifest handle (the path-cited
 /// spanless source-fact rule).
-fn drive_manifest_deps(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("manifest-deps", "source_fact");
+fn drive_manifest_deps(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("manifest-deps", "source_fact", records);
     let tombstoned = tombstoned_ids(records);
     for record in records {
         let GraphRecord::Node {
@@ -1149,8 +1384,8 @@ fn drive_manifest_deps(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-fn drive_drift(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("drift", "source_fact");
+fn drive_drift(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("drift", "source_fact", records);
     // Measure the DEFAULT `eg query drift` output, which returns the top
     // `DEFAULT_QUERY_LIMIT` rows; later rows are not emitted by the default
     // public invocation the gate targets.
@@ -1162,15 +1397,15 @@ fn drive_drift(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-fn drive_semantic(config: &AuditConfig) -> WorkflowBuilder {
+fn drive_semantic<'a>(records: &'a [GraphRecord], config: &AuditConfig) -> WorkflowBuilder<'a> {
     match &config.semantic {
         SemanticInput::Disabled { reason } => {
-            let mut builder = WorkflowBuilder::disabled("semantic", "source_fact", reason);
+            let mut builder = WorkflowBuilder::disabled("semantic", "source_fact", reason, records);
             builder.add_diagnostic("unsupported_workflow".to_owned(), None, None, None);
             builder
         }
         SemanticInput::Enabled { rows } => {
-            let mut builder = WorkflowBuilder::new("semantic", "source_fact");
+            let mut builder = WorkflowBuilder::new("semantic", "source_fact", records);
             for row in rows {
                 let classified = classify_code_handle(
                     &row.record_id,
@@ -1186,8 +1421,8 @@ fn drive_semantic(config: &AuditConfig) -> WorkflowBuilder {
     }
 }
 
-fn drive_context(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("context", "source_fact");
+fn drive_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("context", "source_fact", records);
     for name in symbol_names(records) {
         let ctx = symbol_context(records, name);
         for record in ctx
@@ -1214,8 +1449,8 @@ fn drive_context(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-fn drive_subsystem(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("subsystem", "source_fact");
+fn drive_subsystem(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("subsystem", "source_fact", records);
     for prefix in subsystem_prefixes(records) {
         let Ok(ctx) = subsystem_context(records, &prefix) else {
             continue;
@@ -1251,8 +1486,8 @@ fn drive_subsystem(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-fn drive_task(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("task", "project_state");
+fn drive_task(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("task", "project_state", records);
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
     for task_id in task_ids(records) {
         let ctx = task_evidence_context(records, &task_id);
@@ -1296,8 +1531,8 @@ fn drive_task(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-fn drive_memory(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("memory", "agent_authored");
+fn drive_memory(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("memory", "agent_authored", records);
     for memory_id in memory_claim_ids(records) {
         // Audit the DEFAULT `eg query memory` view (no `--verified-only`): the
         // default emits unverified supporting/contradicting claims as normal
@@ -1372,8 +1607,11 @@ fn resolve_anchors(
     }
 }
 
-fn drive_failures(records: &[GraphRecord], repo_index: &RepositoryIndex) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("failures", "verification_evidence");
+fn drive_failures<'a>(
+    records: &'a [GraphRecord],
+    repo_index: &RepositoryIndex,
+) -> WorkflowBuilder<'a> {
+    let mut builder = WorkflowBuilder::new("failures", "verification_evidence", records);
     let mut handles: BTreeSet<String> = BTreeSet::new();
     handles.extend(symbol_names(records).into_iter().map(str::to_owned));
     // History-bearing: failures linked to a now-deleted file are still reachable
@@ -1411,8 +1649,11 @@ fn drive_failures(records: &[GraphRecord], repo_index: &RepositoryIndex) -> Work
     builder
 }
 
-fn drive_change_impact(records: &[GraphRecord], repo_index: &RepositoryIndex) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("change-impact", "source_fact");
+fn drive_change_impact<'a>(
+    records: &'a [GraphRecord],
+    repo_index: &RepositoryIndex,
+) -> WorkflowBuilder<'a> {
+    let mut builder = WorkflowBuilder::new("change-impact", "source_fact", records);
     let mut handles: BTreeSet<String> = BTreeSet::new();
     handles.extend(symbol_names(records).into_iter().map(str::to_owned));
     // History-bearing handle resolution (see `all_file_paths`).
@@ -1445,8 +1686,8 @@ fn drive_change_impact(records: &[GraphRecord], repo_index: &RepositoryIndex) ->
     builder
 }
 
-fn drive_policy(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("policy", "user_context");
+fn drive_policy(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("policy", "user_context", records);
     // `eg query audit <durable_id>` audits any durable policy node, active or
     // revoked, but only when its audit trail resolves: `eg query policy` filters
     // out durables whose `audit_trail` fails and `eg query audit` returns an
@@ -1477,8 +1718,8 @@ fn drive_policy(records: &[GraphRecord]) -> WorkflowBuilder {
 /// `eg query candidates` — pending `PromoteCandidate` rows. These are
 /// user-context answers that escape the policy lane (which only sees materialized
 /// durables), so an uncited pending candidate must still be gated.
-fn drive_candidates(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("candidates", "user_context");
+fn drive_candidates(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("candidates", "user_context", records);
     for candidate in query::pending_candidates(records, None) {
         builder.push_record(candidate);
         builder.note_redaction(candidate);
@@ -1566,16 +1807,26 @@ fn changes_range(records: &[GraphRecord]) -> Option<(&str, &str)> {
     None
 }
 
-fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder {
+fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
     let Some((base, head)) = changes_range(records) else {
-        return WorkflowBuilder::disabled("changes", "source_fact", "requires_commit_range");
+        return WorkflowBuilder::disabled(
+            "changes",
+            "source_fact",
+            "requires_commit_range",
+            records,
+        );
     };
 
     let Ok(ctx) = changes_context(records, base, head, None) else {
-        return WorkflowBuilder::disabled("changes", "source_fact", "commit_range_unresolved");
+        return WorkflowBuilder::disabled(
+            "changes",
+            "source_fact",
+            "commit_range_unresolved",
+            records,
+        );
     };
 
-    let mut builder = WorkflowBuilder::new("changes", "source_fact");
+    let mut builder = WorkflowBuilder::new("changes", "source_fact", records);
     for item in &ctx.changed_files {
         builder.push_record(item.record);
         builder.note_redaction(item.record);
@@ -1644,12 +1895,90 @@ fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
+/// `eg query log-deltas` (issue #326) — runtime error-signature deltas across a
+/// commit range (issue #328).
+///
+/// This is the one covered log-domain workflow on trunk: it is the only
+/// `eg query` verb that returns `runtime_observation` rows. Each classified
+/// signature row (`new` / `ceased` / `continuing`) is a runtime observation and
+/// must carry its full log citation (`classify_log_handle`); the signature's
+/// resolved-frame targets and its `overlapping_symbol_deltas` are code rows,
+/// reusing the existing code-handle rule (`classify_record` → `source_fact`).
+/// When #324 (`eg query error-context`) and #325 (the subsystem log section)
+/// land, add their drivers here alongside this one.
+///
+/// The commit range is derived from the in-set commit topology, exactly as
+/// `drive_changes` does; without at least two connected commits the lane is
+/// reported disabled rather than skipped.
+fn drive_log_deltas(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let Some((base, head)) = changes_range(records) else {
+        return WorkflowBuilder::disabled(
+            "log-deltas",
+            "runtime_observation",
+            "requires_commit_range",
+            records,
+        );
+    };
+    let Ok(deltas) = log_deltas(records, base, head, None, false) else {
+        return WorkflowBuilder::disabled(
+            "log-deltas",
+            "runtime_observation",
+            "commit_range_unresolved",
+            records,
+        );
+    };
+
+    let mut builder = WorkflowBuilder::new("log-deltas", "runtime_observation", records);
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let tombstoned = tombstoned_ids(records);
+    for signature in deltas
+        .new_signatures
+        .iter()
+        .chain(&deltas.ceased_signatures)
+        .chain(&deltas.continuing_signatures)
+    {
+        // The signature row is a runtime observation: `push_record` reclassifies
+        // it through `classify_log_handle` against the builder's provenance index,
+        // so it must carry its full log citation (well-formed `log:v1:` ID +
+        // LogSource provenance) — the same class-wide rule every workflow uses.
+        if let Some(record) = by_id.get(signature.record_id.as_str()) {
+            builder.push_record(record);
+            builder.note_redaction(record);
+        }
+        // Resolved-frame targets and overlapping symbol deltas are code rows,
+        // audited under the existing code-handle rule. A `Diagnostic`-targeting
+        // (`unresolved`) frame passes via its present Diagnostic handle. A frame
+        // whose target is DANGLING (absent from the record set) or
+        // tombstoned-and-unsuperseded is still a public code row, but carries no
+        // resolvable citation handle: AC3 ("dangling never counts as cited")
+        // requires it be counted as a `MissingRequiredHandle` code-lane failure,
+        // never silently dropped out of the totals.
+        for frame in &signature.resolved_frames {
+            let target_id = frame.target_record_id.as_str();
+            match by_id.get(target_id) {
+                Some(record)
+                    if node_visible(target_id, has_temporal_anchor(record), &tombstoned) =>
+                {
+                    builder.push_record(record);
+                }
+                _ => builder.push_classified(missing(target_id, "source_fact"), String::new()),
+            }
+        }
+        for overlap in &signature.overlapping_symbol_deltas {
+            if let Some(record) = by_id.get(overlap.record_id.as_str()) {
+                builder.push_record(record);
+            }
+        }
+    }
+    builder
+}
+
 /// `eg query evidence-freshness` — per-observation freshness verdicts. Each
 /// verdict row pairs an agent-authored observation with its cited code handle;
 /// both must carry their required citation, and stale/unresolved verdicts emit a
 /// diagnostic against the original handle.
-fn drive_evidence_freshness(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut builder = WorkflowBuilder::new("evidence-freshness", "agent_authored");
+fn drive_evidence_freshness(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("evidence-freshness", "agent_authored", records);
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
     for entry in crate::evidence_freshness::evidence_link_freshness(records) {
         if let Some(observation) = by_id.get(entry.observation_id.as_str()) {
@@ -1739,10 +2068,11 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         drive_evidence_freshness(freshness_records),
         drive_failures(records, &repo_index),
         drive_file(records),
+        drive_log_deltas(records),
         drive_manifest_deps(records),
         drive_memory(records),
         drive_policy(records),
-        drive_semantic(config),
+        drive_semantic(records, config),
         drive_subsystem(records),
         drive_symbol(records),
         drive_task(records),
@@ -1765,10 +2095,52 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         overall.add(&workflow.counts);
     }
 
-    // Gate A (AC4): code-answer rows must be ≥ threshold cited-or-documented.
+    let gate = evaluate_gate(&workflows, &diagnostics, config);
+    // A below-threshold log lane emits a stable diagnostic naming the workflow,
+    // the trust class, and the measured rate, then re-sorts to stay byte-stable.
+    if !gate.log_gate_pass {
+        diagnostics.push(AuditDiagnostic {
+            code: "below_log_citation_threshold".to_owned(),
+            workflow: "log-deltas",
+            source_record_id: None,
+            target_handle: Some(format!("{:.6}", gate.log_citation_completeness)),
+            relation: Some("runtime_observation".to_owned()),
+        });
+        diagnostics.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        diagnostics.dedup();
+    }
+
+    let ok = gate.code_gate_pass
+        && gate.non_code_handle_gate_pass
+        && gate.log_gate_pass
+        && gate.unclassified_missing_rows == 0;
+
+    CitationAuditReport {
+        ok,
+        min_code_citation: config.min_code_citation,
+        min_log_citation: config.min_log_citation,
+        workflows,
+        overall,
+        gate,
+        diagnostics,
+    }
+}
+
+/// Evaluates the three citation gates over the classified workflow rows.
+///
+/// Gate A (AC4): code-answer rows must be ≥ `min_code_citation` cited-or-
+/// documented. Gate B (AC5): no gated non-code row may be missing its handle.
+/// Gate C (#328): `runtime_observation` rows are their OWN rate-gated lane (NOT
+/// in `NON_CODE_GATED`), mirroring the code lane at the strictest default.
+fn evaluate_gate(
+    workflows: &[WorkflowReport],
+    diagnostics: &[AuditDiagnostic],
+    config: &AuditConfig,
+) -> GateOutcome {
     let mut code_total = 0usize;
     let mut code_satisfied = 0usize;
-    // Gate B (AC5): no gated non-code row may be missing its handle.
+    let mut log_total = 0usize;
+    let mut log_satisfied = 0usize;
     let mut non_code_gate_pass = true;
     // Success metric: every missing-handle row must carry a classifying diagnostic.
     let diag_sources: BTreeSet<&str> = diagnostics
@@ -1777,16 +2149,19 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         .collect();
     let mut unclassified_missing_rows = 0usize;
 
-    for workflow in &workflows {
+    for workflow in workflows {
         for row in &workflow.rows {
+            let satisfied = matches!(
+                row.status,
+                CitationStatus::Cited | CitationStatus::AbsentHandleDocumented
+            );
             if row.trust_class == "source_fact" {
                 code_total += 1;
-                if matches!(
-                    row.status,
-                    CitationStatus::Cited | CitationStatus::AbsentHandleDocumented
-                ) {
-                    code_satisfied += 1;
-                }
+                code_satisfied += usize::from(satisfied);
+            }
+            if row.trust_class == "runtime_observation" {
+                log_total += 1;
+                log_satisfied += usize::from(satisfied);
             }
             if row.status == CitationStatus::MissingRequiredHandle {
                 if NON_CODE_GATED.contains(&row.trust_class) {
@@ -1799,30 +2174,25 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         }
     }
 
-    let code_citation_completeness = if code_total == 0 {
-        1.0
-    } else {
-        // Counts are small (row tallies); precision loss is not a concern.
-        #[allow(clippy::cast_precision_loss)]
-        {
-            code_satisfied as f64 / code_total as f64
+    // Counts are small (row tallies); precision loss is not a concern.
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = |satisfied: usize, total: usize| -> f64 {
+        if total == 0 {
+            1.0
+        } else {
+            satisfied as f64 / total as f64
         }
     };
-    let code_gate_pass = code_citation_completeness + GATE_EPSILON >= config.min_code_citation;
-    let ok = code_gate_pass && non_code_gate_pass && unclassified_missing_rows == 0;
+    let code_citation_completeness = ratio(code_satisfied, code_total);
+    let log_citation_completeness = ratio(log_satisfied, log_total);
 
-    CitationAuditReport {
-        ok,
-        min_code_citation: config.min_code_citation,
-        workflows,
-        overall,
-        gate: GateOutcome {
-            code_citation_completeness,
-            code_gate_pass,
-            non_code_handle_gate_pass: non_code_gate_pass,
-            unclassified_missing_rows,
-        },
-        diagnostics,
+    GateOutcome {
+        code_citation_completeness,
+        code_gate_pass: code_citation_completeness + GATE_EPSILON >= config.min_code_citation,
+        non_code_handle_gate_pass: non_code_gate_pass,
+        log_citation_completeness,
+        log_gate_pass: log_citation_completeness + GATE_EPSILON >= config.min_log_citation,
+        unclassified_missing_rows,
     }
 }
 

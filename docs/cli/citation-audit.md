@@ -19,9 +19,15 @@ hosted service, or LLM-generated answer (issue #65).
 ## Synopsis
 
 ```text
-eg audit citations --graph <PATH>    [--min-code-citation <F>] [--format json]
-eg audit citations --data-dir <DIR>  [--min-code-citation <F>] [--format json]
+eg audit citations --graph <PATH>    [--min-code-citation <F>] [--min-log-citation <F>] [--format json]
+eg audit citations --data-dir <DIR>  [--min-code-citation <F>] [--min-log-citation <F>] [--format json]
 ```
+
+`--min-log-citation` gates the `runtime_observation` (log-domain) lane and
+defaults to `1.0` — the strictest gate, because a runtime observation is the
+least-trusted trust class. Both thresholds are validated to `[0.0, 1.0]`; an
+out-of-range value is a usage error (exit 2, `invalid_min_code_citation` /
+`invalid_min_log_citation`).
 
 Reads a seeded record set from a JSONL graph (`--graph`) or an embedded
 `AletheiaDB` store (`--data-dir`). The two sources are mutually exclusive.
@@ -52,10 +58,13 @@ The report ends with a `gate` block and a top-level `ok`:
 {
   "ok": true,
   "min_code_citation": 0.95,
+  "min_log_citation": 1.0,
   "gate": {
     "code_citation_completeness": 1.0,
     "code_gate_pass": true,
     "non_code_handle_gate_pass": true,
+    "log_citation_completeness": 1.0,
+    "log_gate_pass": true,
     "unclassified_missing_rows": 0
   }
 }
@@ -65,8 +74,9 @@ The report ends with a `gate` block and a top-level `ok`:
 |-------|---------|
 | `code_gate_pass` | **Fails** when fewer than `min_code_citation` (default 95%) of code-answer rows carry a stable record ID plus a repo-relative file/span handle or a documented absent-span reason (AC4). |
 | `non_code_handle_gate_pass` | **Fails** when any agent-memory, project, artifact, verification, redaction, protected-artifact, or user-context row lacks at least one source / verification / task / policy-audit / protected-payload handle (AC5). |
+| `log_gate_pass` | **Fails** when fewer than `min_log_citation` (default 100%) of `runtime_observation` (log-domain) rows carry their required citation — a well-formed `log:v1:` record ID plus `LogSource` provenance (issue #328). A below-threshold lane emits a `below_log_citation_threshold` diagnostic naming the workflow, the `runtime_observation` class, and the measured rate. |
 | `unclassified_missing_rows` | Missing-handle rows that lack a classifying diagnostic. The success metric requires this to be `0`. |
-| `ok` | `true` only when both gates pass and `unclassified_missing_rows == 0`. |
+| `ok` | `true` only when the code, non-code, and log gates all pass and `unclassified_missing_rows == 0`. |
 
 Exit codes: `0` gate passed, `1` gate failed (the full JSON report is still
 printed to stdout so it is consumable), `2` usage/load error (bad path,
@@ -87,21 +97,57 @@ Every workflow reports the same six tallies, per workflow and overall (AC3):
 
 Each row carries a `record_id`, a `trust_class` (reusing the existing
 `source_fact` / `agent_authored` / `verification_evidence` / `project_state` /
-`artifact` / `user_context` vocabulary), a `status`
+`artifact` / `user_context` / `runtime_observation` vocabulary), a `status`
 (`cited` / `absent_handle_documented` / `missing_required_handle` /
 `excluded_unverified` / `excluded_protected`), and a `primary_handle` when
 present. Deterministic code facts are kept separate from agent-authored memory,
-project intent, artifacts, verification evidence, and user-context policy; an
-agent-authored claim is never counted as evidence for itself (AC6).
+project intent, artifacts, verification evidence, user-context policy, and
+runtime log observations. The standing invariant: **an agent-authored claim is
+never counted as evidence for itself, and a runtime observation is never counted
+as verification** (AC6; issue #328).
+
+### The `runtime_observation` citation requirement (issue #328)
+
+Runtime log observations (`LogSource`, `ErrorSignature`, `LogEvent`,
+`LogOccurrenceBucket`) are the least-trusted trust class — a program's own claim
+about its execution, deterministically parsed but never verified. Every returned
+`runtime_observation` row must carry:
+
+- a stable, well-formed `log:v1:` record ID, **and**
+- its `LogSource` provenance: the source path **and** the `source_artifact_hash`.
+  A `LogSource` is cited from its own payload. An `ErrorSignature` / `LogEvent` /
+  `LogOccurrenceBucket` gets provenance by resolving its `CAPTURED_FROM` /
+  `AGGREGATES` edge(s) to an **at-least-one** present `LogSource` carrying a
+  hash — log node IDs exclude the source, so a signature may carry several
+  `CAPTURED_FROM` edges to distinct sources. A row with no resolvable source is a
+  `missing_required_handle` failure, never credited by its own ID.
+
+The template hash is **not** a standalone field: the `ErrorSignature` template is
+hashed into the content-addressed `log:v1:` record ID (identity = repository,
+algorithm, normalized template, severity), so a well-formed `log:v1:` ID *is* the
+citation of the template-hash requirement. This is a disclosed schema shape (part
+of the #361–#364 log-graph known-limitation cluster), not a new field.
+
+A signature's resolved backtrace-frame targets (`FRAME_RESOLVES_TO`, #322) and
+its overlapping symbol deltas are **code rows**, audited under the existing
+code-handle rule (record ID + repo-relative file/span, or a documented
+absent-span reason); an `unresolved`-targeting frame passes via its `Diagnostic`
+handle, and a dangling target is never counted as cited.
 
 ### Covered workflows
 
 `symbol`, `file`, `drift`, `semantic`, and `manifest-deps` (code-oriented) plus
 the cross-domain lanes `context`, `subsystem`, `task`, `memory`, `failures`,
-`change-impact`, `policy`, `candidates`, `changes`, and `evidence-freshness`.
-The `manifest-deps` lane gates every returned `DependencyDeclaration` row on
-its stable record ID plus the repo-relative `Cargo.toml` handle (a spanless
-path-cited source fact). A workflow with
+`change-impact`, `policy`, `candidates`, `changes`, `evidence-freshness`, and
+`log-deltas`. The `manifest-deps` lane gates every returned
+`DependencyDeclaration` row on its stable record ID plus the repo-relative
+`Cargo.toml` handle (a spanless path-cited source fact). The `log-deltas` lane
+(`eg query log-deltas`, #326) is the one covered log-domain workflow on trunk —
+the only `eg query` verb that returns `runtime_observation` rows; its classified
+signature rows are gated by `--min-log-citation` while its resolved-frame and
+overlapping-symbol-delta rows are gated as code rows. (When `eg query
+error-context` (#324) and the subsystem log section (#325) land, their drivers
+join this lane.) A workflow with
 nothing to return in the fixture reports zero rows rather than disappearing; one
 that needs inputs the fixture lacks (e.g. `semantic` without an embedded vector
 index, or `changes` without a commit range) is reported `enabled: false` with a
@@ -124,6 +170,8 @@ later uncited version cannot hide behind an earlier cited one.
 | `redacted_field` | A row carries a redaction marker or policy version. |
 | `protected_payload` | A row references a protected raw payload, withheld by hash/handle only. |
 | `unsupported_workflow` | A workflow could not run (e.g. `semantic` without an embedded store). |
+| `below_log_citation_threshold` | The `runtime_observation` (log-domain) lane fell below `min_log_citation`; names the `log-deltas` workflow, the `runtime_observation` class, and the measured rate (issue #328). |
+| `missing_record_id` | A row (code or log) carries no well-formed stable record ID. |
 
 ### Safety: no raw payloads (AC8)
 
@@ -169,8 +217,10 @@ gate when answers regress into uncited prose.
 ## Scope
 
 This slice consumes existing query, evidence-link, redaction, protected-artifact,
-project, verification, user-context, daemon, and schema-version contracts. It
-introduces no new graph domain, node kind, edge label, trust class,
+project, verification, user-context, log-domain, daemon, and schema-version
+contracts. It introduces no new graph domain, node kind, edge label, trust class,
 schema-version rule, redaction taxonomy, protected-artifact retrieval behavior,
 hosted service, LLM-generated answer, language expansion, or project-management
-UI.
+UI. The `runtime_observation` trust class already exists in the log-graph schema
+(issues #319/#320); issue #328 adds its citation **requirement** and gate, not
+the class itself.

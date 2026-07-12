@@ -242,6 +242,7 @@ fn trust_class_strings_match_existing_vocab() {
         "project_state",
         "artifact",
         "user_context",
+        "runtime_observation",
         "other",
     ];
     for kind in [
@@ -254,6 +255,8 @@ fn trust_class_strings_match_existing_vocab() {
         NodeKind::Agent,
         NodeKind::EmbeddingModel,
         NodeKind::DependencyDeclaration,
+        NodeKind::LogSource,
+        NodeKind::ErrorSignature,
     ] {
         let rec = node("id", kind);
         assert!(
@@ -261,6 +264,127 @@ fn trust_class_strings_match_existing_vocab() {
             "unexpected trust class for {kind:?}"
         );
     }
+}
+
+// ── #328: runtime_observation (log-domain) classification ──────────────────
+
+fn log_source_node(id: &str, path: &str, hash: &str) -> GraphRecord {
+    GraphRecord::node(
+        id.to_owned(),
+        NodeKind::LogSource,
+        Some(path.to_owned()),
+        None,
+        Some(path.to_owned()),
+        "log source".to_owned(),
+    )
+    .with_domain("log", crate::ir::LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::LogSource(LogSourcePayload {
+        source_relative_path: path.to_owned(),
+        source_format_version: "plain-v1".to_owned(),
+        source_artifact_hash: hash.to_owned(),
+        line_count: 10,
+    }))
+}
+
+fn error_signature_node(id: &str) -> GraphRecord {
+    GraphRecord::node(
+        id.to_owned(),
+        NodeKind::ErrorSignature,
+        None,
+        None,
+        Some("error signature".to_owned()),
+        "error signature".to_owned(),
+    )
+    .with_domain("log", crate::ir::LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::ErrorSignature(
+        crate::ir::ErrorSignaturePayload {
+            fingerprint_algorithm: "template-v1".to_owned(),
+            template_excerpt: "boom".to_owned(),
+            severity: "error".to_owned(),
+            occurrence_count: 1,
+            first_seen: "2026-01-02T12:00:00Z".to_owned(),
+            last_seen: "2026-01-02T13:00:00Z".to_owned(),
+            frames: None,
+        },
+    ))
+}
+
+fn captured_from(signature_id: &str, source_id: &str) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::CapturedFrom,
+        signature_id.to_owned(),
+        source_id.to_owned(),
+        None,
+        "captured from".to_owned(),
+    )
+}
+
+// #328: a LogSource is cited from its own payload (path + source_artifact_hash).
+#[test]
+fn log_source_cited_from_own_payload() {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "hash1"]);
+    let src = log_source_node(&src_id, "app.log", "abc123");
+    let index = LogProvenanceIndex::build(std::slice::from_ref(&src));
+    let result = classify_log_handle(&index, &src);
+    assert_eq!(result.row.trust_class, "runtime_observation");
+    assert_eq!(result.row.status, CitationStatus::Cited);
+    assert_eq!(result.row.primary_handle.as_deref(), Some("app.log@abc123"));
+}
+
+// #328: an ErrorSignature is cited via an at-least-one present CAPTURED_FROM
+// LogSource carrying a source_artifact_hash.
+#[test]
+fn error_signature_cited_via_captured_from_source() {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "hash1"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let records = vec![
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_id),
+    ];
+    let index = LogProvenanceIndex::build(&records);
+    let result = classify_log_handle(&index, &records[1]);
+    assert_eq!(result.row.status, CitationStatus::Cited);
+    assert_eq!(result.row.primary_handle.as_deref(), Some("app.log@abc123"));
+}
+
+// #328: an ErrorSignature with no resolvable CAPTURED_FROM LogSource is a
+// citation failure — never counted as cited by its own ID.
+#[test]
+fn error_signature_without_source_is_missing_required() {
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let sig = error_signature_node(&sig_id);
+    let index = LogProvenanceIndex::build(std::slice::from_ref(&sig));
+    let result = classify_log_handle(&index, &sig);
+    assert_eq!(result.row.status, CitationStatus::MissingRequiredHandle);
+    assert_eq!(result.diagnostic.unwrap().0, "missing_required_handle");
+}
+
+// #328: log node IDs exclude the source, so a signature may carry MULTIPLE
+// CAPTURED_FROM edges to distinct LogSources — provenance is at-least-one, and a
+// signature whose first source lacks a hash still resolves via a later one.
+#[test]
+fn error_signature_multiple_captured_from_at_least_one() {
+    let src_a = crate::ir::log_stable_id(&["log_source", "repo", "a.log", "h"]);
+    let src_b = crate::ir::log_stable_id(&["log_source", "repo", "b.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let records = vec![
+        // First source has an EMPTY hash (not a valid citation on its own).
+        log_source_node(&src_a, "a.log", ""),
+        // Second source carries a real hash.
+        log_source_node(&src_b, "b.log", "hashB"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_a),
+        captured_from(&sig_id, &src_b),
+    ];
+    let index = LogProvenanceIndex::build(&records);
+    let result = classify_log_handle(&index, &records[2]);
+    assert_eq!(
+        result.row.status,
+        CitationStatus::Cited,
+        "an at-least-one present source with a hash cites the signature"
+    );
+    assert_eq!(result.row.primary_handle.as_deref(), Some("b.log@hashB"));
 }
 
 // AC4: the gate fails below the threshold and passes when fully cited.
@@ -569,6 +693,312 @@ fn subsystem_prefixes_include_root_level_paths() {
     assert!(
         prefixes.contains("src"),
         "nested file keeps its parent-dir prefix: {prefixes:?}"
+    );
+}
+
+// ── #328 AC3: dangling / tombstoned FRAME_RESOLVES_TO targets ──────────────
+//
+// A resolved backtrace frame is a CODE row audited under the code-handle rule.
+// When log-deltas surfaces a frame whose target record is DANGLING (absent from
+// the record set) or TOMBSTONED-and-unsuperseded, the frame is still a public
+// code row with no resolvable citation handle: AC3 ("dangling never counts as
+// cited") requires it be counted as a `MissingRequiredHandle` code-lane failure,
+// never silently dropped.
+
+fn commit_node(sha: &str, parents: &[&str], valid_time: &str) -> GraphRecord {
+    GraphRecord::node(
+        format!("codegraph:v1:commit_{sha}"),
+        NodeKind::Commit,
+        None,
+        None,
+        Some(sha.to_owned()),
+        format!("commit {sha}"),
+    )
+    .with_temporal(crate::ir::TemporalMetadata {
+        git_commit: sha.to_owned(),
+        git_parent_commits: parents.iter().map(|p| (*p).to_owned()).collect(),
+        valid_time: valid_time.to_owned(),
+        author_time: Some(valid_time.to_owned()),
+        observed_at: valid_time.to_owned(),
+        valid_time_source: Some("git_commit_committer_date".to_owned()),
+    })
+}
+
+fn frame_resolves_to(signature_id: &str, target: &str) -> GraphRecord {
+    GraphRecord::Edge {
+        id: crate::ir::log_stable_id(&[
+            "edge",
+            "FRAME_RESOLVES_TO",
+            signature_id,
+            "0",
+            target,
+            "resolved",
+        ]),
+        schema_version: crate::ir::LOG_SCHEMA_VERSION,
+        label: EdgeLabel::FrameResolvesTo,
+        source: signature_id.to_owned(),
+        target: target.to_owned(),
+        confidence: Some("1.0".to_owned()),
+        resolution: None,
+        frame_resolution: Some(crate::ir::FrameResolution::Resolved),
+        frame_index: Some(0),
+        basis: None,
+        temporal: None,
+        summary: format!("frame 0 resolves to {target}"),
+        producer: None,
+    }
+}
+
+// A two-commit range plus one `new`-in-window ErrorSignature (default first_seen
+// 2026-01-02T12:00:00Z falls inside the [c1, c3] window) cited by its
+// CAPTURED_FROM LogSource, plus a FRAME_RESOLVES_TO edge onto `frame_target`.
+// `extra` carries any additional records (e.g. the frame target node + tombstone).
+fn log_deltas_frame_scenario(frame_target: &str, extra: Vec<GraphRecord>) -> Vec<GraphRecord> {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let mut records = vec![
+        commit_node("c1sha", &[], "2026-01-01T00:00:00Z"),
+        commit_node("c3sha", &["c1sha"], "2026-01-03T00:00:00Z"),
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_id),
+        frame_resolves_to(&sig_id, frame_target),
+    ];
+    records.extend(extra);
+    records
+}
+
+fn log_deltas_frame_row<'a>(
+    report: &'a CitationAuditReport,
+    target: &str,
+) -> &'a RowClassification {
+    let workflow = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == "log-deltas")
+        .expect("log-deltas is a registered audit workflow");
+    assert!(
+        workflow.enabled,
+        "log-deltas lane must be enabled for the seeded range"
+    );
+    workflow
+        .rows
+        .iter()
+        .find(|r| r.record_id == target)
+        .unwrap_or_else(|| {
+            panic!(
+                "frame target {target} must surface as a log-deltas row, never be dropped; rows: {:?}",
+                workflow.rows
+            )
+        })
+}
+
+// #328 AC3 (the bug): a FRAME_RESOLVES_TO edge whose target record is ABSENT
+// from the graph must count as a missing-handle CODE-lane citation failure, not
+// be silently skipped out of the totals.
+#[test]
+fn dangling_frame_target_counts_as_missing_citation() {
+    let ghost = "codegraph:v1:ghost_symbol";
+    let records = log_deltas_frame_scenario(ghost, vec![]);
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let row = log_deltas_frame_row(&report, ghost);
+    assert_eq!(
+        row.status,
+        CitationStatus::MissingRequiredHandle,
+        "a dangling frame target is never cited"
+    );
+    assert_eq!(
+        row.trust_class, "source_fact",
+        "a frame row is a code row and lands in the code-citation lane"
+    );
+    // The missing row carries a classifying diagnostic (never an unclassified miss).
+    assert_eq!(report.gate.unclassified_missing_rows, 0);
+    // The dangling code row drags the code lane below the default gate.
+    assert!(
+        !report.gate.code_gate_pass,
+        "an uncited public code row must fail the code gate"
+    );
+    assert!(!report.ok);
+}
+
+// #328 AC3: a FRAME_RESOLVES_TO edge whose target is present but
+// TOMBSTONED-and-unsuperseded is likewise not a valid citation.
+#[test]
+fn tombstoned_frame_target_counts_as_missing_citation() {
+    let dead = "codegraph:v1:retracted_symbol";
+    let mut dead_symbol = node(dead, NodeKind::Symbol);
+    if let GraphRecord::Node {
+        repo_relative_path,
+        span,
+        ..
+    } = &mut dead_symbol
+    {
+        // Even with a well-formed file/span, a tombstoned-and-unsuperseded target
+        // is not a live citation.
+        repo_relative_path.replace("src/gone.rs".to_owned());
+        *span = Some(mk_span(1, 5));
+    }
+    let tombstone = GraphRecord::Tombstone {
+        id: "codegraph:v1:tomb_retracted".to_owned(),
+        schema_version: 1,
+        deleted_id: dead.to_owned(),
+        summary: "symbol removed".to_owned(),
+        producer: None,
+    };
+    let records = log_deltas_frame_scenario(dead, vec![dead_symbol, tombstone]);
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let row = log_deltas_frame_row(&report, dead);
+    assert_eq!(
+        row.status,
+        CitationStatus::MissingRequiredHandle,
+        "a tombstoned-and-unsuperseded frame target is never cited"
+    );
+    assert_eq!(row.trust_class, "source_fact");
+    assert!(!report.gate.code_gate_pass);
+    assert!(!report.ok);
+}
+
+// #328 AC3 (guard the correct case): a frame resolving to a PRESENT node is
+// audited under the code-handle rule and stays cited — the fix for the dangling
+// case must not regress a genuinely-resolved frame.
+#[test]
+fn present_frame_target_stays_cited() {
+    let live = "codegraph:v1:live_symbol";
+    let mut live_symbol = node(live, NodeKind::Symbol);
+    if let GraphRecord::Node {
+        repo_relative_path,
+        span,
+        ..
+    } = &mut live_symbol
+    {
+        repo_relative_path.replace("src/lib.rs".to_owned());
+        *span = Some(mk_span(10, 20));
+    }
+    let records = log_deltas_frame_scenario(live, vec![live_symbol]);
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let row = log_deltas_frame_row(&report, live);
+    assert_eq!(
+        row.status,
+        CitationStatus::Cited,
+        "a resolved frame onto a present symbol is cited by its file/span"
+    );
+    assert_eq!(row.trust_class, "source_fact");
+    assert!(report.gate.code_gate_pass);
+    assert!(report.ok);
+}
+
+// ── #328 Finding A: class-wide runtime_observation provenance ──────────────
+//
+// The `runtime_observation` citation requirement is CLASS-WIDE ("every row"):
+// a log record surfaced through ANY workflow — not just `eg query log-deltas` —
+// must carry its full log citation. Here `eg query memory` returns an
+// ErrorSignature as supporting evidence; an ErrorSignature with no CAPTURED_FROM
+// LogSource has no resolvable provenance and must be a citation FAILURE, never
+// counted as cited by its own ID just because a non-log-deltas workflow reached
+// it via the context-free catch-all classifier.
+#[test]
+fn runtime_observation_via_memory_requires_provenance_classwide() {
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let log_link = EvidenceLink {
+        target_record_id: Some(sig_id.clone()),
+        target_domain: "log".to_owned(),
+        relation: "OBSERVES".to_owned(),
+        confidence: "1.0".to_owned(),
+        as_of_commit: None,
+        target_repo_relative_path: None,
+        target_span: None,
+        target_git_commit: None,
+    };
+    // The Observation is itself cited (external evidence link + source handle);
+    // the ErrorSignature it cites has NO CAPTURED_FROM edge → no LogSource.
+    let obs = observation(
+        "agent_memory:v1:obs_log",
+        Some("traj/run.traj"),
+        vec![log_link],
+    );
+    let sig = error_signature_node(&sig_id);
+    let records = vec![obs, sig];
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let memory = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == "memory")
+        .expect("memory workflow present");
+    let row = memory
+        .rows
+        .iter()
+        .find(|r| r.record_id == sig_id)
+        .expect("the ErrorSignature must surface as a memory supporting-evidence row");
+    assert_eq!(row.trust_class, "runtime_observation");
+    assert_eq!(
+        row.status,
+        CitationStatus::MissingRequiredHandle,
+        "a provenance-less runtime observation is never cited, regardless of surfacing workflow"
+    );
+    assert!(
+        !report.gate.log_gate_pass,
+        "an uncited runtime observation must fail the log gate"
+    );
+    assert!(!report.ok);
+}
+
+// ── #328 Finding B: tombstoned log provenance is not reachable ─────────────
+//
+// `LogProvenanceIndex` must ignore a TOMBSTONED CAPTURED_FROM/AGGREGATES edge and
+// a TOMBSTONED-and-unsuperseded LogSource target, mirroring the node/frame paths.
+#[test]
+fn tombstoned_captured_from_edge_is_not_provenance() {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let edge = captured_from(&sig_id, &src_id);
+    let edge_id = edge.id().to_owned();
+    let records = vec![
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        edge,
+        GraphRecord::Tombstone {
+            id: "log:v1:tomb_edge".to_owned(),
+            schema_version: crate::ir::LOG_SCHEMA_VERSION,
+            deleted_id: edge_id,
+            summary: "edge removed".to_owned(),
+            producer: None,
+        },
+    ];
+    let index = LogProvenanceIndex::build(&records);
+    let result = classify_log_handle(&index, &records[1]);
+    assert_eq!(
+        result.row.status,
+        CitationStatus::MissingRequiredHandle,
+        "a signature whose only CAPTURED_FROM edge is tombstoned has no reachable provenance"
+    );
+}
+
+#[test]
+fn tombstoned_log_source_target_is_not_provenance() {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let records = vec![
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_id),
+        GraphRecord::Tombstone {
+            id: "log:v1:tomb_src".to_owned(),
+            schema_version: crate::ir::LOG_SCHEMA_VERSION,
+            deleted_id: src_id.clone(),
+            summary: "log source removed".to_owned(),
+            producer: None,
+        },
+    ];
+    let index = LogProvenanceIndex::build(&records);
+    let result = classify_log_handle(&index, &records[1]);
+    assert_eq!(
+        result.row.status,
+        CitationStatus::MissingRequiredHandle,
+        "a CAPTURED_FROM edge to a tombstoned-and-unsuperseded LogSource is not reachable provenance"
     );
 }
 

@@ -7,11 +7,13 @@ pub(crate) fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
             graph,
             data_dir,
             min_code_citation,
+            min_log_citation,
             format,
         } => audit_citations_cmd(
             graph.as_deref(),
             data_dir.as_deref(),
             min_code_citation,
+            min_log_citation,
             format,
         ),
         AuditSubcommand::MemoryHealth {
@@ -812,10 +814,11 @@ pub(crate) fn audit_citations_cmd(
     graph: Option<&Path>,
     data_dir: Option<&Path>,
     min_code_citation: f64,
+    min_log_citation: f64,
     format: OutputFormat,
 ) -> Result<()> {
-    // The gate threshold is a fraction; reject values that would silently disable
-    // or invert the gate (e.g. a negative threshold makes 0% completeness pass).
+    // The gate thresholds are fractions; reject values that would silently disable
+    // or invert a gate (e.g. a negative threshold makes 0% completeness pass).
     if !min_code_citation.is_finite() || !(0.0..=1.0).contains(&min_code_citation) {
         eprintln!(
             "{}",
@@ -823,6 +826,17 @@ pub(crate) fn audit_citations_cmd(
                 "code": "invalid_min_code_citation",
                 "value": min_code_citation.to_string(),
                 "message": "--min-code-citation must be a finite value in [0.0, 1.0]"
+            })
+        );
+        std::process::exit(2);
+    }
+    if !min_log_citation.is_finite() || !(0.0..=1.0).contains(&min_log_citation) {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "code": "invalid_min_log_citation",
+                "value": min_log_citation.to_string(),
+                "message": "--min-log-citation must be a finite value in [0.0, 1.0]"
             })
         );
         std::process::exit(2);
@@ -867,6 +881,7 @@ pub(crate) fn audit_citations_cmd(
     });
     let config = crate::citation_audit::AuditConfig {
         min_code_citation,
+        min_log_citation,
         semantic,
         freshness_records,
     };

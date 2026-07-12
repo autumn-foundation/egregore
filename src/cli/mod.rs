@@ -2780,6 +2780,10 @@ pub(crate) enum AuditSubcommand {
         /// Minimum fraction of code-answer rows that must be cited (AC4 gate).
         #[arg(long, default_value_t = crate::citation_audit::DEFAULT_MIN_CODE_CITATION)]
         min_code_citation: f64,
+        /// Minimum fraction of runtime-observation (log-domain) rows that must be
+        /// cited (issue #328); defaults to `1.0`, the strictest gate.
+        #[arg(long, default_value_t = crate::citation_audit::DEFAULT_MIN_LOG_CITATION)]
+        min_log_citation: f64,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
