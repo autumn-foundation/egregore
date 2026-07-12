@@ -53,7 +53,193 @@ pub(crate) fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
         ),
         AuditSubcommand::ControlCatalog { catalog, format } => control_catalog_cmd(catalog, format),
         AuditSubcommand::EvidencePack { action } => evidence_pack_cmd(action),
+        AuditSubcommand::ReviewCoverage {
+            from,
+            to,
+            graph,
+            data_dir,
+            min_coverage,
+            require_non_author,
+            require_final_head,
+            format,
+        } => review_coverage_cmd(
+            &from,
+            &to,
+            graph.as_deref(),
+            data_dir.as_deref(),
+            min_coverage,
+            require_non_author,
+            require_final_head,
+            format,
+        ),
     }
+}
+
+/// Prints a redaction-safe JSON error and exits with the usage/load code (2).
+pub(crate) fn review_coverage_exit(value: &serde_json::Value) -> ! {
+    eprintln!("{value}");
+    std::process::exit(2);
+}
+
+/// Handles `eg audit review-coverage` (issue #339): gates review coverage over
+/// PRs merged in a valid-time window. Exit 0 coverage met (empty window is a
+/// vacuous pass), 1 below threshold (report still printed), 2 usage/load error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn review_coverage_cmd(
+    from: &str,
+    to: &str,
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+    min_coverage: f64,
+    require_non_author: bool,
+    require_final_head: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    use crate::evidence_pack::{ReviewCoverageOptions, Window};
+
+    // Validate the gate threshold: a non-finite or out-of-range value would
+    // silently disable or invert the gate.
+    if !min_coverage.is_finite() || !(0.0..=1.0).contains(&min_coverage) {
+        review_coverage_exit(&serde_json::json!({
+            "code": "invalid_min_coverage",
+            "value": min_coverage.to_string(),
+            "message": "--min-coverage must be a finite value in [0.0, 1.0]",
+        }));
+    }
+
+    // Validate the window bounds before opening any store, so a reversed/invalid
+    // window is a precise usage error rather than a downstream failure.
+    let from_ts = chrono::DateTime::parse_from_rfc3339(from).unwrap_or_else(|_| {
+        review_coverage_exit(&serde_json::json!({
+            "code": "invalid_timestamp",
+            "which": "from",
+            "value": from,
+        }))
+    });
+    let to_ts = chrono::DateTime::parse_from_rfc3339(to).unwrap_or_else(|_| {
+        review_coverage_exit(&serde_json::json!({
+            "code": "invalid_timestamp",
+            "which": "to",
+            "value": to,
+        }))
+    });
+    if from_ts >= to_ts {
+        review_coverage_exit(&serde_json::json!({
+            "code": "reversed_window",
+            "from": from,
+            "to": to,
+        }));
+    }
+
+    // Enforce exactly-one-of the input flags before opening any store.
+    match (graph, data_dir) {
+        (Some(_), Some(_)) => review_coverage_exit(&serde_json::json!({
+            "code": "conflicting_input_flags",
+            "message": "provide only one of --graph or --data-dir, not both",
+        })),
+        (None, None) => review_coverage_exit(&serde_json::json!({
+            "code": "missing_input_flag",
+            "message": "provide --graph <path> or --data-dir <path>",
+        })),
+        _ => {}
+    }
+
+    // Read records read-only. An embedded store is read through a throwaway copy.
+    let store_copy = data_dir.map(|dir| match readonly_audit_store(dir) {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    });
+    let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
+    #[allow(clippy::option_if_let_else)] // `--graph` uses the sanitizing reader (round-19 P2)
+    let records = match graph {
+        Some(graph_path) => load_graph_records_sanitized(graph_path),
+        None => match load_query_records(graph, effective_data_dir) {
+            Ok(records) => records,
+            Err(error) => {
+                eprintln!("{error}");
+                drop(store_copy);
+                std::process::exit(2);
+            }
+        },
+    };
+
+    // A genuinely empty evidence input is a LOAD error naming the path, distinct
+    // from the vacuous `empty_window` SUCCESS (a non-empty store whose PRs simply
+    // fall outside the window).
+    if records.is_empty() {
+        let source_path = graph
+            .or(data_dir)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        drop(store_copy);
+        review_coverage_exit(&serde_json::json!({
+            "code": "empty_evidence_input",
+            "path": source_path,
+            "message": "evidence input holds zero records; provide a non-empty graph or store",
+        }));
+    }
+
+    let window = Window {
+        from: from.to_owned(),
+        to: to.to_owned(),
+    };
+    let options = ReviewCoverageOptions {
+        require_non_author,
+        require_final_head,
+    };
+    let report =
+        crate::review_coverage::run_review_coverage(&records, &window, options, min_coverage);
+
+    let output = match format {
+        OutputFormat::Json => {
+            serde_json::to_string(&report).context("failed to serialize review-coverage report")?
+        }
+        OutputFormat::Text => render_review_coverage_text(&report),
+    };
+    println!("{output}");
+    let exit_code = i32::from(!report.ok);
+    drop(store_copy);
+    std::process::exit(exit_code);
+}
+
+/// Renders a review-coverage report as a deterministic human-readable form.
+fn render_review_coverage_text(report: &crate::review_coverage::ReviewCoverageReport) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!(
+        "window: {} <= t < {}",
+        report.window.from, report.window.to
+    ));
+    lines.push(format!(
+        "options: require_non_author={} require_final_head={}",
+        report.options.require_non_author, report.options.require_final_head
+    ));
+    lines.push(format!("ok: {}", report.ok));
+    lines.push(format!(
+        "coverage: {:.4} (covered {} / merged {}) vs minimum {:.4}",
+        report.coverage, report.covered_count, report.merged_pr_count, report.min_coverage
+    ));
+    lines.push("verdict_counts:".to_owned());
+    for (verdict, count) in &report.verdict_counts {
+        lines.push(format!("  {verdict}: {count}"));
+    }
+    lines.push("rows:".to_owned());
+    for row in &report.rows {
+        let subs = if row.sub_labels.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", row.sub_labels.join(","))
+        };
+        lines.push(format!("  {} {}{}", row.pr_task_id, row.verdict, subs));
+    }
+    lines.push(format!("diagnostics: {}", report.diagnostics.len()));
+    for d in &report.diagnostics {
+        lines.push(format!("  {} {}", d.code, d.detail));
+    }
+    lines.push(format!("disclaimer: {}", report.disclaimer));
+    lines.join("\n")
 }
 
 /// Routes `eg audit evidence-pack` actions (issue #338).
