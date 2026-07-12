@@ -5047,6 +5047,25 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 println!("{}", serde_json::to_string(&envelope)?);
                 std::process::exit(1);
             }
+            // `--as-of` bounds the occurrence view on the valid axis but is NOT
+            // routed through the commit resolver (which validates `--at`), so a
+            // malformed instant would otherwise be silently no-op'd by the core's
+            // `parse_instant` (returning None → no cutoff → every bucket kept).
+            // Validate it up front so a bad `--as-of` fails loudly with a
+            // machine-readable error, mirroring the sibling temporal verbs.
+            if let Some(vt) = as_of.as_deref()
+                && chrono::DateTime::parse_from_rfc3339(vt).is_err()
+            {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "invalid_as_of_timestamp",
+                        "message": format!("--as-of must be an RFC 3339 instant, got '{vt}'"),
+                    },
+                });
+                println!("{}", serde_json::to_string(&envelope)?);
+                std::process::exit(1);
+            }
             // Strictly read-only lane: opening the embedded engine in place
             // re-persists its index files, so `--data-dir` reads a throwaway
             // copy. `--at`/`--as-of` need the history-inclusive read (superseded

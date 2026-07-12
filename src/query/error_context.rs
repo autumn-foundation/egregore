@@ -424,7 +424,18 @@ fn graph_has_protected_handle(records: &[GraphRecord]) -> bool {
 
 /// Resolves a handle to anchor `ErrorSignature` IDs (§1: record ID → fingerprint
 /// prefix → symbol name).
-fn resolve_handle(records: &[GraphRecord], handle: &str) -> HandleResolution {
+///
+/// `frame_records` supplies the `FRAME_RESOLVES_TO` edges consulted by symbol-name
+/// mode (§1c). Under `--at` it is the commit-view-re-resolved frame set, so a
+/// symbol named only by a frame that resolves at that commit still matches;
+/// without `--at` it is the graph's own edges. Signature and symbol NODE indices
+/// always come from `records` (the re-resolved set never re-emits code-graph
+/// symbols).
+fn resolve_handle(
+    records: &[GraphRecord],
+    frame_records: &[GraphRecord],
+    handle: &str,
+) -> HandleResolution {
     let tombstoned: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| match r {
@@ -483,7 +494,7 @@ fn resolve_handle(records: &[GraphRecord], handle: &str) -> HandleResolution {
 
     if !symbol_ids.is_empty() {
         let mut resolved: BTreeSet<&str> = BTreeSet::new();
-        for r in records {
+        for r in frame_records {
             if let GraphRecord::Edge {
                 label: EdgeLabel::FrameResolvesTo,
                 source,
@@ -553,8 +564,22 @@ pub fn error_context(
         return Err(ErrorContextError::ProtectedHandleInGraph);
     }
 
+    // Frame view: re-resolved against a commit view when `--at` is set, else the
+    // graph's existing FRAME_RESOLVES_TO edges. Computed BEFORE handle resolution
+    // so symbol-name mode (§1c) resolves against the SAME commit-view frames that
+    // Stage A reports — resolving symbol handles from the current graph while
+    // Stage A re-resolves would make `error-context <symbol> --at <commit>` miss a
+    // signature whose frame only resolves to that symbol at the commit view.
+    let reresolved;
+    let frame_records: &[GraphRecord] = if at_commit.is_some() {
+        reresolved = log_resolve::resolve_frames(records, at_commit);
+        &reresolved.records
+    } else {
+        records
+    };
+
     // §1: resolve the handle to anchor signature IDs.
-    let signature_ids: Vec<String> = match resolve_handle(records, handle) {
+    let signature_ids: Vec<String> = match resolve_handle(records, frame_records, handle) {
         HandleResolution::Signatures(ids) => ids,
         HandleResolution::Ambiguous(candidates) => {
             return Err(ErrorContextError::Ambiguous { candidates });
@@ -569,15 +594,6 @@ pub fn error_context(
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
 
     // ── Stage A: signature blocks (direct edge reads) ────────────────────────
-    // Frame edges: re-resolved against a commit view when `--at`/`--as-of` set,
-    // else read from the graph's existing FRAME_RESOLVES_TO edges.
-    let reresolved;
-    let frame_records: &[GraphRecord] = if at_commit.is_some() {
-        reresolved = log_resolve::resolve_frames(records, at_commit);
-        &reresolved.records
-    } else {
-        records
-    };
     let mut frames_by_sig: BTreeMap<&str, Vec<ResolvedFrameHandle>> = BTreeMap::new();
     for r in frame_records {
         if let GraphRecord::Edge {
@@ -1097,14 +1113,31 @@ fn build_first_seen_range(
     // iff it carries at least one Commit with a parseable valid_time. The emitted
     // window strings keep the original RFC 3339 text; only the ordering is by
     // instant (committer dates carry local offsets, log times are Z-normalized).
+    //
+    // When `--repo` is set the timeline is scoped to commits OWNED by that
+    // repository (via the CONTAINS topology, like `range_deltas`/`log_deltas`):
+    // in a shared multi-repository store an unrelated repository's commits could
+    // otherwise bracket `first_seen`, citing a foreign window and, because the
+    // reused `range_deltas` join below is itself repo-scoped, dropping the real
+    // overlap. Commits ARE attributable (`owner_of`), so bracketing must be
+    // scoped too, not built from every Commit node.
+    let repo_index = repo_scope.map(|_| super::RepositoryIndex::build(records));
+    let commit_in_scope = |id: &str| -> bool {
+        match (repo_scope, repo_index.as_ref()) {
+            (Some(scope), Some(index)) => index.owner_of(id) == Some(scope),
+            _ => true,
+        }
+    };
     let mut commits: Vec<(String, DateTime<Utc>, String)> = Vec::new();
     for r in records {
         if let GraphRecord::Node {
+            id,
             kind: NodeKind::Commit,
             name: Some(sha),
             temporal: Some(t),
             ..
         } = r
+            && commit_in_scope(id)
             && let Some(instant) = parse_instant(&t.valid_time)
         {
             commits.push((sha.clone(), instant, t.valid_time.clone()));

@@ -54,11 +54,15 @@ text never enters the response beyond the signature's bounded, post-redaction
 
 ### `--repo` scope (code side only)
 
-`--repo <SELECTOR>` scopes the **code side** of the `first_seen_range`
-symbol-delta join to one repository in a shared multi-repo store. Log records
-carry no retrievable repository attribution (their repository ID is only hashed
-into their stable IDs), so signatures, frames, buckets, and runs are never
-repository-filtered — mirroring [`eg query log-deltas`](./log-deltas.md).
+`--repo <SELECTOR>` scopes the **code side** of the `first_seen_range` to one
+repository in a shared multi-repo store: both the commit timeline that brackets
+the signature's `first_seen` (base/head/window commits) and the reused
+symbol-delta join are restricted to commits and code owned by that repository
+(via the `CONTAINS` topology, like [`eg query log-deltas`](./log-deltas.md)).
+Without this scoping a foreign repository's commits could bracket a foreign
+window. Log records carry no retrievable repository attribution (their
+repository ID is only hashed into their stable IDs), so signatures, frames,
+buckets, and runs are never repository-filtered.
 
 ### Temporal selectors
 
@@ -66,7 +70,9 @@ repository-filtered — mirroring [`eg query log-deltas`](./log-deltas.md).
   (spans as they existed at that commit), reusing the
   [`eg resolve-frames`](./resolve-frames.md) resolver.
 - `--as-of <RFC3339>` bounds the occurrence-bucket view on the valid axis:
-  buckets whose `bucket_start` is after the instant are dropped.
+  buckets whose `bucket_start` is after the instant are dropped. A malformed
+  `--as-of` (not a full RFC 3339 instant) exits 1 with a machine-readable
+  `invalid_as_of_timestamp` envelope — never silently ignored.
 
 `--at` and `--as-of` are mutually exclusive; combining them exits 1 with a
 machine-readable `unsupported_combination` envelope (mirroring
@@ -168,6 +174,7 @@ eg query error-context log:v1:<hex> --graph combined.graph.jsonl
 | 0 | Handle resolved to ≥1 signature; bundle emitted (some sections may be empty) | `{ "ok": true, ... }` |
 | 1 | Fingerprint prefix ambiguous (≥2 candidates) | `{ "ok": false, "error": { "code": "ambiguous", "candidates": [...] } }` |
 | 1 | `--at` and `--as-of` both set | `{ "ok": false, "error": { "code": "unsupported_combination" } }` |
+| 1 | `--as-of` is not a valid RFC 3339 instant | `{ "ok": false, "error": { "code": "invalid_as_of_timestamp" } }` |
 | 1 | `--protected-store` set and the graph carries a protected handle | `{ "ok": false, "error": { "code": "protected_handle_in_graph" } }` |
 | 2 | No signature ID, fingerprint prefix, or symbol frame target matched | `{ "ok": false, "error": { "code": "no_match", "handle": ... } }` on stdout |
 | 2 | Load error (missing/empty store, unreadable graph) | anyhow diagnostic |

@@ -77,6 +77,43 @@ fn commit(sha: &str, parents: &[&str], valid_time: &str) -> GraphRecord {
     .with_temporal(temporal(sha, parents, valid_time))
 }
 
+fn repo_node(seed: &str) -> (String, GraphRecord) {
+    let id = stable_id(&["node", "Repository", seed]);
+    let node = GraphRecord::node(
+        id.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some(seed.to_owned()),
+        format!("Repository {seed}"),
+    );
+    (id, node)
+}
+
+fn commit_in(repo_seed: &str, sha: &str, valid_time: &str) -> (String, GraphRecord) {
+    let id = stable_id(&["node", "commit", repo_seed, sha]);
+    let node = GraphRecord::node(
+        id.clone(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some(sha.to_owned()),
+        format!("Commit {sha}"),
+    )
+    .with_temporal(temporal(sha, &[], valid_time));
+    (id, node)
+}
+
+fn contains(parent: &str, child: &str) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::Contains,
+        parent.to_owned(),
+        child.to_owned(),
+        None,
+        "contains".to_owned(),
+    )
+}
+
 fn error_signature(
     seed: &str,
     severity: &str,
@@ -970,6 +1007,84 @@ fn first_seen_before_all_commits_gives_partial_window() {
     }
 }
 
+#[test]
+fn first_seen_window_is_scoped_to_repo() {
+    // Repo A owns commits at T1 and T3, bracketing SIG_FIRST widely; repo B owns
+    // commits at 06:00 and 18:00 the same day, bracketing SIG_FIRST more tightly.
+    // Unscoped, the tighter repo-B commits win the window; scoped to repo A the
+    // window must cite ONLY repo A's commits (the cross-repo bleed the fix
+    // closes — commits are attributable via `owner_of`, so the timeline used for
+    // bracketing must be repo-scoped, not built from every Commit node).
+    let (repo_a, repo_a_node) = repo_node("repo-a");
+    let (repo_b, repo_b_node) = repo_node("repo-b");
+    let (ca1_id, ca1) = commit_in("repo-a", "a1sha00000", T1);
+    let (ca2_id, ca2) = commit_in("repo-a", "a2sha00000", T3);
+    let (cb1_id, cb1) = commit_in("repo-b", "b1sha00000", "2026-01-02T06:00:00Z");
+    let (cb2_id, cb2) = commit_in("repo-b", "b2sha00000", "2026-01-02T18:00:00Z");
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 1, None);
+    let records = vec![
+        repo_a_node,
+        repo_b_node,
+        contains(&repo_a, &ca1_id),
+        contains(&repo_a, &ca2_id),
+        contains(&repo_b, &cb1_id),
+        contains(&repo_b, &cb2_id),
+        ca1,
+        ca2,
+        cb1,
+        cb2,
+        sig,
+    ];
+
+    // Unscoped baseline: the tighter repo-B window wins (documents the bug).
+    let unscoped = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+    )
+    .expect("resolve");
+    match unscoped.first_seen_range {
+        FirstSeenRange::History(window) => {
+            assert_eq!(window.base_commit.as_deref(), Some("b1sha00000"));
+            assert_eq!(window.head_commit.as_deref(), Some("b2sha00000"));
+        }
+        FirstSeenRange::Unavailable { .. } => panic!("expected a history-backed window"),
+    }
+
+    // Scoped to repo A: the window must bracket with repo A's commits only.
+    let scoped = error_context(
+        &records,
+        &sig_id,
+        Some(&repo_a),
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+    )
+    .expect("resolve");
+    match scoped.first_seen_range {
+        FirstSeenRange::History(window) => {
+            assert_eq!(
+                window.base_commit.as_deref(),
+                Some("a1sha00000"),
+                "base must be repo A's commit, never repo B's"
+            );
+            assert_eq!(
+                window.head_commit.as_deref(),
+                Some("a2sha00000"),
+                "head must be repo A's commit, never repo B's"
+            );
+            assert_eq!(window.window_start.as_deref(), Some(T1));
+            assert_eq!(window.window_end.as_deref(), Some(T3));
+        }
+        FirstSeenRange::Unavailable { .. } => panic!("expected a history-backed window"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Protected store.
 // ---------------------------------------------------------------------------
@@ -1257,6 +1372,84 @@ fn at_commit_reresolves_frames_against_commit_view() {
     )
     .expect("resolve at c2");
     assert_eq!(at_c2.signatures[0].frames[0].target_record_id, beta_id);
+}
+
+#[test]
+fn symbol_mode_resolves_against_at_commit_reresolved_frames() {
+    // A frame at src/lib.rs:5. At c1 the symbol `alpha` occupies lines 1-10; at
+    // c2 `beta` occupies the same span. The graph carries NO pre-existing
+    // FRAME_RESOLVES_TO edge, so symbol-mode handle resolution MUST re-resolve
+    // frames against the `--at` commit view — resolving from the current graph
+    // (as before the fix) would find no frame target and return no_match.
+    let frames = Some(vec![StackFrame {
+        frame_index: 0,
+        module_path: None,
+        file_path: Some("src/lib.rs".to_owned()),
+        line: Some(5),
+    }]);
+    let (_alpha_id, alpha) = symbol_snapshot("alpha", "src/lib.rs", 1, 10, "c1sha0000", T1);
+    let (_beta_id, beta) = symbol_snapshot("beta", "src/lib.rs", 1, 10, "c2sha0000", T2);
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 1, frames);
+    let records = vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        alpha,
+        beta,
+        sig,
+    ];
+
+    // `error-context alpha --at c1`: the frame re-resolves to alpha at c1, so the
+    // signature is returned (exit 0).
+    let alpha_at_c1 = error_context(
+        &records,
+        "alpha",
+        None,
+        Some("c1sha0000"),
+        None,
+        SupersessionMode::Exclude,
+        None,
+    )
+    .expect("symbol-mode under --at c1 must resolve the frame to alpha");
+    assert_eq!(alpha_at_c1.signature_ids, vec![sig_id.clone()]);
+
+    // `error-context beta --at c1`: beta is NOT the c1 frame target, so no match.
+    match error_context(
+        &records,
+        "beta",
+        None,
+        Some("c1sha0000"),
+        None,
+        SupersessionMode::Exclude,
+        None,
+    ) {
+        Err(ErrorContextError::NoMatch { handle }) => assert_eq!(handle, "beta"),
+        other => panic!("beta must not spuriously match at c1, got {other:?}"),
+    }
+
+    // Symmetric at c2: beta matches, alpha does not.
+    let beta_at_c2 = error_context(
+        &records,
+        "beta",
+        None,
+        Some("c2sha0000"),
+        None,
+        SupersessionMode::Exclude,
+        None,
+    )
+    .expect("symbol-mode under --at c2 must resolve the frame to beta");
+    assert_eq!(beta_at_c2.signature_ids, vec![sig_id]);
+    match error_context(
+        &records,
+        "alpha",
+        None,
+        Some("c2sha0000"),
+        None,
+        SupersessionMode::Exclude,
+        None,
+    ) {
+        Err(ErrorContextError::NoMatch { handle }) => assert_eq!(handle, "alpha"),
+        other => panic!("alpha must not spuriously match at c2, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1748,6 +1941,36 @@ fn cli_as_of_on_commitless_log_graph_bounds_buckets_no_reresolve() {
     assert_eq!(frames[0]["target_record_id"], sym_id);
     // No Commit timeline → history_unavailable, never a fabricated window.
     assert_eq!(body["first_seen_range"]["status"], "unavailable");
+}
+
+#[test]
+fn cli_malformed_as_of_is_rejected_not_silently_ignored() {
+    // A malformed `--as-of` (not full RFC 3339) must fail with a machine-readable
+    // `invalid_as_of_timestamp` error (exit 1), NEVER exit 0 with an unbounded
+    // (all-bucket) view. Before the fix a bad `--as-of` silently produced no
+    // cutoff because the core's `parse_instant` returned `None`.
+    let temp = tempfile::tempdir().unwrap();
+    let graph = temp.path().join("log.jsonl");
+    let (records, sig_id, _sym_id) = commitless_log_fixture();
+    write_graph(&records, &graph);
+
+    for bad in ["2026-01-02", "not-a-timestamp"] {
+        let assert = CargoCommand::cargo_bin("egregore")
+            .unwrap()
+            .args(["query", "error-context", &sig_id])
+            .args(["--as-of", bad])
+            .arg("--graph")
+            .arg(&graph)
+            .assert()
+            .code(1);
+        let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(
+            body["error"]["code"], "invalid_as_of_timestamp",
+            "a malformed --as-of must be rejected, not silently ignored"
+        );
+    }
 }
 
 #[test]
