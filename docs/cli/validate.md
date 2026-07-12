@@ -10,7 +10,10 @@ downstream.
 > correctness, semantic accuracy, schema-version compatibility (issue #16), or
 > whether extraction was complete (issue #87). A graph can pass this gate and
 > still describe the wrong code; what it cannot do is dangle references that
-> make `eg query file` return less than the graph itself contains.
+> make `eg query file` return less than the graph itself contains. For the log
+> domain (issue #327) this is doubly true: the gate asserts structural
+> reference closure only — never fingerprint correctness, timestamp accuracy,
+> or correlation validity.
 
 ## Where it fits
 
@@ -59,6 +62,32 @@ same input is byte-identical.
    | `CONTAINS` | `File`, `Module`, `Commit`, `Change`, `PanicRiskSite`, `DebtMarker` (issue #218 debt-comment markers) |
    | `CALLS`, `MENTIONS` | `Symbol`, `Diagnostic` (unresolved-call markers) |
    | `IMPORTS` | `Import` |
+   | `FINGERPRINTED_AS` | `ErrorSignature` (issue #319 log domain) |
+   | `CAPTURED_FROM` | `LogSource` |
+   | `AGGREGATES` | `ErrorSignature` |
+   | `FRAME_RESOLVES_TO` | `Symbol`, `File`, `Diagnostic` (issue #322 resolution ladder) |
+   | `EMITTED_DURING` | `CommandRun`, `AgentTurn`, `AgentSession` (reserved for issue #323) |
+
+2a. **Typed log-domain edge source kinds** (issue #327) — the log schema frames
+   every log structural edge *directionally*, so the pre-ingest gate also
+   constrains the SOURCE kind of the five log relations
+   (`edge_source_kind_violation`). Code-graph relations are source-unconstrained
+   and unaffected. Presenting the log constraints directionally
+   (source kind → relation → target kind):
+
+   | Source kind | Relation | Target kind |
+   |-------------|----------|-------------|
+   | `LogEvent` | `FINGERPRINTED_AS` | `ErrorSignature` |
+   | `ErrorSignature`, `LogEvent` | `CAPTURED_FROM` | `LogSource` |
+   | `LogOccurrenceBucket` | `AGGREGATES` | `ErrorSignature` |
+   | `ErrorSignature` | `FRAME_RESOLVES_TO` | `Symbol`, `File`, `Diagnostic` |
+   | `ErrorSignature` | `EMITTED_DURING` | `CommandRun`, `AgentTurn`, `AgentSession` (reserved) |
+
+   A `LogOccurrenceBucket` is deliberately **not** an allowed `CAPTURED_FROM`
+   source: a bucket's `LogSource` is reached transitively via its signature's
+   own `CAPTURED_FROM`, so a `LogOccurrenceBucket —CAPTURED_FROM→ LogSource`
+   edge — whose target is a legitimate `LogSource` — is invalid source
+   attribution the gate rejects rather than accepting as clean.
 
 3. **Edges to tombstoned records** — no edge references a
    tombstoned-and-unsuperseded record: an ID named by a tombstone with no
@@ -70,12 +99,16 @@ same input is byte-identical.
    still referenced by a live edge as source or target
    (`tombstone_strands_live_edge`).
 5. **Orphan nodes** — no topology node (`File`, `Module`, `Symbol`, `Import`,
-   `DependencyDeclaration`) has zero incident edges (`orphan_node`). An
-   orphaned symbol is invisible to edge-walking queries such as
-   `eg query file`; an unattached dependency declaration has lost the
-   `File —CONTAINS→ DependencyDeclaration` chain repository scoping walks.
+   `DependencyDeclaration`, `LogEvent`, `LogOccurrenceBucket`, `ErrorSignature`)
+   has zero incident edges (`orphan_node`). An orphaned symbol is invisible to
+   edge-walking queries such as `eg query file`; an unattached dependency
+   declaration has lost the `File —CONTAINS→ DependencyDeclaration` chain
+   repository scoping walks; a `LogEvent`/`LogOccurrenceBucket`/`ErrorSignature`
+   is always emitted attached to its `ErrorSignature`/`LogSource` (issue #319).
    `Repository` (the containment root) and `Diagnostic` markers legitimately
-   stand alone and are exempt, as are non-code-graph node kinds.
+   stand alone and are exempt, as is `LogSource` (a root/sink that may
+   legitimately be edge-less on an empty-log scan) and non-code-graph node
+   kinds.
 6. **Dependency containment** — every `DependencyDeclaration` with incident
    edges is the target of a `CONTAINS` edge from a `File` node whose
    repo-relative path equals the dependency's declared manifest handle
@@ -93,8 +126,49 @@ same input is byte-identical.
    opaque — and graphs without `Repository`-owned Files keep the
    path-equality-only behavior, so legacy/partial graphs are never
    mass-flagged.
+7. **Log-domain structural completeness** (issue #327) — every log-domain node
+   with incident edges carries its required OUTBOUND structural edges, matching
+   what the issue #319/#320 extractor emits, each with a per-requirement
+   cardinality:
 
-Clean `eg scan` and `eg scan-history` outputs pass all checks.
+   | Log node | Required outbound edges |
+   |----------|-------------------------|
+   | `LogEvent` | exactly one `FINGERPRINTED_AS` **and** at least one `CAPTURED_FROM` |
+   | `ErrorSignature` | **at least one** `CAPTURED_FROM` |
+   | `LogOccurrenceBucket` | exactly one `AGGREGATES` (no bucket `CAPTURED_FROM` — its `LogSource` is reached via the signature) |
+
+   A missing required edge (count 0) is `missing_log_structural_edge` for every
+   requirement. A surplus (more than one distinct edge record of a relation)
+   is `duplicate_log_structural_edge` — listing the offending edge IDs — **only
+   for the exactly-one requirements** (`LogEvent`'s `FINGERPRINTED_AS` and
+   `LogOccurrenceBucket`'s `AGGREGATES`). For a `LogEvent` that means
+   `duplicate_log_structural_edge` now fires **only** on multiple distinct
+   `FINGERPRINTED_AS` targets — an event fingerprinted as two different
+   signatures is malformed.
+
+   Both `ErrorSignature`'s and `LogEvent`'s `CAPTURED_FROM` are **at least one**,
+   so `duplicate_log_structural_edge` never fires for either node's source edge.
+   A signature ID is a repo/fingerprint aggregate that **excludes** the source,
+   and a `LogEvent` ID likewise excludes the source (it is keyed on
+   repo/signature/valid-time/content-hash), while each `LogSource` ID is
+   path/hash-distinct. `scan-logs` emits a distinct `CAPTURED_FROM` per
+   `LogSource`, so a graph combining two log files where the same exemplar
+   appears in both legitimately gives one `LogEvent` a `CAPTURED_FROM` edge to
+   each `LogSource` (and, sharing a normalized template/severity, one
+   `ErrorSignature` multiple `CAPTURED_FROM` edges too). That is a valid
+   multi-source aggregate, not a duplicate.
+
+   Counting is by distinct edge record ID, so an identical re-emitted edge record
+   is not a duplicate. Only incident nodes are evaluated — a zero-edge log node
+   stays a single `orphan_node` (check 5) and is never double-reported.
+
+   The bucket's `LogSource` is reached via the signature, but that transitive
+   attribution is not merely assumed: the signature's own `CAPTURED_FROM` is
+   itself a required, validated edge here, so a signature that is missing or
+   duplicates its source edge is flagged rather than silently stranding both
+   its own and its buckets' source attribution.
+
+Clean `eg scan`, `eg scan-history`, and `eg scan-logs` outputs pass all checks.
 
 ## Diagnostics
 
@@ -108,9 +182,12 @@ spans, and counts.
 ```json
 {"code":"dangling_edge_endpoint","edge_id":"codegraph:v5:…","relation":"CALLS","endpoint":"target","missing_id":"codegraph:v5:…"}
 {"code":"edge_target_kind_violation","edge_id":"codegraph:v5:…","relation":"DEFINES","target_id":"codegraph:v5:…","target_kind":"Import","allowed_kinds":["Symbol"],"repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":12,"start_line":1,"end_line":1}}
+{"code":"edge_source_kind_violation","edge_id":"log:v1:…","relation":"CAPTURED_FROM","endpoint":"source","allowed_kinds":["ErrorSignature","LogEvent"],"record_id":"log:v1:…","kind":"LogOccurrenceBucket","repo_relative_path":"app.log","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
 {"code":"edge_to_tombstoned_record","edge_id":"codegraph:v5:…","relation":"CALLS","endpoint":"target","tombstoned_id":"codegraph:v5:…","tombstone_id":"codegraph:v5:…"}
 {"code":"orphan_node","record_id":"codegraph:v5:…","kind":"Symbol","repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
 {"code":"tombstone_strands_live_edge","tombstone_id":"codegraph:v5:…","deleted_id":"codegraph:v5:…","stranded_edge_ids":["codegraph:v5:…"],"repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
+{"code":"missing_log_structural_edge","relation":"CAPTURED_FROM","record_id":"log:v1:…","kind":"LogEvent","repo_relative_path":"app.log","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
+{"code":"duplicate_log_structural_edge","relation":"FINGERPRINTED_AS","stranded_edge_ids":["log:v1:…","log:v1:…"],"record_id":"log:v1:…","kind":"LogEvent","repo_relative_path":"app.log","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
 ```
 
 The final stdout line is always a machine-readable summary:

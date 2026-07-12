@@ -23,6 +23,14 @@ pub const DANGLING_EDGE_ENDPOINT: &str = "dangling_edge_endpoint";
 /// Stable defect category: a typed edge whose target node is present but of a
 /// disallowed kind for the relation.
 pub const EDGE_TARGET_KIND_VIOLATION: &str = "edge_target_kind_violation";
+/// Stable defect category: a typed edge whose source node is present but of a
+/// disallowed kind for the relation (issue #327).
+///
+/// The source-side companion to `edge_target_kind_violation`. The log schema
+/// frames every log structural edge directionally, so a schema-correct target
+/// with a wrong-kind source — e.g. a `LogOccurrenceBucket —CAPTURED_FROM→
+/// LogSource` — is invalid attribution the pre-ingest gate must reject.
+pub const EDGE_SOURCE_KIND_VIOLATION: &str = "edge_source_kind_violation";
 /// Stable defect category: an edge endpoint that resolves only to a tombstone
 /// (the record is deleted and no node record with the same ID supersedes it).
 pub const EDGE_TO_TOMBSTONED_RECORD: &str = "edge_to_tombstoned_record";
@@ -42,6 +50,27 @@ pub const TOMBSTONE_STRANDS_LIVE_EDGE: &str = "tombstone_strands_live_edge";
 /// is the same missing chain. Zero-edge nodes are `orphan_node`, so this
 /// category covers nodes whose edges never include that containment.
 pub const MISSING_CONTAINMENT_EDGE: &str = "missing_containment_edge";
+/// Stable defect category: a log-domain node with incident edges missing a
+/// required outbound structural edge (issue #327).
+///
+/// A `LogEvent` requires one `FINGERPRINTED_AS` and one `CAPTURED_FROM`; an
+/// `ErrorSignature` requires at least one `CAPTURED_FROM`; a
+/// `LogOccurrenceBucket` requires one `AGGREGATES`. Zero-edge log nodes are
+/// `orphan_node`, so this covers only incident nodes.
+pub const MISSING_LOG_STRUCTURAL_EDGE: &str = "missing_log_structural_edge";
+/// Stable defect category: a log-domain node carrying more than one of an
+/// exactly-one required outbound structural edge (issue #327).
+///
+/// For example a `LogEvent` with two distinct `FINGERPRINTED_AS` targets, or a
+/// `LogOccurrenceBucket` with two distinct `AGGREGATES` targets. The count is by
+/// distinct edge record ID. This fires only for the exactly-one requirements
+/// (`LogEvent`'s `FINGERPRINTED_AS` and `LogOccurrenceBucket`'s `AGGREGATES`).
+/// It never fires for a `LogEvent`'s or an `ErrorSignature`'s `CAPTURED_FROM`,
+/// which is at-least-one: the event/signature ID excludes the source, so one
+/// node may legitimately be captured from multiple `LogSource`s (a graph
+/// combining two log files — a merged multi-source aggregate, never a
+/// duplicate).
+pub const DUPLICATE_LOG_STRUCTURAL_EDGE: &str = "duplicate_log_structural_edge";
 
 /// Node kinds that must be reachable through at least one edge.
 ///
@@ -53,12 +82,20 @@ pub const MISSING_CONTAINMENT_EDGE: &str = "missing_containment_edge";
 /// `File —CONTAINS→ DependencyDeclaration` attribution edge — the ownership
 /// chain `--repo` scoping walks — so an unattached one is a defect
 /// (PR #314 review).
-const ORPHANABLE_KINDS: [NodeKind; 5] = [
+/// `LogEvent`, `LogOccurrenceBucket`, and `ErrorSignature` are always emitted
+/// attached to their `LogSource` (a signature via its own `CAPTURED_FROM`;
+/// issue #319/#327), so an edge-less one is a defect. `LogSource` (a root/sink
+/// that may be legitimately edge-less on an empty-log scan) is intentionally
+/// excluded to avoid false positives.
+const ORPHANABLE_KINDS: [NodeKind; 8] = [
     NodeKind::File,
     NodeKind::Module,
     NodeKind::Symbol,
     NodeKind::Import,
     NodeKind::DependencyDeclaration,
+    NodeKind::LogEvent,
+    NodeKind::LogOccurrenceBucket,
+    NodeKind::ErrorSignature,
 ];
 
 /// Allowed target node kinds for the typed code-graph relations checked by
@@ -93,6 +130,60 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
         // requires this Review→Commit target rule even though the PR-side
         // `MERGED_AS` is intentionally absent here.
         EdgeLabel::ReviewsCommit => Some(&[NodeKind::Commit]),
+        // ── Log-signature domain (issues #319 / #322 / #327) ─────────────────
+        // `LogEvent —FINGERPRINTED_AS→ ErrorSignature` (an exemplar is
+        // fingerprinted as one signature) and `LogOccurrenceBucket —AGGREGATES→
+        // ErrorSignature` (an hourly bucket aggregates one signature) both
+        // target `ErrorSignature` only (docs/schema/log-graph.md).
+        EdgeLabel::FingerprintedAs | EdgeLabel::Aggregates => Some(&[NodeKind::ErrorSignature]),
+        // `ErrorSignature`/`LogEvent`/`LogOccurrenceBucket —CAPTURED_FROM→
+        // LogSource`: log-domain records are captured from one source.
+        EdgeLabel::CapturedFrom => Some(&[NodeKind::LogSource]),
+        // `ErrorSignature —FRAME_RESOLVES_TO→ {Symbol|File|Diagnostic}`: the
+        // #322 resolution ladder (resolved/ambiguous→Symbol, path_only→File,
+        // unresolved→Diagnostic); external frames mint no edge.
+        EdgeLabel::FrameResolvesTo => {
+            Some(&[NodeKind::Symbol, NodeKind::File, NodeKind::Diagnostic])
+        }
+        // `ErrorSignature —EMITTED_DURING→ {CommandRun|AgentTurn|AgentSession}`:
+        // reserved for #323; the target constraint is frozen now (issue #327).
+        EdgeLabel::EmittedDuring => Some(&[
+            NodeKind::CommandRun,
+            NodeKind::AgentTurn,
+            NodeKind::AgentSession,
+        ]),
+        _ => None,
+    }
+}
+
+/// Allowed SOURCE node kinds for the log-domain typed relations (issue #327).
+///
+/// The SOURCE-side companion to `allowed_target_kinds`. `docs/schema/log-graph.md`
+/// frames every log structural edge directionally, so an edge whose target is a
+/// schema-correct kind but whose source is not (e.g. a `LogOccurrenceBucket
+/// —CAPTURED_FROM→ LogSource`, a source kind the schema never emits) is invalid
+/// attribution that the pre-ingest gate must reject. Only the five log labels
+/// are constrained; every other label returns `None` (unconstrained) via the
+/// `_ => None` arm, so code-graph edges keep their existing source-unconstrained
+/// behavior and cannot regress.
+const fn allowed_source_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
+    match label {
+        // `LogEvent —FINGERPRINTED_AS→ ErrorSignature`: only a log exemplar is
+        // fingerprinted as a signature (docs/schema/log-graph.md).
+        EdgeLabel::FingerprintedAs => Some(&[NodeKind::LogEvent]),
+        // `{ErrorSignature|LogEvent} —CAPTURED_FROM→ LogSource`: only a signature
+        // or an exemplar is captured from a source — NOT a `LogOccurrenceBucket`,
+        // whose `LogSource` is reached transitively via its signature's own
+        // `CAPTURED_FROM` (docs/schema/log-graph.md).
+        EdgeLabel::CapturedFrom => Some(&[NodeKind::ErrorSignature, NodeKind::LogEvent]),
+        // `LogOccurrenceBucket —AGGREGATES→ ErrorSignature`: only an hourly
+        // bucket aggregates a signature (docs/schema/log-graph.md).
+        EdgeLabel::Aggregates => Some(&[NodeKind::LogOccurrenceBucket]),
+        // `ErrorSignature —FRAME_RESOLVES_TO→ …` (#322) and
+        // `ErrorSignature —EMITTED_DURING→ …` (reserved #323) both originate at a
+        // signature only (docs/schema/log-graph.md). Combined because the source
+        // set is identical (clippy `match_same_arms`).
+        EdgeLabel::FrameResolvesTo | EdgeLabel::EmittedDuring => Some(&[NodeKind::ErrorSignature]),
         _ => None,
     }
 }
@@ -362,6 +453,27 @@ fn check_edges<'a>(
             index.cite_node(&mut diagnostic, target);
             diagnostics.insert(diagnostic);
         }
+
+        // Typed relation source-kind check (present sources only; a missing or
+        // tombstoned source is already reported above). Mirrors the target-kind
+        // check for the source endpoint: log structural edges are directional
+        // (issue #327), so a schema-correct target with a wrong-kind source is
+        // invalid attribution.
+        if let (Some(allowed), Some(kinds)) = (
+            allowed_source_kinds(*label),
+            index.node_kinds.get(source.as_str()),
+        ) && !kinds.iter().any(|kind| allowed.contains(kind))
+        {
+            let mut diagnostic = ValidationDiagnostic::new(EDGE_SOURCE_KIND_VIOLATION);
+            diagnostic.edge_id = Some(edge_id.clone());
+            diagnostic.relation = Some(label.as_str().to_owned());
+            diagnostic.endpoint = Some("source");
+            diagnostic.record_id = Some(source.clone());
+            diagnostic.kind = kinds.iter().next().map(|kind| kind.as_str());
+            diagnostic.allowed_kinds = Some(allowed.iter().map(|kind| kind.as_str()).collect());
+            index.cite_node(&mut diagnostic, source);
+            diagnostics.insert(diagnostic);
+        }
     }
     (incident, stranded_by_deleted)
 }
@@ -513,6 +625,125 @@ fn check_dependency_containment(
     }
 }
 
+/// Cardinality of a required outbound log structural edge (issue #327).
+///
+/// Every requirement fires `missing_log_structural_edge` at count 0. The two
+/// variants differ only above one: an `ExactlyOne` requirement flags a surplus
+/// as `duplicate_log_structural_edge`, while an `AtLeastOne` requirement
+/// tolerates any positive count.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LogEdgeCardinality {
+    /// Exactly one edge; count > 1 is `duplicate_log_structural_edge`.
+    ExactlyOne,
+    /// One or more edges; count > 1 is a valid aggregate, never a duplicate.
+    AtLeastOne,
+}
+
+/// Log-domain structural-completeness rule (issue #327): every incident
+/// log-domain node must carry its required OUTBOUND structural edges (the log
+/// node is the edge `source`), each with a per-requirement cardinality.
+///
+/// * `LogEvent` requires exactly one `FINGERPRINTED_AS` (one exemplar is
+///   fingerprinted as exactly one signature — two is malformed) and at least
+///   one `CAPTURED_FROM`. A `LogEvent` ID excludes the source (it is keyed on
+///   repo/signature/valid-time/content-hash, see `src/log_graph.rs`), while
+///   each `LogSource` ID is path/hash-distinct, so a graph combining two log
+///   files where the same exemplar appears in both legitimately gives one
+///   `LogEvent` a distinct `CAPTURED_FROM` per `LogSource` — never a duplicate,
+///   the same multi-source-aggregate reason as `ErrorSignature` below.
+/// * `ErrorSignature` requires at least one `CAPTURED_FROM` (the extractor
+///   always emits `ErrorSignature —CAPTURED_FROM→ LogSource`, so it is itself a
+///   required, validated edge — bucket source attribution reached via the
+///   signature is thus guaranteed present, not assumed). A signature ID is a
+///   repo/fingerprint aggregate that excludes the source (see
+///   `src/log_graph.rs`), and `scan-logs` emits a distinct `CAPTURED_FROM` per
+///   `LogSource`, so a graph combining two log files that share a fingerprint
+///   legitimately gives one signature two `CAPTURED_FROM` edges — never a
+///   duplicate.
+/// * `LogOccurrenceBucket` requires exactly one `AGGREGATES` (the extractor
+///   does not emit a bucket `CAPTURED_FROM`; the source is reached via the
+///   signature).
+///
+/// Only incident nodes are evaluated (gated on the same `incident` set the
+/// containment check uses) so a zero-edge log node stays a single
+/// `orphan_node` and is never double-reported. Edges are counted by distinct
+/// edge record ID, so an identical re-emitted edge record is not a duplicate.
+/// A missing edge is `missing_log_structural_edge`; an exactly-one surplus is
+/// `duplicate_log_structural_edge` listing the offending edge IDs.
+fn check_log_completeness(
+    records: &[GraphRecord],
+    index: &GraphIndex<'_>,
+    incident: &BTreeSet<&str>,
+    diagnostics: &mut BTreeSet<ValidationDiagnostic>,
+) {
+    use LogEdgeCardinality::{AtLeastOne, ExactlyOne};
+
+    /// Required outbound structural edges per log node kind with their
+    /// cardinality, matching exactly what the issue #319/#320 extractor emits
+    /// (`src/log_graph.rs`): a `LogEvent` gets exactly one `FINGERPRINTED_AS`
+    /// but at least one `CAPTURED_FROM`, an `ErrorSignature` gets at least one
+    /// `CAPTURED_FROM` (one per source it aggregates across), but a
+    /// `LogOccurrenceBucket` gets only `AGGREGATES` (its `LogSource` is reached
+    /// transitively via the signature's own required `CAPTURED_FROM`).
+    /// `LogEvent` `CAPTURED_FROM` is at-least-one for the same
+    /// multi-source-aggregate reason as `ErrorSignature`: a `LogEvent` ID
+    /// excludes the source, so the same exemplar seen in multiple log files
+    /// converges to one event node that captures from each `LogSource`.
+    /// Requiring a bucket `CAPTURED_FROM` would false-positive on every real
+    /// scan-logs graph.
+    const fn required_labels(kind: NodeKind) -> &'static [(EdgeLabel, LogEdgeCardinality)] {
+        match kind {
+            NodeKind::LogEvent => &[
+                (EdgeLabel::FingerprintedAs, ExactlyOne),
+                (EdgeLabel::CapturedFrom, AtLeastOne),
+            ],
+            NodeKind::ErrorSignature => &[(EdgeLabel::CapturedFrom, AtLeastOne)],
+            NodeKind::LogOccurrenceBucket => &[(EdgeLabel::Aggregates, ExactlyOne)],
+            _ => &[],
+        }
+    }
+    // (source node id, label) -> distinct edge record IDs.
+    let mut outbound: BTreeMap<(&str, EdgeLabel), BTreeSet<&str>> = BTreeMap::new();
+    for record in records {
+        let GraphRecord::Edge {
+            id, label, source, ..
+        } = record
+        else {
+            continue;
+        };
+        outbound.entry((source, *label)).or_default().insert(id);
+    }
+    for (id, kinds) in &index.node_kinds {
+        if !incident.contains(id) {
+            continue;
+        }
+        for kind in kinds {
+            for &(label, cardinality) in required_labels(*kind) {
+                let count = outbound.get(&(*id, label)).map_or(0, BTreeSet::len);
+                let code = match (count, cardinality) {
+                    (0, _) => MISSING_LOG_STRUCTURAL_EDGE,
+                    // At-least-one requirements accept any positive count; a
+                    // signature legitimately captures from multiple sources.
+                    (1, _) | (_, AtLeastOne) => continue,
+                    (_, ExactlyOne) => DUPLICATE_LOG_STRUCTURAL_EDGE,
+                };
+                let mut diagnostic = ValidationDiagnostic::new(code);
+                diagnostic.record_id = Some((*id).to_owned());
+                diagnostic.kind = Some(kind.as_str());
+                diagnostic.relation = Some(label.as_str().to_owned());
+                if code == DUPLICATE_LOG_STRUCTURAL_EDGE
+                    && let Some(edge_ids) = outbound.get(&(*id, label))
+                {
+                    diagnostic.stranded_edge_ids =
+                        Some(edge_ids.iter().map(|edge| (*edge).to_owned()).collect());
+                }
+                index.cite_node(&mut diagnostic, id);
+                diagnostics.insert(diagnostic);
+            }
+        }
+    }
+}
+
 /// Validates referential integrity over an already-parsed record set.
 ///
 /// Checks, in one deterministic pass:
@@ -520,7 +751,9 @@ fn check_dependency_containment(
 /// 1. every edge endpoint (source and target) resolves to a node present in
 ///    the graph (`dangling_edge_endpoint`);
 /// 2. every `DEFINES`, `CONTAINS`, `CALLS`, `IMPORTS`, and `MENTIONS` edge
-///    target is a node of an allowed kind (`edge_target_kind_violation`);
+///    target is a node of an allowed kind (`edge_target_kind_violation`), and
+///    every log-domain structural edge additionally has a source of an allowed
+///    kind (`edge_source_kind_violation`, issue #327);
 /// 3. no edge references a tombstoned-and-unsuperseded record — a tombstoned
 ///    ID with no surviving node record (`edge_to_tombstoned_record`);
 /// 4. no record is named by a tombstone yet still referenced by a live edge
@@ -544,6 +777,7 @@ pub fn validate_records(records: &[GraphRecord]) -> ValidationReport {
     check_tombstones(&index, &stranded_by_deleted, &mut diagnostics);
     check_orphans(&index, &incident, &mut diagnostics);
     check_dependency_containment(records, &index, &incident, &mut diagnostics);
+    check_log_completeness(records, &index, &incident, &mut diagnostics);
 
     ValidationReport {
         diagnostics: diagnostics.into_iter().collect(),
@@ -855,6 +1089,649 @@ mod tests {
         assert!(
             codes.contains(&EDGE_TARGET_KIND_VIOLATION),
             "Review→Symbol must be rejected, got {codes:?}"
+        );
+    }
+
+    // ── Log-domain typed target-kind allow-list (issue #327) ─────────────────
+
+    /// Builds a minimal well-formed log graph clean under every check: a
+    /// `LogSource`, an `ErrorSignature` captured from it, a `LogEvent`
+    /// fingerprinted+captured, and a `LogOccurrenceBucket` aggregated. The
+    /// bucket carries NO `CAPTURED_FROM`: its `LogSource` is reached via the
+    /// signature, and a bucket source is a disallowed `CAPTURED_FROM` source
+    /// kind (issue #327 source-kind allow-list).
+    fn clean_log_records() -> Vec<GraphRecord> {
+        vec![
+            node("n:source", NodeKind::LogSource),
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:event", NodeKind::LogEvent),
+            node("n:bucket", NodeKind::LogOccurrenceBucket),
+            edge("e:sig-cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
+            edge("e:evt-fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
+            edge("e:evt-cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+            edge("e:bkt-agg", EdgeLabel::Aggregates, "n:bucket", "n:sig"),
+        ]
+    }
+
+    #[test]
+    fn well_formed_log_graph_is_clean() {
+        let report = validate_records(&clean_log_records());
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn all_log_edges_with_correct_sources_are_clean() {
+        // Every log structural label exercised with a schema-correct source:
+        // FINGERPRINTED_AS(LogEvent→ErrorSignature), CAPTURED_FROM from both an
+        // ErrorSignature and a LogEvent, and AGGREGATES(bucket→ErrorSignature).
+        // No source-kind violation must fire.
+        let records = vec![
+            node("n:source", NodeKind::LogSource),
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:event", NodeKind::LogEvent),
+            node("n:bucket", NodeKind::LogOccurrenceBucket),
+            edge("e:evt-fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
+            edge("e:sig-cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
+            edge("e:evt-cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+            edge("e:bkt-agg", EdgeLabel::Aggregates, "n:bucket", "n:sig"),
+        ];
+        let report = validate_records(&records);
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn bucket_captured_from_source_is_rejected() {
+        // The Codex-review bug: a `LogOccurrenceBucket —CAPTURED_FROM→ LogSource`
+        // has an allowed TARGET (LogSource) but a disallowed SOURCE kind (a
+        // bucket is never a CAPTURED_FROM source). The bucket keeps its required
+        // AGGREGATES so the ONLY defect is the source-kind violation.
+        let records = vec![
+            node("n:bucket", NodeKind::LogOccurrenceBucket),
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:source", NodeKind::LogSource),
+            edge("e:bkt-agg", EdgeLabel::Aggregates, "n:bucket", "n:sig"),
+            edge("e:sig-cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
+            edge("e:bkt-cap", EdgeLabel::CapturedFrom, "n:bucket", "n:source"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![EDGE_SOURCE_KIND_VIOLATION], "got {codes:?}");
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.relation.as_deref(), Some("CAPTURED_FROM"));
+        assert_eq!(diagnostic.record_id.as_deref(), Some("n:bucket"));
+        assert_eq!(diagnostic.edge_id.as_deref(), Some("e:bkt-cap"));
+        assert_eq!(diagnostic.endpoint, Some("source"));
+        assert_eq!(diagnostic.kind, Some("LogOccurrenceBucket"));
+        assert_eq!(
+            diagnostic.allowed_kinds.as_deref(),
+            Some(&["ErrorSignature", "LogEvent"][..])
+        );
+    }
+
+    #[test]
+    fn fingerprinted_as_from_wrong_source_is_rejected() {
+        // FINGERPRINTED_AS must originate at a LogEvent; a LogSource source is a
+        // source-kind violation even though the ErrorSignature target is allowed.
+        let records = vec![
+            node("n:source", NodeKind::LogSource),
+            node("n:sig", NodeKind::ErrorSignature),
+            edge("e:fp", EdgeLabel::FingerprintedAs, "n:source", "n:sig"),
+            edge("e:sig-cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![EDGE_SOURCE_KIND_VIOLATION], "got {codes:?}");
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.relation.as_deref(), Some("FINGERPRINTED_AS"));
+        assert_eq!(diagnostic.record_id.as_deref(), Some("n:source"));
+        assert_eq!(diagnostic.kind, Some("LogSource"));
+        assert_eq!(diagnostic.allowed_kinds.as_deref(), Some(&["LogEvent"][..]));
+    }
+
+    #[test]
+    fn aggregates_from_wrong_source_is_rejected() {
+        // AGGREGATES must originate at a LogOccurrenceBucket; a LogEvent source
+        // is a source-kind violation even though the ErrorSignature target is
+        // allowed. The event keeps its own required edges so it is otherwise
+        // well-formed and only the aggregates source offends.
+        let records = vec![
+            node("n:event", NodeKind::LogEvent),
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:source", NodeKind::LogSource),
+            edge("e:evt-fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
+            edge("e:evt-cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+            edge("e:sig-cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
+            edge("e:agg", EdgeLabel::Aggregates, "n:event", "n:sig"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![EDGE_SOURCE_KIND_VIOLATION], "got {codes:?}");
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.relation.as_deref(), Some("AGGREGATES"));
+        assert_eq!(diagnostic.record_id.as_deref(), Some("n:event"));
+        assert_eq!(diagnostic.kind, Some("LogEvent"));
+        assert_eq!(
+            diagnostic.allowed_kinds.as_deref(),
+            Some(&["LogOccurrenceBucket"][..])
+        );
+    }
+
+    #[test]
+    fn fingerprinted_as_edge_to_error_signature_is_allowed() {
+        let records = vec![
+            node("n:event", NodeKind::LogEvent),
+            node("n:source", NodeKind::LogSource),
+            node("n:sig", NodeKind::ErrorSignature),
+            edge("e:fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
+            edge("e:cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&EDGE_TARGET_KIND_VIOLATION),
+            "FINGERPRINTED_AS→ErrorSignature must be allowed, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn fingerprinted_as_edge_to_wrong_kind_is_rejected() {
+        let records = vec![
+            node("n:event", NodeKind::LogEvent),
+            node("n:task", NodeKind::Task),
+            edge("e:fp", EdgeLabel::FingerprintedAs, "n:event", "n:task"),
+        ];
+        let report = validate_records(&records);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == EDGE_TARGET_KIND_VIOLATION),
+            "FINGERPRINTED_AS→Task must be rejected, got {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn captured_from_edge_to_log_source_is_allowed() {
+        let records = vec![
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:source", NodeKind::LogSource),
+            edge("e:cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&EDGE_TARGET_KIND_VIOLATION),
+            "CAPTURED_FROM→LogSource must be allowed, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn captured_from_edge_to_wrong_kind_is_rejected() {
+        let records = vec![
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:task", NodeKind::Task),
+            edge("e:cap", EdgeLabel::CapturedFrom, "n:sig", "n:task"),
+        ];
+        let report = validate_records(&records);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == EDGE_TARGET_KIND_VIOLATION),
+            "CAPTURED_FROM→Task must be rejected, got {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn aggregates_edge_to_error_signature_is_allowed() {
+        let records = vec![
+            node("n:bucket", NodeKind::LogOccurrenceBucket),
+            node("n:source", NodeKind::LogSource),
+            node("n:sig", NodeKind::ErrorSignature),
+            edge("e:agg", EdgeLabel::Aggregates, "n:bucket", "n:sig"),
+            edge("e:cap", EdgeLabel::CapturedFrom, "n:bucket", "n:source"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&EDGE_TARGET_KIND_VIOLATION),
+            "AGGREGATES→ErrorSignature must be allowed, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn aggregates_edge_to_wrong_kind_is_rejected() {
+        let records = vec![
+            node("n:bucket", NodeKind::LogOccurrenceBucket),
+            node("n:task", NodeKind::Task),
+            edge("e:agg", EdgeLabel::Aggregates, "n:bucket", "n:task"),
+        ];
+        let report = validate_records(&records);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == EDGE_TARGET_KIND_VIOLATION),
+            "AGGREGATES→Task must be rejected, got {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn frame_resolves_to_symbol_file_and_diagnostic_are_allowed() {
+        // The #322 resolution ladder targets Symbol (resolved/ambiguous),
+        // File (path_only), and Diagnostic (unresolved).
+        for (target_id, kind) in [
+            ("n:sym", NodeKind::Symbol),
+            ("n:file", NodeKind::File),
+            ("n:diag", NodeKind::Diagnostic),
+        ] {
+            let records = vec![
+                node("n:sig", NodeKind::ErrorSignature),
+                node(target_id, kind),
+                edge("e:frame", EdgeLabel::FrameResolvesTo, "n:sig", target_id),
+            ];
+            let report = validate_records(&records);
+            let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+            assert!(
+                !codes.contains(&EDGE_TARGET_KIND_VIOLATION),
+                "FRAME_RESOLVES_TO→{} must be allowed, got {codes:?}",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn frame_resolves_to_wrong_kind_is_rejected() {
+        let records = vec![
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:task", NodeKind::Task),
+            edge("e:frame", EdgeLabel::FrameResolvesTo, "n:sig", "n:task"),
+        ];
+        let report = validate_records(&records);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == EDGE_TARGET_KIND_VIOLATION),
+            "FRAME_RESOLVES_TO→Task must be rejected, got {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn frame_resolves_to_tombstoned_symbol_is_flagged() {
+        // A FRAME_RESOLVES_TO edge into a tombstoned-and-unsuperseded Symbol
+        // is an edge_to_tombstoned_record defect — closure flows for log edges.
+        let records = vec![
+            node("n:sig", NodeKind::ErrorSignature),
+            tombstone("t:sym", "n:sym"),
+            edge("e:frame", EdgeLabel::FrameResolvesTo, "n:sig", "n:sym"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_TO_TOMBSTONED_RECORD),
+            "frame into a tombstoned symbol must flag, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn emitted_during_edge_to_command_run_is_allowed() {
+        let records = vec![
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:source", NodeKind::LogSource),
+            node("n:cmd", NodeKind::CommandRun),
+            edge("e:cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
+            edge("e:emit", EdgeLabel::EmittedDuring, "n:sig", "n:cmd"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&EDGE_TARGET_KIND_VIOLATION),
+            "EMITTED_DURING→CommandRun must be allowed, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn emitted_during_edge_to_wrong_kind_is_rejected() {
+        let records = vec![
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:task", NodeKind::Task),
+            edge("e:emit", EdgeLabel::EmittedDuring, "n:sig", "n:task"),
+        ];
+        let report = validate_records(&records);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == EDGE_TARGET_KIND_VIOLATION),
+            "EMITTED_DURING→Task must be rejected, got {:?}",
+            report.diagnostics
+        );
+    }
+
+    // ── Log-domain orphan detection (issue #327) ─────────────────────────────
+
+    #[test]
+    fn orphaned_log_event_is_flagged() {
+        let records = vec![node("n:event", NodeKind::LogEvent)];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![ORPHAN_NODE]);
+        assert_eq!(report.diagnostics[0].kind, Some("LogEvent"));
+    }
+
+    #[test]
+    fn orphaned_log_bucket_is_flagged() {
+        let records = vec![node("n:bucket", NodeKind::LogOccurrenceBucket)];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![ORPHAN_NODE]);
+        assert_eq!(report.diagnostics[0].kind, Some("LogOccurrenceBucket"));
+    }
+
+    // ── Log-domain structural completeness (issue #327) ──────────────────────
+
+    #[test]
+    fn log_event_missing_captured_from_is_flagged() {
+        // LogEvent with only FINGERPRINTED_AS — the CAPTURED_FROM is missing.
+        // The signature carries its own CAPTURED_FROM (as the real extractor
+        // emits) so only the event offends.
+        let records = vec![
+            node("n:event", NodeKind::LogEvent),
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:source", NodeKind::LogSource),
+            edge("e:sig-cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
+            edge("e:fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
+        ];
+        let report = validate_records(&records);
+        let missing: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == MISSING_LOG_STRUCTURAL_EDGE)
+            .collect();
+        assert_eq!(missing.len(), 1, "got {:?}", report.diagnostics);
+        assert_eq!(missing[0].record_id.as_deref(), Some("n:event"));
+        assert_eq!(missing[0].kind, Some("LogEvent"));
+        assert_eq!(missing[0].relation.as_deref(), Some("CAPTURED_FROM"));
+    }
+
+    #[test]
+    fn log_event_missing_fingerprinted_as_is_flagged() {
+        let records = vec![
+            node("n:event", NodeKind::LogEvent),
+            node("n:source", NodeKind::LogSource),
+            edge("e:cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+        ];
+        let report = validate_records(&records);
+        let missing: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == MISSING_LOG_STRUCTURAL_EDGE)
+            .collect();
+        assert_eq!(missing.len(), 1, "got {:?}", report.diagnostics);
+        assert_eq!(missing[0].relation.as_deref(), Some("FINGERPRINTED_AS"));
+    }
+
+    #[test]
+    fn log_bucket_missing_aggregates_is_flagged() {
+        let records = vec![
+            node("n:bucket", NodeKind::LogOccurrenceBucket),
+            node("n:source", NodeKind::LogSource),
+            edge("e:cap", EdgeLabel::CapturedFrom, "n:bucket", "n:source"),
+        ];
+        let report = validate_records(&records);
+        let missing: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == MISSING_LOG_STRUCTURAL_EDGE)
+            .collect();
+        assert_eq!(missing.len(), 1, "got {:?}", report.diagnostics);
+        assert_eq!(missing[0].relation.as_deref(), Some("AGGREGATES"));
+    }
+
+    #[test]
+    fn log_bucket_with_only_aggregates_is_complete() {
+        // The extractor emits only AGGREGATES for a bucket — no CAPTURED_FROM.
+        // A bucket with just its AGGREGATES edge must not be flagged. The
+        // signature carries its own CAPTURED_FROM (as the real extractor emits)
+        // so it is not itself a completeness defect.
+        let records = vec![
+            node("n:bucket", NodeKind::LogOccurrenceBucket),
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:source", NodeKind::LogSource),
+            edge("e:sig-cap", EdgeLabel::CapturedFrom, "n:sig", "n:source"),
+            edge("e:agg", EdgeLabel::Aggregates, "n:bucket", "n:sig"),
+        ];
+        let report = validate_records(&records);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|d| d.code != MISSING_LOG_STRUCTURAL_EDGE),
+            "bucket with AGGREGATES only must be complete, got {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn zero_edge_log_event_is_only_an_orphan_not_a_completeness_defect() {
+        // An incident-gated completeness check must not double-report a
+        // zero-edge log node: it stays a single orphan.
+        let records = vec![node("n:event", NodeKind::LogEvent)];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![ORPHAN_NODE]);
+    }
+
+    #[test]
+    fn log_event_may_capture_from_multiple_sources_is_clean() {
+        // A LogEvent ID excludes the source (it is keyed on
+        // repo/signature/valid-time/content-hash, `src/log_graph.rs:445-451`),
+        // while each LogSource ID is path/hash-distinct, so combining two
+        // scan-logs outputs where the same exemplar (same timestamp+template)
+        // appears in two files yields ONE LogEvent carrying TWO distinct
+        // CAPTURED_FROM edges to two different LogSources — a valid
+        // multi-source aggregate, never a `duplicate_log_structural_edge`.
+        let records = vec![
+            node("n:event", NodeKind::LogEvent),
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:source-a", NodeKind::LogSource),
+            node("n:source-b", NodeKind::LogSource),
+            edge("e:fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
+            edge("e:cap-a", EdgeLabel::CapturedFrom, "n:event", "n:source-a"),
+            edge("e:cap-b", EdgeLabel::CapturedFrom, "n:event", "n:source-b"),
+            // The signature carries its own required CAPTURED_FROM to each
+            // source so only the event's multi-source capture is under test.
+            edge(
+                "e:sig-cap-a",
+                EdgeLabel::CapturedFrom,
+                "n:sig",
+                "n:source-a",
+            ),
+            edge(
+                "e:sig-cap-b",
+                EdgeLabel::CapturedFrom,
+                "n:sig",
+                "n:source-b",
+            ),
+        ];
+        let report = validate_records(&records);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|d| d.code != DUPLICATE_LOG_STRUCTURAL_EDGE),
+            "a LogEvent capturing from multiple sources is a valid aggregate, got {:?}",
+            report.diagnostics
+        );
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn log_event_fingerprinted_to_two_signatures_is_flagged() {
+        // FINGERPRINTED_AS stays exactly-one: a LogEvent is fingerprinted as
+        // exactly one signature (the target is the source-excluded signature_id,
+        // so two DIFFERENT signatures is a genuine malformed duplicate, not a
+        // multi-source aggregate). Both signatures carry their own CAPTURED_FROM
+        // so only the event's double-fingerprint offends.
+        let records = vec![
+            node("n:event", NodeKind::LogEvent),
+            node("n:sig-a", NodeKind::ErrorSignature),
+            node("n:sig-b", NodeKind::ErrorSignature),
+            node("n:source", NodeKind::LogSource),
+            edge("e:fp-a", EdgeLabel::FingerprintedAs, "n:event", "n:sig-a"),
+            edge("e:fp-b", EdgeLabel::FingerprintedAs, "n:event", "n:sig-b"),
+            edge("e:evt-cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+            edge(
+                "e:sig-a-cap",
+                EdgeLabel::CapturedFrom,
+                "n:sig-a",
+                "n:source",
+            ),
+            edge(
+                "e:sig-b-cap",
+                EdgeLabel::CapturedFrom,
+                "n:sig-b",
+                "n:source",
+            ),
+        ];
+        let report = validate_records(&records);
+        let dupes: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == DUPLICATE_LOG_STRUCTURAL_EDGE)
+            .collect();
+        assert_eq!(dupes.len(), 1, "got {:?}", report.diagnostics);
+        assert_eq!(dupes[0].record_id.as_deref(), Some("n:event"));
+        assert_eq!(dupes[0].relation.as_deref(), Some("FINGERPRINTED_AS"));
+        assert_eq!(
+            dupes[0].stranded_edge_ids.as_deref(),
+            Some(&["e:fp-a".to_owned(), "e:fp-b".to_owned()][..])
+        );
+    }
+
+    #[test]
+    fn duplicate_identical_captured_from_edge_records_are_not_flagged() {
+        // Distinct edge RECORDS carrying the same edge ID (re-emitted) count
+        // once — dedupe is by edge record ID.
+        let records = vec![
+            node("n:event", NodeKind::LogEvent),
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:source", NodeKind::LogSource),
+            edge("e:fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
+            edge("e:cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+            edge("e:cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+        ];
+        let report = validate_records(&records);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|d| d.code != DUPLICATE_LOG_STRUCTURAL_EDGE),
+            "identical re-emitted edge records must not count twice, got {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn error_signature_missing_captured_from_is_flagged() {
+        // An ErrorSignature made incident by an inbound FINGERPRINTED_AS from a
+        // LogEvent, but carrying NO outbound CAPTURED_FROM, strands its own and
+        // (transitively) its buckets' source attribution — a completeness
+        // defect, not an orphan.
+        let records = vec![
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:event", NodeKind::LogEvent),
+            node("n:source", NodeKind::LogSource),
+            // The event is well-formed so only the signature offends.
+            edge("e:evt-fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
+            edge("e:evt-cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+        ];
+        let report = validate_records(&records);
+        let missing: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == MISSING_LOG_STRUCTURAL_EDGE)
+            .collect();
+        assert_eq!(missing.len(), 1, "got {:?}", report.diagnostics);
+        assert_eq!(missing[0].record_id.as_deref(), Some("n:sig"));
+        assert_eq!(missing[0].kind, Some("ErrorSignature"));
+        assert_eq!(missing[0].relation.as_deref(), Some("CAPTURED_FROM"));
+    }
+
+    #[test]
+    fn error_signature_may_capture_from_multiple_sources_is_clean() {
+        // An ErrorSignature ID is a repo/fingerprint aggregate that excludes the
+        // source (`src/log_graph.rs`), and scan-logs emits a distinct
+        // CAPTURED_FROM per LogSource. A graph combining two log files that
+        // share a fingerprint therefore gives ONE signature TWO CAPTURED_FROM
+        // edges to two distinct LogSources — a valid aggregate, never a
+        // `duplicate_log_structural_edge`. Both sources also carry their own
+        // well-formed exemplar so nothing else offends.
+        let records = vec![
+            node("n:sig", NodeKind::ErrorSignature),
+            node("n:source-a", NodeKind::LogSource),
+            node("n:source-b", NodeKind::LogSource),
+            node("n:event-a", NodeKind::LogEvent),
+            node("n:event-b", NodeKind::LogEvent),
+            edge("e:cap-a", EdgeLabel::CapturedFrom, "n:sig", "n:source-a"),
+            edge("e:cap-b", EdgeLabel::CapturedFrom, "n:sig", "n:source-b"),
+            edge("e:fp-a", EdgeLabel::FingerprintedAs, "n:event-a", "n:sig"),
+            edge("e:fp-b", EdgeLabel::FingerprintedAs, "n:event-b", "n:sig"),
+            edge(
+                "e:evt-cap-a",
+                EdgeLabel::CapturedFrom,
+                "n:event-a",
+                "n:source-a",
+            ),
+            edge(
+                "e:evt-cap-b",
+                EdgeLabel::CapturedFrom,
+                "n:event-b",
+                "n:source-b",
+            ),
+        ];
+        let report = validate_records(&records);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|d| d.code != DUPLICATE_LOG_STRUCTURAL_EDGE),
+            "a signature capturing from multiple sources is a valid aggregate, got {:?}",
+            report.diagnostics
+        );
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn orphaned_error_signature_is_flagged() {
+        // A lone ErrorSignature node with no edges at all is an orphan (a real
+        // signature always carries its outbound CAPTURED_FROM, so it is never
+        // zero-edge in practice).
+        let records = vec![node("n:sig", NodeKind::ErrorSignature)];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![ORPHAN_NODE]);
+        assert_eq!(report.diagnostics[0].kind, Some("ErrorSignature"));
+    }
+
+    #[test]
+    fn fingerprinted_as_to_missing_signature_is_dangling() {
+        let records = vec![
+            node("n:event", NodeKind::LogEvent),
+            node("n:source", NodeKind::LogSource),
+            edge("e:fp", EdgeLabel::FingerprintedAs, "n:event", "n:absent"),
+            edge("e:cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&DANGLING_EDGE_ENDPOINT),
+            "missing FINGERPRINTED_AS target must dangle, got {codes:?}"
         );
     }
 }
