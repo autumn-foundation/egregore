@@ -133,7 +133,7 @@ same input is byte-identical.
 
    | Log node | Required outbound edges |
    |----------|-------------------------|
-   | `LogEvent` | exactly one `FINGERPRINTED_AS` **and** exactly one `CAPTURED_FROM` |
+   | `LogEvent` | exactly one `FINGERPRINTED_AS` **and** at least one `CAPTURED_FROM` |
    | `ErrorSignature` | **at least one** `CAPTURED_FROM` |
    | `LogOccurrenceBucket` | exactly one `AGGREGATES` (no bucket `CAPTURED_FROM` — its `LogSource` is reached via the signature) |
 
@@ -141,16 +141,22 @@ same input is byte-identical.
    requirement. A surplus (more than one distinct edge record of a relation)
    is `duplicate_log_structural_edge` — listing the offending edge IDs — **only
    for the exactly-one requirements** (`LogEvent`'s `FINGERPRINTED_AS` and
-   `CAPTURED_FROM`, `LogOccurrenceBucket`'s `AGGREGATES`; e.g. a `LogEvent`
-   captured from two `LogSource`s is malformed).
+   `LogOccurrenceBucket`'s `AGGREGATES`). For a `LogEvent` that means
+   `duplicate_log_structural_edge` now fires **only** on multiple distinct
+   `FINGERPRINTED_AS` targets — an event fingerprinted as two different
+   signatures is malformed.
 
-   `ErrorSignature`'s `CAPTURED_FROM` is **at least one**, so
-   `duplicate_log_structural_edge` never fires for a signature's source edge: a
-   signature ID is a repo/fingerprint aggregate that **excludes** the source, and
-   `scan-logs` emits a distinct `CAPTURED_FROM` per `LogSource`, so a graph
-   combining two log files that share a normalized template/severity legitimately
-   gives one `ErrorSignature` multiple `CAPTURED_FROM` edges to different
-   `LogSource`s. That is a valid multi-source aggregate, not a duplicate.
+   Both `ErrorSignature`'s and `LogEvent`'s `CAPTURED_FROM` are **at least one**,
+   so `duplicate_log_structural_edge` never fires for either node's source edge.
+   A signature ID is a repo/fingerprint aggregate that **excludes** the source,
+   and a `LogEvent` ID likewise excludes the source (it is keyed on
+   repo/signature/valid-time/content-hash), while each `LogSource` ID is
+   path/hash-distinct. `scan-logs` emits a distinct `CAPTURED_FROM` per
+   `LogSource`, so a graph combining two log files where the same exemplar
+   appears in both legitimately gives one `LogEvent` a `CAPTURED_FROM` edge to
+   each `LogSource` (and, sharing a normalized template/severity, one
+   `ErrorSignature` multiple `CAPTURED_FROM` edges too). That is a valid
+   multi-source aggregate, not a duplicate.
 
    Counting is by distinct edge record ID, so an identical re-emitted edge record
    is not a duplicate. Only incident nodes are evaluated — a zero-edge log node

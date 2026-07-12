@@ -642,9 +642,14 @@ enum LogEdgeCardinality {
 /// log-domain node must carry its required OUTBOUND structural edges (the log
 /// node is the edge `source`), each with a per-requirement cardinality.
 ///
-/// * `LogEvent` requires exactly one `FINGERPRINTED_AS` and exactly one
-///   `CAPTURED_FROM` (one exemplar fingerprinted as one signature, captured
-///   from one source — two of either is malformed).
+/// * `LogEvent` requires exactly one `FINGERPRINTED_AS` (one exemplar is
+///   fingerprinted as exactly one signature — two is malformed) and at least
+///   one `CAPTURED_FROM`. A `LogEvent` ID excludes the source (it is keyed on
+///   repo/signature/valid-time/content-hash, see `src/log_graph.rs`), while
+///   each `LogSource` ID is path/hash-distinct, so a graph combining two log
+///   files where the same exemplar appears in both legitimately gives one
+///   `LogEvent` a distinct `CAPTURED_FROM` per `LogSource` — never a duplicate,
+///   the same multi-source-aggregate reason as `ErrorSignature` below.
 /// * `ErrorSignature` requires at least one `CAPTURED_FROM` (the extractor
 ///   always emits `ErrorSignature —CAPTURED_FROM→ LogSource`, so it is itself a
 ///   required, validated edge — bucket source attribution reached via the
@@ -675,17 +680,21 @@ fn check_log_completeness(
     /// Required outbound structural edges per log node kind with their
     /// cardinality, matching exactly what the issue #319/#320 extractor emits
     /// (`src/log_graph.rs`): a `LogEvent` gets exactly one `FINGERPRINTED_AS`
-    /// and exactly one `CAPTURED_FROM`, an `ErrorSignature` gets at least one
+    /// but at least one `CAPTURED_FROM`, an `ErrorSignature` gets at least one
     /// `CAPTURED_FROM` (one per source it aggregates across), but a
     /// `LogOccurrenceBucket` gets only `AGGREGATES` (its `LogSource` is reached
     /// transitively via the signature's own required `CAPTURED_FROM`).
+    /// `LogEvent` `CAPTURED_FROM` is at-least-one for the same
+    /// multi-source-aggregate reason as `ErrorSignature`: a `LogEvent` ID
+    /// excludes the source, so the same exemplar seen in multiple log files
+    /// converges to one event node that captures from each `LogSource`.
     /// Requiring a bucket `CAPTURED_FROM` would false-positive on every real
     /// scan-logs graph.
     const fn required_labels(kind: NodeKind) -> &'static [(EdgeLabel, LogEdgeCardinality)] {
         match kind {
             NodeKind::LogEvent => &[
                 (EdgeLabel::FingerprintedAs, ExactlyOne),
-                (EdgeLabel::CapturedFrom, ExactlyOne),
+                (EdgeLabel::CapturedFrom, AtLeastOne),
             ],
             NodeKind::ErrorSignature => &[(EdgeLabel::CapturedFrom, AtLeastOne)],
             NodeKind::LogOccurrenceBucket => &[(EdgeLabel::Aggregates, ExactlyOne)],
@@ -1517,8 +1526,14 @@ mod tests {
     }
 
     #[test]
-    fn log_event_duplicate_captured_from_is_flagged() {
-        // Two distinct CAPTURED_FROM edges from one LogEvent to two sources.
+    fn log_event_may_capture_from_multiple_sources_is_clean() {
+        // A LogEvent ID excludes the source (it is keyed on
+        // repo/signature/valid-time/content-hash, `src/log_graph.rs:445-451`),
+        // while each LogSource ID is path/hash-distinct, so combining two
+        // scan-logs outputs where the same exemplar (same timestamp+template)
+        // appears in two files yields ONE LogEvent carrying TWO distinct
+        // CAPTURED_FROM edges to two different LogSources — a valid
+        // multi-source aggregate, never a `duplicate_log_structural_edge`.
         let records = vec![
             node("n:event", NodeKind::LogEvent),
             node("n:sig", NodeKind::ErrorSignature),
@@ -1527,6 +1542,60 @@ mod tests {
             edge("e:fp", EdgeLabel::FingerprintedAs, "n:event", "n:sig"),
             edge("e:cap-a", EdgeLabel::CapturedFrom, "n:event", "n:source-a"),
             edge("e:cap-b", EdgeLabel::CapturedFrom, "n:event", "n:source-b"),
+            // The signature carries its own required CAPTURED_FROM to each
+            // source so only the event's multi-source capture is under test.
+            edge(
+                "e:sig-cap-a",
+                EdgeLabel::CapturedFrom,
+                "n:sig",
+                "n:source-a",
+            ),
+            edge(
+                "e:sig-cap-b",
+                EdgeLabel::CapturedFrom,
+                "n:sig",
+                "n:source-b",
+            ),
+        ];
+        let report = validate_records(&records);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|d| d.code != DUPLICATE_LOG_STRUCTURAL_EDGE),
+            "a LogEvent capturing from multiple sources is a valid aggregate, got {:?}",
+            report.diagnostics
+        );
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn log_event_fingerprinted_to_two_signatures_is_flagged() {
+        // FINGERPRINTED_AS stays exactly-one: a LogEvent is fingerprinted as
+        // exactly one signature (the target is the source-excluded signature_id,
+        // so two DIFFERENT signatures is a genuine malformed duplicate, not a
+        // multi-source aggregate). Both signatures carry their own CAPTURED_FROM
+        // so only the event's double-fingerprint offends.
+        let records = vec![
+            node("n:event", NodeKind::LogEvent),
+            node("n:sig-a", NodeKind::ErrorSignature),
+            node("n:sig-b", NodeKind::ErrorSignature),
+            node("n:source", NodeKind::LogSource),
+            edge("e:fp-a", EdgeLabel::FingerprintedAs, "n:event", "n:sig-a"),
+            edge("e:fp-b", EdgeLabel::FingerprintedAs, "n:event", "n:sig-b"),
+            edge("e:evt-cap", EdgeLabel::CapturedFrom, "n:event", "n:source"),
+            edge(
+                "e:sig-a-cap",
+                EdgeLabel::CapturedFrom,
+                "n:sig-a",
+                "n:source",
+            ),
+            edge(
+                "e:sig-b-cap",
+                EdgeLabel::CapturedFrom,
+                "n:sig-b",
+                "n:source",
+            ),
         ];
         let report = validate_records(&records);
         let dupes: Vec<_> = report
@@ -1536,10 +1605,10 @@ mod tests {
             .collect();
         assert_eq!(dupes.len(), 1, "got {:?}", report.diagnostics);
         assert_eq!(dupes[0].record_id.as_deref(), Some("n:event"));
-        assert_eq!(dupes[0].relation.as_deref(), Some("CAPTURED_FROM"));
+        assert_eq!(dupes[0].relation.as_deref(), Some("FINGERPRINTED_AS"));
         assert_eq!(
             dupes[0].stranded_edge_ids.as_deref(),
-            Some(&["e:cap-a".to_owned(), "e:cap-b".to_owned()][..])
+            Some(&["e:fp-a".to_owned(), "e:fp-b".to_owned()][..])
         );
     }
 

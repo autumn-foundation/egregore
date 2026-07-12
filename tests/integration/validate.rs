@@ -962,6 +962,55 @@ fn validate_accepts_error_signature_spanning_multiple_sources() {
 }
 
 #[test]
+fn validate_accepts_log_event_spanning_multiple_sources() {
+    let (_temp, graph) = fixture_graph();
+    // The clean subgraph gives `log:v1:event` one CAPTURED_FROM to `log:v1:source`.
+    append_clean_log_subgraph(&graph);
+    // Simulate combined output from scanning a SECOND log file in the same repo
+    // where the SAME exemplar (same timestamp+template) appears: a LogEvent ID
+    // excludes the source (keyed on repo/signature/valid-time/content-hash), so
+    // the exemplar converges to the SAME `log:v1:event` node, which then carries
+    // a DISTINCT CAPTURED_FROM to the second file's LogSource. The signature also
+    // gains that source's CAPTURED_FROM. This must NOT be flagged as a duplicate
+    // — a LogEvent may legitimately capture from multiple sources.
+    append_lines(
+        &graph,
+        &[
+            log_node_line("log:v1:source2", "LogSource", "second log source"),
+            log_edge_line(
+                "log:v1:e-sig-cap2",
+                "CAPTURED_FROM",
+                "log:v1:sig",
+                "log:v1:source2",
+            ),
+            log_edge_line(
+                "log:v1:e-evt-cap2",
+                "CAPTURED_FROM",
+                "log:v1:event",
+                "log:v1:source2",
+            ),
+        ],
+    );
+    let (code, lines) = run_validate(&graph);
+    assert_eq!(
+        code, 0,
+        "a LogEvent spanning two sources is a valid aggregate, must exit 0"
+    );
+    let (diagnostics, summary) = split_output(&lines);
+    let dupes = diagnostics_with_code(diagnostics, "duplicate_log_structural_edge");
+    assert!(
+        dupes.is_empty(),
+        "multi-source LogEvent must not be a duplicate, got {diagnostics:?}"
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "multi-source log graph must be clean, got {diagnostics:?}"
+    );
+    assert_eq!(summary["ok"], true);
+    assert_eq!(summary["defects"], 0);
+}
+
+#[test]
 fn validate_log_defects_are_canonically_ordered_with_code_defects() {
     let (_temp, graph) = fixture_graph();
     let records = graph_records(&graph);
