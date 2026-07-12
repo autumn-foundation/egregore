@@ -2771,7 +2771,23 @@ fn bind_error_signature_rows(
         })
         .map(|(id, _)| *id)
         .collect();
-    let summary_ids: BTreeSet<&str> = signatures.iter().map(|r| r.signature_id.as_str()).collect();
+    // Reject a repeated `signature_id` BEFORE the dedup set collapses it (issue
+    // #373, Codex round-5 P2). A `BTreeSet` would silently merge two rows sharing a
+    // `signature_id` — both then bind the same hashed `ErrorSignature` node and the
+    // bijection still balances — but the summary would no longer have exactly one
+    // row per signature, and a duplicate row can carry divergent exemplar handles or
+    // frame-resolution targets bound only by the whole-summary hash. Detect the
+    // collision explicitly instead of silently absorbing it.
+    let mut summary_ids: BTreeSet<&str> = BTreeSet::new();
+    for row in signatures {
+        if !summary_ids.insert(row.signature_id.as_str()) {
+            return Err(format!(
+                "error_signatures summary lists signature {} more than once in \
+                 section {class} (one row per signature required)",
+                row.signature_id
+            ));
+        }
+    }
     if let Some(extra) = summary_ids.difference(&section_sig_ids).next() {
         return Err(format!(
             "error_signatures summary row {extra} has no backing hashed ErrorSignature \
@@ -2881,7 +2897,22 @@ fn bind_occurrence_totals(
         .map(|(id, _)| *id)
         .collect();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut seen_signatures: BTreeSet<&str> = BTreeSet::new();
     for total in totals {
+        // Reject a duplicate `signature_id` across totals (issue #373, Codex
+        // round-5 P2): one occurrence total per signature. Two totals for one
+        // signature — splitting its buckets, or an appended empty zero total — each
+        // balance their own bucket sum and leave the reverse bucket-coverage guard
+        // satisfied, so without this a consumer reading a per-signature total sees
+        // the count under-reported. This is the round-3 under-reporting failure
+        // re-expressed via row duplication rather than bucket omission.
+        if !seen_signatures.insert(total.signature_id.as_str()) {
+            return Err(format!(
+                "occurrence_buckets summary lists signature {} more than once in \
+                 section {class} (one occurrence total per signature required)",
+                total.signature_id
+            ));
+        }
         let mut sum: u64 = 0;
         for bucket in &total.buckets {
             if !seen.insert(bucket.bucket_id.as_str()) {
@@ -11480,6 +11511,33 @@ mod pack340_tests {
                         .then_with(|| a.bucket_id.cmp(&b.bucket_id))
                 });
             }),
+            // Split one signature's buckets across two totals for the SAME
+            // `signature_id`. Before the fix each partial total equalled its own
+            // bucket sum and the reverse bucket-coverage guard still saw every
+            // bucket, so Integrity passed while a consumer reading per-signature
+            // totals saw the count under-reported by whichever total it read —
+            // the round-3 under-reporting failure via row duplication (issue #373,
+            // Codex round-5 P2).
+            ("duplicate_total_split_buckets", |t| {
+                let half = t[0].buckets.len() / 2;
+                let moved: Vec<BucketCount> = t[0].buckets.split_off(half);
+                let moved_sum: u64 = moved.iter().map(|b| b.occurrence_count).sum();
+                let mut dup = t[0].clone();
+                t[0].in_window_occurrences -= moved_sum;
+                dup.in_window_occurrences = moved_sum;
+                dup.buckets = moved;
+                t.push(dup);
+            }),
+            // Append an empty zero total for an existing `signature_id`. Its sum
+            // (0) trivially equals `in_window_occurrences` and it touches no bucket,
+            // so before the fix Integrity passed even though the summary now carries
+            // two totals for one signature.
+            ("duplicate_total_empty_zero", |t| {
+                let mut dup = t[0].clone();
+                dup.buckets.clear();
+                dup.in_window_occurrences = 0;
+                t.push(dup);
+            }),
         ];
         for (name, mutate) in cases {
             let mut pack = assemble_cc73(&build_log_incident_records());
@@ -11538,6 +11596,16 @@ mod pack340_tests {
                 let mut ghost = s[0].clone();
                 ghost.signature_id = "log:v1:ghost-signature".to_owned();
                 s.push(ghost);
+            }),
+            // Duplicate an existing signature row verbatim (same `signature_id`).
+            // Before the fix the `BTreeSet` of summary IDs collapsed the pair, so
+            // the bijection still balanced and each duplicate bound the same node —
+            // yet the summary no longer had one row per signature and a duplicate
+            // could carry divergent exemplar/frame-resolution fields bound only by
+            // the whole-summary hash (issue #373, Codex round-5 P2).
+            ("duplicate_signature_row", |s| {
+                let dup = s[0].clone();
+                s.push(dup);
             }),
         ];
         for (name, mutate) in cases {
