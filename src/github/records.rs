@@ -344,6 +344,26 @@ pub fn pull_records(ctx: &Context<'_>, pr: &model::PullRequest) -> Emitted {
     emitted
         .records
         .extend(requested_review_records(ctx, &task_id, number, pr));
+
+    // PR-author identity (issue #335, Codex P2). The PR Task already carries the
+    // author login, but before this an author who never appears as a requested
+    // reviewer, review author, or commenter got NO ExternalIdentity node —
+    // leaving the segregation-of-duties join (match Task.author to the approver
+    // identity set) with no citable author identity for the common
+    // "author X, approved by Y" pattern. Mint the author's identity NODE from
+    // `pr.user` (skip an empty login; never fabricate one). NODE ONLY — no
+    // authorship edge is invented here; the SoD join matches the login. The node
+    // is deduplicated one-per-login across the run by the importer seen-set
+    // (`push_emitted`), so an author who is also a reviewer/requested-reviewer
+    // still yields exactly one identity node. Byte-stable and idempotent.
+    if let Some(login) = pr
+        .user
+        .as_ref()
+        .map(|u| u.login.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        emitted.records.push(external_identity_node(ctx, login));
+    }
     emitted
 }
 
@@ -2906,21 +2926,107 @@ mod tests {
         );
     }
 
+    /// Builds `sample_pull` with the author login overridden.
+    fn sample_pull_by(number: u64, author: &str, reviewers: &[&str]) -> model::PullRequest {
+        let mut pr = sample_pull(number, reviewers, &[]);
+        pr.user = Some(model::User {
+            login: author.to_owned(),
+        });
+        pr
+    }
+
+    #[test]
+    fn pr_author_identity_node_is_minted_from_pr_user() {
+        // Codex P2 (#335 AC1): a PR whose author never reviews, comments, or is a
+        // requested reviewer still gets a citable ExternalIdentity minted from
+        // pr.user — the NODE only, with the stable (system, login) id and no edge.
+        let files = FileIndex::new();
+        let c = ctx("o/r", &files, &identity);
+        let e = pull_records(&c, &sample_pull_by(9, "zoe", &[]));
+        let ids: Vec<_> = identity_nodes(&e)
+            .iter()
+            .map(|r| r.id().to_owned())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![external_identity_id("github", "zoe")],
+            "exactly one identity node, the author, with the stable id"
+        );
+        // NODE ONLY: no authorship edge is invented for the author identity.
+        let author_id = external_identity_id("github", "zoe");
+        assert!(
+            !edges_with_label(&e, EdgeLabel::ReviewedBy)
+                .iter()
+                .chain(edges_with_label(&e, EdgeLabel::RequestedReviewFrom).iter())
+                .any(|edge| matches!(
+                    edge,
+                    GraphRecord::Edge { source, target, .. }
+                        if source == &author_id || target == &author_id
+                )),
+            "the author identity is a bare node, never an edge endpoint"
+        );
+    }
+
+    #[test]
+    fn pr_author_identity_skipped_when_login_empty() {
+        let files = FileIndex::new();
+        let c = ctx("o/r", &files, &identity);
+        let mut pr = sample_pull(9, &[], &[]);
+        pr.user = Some(model::User {
+            login: String::new(),
+        });
+        assert!(
+            identity_nodes(&pull_records(&c, &pr)).is_empty(),
+            "an empty author login mints no identity node"
+        );
+        pr.user = None;
+        assert!(
+            identity_nodes(&pull_records(&c, &pr)).is_empty(),
+            "an absent author mints no identity node"
+        );
+    }
+
+    #[test]
+    fn pr_author_who_is_also_requested_reviewer_shares_one_identity_id() {
+        // When the author is ALSO a requested reviewer, pull_records mints the
+        // identity from both sources, but they carry the SAME stable id so the
+        // run-level seen-set collapses them to exactly one node (0 duplicates).
+        let files = FileIndex::new();
+        let c = ctx("o/r", &files, &identity);
+        let e = pull_records(&c, &sample_pull_by(9, "dana", &["dana"]));
+        let distinct: std::collections::BTreeSet<String> = identity_nodes(&e)
+            .iter()
+            .map(|r| r.id().to_owned())
+            .collect();
+        assert_eq!(
+            distinct,
+            std::collections::BTreeSet::from([external_identity_id("github", "dana")]),
+            "author == requested reviewer collapses to one identity id"
+        );
+    }
+
     #[test]
     fn segregation_of_duties_is_deterministically_computable() {
         // AC8: for a merged PR, {approving identity ids} minus {author identity id}
         // is computable, and author-approved-own-PR is distinguishable from a
-        // non-author approval with zero misclassifications.
+        // non-author approval with zero misclassifications. The author identity is
+        // sourced from pr.user (Codex P2) — carol need NOT comment.
         let files = FileIndex::new();
         let c = ctx("o/r", &files, &identity);
 
-        // PR #1: author "carol"; approved by a DIFFERENT reviewer "dave".
+        // PR #1: author "carol" (identity minted purely from pr.user); approved by
+        // a DIFFERENT reviewer "dave".
+        let author1 = external_identity_id("github", "carol");
+        let pr1 = pull_records(&c, &sample_pull_by(1, "carol", &[]));
+        assert!(
+            identity_nodes(&pr1).iter().any(|r| r.id() == author1),
+            "PR author carol has a citable identity minted from pr.user"
+        );
         let mut r_dave = sample_review(10, None);
         r_dave.user = Some(model::User {
             login: "dave".to_owned(),
         });
         let e1 = pr_review_records(&c, 1, &r_dave);
-        let author1 = external_identity_id("github", "carol");
         let approvers1: std::collections::BTreeSet<String> = identity_nodes(&e1)
             .iter()
             .map(|r| r.id().to_owned())
@@ -2931,14 +3037,26 @@ mod tests {
             !approvers1.contains(&author1),
             "non-author approval must NOT be flagged as self-approval"
         );
+        assert_eq!(
+            approvers1
+                .difference(&std::collections::BTreeSet::from([author1]))
+                .count(),
+            approvers1.len(),
+            "author id subtracts cleanly (no false self-approval)"
+        );
 
-        // PR #2: author "erin" approved their OWN PR.
+        // PR #2: author "erin" approved their OWN PR (identity from pr.user).
+        let author2 = external_identity_id("github", "erin");
+        let pr2 = pull_records(&c, &sample_pull_by(2, "erin", &[]));
+        assert!(
+            identity_nodes(&pr2).iter().any(|r| r.id() == author2),
+            "PR author erin has a citable identity minted from pr.user"
+        );
         let mut r_erin = sample_review(20, None);
         r_erin.user = Some(model::User {
             login: "erin".to_owned(),
         });
         let e2 = pr_review_records(&c, 2, &r_erin);
-        let author2 = external_identity_id("github", "erin");
         let approvers2: std::collections::BTreeSet<String> = identity_nodes(&e2)
             .iter()
             .map(|r| r.id().to_owned())

@@ -565,10 +565,21 @@ the state-schema version is bumped (see §5 idempotency), forcing exactly one fu
 refresh on the first upgraded run.
 
 **Reviewer identity — `ExternalIdentity` node + `REVIEWED_BY` /
-`REQUESTED_REVIEW_FROM` edges (issue #335):** every review author and every
-requested reviewer is minted as one `project.ExternalIdentity` node keyed on
+`REQUESTED_REVIEW_FROM` edges (issue #335):** every review author, every
+requested reviewer, and **every PR author** is minted as one
+`project.ExternalIdentity` node keyed on
 `(system, login)` alone (see §9) — carrying ONLY the login (in `author`) and
 `identity_system: "github"`, never email, display name, avatar, or profile URL.
+
+**PR-author identity from `pr.user` (issue #335, AC1):** a PR `Task` carries its
+author login (`pr.user.login`), and that login is minted as an
+`ExternalIdentity` **node** — no authorship edge (the node alone is the citable
+fact; the segregation-of-duties join matches `Task.author` to the identity of
+that login). This closes the case where a PR author never appears as a requested
+reviewer, review author, or commenter and would otherwise have no citable author
+identity to subtract from the approver set. An empty author login mints nothing.
+Because identity nodes dedupe on `(system, login)`, an author who is also a
+reviewer or requested reviewer still yields exactly one node.
 
 | Edge | FROM | TO | Meaning |
 |------|------|----|---------|
@@ -802,6 +813,7 @@ The test suite covers:
 | Review anchor redaction carve-out (issue #334) | `review_commit_sha` survives a redaction-on export in plaintext; never enumerated as sensitive |
 | Requested-reviewer removal lifecycle (issue #335) | A PR whose `requested_reviewers` shrinks tombstones each dropped `REQUESTED_REVIEW_FROM` edge (`requested_review_superseded`, `deleted_id == edge_id`); the surviving reviewer's edge stays live; the `ExternalIdentity` node and `REVIEWED_BY` edges are never tombstoned; removed→re-requested revives; an unchanged reviewer set emits zero tombstones |
 | Requested-team removal lifecycle (issue #335, Codex P2) | A PR whose `requested_teams` shrinks tombstones each dropped `github_team_review_request_unexpanded` `Diagnostic` (`team_review_request_superseded`, `deleted_id == diagnostic_id`); the surviving team's diagnostic stays live; no `REQUESTED_REVIEW_FROM` edge, `ExternalIdentity` node, or `REVIEWED_BY` edge is tombstoned; removed→re-requested revives; an unchanged team set emits zero tombstones; changing both reviewers and teams tombstones both |
+| PR-author identity from `pr.user` (issue #335, Codex P2) | A PR author who never appears as a requested reviewer, review author, or commenter still gets exactly one `ExternalIdentity` node minted from `pr.user` with the stable `(system, login)` id and NO authorship edge; an empty author login mints nothing; an author who is also a reviewer/requested reviewer dedupes to one node; the segregation-of-duties join (`{approver identities}` minus the `Task.author` identity) is computable with self-approval distinguishable from non-author approval |
 | Stderr summary | Documented fields present on every run |
 
 Implementation of behaviour tests is deferred to the `eg import github` CLI

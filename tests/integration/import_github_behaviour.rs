@@ -3051,12 +3051,16 @@ fn identity_logins(jsonl: &str) -> Vec<String> {
 /// segregation-of-duties cases with >=5 distinct logins.
 ///
 /// - PR #1 author `carol`; requests review from `dave` + `erin` and team
-///   `backend`; approved by NON-author `dave`; author `carol` also comments.
+///   `backend`; approved by NON-author `dave`. `carol` leaves NO review and NO
+///   comment — her `ExternalIdentity` is minted purely from `pr.user` (issue
+///   #335, AC1; Codex P2), which is exactly what the segregation-of-duties join
+///   needs (a citable author identity to subtract from the approver set).
 /// - PR #2 author `frank`; requests review from `grace`; approved by author
 ///   `frank` (self-approval).
 ///
 /// Distinct logins: carol, dave, erin, frank, grace (5). `backend` is a team,
-/// recorded as a diagnostic, never a login.
+/// recorded as a diagnostic, never a login. `carol` and `frank` appear as
+/// identities solely by authoring their PRs.
 fn reviewer_identity_routes() -> HashMap<String, Canned> {
     let pulls = serde_json::json!([
         {
@@ -3095,16 +3099,9 @@ fn reviewer_identity_routes() -> HashMap<String, Canned> {
         }
     ])
     .to_string();
-    // The PR author (carol) also comments on the PR conversation.
-    let issue_comments = serde_json::json!([
-        {
-            "id": 701, "body": "One more thing.", "user": {"login": "carol"},
-            "issue_url": "https://api.github.com/repos/o/r/issues/1",
-            "created_at": "2026-01-03T00:00:00Z", "updated_at": "2026-01-03T00:00:00Z",
-            "html_url": "https://github.com/o/r/pull/1#issuecomment-701"
-        }
-    ])
-    .to_string();
+    // The PR author (carol) leaves no comment: her identity must come from
+    // `pr.user`, not a conversation comment (Codex P2).
+    let issue_comments = "[]".to_owned();
 
     let mut routes = HashMap::new();
     routes.insert(
@@ -3167,11 +3164,12 @@ fn fresh_import_emits_reviewer_identities_edges_and_team_diagnostic() {
         "5 distinct participant identities, backend team excluded"
     );
 
-    // REVIEWED_BY: one per emitted review (2 pr_reviews + 1 issue_comment = 3).
+    // REVIEWED_BY: one per emitted review (2 pr_review approvals; the authors
+    // carol/frank leave no review or comment).
     assert_eq!(
         edges_of_label(&jsonl, "REVIEWED_BY"),
-        3,
-        "one REVIEWED_BY per emitted review (2 approvals + 1 comment)"
+        2,
+        "one REVIEWED_BY per emitted review (2 approvals, no comments)"
     );
     // REQUESTED_REVIEW_FROM: dave, erin (PR#1) + grace (PR#2) = 3.
     assert_eq!(
@@ -3203,11 +3201,37 @@ fn fresh_import_emits_reviewer_identities_edges_and_team_diagnostic() {
     // PR #2: author frank, approved by frank → self_approval == true.
     let carol_id = identity_id_of(&jsonl, "carol");
     let frank_id = identity_id_of(&jsonl, "frank");
+    // Both author identities are citable and byte-stable (Codex P2): carol's
+    // node exists SOLELY because she authored PR #1 (she left no review/comment
+    // and is not a requested reviewer), so the id equals the one minted from any
+    // other source for the same login.
+    assert_eq!(
+        carol_id,
+        aletheia_egregore::github::records::external_identity_id("github", "carol"),
+        "carol's author identity id is the stable (system, login) id"
+    );
+    assert!(
+        !jsonl
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| v["record_type"] == "edge"
+                && (v["label"] == "REVIEWED_BY" || v["label"] == "REQUESTED_REVIEW_FROM")
+                && v["target"].as_str() == Some(&carol_id)),
+        "carol is neither a reviewer nor a requested reviewer: her identity comes only from pr.user"
+    );
     let pr1_approvers = reviewed_by_identity_ids_for_pr(&jsonl, 1);
     let pr2_approvers = reviewed_by_identity_ids_for_pr(&jsonl, 2);
+    // {approving identities} minus {author identity} is computable in both cases.
     assert!(
         !pr1_approvers.contains(&carol_id),
         "PR#1 (non-author approval) must NOT be flagged as self-approval"
+    );
+    assert_eq!(
+        pr1_approvers
+            .difference(&std::collections::BTreeSet::from([carol_id]))
+            .count(),
+        pr1_approvers.len(),
+        "author id subtracts cleanly from PR#1's approver set (no false self-approval)"
     );
     assert!(
         pr2_approvers.contains(&frank_id),
@@ -3915,5 +3939,196 @@ fn changing_both_reviewers_and_teams_tombstones_both() {
         ts.len(),
         2,
         "exactly two tombstones: one reviewer edge + one team diagnostic: {j2}"
+    );
+}
+
+// ── Issue #335 (Codex P2): PR-author identities are minted from `pr.user` ──────
+//
+// A PR whose author never appears as a requested reviewer, review author, or
+// commenter still needs a citable `ExternalIdentity` so the segregation-of-duties
+// join (match the PR `Task.author` login to the approver identity set) has an
+// author identity to compare against. The author identity is minted from
+// `pr.user` — NODE ONLY, no authorship edge — and deduplicated one-per-login by
+// the run's identity seen-set, so an author who is ALSO a reviewer/requested
+// reviewer still yields exactly one identity node.
+
+/// Fixture exercising the author-identity source (issue #335, Codex P2):
+///
+/// - PR #10 author `ivan` — a login that appears ONLY as `pr.user` (no review,
+///   no comment, not a requested reviewer); requests review from `dave`, approved
+///   by `dave`.
+/// - PR #11 author `dave` — `dave` is simultaneously a requested reviewer AND a
+///   review author (both on PR #10) AND a PR author (PR #11), so his identity is
+///   minted from three sources and MUST collapse to exactly one node.
+///
+/// Distinct identities: `ivan`, `dave` (2).
+fn author_identity_routes() -> HashMap<String, Canned> {
+    let pulls = serde_json::json!([
+        {
+            "number": 10, "title": "PR ten", "body": null, "state": "closed",
+            "merged_at": "2026-01-05T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "ivan"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-05T00:00:00Z",
+            "requested_reviewers": [{"login": "dave"}],
+            "requested_teams": [],
+            "html_url": "https://github.com/o/r/pull/10"
+        },
+        {
+            "number": 11, "title": "PR eleven", "body": null, "state": "open",
+            "merged_at": null, "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "dave"},
+            "created_at": "2026-01-02T00:00:00Z", "updated_at": "2026-01-06T00:00:00Z",
+            "requested_reviewers": [],
+            "requested_teams": [],
+            "html_url": "https://github.com/o/r/pull/11"
+        }
+    ])
+    .to_string();
+    let reviews_10 = serde_json::json!([
+        {
+            "id": 910, "body": "LGTM", "state": "APPROVED", "user": {"login": "dave"},
+            "submitted_at": "2026-01-04T00:00:00Z",
+            "html_url": "https://github.com/o/r/pull/10#pullrequestreview-910"
+        }
+    ])
+    .to_string();
+
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/repos/o/r".to_owned(),
+        Canned::ok("{\"full_name\":\"o/r\"}", "\"repo\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues?state=all&per_page=100".to_owned(),
+        Canned::ok("[]", "\"issues-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, "\"pulls-335-author\""),
+    );
+    routes.insert(
+        "/repos/o/r/labels?per_page=100".to_owned(),
+        Canned::ok("[]", "\"labels-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"ic-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"prc-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/10/reviews?per_page=100".to_owned(),
+        Canned::ok(&reviews_10, "\"prr-10\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/11/reviews?per_page=100".to_owned(),
+        Canned::ok("[]", "\"prr-11\""),
+    );
+    routes
+}
+
+#[test]
+fn pr_author_only_login_gets_one_identity_from_pr_user() {
+    let server = MockServer::start(author_identity_routes());
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("g.jsonl");
+    let state = tmp.path().join("state.json");
+    let (jsonl, _stderr, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok, "import should succeed");
+
+    // `ivan` appears ONLY as pr.user, yet has exactly one citable identity with
+    // the stable (system, login) id.
+    let ivan_nodes: Vec<_> = nodes_of_kind(&jsonl, "ExternalIdentity")
+        .into_iter()
+        .filter(|v| v["author"].as_str() == Some("ivan"))
+        .collect();
+    assert_eq!(
+        ivan_nodes.len(),
+        1,
+        "the author-only login ivan gets exactly one ExternalIdentity node"
+    );
+    assert_eq!(
+        ivan_nodes[0]["id"].as_str(),
+        Some(aletheia_egregore::github::records::external_identity_id("github", "ivan").as_str()),
+        "ivan's author identity id is the stable (system, login) id"
+    );
+    // NODE ONLY: no edge references ivan (he authored no review and is not a
+    // requested reviewer), so his identity exists solely because of pr.user.
+    let ivan_id = aletheia_egregore::github::records::external_identity_id("github", "ivan");
+    assert!(
+        !jsonl
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| v["record_type"] == "edge"
+                && (v["source"].as_str() == Some(&ivan_id)
+                    || v["target"].as_str() == Some(&ivan_id))),
+        "no edge references the author-only identity: {jsonl}"
+    );
+
+    // Segregation of duties: PR #10 approvers ({dave}) minus author ({ivan}) is
+    // computable, and ivan is NOT in the approver set (non-self-approval).
+    let ivan_task_author = pr_task(&jsonl, 10)["author"].as_str().map(str::to_owned);
+    assert_eq!(
+        ivan_task_author.as_deref(),
+        Some("ivan"),
+        "the PR Task carries the author login the identity is minted from"
+    );
+    let pr10_approvers = reviewed_by_identity_ids_for_pr(&jsonl, 10);
+    assert!(
+        !pr10_approvers.contains(&ivan_id),
+        "PR#10 non-author approval is not flagged as self-approval"
+    );
+
+    // Byte-stable across 5 fresh runs.
+    for i in 0..5 {
+        let out_n = tmp.path().join(format!("g_{i}.jsonl"));
+        let state_n = tmp.path().join(format!("state_{i}.json"));
+        let (jn, _, okn) = run_import(&server.base_url, &out_n, &state_n, &[]);
+        assert!(okn);
+        assert_eq!(
+            jn, jsonl,
+            "import output must be byte-identical across runs"
+        );
+    }
+}
+
+#[test]
+fn author_who_is_also_reviewer_and_review_author_yields_one_identity() {
+    // `dave` is a requested reviewer (PR #10), a review author (PR #10 approval),
+    // AND a PR author (PR #11). Despite three identity sources, the run's identity
+    // seen-set must collapse him to exactly ONE ExternalIdentity node — zero
+    // duplicates — so byte-stability and idempotency hold.
+    let server = MockServer::start(author_identity_routes());
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("g.jsonl");
+    let state = tmp.path().join("state.json");
+    let (jsonl, _stderr, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok, "import should succeed");
+
+    let dave_nodes = nodes_of_kind(&jsonl, "ExternalIdentity")
+        .into_iter()
+        .filter(|v| v["author"].as_str() == Some("dave"))
+        .count();
+    assert_eq!(
+        dave_nodes, 1,
+        "a login that is author + reviewer + requested reviewer dedups to ONE identity node"
+    );
+
+    // Exactly two distinct identities overall (ivan, dave), each minted once.
+    let mut logins = identity_logins(&jsonl);
+    let total = logins.len();
+    logins.sort();
+    logins.dedup();
+    assert_eq!(
+        logins,
+        vec!["dave", "ivan"],
+        "two distinct participant identities"
+    );
+    assert_eq!(
+        total,
+        logins.len(),
+        "no duplicate identity nodes across the run"
     );
 }
