@@ -51,6 +51,17 @@ pub const ERROR_CONTEXT_DISCLAIMER: &str = "Rows are CORRELATION LEADS, never pr
      edge is a content-hash or temporal correlation, never causation; and the absence of a lead is \
      not proof of unrelatedness. Occurrence data reflects only the log sources that were scanned.";
 
+/// Fixed advisory emitted in `repo_scope_caveat` whenever `--repo` is set.
+///
+/// `--repo` scopes only the code-side `first_seen_range` symbol-delta join. Log
+/// records carry no retrievable repository attribution (their repository ID is
+/// only hashed into their stable IDs), so the runtime sections
+/// (`signatures`/frames/buckets and their `EMITTED_DURING` observations) are
+/// NEVER repository-filtered — mirroring `eg query log-deltas`.
+pub const REPO_SCOPE_CAVEAT: &str = "--repo scopes only the code-side first_seen_range \
+     symbol-delta join; log records carry no retrievable repository attribution, so the signature, \
+     frame, bucket, and EMITTED_DURING observation sections are NOT repository-filtered.";
+
 /// The `log:v1:` stable-ID prefix every `ErrorSignature`/`LogSource`/bucket ID
 /// carries (see [`log_stable_id`](crate::ir::log_stable_id)).
 const LOG_ID_PREFIX: &str = "log:v1:";
@@ -248,6 +259,11 @@ pub struct ErrorContext {
     /// Protected payload handles (present only under `--protected-store`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protected_payloads: Option<Vec<ProtectedPayloadRef>>,
+    /// Repository-scope caveat, present only when `--repo` is set: discloses
+    /// that the scope filters only the code-side `first_seen_range` join, never
+    /// the log/runtime sections ([`REPO_SCOPE_CAVEAT`]). Omitted when unscoped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_scope_caveat: Option<&'static str>,
     /// Always-present advisory ([`ERROR_CONTEXT_DISCLAIMER`]).
     pub disclaimer: &'static str,
 }
@@ -267,6 +283,13 @@ pub enum ErrorContextError {
     },
     /// `--protected-store` set AND the graph carries a protected handle (exit 1).
     ProtectedHandleInGraph,
+    /// `--protected-store` set but its manifest could not be read — a tampered
+    /// or unreadable manifest must fail loudly, never degrade to an empty list
+    /// indistinguishable from "no match" (exit 1).
+    ProtectedStoreUnreadable {
+        /// Human-readable diagnostic naming the store path and the I/O cause.
+        message: String,
+    },
 }
 
 /// Outcome of handle resolution (§1).
@@ -608,15 +631,21 @@ pub fn error_context(
                         .insert(target.as_str());
                 }
                 EdgeLabel::EmittedDuring if sig_set.contains(source.as_str()) => {
-                    if let Some(b) = basis {
-                        emitted_runs.entry(target.as_str()).or_insert(*b);
-                    } else {
-                        emitted_runs.entry(target.as_str()).or_insert(
-                            // A basis-less EMITTED_DURING edge should not occur;
-                            // default to the weaker correlation for safety.
-                            CorrelationBasis::TemporalCorrelation,
-                        );
-                    }
+                    // A basis-less EMITTED_DURING edge should not occur; default
+                    // to the weaker correlation for safety.
+                    let incoming = basis.unwrap_or(CorrelationBasis::TemporalCorrelation);
+                    // When two signatures link the SAME run under different bases,
+                    // the stronger `content_hash_join` (confidence 1.0) always
+                    // wins over `temporal_correlation` (0.5) regardless of record
+                    // order — never a file-order downgrade.
+                    emitted_runs
+                        .entry(target.as_str())
+                        .and_modify(|existing| {
+                            if incoming == CorrelationBasis::ContentHashJoin {
+                                *existing = CorrelationBasis::ContentHashJoin;
+                            }
+                        })
+                        .or_insert(incoming);
                 }
                 EdgeLabel::ReferencesTask if sig_set.contains(source.as_str()) => {
                     sig_task_targets.insert(target.as_str());
@@ -960,34 +989,43 @@ pub fn error_context(
         build_first_seen_range(records, &signatures, &frame_target_seeds, repo_scope);
 
     // ── protected payloads (§5) ──────────────────────────────────────────────
-    let protected_payloads = protected_store.map(|dir| {
-        let handles = ProtectedStore::new(dir).list().unwrap_or_default();
-        let by_hash: BTreeMap<&str, &crate::protected::ProtectedHandle> = handles
-            .iter()
-            .map(|h| (h.content_hash.as_str(), h))
-            .collect();
-        let mut refs: Vec<ProtectedPayloadRef> = Vec::new();
-        for block in &signatures {
-            for source in &block.source_handles {
-                if let Some(h) = by_hash.get(source.source_artifact_hash.as_str()) {
-                    refs.push(ProtectedPayloadRef {
-                        source_artifact_hash: source.source_artifact_hash.clone(),
-                        signature_id: block.record_id.clone(),
-                        handle: h.handle.clone(),
-                        source_class: h.source_class.as_str().to_owned(),
-                        byte_len: h.byte_len,
-                    });
+    // A tampered or unreadable manifest fails loudly (exit 1) rather than
+    // silently degrading to an empty list indistinguishable from "no match".
+    let protected_payloads = match protected_store {
+        None => None,
+        Some(dir) => {
+            let handles = ProtectedStore::new(dir).list().map_err(|e| {
+                ErrorContextError::ProtectedStoreUnreadable {
+                    message: format!("failed to read protected store at {}: {e}", dir.display()),
+                }
+            })?;
+            let by_hash: BTreeMap<&str, &crate::protected::ProtectedHandle> = handles
+                .iter()
+                .map(|h| (h.content_hash.as_str(), h))
+                .collect();
+            let mut refs: Vec<ProtectedPayloadRef> = Vec::new();
+            for block in &signatures {
+                for source in &block.source_handles {
+                    if let Some(h) = by_hash.get(source.source_artifact_hash.as_str()) {
+                        refs.push(ProtectedPayloadRef {
+                            source_artifact_hash: source.source_artifact_hash.clone(),
+                            signature_id: block.record_id.clone(),
+                            handle: h.handle.clone(),
+                            source_class: h.source_class.as_str().to_owned(),
+                            byte_len: h.byte_len,
+                        });
+                    }
                 }
             }
+            refs.sort_by(|a, b| {
+                a.source_artifact_hash
+                    .cmp(&b.source_artifact_hash)
+                    .then_with(|| a.signature_id.cmp(&b.signature_id))
+                    .then_with(|| a.handle.cmp(&b.handle))
+            });
+            Some(refs)
         }
-        refs.sort_by(|a, b| {
-            a.source_artifact_hash
-                .cmp(&b.source_artifact_hash)
-                .then_with(|| a.signature_id.cmp(&b.signature_id))
-                .then_with(|| a.handle.cmp(&b.handle))
-        });
-        refs
-    });
+    };
 
     Ok(ErrorContext {
         handle: handle.to_owned(),
@@ -1002,6 +1040,7 @@ pub fn error_context(
         unresolved,
         excluded,
         protected_payloads,
+        repo_scope_caveat: repo_scope.map(|_| REPO_SCOPE_CAVEAT),
         disclaimer: ERROR_CONTEXT_DISCLAIMER,
     })
 }

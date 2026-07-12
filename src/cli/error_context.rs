@@ -68,5 +68,13 @@ pub(crate) fn query_error_context_cmd(
             println!("{}", serde_json::to_string(&envelope)?);
             std::process::exit(1);
         }
+        Err(query::ErrorContextError::ProtectedStoreUnreadable { message }) => {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": { "code": "store_io_error", "detail": { "message": message } },
+            });
+            println!("{}", serde_json::to_string(&envelope)?);
+            std::process::exit(1);
+        }
     }
 }

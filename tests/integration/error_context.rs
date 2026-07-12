@@ -1315,6 +1315,12 @@ fn full_fixture() -> (Vec<GraphRecord>, String) {
     let (cmd_id, cmd_node) = command_run("cmd1", hash);
     let (task_id, task_node) = task("t1");
     let (bnode, bedge) = bucket_with_edge(&sig_id, "2026-01-02T12:00:00Z", 5);
+    // An Observation that OBSERVES the frame-target symbol; its summary carries a
+    // secret marker the redaction projection must strip (FIX 5 coverage).
+    let (obs_id, obs) = observation(
+        "redact",
+        vec![evidence_link("OBSERVES", &sym_id, "codegraph")],
+    );
     let records = vec![
         commit("c1sha0000", &[], T1),
         commit("c2sha0000", &["c1sha0000"], T2),
@@ -1330,6 +1336,8 @@ fn full_fixture() -> (Vec<GraphRecord>, String) {
         run_node,
         cmd_node,
         task_node,
+        obs,
+        observes_edge(&obs_id, &sym_id),
         bnode,
         bedge,
         frame_resolves(&sig_id, &sym_id, 0, FrameResolution::Resolved),
@@ -1353,6 +1361,14 @@ fn no_raw_payload_text_in_envelope() {
         None,
     )
     .expect("resolve");
+    // The Observation carrying SECRET_OBSERVATION_MARKER must actually reach the
+    // observations section, so the marker-absence assertion below is not vacuous.
+    assert!(
+        ctx.observations
+            .iter()
+            .any(|r| r.record_id == "agent_memory:v1:obs_redact"),
+        "the OBSERVES-linked Observation must land in observations"
+    );
     let json = serde_json::to_string(&ctx).unwrap();
     for marker in [
         "SECRET_COMMAND_OUTPUT_MARKER",
@@ -1465,6 +1481,137 @@ fn sections_sorted_by_record_id() {
 }
 
 // ---------------------------------------------------------------------------
+// FIX 3: `content_hash_join` always wins over `temporal_correlation` on the
+// SAME run, regardless of record order.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stronger_basis_wins_over_weaker_for_same_run_regardless_of_order() {
+    // Two signatures both frame-resolve to one symbol (so both are anchors) and
+    // both link the SAME agent run. The weaker `temporal_correlation` edge is
+    // listed FIRST; the stronger `content_hash_join` must still win (no
+    // file-order downgrade).
+    let (sym_id, sym) = code_symbol("boom_handler", "src/lib.rs", 1, 10);
+    let (file_id, file) = code_file("src/lib.rs");
+    let (sig_a, sig_a_node) = error_signature("a", "error", SIG_FIRST, SIG_LAST, 1, None);
+    let (sig_b, sig_b_node) = error_signature("b", "error", SIG_FIRST, SIG_LAST, 1, None);
+    let (run_id, run_node) = agent_run("shared", "2026-01-02T11:00:00Z", "2026-01-02T13:00:00Z");
+    let records = vec![
+        sym,
+        file,
+        defines(&file_id, &sym_id),
+        sig_a_node,
+        sig_b_node,
+        run_node,
+        frame_resolves(&sig_a, &sym_id, 0, FrameResolution::Resolved),
+        frame_resolves(&sig_b, &sym_id, 0, FrameResolution::Resolved),
+        // Weaker basis first — old `.or_insert` would keep it.
+        emitted_during(&sig_a, &run_id, CorrelationBasis::TemporalCorrelation),
+        emitted_during(&sig_b, &run_id, CorrelationBasis::ContentHashJoin),
+    ];
+    let ctx = error_context(
+        &records,
+        "boom_handler",
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+    )
+    .expect("resolve");
+    let row = ctx
+        .observations
+        .iter()
+        .find(|r| r.record_id == run_id)
+        .expect("the shared run must appear once in observations");
+    assert_eq!(
+        row.correlation_basis.as_deref(),
+        Some("content_hash_join"),
+        "content_hash_join must win over temporal_correlation regardless of edge order"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 4: `--repo` scope caveat (honest disclosure).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn repo_scope_caveat_present_only_when_repo_set() {
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 1, None);
+    let records = vec![sig];
+    // Unscoped: field is absent (None).
+    let unscoped = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+    )
+    .expect("resolve");
+    assert!(unscoped.repo_scope_caveat.is_none());
+    // Scoped: field discloses that the runtime sections are NOT filtered.
+    let scoped = error_context(
+        &records,
+        &sig_id,
+        Some("acme/widget"),
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+    )
+    .expect("resolve");
+    assert_eq!(
+        scoped.repo_scope_caveat,
+        Some(aletheia_egregore::query::REPO_SCOPE_CAVEAT)
+    );
+    assert!(
+        scoped
+            .repo_scope_caveat
+            .unwrap()
+            .contains("NOT repository-filtered"),
+        "the caveat must disclose the runtime sections are unfiltered"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 2: a corrupt/unreadable protected manifest must fail loudly, never
+// silently degrade to an empty list.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn corrupt_protected_manifest_fails_loudly() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("protected");
+    fs::create_dir_all(&store).unwrap();
+    // A malformed manifest line makes `ProtectedStore::list()` return an error.
+    fs::write(store.join("manifest.jsonl"), "{ this is not valid json }\n").unwrap();
+
+    let hash = "deadbeefhash";
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 1, None);
+    let (src_id, src) = log_source(ANCHOR, "app.log", hash);
+    let records = vec![sig, src, captured_from(&sig_id, &src_id)];
+    match error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        Some(&store),
+    ) {
+        Err(ErrorContextError::ProtectedStoreUnreadable { message }) => {
+            assert!(
+                message.contains("failed to read protected store"),
+                "message must name the failure: {message}"
+            );
+        }
+        other => panic!("expected ProtectedStoreUnreadable, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Seeded end-to-end CLI byte-stability layer.
 // ---------------------------------------------------------------------------
 
@@ -1536,4 +1683,146 @@ fn cli_byte_stability_end_to_end() {
     let body: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(body["error"]["code"], "no_match");
     assert_eq!(body["error"]["handle"], "no_such_handle_zzz");
+}
+
+// ---------------------------------------------------------------------------
+// FIX 1 (MAJOR, AC): `--as-of` bounds the occurrence view on the valid axis
+// WITHOUT re-resolving frames and WITHOUT requiring a Commit timeline. This is
+// the CLI-level coverage that the missing test let slip: `--as-of` on a plain
+// (commit-less) log graph — the natural bucket-bearing `scan-logs` input — must
+// succeed (exit 0) instead of dying with `empty_history`.
+// ---------------------------------------------------------------------------
+
+/// A commit-less log graph: a signature with NO `StackFrame`s but an existing
+/// `FRAME_RESOLVES_TO` edge onto a code symbol, plus an early and a late bucket.
+/// Because the signature carries no raw frames, any frame re-resolution would
+/// yield an EMPTY frames list — so a non-empty `frames` proves frames were NOT
+/// re-resolved.
+fn commitless_log_fixture() -> (Vec<GraphRecord>, String, String) {
+    let (sym_id, sym) = code_symbol("boom_handler", "src/lib.rs", 1, 10);
+    let (file_id, file) = code_file("src/lib.rs");
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 8, None);
+    let (early_n, early_e) = bucket_with_edge(&sig_id, "2026-01-02T12:00:00Z", 5);
+    let (late_n, late_e) = bucket_with_edge(&sig_id, "2026-01-02T18:00:00Z", 3);
+    let records = vec![
+        sym,
+        file,
+        defines(&file_id, &sym_id),
+        sig,
+        early_n,
+        early_e,
+        late_n,
+        late_e,
+        frame_resolves(&sig_id, &sym_id, 0, FrameResolution::Resolved),
+    ];
+    (records, sig_id, sym_id)
+}
+
+#[test]
+fn cli_as_of_on_commitless_log_graph_bounds_buckets_no_reresolve() {
+    let temp = tempfile::tempdir().unwrap();
+    let graph = temp.path().join("log.jsonl");
+    let (records, sig_id, sym_id) = commitless_log_fixture();
+    write_graph(&records, &graph);
+
+    // `--as-of` between the two buckets: exit 0 (NOT exit-2 empty_history), the
+    // late bucket dropped, and the existing frame preserved (not re-resolved).
+    let assert = CargoCommand::cargo_bin("egregore")
+        .unwrap()
+        .args(["query", "error-context", &sig_id])
+        .args(["--as-of", "2026-01-02T13:00:00Z"])
+        .arg("--graph")
+        .arg(&graph)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(body["ok"], true);
+    let block = &body["signatures"][0];
+    let buckets = block["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 1, "the post-cutoff bucket must be dropped");
+    assert_eq!(buckets[0]["bucket_start"], "2026-01-02T12:00:00Z");
+    // Frames are read from the existing edge, never re-resolved.
+    let frames = block["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 1, "the existing frame edge is preserved");
+    assert_eq!(frames[0]["target_record_id"], sym_id);
+    // No Commit timeline → history_unavailable, never a fabricated window.
+    assert_eq!(body["first_seen_range"]["status"], "unavailable");
+}
+
+#[test]
+fn cli_as_of_on_history_graph_bounds_buckets_no_reresolve() {
+    let temp = tempfile::tempdir().unwrap();
+    let graph = temp.path().join("hist.jsonl");
+    let (mut records, sig_id, sym_id) = history_fixture();
+    // history_fixture's signature carries no StackFrames but an existing frame
+    // edge; add an early and a late bucket to bound.
+    let (early_n, early_e) = bucket_with_edge(&sig_id, "2026-01-02T12:00:00Z", 5);
+    let (late_n, late_e) = bucket_with_edge(&sig_id, "2026-01-02T18:00:00Z", 3);
+    records.extend([early_n, early_e, late_n, late_e]);
+    write_graph(&records, &graph);
+
+    let assert = CargoCommand::cargo_bin("egregore")
+        .unwrap()
+        .args(["query", "error-context", &sig_id])
+        .args(["--as-of", "2026-01-02T13:00:00Z"])
+        .arg("--graph")
+        .arg(&graph)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let block = &body["signatures"][0];
+    let buckets = block["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 1, "late bucket dropped by --as-of");
+    assert_eq!(buckets[0]["bucket_start"], "2026-01-02T12:00:00Z");
+    // Not re-resolved: the existing frame edge survives (no StackFrames exist to
+    // re-resolve from, so re-resolution would have emptied frames).
+    let frames = block["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 1, "existing frame preserved under --as-of");
+    assert_eq!(frames[0]["target_record_id"], sym_id);
+    // The valid history window is still derived from the Commit timeline.
+    assert_eq!(body["first_seen_range"]["status"], "history");
+}
+
+#[test]
+fn cli_at_reresolves_frames_against_commit_view() {
+    // `--at` (unlike `--as-of`) re-resolves frames: the signature carries a
+    // StackFrame at src/lib.rs:5; at c1 `alpha` occupies that span, at c2 `beta`.
+    let temp = tempfile::tempdir().unwrap();
+    let graph = temp.path().join("at.jsonl");
+    let frames = Some(vec![StackFrame {
+        frame_index: 0,
+        module_path: None,
+        file_path: Some("src/lib.rs".to_owned()),
+        line: Some(5),
+    }]);
+    let (_alpha_id, alpha) = symbol_snapshot("alpha", "src/lib.rs", 1, 10, "c1sha0000", T1);
+    let (beta_id, beta) = symbol_snapshot("beta", "src/lib.rs", 1, 10, "c2sha0000", T2);
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 1, frames);
+    let records = vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        alpha,
+        beta,
+        sig,
+    ];
+    write_graph(&records, &graph);
+
+    let assert = CargoCommand::cargo_bin("egregore")
+        .unwrap()
+        .args(["query", "error-context", &sig_id])
+        .args(["--at", "c2sha0000"])
+        .arg("--graph")
+        .arg(&graph)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let frames = body["signatures"][0]["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        frames[0]["target_record_id"], beta_id,
+        "`--at c2` re-resolves the frame to the symbol at that commit view"
+    );
 }

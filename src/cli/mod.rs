@@ -5065,15 +5065,22 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             };
             let index = query::RepositoryIndex::build(&records);
             let repo_scope = resolve_repo_scope(&index, repo.as_deref());
-            // Resolve `--at`/`--as-of` to a single commit SHA for frame
-            // re-resolution (reuses the shared temporal-view resolver).
-            let at_commit = if at.is_some() || as_of.is_some() {
+            // Resolve `--at` ONLY to a single commit SHA for frame re-resolution
+            // (reuses the shared temporal-view resolver). `--as-of` is NOT
+            // resolved to a commit here: per issue #324, `--at` re-resolves frames
+            // against a commit view while `--as-of` bounds ONLY the occurrence
+            // view on the valid axis (applied by the core's bucket filter). Piping
+            // `--as-of` through the commit resolver would (a) die with
+            // `empty_history` on a commit-less log graph — the natural
+            // bucket-bearing `scan-logs` input — and (b) silently re-resolve
+            // frames, a behavior the AC assigns only to `--at`.
+            let at_commit = if at.is_some() {
                 Some(resolve_transitive_commit_view(
                     &records,
                     &index,
                     repo_scope.as_deref(),
                     at.as_deref(),
-                    as_of.as_deref(),
+                    None,
                 )?)
             } else {
                 None
