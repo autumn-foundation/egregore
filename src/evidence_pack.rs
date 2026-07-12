@@ -1136,6 +1136,19 @@ pub struct EvidenceSection {
     /// `remediation_links`). Absent on every other section.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_summary: Option<LogEvidenceSummary>,
+    /// BLAKE3 hash binding the derived `log_summary` into Integrity (issue #340).
+    /// Present iff `log_summary` is present. `verify_pack` recomputes it and fails
+    /// Integrity on any divergence, so a tampered summary value — an inflated
+    /// `in_window_occurrences`, a swapped `template_hash`/`frame_chain_hash`, a
+    /// forged remediation `commit_id`, or a rewritten exemplar handle — cannot ride
+    /// the pack undetected. This mirrors how `review_coverage`'s `measurement` is
+    /// bound: the recomputable fields (`error_signatures` template/frame-chain
+    /// hashes + clipped span, `occurrence_buckets` totals) are additionally bound to
+    /// their backing hashed section rows, while this whole-summary hash is the ONLY
+    /// binding surface for the derived `remediation_links` join, which by design
+    /// carries no backing hashed row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_summary_hash: Option<String>,
     /// Verbatim section-level disclaimer, when the class carries one (#118/#157).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disclaimer: Option<String>,
@@ -2489,6 +2502,238 @@ fn build_log_summaries(
     }
 }
 
+/// Canonical BLAKE3 hash of a derived log summary (issue #340). Assembled onto the
+/// section as `log_summary_hash` and recomputed by `verify_pack`'s Integrity so a
+/// tampered summary value fails verification — the whole-summary analogue of the
+/// per-record `BundleRecord.hash` and the only binding surface for the derived
+/// `remediation_links` join (which carries no backing hashed row).
+fn hash_log_summary(summary: &LogEvidenceSummary) -> String {
+    let serialized = serde_json::to_string(summary).unwrap_or_default();
+    blake3::hash(serialized.as_bytes()).to_string()
+}
+
+/// Binds a section's derived `log_summary` (issue #340) into `verify_pack`'s
+/// Integrity so a tampered summary value fails verification, mirroring the
+/// `review_coverage` `measurement` bind. Returns `Err(detail)` on any mismatch.
+///
+/// Two layers:
+///   1. A whole-summary BLAKE3 bind (`log_summary_hash`): the summary must be
+///      present iff the hash is, and the recomputed hash must match. This is the
+///      ONLY bind available for `remediation_links` — a derived join whose
+///      `commit_id`/`symbol_id`/`verification_ids` are the highest-risk tamper
+///      target yet have NO backing hashed row — and for the exemplar/frame-join
+///      fields that ride edges absent from the pack.
+///   2. An independent recompute bind for the fields with backing hashed rows in
+///      the section: the `error_signatures` template/frame-chain hashes, severity,
+///      and window-clipped span (recomputed from the section's `ErrorSignature`
+///      nodes), and the `occurrence_buckets` per-signature totals (recomputed from
+///      the section's `LogOccurrenceBucket` nodes). These cannot be made to diverge
+///      from the hashed evidence they summarize even by recomputing the summary
+///      hash.
+fn bind_log_summary_integrity(section: &EvidenceSection, window: &Window) -> Result<(), String> {
+    let Some(summary) = &section.log_summary else {
+        // No summary: the bind hash must also be absent. A hash without a summary
+        // is a stripped-summary tamper (the derived evidence removed while its
+        // binding lingered).
+        if section.log_summary_hash.is_some() {
+            return Err(format!(
+                "section {} carries a log_summary_hash but no log_summary",
+                section.class
+            ));
+        }
+        return Ok(());
+    };
+    // (1) whole-summary hash bind.
+    let Some(stored) = &section.log_summary_hash else {
+        return Err(format!(
+            "section {} carries a log_summary but no binding log_summary_hash",
+            section.class
+        ));
+    };
+    if *stored != hash_log_summary(summary) {
+        return Err(format!(
+            "section {} log_summary_hash does not bind its log_summary \
+             (recomputed hash differs)",
+            section.class
+        ));
+    }
+    // (2) independent recompute binds for fields with backing hashed rows.
+    let node_by_id: BTreeMap<&str, &GraphRecord> = section
+        .records
+        .iter()
+        .filter(|br| matches!(br.record, GraphRecord::Node { .. }))
+        .map(|br| (br.record.id(), &br.record))
+        .collect();
+    match summary {
+        LogEvidenceSummary::ErrorSignatures { signatures } => {
+            bind_error_signature_rows(&section.class, signatures, &node_by_id, window)
+        }
+        LogEvidenceSummary::OccurrenceBuckets { signature_totals } => {
+            bind_occurrence_totals(&section.class, signature_totals, &node_by_id)
+        }
+        // The derived join has no backing hashed row; the whole-summary hash above
+        // is its binding surface.
+        LogEvidenceSummary::RemediationLinks { .. } => Ok(()),
+    }
+}
+
+/// Binds every `error_signatures` summary row to its backing hashed `ErrorSignature`
+/// node in the section (issue #340): an exact one-to-one correspondence, and each
+/// row's `template_hash`, `frame_chain_hash`, `severity`, and window-clipped span
+/// recomputed from the node payload. The exemplar/frame-resolution fields ride
+/// edges absent from the pack and are bound by the whole-summary hash only.
+fn bind_error_signature_rows(
+    class: &str,
+    signatures: &[ErrorSignatureRow],
+    node_by_id: &BTreeMap<&str, &GraphRecord>,
+    window: &Window,
+) -> Result<(), String> {
+    // Exact bijection: one summary row per section ErrorSignature node, so a
+    // signature cannot be dropped from — or a phantom one smuggled into — the
+    // summary while every hashed row stays valid.
+    let section_sig_ids: BTreeSet<&str> = node_by_id
+        .iter()
+        .filter(|(_, rec)| {
+            matches!(
+                node_log_payload(rec),
+                Some(crate::ir::LogPayload::ErrorSignature(_))
+            )
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    let summary_ids: BTreeSet<&str> = signatures.iter().map(|r| r.signature_id.as_str()).collect();
+    if let Some(extra) = summary_ids.difference(&section_sig_ids).next() {
+        return Err(format!(
+            "error_signatures summary row {extra} has no backing hashed ErrorSignature \
+             node in section {class}"
+        ));
+    }
+    if let Some(missing) = section_sig_ids.difference(&summary_ids).next() {
+        return Err(format!(
+            "error_signatures section {class} carries ErrorSignature node {missing} \
+             absent from the summary"
+        ));
+    }
+    let from_ts = parse_rfc3339(&window.from);
+    let to_ts = parse_rfc3339(&window.to);
+    for row in signatures {
+        let Some(crate::ir::LogPayload::ErrorSignature(payload)) = node_by_id
+            .get(row.signature_id.as_str())
+            .copied()
+            .and_then(node_log_payload)
+        else {
+            return Err(format!(
+                "error_signatures summary row {} has no ErrorSignature payload to bind against",
+                row.signature_id
+            ));
+        };
+        let expect_template = blake3::hash(payload.template_excerpt.as_bytes()).to_string();
+        if row.template_hash != expect_template {
+            return Err(format!(
+                "error_signatures row {} template_hash does not bind its \
+                 ErrorSignature template_excerpt",
+                row.signature_id
+            ));
+        }
+        let expect_frame_chain = payload.frames.as_ref().map(|frames| {
+            let serialized = serde_json::to_string(frames).unwrap_or_default();
+            blake3::hash(serialized.as_bytes()).to_string()
+        });
+        if row.frame_chain_hash != expect_frame_chain {
+            return Err(format!(
+                "error_signatures row {} frame_chain_hash does not bind its \
+                 ErrorSignature frames",
+                row.signature_id
+            ));
+        }
+        if row.severity != payload.severity {
+            return Err(format!(
+                "error_signatures row {} severity does not bind its ErrorSignature node",
+                row.signature_id
+            ));
+        }
+        // Window-clipped span recompute (only when both bounds parse; a malformed
+        // window is caught independently by Window-consistency).
+        if let (Some(from_ts), Some(to_ts)) = (from_ts, to_ts) {
+            let expect_first = parse_rfc3339(&payload.first_seen).map_or_else(
+                || payload.first_seen.clone(),
+                |p| clip_lower(&payload.first_seen, p, &window.from, from_ts),
+            );
+            let expect_last = parse_rfc3339(&payload.last_seen).map_or_else(
+                || payload.last_seen.clone(),
+                |p| clip_upper(&payload.last_seen, p, &window.to, to_ts),
+            );
+            if row.first_seen_in_window != expect_first || row.last_seen_in_window != expect_last {
+                return Err(format!(
+                    "error_signatures row {} window-clipped span does not bind its \
+                     ErrorSignature valid times",
+                    row.signature_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Binds every `occurrence_buckets` summary total to its backing hashed
+/// `LogOccurrenceBucket` nodes in the section (issue #340): each listed bucket must
+/// resolve to a present hashed node whose `occurrence_count`/`bucket_start` match,
+/// no bucket may be double-counted, and each `in_window_occurrences` must equal the
+/// recomputed sum — so the occurrence total (the tamper target flagged by the P1)
+/// cannot be inflated without adding real, count-matching hashed bucket rows.
+fn bind_occurrence_totals(
+    class: &str,
+    totals: &[SignatureOccurrenceTotal],
+    node_by_id: &BTreeMap<&str, &GraphRecord>,
+) -> Result<(), String> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for total in totals {
+        let mut sum: u64 = 0;
+        for bucket in &total.buckets {
+            if !seen.insert(bucket.bucket_id.as_str()) {
+                return Err(format!(
+                    "occurrence_buckets bucket {} appears more than once in section {class}",
+                    bucket.bucket_id
+                ));
+            }
+            let Some(crate::ir::LogPayload::LogOccurrenceBucket(payload)) = node_by_id
+                .get(bucket.bucket_id.as_str())
+                .copied()
+                .and_then(node_log_payload)
+            else {
+                return Err(format!(
+                    "occurrence_buckets bucket {} has no backing hashed \
+                     LogOccurrenceBucket node in section {class}",
+                    bucket.bucket_id
+                ));
+            };
+            if bucket.occurrence_count != payload.occurrence_count {
+                return Err(format!(
+                    "occurrence_buckets bucket {} occurrence_count does not bind its \
+                     LogOccurrenceBucket node",
+                    bucket.bucket_id
+                ));
+            }
+            if bucket.hour != payload.bucket_start {
+                return Err(format!(
+                    "occurrence_buckets bucket {} hour does not bind its \
+                     LogOccurrenceBucket node",
+                    bucket.bucket_id
+                ));
+            }
+            sum = sum.saturating_add(payload.occurrence_count);
+        }
+        if total.in_window_occurrences != sum {
+            return Err(format!(
+                "occurrence_buckets signature {} in_window_occurrences {} does not equal \
+                 the sum {} of its bound buckets",
+                total.signature_id, total.in_window_occurrences, sum
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The trust-class citation view of a set of section rows, reused for both the
 /// assemble-time citation verdict and `verify_pack`'s coverage check (AC4).
 fn citation_view(rows: &[&BundleRecord]) -> (Vec<ClassCitationTally>, bool, bool) {
@@ -2882,6 +3127,9 @@ pub fn assemble_pack(
         } else {
             None
         };
+        // Bind the derived summary into Integrity (issue #340): the whole-summary
+        // BLAKE3 hash `verify_pack` recomputes so a tampered summary value fails.
+        let log_summary_hash = log_summary.as_ref().map(hash_log_summary);
         sections.push(EvidenceSection {
             class: class.as_wire().to_owned(),
             requirement: cr.requirement.as_wire().to_owned(),
@@ -2892,6 +3140,7 @@ pub fn assemble_pack(
             records: records_for_class,
             measurement: is_review_coverage.then(|| review_measurement.clone()),
             log_summary,
+            log_summary_hash,
             disclaimer,
         });
     }
@@ -4160,6 +4409,16 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     format!("section {} rows are not canonically ordered", section.class);
                 break 'integrity;
             }
+        }
+        // Bind the derived log summary (issue #340) so a tampered summary value —
+        // e.g. an inflated `in_window_occurrences`, a swapped `template_hash`, or a
+        // forged remediation `commit_id`, none of which the per-record/manifest/
+        // window/safety checks reach — fails Integrity, mirroring the
+        // `review_coverage` `measurement` bind above.
+        if let Err(detail) = bind_log_summary_integrity(section, &pack.manifest.window) {
+            integrity_passed = false;
+            integrity_detail = detail;
+            break 'integrity;
         }
     }
     // Recompute the manifest aggregates from the actual included section rows and
@@ -10184,6 +10443,156 @@ mod pack340_tests {
         assert!(
             !report.integrity.passed,
             "a smuggled hashed remediation row must fail Integrity"
+        );
+    }
+
+    // ── AC7: verify BINDS the derived log summaries (tamper-evidence, issue #340)
+    // The `log_summary` values are the derived evidence consumers read, but they
+    // ride OUTSIDE the hashed `records`. Without an Integrity bind an attacker can
+    // edit an occurrence total, a template fingerprint, or a remediation commit id
+    // in a serialized pack and every other check (record hash, manifest counts,
+    // window, safety) still passes. These tests tamper a summary value WITHOUT
+    // updating its binding hash and assert `verify_pack` now reports an Integrity
+    // defect — exactly as `review_coverage.measurement` is bound.
+
+    #[test]
+    fn assembled_log_sections_carry_a_binding_hash() {
+        let records = build_log_incident_records();
+        let pack = assemble_cc73(&records);
+        for class in [
+            EvidenceClass::ErrorSignatures,
+            EvidenceClass::OccurrenceBuckets,
+            EvidenceClass::RemediationLinks,
+        ] {
+            let sec = section(&pack, class);
+            assert!(sec.log_summary.is_some(), "{class:?} carries a summary");
+            let stored = sec
+                .log_summary_hash
+                .as_deref()
+                .unwrap_or_else(|| panic!("{class:?} carries a binding log_summary_hash"));
+            assert_eq!(
+                stored,
+                hash_log_summary(sec.log_summary.as_ref().unwrap()),
+                "{class:?} log_summary_hash binds its summary"
+            );
+        }
+        // Baseline: the untampered pack verifies clean over the new bind.
+        assert!(verify_pack(&pack).ok, "untampered pack verifies clean");
+    }
+
+    #[test]
+    fn verify_rejects_tampered_in_window_occurrences() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) =
+            sec.log_summary.as_mut()
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        // Inflate a signature's occurrence total (leave the binding hash stale).
+        signature_totals[0].in_window_occurrences += 1_000;
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a tampered in_window_occurrences must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_tampered_template_hash() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+            .expect("error_signatures section");
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = sec.log_summary.as_mut()
+        else {
+            panic!("error_signatures summary present");
+        };
+        // Swap a template fingerprint (leave the binding hash stale).
+        signatures[0].template_hash = blake3::hash(b"forged template").to_string();
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a tampered template_hash must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_tampered_frame_chain_hash() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+            .expect("error_signatures section");
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = sec.log_summary.as_mut()
+        else {
+            panic!("error_signatures summary present");
+        };
+        // sig1 carries frames -> a frame_chain_hash; forge it.
+        let sig1 = signatures
+            .iter_mut()
+            .find(|s| s.signature_id == "log:v1:sig1")
+            .expect("sig1 carries frames");
+        sig1.frame_chain_hash = Some(blake3::hash(b"forged frames").to_string());
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a tampered frame_chain_hash must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_forged_remediation_commit_id() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::RemediationLinks.as_wire())
+            .expect("remediation_links section");
+        let Some(LogEvidenceSummary::RemediationLinks { links }) = sec.log_summary.as_mut() else {
+            panic!("remediation_links summary present");
+        };
+        // Forge the remediation commit id — the highest-risk tamper: the link has
+        // NO backing hashed row, so only the whole-summary bind can catch it.
+        links[0].commit_id = "codegraph:v5:attacker-commit".to_owned();
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a forged remediation commit_id must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_stripped_log_summary_hash() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::RemediationLinks.as_wire())
+            .expect("remediation_links section");
+        // Stripping the binding hash while keeping the summary is itself tamper.
+        sec.log_summary_hash = None;
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a stripped log_summary_hash must fail Integrity: {}",
+            report.integrity.detail
         );
     }
 

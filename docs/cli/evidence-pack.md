@@ -246,6 +246,24 @@ fall outside the evidence window — and `verify` enforces that empty-row bound 
 the section's membership exemption (mirroring `review_coverage`), so no hashed row
 can be smuggled in as a remediation "row".
 
+**Integrity binds the log summaries.** The `log_summary` values are the derived
+evidence a consumer reads, yet they ride **outside** the hashed `records`. So each
+log section carries a `log_summary_hash` — the BLAKE3 of its canonical
+`log_summary` — that `verify`'s Integrity recomputes and asserts, exactly as it
+binds `review_coverage`'s `measurement`. A tampered summary value (an inflated
+`in_window_occurrences`, a swapped `template_hash`/`frame_chain_hash`, a forged
+remediation `commit_id`, or a rewritten exemplar handle) whose binding hash was not
+also recomputed fails Integrity. On top of that whole-summary hash, the fields with
+backing hashed rows are bound to them independently: `error_signatures` rows must
+be an exact one-to-one match with the section's `ErrorSignature` nodes and each
+row's `template_hash`/`frame_chain_hash`/`severity`/clipped span is recomputed from
+that node's payload, and each `occurrence_buckets` bucket must resolve to a present
+hashed `LogOccurrenceBucket` node with a matching count and hour while every
+`in_window_occurrences` must equal the recomputed sum — so the occurrence total
+cannot be inflated without adding real, count-matching hashed bucket rows. The
+derived `remediation_links` join has no backing hashed row, so the whole-summary
+hash is its sole binding surface.
+
 **Epistemic boundary.** Occurrence counts are **recorded ingestion of the scanned
 log sources, not guaranteed-complete telemetry** — absence of a signature is not
 proof the error did not occur. Remediation links are **leads, never causal
@@ -459,7 +477,25 @@ Re-verifies an assembled pack offline and read-only:
   `assemble` always emits it, even for a 0%-coverage window with merged PRs but no
   approving reviews (empty rows), so an absent measurement — with or without rows —
   fails Integrity rather than silently accepting an artifact stripped of its
-  coverage result.
+  coverage result. Integrity likewise **binds each log section's derived
+  `log_summary`** (issue #340), which — like the `measurement` — is the evidence a
+  consumer reads yet rides outside the hashed `records`. Every log section carries a
+  `log_summary_hash` (BLAKE3 of the canonical `log_summary`); Integrity recomputes
+  it and fails on any divergence, and requires the hash to be present iff the
+  summary is (a stripped hash, or a hash without a summary, fails). So a tampered
+  summary value — an inflated `in_window_occurrences`, a swapped
+  `template_hash`/`frame_chain_hash`, a forged remediation `commit_id`, or a
+  rewritten exemplar handle — whose binding hash was not also recomputed fails
+  Integrity. On top of that whole-summary hash, the fields with backing hashed rows
+  are bound to them independently: `error_signatures` rows must be an **exact
+  one-to-one match** with the section's `ErrorSignature` nodes, and each row's
+  `template_hash`/`frame_chain_hash`/`severity`/window-clipped span is recomputed
+  from that node's payload; each `occurrence_buckets` bucket must resolve to a
+  present hashed `LogOccurrenceBucket` node with a matching `occurrence_count` and
+  hour (no bucket double-counted), and each `in_window_occurrences` must equal the
+  recomputed sum — so the occurrence total cannot be inflated without adding real,
+  count-matching hashed bucket rows. The derived `remediation_links` join has no
+  backing hashed row, so the whole-summary hash is its sole binding surface.
 - **Coverage** — recompute the #65 citation thresholds (>=95% code rows cited;
   100% non-code rows cited).
 - **Safety** — scans the **entire serialized pack artifact** for raw sensitive
