@@ -61,14 +61,15 @@ pub const MISSING_LOG_STRUCTURAL_EDGE: &str = "missing_log_structural_edge";
 /// Stable defect category: a log-domain node carrying more than one of an
 /// exactly-one required outbound structural edge (issue #327).
 ///
-/// For example a `LogEvent` captured from two distinct `LogSource`s. The count
-/// is by distinct edge record ID. This fires only for exactly-one requirements
-/// (`LogEvent`'s `FINGERPRINTED_AS`/`CAPTURED_FROM` and `LogOccurrenceBucket`'s
-/// `AGGREGATES`). It never fires for an `ErrorSignature`'s `CAPTURED_FROM`,
-/// which is at-least-one: a signature ID is a repo/fingerprint aggregate that
-/// excludes the source, so one signature may legitimately be captured from
-/// multiple `LogSource`s (a graph combining two log files that share a
-/// fingerprint).
+/// For example a `LogEvent` with two distinct `FINGERPRINTED_AS` targets, or a
+/// `LogOccurrenceBucket` with two distinct `AGGREGATES` targets. The count is by
+/// distinct edge record ID. This fires only for the exactly-one requirements
+/// (`LogEvent`'s `FINGERPRINTED_AS` and `LogOccurrenceBucket`'s `AGGREGATES`).
+/// It never fires for a `LogEvent`'s or an `ErrorSignature`'s `CAPTURED_FROM`,
+/// which is at-least-one: the event/signature ID excludes the source, so one
+/// node may legitimately be captured from multiple `LogSource`s (a graph
+/// combining two log files — a merged multi-source aggregate, never a
+/// duplicate).
 pub const DUPLICATE_LOG_STRUCTURAL_EDGE: &str = "duplicate_log_structural_edge";
 
 /// Node kinds that must be reachable through at least one edge.
