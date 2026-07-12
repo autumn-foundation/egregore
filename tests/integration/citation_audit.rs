@@ -3,7 +3,8 @@
     clippy::too_many_lines,
     clippy::redundant_clone,
     clippy::similar_names,
-    clippy::large_stack_arrays
+    clippy::large_stack_arrays,
+    clippy::large_stack_frames
 )]
 
 //! End-to-end tests for `eg audit citations` — the citation-completeness audit
@@ -14,14 +15,17 @@
 use std::{fs, path::PathBuf, time::Instant};
 
 use aletheia_egregore::{
-    EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, MetricKind, NodeKind, SelectionBasis,
-    SourceSpan, TemporalMetadata, UserContextScope,
+    EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, LOG_SCHEMA_VERSION, MetricKind, NodeKind,
+    SelectionBasis, SourceSpan, TemporalMetadata, UserContextScope,
     ir::{
-        AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, Graph, PROJECT_SCHEMA_VERSION,
-        PatchHandle, SEMANTIC_SCHEMA_VERSION, SemanticDriftMetadata, USER_CONTEXT_SCHEMA_VERSION,
-        VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id, artifact_stable_id, project_stable_id,
-        semantic_stable_id, stable_id, user_context_stable_id, verification_stable_id,
+        AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, ErrorSignaturePayload,
+        FrameResolution, Graph, LogOccurrenceBucketPayload, LogPayload, LogSourcePayload,
+        PROJECT_SCHEMA_VERSION, PatchHandle, SEMANTIC_SCHEMA_VERSION, SemanticDriftMetadata,
+        USER_CONTEXT_SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
+        artifact_stable_id, project_stable_id, semantic_stable_id, stable_id,
+        user_context_stable_id, verification_stable_id,
     },
+    log_stable_id,
 };
 use assert_cmd::Command;
 use serde_json::Value;
@@ -44,12 +48,17 @@ const RAW_STDOUT_SENTINEL: &str = "RAW_STDOUT_SHOULD_NOT_LEAK";
 const RAW_PATCH_SENTINEL: &str = "RAW_PATCH_SHOULD_NOT_LEAK";
 const RAW_CLAIM_TEXT_SENTINEL: &str = "RAW_CLAIM_TEXT_SHOULD_NOT_LEAK";
 const RAW_TASK_BODY_SENTINEL: &str = "RAW_TASK_BODY_SHOULD_NOT_LEAK";
+// #328: a bounded, post-redaction log template excerpt is raw runtime text; it
+// must never appear in the audit output (only the record ID + LogSource
+// provenance handle are cited).
+const RAW_LOG_EXCERPT_SENTINEL: &str = "RAW_LOG_EXCERPT_SHOULD_NOT_LEAK";
 
 const SENTINELS: &[&str] = &[
     RAW_STDOUT_SENTINEL,
     RAW_PATCH_SENTINEL,
     RAW_CLAIM_TEXT_SENTINEL,
     RAW_TASK_BODY_SENTINEL,
+    RAW_LOG_EXCERPT_SENTINEL,
 ];
 
 struct Fixture {
@@ -645,6 +654,175 @@ fn seed() -> Fixture {
             Some(vec![link(&promo_ids[0], "agent_memory", "PROPOSED_BY")]);
     }
 
+    // ── Log-domain runtime observations (#320/#322 + range for #326) ─────────
+    // Three linear commits give `eg query log-deltas` a commit range whose
+    // valid-time window is [T2, T3]; each ErrorSignature is cited by resolving
+    // its CAPTURED_FROM edge to a LogSource carrying a source_artifact_hash, so
+    // the runtime_observation lane passes at the strictest default gate (1.0).
+    let repo_id = stable_id(&["repository", "operator-override", "audit-repo"]);
+    let repo = GraphRecord::node(
+        repo_id.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("audit-repo".to_owned()),
+        "Repository audit-repo".to_owned(),
+    );
+    let commit = |sha: &str, parents: &[&str], valid_time: &str| -> GraphRecord {
+        GraphRecord::node(
+            stable_id(&["node", "commit", "audit-repo", sha]),
+            NodeKind::Commit,
+            None,
+            None,
+            Some(sha.to_owned()),
+            format!("Commit {sha}"),
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: sha.to_owned(),
+            git_parent_commits: parents.iter().map(|p| (*p).to_owned()).collect(),
+            valid_time: valid_time.to_owned(),
+            author_time: Some(valid_time.to_owned()),
+            observed_at: valid_time.to_owned(),
+            valid_time_source: Some("git_commit_committer_date".to_owned()),
+        })
+    };
+    let c1 = commit("c1sha0000", &[], "2026-01-01T00:00:00Z");
+    let c2 = commit("c2sha0000", &["c1sha0000"], "2026-01-02T00:00:00Z");
+    let c3 = commit("c3sha0000", &["c2sha0000"], "2026-01-03T00:00:00Z");
+
+    let log_source_id = log_stable_id(&["log_source", "audit-repo", "logs/app.log", "loghash1"]);
+    let log_source = GraphRecord::node(
+        log_source_id.clone(),
+        NodeKind::LogSource,
+        Some("logs/app.log".to_owned()),
+        None,
+        Some("logs/app.log".to_owned()),
+        "Log source logs/app.log".to_owned(),
+    )
+    .with_domain("log", LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::LogSource(LogSourcePayload {
+        source_relative_path: "logs/app.log".to_owned(),
+        source_format_version: "plain-v1".to_owned(),
+        source_artifact_hash: "loghash1".to_owned(),
+        line_count: 42,
+    }))
+    .with_valid_time("2026-01-02T12:00:00Z", "inferred_from_transaction_time");
+
+    let error_signature = |seed: &str, excerpt: &str, first: &str, last: &str| -> GraphRecord {
+        GraphRecord::node(
+            log_stable_id(&[
+                "error_signature",
+                "audit-repo",
+                "template-v1",
+                seed,
+                "error",
+            ]),
+            NodeKind::ErrorSignature,
+            None,
+            None,
+            Some("error signature".to_owned()),
+            format!("Error signature: {seed}"),
+        )
+        .with_domain("log", LOG_SCHEMA_VERSION)
+        .with_log(LogPayload::ErrorSignature(ErrorSignaturePayload {
+            fingerprint_algorithm: "template-v1".to_owned(),
+            template_excerpt: excerpt.to_owned(),
+            severity: "error".to_owned(),
+            occurrence_count: 3,
+            first_seen: first.to_owned(),
+            last_seen: last.to_owned(),
+            frames: None,
+        }))
+        .with_valid_time(first, "log_event_timestamp")
+    };
+    // A `new` signature (first_seen inside [T2, T3]) and a `continuing` one
+    // (first before the window, last through/after its end). The excerpt carries
+    // a raw-text sentinel that must never surface in the audit output.
+    let sig_new = error_signature(
+        "boom-new",
+        &format!("boom {RAW_LOG_EXCERPT_SENTINEL}"),
+        "2026-01-02T12:00:00Z",
+        "2026-01-02T13:00:00Z",
+    );
+    let sig_new_id = sig_new.id().to_owned();
+    let sig_cont = error_signature(
+        "boom-cont",
+        "recurring boom",
+        "2026-01-01T00:00:00Z",
+        "2026-01-05T00:00:00Z",
+    );
+    let sig_cont_id = sig_cont.id().to_owned();
+
+    let captured_new = GraphRecord::edge(
+        EdgeLabel::CapturedFrom,
+        sig_new_id.clone(),
+        log_source_id.clone(),
+        None,
+        "ErrorSignature captured from LogSource".to_owned(),
+    );
+    let captured_cont = GraphRecord::edge(
+        EdgeLabel::CapturedFrom,
+        sig_cont_id.clone(),
+        log_source_id.clone(),
+        None,
+        "ErrorSignature captured from LogSource".to_owned(),
+    );
+
+    let bucket_id = log_stable_id(&[
+        "log_occurrence_bucket",
+        "audit-repo",
+        &sig_new_id,
+        "2026-01-02T12:00:00Z",
+    ]);
+    let bucket = GraphRecord::node(
+        bucket_id.clone(),
+        NodeKind::LogOccurrenceBucket,
+        None,
+        None,
+        Some("bucket".to_owned()),
+        "Occurrence bucket".to_owned(),
+    )
+    .with_domain("log", LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::LogOccurrenceBucket(
+        LogOccurrenceBucketPayload {
+            bucket_start: "2026-01-02T12:00:00Z".to_owned(),
+            bucket_width: "1h".to_owned(),
+            occurrence_count: 3,
+        },
+    ))
+    .with_valid_time("2026-01-02T12:00:00Z", "log_event_timestamp");
+    let aggregates = GraphRecord::edge(
+        EdgeLabel::Aggregates,
+        bucket_id.clone(),
+        sig_new_id.clone(),
+        None,
+        "LogOccurrenceBucket aggregates ErrorSignature".to_owned(),
+    );
+    // A resolved backtrace frame onto the seeded `foo` symbol (#322): the frame
+    // row is audited under the code-handle rule and is cited by foo's file/span.
+    let frame_edge = GraphRecord::Edge {
+        id: log_stable_id(&[
+            "edge",
+            "FRAME_RESOLVES_TO",
+            &sig_new_id,
+            "0",
+            &symbol_id,
+            "resolved",
+        ]),
+        schema_version: LOG_SCHEMA_VERSION,
+        label: EdgeLabel::FrameResolvesTo,
+        source: sig_new_id.clone(),
+        target: symbol_id.clone(),
+        confidence: Some("1.0".to_owned()),
+        resolution: None,
+        frame_resolution: Some(FrameResolution::Resolved),
+        frame_index: Some(0),
+        basis: None,
+        temporal: None,
+        summary: format!("frame 0 of {sig_new_id} resolves to {symbol_id}"),
+        producer: None,
+    };
+
     // ── Assemble ────────────────────────────────────────────────────────────
     for record in [
         agent,
@@ -671,6 +849,18 @@ fn seed() -> Fixture {
         udecision,
         pref,
         pending_candidate,
+        repo,
+        c1,
+        c2,
+        c3,
+        log_source,
+        sig_new,
+        sig_cont,
+        captured_new,
+        captured_cont,
+        bucket,
+        aggregates,
+        frame_edge,
     ] {
         graph.push(record);
     }
@@ -779,6 +969,7 @@ fn covers_all_public_query_workflows() {
         "candidates",
         "changes",
         "evidence-freshness",
+        "log-deltas",
     ] {
         assert!(names.contains(&expected), "workflow {expected} missing");
     }
@@ -820,6 +1011,12 @@ fn covers_all_public_query_workflows() {
     assert!(
         rows_for("evidence-freshness") >= 1,
         "evidence-freshness lane should surface observation verdicts"
+    );
+    // #328: the log-deltas lane surfaces the seeded runtime-observation
+    // signatures (new + continuing) plus the resolved-frame code row.
+    assert!(
+        rows_for("log-deltas") >= 2,
+        "log-deltas lane should surface the seeded runtime-observation signatures"
     );
 }
 
@@ -927,6 +1124,159 @@ fn gate_fails_when_noncode_row_missing_handle() {
         .assert()
         .failure()
         .code(1);
+}
+
+// #328: the green-path (all-cited) log seed passes at the strictest default
+// gate — every runtime_observation signature row is cited by its LogSource
+// provenance, and the log lane meets `--min-log-citation 1.0`.
+#[test]
+fn log_lane_green_path_all_cited_passes() {
+    let fixture = seed();
+    let (report, _) = run_audit(&fixture);
+    assert_eq!(report["ok"], Value::Bool(true), "report: {report:#}");
+    assert_eq!(report["gate"]["log_gate_pass"], Value::Bool(true));
+    assert!(
+        (report["gate"]["log_citation_completeness"]
+            .as_f64()
+            .unwrap()
+            - 1.0)
+            .abs()
+            < 1e-9
+    );
+    assert_eq!(report["min_log_citation"], Value::from(1.0));
+    let log = workflow(&report, "log-deltas");
+    assert_eq!(log["trust_class"], "runtime_observation");
+    // Every runtime_observation signature row is cited by LogSource provenance.
+    let sig_rows: Vec<&Value> = log["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["trust_class"] == "runtime_observation")
+        .collect();
+    assert!(
+        !sig_rows.is_empty(),
+        "log lane must classify signature rows"
+    );
+    for row in sig_rows {
+        assert_eq!(row["status"], "cited", "row: {row:#}");
+        assert!(
+            row["primary_handle"]
+                .as_str()
+                .unwrap()
+                .contains("logs/app.log@"),
+            "runtime observation must cite its LogSource provenance: {row:#}"
+        );
+    }
+}
+
+// Builds a minimal commit range plus one in-window ErrorSignature with NO
+// resolvable CAPTURED_FROM LogSource — a deliberately uncited runtime
+// observation for the red-path gate assertion.
+fn seed_uncited_log_graph(path: &std::path::Path) {
+    let mut graph = Graph::new();
+    let commit = |sha: &str, parents: &[&str], valid_time: &str| -> GraphRecord {
+        GraphRecord::node(
+            stable_id(&["node", "commit", "red-repo", sha]),
+            NodeKind::Commit,
+            None,
+            None,
+            Some(sha.to_owned()),
+            format!("Commit {sha}"),
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: sha.to_owned(),
+            git_parent_commits: parents.iter().map(|p| (*p).to_owned()).collect(),
+            valid_time: valid_time.to_owned(),
+            author_time: Some(valid_time.to_owned()),
+            observed_at: valid_time.to_owned(),
+            valid_time_source: Some("git_commit_committer_date".to_owned()),
+        })
+    };
+    graph.push(commit("c1sha0000", &[], "2026-01-01T00:00:00Z"));
+    graph.push(commit("c2sha0000", &["c1sha0000"], "2026-01-02T00:00:00Z"));
+    graph.push(commit("c3sha0000", &["c2sha0000"], "2026-01-03T00:00:00Z"));
+    // In-window `new` signature, but NO CAPTURED_FROM edge → no LogSource
+    // provenance → uncited runtime observation.
+    graph.push(
+        GraphRecord::node(
+            log_stable_id(&[
+                "error_signature",
+                "red-repo",
+                "template-v1",
+                "orphan",
+                "error",
+            ]),
+            NodeKind::ErrorSignature,
+            None,
+            None,
+            Some("error signature".to_owned()),
+            "Error signature: orphan".to_owned(),
+        )
+        .with_domain("log", LOG_SCHEMA_VERSION)
+        .with_log(LogPayload::ErrorSignature(ErrorSignaturePayload {
+            fingerprint_algorithm: "template-v1".to_owned(),
+            template_excerpt: "orphan boom".to_owned(),
+            severity: "error".to_owned(),
+            occurrence_count: 1,
+            first_seen: "2026-01-02T12:00:00Z".to_owned(),
+            last_seen: "2026-01-02T13:00:00Z".to_owned(),
+            frames: None,
+        }))
+        .with_valid_time("2026-01-02T12:00:00Z", "log_event_timestamp"),
+    );
+    fs::write(path, graph.to_jsonl().expect("serialize")).expect("write");
+}
+
+// #328: an uncited runtime-observation row drops the log rate below the gate,
+// failing with exit 1 and the `below_log_citation_threshold` diagnostic naming
+// the workflow and the runtime_observation class.
+#[test]
+fn log_lane_red_path_uncited_fails_gate() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("uncited_log.jsonl");
+    seed_uncited_log_graph(&path);
+
+    let output = egregore()
+        .args(["audit", "citations", "--graph"])
+        .arg(&path)
+        .assert()
+        .failure()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("valid JSON report");
+    assert_eq!(report["ok"], Value::Bool(false));
+    assert_eq!(report["gate"]["log_gate_pass"], Value::Bool(false));
+    assert!(
+        report["gate"]["log_citation_completeness"]
+            .as_f64()
+            .unwrap()
+            < 1.0
+    );
+    let diags = report["diagnostics"].as_array().unwrap();
+    let below = diags
+        .iter()
+        .find(|d| d["code"] == "below_log_citation_threshold")
+        .expect("below_log_citation_threshold diagnostic must be present");
+    assert_eq!(below["workflow"], "log-deltas");
+    assert_eq!(below["relation"], "runtime_observation");
+}
+
+// #328: an out-of-range --min-log-citation is a usage error (exit 2), mirroring
+// --min-code-citation.
+#[test]
+fn invalid_min_log_citation_is_rejected() {
+    let fixture = seed();
+    for bad in ["-1", "2", "nan"] {
+        egregore()
+            .args(["audit", "citations", "--graph"])
+            .arg(&fixture.graph)
+            .args(["--min-log-citation", bad])
+            .assert()
+            .failure()
+            .code(2);
+    }
 }
 
 // Success metric: the seeded audit completes well under 2 seconds.
@@ -1408,13 +1758,32 @@ fn changes_workflow_audits_commit_range() {
 }
 
 // Review #5: with no commit range, `changes` is reported disabled, not skipped.
+// (The main `seed()` now carries a commit range for the #328 log-deltas lane, so
+// this uses a dedicated commit-less graph — a single cited symbol.)
 #[test]
 fn changes_disabled_without_commit_range() {
-    let fixture = seed();
-    let (report, _) = run_audit(&fixture);
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("no_commits.jsonl");
+    let mut graph = Graph::new();
+    graph.push(GraphRecord::syntax_node(
+        stable_id(&["node", "Symbol", "src/a.rs", "alpha"]),
+        NodeKind::Symbol,
+        "src/a.rs".to_owned(),
+        span(1, 5),
+        "alpha".to_owned(),
+        "rust",
+        "alpha".to_owned(),
+    ));
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let (report, _ok) = audit_report(&path);
     let changes = workflow(&report, "changes");
     assert_eq!(changes["enabled"], Value::Bool(false));
     assert_eq!(changes["disabled_reason"], "requires_commit_range");
+    // The log-deltas lane is likewise disabled without a commit range.
+    let log = workflow(&report, "log-deltas");
+    assert_eq!(log["enabled"], Value::Bool(false));
+    assert_eq!(log["disabled_reason"], "requires_commit_range");
 }
 
 // Review #1: a scan-history symbol that was later deleted still has temporal

@@ -22,18 +22,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::evidence_freshness::FreshnessVerdict;
-use crate::ir::{GraphRecord, SourceSpan};
+use crate::ir::{EdgeLabel, GraphRecord, LogPayload, LogSourcePayload, SourceSpan};
 use crate::query::{
     self, FailureHandleError, RepositoryIndex, ResolvedFailureTarget, change_impact_context,
-    changes_context, failure_history_context, largest_semantic_drifts, memory_audit_context,
-    resolve_drift_target, resolve_failure_handle, subsystem_context, symbol_context,
-    task_evidence_context,
+    changes_context, failure_history_context, largest_semantic_drifts, log_deltas,
+    memory_audit_context, resolve_drift_target, resolve_failure_handle, subsystem_context,
+    symbol_context, task_evidence_context,
 };
 
 /// Default gate threshold: fraction of code-answer rows that must carry a
 /// stable record ID plus a repo-relative file/span handle or a documented
 /// absent-span reason (AC4).
 pub const DEFAULT_MIN_CODE_CITATION: f64 = 0.95;
+
+/// Default gate threshold for the `runtime_observation` lane (issue #328).
+///
+/// `1.0` (strictest): a runtime observation is the least-trusted trust class —
+/// a program's own claim about its execution, deterministically parsed but never
+/// verified — so every returned log row must carry its full citation (a
+/// well-formed `log:v1:` record ID plus its `LogSource` provenance) or the gate
+/// fails. There is no acceptable fraction of uncited runtime observations.
+pub const DEFAULT_MIN_LOG_CITATION: f64 = 1.0;
 
 /// Tolerance applied when comparing the measured completeness against the gate
 /// threshold so that an exact `0.95` fixture is not rejected by float drift.
@@ -95,6 +104,9 @@ pub struct SemanticRow {
 pub struct AuditConfig {
     /// Gate threshold for code-answer citation completeness (AC4).
     pub min_code_citation: f64,
+    /// Gate threshold for the `runtime_observation` (log-domain) lane (issue
+    /// #328). Every returned log row must be cited at or above this fraction.
+    pub min_log_citation: f64,
     /// How the `semantic` workflow is supplied.
     pub semantic: SemanticInput,
     /// Optional history-inclusive record set for the `evidence-freshness` lane.
@@ -112,6 +124,7 @@ impl Default for AuditConfig {
     fn default() -> Self {
         Self {
             min_code_citation: DEFAULT_MIN_CODE_CITATION,
+            min_log_citation: DEFAULT_MIN_LOG_CITATION,
             semantic: SemanticInput::default(),
             freshness_records: None,
         }
@@ -262,6 +275,11 @@ pub struct GateOutcome {
     pub code_gate_pass: bool,
     /// Whether every non-code trust-class row carries a required handle (AC5).
     pub non_code_handle_gate_pass: bool,
+    /// Measured fraction of `runtime_observation` (log-domain) rows that are
+    /// cited or documented-absent (issue #328). `1.0` when no log rows exist.
+    pub log_citation_completeness: f64,
+    /// Whether the `runtime_observation` lane met `min_log_citation` (issue #328).
+    pub log_gate_pass: bool,
     /// Count of missing-handle rows that lack a classifying diagnostic — must be 0.
     pub unclassified_missing_rows: usize,
 }
@@ -273,6 +291,8 @@ pub struct CitationAuditReport {
     pub ok: bool,
     /// Gate threshold in effect.
     pub min_code_citation: f64,
+    /// `runtime_observation` gate threshold in effect (issue #328).
+    pub min_log_citation: f64,
     /// Per-workflow reports, canonically ordered by workflow name.
     pub workflows: Vec<WorkflowReport>,
     /// Overall tallies across enabled workflows.
@@ -484,6 +504,166 @@ fn classify_code_handle(
             },
             diagnostic: Some(("missing_span".to_owned(), path.map(str::to_owned))),
         },
+    }
+}
+
+/// True when `id` is a well-formed `log:v<N>:<hex>` runtime-log record ID.
+///
+/// The `log:v1:` template hash is not stored as a standalone field: the
+/// `ErrorSignature` template is hashed into this content-addressed record ID
+/// (identity = repository, algorithm, normalized template, severity — see
+/// `log_stable_id` / `docs/schema/log-graph.md`), so a well-formed `log:v1:` ID
+/// is the citation of the template-hash requirement (issue #328; the disclosed
+/// schema shape of the #361–#364 known-limitation cluster). Not a schema change.
+fn is_well_formed_log_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("log:v") else {
+        return false;
+    };
+    let Some((version, hex)) = rest.split_once(':') else {
+        return false;
+    };
+    !version.is_empty()
+        && version.bytes().all(|b| b.is_ascii_digit())
+        && hex.len() >= 16
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Resolves a `runtime_observation` record's `LogSource` provenance over the
+/// log-domain edges (issue #328).
+///
+/// Log node IDs exclude the source (a signature's identity is repository +
+/// algorithm + template + severity), so one signature may carry MULTIPLE
+/// `CAPTURED_FROM` edges to distinct `LogSource` records; provenance is resolved
+/// as AT-LEAST-ONE present `LogSource` carrying a `source_artifact_hash`, never
+/// exactly-one. `LogSource` nodes cite themselves from their own payload; an
+/// `ErrorSignature` / `LogEvent` resolves through its `CAPTURED_FROM` edges; a
+/// `LogOccurrenceBucket` resolves through `AGGREGATES` → signature →
+/// `CAPTURED_FROM`.
+struct LogProvenanceIndex<'a> {
+    /// `LogSource` node ID → its payload (path + `source_artifact_hash`).
+    sources: BTreeMap<&'a str, &'a LogSourcePayload>,
+    /// Node ID → `CAPTURED_FROM` edge targets (candidate `LogSource` IDs).
+    captured_from: BTreeMap<&'a str, Vec<&'a str>>,
+    /// Node ID → `AGGREGATES` edge targets (candidate `ErrorSignature` IDs).
+    aggregates: BTreeMap<&'a str, Vec<&'a str>>,
+}
+
+impl<'a> LogProvenanceIndex<'a> {
+    fn build(records: &'a [GraphRecord]) -> Self {
+        let mut sources = BTreeMap::new();
+        let mut captured_from: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let mut aggregates: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for record in records {
+            match record {
+                GraphRecord::Node {
+                    id,
+                    log: Some(payload),
+                    ..
+                } => {
+                    if let LogPayload::LogSource(src) = payload.as_ref() {
+                        sources.insert(id.as_str(), src);
+                    }
+                }
+                GraphRecord::Edge {
+                    label: EdgeLabel::CapturedFrom,
+                    source,
+                    target,
+                    ..
+                } => captured_from
+                    .entry(source.as_str())
+                    .or_default()
+                    .push(target.as_str()),
+                GraphRecord::Edge {
+                    label: EdgeLabel::Aggregates,
+                    source,
+                    target,
+                    ..
+                } => aggregates
+                    .entry(source.as_str())
+                    .or_default()
+                    .push(target.as_str()),
+                _ => {}
+            }
+        }
+        Self {
+            sources,
+            captured_from,
+            aggregates,
+        }
+    }
+
+    /// Returns an at-least-one present `LogSource` (with a non-empty
+    /// `source_artifact_hash`) reachable from `id`, or `None`.
+    fn resolve_source(&self, id: &str) -> Option<&'a LogSourcePayload> {
+        if let Some(src) = self.captured_via(id) {
+            return Some(src);
+        }
+        // A bucket AGGREGATES a signature, not a source; hop one level to the
+        // signature's own CAPTURED_FROM edges.
+        self.aggregates
+            .get(id)
+            .into_iter()
+            .flatten()
+            .find_map(|sig| self.captured_via(sig))
+    }
+
+    /// First `CAPTURED_FROM` target of `id` that is a present `LogSource` with a
+    /// non-empty `source_artifact_hash`.
+    fn captured_via(&self, id: &str) -> Option<&'a LogSourcePayload> {
+        self.captured_from.get(id)?.iter().find_map(|target| {
+            self.sources
+                .get(target)
+                .copied()
+                .filter(|src| !src.source_artifact_hash.is_empty())
+        })
+    }
+}
+
+/// Classifies a `runtime_observation` (log-domain) row (issue #328).
+///
+/// Every runtime-observation row must carry a well-formed `log:v1:` record ID
+/// AND its `LogSource` provenance (source path + `source_artifact_hash`). A
+/// `LogSource` is cited from its own payload; every other log kind resolves
+/// provenance through its `CAPTURED_FROM` / `AGGREGATES` edges to an
+/// at-least-one present `LogSource`. A row with no resolvable source is a
+/// `MissingRequiredHandle` citation failure — never counted as cited by its own
+/// ID (a runtime observation is never counted as verification of itself).
+fn classify_log_handle(index: &LogProvenanceIndex, record: &GraphRecord) -> Classified {
+    let id = record.id();
+    let trust = "runtime_observation";
+    if !is_well_formed_log_id(id) {
+        return Classified {
+            row: RowClassification {
+                record_id: id.to_owned(),
+                trust_class: trust,
+                status: CitationStatus::MissingRequiredHandle,
+                primary_handle: None,
+                absent_handle_reason: None,
+            },
+            diagnostic: Some(("missing_record_id".to_owned(), None)),
+        };
+    }
+    // A LogSource is cited from its own payload; other kinds resolve upstream.
+    let own_source = match record {
+        GraphRecord::Node {
+            log: Some(payload), ..
+        } => match payload.as_ref() {
+            LogPayload::LogSource(src) => Some(src),
+            _ => None,
+        },
+        _ => None,
+    };
+    match own_source.or_else(|| index.resolve_source(id)) {
+        Some(src)
+            if !src.source_artifact_hash.is_empty() && !src.source_relative_path.is_empty() =>
+        {
+            cited(
+                id,
+                trust,
+                format!("{}@{}", src.source_relative_path, src.source_artifact_hash),
+            )
+        }
+        _ => missing(id, trust),
     }
 }
 
@@ -1644,6 +1824,71 @@ fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
+/// `eg query log-deltas` (issue #326) — runtime error-signature deltas across a
+/// commit range (issue #328).
+///
+/// This is the one covered log-domain workflow on trunk: it is the only
+/// `eg query` verb that returns `runtime_observation` rows. Each classified
+/// signature row (`new` / `ceased` / `continuing`) is a runtime observation and
+/// must carry its full log citation (`classify_log_handle`); the signature's
+/// resolved-frame targets and its `overlapping_symbol_deltas` are code rows,
+/// reusing the existing code-handle rule (`classify_record` → `source_fact`).
+/// When #324 (`eg query error-context`) and #325 (the subsystem log section)
+/// land, add their drivers here alongside this one.
+///
+/// The commit range is derived from the in-set commit topology, exactly as
+/// `drive_changes` does; without at least two connected commits the lane is
+/// reported disabled rather than skipped.
+fn drive_log_deltas(records: &[GraphRecord]) -> WorkflowBuilder {
+    let Some((base, head)) = changes_range(records) else {
+        return WorkflowBuilder::disabled(
+            "log-deltas",
+            "runtime_observation",
+            "requires_commit_range",
+        );
+    };
+    let Ok(deltas) = log_deltas(records, base, head, None, false) else {
+        return WorkflowBuilder::disabled(
+            "log-deltas",
+            "runtime_observation",
+            "commit_range_unresolved",
+        );
+    };
+
+    let mut builder = WorkflowBuilder::new("log-deltas", "runtime_observation");
+    let provenance = LogProvenanceIndex::build(records);
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    for signature in deltas
+        .new_signatures
+        .iter()
+        .chain(&deltas.ceased_signatures)
+        .chain(&deltas.continuing_signatures)
+    {
+        // The signature row is a runtime observation: it must carry its full log
+        // citation (well-formed `log:v1:` ID + LogSource provenance).
+        if let Some(record) = by_id.get(signature.record_id.as_str()) {
+            let classified = classify_log_handle(&provenance, record);
+            builder.push_classified(classified, temporal_key(record));
+            builder.note_redaction(record);
+        }
+        // Resolved-frame targets and overlapping symbol deltas are code rows,
+        // audited under the existing code-handle rule. A `Diagnostic`-targeting
+        // (`unresolved`) frame passes via its Diagnostic handle; a dangling
+        // target (no present record) is never counted as cited.
+        for frame in &signature.resolved_frames {
+            if let Some(record) = by_id.get(frame.target_record_id.as_str()) {
+                builder.push_record(record);
+            }
+        }
+        for overlap in &signature.overlapping_symbol_deltas {
+            if let Some(record) = by_id.get(overlap.record_id.as_str()) {
+                builder.push_record(record);
+            }
+        }
+    }
+    builder
+}
+
 /// `eg query evidence-freshness` — per-observation freshness verdicts. Each
 /// verdict row pairs an agent-authored observation with its cited code handle;
 /// both must carry their required citation, and stale/unresolved verdicts emit a
@@ -1739,6 +1984,7 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         drive_evidence_freshness(freshness_records),
         drive_failures(records, &repo_index),
         drive_file(records),
+        drive_log_deltas(records),
         drive_manifest_deps(records),
         drive_memory(records),
         drive_policy(records),
@@ -1765,10 +2011,52 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         overall.add(&workflow.counts);
     }
 
-    // Gate A (AC4): code-answer rows must be ≥ threshold cited-or-documented.
+    let gate = evaluate_gate(&workflows, &diagnostics, config);
+    // A below-threshold log lane emits a stable diagnostic naming the workflow,
+    // the trust class, and the measured rate, then re-sorts to stay byte-stable.
+    if !gate.log_gate_pass {
+        diagnostics.push(AuditDiagnostic {
+            code: "below_log_citation_threshold".to_owned(),
+            workflow: "log-deltas",
+            source_record_id: None,
+            target_handle: Some(format!("{:.6}", gate.log_citation_completeness)),
+            relation: Some("runtime_observation".to_owned()),
+        });
+        diagnostics.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        diagnostics.dedup();
+    }
+
+    let ok = gate.code_gate_pass
+        && gate.non_code_handle_gate_pass
+        && gate.log_gate_pass
+        && gate.unclassified_missing_rows == 0;
+
+    CitationAuditReport {
+        ok,
+        min_code_citation: config.min_code_citation,
+        min_log_citation: config.min_log_citation,
+        workflows,
+        overall,
+        gate,
+        diagnostics,
+    }
+}
+
+/// Evaluates the three citation gates over the classified workflow rows.
+///
+/// Gate A (AC4): code-answer rows must be ≥ `min_code_citation` cited-or-
+/// documented. Gate B (AC5): no gated non-code row may be missing its handle.
+/// Gate C (#328): `runtime_observation` rows are their OWN rate-gated lane (NOT
+/// in `NON_CODE_GATED`), mirroring the code lane at the strictest default.
+fn evaluate_gate(
+    workflows: &[WorkflowReport],
+    diagnostics: &[AuditDiagnostic],
+    config: &AuditConfig,
+) -> GateOutcome {
     let mut code_total = 0usize;
     let mut code_satisfied = 0usize;
-    // Gate B (AC5): no gated non-code row may be missing its handle.
+    let mut log_total = 0usize;
+    let mut log_satisfied = 0usize;
     let mut non_code_gate_pass = true;
     // Success metric: every missing-handle row must carry a classifying diagnostic.
     let diag_sources: BTreeSet<&str> = diagnostics
@@ -1777,16 +2065,19 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         .collect();
     let mut unclassified_missing_rows = 0usize;
 
-    for workflow in &workflows {
+    for workflow in workflows {
         for row in &workflow.rows {
+            let satisfied = matches!(
+                row.status,
+                CitationStatus::Cited | CitationStatus::AbsentHandleDocumented
+            );
             if row.trust_class == "source_fact" {
                 code_total += 1;
-                if matches!(
-                    row.status,
-                    CitationStatus::Cited | CitationStatus::AbsentHandleDocumented
-                ) {
-                    code_satisfied += 1;
-                }
+                code_satisfied += usize::from(satisfied);
+            }
+            if row.trust_class == "runtime_observation" {
+                log_total += 1;
+                log_satisfied += usize::from(satisfied);
             }
             if row.status == CitationStatus::MissingRequiredHandle {
                 if NON_CODE_GATED.contains(&row.trust_class) {
@@ -1799,30 +2090,25 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         }
     }
 
-    let code_citation_completeness = if code_total == 0 {
-        1.0
-    } else {
-        // Counts are small (row tallies); precision loss is not a concern.
-        #[allow(clippy::cast_precision_loss)]
-        {
-            code_satisfied as f64 / code_total as f64
+    // Counts are small (row tallies); precision loss is not a concern.
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = |satisfied: usize, total: usize| -> f64 {
+        if total == 0 {
+            1.0
+        } else {
+            satisfied as f64 / total as f64
         }
     };
-    let code_gate_pass = code_citation_completeness + GATE_EPSILON >= config.min_code_citation;
-    let ok = code_gate_pass && non_code_gate_pass && unclassified_missing_rows == 0;
+    let code_citation_completeness = ratio(code_satisfied, code_total);
+    let log_citation_completeness = ratio(log_satisfied, log_total);
 
-    CitationAuditReport {
-        ok,
-        min_code_citation: config.min_code_citation,
-        workflows,
-        overall,
-        gate: GateOutcome {
-            code_citation_completeness,
-            code_gate_pass,
-            non_code_handle_gate_pass: non_code_gate_pass,
-            unclassified_missing_rows,
-        },
-        diagnostics,
+    GateOutcome {
+        code_citation_completeness,
+        code_gate_pass: code_citation_completeness + GATE_EPSILON >= config.min_code_citation,
+        non_code_handle_gate_pass: non_code_gate_pass,
+        log_citation_completeness,
+        log_gate_pass: log_citation_completeness + GATE_EPSILON >= config.min_log_citation,
+        unclassified_missing_rows,
     }
 }
 

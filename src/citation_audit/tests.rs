@@ -242,6 +242,7 @@ fn trust_class_strings_match_existing_vocab() {
         "project_state",
         "artifact",
         "user_context",
+        "runtime_observation",
         "other",
     ];
     for kind in [
@@ -254,6 +255,8 @@ fn trust_class_strings_match_existing_vocab() {
         NodeKind::Agent,
         NodeKind::EmbeddingModel,
         NodeKind::DependencyDeclaration,
+        NodeKind::LogSource,
+        NodeKind::ErrorSignature,
     ] {
         let rec = node("id", kind);
         assert!(
@@ -261,6 +264,127 @@ fn trust_class_strings_match_existing_vocab() {
             "unexpected trust class for {kind:?}"
         );
     }
+}
+
+// ── #328: runtime_observation (log-domain) classification ──────────────────
+
+fn log_source_node(id: &str, path: &str, hash: &str) -> GraphRecord {
+    GraphRecord::node(
+        id.to_owned(),
+        NodeKind::LogSource,
+        Some(path.to_owned()),
+        None,
+        Some(path.to_owned()),
+        "log source".to_owned(),
+    )
+    .with_domain("log", crate::ir::LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::LogSource(LogSourcePayload {
+        source_relative_path: path.to_owned(),
+        source_format_version: "plain-v1".to_owned(),
+        source_artifact_hash: hash.to_owned(),
+        line_count: 10,
+    }))
+}
+
+fn error_signature_node(id: &str) -> GraphRecord {
+    GraphRecord::node(
+        id.to_owned(),
+        NodeKind::ErrorSignature,
+        None,
+        None,
+        Some("error signature".to_owned()),
+        "error signature".to_owned(),
+    )
+    .with_domain("log", crate::ir::LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::ErrorSignature(
+        crate::ir::ErrorSignaturePayload {
+            fingerprint_algorithm: "template-v1".to_owned(),
+            template_excerpt: "boom".to_owned(),
+            severity: "error".to_owned(),
+            occurrence_count: 1,
+            first_seen: "2026-01-02T12:00:00Z".to_owned(),
+            last_seen: "2026-01-02T13:00:00Z".to_owned(),
+            frames: None,
+        },
+    ))
+}
+
+fn captured_from(signature_id: &str, source_id: &str) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::CapturedFrom,
+        signature_id.to_owned(),
+        source_id.to_owned(),
+        None,
+        "captured from".to_owned(),
+    )
+}
+
+// #328: a LogSource is cited from its own payload (path + source_artifact_hash).
+#[test]
+fn log_source_cited_from_own_payload() {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "hash1"]);
+    let src = log_source_node(&src_id, "app.log", "abc123");
+    let index = LogProvenanceIndex::build(std::slice::from_ref(&src));
+    let result = classify_log_handle(&index, &src);
+    assert_eq!(result.row.trust_class, "runtime_observation");
+    assert_eq!(result.row.status, CitationStatus::Cited);
+    assert_eq!(result.row.primary_handle.as_deref(), Some("app.log@abc123"));
+}
+
+// #328: an ErrorSignature is cited via an at-least-one present CAPTURED_FROM
+// LogSource carrying a source_artifact_hash.
+#[test]
+fn error_signature_cited_via_captured_from_source() {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "hash1"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let records = vec![
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_id),
+    ];
+    let index = LogProvenanceIndex::build(&records);
+    let result = classify_log_handle(&index, &records[1]);
+    assert_eq!(result.row.status, CitationStatus::Cited);
+    assert_eq!(result.row.primary_handle.as_deref(), Some("app.log@abc123"));
+}
+
+// #328: an ErrorSignature with no resolvable CAPTURED_FROM LogSource is a
+// citation failure — never counted as cited by its own ID.
+#[test]
+fn error_signature_without_source_is_missing_required() {
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let sig = error_signature_node(&sig_id);
+    let index = LogProvenanceIndex::build(std::slice::from_ref(&sig));
+    let result = classify_log_handle(&index, &sig);
+    assert_eq!(result.row.status, CitationStatus::MissingRequiredHandle);
+    assert_eq!(result.diagnostic.unwrap().0, "missing_required_handle");
+}
+
+// #328: log node IDs exclude the source, so a signature may carry MULTIPLE
+// CAPTURED_FROM edges to distinct LogSources — provenance is at-least-one, and a
+// signature whose first source lacks a hash still resolves via a later one.
+#[test]
+fn error_signature_multiple_captured_from_at_least_one() {
+    let src_a = crate::ir::log_stable_id(&["log_source", "repo", "a.log", "h"]);
+    let src_b = crate::ir::log_stable_id(&["log_source", "repo", "b.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let records = vec![
+        // First source has an EMPTY hash (not a valid citation on its own).
+        log_source_node(&src_a, "a.log", ""),
+        // Second source carries a real hash.
+        log_source_node(&src_b, "b.log", "hashB"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_a),
+        captured_from(&sig_id, &src_b),
+    ];
+    let index = LogProvenanceIndex::build(&records);
+    let result = classify_log_handle(&index, &records[2]);
+    assert_eq!(
+        result.row.status,
+        CitationStatus::Cited,
+        "an at-least-one present source with a hash cites the signature"
+    );
+    assert_eq!(result.row.primary_handle.as_deref(), Some("b.log@hashB"));
 }
 
 // AC4: the gate fails below the threshold and passes when fully cited.
