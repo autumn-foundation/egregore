@@ -2576,7 +2576,33 @@ fn bind_log_summary_integrity(section: &EvidenceSection, window: &Window) -> Res
         }
         LogEvidenceSummary::OccurrenceBuckets { signature_totals } => {
             require_summary_on_class(&section.class, "occurrence_buckets")?;
-            bind_occurrence_totals(&section.class, signature_totals, &node_by_id)
+            // The bucket->signature attribution rides the co-located
+            // `LogOccurrenceBucket --AGGREGATES--> ErrorSignature` edges (issue #340,
+            // Codex round-3 P1): the bucket NODE payload carries no signature field,
+            // so `total.signature_id` is bound against these hash-bound edge
+            // endpoints, not the node.
+            let mut aggregates_by_bucket: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+            for br in &section.records {
+                if let GraphRecord::Edge {
+                    label,
+                    source,
+                    target,
+                    ..
+                } = &br.record
+                    && label.as_str() == "AGGREGATES"
+                {
+                    aggregates_by_bucket
+                        .entry(source.as_str())
+                        .or_default()
+                        .insert(target.as_str());
+                }
+            }
+            bind_occurrence_totals(
+                &section.class,
+                signature_totals,
+                &node_by_id,
+                &aggregates_by_bucket,
+            )
         }
         // The derived join has no backing hashed row; the whole-summary hash above
         // is its binding surface.
@@ -2709,6 +2735,7 @@ fn bind_occurrence_totals(
     class: &str,
     totals: &[SignatureOccurrenceTotal],
     node_by_id: &BTreeMap<&str, &GraphRecord>,
+    aggregates_by_bucket: &BTreeMap<&str, BTreeSet<&str>>,
 ) -> Result<(), String> {
     // Exact bijection (mirrors `bind_error_signature_rows`): the set of hashed
     // `LogOccurrenceBucket` nodes actually present in the section must equal the set
@@ -2760,6 +2787,30 @@ fn bind_occurrence_totals(
                      LogOccurrenceBucket node",
                     bucket.bucket_id
                 ));
+            }
+            // Signature attribution bind (issue #340, Codex round-3 P1): the bucket
+            // must be filed under the SAME signature its co-located
+            // `LogOccurrenceBucket --AGGREGATES--> ErrorSignature` edge names. Without
+            // this a tampered pack could move a bucket under another signature — the
+            // node count/hour still bind and both sums still balance — and consumers
+            // would read per-signature occurrence counts for the WRONG incident.
+            match aggregates_by_bucket.get(bucket.bucket_id.as_str()) {
+                Some(sigs) if sigs.contains(total.signature_id.as_str()) => {}
+                Some(_) => {
+                    return Err(format!(
+                        "occurrence_buckets bucket {} is filed under signature {} but its \
+                         AGGREGATES attribution edge(s) name a different signature in \
+                         section {class}",
+                        bucket.bucket_id, total.signature_id
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "occurrence_buckets bucket {} has no co-located AGGREGATES \
+                         attribution edge binding it to signature {} in section {class}",
+                        bucket.bucket_id, total.signature_id
+                    ));
+                }
             }
             sum = sum.saturating_add(payload.occurrence_count);
         }
@@ -2993,6 +3044,65 @@ pub fn assemble_pack(
                     record_ids: vec![record.id().to_owned()],
                     detail: "class-relevant record excluded: no resolvable valid time".to_owned(),
                 });
+            }
+        }
+    }
+
+    // --- occurrence-bucket signature attribution (issue #340, Codex round-3) ---
+    // Each `occurrence_buckets` summary total attributes its buckets to a signature
+    // (`total.signature_id`), but the `LogOccurrenceBucket` NODE payload carries no
+    // signature field — the signature is only an identity input hashed into the
+    // bucket's stable ID. So the bucket->signature binding must be carried by a
+    // HASH-BOUND row for `verify_pack` to re-derive it offline: the
+    // `LogOccurrenceBucket --AGGREGATES--> ErrorSignature` edge. Those edges are
+    // co-located into the occurrence_buckets section here (P1). An in-window bucket
+    // with NO attribution edge cannot be filed under any signature, so it is
+    // EXCLUDED from BOTH the section records and the summary under a counted
+    // `unattributed_bucket` diagnostic — never silently mis-summed and never left in
+    // the section where the reverse-coverage guard would reject the freshly
+    // assembled pack (P2, the assemble<->verify consistency invariant). Mirrors the
+    // `missing_valid_time` exclusion-diagnostic idiom.
+    {
+        let bucket_ids_with_edge: BTreeSet<&str> = records
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Edge { label, source, .. } if label.as_str() == "AGGREGATES" => {
+                    Some(source.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        if let Some(buckets) =
+            in_window_by_class.get_mut(EvidenceClass::OccurrenceBuckets.as_wire())
+        {
+            let existing = std::mem::take(buckets);
+            let mut included_ids: BTreeSet<String> = BTreeSet::new();
+            for bucket in existing {
+                if bucket_ids_with_edge.contains(bucket.id()) {
+                    included_ids.insert(bucket.id().to_owned());
+                    buckets.push(bucket);
+                } else {
+                    diagnostics.push(PackDiagnostic {
+                        code: "unattributed_bucket".to_owned(),
+                        evidence_class: Some(EvidenceClass::OccurrenceBuckets.as_wire().to_owned()),
+                        unavailable_reason: None,
+                        record_ids: vec![bucket.id().to_owned()],
+                        detail: "in-window LogOccurrenceBucket excluded: no AGGREGATES \
+                                 attribution edge names its signature"
+                            .to_owned(),
+                    });
+                }
+            }
+            // Co-locate every AGGREGATES attribution edge whose source is an included
+            // bucket as a hash-bound row, so verify re-derives the bucket->signature
+            // binding from tamper-evident evidence.
+            for record in records {
+                if let GraphRecord::Edge { label, source, .. } = record
+                    && label.as_str() == "AGGREGATES"
+                    && included_ids.contains(source.as_str())
+                {
+                    buckets.push(record.clone());
+                }
             }
         }
     }
@@ -4438,6 +4548,50 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                 );
                 break 'integrity;
             }
+        } else if section.class == EvidenceClass::OccurrenceBuckets.as_wire() {
+            // `occurrence_buckets` legitimately co-locates the bucket->signature
+            // attribution edges (issue #340, Codex round-3 P1): `LogOccurrenceBucket
+            // --AGGREGATES--> ErrorSignature`, the hash-bound binding verify
+            // re-derives. Those edges map to no evidence class, so the class check
+            // cannot apply to them — but the exemption is BOUNDED (mirroring
+            // review_coverage): an edge is admitted IFF it is an AGGREGATES edge whose
+            // SOURCE is a LogOccurrenceBucket node present in the section. Anything
+            // else (a node mapping to a non-occurrence_buckets class, an unrelated
+            // edge label, an AGGREGATES edge sourced at a non-present bucket) still
+            // fails Integrity, so nothing can be smuggled in as a fake attribution.
+            let bucket_node_ids: BTreeSet<&str> = section
+                .records
+                .iter()
+                .filter(|br| {
+                    matches!(
+                        node_log_payload(&br.record),
+                        Some(crate::ir::LogPayload::LogOccurrenceBucket(_))
+                    )
+                })
+                .map(|br| br.record.id())
+                .collect();
+            for br in &section.records {
+                let admitted = match &br.record {
+                    GraphRecord::Edge { label, source, .. } => {
+                        label.as_str() == "AGGREGATES" && bucket_node_ids.contains(source.as_str())
+                    }
+                    _ => {
+                        evidence_class_for_record(&br.record).map(|c| c.as_wire())
+                            == Some(section.class.as_str())
+                    }
+                };
+                if !admitted {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "record {} in section {} is neither an occurrence_buckets record nor \
+                         an AGGREGATES attribution edge for a present bucket (section \
+                         membership mismatch)",
+                        br.record.id(),
+                        section.class,
+                    );
+                    break 'integrity;
+                }
+            }
         } else {
             for br in &section.records {
                 let actual = evidence_class_for_record(&br.record).map(|c| c.as_wire());
@@ -4647,14 +4801,24 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                         .get(br.record.id())
                         .is_some_and(|times| times.contains(&t)))
                 } else if section.class == EvidenceClass::OccurrenceBuckets.as_wire() {
-                    // `occurrence_buckets` rows are admitted by the AC2
-                    // interval-intersection rule, NOT the point predicate (issue
-                    // #340): a bucket whose hour `[bucket_start, +1h)` intersects
-                    // the window is legitimately included even when its
-                    // `bucket_start` precedes `from` (a partial-overlap hour is
-                    // counted whole). The SAME predicate `assemble_pack` selected
-                    // it with, so assemble and verify agree.
-                    matches!(resolved, Some(t) if bucket_hour_intersects_window(t, from, to))
+                    if matches!(&br.record, GraphRecord::Edge { label, .. } if label.as_str() == "AGGREGATES")
+                    {
+                        // A co-located `AGGREGATES` attribution edge (issue #340,
+                        // Codex round-3 P1) carries no valid time of its own; its
+                        // window relevance rides the bucket it binds (the bucket row
+                        // IS held to the interval rule below). Section membership
+                        // already restricts it to edges sourced at a present bucket.
+                        true
+                    } else {
+                        // `occurrence_buckets` bucket rows are admitted by the AC2
+                        // interval-intersection rule, NOT the point predicate (issue
+                        // #340): a bucket whose hour `[bucket_start, +1h)` intersects
+                        // the window is legitimately included even when its
+                        // `bucket_start` precedes `from` (a partial-overlap hour is
+                        // counted whole). The SAME predicate `assemble_pack` selected
+                        // it with, so assemble and verify agree.
+                        matches!(resolved, Some(t) if bucket_hour_intersects_window(t, from, to))
+                    }
                 } else {
                     matches!(resolved, Some(t) if from <= t && t < to)
                 };
@@ -10179,9 +10343,26 @@ mod pack340_tests {
         let pack = assemble_cc73(&records);
         let sec = section(&pack, EvidenceClass::OccurrenceBuckets);
         assert_eq!(sec.status, "present");
-        // 15 (sig1) + 16 (sig2) + 16 (sig3) = 47 in-window buckets; the 2
-        // out-of-window sig1 buckets never appear (0 leakage).
-        assert_eq!(sec.record_count, 47);
+        // 15 (sig1) + 16 (sig2) + 16 (sig3) = 47 in-window bucket NODES; the 2
+        // out-of-window sig1 buckets never appear (0 leakage). Each bucket also
+        // co-locates its `AGGREGATES` attribution edge (issue #340, Codex round-3),
+        // so the section carries 47 nodes + 47 edges = 94 hashed rows.
+        assert_eq!(sec.record_count, 94);
+        let node_rows = sec
+            .records
+            .iter()
+            .filter(|br| matches!(br.record, GraphRecord::Node { .. }))
+            .count();
+        let edge_rows = sec
+            .records
+            .iter()
+            .filter(|br| {
+                matches!(&br.record,
+                GraphRecord::Edge { label, .. } if label.as_str() == "AGGREGATES")
+            })
+            .count();
+        assert_eq!(node_rows, 47, "47 in-window bucket nodes");
+        assert_eq!(edge_rows, 47, "one AGGREGATES attribution edge per bucket");
         let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
         else {
             panic!("occurrence_buckets summary present");
@@ -10269,7 +10450,9 @@ mod pack340_tests {
         .expect("assembles");
         let sec = section(&pack, EvidenceClass::OccurrenceBuckets);
         // 05:00 (whole), 06:00, 07:00 (whole) included; 04:00 and 08:00 excluded.
-        assert_eq!(sec.record_count, 3);
+        // Each of the 3 included buckets co-locates its AGGREGATES attribution edge
+        // (issue #340, Codex round-3): 3 nodes + 3 edges = 6 hashed rows.
+        assert_eq!(sec.record_count, 6);
         let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
         else {
             panic!("summary present");
@@ -10816,5 +10999,398 @@ mod pack340_tests {
             "CC7.2 does not map remediation_links"
         );
         assert!(verify_pack(&pack).ok);
+    }
+
+    // ── Codex round-3 P1/P2: bucket <-> signature binding + assemble<->verify ──
+    // The occurrence-bucket summary attributes each bucket to a signature via
+    // `total.signature_id`, but the bucket NODE payload carries no signature field
+    // (the signature is only an identity input of the bucket's stable ID hash). The
+    // fix co-locates the `LogOccurrenceBucket --AGGREGATES--> ErrorSignature` edges
+    // as hash-bound rows so verify can re-derive the binding offline, and excludes
+    // an in-window bucket that lacks an attribution edge from BOTH the section and
+    // the summary under a counted `unattributed_bucket` diagnostic.
+
+    /// A minimal fixture: one signature with one ATTRIBUTED in-window bucket and one
+    /// UNATTRIBUTED in-window bucket (no `AGGREGATES` edge).
+    fn records_with_unattributed_bucket() -> Vec<GraphRecord> {
+        let mut records = vec![error_signature(
+            "log:v1:siga",
+            "error",
+            "boom on start",
+            "2026-03-02T00:00:00Z",
+            "2026-03-02T05:00:00Z",
+            10,
+            Some(Vec::new()),
+        )];
+        // An attributed in-window bucket.
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:ba-00",
+            "2026-03-02T00:00:00Z",
+            3,
+        ));
+        records.push(super::fixture::aggregates("log:v1:ba-00", "log:v1:siga"));
+        // An UNATTRIBUTED in-window bucket: no AGGREGATES edge names its signature.
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:ba-unattr",
+            "2026-03-02T01:00:00Z",
+            99,
+        ));
+        records
+    }
+
+    #[test]
+    fn assemble_with_unattributed_bucket_excludes_it_and_passes_verify() {
+        let records = records_with_unattributed_bucket();
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC7.2",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        // REGRESSION GUARD (P2): every pack `assemble_pack` produces MUST pass its
+        // own offline `verify_pack`. Before the fix the unattributed bucket rode
+        // section.records but was skipped from the summary, so the reverse-coverage
+        // guard rejected the freshly-assembled pack.
+        let report = verify_pack(&pack);
+        assert!(
+            report.ok,
+            "assemble<->verify consistency: {:?} / {:?}",
+            report.integrity, report.window_consistency
+        );
+        // The unattributed bucket is excluded from the section records.
+        let sec = section(&pack, EvidenceClass::OccurrenceBuckets);
+        assert!(
+            !sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:ba-unattr"),
+            "unattributed bucket excluded from section records"
+        );
+        // ... and surfaced under a counted `unattributed_bucket` diagnostic.
+        assert!(
+            pack.diagnostics
+                .iter()
+                .any(|d| d.code == "unattributed_bucket"
+                    && d.evidence_class.as_deref() == Some("occurrence_buckets")
+                    && d.record_ids.iter().any(|id| id == "log:v1:ba-unattr")),
+            "unattributed bucket tallied under a diagnostic: {:?}",
+            pack.diagnostics
+        );
+        // ... and excluded from the summary totals.
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        assert!(
+            signature_totals
+                .iter()
+                .all(|t| t.buckets.iter().all(|b| b.bucket_id != "log:v1:ba-unattr")),
+            "unattributed bucket excluded from the summary"
+        );
+        // The attributed bucket is retained and its AGGREGATES edge co-located.
+        assert!(
+            sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:ba-00"),
+            "attributed bucket retained"
+        );
+        assert!(
+            sec.records.iter().any(|br| matches!(&br.record,
+                GraphRecord::Edge { label, source, target, .. }
+                    if label.as_str() == "AGGREGATES"
+                        && source == "log:v1:ba-00"
+                        && target == "log:v1:siga")),
+            "attribution edge co-located as a hashed row"
+        );
+    }
+
+    #[test]
+    fn assemble_output_always_passes_verify_across_fixtures() {
+        // The assemble->verify-clean invariant across every #340 fixture and both
+        // log-bearing controls: assemble must never produce a pack its own offline
+        // verify rejects.
+        let fixtures = [
+            build_log_incident_records(),
+            records_with_unattributed_bucket(),
+        ];
+        for records in &fixtures {
+            for control in ["CC7.2", "CC7.3"] {
+                let pack = assemble_pack(
+                    records,
+                    &load_default_catalog(),
+                    control,
+                    &win(),
+                    1.0,
+                    "test-0.0.0",
+                    None,
+                )
+                .expect("assembles");
+                let report = verify_pack(&pack);
+                assert!(
+                    report.ok,
+                    "assemble<->verify invariant broken for {control}: {:?} / {:?}",
+                    report.integrity, report.window_consistency
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verify_rejects_bucket_moved_to_wrong_signature() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        {
+            let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) =
+                sec.log_summary.as_mut()
+            else {
+                panic!("occurrence_buckets summary present");
+            };
+            // Move one of sig1's buckets under sig2, adjusting BOTH sums so every
+            // per-bucket count/hour/id still binds its node and both `sum` checks
+            // still pass. The ONLY inconsistency is the signature the bucket is
+            // filed under — which nothing bound before the AGGREGATES co-location.
+            let sig1_idx = signature_totals
+                .iter()
+                .position(|t| t.signature_id == "log:v1:sig1")
+                .expect("sig1 total");
+            let moved = signature_totals[sig1_idx].buckets.remove(0);
+            signature_totals[sig1_idx].in_window_occurrences -= moved.occurrence_count;
+            let sig2 = signature_totals
+                .iter_mut()
+                .find(|t| t.signature_id == "log:v1:sig2")
+                .expect("sig2 total");
+            sig2.in_window_occurrences += moved.occurrence_count;
+            sig2.buckets.push(moved);
+            sig2.buckets.sort_by(|a, b| {
+                a.hour
+                    .cmp(&b.hour)
+                    .then_with(|| a.bucket_id.cmp(&b.bucket_id))
+            });
+        }
+        // Recompute the binding hash over the tampered summary (defeats layer 1).
+        sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a bucket moved to the wrong signature must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn verify_rejects_resignatured_bucket_total() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        {
+            let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) =
+                sec.log_summary.as_mut()
+            else {
+                panic!("occurrence_buckets summary present");
+            };
+            // Re-label a whole total's signature_id. Its buckets still bind their
+            // nodes, but the AGGREGATES edges name the ORIGINAL signature.
+            let total = signature_totals
+                .iter_mut()
+                .find(|t| t.signature_id == "log:v1:sig2")
+                .expect("sig2 total");
+            total.signature_id = "log:v1:sig1".to_owned();
+            // Merge into one total per signature id would break bijection; keep it a
+            // second sig1-labelled total to isolate the attribution check.
+        }
+        sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a re-signatured bucket total must fail Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    #[test]
+    fn systematic_occurrence_bucket_summary_mutations_fail_verify() {
+        // For EVERY node-backed occurrence-bucket summary field and row operation,
+        // mutate it, recompute `log_summary_hash` (so the whole-summary hash cannot
+        // be what catches it), and assert verify reports an Integrity defect.
+        type Mutation = fn(&mut Vec<SignatureOccurrenceTotal>);
+        let cases: &[(&str, Mutation)] = &[
+            ("inflate_total", |t| {
+                t[0].in_window_occurrences += 1_000;
+            }),
+            ("deflate_total", |t| {
+                t[0].in_window_occurrences = t[0].in_window_occurrences.saturating_sub(1);
+            }),
+            ("bucket_occurrence_count", |t| {
+                t[0].buckets[0].occurrence_count += 7;
+            }),
+            ("bucket_hour", |t| {
+                t[0].buckets[0].hour = "2026-03-20T00:00:00Z".to_owned();
+            }),
+            ("phantom_bucket_id", |t| {
+                t[0].buckets[0].bucket_id = "log:v1:ghost-bucket".to_owned();
+            }),
+            ("drop_bucket", |t| {
+                let dropped = t[0].buckets.remove(0);
+                t[0].in_window_occurrences -= dropped.occurrence_count;
+            }),
+            ("drop_total", |t| {
+                t.remove(0);
+            }),
+            ("rename_signature", |t| {
+                t[0].signature_id = "log:v1:ghost-signature".to_owned();
+            }),
+            ("add_phantom_bucket_entry", |t| {
+                let ghost = BucketCount {
+                    bucket_id: "log:v1:ghost-bucket".to_owned(),
+                    hour: "2026-03-02T00:00:00Z".to_owned(),
+                    occurrence_count: 5,
+                };
+                t[0].in_window_occurrences += ghost.occurrence_count;
+                t[0].buckets.push(ghost);
+            }),
+            ("move_bucket_between_signatures", |t| {
+                let moved = t[0].buckets.remove(0);
+                t[0].in_window_occurrences -= moved.occurrence_count;
+                t[1].in_window_occurrences += moved.occurrence_count;
+                t[1].buckets.push(moved);
+                t[1].buckets.sort_by(|a, b| {
+                    a.hour
+                        .cmp(&b.hour)
+                        .then_with(|| a.bucket_id.cmp(&b.bucket_id))
+                });
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut pack = assemble_cc73(&build_log_incident_records());
+            let sec = pack
+                .sections
+                .iter_mut()
+                .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+                .expect("occurrence_buckets section");
+            if let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) =
+                sec.log_summary.as_mut()
+            {
+                mutate(signature_totals);
+            }
+            sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+            let report = verify_pack(&pack);
+            assert!(
+                !report.integrity.passed,
+                "occurrence-bucket mutation `{name}` must fail Integrity (hash recomputed)"
+            );
+        }
+    }
+
+    #[test]
+    fn systematic_error_signature_summary_mutations_fail_verify() {
+        // Every NODE-BACKED error-signature summary field + row operation must fail
+        // verify even with the whole-summary hash recomputed. (The exemplar and
+        // frame-resolution fields ride edges/nodes that CANNOT be co-located — the
+        // LogEvent exemplar node carries redaction-scrubbed excerpt text whose
+        // presence would violate the zero-raw-log Safety invariant — so those are
+        // bound solely by the whole-summary hash and are exercised separately.)
+        type Mutation = fn(&mut Vec<ErrorSignatureRow>);
+        let cases: &[(&str, Mutation)] = &[
+            ("template_hash", |s| {
+                s[0].template_hash = blake3::hash(b"forged template").to_string();
+            }),
+            ("frame_chain_hash", |s| {
+                let sig1 = s
+                    .iter_mut()
+                    .find(|r| r.signature_id == "log:v1:sig1")
+                    .expect("sig1 carries frames");
+                sig1.frame_chain_hash = Some(blake3::hash(b"forged frames").to_string());
+            }),
+            ("severity", |s| {
+                s[0].severity = "warn".to_owned();
+            }),
+            ("first_seen", |s| {
+                s[0].first_seen_in_window = "2026-03-15T00:00:00Z".to_owned();
+            }),
+            ("last_seen", |s| {
+                s[0].last_seen_in_window = "2026-03-15T00:00:00Z".to_owned();
+            }),
+            ("drop_signature_row", |s| {
+                s.remove(0);
+            }),
+            ("add_phantom_signature_row", |s| {
+                let mut ghost = s[0].clone();
+                ghost.signature_id = "log:v1:ghost-signature".to_owned();
+                s.push(ghost);
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut pack = assemble_cc73(&build_log_incident_records());
+            let sec = pack
+                .sections
+                .iter_mut()
+                .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+                .expect("error_signatures section");
+            if let Some(LogEvidenceSummary::ErrorSignatures { signatures }) =
+                sec.log_summary.as_mut()
+            {
+                mutate(signatures);
+            }
+            sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+            let report = verify_pack(&pack);
+            assert!(
+                !report.integrity.passed,
+                "error-signature mutation `{name}` must fail Integrity (hash recomputed)"
+            );
+        }
+    }
+
+    // ── Binding-surface boundary for the non-node-backed fields ───────────────
+    // The exemplar (`protected_handle`/`content_hash`/`source_line`) and
+    // `frame_resolutions` fields on an `error_signatures` row, and EVERY
+    // `remediation_links` field, ride edges/nodes that CANNOT be co-located as
+    // hashed rows: the `LogEvent` exemplar node carries redaction-scrubbed excerpt
+    // text whose presence would violate the zero-raw-log Safety invariant, and the
+    // `remediation_links` section is defined to carry ZERO hashed rows (a
+    // remediation commit may legitimately fall OUTSIDE the evidence window). Their
+    // SOLE binding surface is therefore the whole-summary `log_summary_hash`: a
+    // tamper that does NOT recompute that hash fails Integrity (asserted here); a
+    // tamper that also recomputes it is equivalent to re-deriving the summary and is
+    // the pack's general fabricate-a-consistent-artifact threat, out of scope for an
+    // offline internal-consistency check.
+
+    #[test]
+    fn exemplar_handle_tamper_is_caught_by_whole_summary_hash() {
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+            .expect("error_signatures section");
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = sec.log_summary.as_mut()
+        else {
+            panic!("error_signatures summary present");
+        };
+        let sig1 = signatures
+            .iter_mut()
+            .find(|s| s.signature_id == "log:v1:sig1")
+            .expect("sig1 carries an exemplar");
+        // Rewrite the exemplar content hash WITHOUT recomputing log_summary_hash.
+        sig1.exemplars[0].content_hash = "cd".repeat(32);
+        // (Deliberately leave `sec.log_summary_hash` stale — layer 1 must catch it.)
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a rewritten exemplar handle must fail Integrity via the whole-summary hash: {}",
+            report.integrity.detail
+        );
     }
 }

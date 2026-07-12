@@ -65,6 +65,10 @@ pass/fail gate".
 - A class-relevant record with no resolvable valid time is **excluded** and
   counted under a `missing_valid_time` diagnostic (and a `missing_valid_time`
   gap).
+- An in-window `LogOccurrenceBucket` with no `AGGREGATES` attribution edge is
+  **excluded** from both the `occurrence_buckets` section and its summary and
+  counted under an **`unattributed_bucket`** diagnostic (see the
+  `occurrence_buckets` section below) — it cannot be filed under any signature.
 - A resolved valid time is **parsed before** the in/out-of-window decision. A
   present-but-malformed (non-RFC-3339) valid time is treated as **unresolved** —
   routed to the same `missing_valid_time` path (count + diagnostic + gap) as a
@@ -235,6 +239,22 @@ record_id, hour)`. `verify` applies the same interval-intersection predicate so 
 partial-overlap bucket whose `bucket_start` precedes `from` still passes
 Window-consistency.
 
+The section **co-locates each bucket's `LogOccurrenceBucket --AGGREGATES-->
+ErrorSignature` attribution edge** as a hash-bound row (issue #340, Codex round-3).
+The bucket *node* payload carries **no signature field** — the signature is only an
+identity input hashed into the bucket's stable ID — so the bucket→signature
+attribution that `total.signature_id` asserts must ride a tamper-evident row for
+`verify` to re-derive it offline. An `AGGREGATES` edge carries no valid time of its
+own; its window relevance rides the bucket it binds, and Window-consistency admits
+it on that basis. An **in-window bucket that carries no `AGGREGATES` attribution
+edge** cannot be filed under any signature, so it is **excluded from BOTH the
+section records and the summary** under a counted **`unattributed_bucket`**
+diagnostic (mirroring the `missing_valid_time` exclusion idiom) — never silently
+mis-summed, and never left in the section where the reverse-coverage guard would
+reject the freshly assembled pack. This upholds a hard invariant: **every pack
+`assemble` produces passes its own offline `verify` clean** (the assemble↔verify
+consistency invariant).
+
 **`remediation_links`** — a **derived** join, available (capability probe) when
 `ErrorSignature` + `FRAME_RESOLVES_TO` + `CHANGED_IN` facts all exist. Each lead
 runs `ErrorSignature → FRAME_RESOLVES_TO → Symbol → CHANGED_IN → Commit` where the
@@ -260,13 +280,23 @@ row's `template_hash`/`frame_chain_hash`/`severity`/clipped span is recomputed f
 that node's payload, and each `occurrence_buckets` bucket must resolve to a present
 hashed `LogOccurrenceBucket` node with a matching count and hour while every
 `in_window_occurrences` must equal the recomputed sum — so the occurrence total
-cannot be inflated without adding real, count-matching hashed bucket rows. The
+cannot be inflated without adding real, count-matching hashed bucket rows. Each
+summary bucket must additionally be **filed under the same signature its co-located
+`AGGREGATES` attribution edge names**: moving a bucket under a different
+`signature_id` — the node count/hour still bind and both per-signature sums still
+balance — fails Integrity because no `AGGREGATES` edge in the section binds that
+bucket to the claimed signature, so consumers can never read per-signature
+occurrence counts for the **wrong incident**. The
 bucket binding is an **exact bijection in both directions**: not only must every
 summary bucket resolve to a present hashed node, but every hashed
 `LogOccurrenceBucket` node the section carries must be listed by the summary — so a
 bucket cannot be silently **dropped** from the summary (under-reporting
 `in_window_occurrences` while its hashed row lingers) with the binding hash
-recomputed over the reduced summary. Each summary variant is additionally **bound
+recomputed over the reduced summary. The `AGGREGATES` edges the section co-locates
+are held to a **bounded membership exemption** (mirroring `review_coverage`): only
+an `AGGREGATES` edge whose source is a `LogOccurrenceBucket` node present in the
+same section is admitted; any other edge, or an attribution edge for an absent
+bucket, fails Integrity. Each summary variant is additionally **bound
 to its section class** — `error_signatures`↔`error_signatures`,
 `occurrence_buckets`↔`occurrence_buckets`, `remediation_links`↔`remediation_links` —
 so a `log_summary` on a non-log section, or a variant relocated onto a mismatched
