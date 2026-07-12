@@ -809,6 +809,7 @@ fn collect_log_signatures<'a>(
     let mut frames_by_sig: BTreeMap<&str, Vec<FrameEdge<'a>>> = BTreeMap::new();
     for r in records {
         if let GraphRecord::Edge {
+            id: edge_id,
             label: EdgeLabel::FrameResolvesTo,
             source,
             target,
@@ -817,6 +818,14 @@ fn collect_log_signatures<'a>(
             ..
         } = r
         {
+            // A tombstoned frame-resolution edge is deleted: never read the binding
+            // it carries — mirror the tombstone gate the rest of subsystem_context
+            // applies to edges (keyed on the edge record's own id).
+            if tombstoned_ids.contains(edge_id.as_str())
+                && !has_any_temporal_version.contains(edge_id.as_str())
+            {
+                continue;
+            }
             frames_by_sig
                 .entry(source.as_str())
                 .or_default()

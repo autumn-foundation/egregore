@@ -1070,3 +1070,93 @@ fn query_subsystem_tombstoned_frame_target_excluded_from_log_signatures() {
         "tombstoned frame target must not surface in unresolved: {unresolved:?}"
     );
 }
+
+/// Build a fixture mirroring [`fixture_subsystem_with_logs`] where a live
+/// `ErrorSignature` (`sig_alpha`) and a live target symbol under `src/alpha` are
+/// bound by a `FRAME_RESOLVES_TO` edge, but that EDGE record is tombstoned. The
+/// binding is deleted, so no frame may be read from it: the signature must never
+/// surface in `log_signatures`, and the (still-live) target must not leak into
+/// `unresolved`.
+fn fixture_subsystem_tombstoned_frame_edge() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("subsystem-logs-tombstoned-edge.jsonl");
+
+    let alpha_sym_id = "codegraph:v4:intsublog_alpha_sym001".to_owned();
+    let alpha_file = GraphRecord::node(
+        "file:sublog:alpha_a".to_owned(),
+        NodeKind::File,
+        Some("src/alpha/a.rs".to_owned()),
+        None,
+        Some("src/alpha/a.rs".to_owned()),
+        "file src/alpha/a.rs".to_owned(),
+    );
+    // Live target symbol — only the binding edge is deleted, not the symbol.
+    let alpha_sym = GraphRecord::symbol(
+        alpha_sym_id.clone(),
+        "fn",
+        "src/alpha/a.rs".to_owned(),
+        span(1, 20),
+        "alpha_handler".to_owned(),
+        "fn alpha_handler in src/alpha/a.rs".to_owned(),
+    );
+
+    let sig_alpha_id = "log:v1:sig_alpha";
+    let sig_alpha = error_signature(
+        sig_alpha_id,
+        "fatal",
+        7,
+        "2026-01-02T00:00:00Z",
+        "2026-01-03T00:00:00Z",
+    );
+    let sig_alpha_edge = frame_edge(sig_alpha_id, &alpha_sym_id, FrameResolution::Resolved, 0);
+    // The tombstone that deletes the frame-resolution EDGE by its own record id.
+    let frame_edge_tombstone = GraphRecord::Tombstone {
+        id: "codegraph:v5:tombstone_frame_edge".to_owned(),
+        schema_version: SCHEMA_VERSION,
+        deleted_id: sig_alpha_edge.id().to_owned(),
+        summary: "frame resolution binding was retracted".to_owned(),
+        producer: None,
+    };
+
+    let mut graph = Graph::new();
+    for r in [
+        alpha_file,
+        alpha_sym,
+        sig_alpha,
+        sig_alpha_edge,
+        frame_edge_tombstone,
+    ] {
+        graph.push(r);
+    }
+
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+    (temp, path)
+}
+
+#[test]
+fn query_subsystem_tombstoned_frame_edge_excluded_from_log_signatures() {
+    let (_temp, graph) = fixture_subsystem_tombstoned_frame_edge();
+    let parsed = run_subsystem("src/alpha", &graph);
+
+    // The signature's only frame binding is a tombstoned FRAME_RESOLVES_TO edge:
+    // the deletion gate must drop the frame, so no signature surfaces.
+    let sigs = parsed["log_signatures"]
+        .as_array()
+        .expect("log_signatures array");
+    assert!(
+        sigs.is_empty(),
+        "a signature whose only frame binding is a tombstoned FRAME_RESOLVES_TO \
+         edge must not appear in log_signatures, got {sigs:?}"
+    );
+
+    // The (still-live) target must not leak through the unresolved section either.
+    let unresolved = parsed["unresolved"].as_array().expect("unresolved array");
+    assert!(
+        unresolved.iter().all(|u| {
+            u["target_handle"] != "codegraph:v4:intsublog_alpha_sym001"
+                && u["source_record_id"] != "log:v1:sig_alpha"
+        }),
+        "tombstoned frame-edge binding must not surface in unresolved: {unresolved:?}"
+    );
+}
