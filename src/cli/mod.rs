@@ -4854,7 +4854,18 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // `query_log_deltas_cmd` so the envelope can disclose that cross-scan
             // coalescing is not reconstructable there (issue #363).
             let embedded_source = data_dir.is_some();
-            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            // Strictly read-only lane (PR #356 review): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
             query_log_deltas_cmd(&records, &base, &head, repo.as_deref(), embedded_source)
         }
         QuerySubcommand::Coupling {

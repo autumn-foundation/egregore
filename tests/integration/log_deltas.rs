@@ -1195,6 +1195,103 @@ fn query_log_deltas_cli_embedded_data_dir_discloses_retention_caveat() {
     );
 }
 
+/// Sorted `(relative path, bytes)` fingerprint of every file under `root`
+/// (mirrors `tests/integration/manifest_deps.rs`).
+#[cfg(feature = "embedded-aletheiadb")]
+fn dir_fingerprint(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let ft = entry.file_type().unwrap();
+            let path = entry.path();
+            if ft.is_dir() {
+                walk(&path, base, out);
+            } else if ft.is_file() {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// PR #356 review: the store-backed `log-deltas` query is strictly read-only.
+/// Opening the embedded engine in place re-persists its on-disk index files, so
+/// `--data-dir` must read from a throwaway copy and leave the live store
+/// byte-for-byte untouched (same contract as the other read-only lanes).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_log_deltas_data_dir_is_strictly_read_only() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let [first, _second, third] = seed_repo(&repo);
+    let graph_path = temp.path().join("combined.graph.jsonl");
+
+    let jsonl = scan_repository_history(&repo)
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let mut records: Vec<GraphRecord> = jsonl
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record should parse"))
+        .collect();
+    records.push(error_signature("new-boom", "error", NEW_FIRST, NEW_LAST, 5));
+    records.push(error_signature(
+        "ceased-warn",
+        "warn",
+        CEASED_FIRST,
+        CEASED_LAST,
+        3,
+    ));
+    records.push(error_signature(
+        "cont-error",
+        "error",
+        CONT_FIRST,
+        CONT_LAST,
+        9,
+    ));
+    let mut out = String::new();
+    for r in &records {
+        out.push_str(&serde_json::to_string(r).expect("record should serialize"));
+        out.push('\n');
+    }
+    fs::write(&graph_path, out).expect("graph should write");
+
+    let data_dir = temp.path().join("store");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let base_prefix = &first[..12];
+
+    let before = dir_fingerprint(&data_dir);
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(["query", "log-deltas", base_prefix, &third])
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+    let after = dir_fingerprint(&data_dir);
+    assert_eq!(
+        before, after,
+        "query log-deltas must not modify any store file when reading --data-dir"
+    );
+}
+
 #[test]
 fn query_log_deltas_cli_is_deterministic_and_redaction_safe() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
