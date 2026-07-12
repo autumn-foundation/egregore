@@ -3745,6 +3745,37 @@ pub(crate) struct SubsystemDrift<'a> {
     after_git_commit: Option<&'a str>,
 }
 
+/// One in-prefix resolved backtrace frame on a `log_signatures` row (issue #325).
+#[derive(Serialize)]
+pub(crate) struct SubsystemLogFrame<'a> {
+    frame_index: u32,
+    frame_resolution: &'a str,
+    target_repo_relative_path: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_span: Option<crate::ir::SourceSpan>,
+}
+
+/// One runtime `ErrorSignature` in the `log_signatures` section of a subsystem
+/// response (issue #325).
+///
+/// Rows are runtime observations — leads, not proof the subsystem is unhealthy;
+/// `occurrence_count` reflects scanned log sources only.
+#[derive(Serialize)]
+pub(crate) struct SubsystemLogSignature<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    trust_class: &'static str,
+    schema_version: u32,
+    severity: &'a str,
+    occurrence_count: u64,
+    template_excerpt: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_seen_valid_time: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen_valid_time: Option<&'a str>,
+    resolved_frames: Vec<SubsystemLogFrame<'a>>,
+}
+
 /// Full subsystem context query response envelope (issue #83).
 #[derive(Serialize)]
 pub(crate) struct SubsystemResponse<'a> {
@@ -3758,6 +3789,9 @@ pub(crate) struct SubsystemResponse<'a> {
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
     semantic_drift: Vec<SubsystemDrift<'a>>,
+    // Always present (empty array when no scanned source resolves here) so the
+    // section is additive per AC5 — never `skip_serializing_if` (issue #325).
+    log_signatures: Vec<SubsystemLogSignature<'a>>,
     unresolved: Vec<ContextUnresolved<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     excluded: Vec<ExcludedDiagnostic<'a>>,

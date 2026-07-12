@@ -238,9 +238,18 @@ cargo run -- query cycles codegraph:v1:zzz --graph graph.jsonl    # exit 1 (Unsu
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
-verification evidence, and semantic drift for everything under a repo-relative directory prefix.
-Path matching is segment-aware: `src/alpha` never bleeds into `src/alphabet`.
-Output is a deterministic JSON envelope with trust-separated sections.
+verification evidence, semantic drift, and runtime error signatures for everything under a
+repo-relative directory prefix. Path matching is segment-aware: `src/alpha` never bleeds into
+`src/alphabet`. Output is a deterministic JSON envelope with trust-separated sections. The
+always-present `log_signatures` section (issue #325) lists `ErrorSignature` records (from
+`scan-logs`/`resolve-frames`) whose frames resolve under the prefix: a signature appears iff a
+`FRAME_RESOLVES_TO` edge labeled `resolved` or `path_only` targets an in-prefix Symbol/File;
+`ambiguous`/`unresolved`-only signatures never appear and their dangling targets fall through to
+the existing `unresolved` section. Rows carry `trust_class: "runtime_observation"` — runtime
+LEADS, not proof — with a bounded redacted `template_excerpt` (never raw log text); an empty
+section means "no scanned source resolved here", not "no errors exist". `occurrence_count`
+reflects scanned sources only (#361), and `--graph` coalesces cross-scan duplicate-ID signatures
+while `--data-dir` retains one record per stable log ID (#363).
 
 `eg query change-impact <handle>` returns graph-derived impact leads grouped by relation
 (`direct_callers`, `direct_callees`, `referencing_files`, `implementation_symbols`,

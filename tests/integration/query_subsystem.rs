@@ -4,12 +4,14 @@
 use std::{fs, path::PathBuf};
 
 use aletheia_egregore::{
-    EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, MetricKind, NodeKind, SelectionBasis,
+    EdgeLabel, EmbeddingModel, ErrorSignaturePayload, EvidenceLink, GraphRecord,
+    LOG_SCHEMA_VERSION, LogPayload, MetricKind, NodeKind, SCHEMA_VERSION, SelectionBasis,
     SemanticDriftMetadata, TemporalMetadata,
     ir::{
-        AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, Graph, PROJECT_SCHEMA_VERSION,
-        SEMANTIC_SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
-        artifact_stable_id, project_stable_id, semantic_stable_id, verification_stable_id,
+        AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, FrameResolution, Graph,
+        PROJECT_SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION,
+        agent_memory_stable_id, artifact_stable_id, project_stable_id, semantic_stable_id,
+        verification_stable_id,
     },
 };
 use assert_cmd::Command;
@@ -634,5 +636,527 @@ fn query_subsystem_output_is_deterministic() {
     assert_eq!(
         out_a, out_b,
         "identical query must produce byte-identical output (AC7)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// log_signatures section (issue #325)
+// ---------------------------------------------------------------------------
+
+/// Build an `ErrorSignature` log node.
+fn error_signature(
+    id: &str,
+    severity: &str,
+    occurrence_count: u64,
+    first_seen: &str,
+    last_seen: &str,
+) -> GraphRecord {
+    GraphRecord::node(
+        id.to_owned(),
+        NodeKind::ErrorSignature,
+        None,
+        None,
+        Some(format!("{severity} signature")),
+        format!("Error signature ({severity}) x{occurrence_count}"),
+    )
+    .with_log(LogPayload::ErrorSignature(ErrorSignaturePayload {
+        fingerprint_algorithm: "template-v1".to_owned(),
+        template_excerpt: format!("redacted {severity} template for {id}"),
+        severity: severity.to_owned(),
+        occurrence_count,
+        first_seen: first_seen.to_owned(),
+        last_seen: last_seen.to_owned(),
+        frames: None,
+    }))
+    .with_domain("log", LOG_SCHEMA_VERSION)
+}
+
+/// A `FRAME_RESOLVES_TO` edge carrying a resolution class and frame index.
+fn frame_edge(
+    signature_id: &str,
+    target_id: &str,
+    resolution: FrameResolution,
+    frame_index: u32,
+) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::FrameResolvesTo,
+        signature_id.to_owned(),
+        target_id.to_owned(),
+        Some("1.0".to_owned()),
+        format!("frame {frame_index} resolves ({}) ", resolution.as_str()),
+    )
+    .with_frame_resolution(resolution)
+    .with_frame_index(frame_index)
+}
+
+/// Build a fixture with runtime log signatures resolving into `src/alpha`,
+/// a sibling `src/alphabet`, and an `unresolved`-frames-only signature.
+///
+/// Returns (`TempDir`, `graph_path`). Caller must keep `TempDir` alive.
+fn fixture_subsystem_with_logs() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("subsystem-logs.jsonl");
+
+    // Code seeds under src/alpha and the src/alphabet bleed sibling.
+    let alpha_sym_id = "codegraph:v4:intsublog_alpha_sym001".to_owned();
+    let alpha_file = GraphRecord::node(
+        "file:sublog:alpha_a".to_owned(),
+        NodeKind::File,
+        Some("src/alpha/a.rs".to_owned()),
+        None,
+        Some("src/alpha/a.rs".to_owned()),
+        "file src/alpha/a.rs".to_owned(),
+    );
+    let alpha_sym = GraphRecord::symbol(
+        alpha_sym_id.clone(),
+        "fn",
+        "src/alpha/a.rs".to_owned(),
+        span(1, 20),
+        "alpha_handler".to_owned(),
+        "fn alpha_handler in src/alpha/a.rs".to_owned(),
+    );
+    let alphabet_sym_id = "codegraph:v4:intsublog_alphabet_sym001".to_owned();
+    let alphabet_sym = GraphRecord::symbol(
+        alphabet_sym_id.clone(),
+        "fn",
+        "src/alphabet/a.rs".to_owned(),
+        span(1, 5),
+        "alphabet_handler".to_owned(),
+        "fn alphabet_handler in src/alphabet/a.rs".to_owned(),
+    );
+
+    // (a) In-prefix resolved signature, with a duplicate record to exercise
+    // stable-ID coalescing (earliest first_seen, latest last_seen, summed count).
+    let sig_alpha_id = "log:v1:sig_alpha";
+    let sig_alpha_1 = error_signature(
+        sig_alpha_id,
+        "fatal",
+        7,
+        "2026-01-02T00:00:00Z",
+        "2026-01-03T00:00:00Z",
+    );
+    let sig_alpha_2 = error_signature(
+        sig_alpha_id,
+        "fatal",
+        5,
+        "2026-01-01T00:00:00Z",
+        "2026-01-04T00:00:00Z",
+    );
+    let sig_alpha_edge = frame_edge(sig_alpha_id, &alpha_sym_id, FrameResolution::Resolved, 0);
+
+    // (b) Sibling signature resolving into src/alphabet (bleed guard).
+    let sig_alphabet_id = "log:v1:sig_alphabet";
+    let sig_alphabet = error_signature(
+        sig_alphabet_id,
+        "error",
+        3,
+        "2026-01-01T00:00:00Z",
+        "2026-01-01T00:00:00Z",
+    );
+    let sig_alphabet_edge = frame_edge(
+        sig_alphabet_id,
+        &alphabet_sym_id,
+        FrameResolution::Resolved,
+        0,
+    );
+
+    // (c) Unresolved-frames-only signature: its dangling diagnostic target sits
+    // under src/alpha and must surface in `unresolved`, never in log_signatures.
+    let diag_id = "log:v1:diag_alpha_missing".to_owned();
+    let diag = GraphRecord::node(
+        diag_id.clone(),
+        NodeKind::Diagnostic,
+        Some("src/alpha/missing.rs".to_owned()),
+        None,
+        None,
+        "unresolved frame diagnostic".to_owned(),
+    )
+    .with_domain("log", LOG_SCHEMA_VERSION);
+    let sig_unres_id = "log:v1:sig_unresolved";
+    let sig_unres = error_signature(
+        sig_unres_id,
+        "warn",
+        2,
+        "2026-01-01T00:00:00Z",
+        "2026-01-01T00:00:00Z",
+    );
+    let sig_unres_edge = frame_edge(sig_unres_id, &diag_id, FrameResolution::Unresolved, 0);
+
+    let mut graph = Graph::new();
+    for r in vec![
+        alpha_file,
+        alpha_sym,
+        alphabet_sym,
+        sig_alpha_1,
+        sig_alpha_2,
+        sig_alpha_edge,
+        sig_alphabet,
+        sig_alphabet_edge,
+        diag,
+        sig_unres,
+        sig_unres_edge,
+    ] {
+        graph.push(r);
+    }
+
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+    (temp, path)
+}
+
+fn run_subsystem(prefix: &str, graph: &PathBuf) -> serde_json::Value {
+    let output = egregore()
+        .args(["query", "subsystem", prefix, "--graph"])
+        .arg(graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8");
+    serde_json::from_str(stdout.trim()).expect("valid JSON")
+}
+
+#[test]
+fn query_subsystem_log_signatures_in_prefix_carries_full_citation() {
+    let (_temp, graph) = fixture_subsystem_with_logs();
+    let parsed = run_subsystem("src/alpha", &graph);
+
+    let sigs = parsed["log_signatures"]
+        .as_array()
+        .expect("log_signatures array");
+    assert_eq!(
+        sigs.len(),
+        1,
+        "exactly one in-prefix signature (coalesced) must appear, got {sigs:?}"
+    );
+    let sig = &sigs[0];
+
+    assert_eq!(sig["record_id"], "log:v1:sig_alpha");
+    assert_eq!(sig["kind"], "ErrorSignature");
+    assert_eq!(sig["trust_class"], "runtime_observation");
+    assert_eq!(sig["schema_version"], LOG_SCHEMA_VERSION);
+    assert_eq!(sig["severity"], "fatal");
+    // Coalesced: 7 + 5 summed across the two stable-ID records.
+    assert_eq!(sig["occurrence_count"], 12);
+    // Earliest first_seen, latest last_seen across the group.
+    assert_eq!(sig["first_seen_valid_time"], "2026-01-01T00:00:00Z");
+    assert_eq!(sig["last_seen_valid_time"], "2026-01-04T00:00:00Z");
+
+    let frames = sig["resolved_frames"]
+        .as_array()
+        .expect("resolved_frames array");
+    assert_eq!(frames.len(), 1, "one in-prefix resolved frame");
+    let frame = &frames[0];
+    assert_eq!(frame["frame_index"], 0);
+    assert_eq!(frame["frame_resolution"], "resolved");
+    assert_eq!(frame["target_repo_relative_path"], "src/alpha/a.rs");
+    assert!(
+        frame["target_span"].is_object(),
+        "resolved symbol frame must carry a span"
+    );
+}
+
+#[test]
+fn query_subsystem_log_signatures_no_bleed_to_alphabet() {
+    let (_temp, graph) = fixture_subsystem_with_logs();
+    let output = egregore()
+        .args(["query", "subsystem", "src/alpha", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8");
+
+    assert!(
+        !stdout.contains("sig_alphabet"),
+        "src/alphabet signature must never appear for src/alpha (no bleed, AC2)"
+    );
+    assert!(
+        !stdout.contains("src/alphabet"),
+        "src/alphabet paths must never appear for src/alpha (no bleed, AC2)"
+    );
+}
+
+#[test]
+fn query_subsystem_unresolved_only_signature_absent_but_target_in_unresolved() {
+    let (_temp, graph) = fixture_subsystem_with_logs();
+    let parsed = run_subsystem("src/alpha", &graph);
+
+    // Never in log_signatures.
+    let sigs = parsed["log_signatures"]
+        .as_array()
+        .expect("log_signatures array");
+    assert!(
+        sigs.iter()
+            .all(|s| s["record_id"] != "log:v1:sig_unresolved"),
+        "unresolved-only signature must not appear in log_signatures (AC4)"
+    );
+
+    // Its dangling frame target surfaces through the existing unresolved section.
+    let unresolved = parsed["unresolved"].as_array().expect("unresolved array");
+    assert!(
+        unresolved.iter().any(|u| {
+            u["source_record_id"] == "log:v1:sig_unresolved"
+                && u["target_handle"] == "log:v1:diag_alpha_missing"
+                && u["relation"] == "FRAME_RESOLVES_TO"
+        }),
+        "unresolved-only signature's dangling target must surface in unresolved (AC4): {unresolved:?}"
+    );
+}
+
+#[test]
+fn query_subsystem_zero_log_records_emits_empty_log_signatures_section() {
+    // The base seeded fixture carries zero log-domain records.
+    let (_temp, graph) = fixture_subsystem_seeded();
+    let parsed = run_subsystem("src/alpha", &graph);
+
+    // Always present, empty array (AC5 additive output).
+    assert_eq!(
+        parsed["log_signatures"],
+        serde_json::json!([]),
+        "log_signatures must be present and empty on a zero-log graph (AC5)"
+    );
+
+    // Every other section is unchanged / still populated.
+    assert!(
+        parsed["source_facts"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+    );
+    assert!(
+        parsed["observations"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+    );
+    assert!(
+        parsed["project_state"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+    );
+    assert!(
+        parsed["artifacts"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+    );
+    assert!(
+        parsed["verification_evidence"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+    );
+    assert!(
+        parsed["semantic_drift"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+    );
+    assert_eq!(parsed["ok"], true);
+}
+
+#[test]
+fn query_subsystem_log_signatures_output_is_deterministic_5x() {
+    let (_temp, graph) = fixture_subsystem_with_logs();
+
+    let baseline = egregore()
+        .args(["query", "subsystem", "src/alpha", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    for _ in 0..4 {
+        let again = egregore()
+            .args(["query", "subsystem", "src/alpha", "--graph"])
+            .arg(&graph)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(
+            baseline, again,
+            "log_signatures output must be byte-identical across 5 runs (AC6)"
+        );
+    }
+}
+
+/// Build a fixture mirroring [`fixture_subsystem_with_logs`] where the resolved
+/// frame target (`alpha_sym`) is tombstoned while a live sibling (`alpha_file`)
+/// keeps `src/alpha` matched. A tombstoned non-temporal code target is deleted,
+/// so its signature must never surface in `log_signatures` (nor in `unresolved`).
+fn fixture_subsystem_tombstoned_frame_target() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("subsystem-logs-tombstoned.jsonl");
+
+    let alpha_sym_id = "codegraph:v4:intsublog_alpha_sym001".to_owned();
+    // Live sibling File keeps the prefix matched after the symbol is deleted.
+    let alpha_file = GraphRecord::node(
+        "file:sublog:alpha_a".to_owned(),
+        NodeKind::File,
+        Some("src/alpha/a.rs".to_owned()),
+        None,
+        Some("src/alpha/a.rs".to_owned()),
+        "file src/alpha/a.rs".to_owned(),
+    );
+    let alpha_sym = GraphRecord::symbol(
+        alpha_sym_id.clone(),
+        "fn",
+        "src/alpha/a.rs".to_owned(),
+        span(1, 20),
+        "alpha_handler".to_owned(),
+        "fn alpha_handler in src/alpha/a.rs".to_owned(),
+    );
+    // The tombstone that deletes the resolved frame target.
+    let alpha_sym_tombstone = GraphRecord::Tombstone {
+        id: "codegraph:v5:tombstone_alpha_sym".to_owned(),
+        schema_version: SCHEMA_VERSION,
+        deleted_id: alpha_sym_id.clone(),
+        summary: "alpha_handler was deleted".to_owned(),
+        producer: None,
+    };
+
+    let sig_alpha_id = "log:v1:sig_alpha";
+    let sig_alpha = error_signature(
+        sig_alpha_id,
+        "fatal",
+        7,
+        "2026-01-02T00:00:00Z",
+        "2026-01-03T00:00:00Z",
+    );
+    let sig_alpha_edge = frame_edge(sig_alpha_id, &alpha_sym_id, FrameResolution::Resolved, 0);
+
+    let mut graph = Graph::new();
+    for r in [
+        alpha_file,
+        alpha_sym,
+        alpha_sym_tombstone,
+        sig_alpha,
+        sig_alpha_edge,
+    ] {
+        graph.push(r);
+    }
+
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+    (temp, path)
+}
+
+#[test]
+fn query_subsystem_tombstoned_frame_target_excluded_from_log_signatures() {
+    let (_temp, graph) = fixture_subsystem_tombstoned_frame_target();
+    let parsed = run_subsystem("src/alpha", &graph);
+
+    // The signature's only resolved frame targets a tombstoned non-temporal code
+    // node: the deletion gate must drop the frame, so no signature surfaces.
+    let sigs = parsed["log_signatures"]
+        .as_array()
+        .expect("log_signatures array");
+    assert!(
+        sigs.is_empty(),
+        "a signature whose only frame targets a tombstoned code node must not \
+         appear in log_signatures, got {sigs:?}"
+    );
+
+    // The tombstoned target must not leak through the unresolved section either.
+    let unresolved = parsed["unresolved"].as_array().expect("unresolved array");
+    assert!(
+        unresolved.iter().all(|u| {
+            u["target_handle"] != "codegraph:v4:intsublog_alpha_sym001"
+                && u["source_record_id"] != "log:v1:sig_alpha"
+        }),
+        "tombstoned frame target must not surface in unresolved: {unresolved:?}"
+    );
+}
+
+/// Build a fixture mirroring [`fixture_subsystem_with_logs`] where a live
+/// `ErrorSignature` (`sig_alpha`) and a live target symbol under `src/alpha` are
+/// bound by a `FRAME_RESOLVES_TO` edge, but that EDGE record is tombstoned. The
+/// binding is deleted, so no frame may be read from it: the signature must never
+/// surface in `log_signatures`, and the (still-live) target must not leak into
+/// `unresolved`.
+fn fixture_subsystem_tombstoned_frame_edge() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("subsystem-logs-tombstoned-edge.jsonl");
+
+    let alpha_sym_id = "codegraph:v4:intsublog_alpha_sym001".to_owned();
+    let alpha_file = GraphRecord::node(
+        "file:sublog:alpha_a".to_owned(),
+        NodeKind::File,
+        Some("src/alpha/a.rs".to_owned()),
+        None,
+        Some("src/alpha/a.rs".to_owned()),
+        "file src/alpha/a.rs".to_owned(),
+    );
+    // Live target symbol — only the binding edge is deleted, not the symbol.
+    let alpha_sym = GraphRecord::symbol(
+        alpha_sym_id.clone(),
+        "fn",
+        "src/alpha/a.rs".to_owned(),
+        span(1, 20),
+        "alpha_handler".to_owned(),
+        "fn alpha_handler in src/alpha/a.rs".to_owned(),
+    );
+
+    let sig_alpha_id = "log:v1:sig_alpha";
+    let sig_alpha = error_signature(
+        sig_alpha_id,
+        "fatal",
+        7,
+        "2026-01-02T00:00:00Z",
+        "2026-01-03T00:00:00Z",
+    );
+    let sig_alpha_edge = frame_edge(sig_alpha_id, &alpha_sym_id, FrameResolution::Resolved, 0);
+    // The tombstone that deletes the frame-resolution EDGE by its own record id.
+    let frame_edge_tombstone = GraphRecord::Tombstone {
+        id: "codegraph:v5:tombstone_frame_edge".to_owned(),
+        schema_version: SCHEMA_VERSION,
+        deleted_id: sig_alpha_edge.id().to_owned(),
+        summary: "frame resolution binding was retracted".to_owned(),
+        producer: None,
+    };
+
+    let mut graph = Graph::new();
+    for r in [
+        alpha_file,
+        alpha_sym,
+        sig_alpha,
+        sig_alpha_edge,
+        frame_edge_tombstone,
+    ] {
+        graph.push(r);
+    }
+
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+    (temp, path)
+}
+
+#[test]
+fn query_subsystem_tombstoned_frame_edge_excluded_from_log_signatures() {
+    let (_temp, graph) = fixture_subsystem_tombstoned_frame_edge();
+    let parsed = run_subsystem("src/alpha", &graph);
+
+    // The signature's only frame binding is a tombstoned FRAME_RESOLVES_TO edge:
+    // the deletion gate must drop the frame, so no signature surfaces.
+    let sigs = parsed["log_signatures"]
+        .as_array()
+        .expect("log_signatures array");
+    assert!(
+        sigs.is_empty(),
+        "a signature whose only frame binding is a tombstoned FRAME_RESOLVES_TO \
+         edge must not appear in log_signatures, got {sigs:?}"
+    );
+
+    // The (still-live) target must not leak through the unresolved section either.
+    let unresolved = parsed["unresolved"].as_array().expect("unresolved array");
+    assert!(
+        unresolved.iter().all(|u| {
+            u["target_handle"] != "codegraph:v4:intsublog_alpha_sym001"
+                && u["source_record_id"] != "log:v1:sig_alpha"
+        }),
+        "tombstoned frame-edge binding must not surface in unresolved: {unresolved:?}"
     );
 }

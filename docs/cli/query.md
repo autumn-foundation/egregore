@@ -300,6 +300,103 @@ verification domains without leaving the shared store.
 
 ---
 
+## eg query subsystem
+
+Return every known cross-domain fact for a repository-relative directory / module
+prefix in one trust-separated envelope (issue #83): code facts, agent
+observations, project state, artifacts, verification evidence, semantic drift,
+runtime error signatures, and unresolved evidence links.
+
+```text
+eg query subsystem <PREFIX> --graph <PATH> [--format json|text]
+eg query subsystem <PREFIX> --data-dir <DIR> [--format json|text]
+```
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `<PREFIX>` | yes | Repository-relative directory / module prefix, e.g. `src/adapters`. |
+| `--graph <PATH>` | one of `--graph` / `--data-dir` | Graph JSONL produced by `eg scan`, `eg scan-history`, `eg scan-logs`, and/or `eg resolve-frames`, concatenated. |
+| `--data-dir <DIR>` | one of `--graph` / `--data-dir` | Embedded store directory (transaction-time-current view). |
+| `--format` | no | `json` (default) or `text`. |
+
+### Prefix matching
+
+Matching is **segment-aware**: `src/alpha` matches `src/alpha` and
+`src/alpha/foo.rs` but never `src/alphabet/x.rs`. Both `src/alpha` and
+`src/alpha/` normalize identically.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | At least one record resolved under the prefix. |
+| `1` | `malformed_prefix` — the prefix is empty or reduces to nothing after stripping trailing slashes. |
+| `2` | `no_match` — no records found under the prefix. |
+
+### Envelope sections
+
+The JSON envelope carries `ok`, `prefix`, and the trust-separated sections
+`source_facts`, `topology_edges`, `observations`, `project_state`, `artifacts`,
+`verification_evidence`, `semantic_drift`, `log_signatures`, `unresolved`, and
+`excluded`. `log_signatures` and `unresolved` are **always present** (`[]` when
+empty); `topology_edges` and `excluded` are omitted when empty.
+
+### `log_signatures` (issue #325)
+
+Runtime `ErrorSignature` records (from `eg scan-logs` #320, resolved to code by
+`eg resolve-frames` #322) whose backtrace frames land under the prefix.
+
+**Scope rule (frozen).** A signature appears iff at least one of its
+`FRAME_RESOLVES_TO` edges carries a `resolved` **or** `path_only` resolution
+whose code-graph target's `repo_relative_path` passes the same segment-aware
+prefix matcher used everywhere else in this lane. A signature whose only
+in-prefix frames are `ambiguous` or `unresolved` never enters `log_signatures`;
+its dangling frame targets surface through the `unresolved` section instead, so
+they are never silently dropped. Sibling paths never bleed: a signature
+resolving into `src/alphabet` never appears for `src/alpha`.
+
+Rows are coalesced by stable signature ID (a graph combining multiple
+`scan-logs` outputs carries the same signature ID once per source): earliest
+`first_seen`, latest `last_seen`, summed `occurrence_count`. Rows sort by
+`record_id` and output is byte-identical across runs.
+
+| Field | Type | Always present | Description |
+|-------|------|----------------|-------------|
+| `record_id` | string | yes | Stable `ErrorSignature` record ID (`log:v1:…`). |
+| `kind` | string | yes | Always `"ErrorSignature"`. |
+| `trust_class` | string | yes | Always `"runtime_observation"`. |
+| `schema_version` | number | yes | Log-domain schema version. |
+| `severity` | string | yes | Closed severity class: `fatal` / `error` / `warn`. |
+| `occurrence_count` | number | yes | Total occurrences summed across scanned sources. |
+| `template_excerpt` | string | yes | Bounded, post-redaction template excerpt — the only permitted message text; never raw log text. |
+| `first_seen_valid_time` | string | when recorded | Valid time of the earliest occurrence. |
+| `last_seen_valid_time` | string | when recorded | Valid time of the latest occurrence. |
+| `resolved_frames` | array | yes | In-prefix resolved frames, each with `frame_index`, `frame_resolution` (`resolved` / `path_only`), `target_repo_relative_path`, and (for a `Symbol` target) `target_span`. |
+
+**Rows are leads, not proof.** A signature is a producing program's own claim,
+deterministically parsed but never verified; a frame binding proves the frame
+*names* the symbol, never that the symbol is at fault. An empty `log_signatures`
+means "no scanned source resolved here", **not** "no errors exist".
+
+`occurrence_count` reflects the **scanned log sources only**, not all runtime
+reality: counts sum across the sources you scanned, and re-scanning the same log
+inflates them (issue #361). Over `--graph` (concatenated JSONL) duplicate-ID
+signatures from distinct sources are coalesced here; over `--data-dir` the
+embedded store already retains one record per stable log ID (last-write-wins),
+so cross-scan coalescing is not reconstructable there — combine `scan-logs`
+outputs at the `--graph` level or use per-source stores for multi-scan
+aggregation (issue #363).
+
+**When to use vs `eg query error-context` (#324).** Use `subsystem` for
+directory-first triage ("what's happening under `src/adapters`?"); use
+`error-context` (when available) for error-first triage ("what does this
+signature touch?"). This lane is the health report; `error-context` is the
+error's neighborhood.
+
+---
+
 ## eg query symbol
 
 Find `Symbol` nodes by name.
