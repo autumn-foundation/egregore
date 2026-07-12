@@ -216,6 +216,7 @@ fn frame_edge(
         temporal: None,
         summary: format!("frame {frame_index} of {signature_id} resolves to {target_id}"),
         producer: None,
+        basis: None,
     }
 }
 
@@ -233,6 +234,7 @@ fn log_edge(label: EdgeLabel, source: &str, target: &str, summary: &str) -> Grap
         temporal: None,
         summary: summary.to_owned(),
         producer: None,
+        basis: None,
     }
 }
 
