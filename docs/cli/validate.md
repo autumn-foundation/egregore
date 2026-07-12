@@ -187,7 +187,7 @@ spans, and counts.
 {"code":"orphan_node","record_id":"codegraph:v5:…","kind":"Symbol","repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
 {"code":"tombstone_strands_live_edge","tombstone_id":"codegraph:v5:…","deleted_id":"codegraph:v5:…","stranded_edge_ids":["codegraph:v5:…"],"repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
 {"code":"missing_log_structural_edge","relation":"CAPTURED_FROM","record_id":"log:v1:…","kind":"LogEvent","repo_relative_path":"app.log","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
-{"code":"duplicate_log_structural_edge","relation":"CAPTURED_FROM","stranded_edge_ids":["log:v1:…","log:v1:…"],"record_id":"log:v1:…","kind":"LogEvent","repo_relative_path":"app.log","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
+{"code":"duplicate_log_structural_edge","relation":"FINGERPRINTED_AS","stranded_edge_ids":["log:v1:…","log:v1:…"],"record_id":"log:v1:…","kind":"LogEvent","repo_relative_path":"app.log","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
 ```
 
 The final stdout line is always a machine-readable summary:
