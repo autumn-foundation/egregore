@@ -2644,6 +2644,9 @@ const PROJECT_NODE_KINDS: &[NodeKind] = &[
     NodeKind::GitHubIssue,
     NodeKind::PR,
     NodeKind::Review,
+    // Source-system participant identity (issue #335); carries only a login +
+    // system and is keyed on `(system, login)`.
+    NodeKind::ExternalIdentity,
     NodeKind::LocalTask,
     // Importer diagnostics are valid project records; they carry entity_id == id
     // and valid_time == transaction_time so partial imports remain ingestible.
@@ -2654,6 +2657,11 @@ const PROJECT_FULL_NODE_KINDS: &[NodeKind] = &[
     NodeKind::Task,
     NodeKind::AcceptanceCriterion,
     NodeKind::ExternalLink,
+    // Source-system participant identity (issue #335): a login-less or
+    // system-less identity node is not a citable identity, so it must clear a
+    // required-field check before a REVIEWED_BY/REQUESTED_REVIEW_FROM edge can
+    // bind to it.
+    NodeKind::ExternalIdentity,
 ];
 
 const PROJECT_EDGE_LABELS: &[EdgeLabel] = &[
@@ -2663,6 +2671,8 @@ const PROJECT_EDGE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::TouchesFile,
     EdgeLabel::MergedAs,
     EdgeLabel::ReviewsCommit,
+    EdgeLabel::ReviewedBy,
+    EdgeLabel::RequestedReviewFrom,
     EdgeLabel::MentionsSymbol,
 ];
 
@@ -2699,6 +2709,8 @@ fn validate_project_domain_records(
                 url,
                 system_native_id,
                 discovered_at,
+                author,
+                identity_system,
                 valid_time,
                 valid_time_source,
                 transaction_time,
@@ -2716,6 +2728,7 @@ fn validate_project_domain_records(
                             | NodeKind::GitHubIssue
                             | NodeKind::PR
                             | NodeKind::Review
+                            | NodeKind::ExternalIdentity
                             | NodeKind::LocalTask
                     );
                 if !is_project {
@@ -2796,6 +2809,10 @@ fn validate_project_domain_records(
                         url.as_deref(),
                         system_native_id.as_deref(),
                         discovered_at.as_deref(),
+                    )?,
+                    NodeKind::ExternalIdentity => validate_project_external_identity(
+                        author.as_deref(),
+                        identity_system.as_deref(),
                     )?,
                     _ => {}
                 }
@@ -3304,6 +3321,22 @@ fn validate_project_external_link(
     )
 }
 
+/// Required-field check for a `project.ExternalIdentity` node (issue #335).
+///
+/// A source-system participant identity is keyed on `(identity_system, author)`,
+/// where `author` carries the plaintext login. A login-less or system-less node
+/// is not a citable identity — accepting one would let a later
+/// `REVIEWED_BY`/`REQUESTED_REVIEW_FROM` edge bind to an anonymous target and
+/// break the reviewer-identity joins. Require both before persistence.
+fn validate_project_external_identity(
+    author: Option<&str>,
+    identity_system: Option<&str>,
+) -> WriteResult<()> {
+    required_str(author, "ExternalIdentity.author")?;
+    required_str(identity_system, "ExternalIdentity.identity_system")?;
+    Ok(())
+}
+
 fn validate_project_ref(
     field: &'static str,
     value: &str,
@@ -3352,7 +3385,7 @@ fn validate_project_verification_ref(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn validate_project_edge(
     edge_id: &str,
     schema_version: u32,
@@ -3438,6 +3471,34 @@ fn validate_project_edge(
                 &[from_kind],
                 target_kind,
                 &[NodeKind::Commit],
+            )?;
+            require_project_edge_source_kind(
+                edge_id,
+                label,
+                source,
+                from_source_kind,
+                records,
+                sink,
+            )?;
+        }
+        // Reviewer-identity edges (issue #335). REVIEWED_BY originates from a
+        // `github_review` Review; REQUESTED_REVIEW_FROM from a `github_pr` Task.
+        // Both target an ExternalIdentity, and both require the FROM node's
+        // importer source_kind so a forged/mistyped node can never mint a
+        // reviewer-identity binding.
+        EdgeLabel::ReviewedBy | EdgeLabel::RequestedReviewFrom => {
+            let (from_kind, from_source_kind) = if label == EdgeLabel::ReviewedBy {
+                (NodeKind::Review, "github_review")
+            } else {
+                (NodeKind::Task, "github_pr")
+            };
+            validate_project_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                &[from_kind],
+                target_kind,
+                &[NodeKind::ExternalIdentity],
             )?;
             require_project_edge_source_kind(
                 edge_id,
@@ -4247,7 +4308,9 @@ pub fn validate_agent_memory_record_for_cli(
                 | EdgeLabel::ExternalHandle
                 | EdgeLabel::TouchesFile
                 | EdgeLabel::MergedAs
-                | EdgeLabel::ReviewsCommit => {
+                | EdgeLabel::ReviewsCommit
+                | EdgeLabel::ReviewedBy
+                | EdgeLabel::RequestedReviewFrom => {
                     anyhow::bail!(
                         "evidence link relation '{}' is project-only and must be written as a project edge",
                         edge_label.as_str()
@@ -6487,6 +6550,8 @@ fn validate_agent_memory_edge_endpoints(
             | EdgeLabel::TouchesFile
             | EdgeLabel::MergedAs
             | EdgeLabel::ReviewsCommit
+            | EdgeLabel::ReviewedBy
+            | EdgeLabel::RequestedReviewFrom
     ) {
         return Err(ApiError::bad_request(format!(
             "agent-memory edge '{edge_id}' label '{}' is project-only; use a project:v1: edge",
@@ -7019,7 +7084,9 @@ fn validate_and_synthesize_evidence_edges(
                         | EdgeLabel::ExternalHandle
                         | EdgeLabel::TouchesFile
                         | EdgeLabel::MergedAs
-                        | EdgeLabel::ReviewsCommit => {
+                        | EdgeLabel::ReviewsCommit
+                        | EdgeLabel::ReviewedBy
+                        | EdgeLabel::RequestedReviewFrom => {
                             return Err(ApiError::bad_request(format!(
                                 "evidence link relation '{}' is project-only and must be written as a project edge",
                                 edge_label.as_str()

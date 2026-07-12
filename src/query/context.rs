@@ -94,7 +94,12 @@ pub(super) const fn classify_node(kind: NodeKind) -> Option<ContextSection> {
         | NodeKind::AcceptanceCriterion
         | NodeKind::LocalTask
         | NodeKind::GitHubIssue
-        | NodeKind::PR => Some(ContextSection::ProjectState),
+        | NodeKind::PR
+        // Reviewer-identity join (issue #335): a Review row surfaces in the
+        // project-state section, and the ExternalIdentity reached via
+        // REVIEWED_BY / REQUESTED_REVIEW_FROM carries the participant login.
+        | NodeKind::Review
+        | NodeKind::ExternalIdentity => Some(ContextSection::ProjectState),
         // artifact domain
         NodeKind::Artifact | NodeKind::PatchArtifact | NodeKind::FileEdit => {
             Some(ContextSection::Artifact)
@@ -1164,3 +1169,125 @@ pub fn record_context<'a>(records: &'a [GraphRecord], anchor_id: &str) -> Symbol
 }
 
 // ── semantic → context bridge (issue #90) ──────────────────────────────────
+
+#[cfg(test)]
+mod reviewer_identity_tests {
+    use super::*;
+    use crate::ir::{EvidenceLink, PROJECT_SCHEMA_VERSION};
+
+    fn sym(name: &str) -> GraphRecord {
+        GraphRecord::node(
+            format!("codegraph:v5:{name}"),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    fn project_node(id: &str, kind: NodeKind, login: Option<&str>) -> GraphRecord {
+        let mut rec = GraphRecord::node(
+            id.to_owned(),
+            kind,
+            None,
+            None,
+            None,
+            format!("{} node", kind.as_str()),
+        );
+        if let GraphRecord::Node {
+            schema_version,
+            domain,
+            author,
+            identity_system,
+            ..
+        } = &mut rec
+        {
+            *schema_version = PROJECT_SCHEMA_VERSION;
+            *domain = Some("project".to_owned());
+            if kind == NodeKind::ExternalIdentity {
+                *author = login.map(str::to_owned);
+                *identity_system = Some("github".to_owned());
+            }
+        }
+        rec
+    }
+
+    fn id_for(login: &str) -> String {
+        crate::github::records::external_identity_id("github", login)
+    }
+
+    fn ev_link_to(target: &str) -> EvidenceLink {
+        EvidenceLink {
+            target_record_id: Some(target.to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }
+    }
+
+    #[test]
+    fn symbol_context_surfaces_reviewer_identity_via_reviewed_by_and_requested_review_from() {
+        // Issue #335: a symbol's project-state context includes the reviewer
+        // identities reachable via REVIEWED_BY (from a Review that cites the
+        // symbol) and REQUESTED_REVIEW_FROM (from a Task that mentions it).
+        let foo = sym("foo");
+        let foo_id = foo.id().to_owned();
+
+        // Task that mentions the symbol; requests review from "alice".
+        let task = project_node("project:v1:task", NodeKind::Task, None);
+        let id_alice = project_node(&id_for("alice"), NodeKind::ExternalIdentity, Some("alice"));
+        let mentions = GraphRecord::project_edge(
+            EdgeLabel::MentionsSymbol,
+            task.id().to_owned(),
+            foo_id.clone(),
+            Some("1.0".to_owned()),
+            "task mentions foo".to_owned(),
+        );
+        let requested = GraphRecord::project_edge(
+            EdgeLabel::RequestedReviewFrom,
+            task.id().to_owned(),
+            id_alice.id().to_owned(),
+            None,
+            "requested review".to_owned(),
+        );
+
+        // Review that cites the symbol via evidence_link; authored by "bob".
+        let mut review = project_node("project:v1:review", NodeKind::Review, None);
+        review = review.with_evidence_links(vec![ev_link_to(&foo_id)]);
+        let id_bob = project_node(&id_for("bob"), NodeKind::ExternalIdentity, Some("bob"));
+        let reviewed = GraphRecord::project_edge(
+            EdgeLabel::ReviewedBy,
+            review.id().to_owned(),
+            id_bob.id().to_owned(),
+            None,
+            "review by bob".to_owned(),
+        );
+
+        let records = vec![
+            foo, task, id_alice, mentions, requested, review, id_bob, reviewed,
+        ];
+        let ctx = symbol_context(&records, "foo");
+        let project_ids: Vec<&str> = ctx.project_state.iter().map(|r| r.id()).collect();
+
+        assert!(
+            project_ids.contains(&id_for("alice").as_str()),
+            "requested-reviewer identity must surface: {project_ids:?}"
+        );
+        assert!(
+            project_ids.contains(&id_for("bob").as_str()),
+            "review-author identity must surface: {project_ids:?}"
+        );
+
+        // Byte-stable across repeated runs.
+        for _ in 0..5 {
+            let again = symbol_context(&records, "foo");
+            let ids: Vec<&str> = again.project_state.iter().map(|r| r.id()).collect();
+            assert_eq!(ids, project_ids, "project_state must be byte-stable");
+        }
+    }
+}

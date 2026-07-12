@@ -3013,24 +3013,1122 @@ fn upgraded_v2_store_reemits_review_anchors_when_pull_list_unchanged() {
         "both review anchors (summary + comment) re-emit their REVIEWS_COMMIT edge"
     );
 
-    // Idempotency of every OTHER domain is preserved on the same run: the PR list
-    // and seed are unchanged, so no MERGED_AS re-emits and no stale artifact is
-    // tombstoned, and the unchanged issue/PR Tasks do not re-emit.
-    assert_eq!(
-        edges_of_label(&j2, "MERGED_AS"),
-        0,
-        "unchanged seed must NOT spuriously re-emit MERGED_AS (preserved pr:10 hash)"
-    );
+    // Issue #335 changed the migration to a FULL refresh: v2/v3 → v4 clears every
+    // per-resource hash (not just the review-family ones), because the #335
+    // reviewer-identity facts re-use the unchanged #334 review-hash formula, so a
+    // preserved hash would MATCH and suppress the new REVIEWED_BY /
+    // REQUESTED_REVIEW_FROM edges. So on the migrated run EVERY issue, PR, and
+    // review re-emits exactly once. The seed graph is unchanged, so no artifact is
+    // superseded and none is tombstoned (prior == current merge artifact).
     assert!(
         tombstones334(&j2).is_empty(),
         "no artifact is tombstoned when the seed graph is unchanged: {j2}"
     );
-    let reemitted_tasks: Vec<String> = nodes_of_kind(&j2, "Task")
+    // The PR Task re-emits on the full refresh (its cleared hash forces it), so its
+    // MERGED_AS edge re-emits too — byte-identical, deduped by the store.
+    assert_eq!(
+        edges_of_label(&j2, "MERGED_AS"),
+        1,
+        "the full v4 refresh re-emits the PR and its MERGED_AS edge"
+    );
+    assert!(
+        !nodes_of_kind(&j2, "Task").is_empty(),
+        "the v4 migration is a full refresh: every Task re-emits once"
+    );
+}
+
+// ── Issue #335: reviewer identity ────────────────────────────────────────────
+
+/// Extracts the `author` login from every `ExternalIdentity` node in the JSONL.
+fn identity_logins(jsonl: &str) -> Vec<String> {
+    nodes_of_kind(jsonl, "ExternalIdentity")
         .into_iter()
-        .map(|t| t["summary"].as_str().unwrap_or("").to_owned())
+        .filter_map(|v| v["author"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The reviewer-identity fixture (issue #335, AC8): two PRs exercising the
+/// segregation-of-duties cases with >=5 distinct logins.
+///
+/// - PR #1 author `carol`; requests review from `dave` + `erin` and team
+///   `backend`; approved by NON-author `dave`. `carol` leaves NO review and NO
+///   comment — her `ExternalIdentity` is minted purely from `pr.user` (issue
+///   #335, AC1; Codex P2), which is exactly what the segregation-of-duties join
+///   needs (a citable author identity to subtract from the approver set).
+/// - PR #2 author `frank`; requests review from `grace`; approved by author
+///   `frank` (self-approval).
+///
+/// Distinct logins: carol, dave, erin, frank, grace (5). `backend` is a team,
+/// recorded as a diagnostic, never a login. `carol` and `frank` appear as
+/// identities solely by authoring their PRs.
+fn reviewer_identity_routes() -> HashMap<String, Canned> {
+    let pulls = serde_json::json!([
+        {
+            "number": 1, "title": "PR one", "body": null, "state": "closed",
+            "merged_at": "2026-01-05T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "carol"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-05T00:00:00Z",
+            "requested_reviewers": [{"login": "dave"}, {"login": "erin"}],
+            "requested_teams": [{"slug": "backend"}],
+            "html_url": "https://github.com/o/r/pull/1"
+        },
+        {
+            "number": 2, "title": "PR two", "body": null, "state": "closed",
+            "merged_at": "2026-01-06T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "frank"},
+            "created_at": "2026-01-02T00:00:00Z", "updated_at": "2026-01-06T00:00:00Z",
+            "requested_reviewers": [{"login": "grace"}],
+            "requested_teams": [],
+            "html_url": "https://github.com/o/r/pull/2"
+        }
+    ])
+    .to_string();
+    let reviews_1 = serde_json::json!([
+        {
+            "id": 901, "body": "LGTM", "state": "APPROVED", "user": {"login": "dave"},
+            "submitted_at": "2026-01-04T00:00:00Z",
+            "html_url": "https://github.com/o/r/pull/1#pullrequestreview-901"
+        }
+    ])
+    .to_string();
+    let reviews_2 = serde_json::json!([
+        {
+            "id": 902, "body": "self approve", "state": "APPROVED", "user": {"login": "frank"},
+            "submitted_at": "2026-01-05T00:00:00Z",
+            "html_url": "https://github.com/o/r/pull/2#pullrequestreview-902"
+        }
+    ])
+    .to_string();
+    // The PR author (carol) leaves no comment: her identity must come from
+    // `pr.user`, not a conversation comment (Codex P2).
+    let issue_comments = "[]".to_owned();
+
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/repos/o/r".to_owned(),
+        Canned::ok("{\"full_name\":\"o/r\"}", "\"repo\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues?state=all&per_page=100".to_owned(),
+        Canned::ok("[]", "\"issues-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, "\"pulls-335\""),
+    );
+    routes.insert(
+        "/repos/o/r/labels?per_page=100".to_owned(),
+        Canned::ok("[]", "\"labels-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues/comments?per_page=100".to_owned(),
+        Canned::ok(&issue_comments, "\"ic-335\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"prc-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/1/reviews?per_page=100".to_owned(),
+        Canned::ok(&reviews_1, "\"prr-1\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/2/reviews?per_page=100".to_owned(),
+        Canned::ok(&reviews_2, "\"prr-2\""),
+    );
+    routes
+}
+
+#[test]
+fn fresh_import_emits_reviewer_identities_edges_and_team_diagnostic() {
+    let server = MockServer::start(reviewer_identity_routes());
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("g.jsonl");
+    let state = tmp.path().join("state.json");
+    let (jsonl, _stderr, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok, "import should succeed");
+
+    // Exactly one identity node per distinct login (carol, dave, erin, frank, grace).
+    let mut logins = identity_logins(&jsonl);
+    logins.sort();
+    logins.dedup();
+    let mut all_logins = identity_logins(&jsonl);
+    all_logins.sort();
+    assert_eq!(
+        all_logins, logins,
+        "each (system, login) is minted exactly once: {all_logins:?}"
+    );
+    assert_eq!(
+        logins,
+        vec!["carol", "dave", "erin", "frank", "grace"],
+        "5 distinct participant identities, backend team excluded"
+    );
+
+    // REVIEWED_BY: one per emitted review (2 pr_review approvals; the authors
+    // carol/frank leave no review or comment).
+    assert_eq!(
+        edges_of_label(&jsonl, "REVIEWED_BY"),
+        2,
+        "one REVIEWED_BY per emitted review (2 approvals, no comments)"
+    );
+    // REQUESTED_REVIEW_FROM: dave, erin (PR#1) + grace (PR#2) = 3.
+    assert_eq!(
+        edges_of_label(&jsonl, "REQUESTED_REVIEW_FROM"),
+        3,
+        "one REQUESTED_REVIEW_FROM per requested reviewer login"
+    );
+
+    // The requested TEAM is a diagnostic, never a login, never expanded.
+    let team_diag = nodes_of_kind(&jsonl, "Diagnostic")
+        .into_iter()
+        .filter(|v| {
+            v["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("github_team_review_request_unexpanded"))
+        })
+        .count();
+    assert_eq!(
+        team_diag, 1,
+        "the requested team is recorded as one diagnostic"
+    );
+    assert!(
+        !logins.contains(&"backend".to_owned()),
+        "a team is never expanded into a member identity"
+    );
+
+    // Segregation of duties (AC8): compute {approving identity} minus {author}.
+    // PR #1: author carol, approved by dave → self_approval == false.
+    // PR #2: author frank, approved by frank → self_approval == true.
+    let carol_id = identity_id_of(&jsonl, "carol");
+    let frank_id = identity_id_of(&jsonl, "frank");
+    // Both author identities are citable and byte-stable (Codex P2): carol's
+    // node exists SOLELY because she authored PR #1 (she left no review/comment
+    // and is not a requested reviewer), so the id equals the one minted from any
+    // other source for the same login.
+    assert_eq!(
+        carol_id,
+        aletheia_egregore::github::records::external_identity_id("github", "carol"),
+        "carol's author identity id is the stable (system, login) id"
+    );
+    assert!(
+        !jsonl
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| v["record_type"] == "edge"
+                && (v["label"] == "REVIEWED_BY" || v["label"] == "REQUESTED_REVIEW_FROM")
+                && v["target"].as_str() == Some(&carol_id)),
+        "carol is neither a reviewer nor a requested reviewer: her identity comes only from pr.user"
+    );
+    let pr1_approvers = reviewed_by_identity_ids_for_pr(&jsonl, 1);
+    let pr2_approvers = reviewed_by_identity_ids_for_pr(&jsonl, 2);
+    // {approving identities} minus {author identity} is computable in both cases.
+    assert!(
+        !pr1_approvers.contains(&carol_id),
+        "PR#1 (non-author approval) must NOT be flagged as self-approval"
+    );
+    assert_eq!(
+        pr1_approvers
+            .difference(&std::collections::BTreeSet::from([carol_id]))
+            .count(),
+        pr1_approvers.len(),
+        "author id subtracts cleanly from PR#1's approver set (no false self-approval)"
+    );
+    assert!(
+        pr2_approvers.contains(&frank_id),
+        "PR#2 (author-approved-own-PR) must be flagged as self-approval"
+    );
+
+    // Byte-stable across 5 consecutive runs (a fresh store + state each time).
+    for i in 0..5 {
+        let out_n = tmp.path().join(format!("g_{i}.jsonl"));
+        let state_n = tmp.path().join(format!("state_{i}.json"));
+        let (jn, _, okn) = run_import(&server.base_url, &out_n, &state_n, &[]);
+        assert!(okn);
+        assert_eq!(
+            jn, jsonl,
+            "import output must be byte-identical across runs"
+        );
+    }
+
+    // `eg inspect` counts the identities under (project, ExternalIdentity, 1).
+    let inspect = egregore()
+        .args(["inspect", out.to_str().unwrap()])
+        .env_remove("PATH")
+        .env_remove("Path")
+        .output()
+        .expect("inspect runs");
+    let inspect_out = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        inspect_out.contains("ExternalIdentity"),
+        "inspect must count ExternalIdentity nodes: {inspect_out}"
+    );
+}
+
+#[test]
+fn changed_requested_reviewers_reemit_but_unchanged_pr_stays_suppressed() {
+    // AC5/idempotency: a PR whose requested-reviewer set changes re-emits its
+    // REQUESTED_REVIEW_FROM edges; an unchanged PR stays suppressed on re-import.
+    let server = MockServer::start(reviewer_identity_routes());
+    let tmp = TempDir::new().unwrap();
+    let out1 = tmp.path().join("g1.jsonl");
+    let state = tmp.path().join("state.json");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    assert_eq!(edges_of_label(&j1, "REQUESTED_REVIEW_FROM"), 3);
+
+    // Re-import unchanged → nothing re-emits (no new request edges).
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(&server.base_url, &out2, &state, &[]);
+    assert!(ok2);
+    assert_eq!(
+        edges_of_label(&j2, "REQUESTED_REVIEW_FROM"),
+        0,
+        "an unchanged PR must not re-emit its request edges"
+    );
+
+    // Change PR #1's requested reviewers (drop erin, add heidi) + bump updated_at.
+    let mut routes = reviewer_identity_routes();
+    let pulls = serde_json::json!([
+        {
+            "number": 1, "title": "PR one", "body": null, "state": "closed",
+            "merged_at": "2026-01-05T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "carol"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-07T00:00:00Z",
+            "requested_reviewers": [{"login": "dave"}, {"login": "heidi"}],
+            "requested_teams": [{"slug": "backend"}],
+            "html_url": "https://github.com/o/r/pull/1"
+        },
+        {
+            "number": 2, "title": "PR two", "body": null, "state": "closed",
+            "merged_at": "2026-01-06T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "frank"},
+            "created_at": "2026-01-02T00:00:00Z", "updated_at": "2026-01-06T00:00:00Z",
+            "requested_reviewers": [{"login": "grace"}],
+            "requested_teams": [],
+            "html_url": "https://github.com/o/r/pull/2"
+        }
+    ])
+    .to_string();
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, "\"pulls-335-v2\""),
+    );
+    server.set_routes(routes);
+
+    let out3 = tmp.path().join("g3.jsonl");
+    let (j3, _, ok3) = run_import(&server.base_url, &out3, &state, &[]);
+    assert!(ok3);
+    // PR #1 re-emits its 2 request edges (dave, heidi); PR #2 unchanged → 0.
+    assert_eq!(
+        edges_of_label(&j3, "REQUESTED_REVIEW_FROM"),
+        2,
+        "the changed PR re-emits its request edges; the unchanged PR does not"
+    );
+    assert!(
+        identity_logins(&j3).contains(&"heidi".to_owned()),
+        "the newly-requested reviewer identity is minted"
+    );
+}
+
+/// The stable `ExternalIdentity` record id for a `github` login, read from the
+/// emitted JSONL (matches `external_identity_id`).
+fn identity_id_of(jsonl: &str, login: &str) -> String {
+    nodes_of_kind(jsonl, "ExternalIdentity")
+        .into_iter()
+        .find(|v| v["author"].as_str() == Some(login))
+        .and_then(|v| v["id"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("identity for {login} must exist"))
+}
+
+/// The set of identity record ids that APPROVED PR `n` (reached by `REVIEWED_BY`
+/// from `pr_review` `Review` nodes whose `review_state` is `approved`).
+///
+/// This deliberately excludes non-approving reviews such as the PR author's
+/// conversation comment (an `issue_comment` Review), so the segregation-of-duties
+/// computation `{approving identities} minus {author identity}` is exact.
+fn reviewed_by_identity_ids_for_pr(jsonl: &str, n: u64) -> std::collections::BTreeSet<String> {
+    let pr_task = pr_task(jsonl, n);
+    let task_id = pr_task["id"].as_str().unwrap().to_owned();
+    // Approving review record ids: reviews with review_state == "approved".
+    let approving_review_ids: std::collections::BTreeSet<String> = nodes_of_kind(jsonl, "Review")
+        .into_iter()
+        .filter(|v| v["review_state"].as_str() == Some("approved"))
+        .filter_map(|v| v["id"].as_str().map(str::to_owned))
+        .collect();
+    // Of those, the ones referencing this PR's Task.
+    let review_ids: std::collections::BTreeSet<String> = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| {
+            v["record_type"] == "edge"
+                && v["label"] == "REFERENCES_TASK"
+                && v["target"].as_str() == Some(&task_id)
+                && v["source"]
+                    .as_str()
+                    .is_some_and(|s| approving_review_ids.contains(s))
+        })
+        .filter_map(|v| v["source"].as_str().map(str::to_owned))
+        .collect();
+    jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| {
+            v["record_type"] == "edge"
+                && v["label"] == "REVIEWED_BY"
+                && v["source"].as_str().is_some_and(|s| review_ids.contains(s))
+        })
+        .filter_map(|v| v["target"].as_str().map(str::to_owned))
+        .collect()
+}
+
+// ── Issue #335 (Codex P1): removed requested reviewers are tombstoned ─────────
+//
+// The importer emits `REQUESTED_REVIEW_FROM` edges for the reviewers CURRENTLY
+// in a PR's `requested_reviewers`. When that set shrinks (a reviewer approves,
+// the PR merges/closes, or a reviewer is manually removed) the importer is
+// otherwise purely additive, so the previously-emitted edge for the removed
+// reviewer would linger LIVE in a persistent store and downstream queries would
+// still report the removed reviewer as "requested". The changed set must retract
+// each dropped reviewer's edge via a `Tombstone(deleted_id == edge_id)`,
+// mirroring the #333/#334 supersession discipline — and only the edge, never the
+// global `ExternalIdentity` node and never any immutable `REVIEWED_BY` edge.
+
+/// The `REQUESTED_REVIEW_FROM` edge record id linking PR `n`'s `Task` to
+/// `login`'s `ExternalIdentity`, read from the emitted JSONL.
+fn request_edge_id_for(jsonl: &str, n: u64, login: &str) -> String {
+    let task_id = pr_task(jsonl, n)["id"].as_str().unwrap().to_owned();
+    let identity_id = identity_id_of(jsonl, login);
+    jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| {
+            v["record_type"] == "edge"
+                && v["label"] == "REQUESTED_REVIEW_FROM"
+                && v["source"].as_str() == Some(&task_id)
+                && v["target"].as_str() == Some(&identity_id)
+        })
+        .and_then(|v| v["id"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("REQUESTED_REVIEW_FROM edge for {login} on PR#{n} must exist"))
+}
+
+/// `reviewer_identity_routes` with PR #1's requested reviewers, `updated_at`, and
+/// the `/pulls` `ETag` overridden — so a re-import can shrink or grow the request
+/// set while PR #2 stays byte-identical.
+fn reviewer_routes_pr1(
+    reviewers: &[&str],
+    updated_at: &str,
+    pulls_etag: &str,
+) -> HashMap<String, Canned> {
+    let mut routes = reviewer_identity_routes();
+    let reviewer_json: Vec<serde_json::Value> = reviewers
+        .iter()
+        .map(|l| serde_json::json!({ "login": l }))
+        .collect();
+    let pulls = serde_json::json!([
+        {
+            "number": 1, "title": "PR one", "body": null, "state": "closed",
+            "merged_at": "2026-01-05T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "carol"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": updated_at,
+            "requested_reviewers": reviewer_json,
+            "requested_teams": [{"slug": "backend"}],
+            "html_url": "https://github.com/o/r/pull/1"
+        },
+        {
+            "number": 2, "title": "PR two", "body": null, "state": "closed",
+            "merged_at": "2026-01-06T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "frank"},
+            "created_at": "2026-01-02T00:00:00Z", "updated_at": "2026-01-06T00:00:00Z",
+            "requested_reviewers": [{"login": "grace"}],
+            "requested_teams": [],
+            "html_url": "https://github.com/o/r/pull/2"
+        }
+    ])
+    .to_string();
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, pulls_etag),
+    );
+    routes
+}
+
+#[test]
+fn removed_requested_reviewer_edge_is_tombstoned_survivor_and_identity_untouched() {
+    let server = MockServer::start(reviewer_identity_routes());
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+
+    // 1. Fresh import: PR #1 requests [dave, erin], PR #2 requests [grace] → 3
+    //    REQUESTED_REVIEW_FROM edges. Capture erin's edge id and identity id.
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    assert_eq!(edges_of_label(&j1, "REQUESTED_REVIEW_FROM"), 3);
+    let erin_edge_id = request_edge_id_for(&j1, 1, "erin");
+    let erin_identity_id = identity_id_of(&j1, "erin");
+
+    // 2. Re-import with erin dropped from PR #1 (now [dave] only). The removed
+    //    reviewer's edge must be retracted via exactly one Tombstone; dave's edge
+    //    stays live; PR #2 is unchanged.
+    server.set_routes(reviewer_routes_pr1(
+        &["dave"],
+        "2026-01-07T00:00:00Z",
+        "\"pulls-335-drop-erin\"",
+    ));
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(&server.base_url, &out2, &state, &[]);
+    assert!(ok2);
+
+    let ts = tombstones(&j2);
+    assert_eq!(
+        ts.len(),
+        1,
+        "exactly one Tombstone (erin's removed request edge) must be emitted: {j2}"
+    );
+    assert_eq!(
+        ts[0]["deleted_id"].as_str(),
+        Some(erin_edge_id.as_str()),
+        "the Tombstone must retract erin's REQUESTED_REVIEW_FROM edge id"
+    );
+    // The surviving reviewer's edge is re-emitted live; PR #2 stays suppressed.
+    assert_eq!(
+        edges_of_label(&j2, "REQUESTED_REVIEW_FROM"),
+        1,
+        "only the surviving reviewer (dave) re-emits a live request edge"
+    );
+    let dave_id = identity_id_of(&j1, "dave");
+    assert!(
+        j2.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| v["record_type"] == "edge"
+                && v["label"] == "REQUESTED_REVIEW_FROM"
+                && v["target"].as_str() == Some(&dave_id)),
+        "dave's request edge stays live: {j2}"
+    );
+    // The global ExternalIdentity node is NEVER tombstoned (a login persists
+    // across PRs), and no immutable REVIEWED_BY edge is tombstoned.
+    assert!(
+        !ts.iter()
+            .any(|t| t["deleted_id"].as_str() == Some(erin_identity_id.as_str())),
+        "erin's ExternalIdentity node must NOT be tombstoned"
+    );
+    let reviewed_by_ids: std::collections::BTreeSet<String> = j1
+        .lines()
+        .chain(j2.lines())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["record_type"] == "edge" && v["label"] == "REVIEWED_BY")
+        .filter_map(|v| v["id"].as_str().map(str::to_owned))
         .collect();
     assert!(
-        reemitted_tasks.is_empty(),
-        "unchanged issue/PR Tasks must NOT re-emit on the migrated run: {reemitted_tasks:?}"
+        !ts.iter().any(|t| t["deleted_id"]
+            .as_str()
+            .is_some_and(|d| reviewed_by_ids.contains(d))),
+        "no REVIEWED_BY edge may be tombstoned"
+    );
+}
+
+#[test]
+fn re_requested_reviewer_edge_is_revived_and_unchanged_import_emits_no_tombstones() {
+    let server = MockServer::start(reviewer_identity_routes());
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+
+    // 1. Fresh import: PR #1 requests [dave, erin].
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    let erin_edge_id = request_edge_id_for(&j1, 1, "erin");
+
+    // 2. Drop erin → erin's edge is tombstoned.
+    server.set_routes(reviewer_routes_pr1(
+        &["dave"],
+        "2026-01-07T00:00:00Z",
+        "\"pulls-335-drop\"",
+    ));
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(&server.base_url, &out2, &state, &[]);
+    assert!(ok2);
+    assert!(
+        tombstones(&j2)
+            .iter()
+            .any(|t| t["deleted_id"].as_str() == Some(erin_edge_id.as_str())),
+        "dropping erin tombstones her request edge"
+    );
+
+    // 3. Unchanged re-import (same [dave] payload, forced 200 via a new ETag):
+    //    the reviewer set is identical, so NO tombstone is emitted and no request
+    //    edge re-emits (idempotency / AC8).
+    server.set_routes(reviewer_routes_pr1(
+        &["dave"],
+        "2026-01-07T00:00:00Z",
+        "\"pulls-335-drop-again\"",
+    ));
+    let out3 = tmp.path().join("g3.jsonl");
+    let (j3, _, ok3) = run_import(&server.base_url, &out3, &state, &[]);
+    assert!(ok3);
+    assert_eq!(
+        tombstones(&j3).len(),
+        0,
+        "an unchanged reviewer set emits zero tombstones: {j3}"
+    );
+    assert_eq!(
+        edges_of_label(&j3, "REQUESTED_REVIEW_FROM"),
+        0,
+        "an unchanged reviewer set re-emits no request edges"
+    );
+
+    // 4. Re-request erin ([dave, erin] again): her edge is REVIVED — re-emitted
+    //    live with the SAME stable id — and, because nothing was removed, no new
+    //    tombstone fires. The embedded adapter's write_edge revive-after-tombstone
+    //    (a fresh edge write post-dating the tombstone) then supersedes the
+    //    tombstone in a persistent store.
+    server.set_routes(reviewer_routes_pr1(
+        &["dave", "erin"],
+        "2026-01-08T00:00:00Z",
+        "\"pulls-335-readd\"",
+    ));
+    let out4 = tmp.path().join("g4.jsonl");
+    let (j4, _, ok4) = run_import(&server.base_url, &out4, &state, &[]);
+    assert!(ok4);
+    assert_eq!(
+        request_edge_id_for(&j4, 1, "erin"),
+        erin_edge_id,
+        "the revived edge carries the same stable id"
+    );
+    assert_eq!(
+        edges_of_label(&j4, "REQUESTED_REVIEW_FROM"),
+        2,
+        "both reviewers (dave, erin) re-emit live edges on the re-request"
+    );
+    assert!(
+        !tombstones(&j4)
+            .iter()
+            .any(|t| t["deleted_id"].as_str() == Some(erin_edge_id.as_str())),
+        "re-requesting erin emits no fresh tombstone for her edge: {j4}"
+    );
+}
+
+// ── Issue #335 (Codex P2): removed requested teams are tombstoned ─────────────
+//
+// The importer emits one `github_team_review_request_unexpanded` Diagnostic per
+// team CURRENTLY in a PR's `requested_teams` — the exact sibling of the
+// REQUESTED_REVIEW_FROM edge case above, and with the exact same staleness gap.
+// When that team set shrinks (a team is removed or replaced) the importer is
+// otherwise purely additive, so the previously-emitted diagnostic for the removed
+// team would linger LIVE in a persistent store and current-state queries would
+// still report the removed team's review request. The changed set must retract
+// each dropped team's diagnostic via a `Tombstone(deleted_id == diagnostic_id)`,
+// mirroring the reviewer-edge supersession discipline — and only the team
+// diagnostic, never a reviewer edge, identity node, or REVIEWED_BY edge.
+
+/// The `github_team_review_request_unexpanded` Diagnostic record id for team
+/// `slug` on PR `n`, read from the emitted JSONL.
+fn team_diagnostic_id_for(jsonl: &str, n: u64, slug: &str) -> String {
+    let needle_pr = format!("PR #{n} ");
+    let needle_team = format!("team '{slug}'");
+    nodes_of_kind(jsonl, "Diagnostic")
+        .into_iter()
+        .find(|v| {
+            v["summary"].as_str().is_some_and(|s| {
+                s.contains("github_team_review_request_unexpanded")
+                    && s.contains(&needle_pr)
+                    && s.contains(&needle_team)
+            })
+        })
+        .and_then(|v| v["id"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("team diagnostic for {slug} on PR#{n} must exist"))
+}
+
+/// Count of live `github_team_review_request_unexpanded` Diagnostic nodes in the
+/// JSONL (across all PRs).
+fn team_diagnostic_count(jsonl: &str) -> usize {
+    nodes_of_kind(jsonl, "Diagnostic")
+        .into_iter()
+        .filter(|v| {
+            v["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("github_team_review_request_unexpanded"))
+        })
+        .count()
+}
+
+/// The tombstones whose own summary marks them as team-diagnostic supersessions.
+fn team_tombstones(jsonl: &str) -> Vec<serde_json::Value> {
+    tombstones(jsonl)
+        .into_iter()
+        .filter(|t| {
+            t["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("team_review_request_superseded"))
+        })
+        .collect()
+}
+
+/// `reviewer_identity_routes` with PR #1's requested TEAMS, `updated_at`, and the
+/// `/pulls` `ETag` overridden — reviewers stay [dave, erin] so the team set can be
+/// shrunk or grown while the reviewer edges stay constant and PR #2 stays
+/// byte-identical.
+fn reviewer_routes_pr1_teams(
+    teams: &[&str],
+    updated_at: &str,
+    pulls_etag: &str,
+) -> HashMap<String, Canned> {
+    let mut routes = reviewer_identity_routes();
+    let team_json: Vec<serde_json::Value> = teams
+        .iter()
+        .map(|s| serde_json::json!({ "slug": s }))
+        .collect();
+    let pulls = serde_json::json!([
+        {
+            "number": 1, "title": "PR one", "body": null, "state": "closed",
+            "merged_at": "2026-01-05T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "carol"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": updated_at,
+            "requested_reviewers": [{"login": "dave"}, {"login": "erin"}],
+            "requested_teams": team_json,
+            "html_url": "https://github.com/o/r/pull/1"
+        },
+        {
+            "number": 2, "title": "PR two", "body": null, "state": "closed",
+            "merged_at": "2026-01-06T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "frank"},
+            "created_at": "2026-01-02T00:00:00Z", "updated_at": "2026-01-06T00:00:00Z",
+            "requested_reviewers": [{"login": "grace"}],
+            "requested_teams": [],
+            "html_url": "https://github.com/o/r/pull/2"
+        }
+    ])
+    .to_string();
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, pulls_etag),
+    );
+    routes
+}
+
+#[test]
+fn removed_requested_team_diagnostic_is_tombstoned_survivor_and_reviewers_untouched() {
+    let server = MockServer::start(reviewer_routes_pr1_teams(
+        &["backend", "frontend"],
+        "2026-01-05T00:00:00Z",
+        "\"pulls-335-teams-both\"",
+    ));
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+
+    // 1. Fresh import: PR #1 requests teams [backend, frontend] → 2 team
+    //    diagnostics. Capture backend's diagnostic id.
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    assert_eq!(team_diagnostic_count(&j1), 2, "two team diagnostics: {j1}");
+    let backend_diag_id = team_diagnostic_id_for(&j1, 1, "backend");
+    let frontend_diag_id = team_diagnostic_id_for(&j1, 1, "frontend");
+
+    // 2. Re-import with backend dropped from PR #1 (now [frontend] only). The
+    //    removed team's diagnostic must be retracted via exactly one Tombstone;
+    //    frontend's diagnostic stays live; reviewers/identities are untouched.
+    server.set_routes(reviewer_routes_pr1_teams(
+        &["frontend"],
+        "2026-01-07T00:00:00Z",
+        "\"pulls-335-teams-drop-backend\"",
+    ));
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(&server.base_url, &out2, &state, &[]);
+    assert!(ok2);
+
+    let team_ts = team_tombstones(&j2);
+    assert_eq!(
+        team_ts.len(),
+        1,
+        "exactly one team Tombstone (backend's removed diagnostic) must be emitted: {j2}"
+    );
+    assert_eq!(
+        team_ts[0]["deleted_id"].as_str(),
+        Some(backend_diag_id.as_str()),
+        "the Tombstone must retract backend's team-review diagnostic id"
+    );
+    // No REQUESTED_REVIEW_FROM edge is tombstoned — only the team diagnostic.
+    assert_eq!(
+        tombstones(&j2).len(),
+        1,
+        "only the team diagnostic is tombstoned, no reviewer edge: {j2}"
+    );
+    // The surviving team's diagnostic is re-emitted live with its same stable id.
+    assert_eq!(
+        team_diagnostic_id_for(&j2, 1, "frontend"),
+        frontend_diag_id,
+        "the surviving team's diagnostic keeps its stable id"
+    );
+    assert_eq!(
+        team_diagnostic_count(&j2),
+        1,
+        "only the surviving team (frontend) re-emits a live diagnostic: {j2}"
+    );
+    // Reviewers on PR #1 are unchanged, so their identities and edges re-emit
+    // exactly as before and none is tombstoned.
+    assert_eq!(
+        edges_of_label(&j2, "REQUESTED_REVIEW_FROM"),
+        2,
+        "both reviewers (dave, erin) re-emit their live edges; none is tombstoned"
+    );
+    let dave_edge = request_edge_id_for(&j1, 1, "dave");
+    let erin_edge = request_edge_id_for(&j1, 1, "erin");
+    assert!(
+        !tombstones(&j2).iter().any(|t| {
+            let d = t["deleted_id"].as_str();
+            d == Some(dave_edge.as_str()) || d == Some(erin_edge.as_str())
+        }),
+        "no reviewer edge may be tombstoned: {j2}"
+    );
+}
+
+#[test]
+fn re_requested_team_diagnostic_is_revived_and_unchanged_import_emits_no_team_tombstones() {
+    let server = MockServer::start(reviewer_routes_pr1_teams(
+        &["backend", "frontend"],
+        "2026-01-05T00:00:00Z",
+        "\"pulls-335-teams-both-2\"",
+    ));
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+
+    // 1. Fresh import: PR #1 requests teams [backend, frontend].
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    let backend_diag_id = team_diagnostic_id_for(&j1, 1, "backend");
+
+    // 2. Drop backend → backend's diagnostic is tombstoned.
+    server.set_routes(reviewer_routes_pr1_teams(
+        &["frontend"],
+        "2026-01-07T00:00:00Z",
+        "\"pulls-335-teams-drop\"",
+    ));
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(&server.base_url, &out2, &state, &[]);
+    assert!(ok2);
+    assert!(
+        team_tombstones(&j2)
+            .iter()
+            .any(|t| t["deleted_id"].as_str() == Some(backend_diag_id.as_str())),
+        "dropping backend tombstones its team diagnostic"
+    );
+
+    // 3. Unchanged re-import (same [frontend] payload, forced 200 via a new ETag):
+    //    the team set is identical, so NO team tombstone is emitted and no team
+    //    diagnostic re-emits (idempotency).
+    server.set_routes(reviewer_routes_pr1_teams(
+        &["frontend"],
+        "2026-01-07T00:00:00Z",
+        "\"pulls-335-teams-drop-again\"",
+    ));
+    let out3 = tmp.path().join("g3.jsonl");
+    let (j3, _, ok3) = run_import(&server.base_url, &out3, &state, &[]);
+    assert!(ok3);
+    assert_eq!(
+        team_tombstones(&j3).len(),
+        0,
+        "an unchanged team set emits zero team tombstones: {j3}"
+    );
+    assert_eq!(
+        team_diagnostic_count(&j3),
+        0,
+        "an unchanged team set re-emits no team diagnostics"
+    );
+
+    // 4. Re-request backend ([backend, frontend] again): its diagnostic is
+    //    REVIVED — re-emitted live with the SAME stable id — and, because nothing
+    //    was removed, no new team tombstone fires. The embedded adapter's
+    //    revive-after-tombstone (a fresh node write post-dating the tombstone)
+    //    then supersedes the tombstone in a persistent store.
+    server.set_routes(reviewer_routes_pr1_teams(
+        &["backend", "frontend"],
+        "2026-01-08T00:00:00Z",
+        "\"pulls-335-teams-readd\"",
+    ));
+    let out4 = tmp.path().join("g4.jsonl");
+    let (j4, _, ok4) = run_import(&server.base_url, &out4, &state, &[]);
+    assert!(ok4);
+    assert_eq!(
+        team_diagnostic_id_for(&j4, 1, "backend"),
+        backend_diag_id,
+        "the revived team diagnostic carries the same stable id"
+    );
+    assert_eq!(
+        team_diagnostic_count(&j4),
+        2,
+        "both teams (backend, frontend) re-emit live diagnostics on the re-request"
+    );
+    assert!(
+        !team_tombstones(&j4)
+            .iter()
+            .any(|t| t["deleted_id"].as_str() == Some(backend_diag_id.as_str())),
+        "re-requesting backend emits no fresh tombstone for its diagnostic: {j4}"
+    );
+}
+
+#[test]
+fn changing_both_reviewers_and_teams_tombstones_both() {
+    // Bonus combined case: a PR that changes BOTH its reviewer set and its team
+    // set on one re-import must tombstone the removed reviewer's edge AND the
+    // removed team's diagnostic — the two supersession lanes are independent.
+    let server = MockServer::start(reviewer_routes_pr1_teams(
+        &["backend", "frontend"],
+        "2026-01-05T00:00:00Z",
+        "\"pulls-335-both-lanes\"",
+    ));
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state.json");
+
+    let out1 = tmp.path().join("g1.jsonl");
+    let (j1, _, ok1) = run_import(&server.base_url, &out1, &state, &[]);
+    assert!(ok1);
+    let erin_edge_id = request_edge_id_for(&j1, 1, "erin");
+    let backend_diag_id = team_diagnostic_id_for(&j1, 1, "backend");
+
+    // Drop erin (reviewers → [dave]) AND drop backend (teams → [frontend]).
+    let mut routes = reviewer_routes_pr1_teams(
+        &["frontend"],
+        "2026-01-09T00:00:00Z",
+        "\"pulls-335-both-lanes-v2\"",
+    );
+    let pulls = serde_json::json!([
+        {
+            "number": 1, "title": "PR one", "body": null, "state": "closed",
+            "merged_at": "2026-01-05T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "carol"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-09T00:00:00Z",
+            "requested_reviewers": [{"login": "dave"}],
+            "requested_teams": [{"slug": "frontend"}],
+            "html_url": "https://github.com/o/r/pull/1"
+        },
+        {
+            "number": 2, "title": "PR two", "body": null, "state": "closed",
+            "merged_at": "2026-01-06T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "frank"},
+            "created_at": "2026-01-02T00:00:00Z", "updated_at": "2026-01-06T00:00:00Z",
+            "requested_reviewers": [{"login": "grace"}],
+            "requested_teams": [],
+            "html_url": "https://github.com/o/r/pull/2"
+        }
+    ])
+    .to_string();
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, "\"pulls-335-both-lanes-v2\""),
+    );
+    server.set_routes(routes);
+
+    let out2 = tmp.path().join("g2.jsonl");
+    let (j2, _, ok2) = run_import(&server.base_url, &out2, &state, &[]);
+    assert!(ok2);
+
+    let ts = tombstones(&j2);
+    assert!(
+        ts.iter()
+            .any(|t| t["deleted_id"].as_str() == Some(erin_edge_id.as_str())),
+        "erin's removed request edge is tombstoned: {j2}"
+    );
+    assert!(
+        ts.iter()
+            .any(|t| t["deleted_id"].as_str() == Some(backend_diag_id.as_str())),
+        "backend's removed team diagnostic is tombstoned: {j2}"
+    );
+    assert_eq!(
+        ts.len(),
+        2,
+        "exactly two tombstones: one reviewer edge + one team diagnostic: {j2}"
+    );
+}
+
+// ── Issue #335 (Codex P2): PR-author identities are minted from `pr.user` ──────
+//
+// A PR whose author never appears as a requested reviewer, review author, or
+// commenter still needs a citable `ExternalIdentity` so the segregation-of-duties
+// join (match the PR `Task.author` login to the approver identity set) has an
+// author identity to compare against. The author identity is minted from
+// `pr.user` — NODE ONLY, no authorship edge — and deduplicated one-per-login by
+// the run's identity seen-set, so an author who is ALSO a reviewer/requested
+// reviewer still yields exactly one identity node.
+
+/// Fixture exercising the author-identity source (issue #335, Codex P2):
+///
+/// - PR #10 author `ivan` — a login that appears ONLY as `pr.user` (no review,
+///   no comment, not a requested reviewer); requests review from `dave`, approved
+///   by `dave`.
+/// - PR #11 author `dave` — `dave` is simultaneously a requested reviewer AND a
+///   review author (both on PR #10) AND a PR author (PR #11), so his identity is
+///   minted from three sources and MUST collapse to exactly one node.
+///
+/// Distinct identities: `ivan`, `dave` (2).
+fn author_identity_routes() -> HashMap<String, Canned> {
+    let pulls = serde_json::json!([
+        {
+            "number": 10, "title": "PR ten", "body": null, "state": "closed",
+            "merged_at": "2026-01-05T00:00:00Z", "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "ivan"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-05T00:00:00Z",
+            "requested_reviewers": [{"login": "dave"}],
+            "requested_teams": [],
+            "html_url": "https://github.com/o/r/pull/10"
+        },
+        {
+            "number": 11, "title": "PR eleven", "body": null, "state": "open",
+            "merged_at": null, "draft": false, "labels": [],
+            "assignees": [], "user": {"login": "dave"},
+            "created_at": "2026-01-02T00:00:00Z", "updated_at": "2026-01-06T00:00:00Z",
+            "requested_reviewers": [],
+            "requested_teams": [],
+            "html_url": "https://github.com/o/r/pull/11"
+        }
+    ])
+    .to_string();
+    let reviews_10 = serde_json::json!([
+        {
+            "id": 910, "body": "LGTM", "state": "APPROVED", "user": {"login": "dave"},
+            "submitted_at": "2026-01-04T00:00:00Z",
+            "html_url": "https://github.com/o/r/pull/10#pullrequestreview-910"
+        }
+    ])
+    .to_string();
+
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/repos/o/r".to_owned(),
+        Canned::ok("{\"full_name\":\"o/r\"}", "\"repo\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues?state=all&per_page=100".to_owned(),
+        Canned::ok("[]", "\"issues-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls?state=all&per_page=100".to_owned(),
+        Canned::ok(&pulls, "\"pulls-335-author\""),
+    );
+    routes.insert(
+        "/repos/o/r/labels?per_page=100".to_owned(),
+        Canned::ok("[]", "\"labels-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/issues/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"ic-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/comments?per_page=100".to_owned(),
+        Canned::ok("[]", "\"prc-empty\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/10/reviews?per_page=100".to_owned(),
+        Canned::ok(&reviews_10, "\"prr-10\""),
+    );
+    routes.insert(
+        "/repos/o/r/pulls/11/reviews?per_page=100".to_owned(),
+        Canned::ok("[]", "\"prr-11\""),
+    );
+    routes
+}
+
+#[test]
+fn pr_author_only_login_gets_one_identity_from_pr_user() {
+    let server = MockServer::start(author_identity_routes());
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("g.jsonl");
+    let state = tmp.path().join("state.json");
+    let (jsonl, _stderr, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok, "import should succeed");
+
+    // `ivan` appears ONLY as pr.user, yet has exactly one citable identity with
+    // the stable (system, login) id.
+    let ivan_nodes: Vec<_> = nodes_of_kind(&jsonl, "ExternalIdentity")
+        .into_iter()
+        .filter(|v| v["author"].as_str() == Some("ivan"))
+        .collect();
+    assert_eq!(
+        ivan_nodes.len(),
+        1,
+        "the author-only login ivan gets exactly one ExternalIdentity node"
+    );
+    assert_eq!(
+        ivan_nodes[0]["id"].as_str(),
+        Some(aletheia_egregore::github::records::external_identity_id("github", "ivan").as_str()),
+        "ivan's author identity id is the stable (system, login) id"
+    );
+    // NODE ONLY: no edge references ivan (he authored no review and is not a
+    // requested reviewer), so his identity exists solely because of pr.user.
+    let ivan_id = aletheia_egregore::github::records::external_identity_id("github", "ivan");
+    assert!(
+        !jsonl
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| v["record_type"] == "edge"
+                && (v["source"].as_str() == Some(&ivan_id)
+                    || v["target"].as_str() == Some(&ivan_id))),
+        "no edge references the author-only identity: {jsonl}"
+    );
+
+    // Segregation of duties: PR #10 approvers ({dave}) minus author ({ivan}) is
+    // computable, and ivan is NOT in the approver set (non-self-approval).
+    let ivan_task_author = pr_task(&jsonl, 10)["author"].as_str().map(str::to_owned);
+    assert_eq!(
+        ivan_task_author.as_deref(),
+        Some("ivan"),
+        "the PR Task carries the author login the identity is minted from"
+    );
+    let pr10_approvers = reviewed_by_identity_ids_for_pr(&jsonl, 10);
+    assert!(
+        !pr10_approvers.contains(&ivan_id),
+        "PR#10 non-author approval is not flagged as self-approval"
+    );
+
+    // Byte-stable across 5 fresh runs.
+    for i in 0..5 {
+        let out_n = tmp.path().join(format!("g_{i}.jsonl"));
+        let state_n = tmp.path().join(format!("state_{i}.json"));
+        let (jn, _, okn) = run_import(&server.base_url, &out_n, &state_n, &[]);
+        assert!(okn);
+        assert_eq!(
+            jn, jsonl,
+            "import output must be byte-identical across runs"
+        );
+    }
+}
+
+#[test]
+fn author_who_is_also_reviewer_and_review_author_yields_one_identity() {
+    // `dave` is a requested reviewer (PR #10), a review author (PR #10 approval),
+    // AND a PR author (PR #11). Despite three identity sources, the run's identity
+    // seen-set must collapse him to exactly ONE ExternalIdentity node — zero
+    // duplicates — so byte-stability and idempotency hold.
+    let server = MockServer::start(author_identity_routes());
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("g.jsonl");
+    let state = tmp.path().join("state.json");
+    let (jsonl, _stderr, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok, "import should succeed");
+
+    let dave_nodes = nodes_of_kind(&jsonl, "ExternalIdentity")
+        .into_iter()
+        .filter(|v| v["author"].as_str() == Some("dave"))
+        .count();
+    assert_eq!(
+        dave_nodes, 1,
+        "a login that is author + reviewer + requested reviewer dedups to ONE identity node"
+    );
+
+    // Exactly two distinct identities overall (ivan, dave), each minted once.
+    let mut logins = identity_logins(&jsonl);
+    let total = logins.len();
+    logins.sort();
+    logins.dedup();
+    assert_eq!(
+        logins,
+        vec!["dave", "ivan"],
+        "two distinct participant identities"
+    );
+    assert_eq!(
+        total,
+        logins.len(),
+        "no duplicate identity nodes across the run"
     );
 }

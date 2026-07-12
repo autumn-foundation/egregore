@@ -226,9 +226,13 @@ state. `resource_hashes` provides that storage: it maps `"issue:<n>"` or
 (**all fields that can affect the emitted `Task` or `ExternalLink`:**
 `number`, `state`, `state_reason`, `title`, `body`, `labels`, `assignees`,
 `milestone` (full object), `updated_at`, `closed_at`, and PR-specific fields
-`merged_at`, `draft`, `head.sha`, `head.ref`, `base.ref`, `merge_commit_sha`;
-omitting any of these fields from the hash means a change to that field is
-permanently missed on re-import). For a PR the hash **also** folds in the
+`merged_at`, `draft`, `head.sha`, `head.ref`, `base.ref`, `merge_commit_sha`,
+the requested-review inputs `requested_reviewers` (logins) and `requested_teams`
+(slugs), and the PR **author** login `user.login` (issue #335 — minted as an
+`ExternalIdentity` and stored as `Task.author`, so an author account rename with
+every other field unchanged must re-emit the PR to mint the new identity and
+update `Task.author`); omitting any of these fields from the hash means a change
+to that field is permanently missed on re-import). For a PR the hash **also** folds in the
 `MERGED_AS` merge-link **resolution outcome** against the current seeded
 `--code-graph` (issue #333): the target `Commit` record ID when the
 `merge_commit_sha` resolves, or a stable `unresolved` / `ambiguous:<count>` /
@@ -289,6 +293,31 @@ field is `#[serde(default)]` and is **not** part of a `STATE_SCHEMA_VERSION` bum
 a state file written before it loads normally with an empty map (an absent prior
 reads as "no known artifact" and emits no tombstone), avoiding a heavy full
 refetch that a version bump would force.
+
+**Prior requested-reviewer tracking (`pr_request_edges`, issue #335, Codex
+P1):** the state file also maps `"pr:<n>"` to the sorted **set of
+`REQUESTED_REVIEW_FROM` edge record IDs** the PR emitted last run — its "prior
+request set". On a re-import whose requested-reviewer set **shrank**, the importer
+emits a `requested_review_superseded` `Tombstone` retracting each dropped edge
+before persisting the new set (see §6, "`REQUESTED_REVIEW_FROM` removal
+lifecycle"), so a persistent store never reports a removed reviewer as still
+"requested". An empty current set clears the entry. The field is
+`#[serde(default)]` (an empty `Vec<String>` map) and is **not** its own
+`STATE_SCHEMA_VERSION` bump: a state file written before it loads normally with an
+empty map (an absent prior reads as "no known edges" and emits no tombstone).
+
+**Prior requested-team tracking (`pr_team_diagnostics`, issue #335, Codex P2):**
+the exact sibling of `pr_request_edges` for the team lane. The state file also maps
+`"pr:<n>"` to the sorted **set of `github_team_review_request_unexpanded`
+`Diagnostic` record IDs** the PR emitted last run — its "prior team set". On a
+re-import whose `requested_teams` set **shrank**, the importer emits a
+`team_review_request_superseded` `Tombstone` retracting each dropped team diagnostic
+before persisting the new set (see §6, "REQUESTED team-diagnostic removal
+lifecycle"), so a persistent store never reports a removed team's review request as
+still live. An empty current set clears the entry. The field is `#[serde(default)]`
+(an empty `Vec<String>` map) and is **not** its own `STATE_SCHEMA_VERSION` bump: a
+state file written before it loads normally with an empty map (an absent prior reads
+as "no known diagnostics" and emits no tombstone).
 
 **Deferred endpoint ETag rule:** The v1 importer MUST NOT store ETags for
 deferred comment/review endpoints (`/issues/comments`, `/pulls/comments`,
@@ -539,11 +568,91 @@ Because reviews now emit a new field + edge that a cached review `ETag` could hi
 the state-schema version is bumped (see §5 idempotency), forcing exactly one full
 refresh on the first upgraded run.
 
+**Reviewer identity — `ExternalIdentity` node + `REVIEWED_BY` /
+`REQUESTED_REVIEW_FROM` edges (issue #335):** every review author, every
+requested reviewer, and **every PR author** is minted as one
+`project.ExternalIdentity` node keyed on
+`(system, login)` alone (see §9) — carrying ONLY the login (in `author`) and
+`identity_system: "github"`, never email, display name, avatar, or profile URL.
+
+**PR-author identity from `pr.user` (issue #335, AC1):** a PR `Task` carries its
+author login (`pr.user.login`), and that login is minted as an
+`ExternalIdentity` **node** — no authorship edge (the node alone is the citable
+fact; the segregation-of-duties join matches `Task.author` to the identity of
+that login). This closes the case where a PR author never appears as a requested
+reviewer, review author, or commenter and would otherwise have no citable author
+identity to subtract from the approver set. An empty author login mints nothing.
+Because identity nodes dedupe on `(system, login)`, an author who is also a
+reviewer or requested reviewer still yields exactly one node.
+
+| Edge | FROM | TO | Meaning |
+|------|------|----|---------|
+| `REVIEWED_BY` | `project.Review` (`source_kind: github_review`) | `project.ExternalIdentity` | The review was authored by this participant. |
+| `REQUESTED_REVIEW_FROM` | `project.Task` (`source_kind: github_pr`) | `project.ExternalIdentity` | The PR requested review from this participant. |
+
+Every emitted `Review` (all review kinds) gains exactly one `REVIEWED_BY` to its
+author's identity. Each individual requested reviewer on a PR (`requested_reviewers`
+in the already-fetched `/pulls` payload — no new endpoint) yields one
+`REQUESTED_REVIEW_FROM` edge to that login's identity. A requested TEAM
+(`requested_teams`) is **never expanded to member logins**: it is recorded as a
+`github_team_review_request_unexpanded` project `Diagnostic` carrying the team
+slug and the PR `Task` id — never silently dropped. Both edges are directly-
+submitted **project-domain edges** carrying `project:v1:` identity and are
+validated by the daemon like `MERGED_AS`/`REVIEWS_COMMIT` (the FROM node's importer
+`source_kind` is required; both terminate at `ExternalIdentity` ONLY). The daemon
+additionally requires every `ExternalIdentity` node to carry a non-empty `author`
+(login) and `identity_system` before it is accepted, so a reviewer edge can never
+bind to a login-less anonymous identity; the importer's own identity nodes always
+carry both. The offline `eg validate` gate enforces the same directions on the
+edges — `REVIEWED_BY` must originate from a `Review` and `REQUESTED_REVIEW_FROM`
+from a `Task` — reporting a wrong-source reviewer edge as an
+`edge_source_kind_violation` defect. Within one
+run each identity is minted exactly once (deduped on `(system, login)`); across
+runs the store's idempotency and the embedded read-back skip converge to one node
+per login. Identities derive **only** from GitHub payloads (no seed graph), and a
+PR whose requested-reviewer set changes re-emits its request edges via the PR
+change hash, while an unchanged PR stays suppressed. A `REVIEWED_BY` binding proves
+a review NAMES a participant, never a verdict; a `REQUESTED_REVIEW_FROM` is an
+invitation, never proof a review happened. Consumed by #338/#339; future
+beneficiaries #245 (ownership) and #262.
+
+**`REQUESTED_REVIEW_FROM` removal lifecycle (issue #335):** a PR emits one
+`REQUESTED_REVIEW_FROM` edge per reviewer currently in `requested_reviewers`, but
+that set **shrinks** whenever a reviewer approves, the PR merges/closes, or a
+reviewer is manually removed. Because the importer is otherwise purely additive, a
+removed reviewer's edge would linger live in a persistent store and downstream
+queries would still report them as "requested". So — mirroring the `MERGED_AS`
+(§6) and `REVIEWS_COMMIT` (above) supersession discipline — the importer persists
+the PR's prior request-edge set (`pr_request_edges` in §5's state file) and, on
+each change, emits a `requested_review_superseded` `Tombstone` naming each dropped
+edge via `deleted_id` **before** persisting the new set. The generic
+revive-after-tombstone rule applies: re-requesting a removed reviewer re-emits the
+**same** edge id, whose later, higher-sequence write supersedes the tombstone.
+Only the edge is retracted — the global `ExternalIdentity` node is **never**
+tombstoned (a login is a cross-PR fact), and an immutable `REVIEWED_BY` edge is
+never tombstoned (a review that happened is a fact; dismissals are #336's concern).
+
+**REQUESTED team-diagnostic removal lifecycle (issue #335, Codex P2):** the exact
+sibling of the `REQUESTED_REVIEW_FROM` removal lifecycle above, for the team lane. A
+PR emits one `github_team_review_request_unexpanded` `Diagnostic` per team currently
+in `requested_teams`, but that set **shrinks** whenever a team is removed or
+replaced. Because the importer is otherwise purely additive, a removed team's
+diagnostic would linger live in a persistent store and current-state queries would
+still report the removed team's review request. So — mirroring the reviewer-edge
+supersession discipline — the importer persists the PR's prior team-diagnostic set
+(`pr_team_diagnostics` in §5's state file) and, on each change, emits a
+`team_review_request_superseded` `Tombstone` naming each dropped diagnostic via
+`deleted_id` **before** persisting the new set. The generic revive-after-tombstone
+rule applies: re-requesting a removed team re-emits the **same** diagnostic id,
+whose later, higher-sequence node write supersedes the tombstone. Only the team
+diagnostic is retracted — never a `REQUESTED_REVIEW_FROM` edge, an `ExternalIdentity`
+node, or an immutable `REVIEWED_BY` edge.
+
 **`valid_time_source`:** All GitHub-sourced records use `github_updated_at`.
 **`source_kind`:** Issues use `github_issue`; PRs use `github_pr`; every `Review`
 node (issue_comment / pr_review / pr_review_comment) uses `github_review` — the
-daemon `REVIEWS_COMMIT` project-edge validator requires this exact source kind on
-the FROM node (issue #334).
+daemon `REVIEWS_COMMIT` and `REVIEWED_BY` project-edge validators require this exact
+source kind on the FROM node (issues #334/#335).
 
 ---
 
@@ -598,7 +707,9 @@ These GitHub fields pass through the redaction pipeline defined in
 
 Repo name, issue/PR number, state, author login, `created_at`, `updated_at`,
 `closed_at`, merge commit SHA, head/base branch names, review anchor commit SHA
-(`Review.review_commit_sha`, issue #334).
+(`Review.review_commit_sha`, issue #334), and participant identity login +
+system (`ExternalIdentity.author` + `ExternalIdentity.identity_system`, issue
+#335).
 
 **First-class plaintext PR `Task` fields (issue #333):** The six promoted flat
 `Task` fields — `head_sha`, `head_ref`, `base_ref`, `merge_commit_sha`,
@@ -617,6 +728,16 @@ as the #333 PR fields above: it is **deliberately NOT routed through redaction**
 is not listed in the sensitive-field index (`docs/schema/redaction.md`), and
 survives verbatim in a redaction-on export so review→commit anchors stay joinable
 and citable. `review_side` (LEFT/RIGHT) shares this treatment.
+
+**First-class plaintext `ExternalIdentity` (issue #335):** The participant login
+(`ExternalIdentity.author`) and source system (`ExternalIdentity.identity_system`)
+inherit the §8 author-login plaintext carve-out: a login is the same non-secret
+handle already carried plaintext on every `Task.author` / `Review.author`, so the
+identity node is **deliberately NOT routed through redaction**, is not listed in
+the sensitive-field index (`docs/schema/redaction.md`), and survives verbatim in a
+redaction-on export so reviewer-identity joins stay stable. The node carries no
+other identity attribute (no email, display name, avatar, or profile URL), so no
+new sensitive field is introduced.
 
 **Redacted body-stored metadata:** Milestone title (`Task.body_handle` field) is
 NOT in the plaintext carve-out. `Task.body_handle.inline` is a redactable field
@@ -658,6 +779,8 @@ Subkind identities:
 | Issue Comment `Review` | `"issue_comment:<n>:<comment_id>"` |
 | PR Review `Review` | `"pr_review:<n>:<review_id>"` |
 | PR Review Comment `Review` | `"pr_review_comment:<n>:<comment_id>"` |
+| `ExternalIdentity` (issue #335) | `project_stable_id(["project", "ExternalIdentity", "github", <login>])` — keyed on `(system, login)` ALONE, **deliberately NOT** using `source_repo` or `github_number`: a participant identity is global across repositories, so the same login in two repos maps to exactly one node. This is the one importer record whose ID is intentionally repo-independent. |
+| `github_team_review_request_unexpanded` `Diagnostic` (issue #335) | repo-scoped: `project_stable_id(["project", "Diagnostic", "github", <source_repo>, "pr:<n>", "github_team_review_request_unexpanded", <team_slug>])` |
 
 **Normative rule:** re-importing identical GitHub state produces byte-identical IDs.
 This is the idempotency invariant — if the ID changes between two runs for the
@@ -699,6 +822,9 @@ The test suite covers:
 | Review anchor resolve-or-diagnose (issue #334) | Zero/multiple `Commit` matches → `github_commit_unresolved` diagnostic (repo-scoped); absent `commit_id` → `github_review_unanchored`; `issue_comment` exempt (field absent, no diagnostic); SHA never fabricated |
 | Review anchor seed-graph invalidation (issue #334) | A code graph added/changed after import re-resolves review anchors across a would-be `304`; outcome change tombstones the superseded artifact; resolved→superseded→resolved revives; unchanged seed stays idempotent |
 | Review anchor redaction carve-out (issue #334) | `review_commit_sha` survives a redaction-on export in plaintext; never enumerated as sensitive |
+| Requested-reviewer removal lifecycle (issue #335) | A PR whose `requested_reviewers` shrinks tombstones each dropped `REQUESTED_REVIEW_FROM` edge (`requested_review_superseded`, `deleted_id == edge_id`); the surviving reviewer's edge stays live; the `ExternalIdentity` node and `REVIEWED_BY` edges are never tombstoned; removed→re-requested revives; an unchanged reviewer set emits zero tombstones |
+| Requested-team removal lifecycle (issue #335, Codex P2) | A PR whose `requested_teams` shrinks tombstones each dropped `github_team_review_request_unexpanded` `Diagnostic` (`team_review_request_superseded`, `deleted_id == diagnostic_id`); the surviving team's diagnostic stays live; no `REQUESTED_REVIEW_FROM` edge, `ExternalIdentity` node, or `REVIEWED_BY` edge is tombstoned; removed→re-requested revives; an unchanged team set emits zero tombstones; changing both reviewers and teams tombstones both |
+| PR-author identity from `pr.user` (issue #335, Codex P2) | A PR author who never appears as a requested reviewer, review author, or commenter still gets exactly one `ExternalIdentity` node minted from `pr.user` with the stable `(system, login)` id and NO authorship edge; an empty author login mints nothing; an author who is also a reviewer/requested reviewer dedupes to one node; the segregation-of-duties join (`{approver identities}` minus the `Task.author` identity) is computable with self-approval distinguishable from non-author approval |
 | Stderr summary | Documented fields present on every run |
 
 Implementation of behaviour tests is deferred to the `eg import github` CLI

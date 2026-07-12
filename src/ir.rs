@@ -1350,6 +1350,15 @@ pub enum GraphRecord {
         /// `None`.
         #[serde(skip_serializing_if = "Option::is_none")]
         review_commit_sha: Option<String>,
+        /// Source system for an `ExternalIdentity` node (issue #335). Always
+        /// `"github"` for importer-minted identities; the identity's `author`
+        /// field carries the login. Together `(identity_system, author)` are the
+        /// node's stable-identity parts. No email, display name, avatar, or
+        /// profile URL is ever stored. Plaintext query substrate per
+        /// `docs/schema/import-github.md` §8 (the author-login carve-out); never
+        /// redacted. Legacy records lacking the field deserialize to `None`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        identity_system: Option<String>,
         /// User-context domain fields, flattened into node JSON.
         #[serde(flatten)]
         user_context: UserContextFields,
@@ -1554,6 +1563,7 @@ impl GraphRecord {
             diff_hunk_handle: None,
             review_side: None,
             review_commit_sha: None,
+            identity_system: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -1676,6 +1686,7 @@ impl GraphRecord {
             diff_hunk_handle: None,
             review_side: None,
             review_commit_sha: None,
+            identity_system: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -1797,6 +1808,7 @@ impl GraphRecord {
             diff_hunk_handle: None,
             review_side: None,
             review_commit_sha: None,
+            identity_system: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -1923,6 +1935,7 @@ impl GraphRecord {
             diff_hunk_handle: None,
             review_side: None,
             review_commit_sha: None,
+            identity_system: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -2698,6 +2711,14 @@ pub enum NodeKind {
     PR,
     /// Review comment, finding, approval, or requested change (project domain, reserved).
     Review,
+    /// A source-system participant identity — a GitHub login (issue #335).
+    /// Project domain, trust class `project_state`. One node per distinct
+    /// `(system, login)` pair, keyed on those two parts alone (deliberately
+    /// NOT repo-scoped: identities are global across repositories). Carries
+    /// ONLY the login (in `author`) and `identity_system` — never email,
+    /// display name, avatar, or profile URL. Consumed by #338/#339;
+    /// beneficiaries #245/#262.
+    ExternalIdentity,
     /// Local project/task JSONL work item (project domain, reserved).
     LocalTask,
     /// File, patch, report, or generated output linked to work.
@@ -2803,6 +2824,7 @@ impl NodeKind {
             Self::GitHubIssue => "GitHubIssue",
             Self::PR => "PR",
             Self::Review => "Review",
+            Self::ExternalIdentity => "ExternalIdentity",
             Self::LocalTask => "LocalTask",
             Self::Artifact => "Artifact",
             Self::Verification => "Verification",
@@ -2905,6 +2927,16 @@ pub enum EdgeLabel {
     /// `Commit`. "Anchored at this SHA" is never "approved all changes in a
     /// range": it names the tree the review observed, not a verdict on it.
     ReviewsCommit,
+    /// Project `Review` was authored by a source-system `ExternalIdentity`
+    /// (issue #335). FROM `project.Review` TO `project.ExternalIdentity`;
+    /// emitted for every `Review` whose payload carries an author login. A
+    /// binding names who wrote the review, never a verdict on its content.
+    ReviewedBy,
+    /// Project PR `Task` requested review from a source-system
+    /// `ExternalIdentity` (issue #335). FROM `project.Task` TO
+    /// `project.ExternalIdentity`; one edge per requested-reviewer login on the
+    /// PR. A request is an invitation to review, never proof a review happened.
+    RequestedReviewFrom,
     /// Agent-memory node describes a failure on a code entity.
     FailedOn,
     /// Agent-memory node explains a code change.
@@ -2977,6 +3009,8 @@ impl EdgeLabel {
             "TOUCHES_FILE" => Some(Self::TouchesFile),
             "MERGED_AS" => Some(Self::MergedAs),
             "REVIEWS_COMMIT" => Some(Self::ReviewsCommit),
+            "REVIEWED_BY" => Some(Self::ReviewedBy),
+            "REQUESTED_REVIEW_FROM" => Some(Self::RequestedReviewFrom),
             "FAILED_ON" => Some(Self::FailedOn),
             "EXPLAINS_CHANGE" => Some(Self::ExplainsChange),
             "REFERENCES_TASK" => Some(Self::ReferencesTask),
@@ -3019,6 +3053,8 @@ impl EdgeLabel {
                 | Self::TouchesFile
                 | Self::MergedAs
                 | Self::ReviewsCommit
+                | Self::ReviewedBy
+                | Self::RequestedReviewFrom
                 | Self::FailedOn
                 | Self::ExplainsChange
                 | Self::ReferencesTask
@@ -3086,6 +3122,8 @@ impl EdgeLabel {
             Self::TouchesFile => "TOUCHES_FILE",
             Self::MergedAs => "MERGED_AS",
             Self::ReviewsCommit => "REVIEWS_COMMIT",
+            Self::ReviewedBy => "REVIEWED_BY",
+            Self::RequestedReviewFrom => "REQUESTED_REVIEW_FROM",
             Self::FailedOn => "FAILED_ON",
             Self::ExplainsChange => "EXPLAINS_CHANGE",
             Self::ReferencesTask => "REFERENCES_TASK",

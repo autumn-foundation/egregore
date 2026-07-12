@@ -3002,6 +3002,25 @@ fn project_review_json(id: &str, source_kind: &str) -> serde_json::Value {
     })
 }
 
+fn project_external_identity_json(id: &str, login: &str) -> serde_json::Value {
+    // Issue #335: a GitHub-imported ExternalIdentity node — only login (author)
+    // and system (identity_system).
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "ExternalIdentity",
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "domain": "project",
+        "entity_id": id,
+        "author": login,
+        "identity_system": "github",
+        "valid_time": "2026-05-18T05:49:32Z",
+        "valid_time_source": "github_updated_at",
+        "transaction_time": "2026-07-10T00:00:00Z",
+        "summary": format!("github identity {login}")
+    })
+}
+
 fn project_acceptance_criterion_json(
     id: &str,
     parent_task_id: &str,
@@ -4305,6 +4324,9 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::GitHubIssue
         | NodeKind::PR
         | NodeKind::Review
+        // Reviewer identity (issue #335), documented in
+        // docs/schema/project-graph.md + docs/schema/import-github.md.
+        | NodeKind::ExternalIdentity
         | NodeKind::LocalTask => "project-domain-reserved",
         // Reserved with one-line definitions in docs/schema/agent-memory.md §4b
         NodeKind::Artifact | NodeKind::CommandEvidence => "agent-memory-reserved",
@@ -4378,6 +4400,8 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::TouchesFile
         | EdgeLabel::MergedAs
         | EdgeLabel::ReviewsCommit
+        | EdgeLabel::ReviewedBy
+        | EdgeLabel::RequestedReviewFrom
         | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange
         | EdgeLabel::ReferencesTask
@@ -7199,6 +7223,298 @@ fn project_reviews_commit_rejects_non_github_review_source() {
                 if id == "project:v1:reviews-commit-bad-source-edge"
         )),
         "the rejected REVIEWS_COMMIT edge must not be persisted"
+    );
+}
+
+// Issue #335: the daemon must ACCEPT a REVIEWED_BY (Review→ExternalIdentity,
+// github_review source) and a REQUESTED_REVIEW_FROM (Task→ExternalIdentity,
+// github_pr source) project edge, and persist them with project:v1: identity.
+#[test]
+fn project_reviewer_identity_edges_are_accepted() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let review_id = "project:v1:test-review-rb";
+    let task_id = "project:v1:test-task-rrf";
+    let identity_id = "project:v1:test-identity-octocat";
+    let reviewed_by = serde_json::json!({
+        "record_type": "edge",
+        "id": "project:v1:reviewed-by-edge",
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "label": "REVIEWED_BY",
+        "source": review_id,
+        "target": identity_id,
+        "summary": "review authored by octocat"
+    });
+    let requested = serde_json::json!({
+        "record_type": "edge",
+        "id": "project:v1:requested-review-from-edge",
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "label": "REQUESTED_REVIEW_FROM",
+        "source": task_id,
+        "target": identity_id,
+        "summary": "requested review from octocat"
+    });
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-reviewer-identity-edges",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-reviewer-identity-edges-key",
+            "domain": "project",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": {
+                "records": [
+                    project_external_link_json(PROJECT_EXTERNAL_LINK_ID),
+                    project_review_json(review_id, "github_review"),
+                    project_task_json_with_source_kind(task_id, "open", "2026-07-10T00:00:00Z", "github_pr"),
+                    project_external_identity_json(identity_id, "octocat"),
+                    reviewed_by,
+                    requested
+                ]
+            }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "reviewer-identity project edges should be accepted, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Edge { label: EdgeLabel::ReviewedBy, id, .. } if id.starts_with("project:v1:")
+        )),
+        "the REVIEWED_BY edge should be persisted"
+    );
+    assert!(
+        records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Edge { label: EdgeLabel::RequestedReviewFrom, id, .. } if id.starts_with("project:v1:")
+        )),
+        "the REQUESTED_REVIEW_FROM edge should be persisted"
+    );
+    assert!(
+        records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::ExternalIdentity,
+                ..
+            }
+        )),
+        "the ExternalIdentity node should be persisted"
+    );
+}
+
+// Issue #335: the daemon must REJECT a REVIEWED_BY whose source Review is not
+// stamped source_kind github_review (mirrors the REVIEWS_COMMIT rigor).
+#[test]
+fn project_reviewed_by_rejects_non_github_review_source() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let review_id = "project:v1:test-review-rb-bad";
+    let identity_id = "project:v1:test-identity-bad";
+    let reviewed_by = serde_json::json!({
+        "record_type": "edge",
+        "id": "project:v1:reviewed-by-bad-source-edge",
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "label": "REVIEWED_BY",
+        "source": review_id,
+        "target": identity_id,
+        "summary": "forged review claims authorship"
+    });
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-reviewed-by-bad-source",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-reviewed-by-bad-source-key",
+            "domain": "project",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": {
+                "records": [
+                    // source_kind local_jsonl — NOT an importer-stamped Review.
+                    project_review_json(review_id, "local_jsonl"),
+                    project_external_identity_json(identity_id, "octocat"),
+                    reviewed_by
+                ]
+            }
+        }),
+    );
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "REVIEWED_BY from a non-github_review source should be rejected, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        !records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Edge { label: EdgeLabel::ReviewedBy, id, .. }
+                if id == "project:v1:reviewed-by-bad-source-edge"
+        )),
+        "the rejected REVIEWED_BY edge must not be persisted"
+    );
+}
+
+// Issue #335: an ExternalIdentity node that omits its login (`author`) carries
+// no citable identity, so a later REVIEWED_BY/REQUESTED_REVIEW_FROM edge would
+// bind to an anonymous node. The daemon must REQUIRE `author` before accepting.
+#[test]
+fn project_external_identity_missing_author_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let identity_id = "project:v1:test-identity-no-author";
+    let mut identity = project_external_identity_json(identity_id, "octocat");
+    identity.as_object_mut().unwrap().remove("author");
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-identity-missing-author",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-identity-missing-author-key",
+            "domain": "project",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": { "records": [ identity ] }
+        }),
+    );
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "ExternalIdentity missing author (login) should be rejected, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        !records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::ExternalIdentity,
+                ..
+            }
+        )),
+        "the login-less ExternalIdentity node must not be persisted"
+    );
+}
+
+// Issue #335: an ExternalIdentity node that omits its `identity_system` is not a
+// well-formed source-system participant identity; the daemon must REQUIRE it.
+#[test]
+fn project_external_identity_missing_identity_system_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let identity_id = "project:v1:test-identity-no-system";
+    let mut identity = project_external_identity_json(identity_id, "octocat");
+    identity.as_object_mut().unwrap().remove("identity_system");
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-identity-missing-system",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-identity-missing-system-key",
+            "domain": "project",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": { "records": [ identity ] }
+        }),
+    );
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "ExternalIdentity missing identity_system should be rejected, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        !records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::ExternalIdentity,
+                ..
+            }
+        )),
+        "the system-less ExternalIdentity node must not be persisted"
+    );
+}
+
+// Issue #335: a well-formed ExternalIdentity node (author + identity_system
+// present) is ACCEPTED on its own and round-trips into the store.
+#[test]
+fn project_external_identity_well_formed_is_accepted() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let identity_id = "project:v1:test-identity-ok";
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-identity-well-formed",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-identity-well-formed-key",
+            "domain": "project",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": { "records": [ project_external_identity_json(identity_id, "octocat") ] }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "a well-formed ExternalIdentity should be accepted, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Node { kind: NodeKind::ExternalIdentity, id, .. }
+                if id == identity_id
+        )),
+        "the well-formed ExternalIdentity node should be persisted"
     );
 }
 

@@ -342,6 +342,7 @@ pub(crate) fn domain_for_node_kind(kind: &str) -> &'static str {
         | "GitHubIssue"
         | "PR"
         | "Review"
+        | "ExternalIdentity"
         | "LocalTask" => Domain::Project.as_str(),
         "Artifact" | "PatchArtifact" => Domain::Artifact.as_str(),
         "Verification" | "CommandEvidence" | "CommandRun" | "TestRun" | "CIStatus"

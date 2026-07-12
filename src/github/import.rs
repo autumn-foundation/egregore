@@ -98,6 +98,8 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     let mut state = prior_state;
     let mut graph = Graph::new();
     let mut emitted_count = 0usize;
+    // Run-level dedup of ExternalIdentity nodes to one-per-login (issue #335).
+    let mut seen_identities: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     // Seed-graph fingerprint gating for the `/pulls` conditional request (#333,
     // Codex round-5). PR merge-link resolution depends on the local seed graph,
@@ -149,6 +151,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             push_emitted(
                 &mut graph,
                 &mut emitted_count,
+                &mut seen_identities,
                 records::issue_records(&ctx, &issue),
             );
         }
@@ -194,13 +197,32 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             // is only ever needed on the reprocess path below (#333, round-6).
             let current_artifact =
                 records::merge_artifact_id(ctx.commit_index, opts.source_repo, &pr);
+            // The current set of REQUESTED_REVIEW_FROM edge ids this PR emits, for
+            // the requested-reviewer supersession diff (#335, Codex P1). Folded
+            // into `pull_hash`, so an unchanged hash guarantees an unchanged set.
+            let current_request_edges = records::requested_review_edge_ids(opts.source_repo, &pr);
+            // The current set of github_team_review_request_unexpanded Diagnostic
+            // ids this PR emits, for the requested-team supersession diff (#335,
+            // Codex P2 — the exact sibling of the reviewer-edge case above). Folded
+            // into `pull_hash` (via requested_teams), so an unchanged hash
+            // guarantees an unchanged set.
+            let current_team_diagnostics =
+                records::team_review_diagnostic_ids(opts.source_repo, &pr);
             if state.is_unchanged(&key, &hash) {
                 // Backfill the tracked artifact id without emitting anything: a
                 // no-op on a store this build already wrote, but it populates a
                 // pre-round-6 (or legacy) store so a LATER outcome change can
                 // still retract this artifact. Safe because the unchanged hash
                 // proves `current_artifact` equals what was emitted before.
-                state.set_merge_artifact(key, current_artifact);
+                state.set_merge_artifact(key.clone(), current_artifact);
+                // Backfill the prior request set likewise (#335, Codex P1) so a
+                // legacy store gains the tracking without a re-emit; the unchanged
+                // hash proves the request set is unchanged too.
+                state.set_request_edges(key.clone(), current_request_edges);
+                // Backfill the prior team-diagnostic set likewise (#335, Codex P2)
+                // so a legacy store gains the tracking without a re-emit; the
+                // unchanged hash proves the team set is unchanged too.
+                state.set_team_diagnostics(key, current_team_diagnostics);
                 continue;
             }
             // Retract a superseded merge artifact whose outcome changed on this
@@ -215,17 +237,68 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                 push_emitted(
                     &mut graph,
                     &mut emitted_count,
+                    &mut seen_identities,
                     Emitted {
                         records: vec![records::merge_artifact_tombstone(pr.number, &prior)],
                         link_diagnostics: 0,
                     },
                 );
             }
+            // Retract each REQUESTED_REVIEW_FROM edge whose reviewer was removed
+            // from the PR's requested set since the last run (#335, Codex P1):
+            // the importer is otherwise purely additive, so without this a
+            // removed reviewer's edge lingers live in a persistent store and
+            // downstream queries still report them as "requested". Only the edge
+            // is tombstoned — never the global ExternalIdentity node.
+            let removed_request_edges: Vec<String> = state
+                .prior_request_edges(&key)
+                .iter()
+                .filter(|prior| !current_request_edges.iter().any(|c| c == *prior))
+                .cloned()
+                .collect();
+            for prior in &removed_request_edges {
+                push_emitted(
+                    &mut graph,
+                    &mut emitted_count,
+                    &mut seen_identities,
+                    Emitted {
+                        records: vec![records::request_review_edge_tombstone(pr.number, prior)],
+                        link_diagnostics: 0,
+                    },
+                );
+            }
+            // Retract each github_team_review_request_unexpanded diagnostic whose
+            // team was removed from the PR's requested-team set since the last run
+            // (#335, Codex P2): the exact sibling of the reviewer-edge case above.
+            // Without this a removed team's diagnostic lingers live in a persistent
+            // store and current-state queries still report the removed team's
+            // review request. Only the diagnostic is tombstoned — never a reviewer
+            // edge, an identity node, or a REVIEWED_BY edge.
+            let removed_team_diagnostics: Vec<String> = state
+                .prior_team_diagnostics(&key)
+                .iter()
+                .filter(|prior| !current_team_diagnostics.iter().any(|c| c == *prior))
+                .cloned()
+                .collect();
+            for prior in &removed_team_diagnostics {
+                push_emitted(
+                    &mut graph,
+                    &mut emitted_count,
+                    &mut seen_identities,
+                    Emitted {
+                        records: vec![records::team_review_diagnostic_tombstone(pr.number, prior)],
+                        link_diagnostics: 0,
+                    },
+                );
+            }
             state.record_hash(key.clone(), hash);
-            state.set_merge_artifact(key, current_artifact);
+            state.set_merge_artifact(key.clone(), current_artifact);
+            state.set_request_edges(key.clone(), current_request_edges);
+            state.set_team_diagnostics(key, current_team_diagnostics);
             push_emitted(
                 &mut graph,
                 &mut emitted_count,
+                &mut seen_identities,
                 records::pull_records(&ctx, &pr),
             );
         }
@@ -264,6 +337,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             push_emitted(
                 &mut graph,
                 &mut emitted_count,
+                &mut seen_identities,
                 records::issue_comment_records(&ctx, &c),
             );
         }
@@ -328,6 +402,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                 push_emitted(
                     &mut graph,
                     &mut emitted_count,
+                    &mut seen_identities,
                     Emitted {
                         records: vec![records::review_artifact_tombstone(native, &prior)],
                         link_diagnostics: 0,
@@ -339,6 +414,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
             push_emitted(
                 &mut graph,
                 &mut emitted_count,
+                &mut seen_identities,
                 records::review_comment_records(&ctx, &c),
             );
         }
@@ -401,6 +477,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                         push_emitted(
                             &mut graph,
                             &mut emitted_count,
+                            &mut seen_identities,
                             Emitted {
                                 records: vec![records::review_artifact_tombstone(&native, &prior)],
                                 link_diagnostics: 0,
@@ -412,6 +489,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                     push_emitted(
                         &mut graph,
                         &mut emitted_count,
+                        &mut seen_identities,
                         records::pr_review_records(&ctx, number, &r),
                     );
                 }
@@ -453,8 +531,32 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
 }
 
 /// Pushes every record of an [`Emitted`] batch into `graph`, counting them.
-fn push_emitted(graph: &mut Graph, count: &mut usize, emitted: Emitted) {
+///
+/// `seen_identities` deduplicates `ExternalIdentity` nodes to one-per-`(system,
+/// login)` across the whole run (issue #335): the same login can author reviews
+/// on many PRs and be a requested reviewer, so its identity node is minted by
+/// several emitters, but the run's JSONL must carry exactly one. The
+/// deduplication is keyed on the node's stable id (which embeds `(system,
+/// login)`), so the output stays byte-stable and idempotent. The
+/// `REVIEWED_BY` / `REQUESTED_REVIEW_FROM` edges are NOT deduplicated — each is
+/// a distinct (review-or-task, identity) fact.
+fn push_emitted(
+    graph: &mut Graph,
+    count: &mut usize,
+    seen_identities: &mut std::collections::BTreeSet<String>,
+    emitted: Emitted,
+) {
     for rec in emitted.records {
+        if let GraphRecord::Node {
+            kind: NodeKind::ExternalIdentity,
+            id,
+            ..
+        } = &rec
+            && !seen_identities.insert(id.clone())
+        {
+            // Already emitted this identity in this run; skip the duplicate node.
+            continue;
+        }
         *count += 1;
         graph.push(rec);
     }
