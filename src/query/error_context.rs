@@ -842,7 +842,16 @@ pub fn error_context(
         .filter(|t| crate::schema_version::domain_from_record_id(t).as_deref() == Some("codegraph"))
         .collect();
 
-    let mut source_facts: BTreeMap<String, &GraphRecord> = BTreeMap::new();
+    // Keyed by (record ID, git_commit) so EVERY temporal version of a stable ID
+    // survives. `record_context` deliberately returns all versions of a symbol
+    // (see its by-ID collapse comment); an ID-only key here would re-collapse
+    // them to the lexically-largest-`git_commit` version, dropping the historical
+    // fact that `error-context <sig> --at <old commit>` exists to surface (the
+    // frame correctly re-resolves to the symbol's stable ID at that commit, but
+    // the cited version would otherwise be an arbitrary later one). Confined to
+    // the frame-target source_facts — the log-half sections keep their own by-ID
+    // single-version maps.
+    let mut source_facts: BTreeMap<(String, Option<String>), &GraphRecord> = BTreeMap::new();
     let mut observations: BTreeMap<String, &GraphRecord> = BTreeMap::new();
     let mut project_state: BTreeMap<String, &GraphRecord> = BTreeMap::new();
     let mut artifacts: BTreeMap<String, &GraphRecord> = BTreeMap::new();
@@ -852,7 +861,13 @@ pub fn error_context(
     for seed in &frame_target_seeds {
         let ctx = super::record_context(records, seed);
         for r in ctx.source_facts {
-            source_facts.insert(r.id().to_owned(), r);
+            let git_commit = match r {
+                GraphRecord::Node {
+                    temporal: Some(t), ..
+                } => Some(t.git_commit.clone()),
+                _ => None,
+            };
+            source_facts.insert((r.id().to_owned(), git_commit), r);
         }
         for r in ctx.observations {
             observations.insert(r.id().to_owned(), r);
@@ -1040,21 +1055,31 @@ pub fn error_context(
                     message: format!("failed to read protected store at {}: {e}", dir.display()),
                 }
             })?;
-            let by_hash: BTreeMap<&str, &crate::protected::ProtectedHandle> = handles
-                .iter()
-                .map(|h| (h.content_hash.as_str(), h))
-                .collect();
+            // A content hash can back MORE THAN ONE protected handle: handle
+            // identity is (source_class, content_hash, source_path), so one
+            // captured artifact may legitimately appear under several classes or
+            // paths. Collect EVERY handle per hash — a plain `BTreeMap<&str, &_>`
+            // would be last-write-wins per key and silently drop all but the
+            // lexically-largest-serialized handle, omitting the actual
+            // `log_payload` or surfacing the wrong class.
+            let mut by_hash: BTreeMap<&str, Vec<&crate::protected::ProtectedHandle>> =
+                BTreeMap::new();
+            for h in &handles {
+                by_hash.entry(h.content_hash.as_str()).or_default().push(h);
+            }
             let mut refs: Vec<ProtectedPayloadRef> = Vec::new();
             for block in &signatures {
                 for source in &block.source_handles {
-                    if let Some(h) = by_hash.get(source.source_artifact_hash.as_str()) {
-                        refs.push(ProtectedPayloadRef {
-                            source_artifact_hash: source.source_artifact_hash.clone(),
-                            signature_id: block.record_id.clone(),
-                            handle: h.handle.clone(),
-                            source_class: h.source_class.as_str().to_owned(),
-                            byte_len: h.byte_len,
-                        });
+                    if let Some(hs) = by_hash.get(source.source_artifact_hash.as_str()) {
+                        for h in hs {
+                            refs.push(ProtectedPayloadRef {
+                                source_artifact_hash: source.source_artifact_hash.clone(),
+                                signature_id: block.record_id.clone(),
+                                handle: h.handle.clone(),
+                                source_class: h.source_class.as_str().to_owned(),
+                                byte_len: h.byte_len,
+                            });
+                        }
                     }
                 }
             }

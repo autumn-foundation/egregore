@@ -975,6 +975,108 @@ fn history_backed_graph_yields_narrowest_window() {
 }
 
 #[test]
+fn source_facts_preserve_all_temporal_versions() {
+    // The frame-target symbol `tweaked` is modified across c1/c2/c3 under ONE
+    // stable ID. `record_context` returns every temporal version; error-context
+    // must not re-collapse them to a single (lexically-largest-git_commit) row.
+    let (records, sig_id, sym_id) = history_fixture();
+    let ctx = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("resolve");
+    let commits: Vec<&str> = ctx
+        .source_facts
+        .iter()
+        .filter(|r| r.record_id == sym_id)
+        .filter_map(|r| r.git_commit.as_deref())
+        .collect();
+    assert_eq!(
+        commits.len(),
+        3,
+        "all three temporal versions of the frame target survive, got {commits:?}"
+    );
+    assert!(commits.contains(&"c1sha0000"));
+    assert!(commits.contains(&"c2sha0000"));
+    assert!(commits.contains(&"c3sha0000"));
+}
+
+// A frame-target symbol with the SAME stable ID modified across three commits,
+// resolved by a StackFrame so `--at` re-resolution works at the commit view.
+fn at_source_facts_fixture() -> (Vec<GraphRecord>, String, String) {
+    let frames = Some(vec![StackFrame {
+        frame_index: 0,
+        module_path: None,
+        file_path: Some("src/lib.rs".to_owned()),
+        line: Some(5),
+    }]);
+    let (sym_id, _) = symbol_snapshot("tweaked", "src/lib.rs", 1, 10, "c1sha0000", T1);
+    let s1 = symbol_snapshot("tweaked", "src/lib.rs", 1, 10, "c1sha0000", T1).1;
+    let s2 = symbol_snapshot("tweaked", "src/lib.rs", 1, 12, "c2sha0000", T2).1;
+    let s3 = symbol_snapshot("tweaked", "src/lib.rs", 1, 14, "c3sha0000", T3).1;
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 1, frames);
+    let records = vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        commit("c3sha0000", &["c2sha0000"], T3),
+        s1,
+        s2,
+        s3,
+        sig,
+    ];
+    (records, sig_id, sym_id)
+}
+
+#[test]
+fn source_facts_under_at_include_historical_version() {
+    // Headline case: `--at c1` re-resolves the frame to `tweaked`'s stable ID at
+    // c1, but the cited source fact must INCLUDE the c1 version (the reason `--at`
+    // exists), not an arbitrary later-SHA version.
+    let (records, sig_id, sym_id) = at_source_facts_fixture();
+    let ctx = error_context(
+        &records,
+        &sig_id,
+        None,
+        Some("c1sha0000"),
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("resolve at c1");
+    assert!(
+        ctx.source_facts
+            .iter()
+            .any(|r| r.record_id == sym_id && r.git_commit.as_deref() == Some("c1sha0000")),
+        "the --at c1 historical version must be present in source_facts"
+    );
+
+    // Byte-stable across repeated runs.
+    let ctx2 = error_context(
+        &records,
+        &sig_id,
+        None,
+        Some("c1sha0000"),
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("resolve at c1");
+    assert_eq!(
+        serde_json::to_string(&ctx).unwrap(),
+        serde_json::to_string(&ctx2).unwrap(),
+        "source_facts under --at is byte-identical across runs"
+    );
+}
+
+#[test]
 fn plain_scan_graph_reports_history_unavailable() {
     let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 1, None);
     let records = vec![sig];
@@ -1136,6 +1238,96 @@ fn protected_handle(content_hash: &str, byte_len: u64) -> ProtectedHandle {
         producer_id: "op-1".to_owned(),
         producer_version: "test".to_owned(),
     }
+}
+
+fn protected_handle_with_class(
+    content_hash: &str,
+    byte_len: u64,
+    class: ProtectedPayloadClass,
+    source_path: Option<&str>,
+) -> ProtectedHandle {
+    ProtectedHandle {
+        handle: ProtectedHandle::compute_handle(&class, content_hash, source_path),
+        schema_version: PROTECTED_SCHEMA_VERSION,
+        source_class: class,
+        source_path: source_path.map(str::to_owned),
+        content_hash: content_hash.to_owned(),
+        byte_len,
+        captured_at: "2026-01-02T00:00:00Z".to_owned(),
+        producer_id: "op-1".to_owned(),
+        producer_version: "test".to_owned(),
+    }
+}
+
+#[test]
+fn protected_on_emits_all_handles_sharing_one_content_hash() {
+    // Handle identity is (source_class, content_hash, source_path), so ONE
+    // captured artifact hash can back multiple distinct handles. The read-time
+    // join must emit ALL of them — a last-write-wins map would drop the actual
+    // `log_payload` or surface the wrong class.
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("protected");
+    let hash = "deadbeefhash";
+    let log_h = protected_handle_with_class(
+        hash,
+        4096,
+        ProtectedPayloadClass::LogPayload,
+        Some("app.log"),
+    );
+    let report_h =
+        protected_handle_with_class(hash, 128, ProtectedPayloadClass::Report, Some("app.log"));
+    assert_ne!(
+        log_h.handle, report_h.handle,
+        "distinct handles for one hash"
+    );
+    write_manifest(&store, &[log_h, report_h]);
+
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 1, None);
+    let (src_id, src) = log_source(ANCHOR, "app.log", hash);
+    let records = vec![sig, src, captured_from(&sig_id, &src_id)];
+    let ctx = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        Some(&store),
+        false,
+    )
+    .expect("resolve");
+    let payloads = ctx.protected_payloads.clone().expect("flag on yields Some");
+    // BOTH handles matching the source hash appear, with their distinct classes.
+    assert_eq!(payloads.len(), 2);
+    let classes: Vec<&str> = payloads.iter().map(|p| p.source_class.as_str()).collect();
+    assert!(
+        classes.contains(&"log_payload"),
+        "log_payload handle present"
+    );
+    assert!(classes.contains(&"report"), "report handle present");
+    assert!(
+        payloads.iter().all(|p| p.source_artifact_hash == hash),
+        "every row cites the shared source hash"
+    );
+    assert_ne!(payloads[0].handle, payloads[1].handle, "distinct handles");
+
+    // Byte-stable across repeated runs.
+    let ctx2 = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        Some(&store),
+        false,
+    )
+    .expect("resolve");
+    assert_eq!(
+        serde_json::to_string(&ctx).unwrap(),
+        serde_json::to_string(&ctx2).unwrap(),
+        "protected join is byte-identical across runs"
+    );
 }
 
 #[test]
