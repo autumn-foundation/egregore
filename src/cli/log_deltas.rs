@@ -8,15 +8,21 @@ use super::*;
 /// when a commit handle resolves to nothing or the history is empty (no match),
 /// and `1` for the remaining stable diagnostics (ambiguous prefix, identical
 /// endpoints, reversed range, no ancestor path).
+///
+/// `embedded_source` is `true` when the records came from the embedded
+/// (`--data-dir`) read path; it is threaded into [`query::log_deltas`] so the
+/// response can disclose the embedded-store last-write-wins retention limitation
+/// (issue #363) when log records are present. It never affects classification.
 pub(crate) fn query_log_deltas_cmd(
     records: &[GraphRecord],
     base: &str,
     head: &str,
     repo: Option<&str>,
+    embedded_source: bool,
 ) -> Result<()> {
     let index = query::RepositoryIndex::build(records);
     let repo_scope = resolve_repo_scope(&index, repo);
-    match query::log_deltas(records, base, head, repo_scope.as_deref()) {
+    match query::log_deltas(records, base, head, repo_scope.as_deref(), embedded_source) {
         Ok(deltas) => {
             #[derive(Debug, Clone, serde::Serialize)]
             struct LogDeltasResponse {

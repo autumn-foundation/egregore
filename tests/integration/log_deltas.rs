@@ -273,14 +273,14 @@ fn synthetic_log_delta_records() -> Vec<GraphRecord> {
 #[test]
 fn log_deltas_empty_history_errors() {
     let records = vec![error_signature("lonely", "error", NEW_FIRST, NEW_LAST, 1)];
-    let err = log_deltas(&records, "c1", "c2", None).unwrap_err();
+    let err = log_deltas(&records, "c1", "c2", None, false).unwrap_err();
     assert!(matches!(err, RangeDeltasError::EmptyHistory));
 }
 
 #[test]
 fn log_deltas_missing_commit_errors() {
     let records = synthetic_log_delta_records();
-    let err = log_deltas(&records, "ffff", "c3sha0000", None).unwrap_err();
+    let err = log_deltas(&records, "ffff", "c3sha0000", None, false).unwrap_err();
     match err {
         RangeDeltasError::MissingCommit { commit_prefix } => assert_eq!(commit_prefix, "ffff"),
         other => panic!("expected MissingCommit, got {other:?}"),
@@ -290,7 +290,7 @@ fn log_deltas_missing_commit_errors() {
 #[test]
 fn log_deltas_identical_endpoints_error() {
     let records = synthetic_log_delta_records();
-    let err = log_deltas(&records, "c2", "c2sha0000", None).unwrap_err();
+    let err = log_deltas(&records, "c2", "c2sha0000", None, false).unwrap_err();
     match err {
         RangeDeltasError::IdenticalEndpoints { commit } => assert_eq!(commit, "c2sha0000"),
         other => panic!("expected IdenticalEndpoints, got {other:?}"),
@@ -300,7 +300,7 @@ fn log_deltas_identical_endpoints_error() {
 #[test]
 fn log_deltas_reversed_range_errors() {
     let records = synthetic_log_delta_records();
-    let err = log_deltas(&records, "c3", "c1", None).unwrap_err();
+    let err = log_deltas(&records, "c3", "c1", None, false).unwrap_err();
     assert!(matches!(err, RangeDeltasError::ReversedRange { .. }));
 }
 
@@ -315,7 +315,7 @@ fn record_ids(rows: &[aletheia_egregore::query::LogSignatureDelta]) -> Vec<&str>
 #[test]
 fn log_deltas_classifies_four_signature_cases() {
     let records = synthetic_log_delta_records();
-    let deltas = log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+    let deltas = log_deltas(&records, "c1", "c3", None, false).expect("range should resolve");
 
     assert_eq!(deltas.base, "c1sha0000");
     assert_eq!(deltas.head, "c3sha0000");
@@ -378,7 +378,7 @@ fn log_deltas_classifies_four_signature_cases() {
 #[test]
 fn log_deltas_new_signature_joins_overlapping_symbol_delta() {
     let records = synthetic_log_delta_records();
-    let deltas = log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+    let deltas = log_deltas(&records, "c1", "c3", None, false).expect("range should resolve");
 
     let new_row = &deltas.new_signatures[0];
     // The resolved frame binds the signature to the `tweaked` symbol.
@@ -409,7 +409,7 @@ fn log_deltas_new_signature_joins_overlapping_symbol_delta() {
 #[test]
 fn log_deltas_per_window_occurrences_from_buckets() {
     let records = synthetic_log_delta_records();
-    let deltas = log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+    let deltas = log_deltas(&records, "c1", "c3", None, false).expect("range should resolve");
     let new_row = &deltas.new_signatures[0];
     assert_eq!(new_row.occurrence_source, "occurrence_buckets");
     // The single bucket sits after the base endpoint (T1) but at/before head (T3).
@@ -449,7 +449,7 @@ fn log_deltas_sums_per_source_buckets_sharing_a_bucket_id() {
         second_node,
         second_edge,
     ];
-    let deltas = log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+    let deltas = log_deltas(&records, "c1", "c3", None, false).expect("range should resolve");
     assert_eq!(record_ids(&deltas.new_signatures), vec![sig]);
     let row = &deltas.new_signatures[0];
     assert_eq!(row.occurrence_source, "occurrence_buckets");
@@ -468,12 +468,12 @@ fn log_deltas_sums_per_source_buckets_sharing_a_bucket_id() {
 fn log_deltas_is_byte_stable_across_runs() {
     let records = synthetic_log_delta_records();
     let baseline = serde_json::to_string(
-        &log_deltas(&records, "c1", "c3", None).expect("range should resolve"),
+        &log_deltas(&records, "c1", "c3", None, false).expect("range should resolve"),
     )
     .expect("serialize");
     for _ in 0..4 {
         let again: LogDeltas =
-            log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+            log_deltas(&records, "c1", "c3", None, false).expect("range should resolve");
         assert_eq!(baseline, serde_json::to_string(&again).expect("serialize"));
     }
 }
@@ -533,7 +533,7 @@ fn split_signature_records() -> Vec<GraphRecord> {
 #[test]
 fn log_deltas_coalesces_split_signature_across_scan_outputs() {
     let records = split_signature_records();
-    let deltas = log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+    let deltas = log_deltas(&records, "c1", "c3", None, false).expect("range should resolve");
     let sig = log_sig_id("split-boom");
 
     // (1) Exactly ONE row for the stable signature ID across all classes — never
@@ -615,7 +615,7 @@ fn timezone_window_records() -> Vec<GraphRecord> {
 #[test]
 fn log_deltas_classifies_across_timezone_offsets() {
     let records = timezone_window_records();
-    let deltas = log_deltas(&records, "c1", "c3", None).expect("range should resolve");
+    let deltas = log_deltas(&records, "c1", "c3", None, false).expect("range should resolve");
 
     // window_end is the head commit's committer date (05:30:00Z as an instant).
     assert_eq!(deltas.window.window_start, TZ_MID);
@@ -779,8 +779,8 @@ fn log_deltas_repo_scope_keeps_log_signatures() {
     let base_prefix = &first[..12];
 
     // Unscoped: the three in-window classes are populated.
-    let unscoped =
-        log_deltas(&records, base_prefix, &third, None).expect("unscoped range should resolve");
+    let unscoped = log_deltas(&records, base_prefix, &third, None, false)
+        .expect("unscoped range should resolve");
     assert_eq!(
         record_ids(&unscoped.new_signatures),
         vec![log_sig_id("new-boom")]
@@ -793,7 +793,7 @@ fn log_deltas_repo_scope_keeps_log_signatures() {
     // regression this guards: `owner_of(<signature-id>)` is `None`, so a naive
     // `--repo` predicate over signature IDs filtered out every signature and
     // returned empty groups even for the correct repository.
-    let scoped = log_deltas(&records, base_prefix, &third, Some(&repo_id))
+    let scoped = log_deltas(&records, base_prefix, &third, Some(&repo_id), false)
         .expect("scoped range should resolve");
     assert_eq!(
         record_ids(&scoped.new_signatures),
@@ -851,15 +851,15 @@ fn log_deltas_repo_scope_discloses_unfiltered_logs_and_elevates_for_multi_repo()
     let base_prefix = &first[..12];
 
     // Unscoped queries carry NO caveat — the field is absent.
-    let unscoped =
-        log_deltas(&records, base_prefix, &third, None).expect("unscoped range should resolve");
+    let unscoped = log_deltas(&records, base_prefix, &third, None, false)
+        .expect("unscoped range should resolve");
     assert!(
         unscoped.repo_scope_caveat.is_none(),
         "unscoped log-deltas must not carry a repo-scope caveat"
     );
 
     // Single-repository store, `--repo` set: caveat present-but-benign.
-    let single = log_deltas(&records, base_prefix, &third, Some(&repo_id))
+    let single = log_deltas(&records, base_prefix, &third, Some(&repo_id), false)
         .expect("scoped single-repo range should resolve");
     let caveat = single
         .repo_scope_caveat
@@ -899,7 +899,7 @@ fn log_deltas_repo_scope_discloses_unfiltered_logs_and_elevates_for_multi_repo()
         7,
     ));
 
-    let multi = log_deltas(&records, base_prefix, &third, Some(&repo_id))
+    let multi = log_deltas(&records, base_prefix, &third, Some(&repo_id), false)
         .expect("scoped multi-repo range should resolve");
     // The unrelated repo-B signature is included despite `--repo A` (unfiltered).
     let repo_b_id = log_sig_id("repo-b-boom");
@@ -976,7 +976,7 @@ fn log_deltas_single_repo_node_count_never_claims_log_isolation() {
         9,
     ));
 
-    let scoped = log_deltas(&records, base_prefix, &third, Some(&repo_id))
+    let scoped = log_deltas(&records, base_prefix, &third, Some(&repo_id), false)
         .expect("scoped range should resolve");
 
     // (a) Behavior unchanged: the repo-B signature is still classified.
@@ -1025,6 +1025,173 @@ fn log_deltas_single_repo_node_count_never_claims_log_isolation() {
     assert!(
         caveat.message.contains("per-repository stores"),
         "the caveat must point to per-repository stores for log isolation"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Embedded-store retention caveat (issue #363).
+//
+// The embedded (`--data-dir`) current-state read surface retains one record per
+// stable ID, and `ErrorSignature` / `LogOccurrenceBucket` are non-temporal, so
+// multiple `scan-logs` ingests of the same stable ID collapse (last-write-wins)
+// before this query runs — the cross-scan coalescing performed on the `--graph`
+// path is not reconstructable there. We DIAGNOSE (disclose in the envelope),
+// never reject: a single-ingest store is correct and keeps working.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn log_deltas_embedded_source_discloses_retention_when_log_records_present() {
+    let records = synthetic_log_delta_records();
+    let deltas = log_deltas(&records, "c1", "c3", None, true).expect("range should resolve");
+
+    let caveat = deltas
+        .embedded_log_retention_caveat
+        .as_ref()
+        .expect("embedded path with log records must disclose the retention caveat");
+    assert!(
+        caveat.message.contains("last-write-wins"),
+        "the caveat must state embedded stores retain one record per stable ID (last-write-wins)"
+    );
+    assert!(
+        caveat.message.contains("`--graph`"),
+        "the caveat must point to the `--graph` path for multi-scan coalescing"
+    );
+    assert!(
+        caveat.message.contains("per-source stores"),
+        "the caveat must offer per-source stores as the alternative"
+    );
+    assert!(
+        caveat.message.contains("#363"),
+        "the caveat must reference the follow-up issue tracking the real fix"
+    );
+
+    // The flag is disclosure-only: classification is byte-for-byte the `--graph`
+    // result — the embedded flag NEVER changes which class a signature lands in.
+    assert_eq!(
+        record_ids(&deltas.new_signatures),
+        vec![log_sig_id("new-boom")]
+    );
+    assert_eq!(deltas.ceased_signatures.len(), 1);
+    assert_eq!(deltas.continuing_signatures.len(), 1);
+}
+
+#[test]
+fn log_deltas_graph_source_never_carries_retention_caveat() {
+    let records = synthetic_log_delta_records();
+    let deltas = log_deltas(&records, "c1", "c3", None, false).expect("range should resolve");
+    assert!(
+        deltas.embedded_log_retention_caveat.is_none(),
+        "the --graph path preserves every ingested line and must not carry the retention caveat"
+    );
+}
+
+#[test]
+fn log_deltas_embedded_source_without_log_records_omits_retention_caveat() {
+    // Commits + a modified symbol, but NO `ErrorSignature` records. An embedded
+    // store with no log records yields exact results, so no disclosure is
+    // warranted — the caveat is gated on log records actually being present.
+    let records = vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        commit("c3sha0000", &["c2sha0000"], T3),
+        symbol_snapshot("tweaked", "src/lib.rs", "C1", "c1sha0000", T1),
+        symbol_snapshot("tweaked", "src/lib.rs", "C2", "c2sha0000", T2),
+        symbol_snapshot("tweaked", "src/lib.rs", "C2", "c3sha0000", T3),
+    ];
+    let deltas = log_deltas(&records, "c1", "c3", None, true).expect("range should resolve");
+    assert!(
+        deltas.embedded_log_retention_caveat.is_none(),
+        "an embedded store with no `ErrorSignature` records must not carry the retention caveat"
+    );
+}
+
+/// End-to-end embedded path (issue #363): ingesting the combined graph into an
+/// embedded store and querying it over `--data-dir` must carry the retention
+/// caveat, while the same query over `--graph` must not.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_log_deltas_cli_embedded_data_dir_discloses_retention_caveat() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let [first, _second, third] = seed_repo(&repo);
+    let graph_path = temp.path().join("combined.graph.jsonl");
+
+    // A history graph plus `ErrorSignature` nodes — no `FRAME_RESOLVES_TO` edge
+    // onto a multi-snapshot symbol (which the stricter embedded ingest rejects).
+    // The caveat only needs commits (for range resolution) plus at least one
+    // signature, so this exercises the embedded read path faithfully.
+    let jsonl = scan_repository_history(&repo)
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let mut records: Vec<GraphRecord> = jsonl
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record should parse"))
+        .collect();
+    records.push(error_signature("new-boom", "error", NEW_FIRST, NEW_LAST, 5));
+    records.push(error_signature(
+        "ceased-warn",
+        "warn",
+        CEASED_FIRST,
+        CEASED_LAST,
+        3,
+    ));
+    records.push(error_signature(
+        "cont-error",
+        "error",
+        CONT_FIRST,
+        CONT_LAST,
+        9,
+    ));
+    let mut out = String::new();
+    for r in &records {
+        out.push_str(&serde_json::to_string(r).expect("record should serialize"));
+        out.push('\n');
+    }
+    fs::write(&graph_path, out).expect("graph should write");
+
+    let data_dir = temp.path().join("store");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let base_prefix = &first[..12];
+
+    // `--data-dir`: the retention caveat is present because log records exist.
+    let assert = CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(["query", "log-deltas", base_prefix, &third])
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&out).expect("stdout should be JSON");
+    let message = body["embedded_log_retention_caveat"]["message"]
+        .as_str()
+        .expect("the embedded --data-dir path must carry the retention caveat");
+    assert!(message.contains("last-write-wins"));
+    assert!(message.contains("#363"));
+
+    // `--graph`: the same query must NOT carry the caveat.
+    let assert = CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(["query", "log-deltas", base_prefix, &third])
+        .arg("--graph")
+        .arg(&graph_path)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&out).expect("stdout should be JSON");
+    assert!(
+        body.get("embedded_log_retention_caveat").is_none(),
+        "the --graph path must not carry the embedded retention caveat"
     );
 }
 
@@ -1082,6 +1249,13 @@ fn query_log_deltas_cli_is_deterministic_and_redaction_safe() {
     assert_eq!(overlaps[0]["change_class"], "modified_symbol");
     assert_eq!(body["ceased_signatures"].as_array().unwrap().len(), 1);
     assert_eq!(body["continuing_signatures"].as_array().unwrap().len(), 1);
+
+    // The `--graph` path preserves every ingested line, so it never carries the
+    // embedded-store retention caveat (issue #363).
+    assert!(
+        body.get("embedded_log_retention_caveat").is_none(),
+        "the --graph path must not carry the embedded retention caveat"
+    );
 
     assert!(
         body["disclaimer"]

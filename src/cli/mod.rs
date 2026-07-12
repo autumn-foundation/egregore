@@ -4848,8 +4848,14 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             data_dir,
             repo,
         } => {
+            // `data_dir.is_some()` marks the embedded read path, whose
+            // current-state read surface retains one record per stable
+            // non-temporal log ID (last-write-wins); threaded into
+            // `query_log_deltas_cmd` so the envelope can disclose that cross-scan
+            // coalescing is not reconstructable there (issue #363).
+            let embedded_source = data_dir.is_some();
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_log_deltas_cmd(&records, &base, &head, repo.as_deref())
+            query_log_deltas_cmd(&records, &base, &head, repo.as_deref(), embedded_source)
         }
         QuerySubcommand::Coupling {
             path,

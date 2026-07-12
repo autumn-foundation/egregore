@@ -73,6 +73,15 @@ schema-level fix — persisting repository attribution on log records so `--repo
 can soundly filter log signatures and the caveat can be dropped — is tracked in
 issue #362.
 
+Separately, whenever the query runs over the embedded (`--data-dir`) read path
+**and** the store holds at least one `ErrorSignature`, the response carries an
+`embedded_log_retention_caveat` object (a fixed `message`) disclosing that
+embedded stores retain one record per stable non-temporal log ID
+(last-write-wins), so cross-scan coalescing is **not** reconstructable there — see
+[`--graph` only](#--graph-only-coalescing-is-not-reconstructable-on---data-dir-issue-363)
+above. The field is omitted for `--graph` queries and for embedded stores with no
+log records, and is deterministic (fixed string, no wall clock).
+
 ## Shortest offline workflow
 
 ```sh
@@ -155,6 +164,27 @@ Without this coalescing a single stable signature could split — an earlier sca
 that observed it before the range landing in `ceased_signatures` while a later
 scan that first observed it in-range lands in `new_signatures`. In a store built
 from a single `scan-logs` output this is moot (each signature ID appears once).
+
+### `--graph` only: coalescing is not reconstructable on `--data-dir` (issue #363)
+
+Cross-scan coalescing is a **`--graph`** capability. The embedded (`--data-dir`)
+current-state read surface returns exactly **one record per stable ID**, and
+`ErrorSignature` / `LogOccurrenceBucket` are **non-temporal** nodes, so ingesting
+multiple `scan-logs` outputs of the **same** stable signature/bucket ID retains a
+single record (**last-write-wins**) — the duplicate records the coalescing needs
+are gone before `log-deltas` runs. On the `--data-dir` path, therefore,
+`first_seen` / `last_seen` and occurrence counts reflect only the **retained**
+record, and the split-signature case above can **misclassify**.
+
+A **single** `scan-logs` ingest is unaffected and correct — this only bites
+multi-scan aggregation on the embedded path. When the query runs over
+`--data-dir` **and** the store holds at least one `ErrorSignature`, the response
+envelope carries an `embedded_log_retention_caveat` object (a fixed `message`)
+disclosing this. To aggregate across scans, combine `scan-logs` outputs at the
+**`--graph`** level (concatenated JSONL) or use **per-source stores**. The
+store/adapter-layer fix — a log-domain-aware embedded read path that retains
+duplicate non-temporal log records — is out of this command's scope and tracked
+in **issue #363**.
 
 ## Change classes
 

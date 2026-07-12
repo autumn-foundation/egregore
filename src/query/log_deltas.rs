@@ -41,6 +41,19 @@
 //! classes (an earlier scan → `ceased`, a later scan first-seen in-range →
 //! `new`) and double-count its occurrences.
 //!
+//! Coalescing is a **`--graph`-only** capability. The embedded (`--data-dir`)
+//! current-state read surface returns one record per stable ID, and
+//! `ErrorSignature` / `LogOccurrenceBucket` are non-temporal, so multiple
+//! `scan-logs` ingests of the same stable ID collapse (last-write-wins) BEFORE
+//! this query runs — the duplicate records coalescing needs are already gone. On
+//! the embedded path `first_seen` / `last_seen` and occurrence counts reflect
+//! only the retained record and the split-signature case can misclassify; a
+//! single ingest is unaffected. `log_deltas`'s `embedded_source` argument gates a
+//! [`LogEmbeddedRetentionCaveat`] that discloses this in the envelope when the
+//! embedded path is used and log records are present (issue #363). The
+//! adapter-level fix (retaining duplicate non-temporal log records) is out of
+//! #326's scope and tracked in #363.
+//!
 //! # Classification (closed, mutually exclusive, precedence-ordered)
 //!
 //! Every in-scope `ErrorSignature`, after coalescing, is classified against the
@@ -185,6 +198,53 @@ pub struct LogRepoScopeCaveat {
     pub message: &'static str,
 }
 
+/// Envelope caveat emitted ONLY on the embedded (`--data-dir`) read path when
+/// the store holds at least one `ErrorSignature` record (issue #363).
+///
+/// The embedded store's current-state read surface
+/// ([`EmbeddedAletheiaSink::read_all_records`](crate::adapters)) returns exactly
+/// one record per stable ID. `ErrorSignature` and `LogOccurrenceBucket` are
+/// NON-temporal nodes, so ingesting multiple `scan-logs` outputs of the SAME
+/// stable signature/bucket ID retains a single record (last-write-wins); the
+/// duplicate records are gone before this query runs. The cross-scan coalescing
+/// this query performs on the `--graph` path — grouping duplicate signatures by
+/// stable ID and merging earliest `first_seen` / latest `last_seen` / summed
+/// occurrence counts BEFORE classification — therefore CANNOT be reconstructed
+/// from a `--data-dir` store: `first_seen` / `last_seen` and occurrence counts
+/// reflect only the retained record, and a multi-scan split-signature case can
+/// misclassify. A SINGLE `scan-logs` ingest is unaffected and correct.
+///
+/// For multi-scan aggregation, combine `scan-logs` outputs at the `--graph`
+/// level (concatenated JSONL) or use per-source stores. The store/adapter-layer
+/// fix — a log-domain-aware embedded read path that retains duplicate
+/// non-temporal log records — is out of #326's frozen scope and tracked in
+/// issue #363.
+pub const LOG_EMBEDDED_RETENTION_CAVEAT: &str = "Embedded (`--data-dir`) stores retain exactly one \
+     record per stable non-temporal log ID (last-write-wins for `ErrorSignature` / \
+     `LogOccurrenceBucket`). Multiple `scan-logs` ingests of the same stable signature/bucket ID \
+     are therefore collapsed BEFORE this query runs, so the cross-scan coalescing performed on the \
+     `--graph` path is NOT reconstructable here: `first_seen`, `last_seen`, and occurrence counts \
+     reflect only the retained record, and a multi-scan split-signature case can misclassify. A \
+     single `scan-logs` ingest is unaffected. For multi-scan aggregation, combine `scan-logs` \
+     outputs at the `--graph` level (concatenated JSONL) or use per-source stores. Tracked in \
+     issue #363.";
+
+/// Advisory disclosure attached to a [`LogDeltas`] response whenever the query
+/// runs over the embedded (`--data-dir`) read path AND the store holds at least
+/// one `ErrorSignature` record (issue #363).
+///
+/// Surfaces the embedded-store last-write-wins limitation in the machine-readable
+/// envelope, not only the docs. Present only on the embedded path with log
+/// records; absent for `--graph` queries and for embedded stores with no log
+/// records (where single-ingest results are exact and no disclosure is warranted).
+/// The `message` is a fixed string ([`LOG_EMBEDDED_RETENTION_CAVEAT`]), so the
+/// envelope stays deterministic and byte-stable.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LogEmbeddedRetentionCaveat {
+    /// Fixed advisory text ([`LOG_EMBEDDED_RETENTION_CAVEAT`]).
+    pub message: &'static str,
+}
+
 /// The valid-time window a [`LogDeltas`] response classifies against, derived
 /// from the committer dates of the commits in the resolved range.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -278,6 +338,14 @@ pub struct LogDeltas {
     /// [`LogRepoScopeCaveat`]. Absent (omitted from JSON) for unscoped queries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_scope_caveat: Option<LogRepoScopeCaveat>,
+    /// Embedded-store retention caveat, present only when the query ran over the
+    /// embedded (`--data-dir`) read path AND the store holds at least one
+    /// `ErrorSignature` record (issue #363): cross-scan coalescing is not
+    /// reconstructable on the embedded path — see [`LogEmbeddedRetentionCaveat`].
+    /// Absent (omitted from JSON) for `--graph` queries and for embedded stores
+    /// with no log records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedded_log_retention_caveat: Option<LogEmbeddedRetentionCaveat>,
     /// Signatures first observed inside the window (the regression signal).
     pub new_signatures: Vec<LogSignatureDelta>,
     /// Signatures that existed before the range and went silent by its end.
@@ -312,12 +380,21 @@ enum LogDeltaClass {
 /// is missing or ambiguous, the endpoints are identical, the range is
 /// reversed, or no ancestor path connects the endpoints — the same taxonomy as
 /// [`range_deltas`](super::range_deltas).
+/// `embedded_source` records whether the caller loaded `records` from the
+/// embedded (`--data-dir`) read path rather than a `--graph` JSONL. On the
+/// embedded path the current-state read surface retains one record per stable ID
+/// (last-write-wins for non-temporal `ErrorSignature` / `LogOccurrenceBucket`
+/// nodes), so cross-scan coalescing cannot be reconstructed; when it is set AND
+/// the store holds at least one `ErrorSignature`, the response carries
+/// [`LogEmbeddedRetentionCaveat`] disclosing this (issue #363). It never changes
+/// classification — only whether the caveat is emitted.
 #[allow(clippy::missing_panics_doc)]
 pub fn log_deltas(
     records: &[GraphRecord],
     base_prefix: &str,
     head_prefix: &str,
     repo_scope: Option<&str>,
+    embedded_source: bool,
 ) -> Result<LogDeltas, RangeDeltasError> {
     // Repository scoping mirrors `range_deltas` for the CODE side only: in a
     // shared store two repositories can carry the same commit SHA, so commit
@@ -659,6 +736,26 @@ pub fn log_deltas(
         _ => None,
     };
 
+    // Embedded-store retention caveat (issue #363): the embedded `--data-dir`
+    // current-state read surface returns one record per stable ID, and
+    // `ErrorSignature` / `LogOccurrenceBucket` are non-temporal, so multiple
+    // `scan-logs` ingests of the same stable ID are collapsed (last-write-wins)
+    // BEFORE this query runs — the cross-scan coalescing performed above cannot
+    // be reconstructed from the embedded path. DIAGNOSE rather than reject: a
+    // single-ingest store is correct and must keep working, so the caveat is
+    // gated on log records actually being present (`sig_groups` holds every
+    // `ErrorSignature` node encountered, regardless of classification). The
+    // `--graph` path preserves every ingested line, so it never carries this
+    // caveat. Fixed string, no wall clock — byte-stable. See issue #363 and
+    // docs/cli/log-deltas.md.
+    let embedded_log_retention_caveat = if embedded_source && !sig_groups.is_empty() {
+        Some(LogEmbeddedRetentionCaveat {
+            message: LOG_EMBEDDED_RETENTION_CAVEAT,
+        })
+    } else {
+        None
+    };
+
     Ok(LogDeltas {
         base: base_sha,
         head: head_sha,
@@ -669,6 +766,7 @@ pub fn log_deltas(
         range_commit_count: range.range_commit_shas.len(),
         disclaimer: LOG_DELTAS_DISCLAIMER,
         repo_scope_caveat,
+        embedded_log_retention_caveat,
         new_signatures,
         ceased_signatures,
         continuing_signatures,

@@ -313,8 +313,15 @@ bucket record ID, per #361), aggregate `occurrence_count` summed — so exactly 
 split across conflicting classes. Exit codes and the error
 taxonomy mirror #118 exactly. Rows are regression LEADS, never proof this range caused the
 failure; a ceased signature is not proof of a fix; occurrence data only reflects scanned log
-sources. Read-only, redaction-safe (no raw log text), deterministic and byte-identical across
-runs. See `docs/cli/log-deltas.md`.
+sources. Cross-scan signature coalescing is a `--graph` capability: the embedded (`--data-dir`)
+read path retains one record per stable non-temporal log ID (last-write-wins for
+`ErrorSignature`/`LogOccurrenceBucket`), so multiple `scan-logs` ingests of the same stable ID
+collapse before the query runs and coalescing is not reconstructable there — a single ingest is
+unaffected. When run over `--data-dir` with log records present, the envelope carries an
+`embedded_log_retention_caveat` disclosing this; for multi-scan aggregation combine `scan-logs`
+outputs at the `--graph` level (concatenated JSONL) or use per-source stores (the adapter-level
+retention fix is tracked in #363). Read-only, redaction-safe (no raw log text), deterministic and
+byte-identical across runs. See `docs/cli/log-deltas.md`.
 
 `eg query file <path> --at <commit>` / `--as-of <instant>` reconstructs the deterministic
 set of symbols a file defined at a chosen commit or valid-time instant (issue #158) from a
