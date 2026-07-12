@@ -25,6 +25,7 @@ mod deps;
 mod deterministic_scan;
 mod doctor;
 mod embeddings;
+mod error_context;
 mod evidence_freshness;
 mod evidence_pack;
 mod evidence_write;
