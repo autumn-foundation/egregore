@@ -2270,6 +2270,137 @@ fn embedded_data_dir_coalesces_signature_block_like_graph() {
     assert!(graph.embedded_log_retention_caveat.is_none());
 }
 
+/// Issue #363 (Codex P2): the same-hour/same-count `LogOccurrenceBucket` sub-case.
+/// When two DIFFERING scans of one signature share a bucket for the same hour with
+/// the SAME count, that bucket record is BYTE-IDENTICAL (same ID AND content), so
+/// its second write is an idempotent no-op → only ONE physical bucket node. The
+/// two `ErrorSignature` records still differ, so both are retained and coalesced.
+/// Consequence: the coalesced signature's occurrence-bucket block holds the shared
+/// bucket ONCE on `--data-dir`, whereas `--graph` (which iterates bucket nodes over
+/// the concatenated JSONL, never deduping by bucket record ID) holds it TWICE. This
+/// case LEGITIMATELY diverges from `--graph`; the real fix is source-aware bucket
+/// identity, tracked in issue #361. We assert the OBSERVED behavior and do NOT
+/// assert `--data-dir == --graph` for the bucket block.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_data_dir_dedups_shared_same_count_bucket_block() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+
+    // Two differing scans of one fingerprint (distinct last_seen + count).
+    let (sig_id, sig1) = error_signature(
+        "boom",
+        "error",
+        "2026-01-02T10:00:00Z",
+        "2026-01-02T11:00:00Z",
+        3,
+        None,
+    );
+    let (sig_id2, sig2) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 5, None);
+    assert_eq!(sig_id, sig_id2, "same seed → same stable signature ID");
+    // A SHARED 12:00 bucket with an IDENTICAL count (4) is emitted by BOTH scans →
+    // byte-identical record → deduped on the embedded path. Plus one DISTINCT-hour
+    // bucket per scan so the block has non-shared occurrence data too.
+    let (shared_n, shared_e) = bucket_with_edge(&sig_id, "2026-01-02T12:00:00Z", 4);
+    let (d1n, d1e) = bucket_with_edge(&sig_id, "2026-01-02T10:00:00Z", 3);
+    let (d2n, d2e) = bucket_with_edge(&sig_id, "2026-01-02T13:00:00Z", 6);
+    let records = vec![
+        sig1,
+        sig2,
+        shared_n.clone(),
+        shared_e.clone(),
+        d1n,
+        d1e,
+        shared_n,
+        shared_e,
+        d2n,
+        d2e,
+    ];
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("shared-bucket-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record).expect("record should write");
+    }
+    let embedded_records = sink
+        .read_all_records_log_retained()
+        .expect("log-retained read should surface both signature versions");
+    drop(sink);
+
+    let graph = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("graph resolve");
+    let embedded = error_context(
+        &embedded_records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        true,
+    )
+    .expect("embedded resolve");
+
+    let shared_rows = |ctx: &aletheia_egregore::query::ErrorContext| {
+        ctx.signatures[0]
+            .buckets
+            .iter()
+            .filter(|b| b.bucket_start == "2026-01-02T12:00:00Z")
+            .count()
+    };
+    let total = |ctx: &aletheia_egregore::query::ErrorContext| -> u64 {
+        ctx.signatures[0]
+            .buckets
+            .iter()
+            .map(|b| b.occurrence_count)
+            .sum()
+    };
+
+    // --graph: the shared 12:00 bucket appears TWICE (both byte-identical copies),
+    // so the bucket-block total sums it twice: 3 + 4 + 4 + 6 = 17.
+    assert_eq!(
+        shared_rows(&graph),
+        2,
+        "--graph carries both shared-bucket copies"
+    );
+    assert_eq!(total(&graph), 17);
+
+    // --data-dir: the byte-identical shared bucket is deduped to one physical node,
+    // so it appears ONCE and its count is reflected once: 3 + 4 + 6 = 13.
+    assert_eq!(
+        shared_rows(&embedded),
+        1,
+        "the byte-identical shared bucket is deduped to one physical record on --data-dir"
+    );
+    assert_eq!(total(&embedded), 13);
+
+    // The two paths LEGITIMATELY diverge here by exactly the once-deduped shared
+    // count (4) — inherent to non-source-aware bucket identity (issue #361), NOT a
+    // bug in the embedded read path. Deliberately NOT asserting block equality.
+    // (Coalesced signature IDENTITY parity — first_seen/last_seen/aggregate — is
+    // covered by `embedded_data_dir_coalesces_signature_block_like_graph`; this
+    // sub-case affects only duplicate buckets.)
+    assert_eq!(total(&graph) - total(&embedded), 4);
+
+    // The embedded path still discloses the retention caveat, which now names this
+    // shared-hour/shared-count bucket sub-case and cites #361.
+    let caveat = embedded
+        .embedded_log_retention_caveat
+        .as_ref()
+        .expect("embedded path with an ErrorSignature must disclose the retention caveat");
+    assert!(caveat.message.contains("#361"));
+    assert!(graph.embedded_log_retention_caveat.is_none());
+}
+
 #[test]
 fn embedded_source_over_pure_scan_graph_carries_no_caveat_envelope() {
     // The caveat is gated on at least one `ErrorSignature` node being present.

@@ -103,9 +103,17 @@ surface, which surfaces every **superseded** non-temporal `ErrorSignature` /
 `LogOccurrenceBucket` version that differing-content `scan-logs` ingests append.
 The cross-scan coalescing the `--graph` path performs (earliest `first_seen`,
 latest `last_seen`, summed occurrence counts, all buckets) is therefore
-reconstructed **exactly** on `--data-dir` for differing-content scans. The one
-residual divergence is that byte-identical re-ingests are deduped to one physical
-record (not multiplied). The `--graph` path preserves every ingested line and
+reconstructed **exactly** on `--data-dir` for differing-content scans. The residual
+divergence has two forms, both from idempotent-write dedup of byte-identical
+non-temporal records: (1) a byte-identical re-ingest of the whole `scan-logs`
+output is deduped to one physical record (not multiplied); and (2) even across
+**differing** scans, an individual byte-identical `LogOccurrenceBucket` (same
+signature, same hour, **same count**) is deduped to one physical record rather than
+summed, so a shared-hour/shared-count bucket contributes once on `--data-dir` but
+twice on `--graph` (which iterates bucket nodes and sums duplicates), and the
+coalesced signature's occurrence-bucket block can hold fewer occurrences on
+`--data-dir`. Both stem from non-source-aware bucket identity, whose real fix is
+tracked in **issue #361**. The `--graph` path preserves every ingested line and
 never carries the caveat; a pure `scan` store with no log records never carries
 it either. This mirrors the identical disclosure on
 [`eg query log-deltas`](./log-deltas.md); the adapter-level retention fix landed

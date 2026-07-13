@@ -367,10 +367,15 @@ surface (`read_all_records_log_retained`), which surfaces every superseded non-t
 `ErrorSignature`/`LogOccurrenceBucket` version that differing-content `scan-logs` ingests append,
 so `first_seen`/`last_seen`/occurrence counts are reconstructed exactly as on the concatenated
 `--graph` JSONL. When run over `--data-dir` with log records present, the envelope still carries an
-`embedded_log_retention_caveat` disclosing the one residual divergence: byte-identical re-ingests
-are idempotent (deduped to one physical record) rather than multiplied, so identical re-scans do
-not inflate `--data-dir` counts the way concatenating identical JSONL does on `--graph`; a single
-ingest is exact either way. Read-only, redaction-safe (no raw log text), deterministic and
+`embedded_log_retention_caveat` disclosing a residual divergence in two forms, both from
+idempotent-write dedup of byte-identical non-temporal records: (1) byte-identical re-ingests of the
+whole `scan-logs` output are deduped to one physical record rather than multiplied, so identical
+re-scans do not inflate `--data-dir` counts the way concatenating identical JSONL does on `--graph`;
+and (2) even across differing scans, an individual byte-identical `LogOccurrenceBucket` (same
+signature, hour, and count) is deduped rather than summed, so a shared-hour/shared-count bucket
+contributes once on `--data-dir` but twice on `--graph`, leaving per-window occurrence counts
+possibly lower on `--data-dir` — inherent to non-source-aware bucket identity, deferred to #361.
+A single ingest is exact either way. Read-only, redaction-safe (no raw log text), deterministic and
 byte-identical across runs. See `docs/cli/log-deltas.md`.
 
 `eg query error-context <handle>` resolves ONE `ErrorSignature` and assembles a single
@@ -408,8 +413,11 @@ must carry zero protected handles or the run exits 1 (`protected_handle_in_graph
 `--data-dir` the current-state (no `--at`/`--as-of`) read loads through the log-retained surface
 (#363), so multi-scan signature coalescing (earliest `first_seen`, latest `last_seen`, summed
 occurrence, all buckets) is reconstructed exactly as on `--graph`; the envelope carries an
-`embedded_log_retention_caveat` disclosing the one residual divergence (byte-identical re-ingests
-are deduped, not multiplied). All
+`embedded_log_retention_caveat` disclosing the residual divergence in two forms (a byte-identical
+re-ingest of the whole output is deduped not multiplied; and an individual byte-identical
+`LogOccurrenceBucket` — same signature/hour/count — is deduped rather than summed, so a
+shared-hour/shared-count bucket contributes once on `--data-dir` but twice on `--graph`, deferred
+to #361). All
 timestamp ordering is by parsed UTC instant, never raw RFC 3339 string order. Rows are
 CORRELATION LEADS, never proof of cause: a resolved frame proves the backtrace NAMES a symbol,
 an `EMITTED_DURING` edge is a correlation. Read-only, redaction-safe (only the bounded

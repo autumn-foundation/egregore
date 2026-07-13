@@ -781,6 +781,151 @@ fn log_deltas_embedded_data_dir_coalesces_like_graph_for_differing_scans() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Same-hour / same-count bucket dedup on the embedded read path (issue #363,
+// Codex P2). When two DIFFERING scans of the SAME signature share a
+// `LogOccurrenceBucket` for the same hour with the SAME count, that bucket record
+// is BYTE-IDENTICAL across scans (bucket ID = repository/signature/hour/width;
+// content = the same count). The second write therefore takes `write_record`'s
+// idempotent no-op path, so only ONE physical bucket node exists and
+// `read_all_records_log_retained` has nothing superseded to re-emit for it. The
+// two `ErrorSignature` records still DIFFER (distinct last_seen/count), so BOTH
+// are retained and coalesced. Consequence: the shared-hour bucket count is
+// reflected ONCE in the `--data-dir` per-window totals, whereas the `--graph`
+// path (which iterates bucket nodes over the concatenated JSONL and sums
+// duplicates, issue #361) counts it TWICE. This case legitimately diverges from
+// `--graph`; the real fix is source-aware bucket identity, tracked in issue #361.
+// This test asserts the OBSERVED `--data-dir` behavior and deliberately does NOT
+// assert `--data-dir == --graph`.
+// ---------------------------------------------------------------------------
+
+/// Same seed → same stable `ErrorSignature` ID, emitted twice with DIFFERING
+/// content (distinct `last_seen` + per-scan count), so both signature records are
+/// retained and coalesce. Both scans emit a SHARED bucket for the 12:00 hour with
+/// an IDENTICAL count (4) — byte-identical → deduped to one physical record — plus
+/// one DISTINCT-hour bucket each (13:00 x3, 14:00 x6) so the scans genuinely
+/// differ and there is non-shared occurrence data. All buckets fall inside the
+/// `[T2, T3]` window (after base T1, at/before head T3), so `base_window` is 0.
+#[cfg(feature = "embedded-aletheiadb")]
+fn split_signature_shared_same_count_bucket() -> Vec<GraphRecord> {
+    const SHARED_HOUR: &str = "2026-01-02T12:00:00Z";
+    const SCAN1_HOUR: &str = "2026-01-02T13:00:00Z";
+    const SCAN2_HOUR: &str = "2026-01-02T14:00:00Z";
+    const SCAN1_LAST: &str = "2026-01-02T13:30:00Z";
+    const SCAN2_LAST: &str = "2026-01-02T14:30:00Z";
+
+    let sig = log_sig_id("shared-hour");
+    // The byte-identical shared bucket (same signature, hour, and count) is emitted
+    // by BOTH scans; only the second write is the idempotent no-op.
+    let (shared_node, shared_edge) = bucket_with_edge(&sig, SHARED_HOUR, 4);
+    let (scan1_node, scan1_edge) = bucket_with_edge(&sig, SCAN1_HOUR, 3);
+    let (scan2_node, scan2_edge) = bucket_with_edge(&sig, SCAN2_HOUR, 6);
+    vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        commit("c3sha0000", &["c2sha0000"], T3),
+        // Two differing scan outputs of the same signature ID (distinct last_seen).
+        error_signature("shared-hour", "error", NEW_FIRST, SCAN1_LAST, 5),
+        error_signature("shared-hour", "error", NEW_FIRST, SCAN2_LAST, 8),
+        // Scan 1 buckets: the shared 12:00 bucket + its distinct 13:00 bucket.
+        shared_node.clone(),
+        shared_edge.clone(),
+        scan1_node,
+        scan1_edge,
+        // Scan 2 buckets: the SAME shared 12:00 bucket (byte-identical) + 14:00.
+        shared_node,
+        shared_edge,
+        scan2_node,
+        scan2_edge,
+    ]
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn log_deltas_embedded_dedups_shared_same_count_bucket() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+
+    let records = split_signature_shared_same_count_bucket();
+
+    // Build the embedded store by writing every record in order. The second write
+    // of the byte-identical shared bucket is an idempotent no-op, so only ONE
+    // physical shared-bucket node ever exists.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("shared-bucket-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record).expect("record should write");
+    }
+    let embedded_records = sink
+        .read_all_records_log_retained()
+        .expect("log-retained read should surface both signature versions");
+    drop(sink);
+
+    let sig = log_sig_id("shared-hour");
+
+    // --data-dir: the coalesced signature is NEW (first_seen inside the window) and
+    // its per-window occurrence total reflects the shared 12:00 bucket ONCE:
+    // shared(4) + scan1 distinct(3) + scan2 distinct(6) = 13. base_window is 0
+    // because every bucket falls after the base endpoint (T1).
+    let embedded = log_deltas(&embedded_records, "c1", "c3", None, true)
+        .expect("embedded range should resolve");
+    assert_eq!(record_ids(&embedded.new_signatures), vec![sig.clone()]);
+    let embedded_row = &embedded.new_signatures[0];
+    assert_eq!(embedded_row.occurrence_source, "occurrence_buckets");
+    assert_eq!(embedded_row.base_window_occurrences, Some(0));
+    assert_eq!(
+        embedded_row.head_window_occurrences,
+        Some(13),
+        "the byte-identical shared 12:00 bucket is deduped to one physical record, \
+         so its count (4) is reflected ONCE: 4 + 3 + 6 = 13"
+    );
+
+    // --graph: the concatenated JSONL carries TWO copies of the byte-identical
+    // shared bucket. log_deltas iterates bucket NODES and sums duplicates (never
+    // deduping by bucket record ID, issue #361), so the shared count is added TWICE:
+    // shared(4 + 4) + scan1(3) + scan2(6) = 17.
+    let graph = log_deltas(&records, "c1", "c3", None, false).expect("graph range should resolve");
+    assert_eq!(record_ids(&graph.new_signatures), vec![sig]);
+    let graph_row = &graph.new_signatures[0];
+    assert_eq!(graph_row.base_window_occurrences, Some(0));
+    assert_eq!(
+        graph_row.head_window_occurrences,
+        Some(17),
+        "the --graph path sums both byte-identical shared-bucket copies (4 + 4)"
+    );
+
+    // The two paths LEGITIMATELY diverge for this same-hour/same-count case: the
+    // gap is exactly the deduped shared-bucket count (4). This is inherent to
+    // non-source-aware bucket identity, whose real fix is issue #361 — NOT a bug in
+    // the embedded read path. We deliberately do NOT assert equality here.
+    assert_eq!(
+        graph_row.head_window_occurrences.unwrap() - embedded_row.head_window_occurrences.unwrap(),
+        4,
+        "the divergence equals the once-deduped shared-hour bucket count (issue #361)"
+    );
+
+    // The embedded path still discloses the retention caveat, which now names this
+    // shared-hour/shared-count bucket sub-case.
+    assert!(
+        embedded.embedded_log_retention_caveat.is_some(),
+        "the embedded path must disclose the retention caveat"
+    );
+    assert!(
+        embedded
+            .embedded_log_retention_caveat
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("#361"),
+        "the caveat must cite issue #361 as the tracked source-aware-identity fix"
+    );
+
+    // Determinism: the embedded classification is byte-stable across repeated runs.
+    let embedded_again = log_deltas(&embedded_records, "c1", "c3", None, true)
+        .expect("embedded range should resolve again");
+    assert_eq!(signature_rows(&embedded), signature_rows(&embedded_again));
+}
+
 /// Four signatures across the classes plus the new signature's bucket, with NO
 /// `FRAME_RESOLVES_TO` edge onto a multi-snapshot symbol (which the stricter
 /// embedded write path rejects). Exercises the single-scan embedded parity.

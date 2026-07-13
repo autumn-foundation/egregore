@@ -246,19 +246,31 @@ pub struct LogRepoScopeCaveat {
 /// counts BEFORE classification — IS reconstructed on `--data-dir` for scans
 /// whose captured content differs.
 ///
-/// The caveat remains a disclosure because one residual divergence persists: a
-/// byte-identical re-ingest of the same `scan-logs` output is an idempotent
-/// no-op (deduped to one physical record) rather than multiplied, so identical
-/// re-scans do not inflate `--data-dir` counts the way concatenating identical
-/// JSONL does on `--graph`. A SINGLE `scan-logs` ingest is exact either way.
+/// The caveat remains a disclosure because a residual divergence persists in two
+/// forms, both rooted in the idempotent-write dedup of byte-identical non-temporal
+/// records. (1) A byte-identical re-ingest of the same `scan-logs` output is an
+/// idempotent no-op (deduped to one physical record) rather than multiplied, so
+/// identical re-scans do not inflate `--data-dir` counts the way concatenating
+/// identical JSONL does on `--graph`. (2) Even across DIFFERING scans, an
+/// individual byte-identical `LogOccurrenceBucket` (same signature, same hour,
+/// same count → same record ID AND same content) is deduped to one physical
+/// record rather than summed, so a shared-hour/shared-count bucket contributes
+/// once here but twice on `--graph` (which iterates bucket nodes and sums
+/// duplicates, issue #361); per-window occurrence counts can therefore be lower on
+/// `--data-dir`. Both stem from non-source-aware bucket identity, whose real fix is
+/// tracked in issue #361. A SINGLE `scan-logs` ingest is exact either way.
 pub const LOG_EMBEDDED_RETENTION_CAVEAT: &str = "Embedded (`--data-dir`) stores retain every \
      superseded non-temporal log observation (`ErrorSignature` / `LogOccurrenceBucket`), so the \
      cross-scan coalescing performed on the `--graph` path (earliest `first_seen`, latest \
      `last_seen`, summed occurrence counts) is reconstructed here for scans whose captured content \
-     differs. One residual divergence from `--graph`: byte-identical re-ingests of the same \
-     `scan-logs` output are idempotent (deduped to one physical record) rather than multiplied, so \
-     identical re-scans do not inflate counts on `--data-dir` the way concatenating identical JSONL \
-     does on `--graph`. Issue #363.";
+     differs. One residual divergence from `--graph` persists in two forms: (1) byte-identical \
+     re-ingests of the same `scan-logs` output are idempotent (deduped to one physical record) \
+     rather than multiplied, so identical re-scans do not inflate counts on `--data-dir` the way \
+     concatenating identical JSONL does on `--graph`; and (2) even across DIFFERING scans, an \
+     individual byte-identical `LogOccurrenceBucket` (same signature, same hour, same count) is \
+     deduped to one physical record rather than summed, so a shared-hour/shared-count bucket \
+     contributes once here but twice on `--graph`, and per-window occurrence counts can be lower on \
+     `--data-dir`. Both stem from non-source-aware bucket identity (issue #361). Issue #363.";
 
 /// Advisory disclosure attached to a [`LogDeltas`] response whenever the query
 /// runs over the embedded (`--data-dir`) read path AND the store holds at least

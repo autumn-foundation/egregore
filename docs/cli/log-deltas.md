@@ -180,14 +180,29 @@ so the same duplicate slice the coalescer needs is present, and `first_seen` /
 concatenated `--graph` JSONL. The split-signature case above therefore classifies
 identically on `--data-dir` and `--graph`.
 
-One residual divergence remains: a **byte-identical** re-ingest of the same
-`scan-logs` output is an idempotent no-op (deduped to one physical record) rather
-than multiplied, so identical re-scans do **not** inflate `--data-dir` counts the
-way concatenating identical JSONL does on `--graph`. A **single** `scan-logs`
-ingest is exact either way. When the query runs over `--data-dir` **and** the
-store holds at least one `ErrorSignature`, the response envelope carries an
-`embedded_log_retention_caveat` object (a fixed `message`) disclosing this
-residual divergence. The adapter-level retention fix landed in **issue #363**.
+One residual divergence remains, in two forms, both rooted in the idempotent-write
+dedup of byte-identical non-temporal records:
+
+1. A **byte-identical** re-ingest of the *entire* same `scan-logs` output is an
+   idempotent no-op (deduped to one physical record) rather than multiplied, so
+   identical re-scans do **not** inflate `--data-dir` counts the way concatenating
+   identical JSONL does on `--graph`.
+2. Even across **differing** scans, an individual **byte-identical**
+   `LogOccurrenceBucket` — same signature, same hour, **same count** (so the same
+   record ID *and* the same content) — is deduped to one physical record rather
+   than summed. Such a shared-hour/shared-count bucket therefore contributes its
+   count **once** on `--data-dir` but **twice** on `--graph`, whose concatenated
+   JSONL carries both copies and whose bucket-sum iterates bucket **nodes** without
+   deduping by bucket record ID (see #361). Per-window occurrence counts
+   (`base_window_occurrences` / `head_window_occurrences`) can therefore be **lower**
+   on `--data-dir` for this case. This is inherent to non-source-aware bucket
+   identity; the real fix is source-aware bucket identity, tracked in **issue #361**.
+
+A **single** `scan-logs` ingest is exact either way. When the query runs over
+`--data-dir` **and** the store holds at least one `ErrorSignature`, the response
+envelope carries an `embedded_log_retention_caveat` object (a fixed `message`)
+disclosing both forms of this residual divergence. The adapter-level retention fix
+landed in **issue #363**.
 
 ## Change classes
 
