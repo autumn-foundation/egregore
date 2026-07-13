@@ -110,11 +110,14 @@ surface, which surfaces every **superseded** non-temporal `ErrorSignature` /
 The cross-scan coalescing the `--graph` path performs (earliest `first_seen`,
 latest `last_seen`, summed occurrence counts, all buckets) is therefore
 reconstructed **exactly** on `--data-dir` for differing-content scans. Only
-**distinct scan observations** are retained: the standard `scan-logs ->
-resolve-frames -> link-logs` pipeline re-emits the same `ErrorSignature` node
-enriched with evidence links but with an unchanged log payload, and that
-enrichment-only rewrite is retained as a **single** observation — never
-double-counted. The residual
+**distinct scan observations** are retained, where "distinct" is decided on the
+**full scan payload** (window, occurrence count, and captured `frames` #322) —
+not just `first_seen` / `last_seen` / `occurrence_count` — so two observations
+sharing one occurrence window but differing in captured frames are both kept. The
+standard `scan-logs -> resolve-frames -> link-logs` pipeline re-emits the same
+`ErrorSignature` node enriched with node-level evidence links but with an
+unchanged log payload, and that enrichment-only rewrite is retained as a
+**single** observation — never double-counted. The residual
 divergence has two forms, both from idempotent-write dedup of byte-identical
 non-temporal records: (1) a byte-identical re-ingest of the whole `scan-logs`
 output is deduped to one physical record (not multiplied); and (2) even across

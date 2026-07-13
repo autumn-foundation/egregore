@@ -181,14 +181,18 @@ so the same duplicate slice the coalescer needs is present, and `first_seen` /
 concatenated `--graph` JSONL. The split-signature case above therefore classifies
 identically on `--data-dir` and `--graph`.
 
-Only **distinct scan observations** are retained. The standard pipeline
+Only **distinct scan observations** are retained, where "distinct" is decided on
+the **full scan payload** (window, occurrence count, and captured `frames`) —
+not just `first_seen` / `last_seen` / `occurrence_count` — so two observations
+that share an identical occurrence window but differ in their scan-time captured
+frames (#322) are both kept. The standard pipeline
 `scan-logs -> resolve-frames -> link-logs` re-emits the same `ErrorSignature`
-node enriched with evidence links (`FRAME_RESOLVES_TO` / `EMITTED_DURING` /
-`REFERENCES_TASK`) while leaving its log payload (`first_seen` / `last_seen` /
-`occurrence_count`) unchanged. That enrichment-only rewrite is the **same**
-observation, not a new scan, so it is retained as a **single** observation and
-never double-counts occurrences. The retained current version is always the
-enriched one, so resolved frames and evidence links are preserved.
+node enriched with node-level evidence links (`FRAME_RESOLVES_TO` /
+`EMITTED_DURING` / `REFERENCES_TASK`) while leaving its log payload unchanged.
+That enrichment-only rewrite is the **same** observation (identical payload, only
+`evidence_links` added), not a new scan, so it is retained as a **single**
+observation and never double-counts occurrences. The retained current version is
+always the enriched one, so resolved frames and evidence links are preserved.
 
 One residual divergence remains, in two forms, both rooted in the idempotent-write
 dedup of byte-identical non-temporal records:

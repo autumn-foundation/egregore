@@ -3649,33 +3649,57 @@ fn read_back_error(record_id: &str, message: impl Into<String>) -> AdapterError 
     }
 }
 
-/// Coalesce-relevant "observation key" of a log-domain node: the log-payload
-/// fields the #326 `log-deltas` / #324 `error-context` cross-scan coalescers
-/// actually merge. Two physical versions of the same stable ID that share this
-/// key are the SAME scan observation — e.g. an enrichment rewrite from
-/// `resolve-frames` / `link-logs` that adds evidence links but leaves the log
-/// payload untouched — and must never be re-counted by
-/// [`EmbeddedAletheiaSink::read_all_records_log_retained`]. Evidence links and
-/// other node metadata are deliberately excluded from the key. Returns `None`
-/// for a node that carries no coalesce-relevant log payload.
+/// Coalesce-relevant "observation key" of a log-domain node: the FULL scan
+/// payload of the node, excluding only post-scan enrichment metadata. Two
+/// physical versions of the same stable ID that share this key are the SAME
+/// scan observation — e.g. an enrichment rewrite from `resolve-frames` /
+/// `link-logs` that adds node-level `evidence_links` but leaves the log payload
+/// (`LogPayload`) untouched — and must never be re-counted by
+/// [`EmbeddedAletheiaSink::read_all_records_log_retained`]. Returns `None` for a
+/// node that carries no coalesce-relevant log payload.
 ///
-/// * `ErrorSignature`: `(first_seen, last_seen, occurrence_count)` — exactly the
-///   fields the signature coalescer merges (min `first_seen`, max `last_seen`,
-///   summed `occurrence_count`). Identity fields (severity/template/fingerprint)
-///   are constant per stable ID, so they need not appear.
-/// * `LogOccurrenceBucket`: `(bucket_start, occurrence_count)`. Byte-identical
-///   buckets are already write-deduped, so this is effectively a no-op for
-///   buckets, but the rule is applied uniformly.
+/// # Why the full payload, not just the occurrence triple
+///
+/// Two GENUINELY DISTINCT scan observations of one signature ID can share
+/// identical `first_seen`/`last_seen`/`occurrence_count` yet differ in a
+/// non-identity SCAN payload field — most notably the `frames` backtrace chain
+/// captured at scan time (#322). A key on the occurrence triple alone would
+/// treat those as one observation and drop the superseded version, so
+/// `--data-dir` would UNDER-SUM versus the `--graph` path which retains and sums
+/// both. Keying on the whole payload keeps every distinct scan payload while
+/// still collapsing enrichment-only rewrites.
+///
+/// # Why `evidence_links` is excluded for free
+///
+/// `evidence_links` is a NODE-level field on [`GraphRecord::Node`], NOT part of
+/// [`crate::ir::LogPayload`]. `resolve-frames` / `link-logs` enrichment mutates
+/// only that node-level field (via `GraphRecord::with_evidence_links`), never
+/// the payload, so serializing the payload naturally excludes enrichment
+/// metadata: an enrichment rewrite has an identical payload → identical key →
+/// collapses, while a distinct scan payload has a distinct key → is retained.
+///
+/// # Determinism
+///
+/// The key is `serde_json::to_string` of the matched payload variant. All log
+/// payload structs (and `StackFrame`) are plain scalar/`Option` fields in a
+/// fixed declaration order with no maps, so serialization is byte-stable across
+/// runs — the same machinery that makes the graph JSONL byte-stable. The enum's
+/// `#[serde(tag = "log_kind")]` discriminant keeps signature and bucket keyspaces
+/// disjoint. `serde_json` cannot fail for these map-free structs; `.ok()` degrades
+/// a theoretically-impossible failure to `None` (retain — never a silent
+/// double-count).
+///
+/// * `ErrorSignature`: the full [`crate::ir::ErrorSignaturePayload`], including
+///   the `frames` chain, so two observations differing only in captured frames
+///   are retained.
+/// * `LogOccurrenceBucket`: the full bucket payload. Byte-identical buckets are
+///   already write-deduped, so this is effectively a no-op for buckets, but the
+///   rule is applied uniformly.
 fn log_observation_key(record: &GraphRecord) -> Option<String> {
-    match record.log_payload()? {
-        crate::ir::LogPayload::ErrorSignature(payload) => Some(format!(
-            "sig\u{1f}{}\u{1f}{}\u{1f}{}",
-            payload.first_seen, payload.last_seen, payload.occurrence_count
-        )),
-        crate::ir::LogPayload::LogOccurrenceBucket(payload) => Some(format!(
-            "bucket\u{1f}{}\u{1f}{}",
-            payload.bucket_start, payload.occurrence_count
-        )),
+    let payload = record.log_payload()?;
+    match payload {
+        crate::ir::LogPayload::ErrorSignature(_)
+        | crate::ir::LogPayload::LogOccurrenceBucket(_) => serde_json::to_string(payload).ok(),
         crate::ir::LogPayload::LogSource(_) | crate::ir::LogPayload::LogEvent(_) => None,
     }
 }
@@ -4739,6 +4763,42 @@ mod tests {
         .with_valid_time(first_seen, "log_event_timestamp")
     }
 
+    /// Like [`error_signature_record`] but with a caller-supplied captured
+    /// backtrace `frames` chain. Two `scan-logs` observations of the same
+    /// signature ID can share identical `first_seen`/`last_seen`/
+    /// `occurrence_count` yet differ ONLY in their scan-time captured frames
+    /// (a #322 non-identity payload field) — a genuinely distinct observation
+    /// the retained read must keep, not an enrichment rewrite (issue #363).
+    fn error_signature_record_with_frames(
+        id: &str,
+        first_seen: &str,
+        last_seen: &str,
+        occurrence_count: u64,
+        frames: Vec<crate::ir::StackFrame>,
+    ) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::ErrorSignature,
+            None,
+            None,
+            Some("error signature".to_owned()),
+            format!("Error signature x{occurrence_count}"),
+        )
+        .with_domain("log", crate::ir::LOG_SCHEMA_VERSION)
+        .with_log(crate::ir::LogPayload::ErrorSignature(
+            crate::ir::ErrorSignaturePayload {
+                fingerprint_algorithm: "template-v1".to_owned(),
+                template_excerpt: "template boom".to_owned(),
+                severity: "error".to_owned(),
+                occurrence_count,
+                first_seen: first_seen.to_owned(),
+                last_seen: last_seen.to_owned(),
+                frames: Some(frames),
+            },
+        ))
+        .with_valid_time(first_seen, "log_event_timestamp")
+    }
+
     #[test]
     fn read_all_records_log_retained_surfaces_superseded_log_signature_versions() {
         // Issue #363: two `scan-logs` ingests of the same fingerprint (identical
@@ -4805,6 +4865,62 @@ mod tests {
         assert_eq!(
             count, 1,
             "a byte-identical re-ingest is deduped to one physical record"
+        );
+    }
+
+    #[test]
+    fn read_all_records_log_retained_retains_distinct_payload_same_window() {
+        // Issue #363 (Codex P2): two GENUINELY DISTINCT scan observations of the
+        // same signature ID with IDENTICAL first_seen/last_seen/occurrence_count
+        // but DIFFERING scan-time captured frames (#322, non-identity) are
+        // distinct observations — the retained read must surface BOTH so the
+        // #326/#324 coalescers sum both occurrence sets exactly as on the
+        // concatenated `--graph` JSONL. A key on the occurrence triple alone
+        // collapses them to one (under-count); a key on the full scan payload
+        // keeps both.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("log-retained-distinct-payload-store");
+        let sig_id = "log:v1:distinct-payload-boom";
+        let frames_a = vec![crate::ir::StackFrame {
+            frame_index: 0,
+            module_path: Some("app::alpha".to_owned()),
+            file_path: Some("src/alpha.rs".to_owned()),
+            line: Some(10),
+        }];
+        let frames_b = vec![crate::ir::StackFrame {
+            frame_index: 0,
+            module_path: Some("app::beta".to_owned()),
+            file_path: Some("src/beta.rs".to_owned()),
+            line: Some(20),
+        }];
+        let v1 = error_signature_record_with_frames(
+            sig_id,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T05:00:00Z",
+            3,
+            frames_a,
+        );
+        let v2 = error_signature_record_with_frames(
+            sig_id,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T05:00:00Z",
+            3,
+            frames_b,
+        );
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&v1).expect("v1 should write");
+        sink.write_record(&v2).expect("v2 should write");
+
+        let retained = sink
+            .read_all_records_log_retained()
+            .expect("log-retained read");
+        let count = retained
+            .iter()
+            .filter(|r| r.id() == sig_id && r.node_kind_name() == Some("ErrorSignature"))
+            .count();
+        assert_eq!(
+            count, 2,
+            "two distinct scan payloads (same occurrence window, different frames) both survive"
         );
     }
 
@@ -4923,6 +5039,60 @@ mod tests {
         assert_eq!(
             count, 2,
             "two distinct scan observations both survive the log-retained history read"
+        );
+    }
+
+    /// Issue #363 (Codex P2): the history-inclusive log-retained read keeps two
+    /// scan observations that share `first_seen`/`last_seen`/`occurrence_count` but
+    /// differ in captured scan payload (#322 frames) — a key on the occurrence
+    /// triple alone would collapse them (under-count), a full-scan-payload key
+    /// retains both.
+    #[test]
+    fn read_all_records_including_superseded_log_retained_retains_distinct_payload_same_window() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("temporal-distinct-payload-store");
+        let sig_id = "log:v1:temporal-distinct-payload-boom";
+        let frames_a = vec![crate::ir::StackFrame {
+            frame_index: 0,
+            module_path: Some("app::alpha".to_owned()),
+            file_path: Some("src/alpha.rs".to_owned()),
+            line: Some(10),
+        }];
+        let frames_b = vec![crate::ir::StackFrame {
+            frame_index: 0,
+            module_path: Some("app::beta".to_owned()),
+            file_path: Some("src/beta.rs".to_owned()),
+            line: Some(20),
+        }];
+        let v1 = error_signature_record_with_frames(
+            sig_id,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T05:00:00Z",
+            4,
+            frames_a,
+        );
+        let v2 = error_signature_record_with_frames(
+            sig_id,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T05:00:00Z",
+            4,
+            frames_b,
+        );
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&v1).expect("v1 should write");
+        sink.write_record(&v2).expect("v2 should write");
+
+        let retained = sink
+            .read_all_records_including_superseded_log_retained()
+            .expect("log-retained history read");
+        let count = retained
+            .iter()
+            .filter(|r| r.id() == sig_id && r.node_kind_name() == Some("ErrorSignature"))
+            .count();
+        assert_eq!(
+            count, 2,
+            "two distinct scan payloads (same occurrence window, different frames) both survive \
+             the log-retained history read"
         );
     }
 
