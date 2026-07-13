@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
+use crate::github::records::{SOURCE_KIND_PR, SOURCE_KIND_REVIEW};
 use crate::ir::{EdgeLabel, GraphRecord, NodeKind, SourceSpan};
 
 /// Stable defect category: an edge endpoint that resolves to no node record
@@ -31,6 +32,22 @@ pub const EDGE_TARGET_KIND_VIOLATION: &str = "edge_target_kind_violation";
 /// with a wrong-kind source — e.g. a `LogOccurrenceBucket —CAPTURED_FROM→
 /// LogSource` — is invalid attribution the pre-ingest gate must reject.
 pub const EDGE_SOURCE_KIND_VIOLATION: &str = "edge_source_kind_violation";
+/// Stable defect category: a reviewer-identity edge whose source node is of the
+/// correct kind but carries the wrong (or no) importer `source_kind`
+/// attribution (issue #369).
+///
+/// The finer companion to `edge_source_kind_violation`: that category constrains
+/// the source *node kind*, while this one constrains the importer-origin
+/// `source_kind` STRING the node carries. The daemon's `validate_project_edge`
+/// gates `REVIEWED_BY` on a `github_review` Review source and
+/// `REQUESTED_REVIEW_FROM` on a `github_pr` Task source via
+/// `require_project_edge_source_kind`; a kind-correct but mis-attributed source
+/// (e.g. a `github_issue` Task, or a hand-authored Review with no `source_kind`)
+/// is a binding the daemon rejects, so the offline pre-ingest gate must reject
+/// it too. Fires only when the source node kind is already valid for the
+/// relation, so a wrong-kind source is reported once as
+/// `edge_source_kind_violation`, never doubly.
+pub const EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION: &str = "edge_source_kind_attribution_violation";
 /// Stable defect category: an edge endpoint that resolves only to a tombstone
 /// (the record is deleted and no node record with the same ID supersedes it).
 pub const EDGE_TO_TOMBSTONED_RECORD: &str = "edge_to_tombstoned_record";
@@ -214,6 +231,28 @@ const fn allowed_source_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
     }
 }
 
+/// The importer `source_kind` a reviewer-identity edge requires on its SOURCE
+/// node (issue #369), matching the daemon's `require_project_edge_source_kind`
+/// gate in `validate_project_edge`.
+///
+/// Distinct from `allowed_source_kinds`, which constrains the source NODE KIND:
+/// this constrains the finer importer-origin `source_kind` STRING the node
+/// carries (`github_review` / `github_pr`), so a kind-correct but mis-attributed
+/// source can never mint a reviewer-identity binding the daemon would reject.
+/// Only the two reviewer-identity edges are constrained; every other label
+/// returns `None` (unconstrained) via the `_ => None` arm.
+const fn required_source_kind(label: EdgeLabel) -> Option<&'static str> {
+    match label {
+        // `Review —REVIEWED_BY→ ExternalIdentity` must originate from an
+        // importer-stamped `github_review` Review.
+        EdgeLabel::ReviewedBy => Some(SOURCE_KIND_REVIEW),
+        // `Task —REQUESTED_REVIEW_FROM→ ExternalIdentity` must originate from a
+        // `github_pr` PR Task — never a `github_issue` Task.
+        EdgeLabel::RequestedReviewFrom => Some(SOURCE_KIND_PR),
+        _ => None,
+    }
+}
+
 /// One machine-readable referential-integrity diagnostic.
 ///
 /// Field population depends on `code`; unset fields are omitted from JSON.
@@ -263,6 +302,15 @@ pub struct ValidationDiagnostic {
     /// Node kind of the offending record.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'static str>,
+    /// Observed importer `source_kind` on the offending source node
+    /// (`edge_source_kind_attribution_violation`); absent when the node carries
+    /// none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    /// Importer `source_kind` the relation requires on its source node
+    /// (`edge_source_kind_attribution_violation`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_source_kind: Option<&'static str>,
     /// Repo-relative path of the offending or referenced node, when present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_relative_path: Option<String>,
@@ -288,6 +336,8 @@ impl ValidationDiagnostic {
             stranded_edge_ids: None,
             record_id: None,
             kind: None,
+            source_kind: None,
+            required_source_kind: None,
             repo_relative_path: None,
             span: None,
         }
@@ -320,6 +370,12 @@ impl ValidationDiagnostic {
         }
         push(&mut parts, "record", self.record_id.as_deref());
         push(&mut parts, "kind", self.kind);
+        push(&mut parts, "source_kind", self.source_kind.as_deref());
+        push(
+            &mut parts,
+            "required_source_kind",
+            self.required_source_kind,
+        );
         push(&mut parts, "path", self.repo_relative_path.as_deref());
         if let Some(span) = self.span {
             parts.push(format!("lines={}-{}", span.start_line, span.end_line));
@@ -359,6 +415,10 @@ impl ValidationReport {
 struct GraphIndex<'a> {
     /// Every kind observed per node ID.
     node_kinds: BTreeMap<&'a str, BTreeSet<NodeKind>>,
+    /// Every importer `source_kind` observed per node ID (issue #369). A node
+    /// ID may recur across history commits; the set holds every attribution
+    /// seen, so a match against any is a match.
+    node_source_kinds: BTreeMap<&'a str, BTreeSet<&'a str>>,
     /// First node record per ID, for path/span citations.
     node_first: BTreeMap<&'a str, &'a GraphRecord>,
     /// Tombstone record IDs per deleted ID.
@@ -376,9 +436,21 @@ impl<'a> GraphIndex<'a> {
         let mut index = Self::default();
         for record in records {
             match record {
-                GraphRecord::Node { id, kind, .. } => {
+                GraphRecord::Node {
+                    id,
+                    kind,
+                    source_kind,
+                    ..
+                } => {
                     index.nodes += 1;
                     index.node_kinds.entry(id).or_default().insert(*kind);
+                    if let Some(source_kind) = source_kind {
+                        index
+                            .node_source_kinds
+                            .entry(id)
+                            .or_default()
+                            .insert(source_kind.as_str());
+                    }
                     index.node_first.entry(id).or_insert(record);
                 }
                 GraphRecord::Edge { .. } => index.edges += 1,
@@ -499,6 +571,40 @@ fn check_edges<'a>(
             diagnostic.allowed_kinds = Some(allowed.iter().map(|kind| kind.as_str()).collect());
             index.cite_node(&mut diagnostic, source);
             diagnostics.insert(diagnostic);
+        }
+
+        // Reviewer-identity source-kind attribution check (issue #369). The
+        // daemon's `require_project_edge_source_kind` gates REVIEWED_BY on a
+        // `github_review` Review source and REQUESTED_REVIEW_FROM on a
+        // `github_pr` Task source; the offline validator previously checked only
+        // the coarse source node kind, so it green-lit bindings the daemon
+        // rejects. Runs only when the source node kind is already valid for the
+        // relation (so a wrong-kind source is reported once, as
+        // `edge_source_kind_violation`, never doubly), and requires the source
+        // node's importer `source_kind` to equal the relation's required value —
+        // a wrong or absent attribution is a defect.
+        if let (Some(required), Some(kinds)) = (
+            required_source_kind(*label),
+            index.node_kinds.get(source.as_str()),
+        ) && allowed_source_kinds(*label)
+            .is_some_and(|allowed| kinds.iter().any(|kind| allowed.contains(kind)))
+        {
+            let observed = index.node_source_kinds.get(source.as_str());
+            let satisfied = observed.is_some_and(|set| set.contains(required));
+            if !satisfied {
+                let mut diagnostic =
+                    ValidationDiagnostic::new(EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION);
+                diagnostic.edge_id = Some(edge_id.clone());
+                diagnostic.relation = Some(label.as_str().to_owned());
+                diagnostic.endpoint = Some("source");
+                diagnostic.record_id = Some(source.clone());
+                diagnostic.source_kind = observed
+                    .and_then(|set| set.iter().next().copied())
+                    .map(str::to_owned);
+                diagnostic.required_source_kind = Some(required);
+                index.cite_node(&mut diagnostic, source);
+                diagnostics.insert(diagnostic);
+            }
         }
     }
     (incident, stranded_by_deleted)
@@ -837,6 +943,15 @@ mod tests {
             Some("n".to_owned()),
             "test node".to_owned(),
         )
+    }
+
+    /// A node carrying an importer `source_kind` attribution (issue #369).
+    fn node_with_source_kind(id: &str, kind: NodeKind, kind_str: &str) -> GraphRecord {
+        let mut record = node(id, kind);
+        if let GraphRecord::Node { source_kind, .. } = &mut record {
+            *source_kind = Some(kind_str.to_owned());
+        }
+        record
     }
 
     fn edge(id: &str, label: EdgeLabel, source: &str, target: &str) -> GraphRecord {
@@ -1849,6 +1964,84 @@ mod tests {
             codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
             "Review—REQUESTED_REVIEW_FROM→ExternalIdentity must be rejected, got {codes:?}"
         );
+    }
+
+    #[test]
+    fn reviewer_identity_edges_with_correct_source_kind_are_clean() {
+        // Issue #369: a REVIEWED_BY from a `github_review` Review and a
+        // REQUESTED_REVIEW_FROM from a `github_pr` Task carry the importer
+        // source_kind the daemon requires, so both pass the parity check.
+        let records = vec![
+            node_with_source_kind("n:review", NodeKind::Review, "github_review"),
+            node_with_source_kind("n:task", NodeKind::Task, "github_pr"),
+            node("n:id", NodeKind::ExternalIdentity),
+            edge("e:rb", EdgeLabel::ReviewedBy, "n:review", "n:id"),
+            edge("e:rrf", EdgeLabel::RequestedReviewFrom, "n:task", "n:id"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
+            "correctly-attributed reviewer-identity edges must be clean, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn reviewed_by_from_non_github_review_source_kind_is_rejected() {
+        // Issue #369: a REVIEWED_BY whose source is a node-kind-correct but
+        // non-`github_review` Review (here: no importer source_kind at all —
+        // a generic/hand-authored Review) is a binding the daemon rejects, so
+        // the offline gate must reject it too. The node-kind check passes
+        // (source is a Review), so the attribution defect is the only one.
+        let records = vec![
+            node("n:review", NodeKind::Review),
+            node("n:id", NodeKind::ExternalIdentity),
+            edge("e:rb", EdgeLabel::ReviewedBy, "n:review", "n:id"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
+            "REVIEWED_BY from a source lacking source_kind github_review must be rejected, got {codes:?}"
+        );
+        assert!(
+            !codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "a node-kind-correct Review source must not also trip the node-kind check, got {codes:?}"
+        );
+        let defect = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION)
+            .expect("attribution defect present");
+        assert_eq!(defect.edge_id.as_deref(), Some("e:rb"));
+        assert_eq!(defect.record_id.as_deref(), Some("n:review"));
+        assert_eq!(defect.required_source_kind, Some("github_review"));
+        assert_eq!(defect.source_kind, None);
+    }
+
+    #[test]
+    fn requested_review_from_github_issue_task_is_rejected() {
+        // Issue #369: the issue's canonical example — a `github_issue` Task
+        // (node-kind-correct for REQUESTED_REVIEW_FROM, wrong source_kind) is a
+        // binding the daemon rejects, so the offline validator must too.
+        let records = vec![
+            node_with_source_kind("n:task", NodeKind::Task, "github_issue"),
+            node("n:id", NodeKind::ExternalIdentity),
+            edge("e:rrf", EdgeLabel::RequestedReviewFrom, "n:task", "n:id"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
+            "REQUESTED_REVIEW_FROM off a github_issue Task must be rejected, got {codes:?}"
+        );
+        let defect = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION)
+            .expect("attribution defect present");
+        assert_eq!(defect.required_source_kind, Some("github_pr"));
+        assert_eq!(defect.source_kind.as_deref(), Some("github_issue"));
     }
 
     #[test]
