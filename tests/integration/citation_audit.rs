@@ -788,6 +788,7 @@ fn seed() -> Fixture {
             bucket_start: "2026-01-02T12:00:00Z".to_owned(),
             bucket_width: "1h".to_owned(),
             occurrence_count: 3,
+            source_id: log_source_id.clone(),
         },
     ))
     .with_valid_time("2026-01-02T12:00:00Z", "log_event_timestamp");

@@ -156,14 +156,36 @@ fn log_sig_id(seed: &str) -> String {
     aletheia_egregore::log_stable_id(&["error_signature", "repo_test", seed])
 }
 
-/// A `LogOccurrenceBucket` node plus its `AGGREGATES` edge to the signature.
+/// The default `LogSource` handle folded into a single-source fixture bucket ID.
+const DEFAULT_SOURCE: &str = "log:v2:source-default";
+
+/// A `LogOccurrenceBucket` node plus its `AGGREGATES` edge to the signature,
+/// attributed to a single default source (issue #361: bucket identity is now
+/// source-aware, so a fixture modelling ONE source uses one source handle).
 fn bucket_with_edge(
     signature_id: &str,
     bucket_start: &str,
     count: u64,
 ) -> (GraphRecord, GraphRecord) {
-    let bucket_id =
-        aletheia_egregore::log_stable_id(&["log_occurrence_bucket", signature_id, bucket_start]);
+    bucket_with_source(signature_id, bucket_start, count, DEFAULT_SOURCE)
+}
+
+/// A `LogOccurrenceBucket` node plus its `AGGREGATES` edge, attributed to an
+/// explicit `source_id` (issue #361). The `source_id` is folded LAST into the
+/// bucket's stable ID, mirroring production ordering, so distinct sources mint
+/// DISTINCT bucket IDs while a rescan of the same source mints the SAME ID.
+fn bucket_with_source(
+    signature_id: &str,
+    bucket_start: &str,
+    count: u64,
+    source_id: &str,
+) -> (GraphRecord, GraphRecord) {
+    let bucket_id = aletheia_egregore::log_stable_id(&[
+        "log_occurrence_bucket",
+        signature_id,
+        bucket_start,
+        source_id,
+    ]);
     let node = GraphRecord::node(
         bucket_id.clone(),
         NodeKind::LogOccurrenceBucket,
@@ -178,6 +200,7 @@ fn bucket_with_edge(
             bucket_start: bucket_start.to_owned(),
             bucket_width: "1h".to_owned(),
             occurrence_count: count,
+            source_id: source_id.to_owned(),
         },
     ))
     .with_valid_time(bucket_start, "log_event_timestamp");
@@ -486,18 +509,16 @@ fn log_deltas_window_occurrences_are_hour_bucket_granular() {
 }
 
 #[test]
-fn log_deltas_sums_per_source_buckets_sharing_a_bucket_id() {
+fn log_deltas_sums_distinct_source_buckets_for_the_same_hour() {
     // Two DISTINCT scan-logs sources observe the same signature in the same hour
-    // inside the head window. `LogOccurrenceBucket` identity is
-    // (repository/signature/hour/width) and omits `LogSource` (see #361), so both
-    // sources mint the SAME bucket record ID with different per-source counts (3
-    // and 4). Per-window counts must SUM across sources (7) so they stay
-    // consistent with the aggregate `occurrence_count`, which already sums the
-    // coalesced signatures — deduping by bucket record ID would keep only one
-    // source's count and under-report.
+    // inside the head window. Since issue #361 made `LogOccurrenceBucket` identity
+    // source-aware (repository/signature/hour/width/SOURCE), the two sources mint
+    // DISTINCT bucket record IDs with their own per-source counts (3 and 4).
+    // Per-window counts SUM across the distinct sources (7), staying consistent
+    // with the aggregate `occurrence_count`, which sums the coalesced signatures.
     let sig = log_sig_id("dual-source");
-    let (first_node, first_edge) = bucket_with_edge(&sig, NEW_BUCKET, 3);
-    let (second_node, second_edge) = bucket_with_edge(&sig, NEW_BUCKET, 4);
+    let (first_node, first_edge) = bucket_with_source(&sig, NEW_BUCKET, 3, "log:v2:source-a");
+    let (second_node, second_edge) = bucket_with_source(&sig, NEW_BUCKET, 4, "log:v2:source-b");
     let records = vec![
         commit("c1sha0000", &[], T1),
         commit("c2sha0000", &["c1sha0000"], T2),
@@ -519,7 +540,7 @@ fn log_deltas_sums_per_source_buckets_sharing_a_bucket_id() {
     assert_eq!(
         row.head_window_occurrences,
         Some(7),
-        "distinct sources sharing a bucket record ID must SUM (3 + 4), not dedupe"
+        "distinct source-aware bucket IDs must SUM (3 + 4)"
     );
     // Aggregate count sums the two per-source signature payloads, matching.
     assert_eq!(row.occurrence_count, 7);
@@ -555,19 +576,17 @@ fn log_deltas_is_byte_stable_across_runs() {
 /// repo produce: scan 1 observed the signature entirely BEFORE the `[T2, T3]`
 /// range window (alone → `ceased`); scan 2 first observed it INSIDE the window
 /// (alone → `new`). Buckets: an H1 hour before the window, an H2 hour inside it,
-/// and a re-scanned duplicate of H2 (identical bucket record ID). Per-window
-/// bucket counts SUM every linked bucket without deduping by record ID (#361) so
-/// distinct sources sharing a bucket ID are preserved; the symmetric cost is that
-/// this identical H2 rescan is counted twice. Merged bounds (earliest
+/// and a re-scanned duplicate of H2 from the SAME source (identical source-aware
+/// bucket record ID). Per-window bucket counts DEDUP by record ID (#361), so this
+/// identical H2 rescan collapses and is counted ONCE. Merged bounds (earliest
 /// `first_seen`, latest `last_seen`) drive a single `ceased` classification.
 fn split_signature_records() -> Vec<GraphRecord> {
     let sig = log_sig_id("split-boom");
     let (h1_node, h1_edge) = bucket_with_edge(&sig, "2026-01-01T00:00:00Z", 3);
     let (h2_node, h2_edge) = bucket_with_edge(&sig, NEW_BUCKET, 5);
-    // A second scan re-emits the identical H2 bucket: same content-addressed
-    // bucket record ID. Per-window counts SUM every linked bucket (#361), so this
-    // identical rescan is counted again — the documented, symmetric cost of not
-    // deduping (which is what preserves distinct sources sharing a bucket ID).
+    // A second scan re-emits the identical H2 bucket from the SAME source: same
+    // source-aware bucket record ID and identical bytes. Per-window counts dedup
+    // by record ID (#361), so this rescan collapses and is counted once.
     let (h2_dup_node, h2_dup_edge) = bucket_with_edge(&sig, NEW_BUCKET, 5);
     vec![
         commit("c1sha0000", &[], T1),
@@ -631,8 +650,8 @@ fn log_deltas_coalesces_split_signature_across_scan_outputs() {
         "merged last_seen is the latest across the group"
     );
 
-    // (3) Summed per-window bucket counts (#361): every linked bucket is summed
-    // without deduping by record ID, so the re-scanned H2 hour is counted twice.
+    // (3) Deduped per-window bucket counts (#361): the re-scanned H2 hour shares a
+    // source-aware bucket record ID and collapses, so it is counted ONCE.
     assert_eq!(row.occurrence_source, "occurrence_buckets");
     assert_eq!(
         row.base_window_occurrences,
@@ -641,8 +660,8 @@ fn log_deltas_coalesces_split_signature_across_scan_outputs() {
     );
     assert_eq!(
         row.head_window_occurrences,
-        Some(13),
-        "H1 (3) + H2 (5) + duplicate H2 (5), summed without bucket-ID dedup"
+        Some(8),
+        "H1 (3) + H2 (5); the identical H2 rescan is deduped by bucket ID"
     );
     // (4) Aggregate occurrence_count sums the two scan payloads.
     assert_eq!(
@@ -783,148 +802,184 @@ fn log_deltas_embedded_data_dir_coalesces_like_graph_for_differing_scans() {
 }
 
 // ---------------------------------------------------------------------------
-// Same-hour / same-count bucket dedup on the embedded read path (issue #363,
-// Codex P2). When two DIFFERING scans of the SAME signature share a
-// `LogOccurrenceBucket` for the same hour with the SAME count, that bucket record
-// is BYTE-IDENTICAL across scans (bucket ID = repository/signature/hour/width;
-// content = the same count). The second write therefore takes `write_record`'s
-// idempotent no-op path, so only ONE physical bucket node exists and
-// `read_all_records_log_retained` has nothing superseded to re-emit for it. The
-// two `ErrorSignature` records still DIFFER (distinct last_seen/count), so BOTH
-// are retained and coalesced. Consequence: the shared-hour bucket count is
-// reflected ONCE in the `--data-dir` per-window totals, whereas the `--graph`
-// path (which iterates bucket nodes over the concatenated JSONL and sums
-// duplicates, issue #361) counts it TWICE. This case legitimately diverges from
-// `--graph`; the real fix is source-aware bucket identity, tracked in issue #361.
-// This test asserts the OBSERVED `--data-dir` behavior and deliberately does NOT
-// assert `--data-dir == --graph`.
+// Source-aware bucket identity convergence (issue #361). Two cases prove that
+// per-window occurrence counts now CONVERGE between `--graph` and `--data-dir`:
+//   (a) a RESCAN of the identical source mints IDENTICAL source-aware bucket IDs,
+//       which collapse on BOTH paths (`--graph` dedups by record ID, `--data-dir`
+//       idempotent-write-dedups) — no divergence in bucket counts;
+//   (b) two DISTINCT sources mint DISTINCT source-aware bucket IDs, which SUM on
+//       BOTH paths.
+// The `--data-dir` retention caveat remains ONLY to disclose the residual
+// idempotent-write behavior (a byte-identical whole-output re-ingest doubles the
+// signature aggregate `occurrence_count` on `--graph` but not on `--data-dir`) —
+// NOT a bucket-identity gap.
 // ---------------------------------------------------------------------------
 
-/// Same seed → same stable `ErrorSignature` ID, emitted twice with DIFFERING
-/// content (distinct `last_seen` + per-scan count), so both signature records are
-/// retained and coalesce. Both scans emit a SHARED bucket for the 12:00 hour with
-/// an IDENTICAL count (4) — byte-identical → deduped to one physical record — plus
-/// one DISTINCT-hour bucket each (13:00 x3, 14:00 x6) so the scans genuinely
-/// differ and there is non-shared occurrence data. All buckets fall inside the
-/// `[T2, T3]` window (after base T1, at/before head T3), so `base_window` is 0.
+/// A RESCAN of the identical source: the SAME `ErrorSignature` (byte-identical
+/// content) and the SAME buckets (default source → identical source-aware bucket
+/// IDs) emitted TWICE, exactly as `cat scan.jsonl scan.jsonl` would produce.
+/// Buckets: 12:00 x4 and 13:00 x3, both inside the `[T2, T3]` window.
 #[cfg(feature = "embedded-aletheiadb")]
-fn split_signature_shared_same_count_bucket() -> Vec<GraphRecord> {
-    const SHARED_HOUR: &str = "2026-01-02T12:00:00Z";
-    const SCAN1_HOUR: &str = "2026-01-02T13:00:00Z";
-    const SCAN2_HOUR: &str = "2026-01-02T14:00:00Z";
-    const SCAN1_LAST: &str = "2026-01-02T13:30:00Z";
-    const SCAN2_LAST: &str = "2026-01-02T14:30:00Z";
+fn rescan_identical_source_records() -> Vec<GraphRecord> {
+    const HOUR_A: &str = "2026-01-02T12:00:00Z";
+    const HOUR_B: &str = "2026-01-02T13:00:00Z";
 
-    let sig = log_sig_id("shared-hour");
-    // The byte-identical shared bucket (same signature, hour, and count) is emitted
-    // by BOTH scans; only the second write is the idempotent no-op.
-    let (shared_node, shared_edge) = bucket_with_edge(&sig, SHARED_HOUR, 4);
-    let (scan1_node, scan1_edge) = bucket_with_edge(&sig, SCAN1_HOUR, 3);
-    let (scan2_node, scan2_edge) = bucket_with_edge(&sig, SCAN2_HOUR, 6);
+    let sig = log_sig_id("rescan-boom");
+    let (a_node, a_edge) = bucket_with_edge(&sig, HOUR_A, 4);
+    let (b_node, b_edge) = bucket_with_edge(&sig, HOUR_B, 3);
     vec![
         commit("c1sha0000", &[], T1),
         commit("c2sha0000", &["c1sha0000"], T2),
         commit("c3sha0000", &["c2sha0000"], T3),
-        // Two differing scan outputs of the same signature ID (distinct last_seen).
-        error_signature("shared-hour", "error", NEW_FIRST, SCAN1_LAST, 5),
-        error_signature("shared-hour", "error", NEW_FIRST, SCAN2_LAST, 8),
-        // Scan 1 buckets: the shared 12:00 bucket + its distinct 13:00 bucket.
-        shared_node.clone(),
-        shared_edge.clone(),
-        scan1_node,
-        scan1_edge,
-        // Scan 2 buckets: the SAME shared 12:00 bucket (byte-identical) + 14:00.
-        shared_node,
-        shared_edge,
-        scan2_node,
-        scan2_edge,
+        // Byte-identical signature emitted twice (identical rescan).
+        error_signature("rescan-boom", "error", NEW_FIRST, NEW_LAST, 5),
+        error_signature("rescan-boom", "error", NEW_FIRST, NEW_LAST, 5),
+        a_node.clone(),
+        a_edge.clone(),
+        b_node.clone(),
+        b_edge.clone(),
+        a_node,
+        a_edge,
+        b_node,
+        b_edge,
     ]
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
-fn log_deltas_embedded_dedups_shared_same_count_bucket() {
+fn log_deltas_rescan_buckets_converge_across_graph_and_data_dir() {
     use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
 
-    let records = split_signature_shared_same_count_bucket();
+    let records = rescan_identical_source_records();
 
-    // Build the embedded store by writing every record in order. The second write
-    // of the byte-identical shared bucket is an idempotent no-op, so only ONE
-    // physical shared-bucket node ever exists.
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let data_dir = temp.path().join("shared-bucket-store");
+    let data_dir = temp.path().join("rescan-store");
     let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
     for record in &records {
         sink.write_record(record).expect("record should write");
     }
     let embedded_records = sink
         .read_all_records_log_retained()
-        .expect("log-retained read should surface both signature versions");
+        .expect("log-retained read");
     drop(sink);
 
-    let sig = log_sig_id("shared-hour");
+    let sig = log_sig_id("rescan-boom");
 
-    // --data-dir: the coalesced signature is NEW (first_seen inside the window) and
-    // its per-window occurrence total reflects the shared 12:00 bucket ONCE:
-    // shared(4) + scan1 distinct(3) + scan2 distinct(6) = 13. base_window is 0
-    // because every bucket falls after the base endpoint (T1).
+    // --data-dir: identical buckets are idempotent-write-deduped → counted once:
+    // 4 + 3 = 7.
     let embedded = log_deltas(&embedded_records, "c1", "c3", None, true)
         .expect("embedded range should resolve");
     assert_eq!(record_ids(&embedded.new_signatures), vec![sig.clone()]);
     let embedded_row = &embedded.new_signatures[0];
     assert_eq!(embedded_row.occurrence_source, "occurrence_buckets");
     assert_eq!(embedded_row.base_window_occurrences, Some(0));
-    assert_eq!(
-        embedded_row.head_window_occurrences,
-        Some(13),
-        "the byte-identical shared 12:00 bucket is deduped to one physical record, \
-         so its count (4) is reflected ONCE: 4 + 3 + 6 = 13"
-    );
+    assert_eq!(embedded_row.head_window_occurrences, Some(7));
 
-    // --graph: the concatenated JSONL carries TWO copies of the byte-identical
-    // shared bucket. log_deltas iterates bucket NODES and sums duplicates (never
-    // deduping by bucket record ID, issue #361), so the shared count is added TWICE:
-    // shared(4 + 4) + scan1(3) + scan2(6) = 17.
+    // --graph: the identical rescan buckets share source-aware IDs and are deduped
+    // by record ID before summing → ALSO 7. Per-window counts CONVERGE.
     let graph = log_deltas(&records, "c1", "c3", None, false).expect("graph range should resolve");
     assert_eq!(record_ids(&graph.new_signatures), vec![sig]);
     let graph_row = &graph.new_signatures[0];
-    assert_eq!(graph_row.base_window_occurrences, Some(0));
     assert_eq!(
         graph_row.head_window_occurrences,
-        Some(17),
-        "the --graph path sums both byte-identical shared-bucket copies (4 + 4)"
+        Some(7),
+        "identical rescan buckets collapse on --graph too (source-aware identity, #361)"
     );
-
-    // The two paths LEGITIMATELY diverge for this same-hour/same-count case: the
-    // gap is exactly the deduped shared-bucket count (4). This is inherent to
-    // non-source-aware bucket identity, whose real fix is issue #361 — NOT a bug in
-    // the embedded read path. We deliberately do NOT assert equality here.
     assert_eq!(
-        graph_row.head_window_occurrences.unwrap() - embedded_row.head_window_occurrences.unwrap(),
-        4,
-        "the divergence equals the once-deduped shared-hour bucket count (issue #361)"
+        graph_row.head_window_occurrences, embedded_row.head_window_occurrences,
+        "per-window occurrence counts CONVERGE for a rescan"
     );
 
-    // The embedded path still discloses the retention caveat, which now names this
-    // shared-hour/shared-count bucket sub-case.
+    // The ONLY residual: the byte-identical whole-output re-ingest doubles the
+    // signature aggregate occurrence_count on --graph (10) but not on --data-dir
+    // (5, idempotent-write dedup). This is idempotent-write behavior, not a
+    // bucket-identity gap — exactly what the caveat now discloses.
+    assert_eq!(graph_row.occurrence_count, 10);
+    assert_eq!(embedded_row.occurrence_count, 5);
+    assert!(embedded.embedded_log_retention_caveat.is_some());
+    let caveat = embedded.embedded_log_retention_caveat.as_ref().unwrap();
     assert!(
-        embedded.embedded_log_retention_caveat.is_some(),
-        "the embedded path must disclose the retention caveat"
+        caveat.message.contains("converge"),
+        "the caveat must now disclose that per-window counts converge, got: {}",
+        caveat.message
     );
     assert!(
-        embedded
-            .embedded_log_retention_caveat
-            .as_ref()
-            .unwrap()
-            .message
-            .contains("#361"),
-        "the caveat must cite issue #361 as the tracked source-aware-identity fix"
+        caveat.message.contains("idempotent"),
+        "the caveat must attribute the residual to idempotent-write dedup, got: {}",
+        caveat.message
     );
 
-    // Determinism: the embedded classification is byte-stable across repeated runs.
+    // Determinism.
     let embedded_again = log_deltas(&embedded_records, "c1", "c3", None, true)
         .expect("embedded range should resolve again");
     assert_eq!(signature_rows(&embedded), signature_rows(&embedded_again));
+}
+
+/// Two DISTINCT sources observing the SAME signature in the SAME 12:00 hour, with
+/// DIFFERING signature content (distinct `last_seen`) so both are retained on
+/// `--data-dir`. Distinct sources mint DISTINCT source-aware bucket IDs.
+#[cfg(feature = "embedded-aletheiadb")]
+fn distinct_source_same_hour_records() -> Vec<GraphRecord> {
+    const HOUR: &str = "2026-01-02T12:00:00Z";
+    const LAST_A: &str = "2026-01-02T12:30:00Z";
+    const LAST_B: &str = "2026-01-02T13:30:00Z";
+
+    let sig = log_sig_id("multi-source");
+    let (a_node, a_edge) = bucket_with_source(&sig, HOUR, 4, "log:v2:source-a");
+    let (b_node, b_edge) = bucket_with_source(&sig, HOUR, 6, "log:v2:source-b");
+    vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        commit("c3sha0000", &["c2sha0000"], T3),
+        error_signature("multi-source", "error", NEW_FIRST, LAST_A, 4),
+        error_signature("multi-source", "error", NEW_FIRST, LAST_B, 6),
+        a_node,
+        a_edge,
+        b_node,
+        b_edge,
+    ]
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn log_deltas_distinct_sources_sum_across_graph_and_data_dir() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+
+    let records = distinct_source_same_hour_records();
+
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("multi-source-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record).expect("record should write");
+    }
+    let embedded_records = sink
+        .read_all_records_log_retained()
+        .expect("log-retained read");
+    drop(sink);
+
+    let sig = log_sig_id("multi-source");
+
+    // --data-dir: distinct source-aware bucket IDs both survive → 4 + 6 = 10.
+    let embedded = log_deltas(&embedded_records, "c1", "c3", None, true)
+        .expect("embedded range should resolve");
+    assert_eq!(record_ids(&embedded.new_signatures), vec![sig.clone()]);
+    let embedded_row = &embedded.new_signatures[0];
+    assert_eq!(embedded_row.head_window_occurrences, Some(10));
+
+    // --graph: distinct bucket IDs both sum → 10. CONVERGES with --data-dir.
+    let graph = log_deltas(&records, "c1", "c3", None, false).expect("graph range should resolve");
+    assert_eq!(record_ids(&graph.new_signatures), vec![sig]);
+    let graph_row = &graph.new_signatures[0];
+    assert_eq!(
+        graph_row.head_window_occurrences,
+        Some(10),
+        "distinct sources sum on --graph too (source-aware identity, #361)"
+    );
+    assert_eq!(
+        graph_row.head_window_occurrences, embedded_row.head_window_occurrences,
+        "distinct-source per-window occurrence counts CONVERGE"
+    );
 }
 
 /// Four signatures across the classes plus the new signature's bucket, with NO
@@ -1540,9 +1595,10 @@ fn log_deltas_embedded_source_discloses_retention_when_log_records_present() {
         .embedded_log_retention_caveat
         .as_ref()
         .expect("embedded path with log records must disclose the retention caveat");
-    // #363 landed the adapter-level retention: the embedded lane surfaces every
-    // superseded log version, so the caveat now states coalescing is
-    // reconstructed and discloses only the byte-identical-re-ingest divergence.
+    // #363 landed the adapter-level retention and #361 made bucket identity
+    // source-aware: the caveat now states coalescing is reconstructed, per-window
+    // counts converge, and the only residual is the idempotent-write dedup of a
+    // byte-identical whole-output re-ingest.
     assert!(
         caveat
             .message
@@ -1558,8 +1614,12 @@ fn log_deltas_embedded_source_discloses_retention_when_log_records_present() {
         "the caveat must reference the `--graph` path it now matches"
     );
     assert!(
-        caveat.message.contains("byte-identical re-ingests"),
-        "the caveat must disclose the residual byte-identical-re-ingest divergence"
+        caveat.message.contains("converge"),
+        "the caveat must disclose that per-window counts now converge (issue #361)"
+    );
+    assert!(
+        caveat.message.contains("byte-identical re-ingest"),
+        "the caveat must disclose the residual idempotent-write re-ingest divergence"
     );
     assert!(
         caveat.message.contains("#363"),

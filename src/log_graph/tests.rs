@@ -185,10 +185,10 @@ fn frame_resolves_to_schema_tuple_is_known() {
     let version = record_version(&edge);
     assert_eq!(version.domain, "log");
     assert_eq!(version.kind, "FRAME_RESOLVES_TO");
-    assert_eq!(version.version, 1);
+    assert_eq!(version.version, 2);
     assert!(
         is_known_record_version(&version),
-        "(log, FRAME_RESOLVES_TO, 1) must be an accepted schema tuple"
+        "(log, FRAME_RESOLVES_TO, 2) must be an accepted schema tuple"
     );
 }
 
@@ -276,7 +276,7 @@ fn log_stable_id_is_deterministic_and_prefixed() {
         "error",
     ]);
     assert_eq!(a, b);
-    assert!(a.starts_with("log:v1:"), "got {a}");
+    assert!(a.starts_with("log:v2:"), "got {a}");
 }
 
 #[test]
@@ -290,22 +290,27 @@ fn log_stable_id_preserves_case_of_parts() {
 // ── schema-version gate ──────────────────────────────────────────────────────
 
 #[test]
-fn schema_gate_accepts_v1_rejects_unknown() {
+fn schema_gate_accepts_v2_rejects_unknown() {
     use crate::schema_version::{RecordVersion, is_known_record_version};
+    // Log domain is at schema v2 since issue #361 (source-aware bucket identity);
+    // v1 is a superseded version and is no longer accepted.
     for kind in [
         "LogSource",
         "ErrorSignature",
         "LogEvent",
         "LogOccurrenceBucket",
     ] {
-        assert!(is_known_record_version(&RecordVersion::new("log", kind, 1)));
+        assert!(is_known_record_version(&RecordVersion::new("log", kind, 2)));
+        assert!(!is_known_record_version(&RecordVersion::new(
+            "log", kind, 1
+        )));
         assert!(!is_known_record_version(&RecordVersion::new(
             "log", kind, 999
         )));
     }
     for label in ["FINGERPRINTED_AS", "CAPTURED_FROM", "AGGREGATES"] {
         assert!(is_known_record_version(&RecordVersion::new(
-            "log", label, 1
+            "log", label, 2
         )));
     }
 }
@@ -415,5 +420,108 @@ fn safety_net_leaves_secret_free_and_already_redacted_lines_unchanged() {
         String::from_utf8(redacted_source_bytes(already)).expect("utf8"),
         already,
         "an already-redacted placeholder line must pass through the net unchanged"
+    );
+}
+
+// ── issue #361: source-aware LogOccurrenceBucket identity ────────────────────
+
+/// Scans `body` written to `dir/name` and returns the raw scan records.
+fn scan_records(dir: &std::path::Path, name: &str, body: &str) -> Vec<GraphRecord> {
+    let path = dir.join(name);
+    std::fs::write(&path, body).expect("write log fixture");
+    scan_log_records(&path, dir, "repo_test", "2026-01-02T03:00:00Z", false)
+        .expect("scan should succeed")
+        .records
+}
+
+/// Returns the single occurrence bucket's `(record_id, payload.source_id)`.
+fn bucket_id_and_source(records: &[GraphRecord]) -> (String, String) {
+    let mut found: Option<(String, String)> = None;
+    for r in records {
+        if let GraphRecord::Node {
+            id,
+            log: Some(payload),
+            ..
+        } = r
+            && let LogPayload::LogOccurrenceBucket(b) = payload.as_ref()
+        {
+            assert!(found.is_none(), "expected exactly one occurrence bucket");
+            found = Some((id.clone(), b.source_id.clone()));
+        }
+    }
+    found.expect("scan produced one occurrence bucket")
+}
+
+/// Returns the single `ErrorSignature` record ID.
+fn signature_id_of(records: &[GraphRecord]) -> String {
+    records
+        .iter()
+        .find_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::ErrorSignature,
+                ..
+            } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("scan produced one ErrorSignature")
+}
+
+const ONE_ERROR: &str = "2026-01-02T03:00:00Z [ERROR] widget checkout failed for order\n";
+
+#[test]
+fn rescanning_identical_source_yields_identical_bucket_ids() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let first = scan_records(dir.path(), "app.log", ONE_ERROR);
+    let second = scan_records(dir.path(), "app.log", ONE_ERROR);
+    let (id_a, src_a) = bucket_id_and_source(&first);
+    let (id_b, src_b) = bucket_id_and_source(&second);
+    assert_eq!(
+        id_a, id_b,
+        "a rescan of identical bytes mints the same bucket ID"
+    );
+    assert_eq!(src_a, src_b, "a rescan carries the same source_id");
+}
+
+#[test]
+fn distinct_sources_same_signature_yield_distinct_bucket_ids() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    // Two DIFFERENT log files (distinct paths) carrying the SAME error shape → the
+    // SAME ErrorSignature, but distinct LogSource identities (two app instances).
+    let a = scan_records(dir.path(), "instance-a.log", ONE_ERROR);
+    let b = scan_records(dir.path(), "instance-b.log", ONE_ERROR);
+    assert_eq!(
+        signature_id_of(&a),
+        signature_id_of(&b),
+        "distinct sources with the same error share one signature ID"
+    );
+    let (id_a, src_a) = bucket_id_and_source(&a);
+    let (id_b, src_b) = bucket_id_and_source(&b);
+    assert_ne!(src_a, src_b, "distinct sources carry distinct source_id");
+    assert_ne!(
+        id_a, id_b,
+        "distinct sources mint distinct bucket IDs (source-aware identity, #361)"
+    );
+}
+
+#[test]
+fn bucket_payload_carries_its_log_source_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let records = scan_records(dir.path(), "app.log", ONE_ERROR);
+    let source_id = records
+        .iter()
+        .find_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::LogSource,
+                ..
+            } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("scan produced a LogSource");
+    let (_, bucket_source) = bucket_id_and_source(&records);
+    assert_eq!(
+        bucket_source, source_id,
+        "a bucket's source_id is a handle to its LogSource"
     );
 }
