@@ -102,17 +102,16 @@
 //! Endpoint-exact counts would require sub-hour per-occurrence timestamps the
 //! bucket model does not retain.
 //!
-//! These per-window counts SUM every linked bucket across the coalesced group
-//! and are never deduped by bucket record ID (issue #361). A `LogOccurrenceBucket`
-//! record ID is `(repository/signature/hour/width)` and omits `LogSource`, so two
-//! DISTINCT scan-logs sources observing the same signature in the same hour mint
-//! the SAME bucket record ID with their own per-source counts; summing preserves
-//! both sources and keeps these counts consistent with the aggregate
-//! `occurrence_count`, which likewise sums the coalesced signatures. The symmetric
-//! cost is that concatenating the IDENTICAL scan-logs output multiplies counts (a
-//! degenerate, user-error input) — scan each source once, or use per-source
-//! stores. Fully source-attributed counts require source-aware bucket identity, a
-//! #320 log-graph schema change out of #326's scope (tracked in #361).
+//! These per-window counts SUM every DISTINCT linked bucket across the coalesced
+//! group, deduped by bucket record ID (issue #361, source-aware identity). A
+//! `LogOccurrenceBucket` record ID is now `(repository/signature/hour/width/SOURCE)`,
+//! so two DISTINCT scan-logs sources observing the same signature in the same hour
+//! mint DISTINCT bucket IDs whose per-source counts each sum in — preserving both
+//! sources and keeping these counts consistent with the aggregate `occurrence_count`,
+//! which likewise sums the coalesced signatures. A genuine rescan of the IDENTICAL
+//! source mints the SAME bucket ID (byte-identical) and is collapsed by the
+//! dedup-by-ID, so concatenating the IDENTICAL scan-logs output no longer
+//! double-counts buckets.
 //!
 //! When a signature carries no linked buckets (e.g. a log graph ingested
 //! without buckets), per-window bucketization is unavailable: the two window
@@ -246,31 +245,34 @@ pub struct LogRepoScopeCaveat {
 /// counts BEFORE classification — IS reconstructed on `--data-dir` for scans
 /// whose captured content differs.
 ///
-/// The caveat remains a disclosure because a residual divergence persists in two
-/// forms, both rooted in the idempotent-write dedup of byte-identical non-temporal
-/// records. (1) A byte-identical re-ingest of the same `scan-logs` output is an
-/// idempotent no-op (deduped to one physical record) rather than multiplied, so
-/// identical re-scans do not inflate `--data-dir` counts the way concatenating
-/// identical JSONL does on `--graph`. (2) Even across DIFFERING scans, an
-/// individual byte-identical `LogOccurrenceBucket` (same signature, same hour,
-/// same count → same record ID AND same content) is deduped to one physical
-/// record rather than summed, so a shared-hour/shared-count bucket contributes
-/// once here but twice on `--graph` (which iterates bucket nodes and sums
-/// duplicates, issue #361); per-window occurrence counts can therefore be lower on
-/// `--data-dir`. Both stem from non-source-aware bucket identity, whose real fix is
-/// tracked in issue #361. A SINGLE `scan-logs` ingest is exact either way.
+/// Since issue #361 made `LogOccurrenceBucket` identity source-aware
+/// (repository/signature/hour/width/SOURCE), the former same-hour/same-count
+/// bucket divergence is GONE: distinct sources now mint DISTINCT bucket IDs
+/// (summed on both paths) and a genuine rescan mints the SAME bucket ID (deduped
+/// on both paths — `--graph` dedups by record ID before summing, `--data-dir`
+/// dedups at write time), so per-window occurrence counts CONVERGE.
+///
+/// The caveat remains a disclosure because ONE residual divergence persists,
+/// rooted purely in the idempotent-write dedup of byte-identical non-temporal
+/// records — NOT a bucket-identity gap: a byte-identical re-ingest of the SAME
+/// `scan-logs` output (the same signature record appended twice) is an idempotent
+/// no-op on `--data-dir` (deduped to one physical record) but is summed on
+/// `--graph` (which groups duplicate signatures by stable ID and sums their
+/// aggregate `occurrence_count`), so concatenating identical JSONL inflates the
+/// `--graph` aggregate count while an identical re-scan does not inflate
+/// `--data-dir`. A SINGLE `scan-logs` ingest is exact either way.
 pub const LOG_EMBEDDED_RETENTION_CAVEAT: &str = "Embedded (`--data-dir`) stores retain every \
      superseded non-temporal log observation (`ErrorSignature` / `LogOccurrenceBucket`), so the \
      cross-scan coalescing performed on the `--graph` path (earliest `first_seen`, latest \
      `last_seen`, summed occurrence counts) is reconstructed here for scans whose captured content \
-     differs. One residual divergence from `--graph` persists in two forms: (1) byte-identical \
-     re-ingests of the same `scan-logs` output are idempotent (deduped to one physical record) \
-     rather than multiplied, so identical re-scans do not inflate counts on `--data-dir` the way \
-     concatenating identical JSONL does on `--graph`; and (2) even across DIFFERING scans, an \
-     individual byte-identical `LogOccurrenceBucket` (same signature, same hour, same count) is \
-     deduped to one physical record rather than summed, so a shared-hour/shared-count bucket \
-     contributes once here but twice on `--graph`, and per-window occurrence counts can be lower on \
-     `--data-dir`. Both stem from non-source-aware bucket identity (issue #361). Issue #363.";
+     differs. Since bucket identity became source-aware (issue #361), distinct sources mint \
+     distinct bucket IDs (summed on both paths) and genuine rescans mint identical bucket IDs \
+     (deduped on both paths), so per-window occurrence counts converge. One residual divergence \
+     from `--graph` persists, rooted only in idempotent-write dedup (not bucket identity): a \
+     byte-identical re-ingest of the same `scan-logs` output is deduped to one physical record on \
+     `--data-dir` but summed on `--graph`, so concatenating identical JSONL inflates the `--graph` \
+     aggregate `occurrence_count` while an identical re-scan does not inflate `--data-dir`. Issue \
+     #363.";
 
 /// Advisory disclosure attached to a [`LogDeltas`] response whenever the query
 /// runs over the embedded (`--data-dir`) read path AND the store holds at least
@@ -580,24 +582,27 @@ pub fn log_deltas(
         }
     }
 
-    // signature_id → linked (bucket_start, occurrence_count) pairs, ONE entry per
-    // bucket NODE record (issue #361). A `LogOccurrenceBucket` record ID is
-    // (repository/signature/hour/width) and omits `LogSource`, so two DISTINCT
-    // scan-logs sources observing the same signature in the same hour emit
-    // separate bucket nodes that share a bucket record ID. Iterating NODES here —
-    // rather than resolving edges through a by-ID index that would collapse those
-    // duplicates, or deduping by bucket ID — preserves each source's own count and
-    // keeps the window sums consistent with the summed aggregate `occurrence_count`.
-    // The symmetric cost is that an identical rescanned source's duplicate bucket
-    // node is counted again (a degenerate, user-error input); source-aware bucket
-    // identity is the true fix, out of #326's scope (tracked in #361).
+    // signature_id → linked (bucket_start, occurrence_count) pairs, DEDUPED by
+    // bucket record ID (issue #361, source-aware identity). A `LogOccurrenceBucket`
+    // record ID is now (repository/signature/hour/width/SOURCE), so two DISTINCT
+    // scan-logs sources observing the same signature in the same hour mint DISTINCT
+    // bucket IDs (each pushed once → summed naturally below), while a genuine rescan
+    // of identical bytes mints the SAME bucket ID (byte-identical → collapsed here).
+    // Iterating NODES and deduping by record ID therefore counts each real
+    // observation exactly once and no longer double-counts a concatenated rescan.
     let mut buckets_by_sig: BTreeMap<&str, Vec<(&str, u64)>> = BTreeMap::new();
+    let mut seen_bucket_ids: BTreeSet<&str> = BTreeSet::new();
     for r in records {
         if let GraphRecord::Node {
             log: Some(payload), ..
         } = r
         {
             if let LogPayload::LogOccurrenceBucket(bucket) = payload.as_ref() {
+                if !seen_bucket_ids.insert(r.id()) {
+                    // A byte-identical rescan of the same source: same bucket ID,
+                    // already counted. Collapse it (do not sum).
+                    continue;
+                }
                 if let Some(sigs) = bucket_targets.get(r.id()) {
                     for sig in sigs {
                         buckets_by_sig
@@ -690,16 +695,14 @@ pub fn log_deltas(
             LogDeltaClass::OutOfRange => continue,
         };
 
-        // Per-window occurrence counts SUM every linked bucket at/before the
-        // endpoint, WITHOUT deduping by bucket record ID (issue #361). Bucket
-        // identity is (repository/signature/hour/width) and omits `LogSource`, so
-        // two DISTINCT scan-logs sources observing the same signature in the same
-        // hour mint the SAME bucket record ID with their own per-source counts;
-        // summing preserves both sources and keeps these counts consistent with
-        // the aggregate `occurrence_count`, which already sums the coalesced
-        // signatures. The symmetric cost is that concatenating the IDENTICAL
-        // scan-logs output multiplies counts (a degenerate, user-error input);
-        // source-aware bucket identity is the true fix, tracked in #361.
+        // Per-window occurrence counts SUM every DISTINCT linked bucket (deduped
+        // by record ID above) at/before the endpoint (issue #361, source-aware
+        // identity). Bucket identity is now
+        // (repository/signature/hour/width/SOURCE), so two DISTINCT scan-logs
+        // sources observing the same signature in the same hour mint DISTINCT
+        // bucket IDs whose per-source counts each sum in; a genuine rescan of
+        // identical bytes mints the SAME bucket ID and was collapsed above, so
+        // concatenating an identical scan-logs output no longer double-counts.
         let (occurrence_source, base_window, head_window) = match buckets_by_sig.get(*id) {
             Some(buckets) if !buckets.is_empty() => {
                 let base_sum = base_instant.map(|bt| window_bucket_sum(buckets, bt));

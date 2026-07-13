@@ -2303,33 +2303,6 @@ fn merge_error_signature_into(acc: &mut GraphRecord, other: &GraphRecord) {
     }
 }
 
-/// Merges `other`'s `LogOccurrenceBucket` occurrence count into the accumulator
-/// node (issue #340, Codex round-6 P2). Bucket identity is
-/// `(repository/signature/hour/width)` and omits `LogSource`, so two distinct
-/// scans observing the same signature in the same hour mint the SAME bucket
-/// record ID with their own per-source counts; the counts are SUMMED across the
-/// group (never deduped by bucket record ID, per issue #361), keeping them
-/// consistent with the summed aggregate `occurrence_count`. `bucket_start` /
-/// `bucket_width` are identity, hence identical across the group.
-fn merge_bucket_into(acc: &mut GraphRecord, other: &GraphRecord) {
-    let o_count = {
-        let Some(crate::ir::LogPayload::LogOccurrenceBucket(o)) = node_log_payload(other) else {
-            return;
-        };
-        o.occurrence_count
-    };
-    let GraphRecord::Node {
-        log: Some(payload), ..
-    } = acc
-    else {
-        return;
-    };
-    let crate::ir::LogPayload::LogOccurrenceBucket(a) = payload.as_mut() else {
-        return;
-    };
-    a.occurrence_count = a.occurrence_count.saturating_add(o_count);
-}
-
 /// Coalesces duplicate log-domain records by stable ID at ASSEMBLE time (issue
 /// #340, Codex round-6 P2), mirroring the documented `query log-deltas` cross-scan
 /// coalescing semantics so a concatenated multi-scan graph produces exactly ONE
@@ -2337,9 +2310,11 @@ fn merge_bucket_into(acc: &mut GraphRecord, other: &GraphRecord) {
 ///
 /// A `LogSource` is a NON-identity input for a signature — the `ErrorSignature`
 /// stable ID is `(repository_id, fingerprint_algorithm, template, severity)` only
-/// (and a `LogOccurrenceBucket` ID omits `LogSource` likewise) — so a graph made
+/// (a `LogOccurrenceBucket` ID, by contrast, IS source-aware since issue #361:
+/// `(repository/signature/hour/width/SOURCE)`) — so a graph made
 /// by concatenating several `scan-logs` outputs for one repo (a documented,
-/// legitimate workflow) carries the SAME stable log ID once per scan. Without
+/// legitimate workflow) carries the SAME stable signature ID once per scan, while
+/// distinct sources mint distinct bucket IDs. Without
 /// coalescing, `assemble_pack` would emit one summary row per PHYSICAL record and
 /// its own offline `verify_pack` (which requires exactly one row per signature)
 /// would reject the freshly assembled pack. This restores the hard invariant that
@@ -2348,8 +2323,11 @@ fn merge_bucket_into(acc: &mut GraphRecord, other: &GraphRecord) {
 /// Merge rules (match `log_deltas` exactly):
 /// * `ErrorSignature` records sharing an ID → one node: earliest `first_seen`,
 ///   latest `last_seen` (by parsed UTC instant), summed `occurrence_count`.
-/// * `LogOccurrenceBucket` records sharing an ID → one node: summed
-///   `occurrence_count` (never deduped by bucket ID, per #361).
+/// * `LogOccurrenceBucket` records sharing an ID → deduped to the first
+///   occurrence (issue #361, source-aware identity): bucket ID is now
+///   `(repository/signature/hour/width/SOURCE)`, so a shared bucket ID means a
+///   genuine rescan of identical bytes (identical content) — collapse it;
+///   distinct sources mint distinct bucket IDs that survive and sum downstream.
 /// * `LogSource` / `LogEvent` nodes and log-domain edges sharing an ID → deduped
 ///   to the first occurrence (an exact duplicate carries identical content).
 ///
@@ -2363,7 +2341,6 @@ fn merge_bucket_into(acc: &mut GraphRecord, other: &GraphRecord) {
 fn coalesce_log_records(records: &[GraphRecord]) -> Vec<GraphRecord> {
     let mut out: Vec<GraphRecord> = Vec::with_capacity(records.len());
     let mut sig_slot: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut bucket_slot: BTreeMap<&str, usize> = BTreeMap::new();
     let mut seen_dedup: BTreeSet<&str> = BTreeSet::new();
     for record in records {
         match record {
@@ -2380,15 +2357,13 @@ fn coalesce_log_records(records: &[GraphRecord]) -> Vec<GraphRecord> {
                         out.push(record.clone());
                     }
                 }
-                crate::ir::LogPayload::LogOccurrenceBucket(_) => {
-                    if let Some(&idx) = bucket_slot.get(id.as_str()) {
-                        merge_bucket_into(&mut out[idx], record);
-                    } else {
-                        bucket_slot.insert(id.as_str(), out.len());
-                        out.push(record.clone());
-                    }
-                }
-                crate::ir::LogPayload::LogSource(_) | crate::ir::LogPayload::LogEvent(_) => {
+                crate::ir::LogPayload::LogOccurrenceBucket(_)
+                | crate::ir::LogPayload::LogSource(_)
+                | crate::ir::LogPayload::LogEvent(_) => {
+                    // Dedup by record ID (issue #361): a shared bucket ID is a
+                    // genuine rescan of identical bytes (source-aware identity),
+                    // so collapse it rather than summing; distinct sources mint
+                    // distinct bucket IDs that both survive and sum downstream.
                     if seen_dedup.insert(id.as_str()) {
                         out.push(record.clone());
                     }
@@ -2533,7 +2508,10 @@ fn build_error_signature_rows(
 
 /// Builds the `occurrence_buckets` per-signature totals (AC2): sums ONLY the
 /// in-window buckets, grouped by the signature the bucket `AGGREGATES`, ordered
-/// by `(signature record_id, hour)`.
+/// by `(signature record_id, hour)`. Input is the coalesced record set, which
+/// dedups buckets by record ID (issue #361, source-aware identity), so each
+/// distinct bucket ID is counted exactly once — distinct sources (distinct IDs)
+/// sum, a genuine rescan (shared ID) is collapsed upstream.
 fn build_occurrence_totals(
     in_window_buckets: &[GraphRecord],
     bucket_to_signature: &BTreeMap<String, String>,
@@ -5868,6 +5846,10 @@ pub(crate) mod fixture {
                 bucket_start: bucket_start.to_owned(),
                 bucket_width: "1h".to_owned(),
                 occurrence_count,
+                // Fixtures assign bucket record IDs explicitly, so the payload
+                // source_id (identity input since #361) is a fixed placeholder;
+                // dedup/coalesce keys on the record ID, not this field.
+                source_id: "log:v2:fixture-source".to_owned(),
             }),
             bucket_start,
         )
@@ -12039,9 +12021,11 @@ mod pack340_tests {
     // The fix coalesces duplicate log records by stable ID at assemble time.
 
     /// The `build_log_incident_records()` graph concatenated with itself: every
-    /// stable log ID appears TWICE, exactly as `cat scanA.jsonl scanB.jsonl` of one
-    /// repo's identical scans would produce. Summed occurrence counts double; merged
-    /// first/last-seen are unchanged (identical copies).
+    /// stable log ID appears TWICE, exactly as `cat scanA.jsonl scanA.jsonl` of one
+    /// repo's IDENTICAL scan would produce. Signature aggregate `occurrence_count`
+    /// still doubles (signature identity omits `LogSource`), but bucket totals DEDUP
+    /// (issue #361: a shared bucket ID is a byte-identical rescan → collapsed).
+    /// Merged first/last-seen are unchanged (identical copies).
     fn concatenated_multi_scan_records() -> Vec<GraphRecord> {
         let mut records = build_log_incident_records();
         let dup = build_log_incident_records();
@@ -12051,12 +12035,13 @@ mod pack340_tests {
 
     /// Two DISTINCT scans of one repo producing the SAME stable `ErrorSignature`
     /// ID (`log:v1:sigX`) with DIFFERENT `LogSource`, DIFFERENT first/last-seen, and
-    /// an overlapping/summable bucket (`log:v1:bx-00`, same hour, per-scan counts).
-    /// Proves the merge keeps the earliest `first_seen`, the latest `last_seen`, and
-    /// the SUMMED occurrence counts — not a doubled-then-rejected or halved value.
+    /// two same-hour buckets that (since issue #361) carry DISTINCT source-aware
+    /// bucket IDs (`log:v2:bx-00-a` / `log:v2:bx-00-b`), so both survive and their
+    /// per-source counts sum. Proves the merge keeps the earliest `first_seen`, the
+    /// latest `last_seen`, and the SUMMED occurrence counts across distinct sources.
     fn two_scan_differing_extents_records() -> Vec<GraphRecord> {
         vec![
-            // Scan A: narrow span, count 10; bucket count 4.
+            // Scan A (source A): narrow span, count 10; bucket count 4.
             error_signature(
                 "log:v1:sigX",
                 "error",
@@ -12066,10 +12051,10 @@ mod pack340_tests {
                 10,
                 None,
             ),
-            super::fixture::occurrence_bucket("log:v1:bx-00", "2026-03-03T00:00:00Z", 4),
-            super::fixture::aggregates("log:v1:bx-00", "log:v1:sigX"),
-            // Scan B: EARLIER first_seen, LATER last_seen, count 25; SAME bucket ID,
-            // count 6 (distinct scan of the same hour).
+            super::fixture::occurrence_bucket("log:v2:bx-00-a", "2026-03-03T00:00:00Z", 4),
+            super::fixture::aggregates("log:v2:bx-00-a", "log:v1:sigX"),
+            // Scan B (source B): EARLIER first_seen, LATER last_seen, count 25; a
+            // DISTINCT source-aware bucket ID for the same hour, count 6.
             error_signature(
                 "log:v1:sigX",
                 "error",
@@ -12079,8 +12064,8 @@ mod pack340_tests {
                 25,
                 None,
             ),
-            super::fixture::occurrence_bucket("log:v1:bx-00", "2026-03-03T00:00:00Z", 6),
-            super::fixture::aggregates("log:v1:bx-00", "log:v1:sigX"),
+            super::fixture::occurrence_bucket("log:v2:bx-00-b", "2026-03-03T00:00:00Z", 6),
+            super::fixture::aggregates("log:v2:bx-00-b", "log:v1:sigX"),
         ]
     }
 
@@ -12135,8 +12120,11 @@ mod pack340_tests {
             }
         }
 
-        // Occurrence-bucket totals are SUMMED across the scans, never rejected as
-        // duplicates. sig1's 15 in-window buckets carry counts (1..15) x 2 scans.
+        // Occurrence-bucket totals DEDUP byte-identical rescan buckets by record ID
+        // (issue #361, source-aware identity): this fixture concatenates the IDENTICAL
+        // scan, so every bucket ID is duplicated with identical content and collapses
+        // to one physical record. sig1's 15 in-window buckets carry counts (1..15),
+        // counted ONCE.
         let occ_sec = section(&pack, EvidenceClass::OccurrenceBuckets);
         let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &occ_sec.log_summary
         else {
@@ -12146,10 +12134,11 @@ mod pack340_tests {
             .iter()
             .find(|t| t.signature_id == "log:v1:sig1")
             .expect("sig1 total");
-        // Single-scan sum is 1+2+..+15 = 120; concatenated twice = 240.
+        // Single-scan sum is 1+2+..+15 = 120; a byte-identical rescan collapses, so
+        // the total stays 120 (buckets no longer double-count on concatenation).
         assert_eq!(
-            sig1_total.in_window_occurrences, 240,
-            "sig1 in_window_occurrences summed across the two scans"
+            sig1_total.in_window_occurrences, 120,
+            "sig1 in_window_occurrences dedups the byte-identical rescan buckets"
         );
         // One bucket row per stable bucket ID (15 for sig1), never doubled rows.
         assert_eq!(sig1_total.buckets.len(), 15, "one row per stable bucket ID");
@@ -12196,7 +12185,7 @@ mod pack340_tests {
             "occurrence_count summed across the two scans"
         );
 
-        // Bucket total = 4 + 6 = 10 (summed across the same-hour scans).
+        // Bucket total = 4 + 6 = 10 (distinct source-aware bucket IDs both sum).
         let occ_sec = section(&pack, EvidenceClass::OccurrenceBuckets);
         let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &occ_sec.log_summary
         else {
@@ -12205,12 +12194,12 @@ mod pack340_tests {
         assert_eq!(signature_totals.len(), 1);
         assert_eq!(
             signature_totals[0].in_window_occurrences, 10,
-            "bucket count summed across the two scans"
+            "bucket count summed across the two distinct sources"
         );
         assert_eq!(
             signature_totals[0].buckets.len(),
-            1,
-            "one row per stable bucket ID"
+            2,
+            "one row per DISTINCT source-aware bucket ID (issue #361)"
         );
     }
 
