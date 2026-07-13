@@ -2409,6 +2409,15 @@ fn frame_resolution_joins(edges: &[&GraphRecord]) -> Vec<FrameResolutionJoin> {
         a.frame_index
             .cmp(&b.frame_index)
             .then_with(|| a.target_id.cmp(&b.target_id))
+            // `resolution` is the final tiebreaker (issue #371, Codex round-7 P2):
+            // `log_resolve` folds resolution into the FRAME_RESOLVES_TO edge id, so a
+            // graph can carry two edges sharing (signature, frame_index, target) but
+            // differing in resolution. Without this key those joins compare EQUAL and a
+            // stable sort would preserve each caller's differing input order — assemble
+            // (input edge order) and verify (canonically id-sorted section rows) would
+            // then disagree and reject a freshly assembled pack. This makes the shared
+            // derivation TOTAL and input-order-independent on BOTH paths.
+            .then_with(|| a.resolution.cmp(&b.resolution))
     });
     joins
 }
@@ -2637,6 +2646,14 @@ fn build_remediation_links(
             .then_with(|| a.symbol_id.cmp(&b.symbol_id))
             .then_with(|| a.commit_id.cmp(&b.commit_id))
             .then_with(|| a.commit_valid_time.cmp(&b.commit_valid_time))
+            // `frame_index`/`frame_resolution` complete the key (issue #371, Codex
+            // round-7 P2): two FRAME_RESOLVES_TO edges sharing (signature, target)
+            // but differing in resolution mint two remediation rows identical on
+            // every key above; without these tiebreakers a stable sort preserves the
+            // caller's input edge order and the derived leads (and the pack bytes)
+            // would depend on it.
+            .then_with(|| a.frame_index.cmp(&b.frame_index))
+            .then_with(|| a.frame_resolution.cmp(&b.frame_resolution))
     });
     rows.dedup();
     rows
@@ -10881,6 +10898,105 @@ mod pack340_tests {
         // sig2/sig3 carry no frames.
         assert!(signatures[1].frame_chain_hash.is_none());
         assert!(signatures[1].frame_resolutions.is_empty());
+    }
+
+    // Builds a `sig1 --FRAME_RESOLVES_TO--> codegraph:v5:sym-db` edge at
+    // frame_index 0 with a caller-chosen resolution and an explicit stable id.
+    // The real `log_resolve::resolve_frames` folds `resolution` into the edge id,
+    // so two edges sharing (signature, frame_index, target) but differing in
+    // resolution coexist as distinct records — this helper reproduces that (the
+    // `fixture::frame_resolves_to` id omits resolution, so it would collapse the
+    // pair under `coalesce_log_records`).
+    fn frame_edge_with_id(id: &str, resolution: crate::ir::FrameResolution) -> GraphRecord {
+        let mut e =
+            super::fixture::frame_resolves_to("log:v1:sig1", "codegraph:v5:sym-db", resolution, 0);
+        if let GraphRecord::Edge { id: eid, .. } = &mut e {
+            *eid = id.to_owned();
+        }
+        e
+    }
+
+    // Issue #371, Codex round-7 P2: when a graph carries two FRAME_RESOLVES_TO
+    // edges for the SAME signature+frame_index+target but DIFFERENT resolution,
+    // the shared `frame_resolution_joins` derivation must be a TOTAL order so
+    // assemble (which sees the input edge order) and verify (which sees the
+    // canonically id-sorted section rows) agree, and the assembled pack is
+    // byte-identical regardless of input edge order. Without `resolution` in the
+    // sort key the two joins compare EQUAL, a stable sort preserves each caller's
+    // differing input order, and (a) verify rejects the freshly assembled pack
+    // and (b) reversing the input edges changes the pack bytes.
+    #[test]
+    fn frame_join_ordering_is_total_over_resolution_across_assemble_and_verify() {
+        // Craft ids so the section's id-ascending canonical order is the REVERSE
+        // of the input order below: "...path_only" < "...resolved" lexically.
+        let id_resolved = "log:v1:edge-frame-sig1-symdb-resolved";
+        let id_path_only = "log:v1:edge-frame-sig1-symdb-path_only";
+
+        // Base incident, minus its built-in single FRAME_RESOLVES_TO edge so this
+        // test wholly controls sig1's frame edges.
+        let base: Vec<GraphRecord> = build_log_incident_records()
+            .into_iter()
+            .filter(|r| {
+                !matches!(r,
+                    GraphRecord::Edge { label, .. } if label.as_str() == "FRAME_RESOLVES_TO")
+            })
+            .collect();
+
+        let e_resolved = frame_edge_with_id(id_resolved, crate::ir::FrameResolution::Resolved);
+        let e_path_only = frame_edge_with_id(id_path_only, crate::ir::FrameResolution::PathOnly);
+
+        // Forward input order: resolved (larger id) FIRST, path_only (smaller id)
+        // SECOND — the reverse of the section's id-ascending order.
+        let mut fwd = base.clone();
+        fwd.push(e_resolved.clone());
+        fwd.push(e_path_only.clone());
+
+        // Reversed input order: same two edges, swapped.
+        let mut rev = base;
+        rev.push(e_path_only);
+        rev.push(e_resolved);
+
+        let pack_fwd = assemble_cc73(&fwd);
+        let pack_rev = assemble_cc73(&rev);
+
+        // (a) Round-trip: a freshly assembled pack must pass its own verify. Before
+        // the fix, assemble records [resolved, path_only] (input order) while verify
+        // recomputes [path_only, resolved] (section id order), so integrity fails.
+        let report = verify_pack(&pack_fwd);
+        assert!(
+            report.ok,
+            "freshly assembled pack must pass verify (round-trip): {report:?}"
+        );
+
+        // (b) Determinism: the assembled pack must be byte-identical regardless of
+        // the caller's input edge order. Before the fix the tied joins keep input
+        // order, so the two packs diverge.
+        let bytes_fwd = serde_json::to_vec(&pack_fwd).expect("serialize fwd");
+        let bytes_rev = serde_json::to_vec(&pack_rev).expect("serialize rev");
+        assert_eq!(
+            bytes_fwd, bytes_rev,
+            "pack bytes must be independent of input FRAME_RESOLVES_TO edge order"
+        );
+
+        // Both packs must land on the total order (path_only < resolved).
+        let sec = section(&pack_fwd, EvidenceClass::ErrorSignatures);
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = &sec.log_summary else {
+            panic!("error_signatures summary present");
+        };
+        let sig1 = signatures
+            .iter()
+            .find(|s| s.signature_id == "log:v1:sig1")
+            .expect("sig1 row present");
+        let labels: Vec<Option<&str>> = sig1
+            .frame_resolutions
+            .iter()
+            .map(|j| j.resolution.as_deref())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![Some("path_only"), Some("resolved")],
+            "frame joins sorted by (frame_index, target_id, resolution)"
+        );
     }
 
     // ── AC2: occurrence_buckets ───────────────────────────────────────────────
