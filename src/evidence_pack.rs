@@ -5979,8 +5979,40 @@ pub(crate) mod fixture {
 
     use crate::ir::{
         ErrorSignaturePayload, FrameResolution, LOG_SCHEMA_VERSION, LogEventPayload,
-        LogOccurrenceBucketPayload, LogPayload, StackFrame,
+        LogOccurrenceBucketPayload, LogPayload, LogSourcePayload, StackFrame,
     };
+
+    /// A `LogSource` node (issue #320) carrying the provenance a runtime
+    /// observation cites: its repo-relative source path + `source_artifact_hash`.
+    /// Used to give an `ErrorSignature`'s `CAPTURED_FROM` chain a resolvable
+    /// source so the class-wide `runtime_observation` citation requirement is
+    /// satisfied (issue #372).
+    pub fn log_source(id: &str, path: &str, hash: &str) -> GraphRecord {
+        log_node(
+            id,
+            NodeKind::LogSource,
+            format!("log source {path}"),
+            LogPayload::LogSource(LogSourcePayload {
+                source_relative_path: path.to_owned(),
+                source_format_version: "plain-v1".to_owned(),
+                source_artifact_hash: hash.to_owned(),
+                line_count: 10,
+            }),
+            WINDOW_FROM,
+        )
+    }
+
+    /// An `ErrorSignature --CAPTURED_FROM--> LogSource` edge (issue #320) that
+    /// makes a signature's runtime provenance resolvable (issue #372).
+    pub fn captured_from(signature_id: &str, source_id: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::CapturedFrom,
+            signature_id.to_owned(),
+            source_id.to_owned(),
+            None,
+            "ErrorSignature captured from LogSource".to_owned(),
+        )
+    }
 
     /// A benign, redaction-safe normalized template for a signature (NOT raw log
     /// text — these are the bounded excerpts the shipping log domain stores).
@@ -11028,7 +11060,7 @@ mod pack338_tests {
 mod pack340_tests {
     use super::fixture::{
         EXEMPLAR_SENTINEL, LOG_SIGNATURE_IDS, WINDOW_FROM, WINDOW_TO, build_log_incident_records,
-        build_seed_records, error_signature,
+        build_seed_records, captured_from, error_signature, log_source,
     };
     use super::*;
 
@@ -11057,6 +11089,47 @@ mod pack340_tests {
             .iter()
             .find(|s| s.class == class.as_wire())
             .unwrap_or_else(|| panic!("section {} present", class.as_wire()))
+    }
+
+    // ── #372: assemble applies the class-wide runtime-provenance requirement ───
+    //
+    // The #340 log fixture carries NO `LogSource`/`CAPTURED_FROM`, so every
+    // `ErrorSignature` / `LogOccurrenceBucket` row in a CC7.3 pack is
+    // provenance-less. `eg audit citations` fails the identical records, so the
+    // pack's assemble-time citation verdict must fail them too (issue #372) — the
+    // context-free classifier used to (wrongly) count them Cited by their own ID.
+    #[test]
+    fn assemble_citation_verdict_fails_on_provenance_less_log_rows() {
+        let records = build_log_incident_records();
+        let pack = assemble_cc73(&records);
+        assert!(
+            !pack.verdicts.citation.passed,
+            "a provenance-less runtime observation must fail the pack citation gate \
+             (#372), exactly as eg audit citations fails it"
+        );
+    }
+
+    // #372 positive: with a resolvable `LogSource` + `CAPTURED_FROM` for every
+    // in-window signature co-located in the INPUT graph (which assemble's
+    // full-records provenance index sees — NOT co-located into pack sections), the
+    // runtime rows resolve their provenance and the citation verdict passes.
+    #[test]
+    fn assemble_citation_verdict_passes_with_resolvable_log_provenance() {
+        let mut records = build_log_incident_records();
+        for (i, sig) in LOG_SIGNATURE_IDS.iter().enumerate() {
+            let src = format!("log:v1:prov-src-{i}");
+            records.push(log_source(&src, &format!("app-{i}.log"), &format!("hash{i}")));
+            records.push(captured_from(sig, &src));
+        }
+        let pack = assemble_cc73(&records);
+        assert!(
+            pack.verdicts.citation.passed,
+            "resolvable LogSource provenance must satisfy the runtime citation gate (#372)"
+        );
+        assert!(
+            verify_pack(&pack).ok,
+            "the provenance-complete pack still self-verifies clean"
+        );
     }
 
     // ── AC1: error_signatures ─────────────────────────────────────────────────
