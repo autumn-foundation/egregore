@@ -871,9 +871,9 @@ impl EmbeddedAletheiaSink {
     }
 
     /// Like [`Self::read_all_records`], but additionally re-emits every
-    /// *superseded* (non-current) physical version of a non-temporal
-    /// **log-domain** node whose `kind` is `ErrorSignature` or
-    /// `LogOccurrenceBucket` (issue #363).
+    /// superseded (non-current) physical version of a non-temporal **log-domain**
+    /// node (`kind` `ErrorSignature` or `LogOccurrenceBucket`) that is a
+    /// **distinct scan observation** (issue #363).
     ///
     /// # Why the log domain needs this
     ///
@@ -891,6 +891,29 @@ impl EmbeddedAletheiaSink {
     /// counts. This method surfaces the superseded physical versions so those
     /// coalescers operate on `--data-dir` exactly as they do on the concatenated
     /// `--graph` JSONL for scans whose captured content differs.
+    ///
+    /// # Distinct scan observations only — enrichment rewrites are not re-counted
+    ///
+    /// The standard pipeline `scan-logs -> resolve-frames -> link-logs` ingests
+    /// the SAME `ErrorSignature` node more than once into one store: `scan-logs`
+    /// writes it bare, then `resolve-frames` / `link-logs` re-emit it enriched
+    /// with `FRAME_RESOLVES_TO` / `EMITTED_DURING` / `REFERENCES_TASK` evidence
+    /// links while leaving the log payload (`first_seen`/`last_seen`/
+    /// `occurrence_count`) untouched. That enriched node differs in content, so
+    /// the write appends a new physical version — but it is the SAME scan
+    /// observation, not a new one. Re-emitting it would make the coalescers SUM
+    /// `occurrence_count` twice (double-counting the most common workflow).
+    ///
+    /// A superseded version is therefore retained only when its coalesce-relevant
+    /// log-payload "observation key" ([`log_observation_key`]) differs from the
+    /// current version and from every already-retained superseded version of the
+    /// same stable ID. The key is derived from exactly the fields the coalescers
+    /// merge (`first_seen`/`last_seen`/`occurrence_count` for signatures,
+    /// `bucket_start`/`occurrence_count` for buckets) and deliberately excludes
+    /// evidence links and other node metadata, so an enrichment-only rewrite maps
+    /// to the same key and is dropped. The current version emitted by
+    /// [`Self::read_all_records`] is always the latest write (highest node id),
+    /// i.e. the enriched one, so evidence links / resolved frames are preserved.
     ///
     /// # What stays the same
     ///
@@ -916,6 +939,11 @@ impl EmbeddedAletheiaSink {
     pub fn read_all_records_log_retained(&self) -> AdapterResult<Vec<GraphRecord>> {
         let mut records = self.read_all_records()?;
         let active_tombstoned = self.active_deleted_ids()?;
+        // Per stable ID, the set of observation keys already represented — seeded
+        // lazily with the CURRENT version's key so an enrichment rewrite of the
+        // current observation is never re-emitted.
+        let mut seen_keys: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
         let mut superseded: Vec<(u64, GraphRecord)> = Vec::new();
         for node_id in self.db.get_all_node_ids() {
             let node = self.db.get_node(node_id).map_err(|error| {
@@ -961,8 +989,36 @@ impl EmbeddedAletheiaSink {
             // already in `records` via `read_all_records`.
             match self.node_lookup.non_temporal.get(&record_id) {
                 Some(current) if *current == node_id => continue, // current, already emitted
-                Some(_) => {}                                     // superseded → emit
+                Some(_) => {}                                     // superseded → candidate
                 None => continue, // not a non-temporal node (defensive)
+            }
+            let record = self.read_node_record(&record_id, node_id)?;
+            // Seed this ID's seen-key set with the CURRENT version's observation
+            // key, so an enrichment rewrite of the current observation is not
+            // re-emitted.
+            let seen = seen_keys.entry(record_id.clone()).or_insert_with(|| {
+                let mut set = std::collections::BTreeSet::new();
+                if let Some(&current) = self.node_lookup.non_temporal.get(&record_id)
+                    && let Ok(current_record) = self.read_node_record(&record_id, current)
+                    && let Some(key) = log_observation_key(&current_record)
+                {
+                    set.insert(key);
+                }
+                set
+            });
+            // Retain only a DISTINCT scan observation: a superseded version whose
+            // coalesce-relevant log payload differs from the current version and
+            // from every already-retained superseded version. Enrichment-only
+            // rewrites (identical payload, evidence links added) collapse to an
+            // already-seen key and are dropped — never double-counted.
+            // A payload-less log node is defensive: retain it (it cannot be an
+            // enrichment duplicate of a payload-bearing observation). A
+            // payload-bearing version is retained only when its key is new;
+            // a duplicate key (including an enrichment rewrite) is skipped.
+            if let Some(key) = log_observation_key(&record)
+                && !seen.insert(key)
+            {
+                continue;
             }
             let seq = optional_str_property(
                 "read_all_records_log_retained",
@@ -971,7 +1027,7 @@ impl EmbeddedAletheiaSink {
             )?
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
-            superseded.push((seq, self.read_node_record(&record_id, node_id)?));
+            superseded.push((seq, record));
         }
         superseded.sort_by_key(|(seq, _)| *seq);
         records.extend(superseded.into_iter().map(|(_, record)| record));
@@ -3496,6 +3552,37 @@ fn read_back_error(record_id: &str, message: impl Into<String>) -> AdapterError 
     AdapterError::ReadBack {
         record_id: record_id.to_owned(),
         message: message.into(),
+    }
+}
+
+/// Coalesce-relevant "observation key" of a log-domain node: the log-payload
+/// fields the #326 `log-deltas` / #324 `error-context` cross-scan coalescers
+/// actually merge. Two physical versions of the same stable ID that share this
+/// key are the SAME scan observation — e.g. an enrichment rewrite from
+/// `resolve-frames` / `link-logs` that adds evidence links but leaves the log
+/// payload untouched — and must never be re-counted by
+/// [`EmbeddedAletheiaSink::read_all_records_log_retained`]. Evidence links and
+/// other node metadata are deliberately excluded from the key. Returns `None`
+/// for a node that carries no coalesce-relevant log payload.
+///
+/// * `ErrorSignature`: `(first_seen, last_seen, occurrence_count)` — exactly the
+///   fields the signature coalescer merges (min `first_seen`, max `last_seen`,
+///   summed `occurrence_count`). Identity fields (severity/template/fingerprint)
+///   are constant per stable ID, so they need not appear.
+/// * `LogOccurrenceBucket`: `(bucket_start, occurrence_count)`. Byte-identical
+///   buckets are already write-deduped, so this is effectively a no-op for
+///   buckets, but the rule is applied uniformly.
+fn log_observation_key(record: &GraphRecord) -> Option<String> {
+    match record.log_payload()? {
+        crate::ir::LogPayload::ErrorSignature(payload) => Some(format!(
+            "sig\u{1f}{}\u{1f}{}\u{1f}{}",
+            payload.first_seen, payload.last_seen, payload.occurrence_count
+        )),
+        crate::ir::LogPayload::LogOccurrenceBucket(payload) => Some(format!(
+            "bucket\u{1f}{}\u{1f}{}",
+            payload.bucket_start, payload.occurrence_count
+        )),
+        crate::ir::LogPayload::LogSource(_) | crate::ir::LogPayload::LogEvent(_) => None,
     }
 }
 

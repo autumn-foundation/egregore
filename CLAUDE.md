@@ -363,10 +363,12 @@ taxonomy mirror #118 exactly. Rows are regression LEADS, never proof this range 
 failure; a ceased signature is not proof of a fix; occurrence data only reflects scanned log
 sources. Cross-scan signature coalescing now works on BOTH read paths (#363 landed the
 adapter-level retention): the embedded (`--data-dir`) lane loads through the log-retained read
-surface (`read_all_records_log_retained`), which surfaces every superseded non-temporal
-`ErrorSignature`/`LogOccurrenceBucket` version that differing-content `scan-logs` ingests append,
-so `first_seen`/`last_seen`/occurrence counts are reconstructed exactly as on the concatenated
-`--graph` JSONL. When run over `--data-dir` with log records present, the envelope still carries an
+surface (`read_all_records_log_retained`), which surfaces every distinct scan OBSERVATION —
+each superseded non-temporal `ErrorSignature`/`LogOccurrenceBucket` version that
+differing-content `scan-logs` ingests append, while an enrichment-only rewrite (evidence links
+added by `resolve-frames`/`link-logs`, log payload unchanged) is retained as a single
+observation and never double-counted — so `first_seen`/`last_seen`/occurrence counts are
+reconstructed exactly as on the concatenated `--graph` JSONL. When run over `--data-dir` with log records present, the envelope still carries an
 `embedded_log_retention_caveat` disclosing a residual divergence in two forms, both from
 idempotent-write dedup of byte-identical non-temporal records: (1) byte-identical re-ingests of the
 whole `scan-logs` output are deduped to one physical record rather than multiplied, so identical

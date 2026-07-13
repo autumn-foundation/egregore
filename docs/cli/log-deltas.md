@@ -76,7 +76,8 @@ issue #362.
 Separately, whenever the query runs over the embedded (`--data-dir`) read path
 **and** the store holds at least one `ErrorSignature`, the response carries an
 `embedded_log_retention_caveat` object (a fixed `message`) disclosing that
-embedded stores now retain **every superseded** non-temporal log observation, so
+embedded stores now retain **every distinct scan observation** (enrichment-only
+rewrites from `resolve-frames` / `link-logs` are not double-counted), so
 cross-scan coalescing **is** reconstructed there for differing-content scans, and
 that the one residual divergence is that byte-identical re-ingests are deduped
 (not multiplied) — see
@@ -179,6 +180,15 @@ so the same duplicate slice the coalescer needs is present, and `first_seen` /
 `last_seen` / occurrence counts are reconstructed **exactly** as on the
 concatenated `--graph` JSONL. The split-signature case above therefore classifies
 identically on `--data-dir` and `--graph`.
+
+Only **distinct scan observations** are retained. The standard pipeline
+`scan-logs -> resolve-frames -> link-logs` re-emits the same `ErrorSignature`
+node enriched with evidence links (`FRAME_RESOLVES_TO` / `EMITTED_DURING` /
+`REFERENCES_TASK`) while leaving its log payload (`first_seen` / `last_seen` /
+`occurrence_count`) unchanged. That enrichment-only rewrite is the **same**
+observation, not a new scan, so it is retained as a **single** observation and
+never double-counts occurrences. The retained current version is always the
+enriched one, so resolved frames and evidence links are preserved.
 
 One residual divergence remains, in two forms, both rooted in the idempotent-write
 dedup of byte-identical non-temporal records:

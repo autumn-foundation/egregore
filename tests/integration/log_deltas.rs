@@ -25,7 +25,8 @@ use std::{
 use aletheia_egregore::{
     GraphRecord, LOG_SCHEMA_VERSION, NodeKind, TemporalMetadata,
     ir::{
-        EdgeLabel, ErrorSignaturePayload, FrameResolution, LogOccurrenceBucketPayload, LogPayload,
+        EdgeLabel, ErrorSignaturePayload, EvidenceLink, FrameResolution,
+        LogOccurrenceBucketPayload, LogPayload,
     },
     query::{LogDeltas, RangeDeltasError, log_deltas},
     scan_repository_history, stable_id,
@@ -972,6 +973,112 @@ fn log_deltas_embedded_data_dir_single_scan_matches_graph() {
         signature_rows(&embedded),
         signature_rows(&graph),
         "a single-scan embedded store must match the --graph result"
+    );
+}
+
+/// The same `ErrorSignature` re-emitted with evidence links added but an
+/// IDENTICAL log payload, exactly as `resolve-frames` / `link-logs` do (they
+/// re-emit the signature node enriched with `FRAME_RESOLVES_TO` /
+/// `EMITTED_DURING` / `REFERENCES_TASK` evidence links, leaving
+/// `first_seen`/`last_seen`/`occurrence_count` untouched).
+#[cfg(feature = "embedded-aletheiadb")]
+fn error_signature_enriched(
+    seed: &str,
+    severity: &str,
+    first_seen: &str,
+    last_seen: &str,
+    occurrence_count: u64,
+) -> GraphRecord {
+    error_signature(seed, severity, first_seen, last_seen, occurrence_count).with_evidence_links(
+        vec![EvidenceLink {
+            target_record_id: Some(symbol_id("tweaked", "src/lib.rs")),
+            target_domain: "codegraph".to_owned(),
+            relation: EdgeLabel::FrameResolvesTo.as_str().to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: Some("src/lib.rs".to_owned()),
+            target_span: None,
+            target_git_commit: None,
+        }],
+    )
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn log_deltas_embedded_does_not_double_count_enrichment_rewrite() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+
+    // Issue #363 regression: the STANDARD pipeline `scan-logs -> resolve-frames ->
+    // link-logs` ingests the SAME `ErrorSignature` node twice into one embedded
+    // store — first bare (scan-logs), then enriched with evidence links
+    // (resolve-frames / link-logs) but with an IDENTICAL log payload
+    // (`first_seen`/`last_seen`/`occurrence_count` unchanged). The enriched node's
+    // differing content appends a new physical version. The log-retained read must
+    // treat these as ONE scan observation and NOT re-count the occurrence total:
+    // an enrichment rewrite is not a distinct scan.
+    let (bucket_node, bucket_edge) = bucket_with_edge(&log_sig_id("enrich-boom"), NEW_BUCKET, 5);
+    let records: Vec<GraphRecord> = vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        commit("c3sha0000", &["c2sha0000"], T3),
+        // scan-logs: the bare signature.
+        error_signature("enrich-boom", "error", NEW_FIRST, NEW_LAST, 5),
+        // resolve-frames / link-logs: the SAME signature, identical payload, only
+        // evidence links added.
+        error_signature_enriched("enrich-boom", "error", NEW_FIRST, NEW_LAST, 5),
+        // The occurrence bucket for the new signature.
+        bucket_node,
+        bucket_edge,
+    ];
+
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("enrichment-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record).expect("record should write");
+    }
+    let embedded_records = sink
+        .read_all_records_log_retained()
+        .expect("log-retained read");
+    drop(sink);
+
+    let sig = log_sig_id("enrich-boom");
+
+    // Exactly ONE `ErrorSignature` for that ID: the enrichment rewrite is not a
+    // distinct scan observation, so it is not re-emitted.
+    let sig_count = embedded_records
+        .iter()
+        .filter(|r| r.id() == sig && r.node_kind_name() == Some("ErrorSignature"))
+        .count();
+    assert_eq!(
+        sig_count, 1,
+        "the enrichment rewrite must not surface a second signature version"
+    );
+
+    // And log-deltas reports the single-scan occurrence truth (5), NOT 10.
+    let embedded = log_deltas(&embedded_records, "c1", "c3", None, true)
+        .expect("embedded range should resolve");
+    assert_eq!(record_ids(&embedded.new_signatures), vec![sig.clone()]);
+    let row = &embedded.new_signatures[0];
+    assert_eq!(
+        row.occurrence_count, 5,
+        "the aggregate occurrence must not double-count the enrichment rewrite"
+    );
+    assert_eq!(
+        row.head_window_occurrences,
+        Some(5),
+        "the per-window bucket total must not double-count"
+    );
+
+    // The enriched (current) version's evidence link survives: the retained read
+    // keeps the enriched current node, not the bare one.
+    let current_sig = embedded_records
+        .iter()
+        .find(|r| r.id() == sig && r.node_kind_name() == Some("ErrorSignature"))
+        .expect("the signature must be present");
+    assert!(
+        current_sig.evidence_links().is_some_and(|l| !l.is_empty()),
+        "the retained signature must be the enriched (evidence-link-carrying) version"
     );
 }
 
