@@ -4312,6 +4312,32 @@ fn pack_safety(rows: &[BundleRecord]) -> (bool, String) {
                 format!("record {record_id} retains scrubbed field '{field}'"),
             );
         }
+        // Co-located `FRAME_RESOLVES_TO` attribution edges (issue #371) carry a
+        // required free-text `summary` that `scrub_log_node_text` clears at
+        // assemble time. But `verify_pack` reads `section.records` AS-IS and never
+        // re-runs that scrub, the frame binding derives only
+        // `frame_index`/`resolution`/`target_id` (never `summary`), and the checks
+        // above only catch secrets (`detect_secret`) and Node scrubbed fields
+        // (`first_unscrubbed_field` is a no-op for edges). So a NON-secret raw
+        // backtrace placed in this summary — with the row hash recomputed so
+        // Integrity passes — would otherwise verify clean. Treat a nonempty
+        // co-located frame-edge summary as an unscrubbed field so verify FAILS
+        // Safety, mirroring the assemble-side scrub discipline.
+        if let GraphRecord::Edge {
+            label: crate::ir::EdgeLabel::FrameResolvesTo,
+            summary,
+            ..
+        } = &br.record
+            && !summary.is_empty()
+        {
+            return (
+                false,
+                format!(
+                    "record {record_id} retains scrubbed field 'summary' \
+                     (co-located FRAME_RESOLVES_TO edge)"
+                ),
+            );
+        }
     }
     (
         true,
@@ -11414,6 +11440,74 @@ mod pack340_tests {
             .expect("sig1 present");
         assert_eq!(sig1.frame_resolutions.len(), 1);
         assert_eq!(sig1.frame_resolutions[0].target_id, "codegraph:v5:sym-db");
+    }
+
+    /// Issue #371 (Codex P2 verify-side follow-on): the assemble-side scrub clears
+    /// a co-located `FRAME_RESOLVES_TO` edge's free-text `summary`, but
+    /// `verify_pack` reads `section.records` AS-IS and never re-runs
+    /// `scrub_log_node_text`. The frame binding derives only
+    /// `frame_index`/`resolution`/`target_id` and ignores `summary`, and pack
+    /// Safety only runs `detect_secret` + a Node-only `first_unscrubbed_field`, so
+    /// a NON-secret raw backtrace injected into such an edge summary — with the
+    /// row hash recomputed so Integrity passes — would verify clean without an
+    /// explicit verify-side check. Safety must reject a nonempty co-located
+    /// frame-edge summary.
+    #[test]
+    fn verify_rejects_raw_text_in_co_located_frame_edge_summary() {
+        const RAW_FRAME_SENTINEL: &str = "RAW_FRAME_SENTINEL_backtrace_line";
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+
+        // A clean assembled pack (summaries already cleared) verifies ok.
+        assert!(
+            verify_pack(&pack).ok,
+            "clean assembled pack verifies before tampering"
+        );
+
+        // Inject raw backtrace text into a co-located FRAME_RESOLVES_TO edge row's
+        // summary and RECOMPUTE that row's content hash so Integrity still passes
+        // — only the new Safety check can catch it.
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+            .expect("error_signatures section");
+        let mut injected = false;
+        for br in &mut sec.records {
+            if let GraphRecord::Edge { label, summary, .. } = &mut br.record
+                && label.as_str() == "FRAME_RESOLVES_TO"
+            {
+                *summary = format!("{RAW_FRAME_SENTINEL} at src/db.rs:42 in app::db::connect");
+                br.hash =
+                    blake3::hash(serde_json::to_string(&br.record).unwrap().as_bytes()).to_string();
+                injected = true;
+                break;
+            }
+        }
+        assert!(
+            injected,
+            "clean pack co-locates a FRAME_RESOLVES_TO edge row to inject on"
+        );
+
+        let report = verify_pack(&pack);
+        // Integrity still passes — the row hash was recomputed to match, so only
+        // the new Safety check stands between the tamper and a clean verdict.
+        assert!(
+            report.integrity.passed,
+            "row hash recomputed so Integrity passes: {}",
+            report.integrity.detail
+        );
+        // Safety must reject the nonempty co-located frame-edge summary.
+        assert!(
+            !report.safety.passed,
+            "a nonempty co-located FRAME_RESOLVES_TO summary must fail Safety"
+        );
+        assert!(
+            report.safety.detail.contains("summary"),
+            "Safety detail names the frame-edge summary: {}",
+            report.safety.detail
+        );
+        assert!(!report.ok, "verify rejects the tampered pack");
     }
 
     /// Codex round-4 P2: the `error_signatures` section's hashed records must NOT
