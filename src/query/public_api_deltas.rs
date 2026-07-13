@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    ChainReachability, PUBLIC_API_SYMBOL_KINDS, RangeDeltaClass, RangeDeltasError, RepositoryIndex,
+    ChainReachability, PUBLIC_API_SYMBOL_KINDS, RangeDeltaClass, RangeDeltasError,
     chain_reachability, is_library_crate_path, range_delta_node_summary, resolve_commit_range,
-    temporal_snapshot_index,
+    resolve_range_scope, temporal_snapshot_index,
 };
 use crate::ir::{EdgeLabel, GraphRecord, NodeKind, SourceSpan};
 
@@ -338,13 +338,8 @@ pub fn public_api_deltas<'a>(
     repo_scope: Option<&str>,
     options: PublicApiDeltasOptions,
 ) -> Result<PublicApiDeltas<'a>, RangeDeltasError> {
-    let repo_index = repo_scope.map(|_| RepositoryIndex::build(records));
-    let in_scope = |id: &str| -> bool {
-        match (repo_scope, repo_index.as_ref()) {
-            (Some(scope), Some(index)) => index.owner_of(id) == Some(scope),
-            _ => true,
-        }
-    };
+    let scope = resolve_range_scope(records, base_prefix, head_prefix, repo_scope)?;
+    let in_scope = |id: &str| scope.in_scope(id);
 
     let range = resolve_commit_range(records, base_prefix, head_prefix, &in_scope)?;
     let base_sha = range.base_sha;

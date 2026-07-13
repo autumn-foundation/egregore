@@ -308,6 +308,16 @@ impl From<RangeDeltasError> for CoChangeCouplingError {
             RangeDeltasError::ReversedRange { base, head } => Self::ReversedRange { base, head },
             RangeDeltasError::NoPath { base, head } => Self::NoPath { base, head },
             RangeDeltasError::EmptyHistory => Self::EmptyHistory,
+            // `RepoScopeRequired` (issue #341) is produced only by
+            // `resolve_range_scope`, which the coupling lane never calls: it
+            // gates commit resolution through its own PR #312 `effective_in_scope`
+            // anchored on the target file's owning repository (issue #153), so
+            // this cross-repo refusal can never reach the coupling path.
+            RangeDeltasError::RepoScopeRequired { .. } => {
+                unreachable!(
+                    "coupling anchors its own repository scope and never invokes resolve_range_scope"
+                )
+            }
         }
     }
 }
