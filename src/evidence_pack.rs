@@ -2209,9 +2209,18 @@ enum BucketAdmission {
     Unattributed,
     /// `AGGREGATES` edges name more than one distinct signature (issue #374).
     ConflictingAttribution,
-    /// The payload `bucket_start` or the node `valid_time` is absent/unparseable
-    /// (issue #375; routed to the shared `missing_valid_time` exclusion).
+    /// The node `valid_time` is absent/unparseable — i.e. `valid_time_unresolved`
+    /// holds — so this bucket is in the shared `missing_valid_time` exclusion set
+    /// that `derive_gaps` also gaps (issue #375; Codex #387 round-2 gap contract).
     MissingValidTime,
+    /// The node `valid_time` resolves fine but the payload `bucket_start` is
+    /// absent/unparseable — a DISTINCT defect from missing-valid-time. Because the
+    /// valid time resolves, `valid_time_unresolved` is false and `derive_gaps`
+    /// emits no `missing_valid_time` gap for it, so it must be diagnosed under its
+    /// OWN `malformed_bucket_start` code and never counted/diagnosed missing-time
+    /// (Codex #387 round-2: keep the counted+diagnosed missing-time set equal to
+    /// the gapped set).
+    MalformedBucketStart,
     /// Both parse but the node `valid_time` disagrees (by instant) with the
     /// payload `bucket_start` (issue #375).
     ValidTimeMismatch,
@@ -2220,22 +2229,35 @@ enum BucketAdmission {
 /// Classifies one `LogOccurrenceBucket` for pack inclusion (issues #374/#375), so
 /// `assemble_pack` excludes exactly the buckets its own `verify_pack` would reject.
 /// `targets` is the set of DISTINCT signatures this bucket's `AGGREGATES` edges
-/// name (empty when none). Ordering: `bucket_start` drives the window, so an
-/// absent/unparseable one is `MissingValidTime` and an out-of-window one is
-/// excluded silently BEFORE the attribution/valid-time checks — those two reject
-/// only buckets that would otherwise enter the section, preserving the existing
-/// silent out-of-window drop.
+/// name (empty when none).
+///
+/// Ordering (Codex #387 round-2 gap contract): `MissingValidTime` is returned iff
+/// `valid_time_unresolved(record)` is true — the SAME predicate `derive_gaps` keys
+/// its `missing_valid_time` gap rows on — so the counted+diagnosed missing-time set
+/// stays exactly equal to the gapped set. A bucket with a resolvable node
+/// `valid_time` is therefore NEVER missing-time, even when its payload
+/// `bucket_start` is unparsable: that is the distinct `MalformedBucketStart`
+/// defect. After that, the payload `bucket_start` drives the window (an out-of-window
+/// bucket is excluded silently, matching every class), then the node `valid_time`
+/// must equal the `bucket_start` by instant, then attribution must be exactly one
+/// signature.
 fn classify_occurrence_bucket(
     record: &GraphRecord,
     targets: &BTreeSet<&str>,
     from: DateTimeFixed,
     to: DateTimeFixed,
 ) -> BucketAdmission {
-    // The payload `bucket_start` drives the window decision (issue #375) and must
-    // parse; an absent/malformed one routes to the shared `missing_valid_time`
-    // path exactly as a truly-absent valid time does.
-    let Some(bucket_start) = occurrence_bucket_start(record) else {
+    // Gap contract (Codex #387 round-2): `MissingValidTime` must match
+    // `derive_gaps`' `valid_time_unresolved` predicate EXACTLY so the
+    // counted+diagnosed missing-time set equals the gapped set. Check it FIRST.
+    if valid_time_unresolved(record) {
         return BucketAdmission::MissingValidTime;
+    }
+    // The node `valid_time` is resolvable from here. The payload `bucket_start`
+    // drives the window decision (issue #375) and must parse; an absent/unparsable
+    // one with a resolvable valid_time is a DISTINCT defect, never missing-time.
+    let Some(bucket_start) = occurrence_bucket_start(record) else {
+        return BucketAdmission::MalformedBucketStart;
     };
     // An out-of-window bucket never enters the section, so it is excluded silently
     // regardless of attribution/valid-time state (matching the pre-existing
@@ -2243,13 +2265,11 @@ fn classify_occurrence_bucket(
     if !bucket_hour_intersects_window(bucket_start, from, to) {
         return BucketAdmission::OutOfWindow;
     }
-    // Issue #375: the node `valid_time` must be present, parseable, and equal (by
-    // instant) to the payload `bucket_start`. A tampered graph could otherwise
-    // stamp an in-window `valid_time` over a differing `bucket_start`.
-    match resolve_valid_time(record).and_then(|s| parse_rfc3339(&s)) {
-        None => return BucketAdmission::MissingValidTime,
-        Some(vt) if vt != bucket_start => return BucketAdmission::ValidTimeMismatch,
-        Some(_) => {}
+    // Issue #375: the node `valid_time` (already resolvable) must equal (by instant)
+    // the payload `bucket_start`. A tampered graph could otherwise stamp an in-window
+    // `valid_time` over a differing `bucket_start`.
+    if resolve_valid_time(record).and_then(|s| parse_rfc3339(&s)) != Some(bucket_start) {
+        return BucketAdmission::ValidTimeMismatch;
     }
     // Issue #340/#374: attribution must be exactly one distinct signature.
     match targets.len() {
@@ -3646,6 +3666,23 @@ pub fn assemble_pack(
                         unavailable_reason: None,
                         record_ids: vec![record.id().to_owned()],
                         detail: "class-relevant record excluded: no resolvable valid time"
+                            .to_owned(),
+                    });
+                }
+                BucketAdmission::MalformedBucketStart => {
+                    // Codex #387 round-2: the node `valid_time` resolves (so
+                    // `valid_time_unresolved` is false and `derive_gaps` emits no
+                    // `missing_valid_time` gap), but the payload `bucket_start` is
+                    // unparsable. Diagnose it under its OWN code and DO NOT count it
+                    // in `excluded_missing_valid_time` — keeping the counted,
+                    // diagnosed, and gapped missing-time sets identical.
+                    diagnostics.push(PackDiagnostic {
+                        code: "malformed_bucket_start".to_owned(),
+                        evidence_class: Some(EvidenceClass::OccurrenceBuckets.as_wire().to_owned()),
+                        unavailable_reason: None,
+                        record_ids: vec![record.id().to_owned()],
+                        detail: "in-window LogOccurrenceBucket excluded: payload bucket_start \
+                                 is absent or unparsable while the node valid_time resolves"
                             .to_owned(),
                     });
                 }
@@ -12349,6 +12386,51 @@ mod pack340_tests {
         records
     }
 
+    /// A minimal fixture: one signature, one clean attributed in-window bucket, and
+    /// one bucket whose payload `bucket_start` is UNPARSABLE but whose node
+    /// `valid_time` is a resolvable in-window RFC3339 instant (Codex #387 round-2,
+    /// issues #374/#375). This is a DISTINCT defect from missing-valid-time: the
+    /// valid time resolves fine, so `valid_time_unresolved` is false and
+    /// `derive_gaps` emits no `missing_valid_time` gap for it — therefore it must
+    /// NOT be counted in `excluded_missing_valid_time` nor diagnosed
+    /// `missing_valid_time`, but under its own `malformed_bucket_start` diagnostic.
+    fn records_with_malformed_bucket_start() -> Vec<GraphRecord> {
+        let mut records = vec![error_signature(
+            "log:v1:sigx",
+            "error",
+            "boom",
+            "2026-03-02T00:00:00Z",
+            "2026-03-02T05:00:00Z",
+            10,
+            Some(Vec::new()),
+        )];
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:bx-ok",
+            "2026-03-02T00:00:00Z",
+            3,
+        ));
+        records.push(super::fixture::aggregates("log:v1:bx-ok", "log:v1:sigx"));
+        // Node `valid_time` stays the in-window instant the helper stamped; only the
+        // PAYLOAD `bucket_start` is overwritten to an unparsable string.
+        let mut malformed =
+            super::fixture::occurrence_bucket("log:v1:bx-malformed", "2026-03-02T01:00:00Z", 99);
+        if let GraphRecord::Node { log: Some(p), .. } = &mut malformed {
+            if let crate::ir::LogPayload::LogOccurrenceBucket(payload) = p.as_mut() {
+                payload.bucket_start = "not-a-timestamp".to_owned();
+            } else {
+                panic!("occurrence_bucket builds a LogOccurrenceBucket payload");
+            }
+        } else {
+            panic!("occurrence_bucket builds a node with a log payload");
+        }
+        records.push(malformed);
+        records.push(super::fixture::aggregates(
+            "log:v1:bx-malformed",
+            "log:v1:sigx",
+        ));
+        records
+    }
+
     #[test]
     fn assemble_excludes_conflicting_attribution_bucket_and_passes_verify() {
         let records = records_with_conflicting_attribution_bucket();
@@ -12484,6 +12566,121 @@ mod pack340_tests {
             sec.records
                 .iter()
                 .any(|br| br.record.id() == "log:v1:bn-ok"),
+            "clean bucket retained"
+        );
+        // Codex #387 round-2 contract: the counted+diagnosed missing-time set MUST
+        // equal the gapped set. This genuinely-`valid_time_unresolved` bucket is in
+        // all three: excluded_missing_valid_time == 1, one `missing_valid_time`
+        // diagnostic, one `missing_valid_time` gap row, all naming it.
+        assert_eq!(
+            pack.manifest.excluded_missing_valid_time, 1,
+            "genuine missing-valid_time bucket counted"
+        );
+        let mvt_diags = pack
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "missing_valid_time")
+            .count();
+        let mvt_gaps = pack
+            .gaps
+            .iter()
+            .filter(|g| g.gap_class == "missing_valid_time")
+            .count();
+        assert_eq!(
+            mvt_diags, mvt_gaps,
+            "counted+diagnosed missing-time set must equal the gapped set: {mvt_diags} diags vs {mvt_gaps} gaps"
+        );
+        assert_eq!(mvt_diags, 1, "exactly the one genuine missing-time record");
+        assert!(
+            pack.gaps.iter().any(|g| g.gap_class == "missing_valid_time"
+                && g.record_ids.iter().any(|id| id == "log:v1:bn-missing")),
+            "genuine missing-valid_time bucket gets a matching gap row: {:?}",
+            pack.gaps
+        );
+    }
+
+    #[test]
+    fn assemble_excludes_bucket_with_malformed_bucket_start_and_passes_verify() {
+        let records = records_with_malformed_bucket_start();
+        let pack = assemble_cc73(&records);
+        // (a) The invariant: assemble output passes its OWN offline verify.
+        let report = verify_pack(&pack);
+        assert!(
+            report.ok,
+            "assemble<->verify consistency for a malformed-bucket_start source: {:?} / {:?}",
+            report.integrity, report.window_consistency
+        );
+        let sec = section(&pack, EvidenceClass::OccurrenceBuckets);
+        // (b) The malformed bucket is excluded from the section records ...
+        assert!(
+            !sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:bx-malformed"),
+            "malformed-bucket_start bucket excluded from section records"
+        );
+        // ... and from the summary totals.
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        assert!(
+            signature_totals.iter().all(|t| t
+                .buckets
+                .iter()
+                .all(|b| b.bucket_id != "log:v1:bx-malformed")),
+            "malformed-bucket_start bucket excluded from the summary"
+        );
+        // (c) ... under a NEW `malformed_bucket_start` diagnostic naming it.
+        assert!(
+            pack.diagnostics
+                .iter()
+                .any(|d| d.code == "malformed_bucket_start"
+                    && d.evidence_class.as_deref() == Some("occurrence_buckets")
+                    && d.record_ids.iter().any(|id| id == "log:v1:bx-malformed")),
+            "malformed bucket tallied under a malformed_bucket_start diagnostic: {:?}",
+            pack.diagnostics
+        );
+        // (d) It is NOT routed through the missing-valid-time path: no
+        // `missing_valid_time` diagnostic names it and it is not counted there.
+        assert!(
+            !pack
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "missing_valid_time"
+                    && d.record_ids.iter().any(|id| id == "log:v1:bx-malformed")),
+            "malformed bucket must NOT get a missing_valid_time diagnostic: {:?}",
+            pack.diagnostics
+        );
+        assert_eq!(
+            pack.manifest.excluded_missing_valid_time, 0,
+            "malformed bucket_start must not count as excluded_missing_valid_time"
+        );
+        // (e) The contract at the heart of the finding: the malformed bucket
+        // contributes to NEITHER the missing-time diagnostics NOR the missing-time
+        // gaps, and those two sets stay equal (0 == 0 here).
+        let mvt_diags = pack
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "missing_valid_time")
+            .count();
+        let mvt_gaps = pack
+            .gaps
+            .iter()
+            .filter(|g| g.gap_class == "missing_valid_time")
+            .count();
+        assert_eq!(
+            mvt_diags, mvt_gaps,
+            "counted+diagnosed missing-time set must equal the gapped set: {mvt_diags} diags vs {mvt_gaps} gaps"
+        );
+        assert_eq!(
+            mvt_diags, 0,
+            "malformed bucket_start contributes to neither missing-time diags nor gaps"
+        );
+        // The clean bucket is retained.
+        assert!(
+            sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:bx-ok"),
             "clean bucket retained"
         );
     }
@@ -12689,6 +12886,7 @@ mod pack340_tests {
             records_with_conflicting_attribution_bucket(),
             records_with_valid_time_mismatch_bucket(),
             records_with_missing_valid_time_bucket(),
+            records_with_malformed_bucket_start(),
         ];
         for records in &fixtures {
             for control in ["CC7.2", "CC7.3"] {
