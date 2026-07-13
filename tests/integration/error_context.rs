@@ -2157,9 +2157,10 @@ fn repo_scope_caveat_present_only_when_repo_set() {
 // ---------------------------------------------------------------------------
 // Embedded-store log-retention caveat (issue #363 disclosure), mirroring the
 // sibling `eg query log-deltas` disclosure. When error-context runs over an
-// embedded (`--data-dir`) store the current-state read surface retains one
-// record per stable non-temporal log ID (last-write-wins), so multi-scan
-// coalescing is not reconstructable there. The `--graph` path preserves every
+// embedded (`--data-dir`) store the log-retained read surface surfaces every
+// superseded non-temporal log version, so multi-scan coalescing IS reconstructed
+// there for differing-content scans; the caveat now discloses only the residual
+// byte-identical-re-ingest divergence. The `--graph` path preserves every
 // ingested line and must NOT carry the caveat.
 // ---------------------------------------------------------------------------
 
@@ -2189,20 +2190,26 @@ fn embedded_source_discloses_log_retention_caveat() {
         aletheia_egregore::query::LOG_EMBEDDED_RETENTION_CAVEAT
     );
     assert!(
-        caveat.message.contains("last-write-wins"),
-        "the caveat must state embedded stores retain one record per stable ID (last-write-wins)"
+        caveat
+            .message
+            .contains("retain every superseded non-temporal log observation"),
+        "the caveat must state embedded stores retain every superseded log observation"
+    );
+    assert!(
+        caveat.message.contains("reconstructed here"),
+        "the caveat must state cross-scan coalescing is reconstructed on the embedded path"
     );
     assert!(
         caveat.message.contains("`--graph`"),
-        "the caveat must point to the `--graph` path for multi-scan coalescing"
+        "the caveat must reference the `--graph` path it now matches"
     );
     assert!(
-        caveat.message.contains("per-source stores"),
-        "the caveat must offer per-source stores as the alternative"
+        caveat.message.contains("byte-identical re-ingests"),
+        "the caveat must disclose the residual byte-identical-re-ingest divergence"
     );
     assert!(
         caveat.message.contains("#363"),
-        "the caveat must reference the follow-up issue tracking the real fix"
+        "the caveat must reference the issue tracking the fix"
     );
 
     // Disclosure-only: resolution is unchanged by the flag.
@@ -2227,6 +2234,491 @@ fn graph_source_never_carries_log_retention_caveat() {
     assert!(
         ctx.embedded_log_retention_caveat.is_none(),
         "the --graph path preserves every ingested line and must not carry the retention caveat"
+    );
+}
+
+/// Issue #363: a `--data-dir` store ingested with two differing-content
+/// `scan-logs` outputs for the SAME signature ID must coalesce the signature
+/// block (earliest `first_seen`, latest `last_seen`, summed occurrence, both
+/// buckets) exactly as the `--graph` path does — the log-retained read surfaces
+/// both physical versions. Distinct buckets avoid the byte-identical re-ingest
+/// dedup, so occurrence data matches too.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_data_dir_coalesces_signature_block_like_graph() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+
+    // Two scans of one fingerprint: scan 1 earlier/lower count, scan 2 later.
+    let (sig_id, sig1) = error_signature(
+        "boom",
+        "error",
+        "2026-01-02T10:00:00Z",
+        "2026-01-02T11:00:00Z",
+        3,
+        None,
+    );
+    let (sig_id2, sig2) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 5, None);
+    assert_eq!(sig_id, sig_id2, "same seed → same stable signature ID");
+    let (b1n, b1e) = bucket_with_edge(&sig_id, "2026-01-02T10:00:00Z", 3);
+    let (b2n, b2e) = bucket_with_edge(&sig_id, "2026-01-02T12:00:00Z", 5);
+    let records = vec![sig1, sig2, b1n, b1e, b2n, b2e];
+
+    // Build the embedded store, then read it back with log retention.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record).expect("record should write");
+    }
+    let embedded_records = sink
+        .read_all_records_log_retained()
+        .expect("log-retained read should surface both signature versions");
+    drop(sink);
+
+    let graph = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("graph resolve");
+    let embedded = error_context(
+        &embedded_records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        true,
+    )
+    .expect("embedded resolve");
+
+    let g = &graph.signatures[0];
+    let e = &embedded.signatures[0];
+    // Coalesced identity + occurrence data match the --graph path.
+    assert_eq!(e.first_seen, g.first_seen);
+    assert_eq!(e.last_seen, g.last_seen);
+    assert_eq!(e.occurrence_count, g.occurrence_count);
+    // And concretely the coalesced values (earliest, latest, summed).
+    assert_eq!(e.first_seen, "2026-01-02T10:00:00Z");
+    assert_eq!(e.last_seen, SIG_LAST);
+    assert_eq!(e.occurrence_count, 8);
+    // Both buckets survive on the embedded path, matching --graph.
+    let g_buckets: Vec<(String, u64)> = g
+        .buckets
+        .iter()
+        .map(|b| (b.bucket_start.clone(), b.occurrence_count))
+        .collect();
+    let e_buckets: Vec<(String, u64)> = e
+        .buckets
+        .iter()
+        .map(|b| (b.bucket_start.clone(), b.occurrence_count))
+        .collect();
+    assert_eq!(e_buckets, g_buckets);
+    assert_eq!(
+        e_buckets,
+        vec![
+            ("2026-01-02T10:00:00Z".to_owned(), 3),
+            ("2026-01-02T12:00:00Z".to_owned(), 5),
+        ]
+    );
+
+    // The embedded path discloses the residual retention caveat; --graph does not.
+    assert!(embedded.embedded_log_retention_caveat.is_some());
+    assert!(graph.embedded_log_retention_caveat.is_none());
+}
+
+/// Issue #363 (Codex P2): a `forget`-retracted log observation is NOT resurrected
+/// by a later re-scan on the `--data-dir` retained read. A signature is written
+/// (occurrence 3), then tombstoned (as `eg forget` does — a log ID is
+/// non-`codegraph:`, non-temporal, so retraction is allowed), then re-observed by
+/// a later scan with a DISTINCT payload (occurrence 5). The current-state read
+/// exposes only the post-forget version; the log-retained read must too — the
+/// pre-retraction observation is suppressed by the retraction boundary, so the
+/// coalesced `error-context` occurrence is 5, never 3 + 5 = 8.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_data_dir_honors_forget_retraction_boundary_in_error_context() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+    use aletheia_egregore::forget::retraction_tombstone_id;
+
+    // v1 (occurrence 3) → forget/tombstone → v2 (occurrence 5, distinct window).
+    let (sig_id, sig1) = error_signature(
+        "boom",
+        "error",
+        "2026-01-02T10:00:00Z",
+        "2026-01-02T11:00:00Z",
+        3,
+        None,
+    );
+    let (sig_id2, sig2) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 5, None);
+    assert_eq!(sig_id, sig_id2, "same seed → same stable signature ID");
+    // The tombstone mirrors exactly what `eg forget` mints for a log ID.
+    let (tombstone_id, tombstone_version) = retraction_tombstone_id(&sig_id);
+    let tombstone = GraphRecord::Tombstone {
+        id: tombstone_id,
+        schema_version: tombstone_version,
+        deleted_id: sig_id.clone(),
+        summary: "retracted: leaked value".to_owned(),
+        producer: None,
+    };
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("forget-boundary-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    sink.write_record(&sig1).expect("v1 should write");
+    sink.write_record(&tombstone)
+        .expect("tombstone should write");
+    sink.write_record(&sig2)
+        .expect("post-forget re-scan should write");
+    let embedded_records = sink
+        .read_all_records_log_retained()
+        .expect("log-retained read");
+    drop(sink);
+
+    let embedded = error_context(
+        &embedded_records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        true,
+    )
+    .expect("embedded resolve");
+
+    assert_eq!(
+        embedded.signatures.len(),
+        1,
+        "the retracted-then-re-observed signature coalesces to one row"
+    );
+    let e = &embedded.signatures[0];
+    // Only the post-forget observation survives — never 3 + 5 = 8.
+    assert_eq!(
+        e.occurrence_count, 5,
+        "the pre-forget observation must not be resurrected into the coalesced sum"
+    );
+    assert_eq!(e.first_seen, SIG_FIRST);
+    assert_eq!(e.last_seen, SIG_LAST);
+}
+
+/// Issue #363 (Codex P2): the same-hour/same-count `LogOccurrenceBucket` sub-case.
+/// When two DIFFERING scans of one signature share a bucket for the same hour with
+/// the SAME count, that bucket record is BYTE-IDENTICAL (same ID AND content), so
+/// its second write is an idempotent no-op → only ONE physical bucket node. The
+/// two `ErrorSignature` records still differ, so both are retained and coalesced.
+/// Consequence: the coalesced signature's occurrence-bucket block holds the shared
+/// bucket ONCE on `--data-dir`, whereas `--graph` (which iterates bucket nodes over
+/// the concatenated JSONL, never deduping by bucket record ID) holds it TWICE. This
+/// case LEGITIMATELY diverges from `--graph`; the real fix is source-aware bucket
+/// identity, tracked in issue #361. We assert the OBSERVED behavior and do NOT
+/// assert `--data-dir == --graph` for the bucket block.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_data_dir_dedups_shared_same_count_bucket_block() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+
+    // Two differing scans of one fingerprint (distinct last_seen + count).
+    let (sig_id, sig1) = error_signature(
+        "boom",
+        "error",
+        "2026-01-02T10:00:00Z",
+        "2026-01-02T11:00:00Z",
+        3,
+        None,
+    );
+    let (sig_id2, sig2) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 5, None);
+    assert_eq!(sig_id, sig_id2, "same seed → same stable signature ID");
+    // A SHARED 12:00 bucket with an IDENTICAL count (4) is emitted by BOTH scans →
+    // byte-identical record → deduped on the embedded path. Plus one DISTINCT-hour
+    // bucket per scan so the block has non-shared occurrence data too.
+    let (shared_n, shared_e) = bucket_with_edge(&sig_id, "2026-01-02T12:00:00Z", 4);
+    let (d1n, d1e) = bucket_with_edge(&sig_id, "2026-01-02T10:00:00Z", 3);
+    let (d2n, d2e) = bucket_with_edge(&sig_id, "2026-01-02T13:00:00Z", 6);
+    let records = vec![
+        sig1,
+        sig2,
+        shared_n.clone(),
+        shared_e.clone(),
+        d1n,
+        d1e,
+        shared_n,
+        shared_e,
+        d2n,
+        d2e,
+    ];
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("shared-bucket-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record).expect("record should write");
+    }
+    let embedded_records = sink
+        .read_all_records_log_retained()
+        .expect("log-retained read should surface both signature versions");
+    drop(sink);
+
+    let graph = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("graph resolve");
+    let embedded = error_context(
+        &embedded_records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        true,
+    )
+    .expect("embedded resolve");
+
+    let shared_rows = |ctx: &aletheia_egregore::query::ErrorContext| {
+        ctx.signatures[0]
+            .buckets
+            .iter()
+            .filter(|b| b.bucket_start == "2026-01-02T12:00:00Z")
+            .count()
+    };
+    let total = |ctx: &aletheia_egregore::query::ErrorContext| -> u64 {
+        ctx.signatures[0]
+            .buckets
+            .iter()
+            .map(|b| b.occurrence_count)
+            .sum()
+    };
+
+    // --graph: the shared 12:00 bucket appears TWICE (both byte-identical copies),
+    // so the bucket-block total sums it twice: 3 + 4 + 4 + 6 = 17.
+    assert_eq!(
+        shared_rows(&graph),
+        2,
+        "--graph carries both shared-bucket copies"
+    );
+    assert_eq!(total(&graph), 17);
+
+    // --data-dir: the byte-identical shared bucket is deduped to one physical node,
+    // so it appears ONCE and its count is reflected once: 3 + 4 + 6 = 13.
+    assert_eq!(
+        shared_rows(&embedded),
+        1,
+        "the byte-identical shared bucket is deduped to one physical record on --data-dir"
+    );
+    assert_eq!(total(&embedded), 13);
+
+    // The two paths LEGITIMATELY diverge here by exactly the once-deduped shared
+    // count (4) — inherent to non-source-aware bucket identity (issue #361), NOT a
+    // bug in the embedded read path. Deliberately NOT asserting block equality.
+    // (Coalesced signature IDENTITY parity — first_seen/last_seen/aggregate — is
+    // covered by `embedded_data_dir_coalesces_signature_block_like_graph`; this
+    // sub-case affects only duplicate buckets.)
+    assert_eq!(total(&graph) - total(&embedded), 4);
+
+    // The embedded path still discloses the retention caveat, which now names this
+    // shared-hour/shared-count bucket sub-case and cites #361.
+    let caveat = embedded
+        .embedded_log_retention_caveat
+        .as_ref()
+        .expect("embedded path with an ErrorSignature must disclose the retention caveat");
+    assert!(caveat.message.contains("#361"));
+    assert!(graph.embedded_log_retention_caveat.is_none());
+}
+
+/// Issue #363 (Codex P2): the `error-context --data-dir --at`/`--as-of`
+/// TEMPORAL lane must NOT double-count an enrichment-only `ErrorSignature`
+/// rewrite. The standard pipeline `scan-logs -> resolve-frames -> link-logs`
+/// writes a signature bare, then rewrites it with `FRAME_RESOLVES_TO` /
+/// `EMITTED_DURING` evidence links while leaving the log payload untouched —
+/// producing two physical versions of one scan observation. The unfiltered
+/// history-inclusive read (`read_all_records_including_superseded`, the pre-fix
+/// temporal lane) re-emits BOTH, so the coalescer SUMS `occurrence_count` twice.
+/// The log-retained history read collapses the enrichment rewrite to its single
+/// latest (enriched) version, counting the observation once, while leaving every
+/// non-log temporal/superseded record intact for `--at` reconstruction.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_temporal_lane_collapses_enrichment_rewrite_occurrence_count() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+
+    // A signature whose frame resolves to a symbol present at c1, plus commit
+    // history so `--at c1` resolves — mirrors `at_source_facts_fixture`.
+    let frames = Some(vec![StackFrame {
+        frame_index: 0,
+        module_path: None,
+        file_path: Some("src/lib.rs".to_owned()),
+        line: Some(5),
+    }]);
+    let (sym_id, s1) = symbol_snapshot("tweaked", "src/lib.rs", 1, 10, "c1sha0000", T1);
+    let (sig_id, bare_sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 7, frames);
+    let (bn, be) = bucket_with_edge(&sig_id, SIG_FIRST, 7);
+    // The enrichment rewrite: SAME log payload (occurrence 7), an evidence link
+    // added by resolve-frames/link-logs (mirrors FRAME_RESOLVES_TO on the node).
+    let enriched_sig = bare_sig.clone().with_evidence_links(vec![evidence_link(
+        "FRAME_RESOLVES_TO",
+        &sym_id,
+        "codegraph",
+    )]);
+    // resolve-frames also emits the FRAME_RESOLVES_TO edge itself.
+    let fr_edge = frame_resolves(&sig_id, &sym_id, 0, FrameResolution::Resolved);
+    // Pipeline write order: scan-logs (bare + bucket), then resolve-frames
+    // (enriched signature rewrite + edge).
+    let records = vec![
+        commit("c1sha0000", &[], T1),
+        s1,
+        bare_sig,
+        bn,
+        be,
+        enriched_sig,
+        fr_edge,
+    ];
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("enrichment-temporal-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record).expect("record should write");
+    }
+
+    // HEAD behaviour (regression guard for the hole): the UNFILTERED
+    // history-inclusive read re-emits BOTH physical signature versions, so the
+    // coalescer SUMS 7 + 7 = 14 — the observed double-count on trunk.
+    let unfiltered = sink
+        .read_all_records_including_superseded()
+        .expect("history read");
+    let bug = error_context(
+        &unfiltered,
+        &sig_id,
+        None,
+        Some("c1sha0000"),
+        None,
+        SupersessionMode::Exclude,
+        None,
+        true,
+    )
+    .expect("resolve at c1 (unfiltered)");
+    assert_eq!(
+        bug.signatures[0].occurrence_count, 14,
+        "the unfiltered temporal read double-counts the enrichment rewrite (documented HEAD hole)"
+    );
+
+    // FIXED behaviour: the log-retained history read collapses the enrichment
+    // rewrite to exactly ONE physical version — the latest (enriched) one.
+    let retained = sink
+        .read_all_records_including_superseded_log_retained()
+        .expect("log-retained history read");
+    let sig_versions: Vec<&GraphRecord> = retained
+        .iter()
+        .filter(|r| r.id() == sig_id && r.node_kind_name() == Some("ErrorSignature"))
+        .collect();
+    assert_eq!(
+        sig_versions.len(),
+        1,
+        "the enrichment rewrite collapses to one physical signature version"
+    );
+    assert!(
+        sig_versions[0]
+            .evidence_links()
+            .is_some_and(|links| !links.is_empty()),
+        "the retained version is the ENRICHED one (carries the evidence links)"
+    );
+    let fixed = error_context(
+        &retained,
+        &sig_id,
+        None,
+        Some("c1sha0000"),
+        None,
+        SupersessionMode::Exclude,
+        None,
+        true,
+    )
+    .expect("resolve at c1 (retained)");
+    assert_eq!(
+        fixed.signatures[0].occurrence_count, 7,
+        "the enrichment rewrite is counted ONCE on the fixed temporal lane"
+    );
+    // The FRAME_RESOLVES_TO edge still joins after the enrichment dedup.
+    assert!(
+        !fixed.signatures[0].frames.is_empty(),
+        "the resolved frame still joins after the enrichment dedup"
+    );
+    // Non-log temporal reconstruction is unaffected: the c1 frame-target symbol
+    // is still resolved under `--at c1`.
+    assert!(
+        fixed.source_facts.iter().any(|r| r.record_id == sym_id),
+        "the frame-target symbol is still resolved under --at c1"
+    );
+}
+
+/// Issue #363: the log-retained temporal read must still coalesce two DISTINCT
+/// scan observations (differing `first_seen`/`last_seen`/`occurrence_count`) —
+/// the enrichment-dedup collapses only same-observation rewrites, never distinct
+/// observations — so a genuine multi-scan case reconstructs earliest/latest/summed
+/// exactly as the unfiltered read does under `--at`.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_temporal_lane_retains_distinct_scan_observations() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+
+    let (sig_id, sig1) = error_signature(
+        "boom",
+        "error",
+        "2026-01-02T10:00:00Z",
+        "2026-01-02T11:00:00Z",
+        3,
+        None,
+    );
+    let (sig_id2, sig2) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 5, None);
+    assert_eq!(sig_id, sig_id2, "same seed → same stable signature ID");
+    let records = vec![commit("c1sha0000", &[], T1), sig1, sig2];
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("distinct-obs-temporal-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record).expect("record should write");
+    }
+    let retained = sink
+        .read_all_records_including_superseded_log_retained()
+        .expect("log-retained history read");
+    let versions = retained
+        .iter()
+        .filter(|r| r.id() == sig_id && r.node_kind_name() == Some("ErrorSignature"))
+        .count();
+    assert_eq!(
+        versions, 2,
+        "two DISTINCT scan observations both survive the log-retained temporal read"
+    );
+    let ctx = error_context(
+        &retained,
+        &sig_id,
+        None,
+        Some("c1sha0000"),
+        None,
+        SupersessionMode::Exclude,
+        None,
+        true,
+    )
+    .expect("resolve at c1");
+    assert_eq!(ctx.signatures[0].first_seen, "2026-01-02T10:00:00Z");
+    assert_eq!(ctx.signatures[0].last_seen, SIG_LAST);
+    assert_eq!(
+        ctx.signatures[0].occurrence_count, 8,
+        "distinct observations coalesce to the summed count (3 + 5)"
     );
 }
 

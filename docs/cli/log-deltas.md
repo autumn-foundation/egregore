@@ -76,11 +76,14 @@ issue #362.
 Separately, whenever the query runs over the embedded (`--data-dir`) read path
 **and** the store holds at least one `ErrorSignature`, the response carries an
 `embedded_log_retention_caveat` object (a fixed `message`) disclosing that
-embedded stores retain one record per stable non-temporal log ID
-(last-write-wins), so cross-scan coalescing is **not** reconstructable there — see
-[`--graph` only](#--graph-only-coalescing-is-not-reconstructable-on---data-dir-issue-363)
-above. The field is omitted for `--graph` queries and for embedded stores with no
-log records, and is deterministic (fixed string, no wall clock).
+embedded stores now retain **every distinct scan observation** (enrichment-only
+rewrites from `resolve-frames` / `link-logs` are not double-counted), so
+cross-scan coalescing **is** reconstructed there for differing-content scans, and
+that the one residual divergence is that byte-identical re-ingests are deduped
+(not multiplied) — see
+[embedded coalescing](#embedded---data-dir-coalescing-issue-363) below. The field
+is omitted for `--graph` queries and for embedded stores with no log records, and
+is deterministic (fixed string, no wall clock).
 
 ## Shortest offline workflow
 
@@ -165,26 +168,62 @@ that observed it before the range landing in `ceased_signatures` while a later
 scan that first observed it in-range lands in `new_signatures`. In a store built
 from a single `scan-logs` output this is moot (each signature ID appears once).
 
-### `--graph` only: coalescing is not reconstructable on `--data-dir` (issue #363)
+### Embedded (`--data-dir`) coalescing (issue #363)
 
-Cross-scan coalescing is a **`--graph`** capability. The embedded (`--data-dir`)
-current-state read surface returns exactly **one record per stable ID**, and
-`ErrorSignature` / `LogOccurrenceBucket` are **non-temporal** nodes, so ingesting
-multiple `scan-logs` outputs of the **same** stable signature/bucket ID retains a
-single record (**last-write-wins**) — the duplicate records the coalescing needs
-are gone before `log-deltas` runs. On the `--data-dir` path, therefore,
-`first_seen` / `last_seen` and occurrence counts reflect only the **retained**
-record, and the split-signature case above can **misclassify**.
+Cross-scan coalescing works on **both** read paths. `ErrorSignature` /
+`LogOccurrenceBucket` are **non-temporal** nodes, so ingesting multiple
+`scan-logs` outputs of the **same** stable signature/bucket ID with differing
+captured content appends a **superseded** physical version per scan. The embedded
+(`--data-dir`) lane loads records through the **log-retained** read surface
+(`read_all_records_log_retained`), which surfaces every one of those versions —
+so the same duplicate slice the coalescer needs is present, and `first_seen` /
+`last_seen` / occurrence counts are reconstructed **exactly** as on the
+concatenated `--graph` JSONL. The split-signature case above therefore classifies
+identically on `--data-dir` and `--graph`.
 
-A **single** `scan-logs` ingest is unaffected and correct — this only bites
-multi-scan aggregation on the embedded path. When the query runs over
+Only **distinct scan observations** are retained, where "distinct" is decided on
+the **full scan payload** (window, occurrence count, and captured `frames`) —
+not just `first_seen` / `last_seen` / `occurrence_count` — so two observations
+that share an identical occurrence window but differ in their scan-time captured
+frames (#322) are both kept. The standard pipeline
+`scan-logs -> resolve-frames -> link-logs` re-emits the same `ErrorSignature`
+node enriched with node-level evidence links (`FRAME_RESOLVES_TO` /
+`EMITTED_DURING` / `REFERENCES_TASK`) while leaving its log payload unchanged.
+That enrichment-only rewrite is the **same** observation (identical payload, only
+`evidence_links` added), not a new scan, so it is retained as a **single**
+observation and never double-counts occurrences. The retained current version is
+always the enriched one, so resolved frames and evidence links are preserved.
+
+One residual divergence remains, in two forms, both rooted in the idempotent-write
+dedup of byte-identical non-temporal records:
+
+1. A **byte-identical** re-ingest of the *entire* same `scan-logs` output is an
+   idempotent no-op (deduped to one physical record) rather than multiplied, so
+   identical re-scans do **not** inflate `--data-dir` counts the way concatenating
+   identical JSONL does on `--graph`.
+2. Even across **differing** scans, an individual **byte-identical**
+   `LogOccurrenceBucket` — same signature, same hour, **same count** (so the same
+   record ID *and* the same content) — is deduped to one physical record rather
+   than summed. Such a shared-hour/shared-count bucket therefore contributes its
+   count **once** on `--data-dir` but **twice** on `--graph`, whose concatenated
+   JSONL carries both copies and whose bucket-sum iterates bucket **nodes** without
+   deduping by bucket record ID (see #361). Per-window occurrence counts
+   (`base_window_occurrences` / `head_window_occurrences`) can therefore be **lower**
+   on `--data-dir` for this case. This is inherent to non-source-aware bucket
+   identity; the real fix is source-aware bucket identity, tracked in **issue #361**.
+
+A **single** `scan-logs` ingest is exact either way. When the query runs over
 `--data-dir` **and** the store holds at least one `ErrorSignature`, the response
 envelope carries an `embedded_log_retention_caveat` object (a fixed `message`)
-disclosing this. To aggregate across scans, combine `scan-logs` outputs at the
-**`--graph`** level (concatenated JSONL) or use **per-source stores**. The
-store/adapter-layer fix — a log-domain-aware embedded read path that retains
-duplicate non-temporal log records — is out of this command's scope and tracked
-in **issue #363**.
+disclosing both forms of this residual divergence. The adapter-level retention fix
+landed in **issue #363**.
+
+The retention preserves the **`forget` retraction boundary**: if an
+`ErrorSignature` was retracted with `eg forget` and a **later** `scan-logs`
+re-observes the same stable ID, the log-retained read surfaces only the
+post-retraction observation — the pre-retraction observation is **not**
+resurrected into the coalesced sum (a re-scan after `forget` never revives a
+forgotten observation).
 
 ## Change classes
 

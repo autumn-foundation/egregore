@@ -78,6 +78,12 @@ buckets, and runs are never repository-filtered.
 machine-readable `unsupported_combination` envelope (mirroring
 `eg resolve-frames`).
 
+Over `--data-dir`, the `--at`/`--as-of` lane loads through the same log-retained
+read surface as the current-state lane, so an enrichment-only `ErrorSignature`
+rewrite is collapsed to a **single** observation here too (never double-counted),
+while every non-log superseded/temporal version stays intact for valid-time
+reconstruction (issue #363).
+
 ### `--supersession`
 
 `--supersession exclude` (default) removes superseded/contradicted agent rows
@@ -98,16 +104,40 @@ while the flag is set exits 1 with `protected_handle_in_graph`.
 
 When the query runs over an embedded (`--data-dir`) store that holds at least one
 `ErrorSignature`, the response carries an `embedded_log_retention_caveat`
-disclosing that the embedded current-state read surface retains exactly one
-record per stable non-temporal log ID (last-write-wins for `ErrorSignature` /
-`LogOccurrenceBucket`). Multiple `scan-logs` ingests of the same stable ID are
-therefore collapsed **before** this query runs, so the cross-scan coalescing the
-`--graph` path performs is not reconstructable there. The `--graph` path
-preserves every ingested line and never carries the caveat; a pure `scan` store
-with no log records never carries it either. This mirrors the identical
-disclosure on [`eg query log-deltas`](./log-deltas.md); the underlying
-adapter-layer fix is tracked in issue #363. This is a disclosure only — it never
-changes handle resolution or section contents.
+disclosing that the embedded lane now loads through the **log-retained** read
+surface, which surfaces every **superseded** non-temporal `ErrorSignature` /
+`LogOccurrenceBucket` version that differing-content `scan-logs` ingests append.
+The cross-scan coalescing the `--graph` path performs (earliest `first_seen`,
+latest `last_seen`, summed occurrence counts, all buckets) is therefore
+reconstructed **exactly** on `--data-dir` for differing-content scans. Only
+**distinct scan observations** are retained, where "distinct" is decided on the
+**full scan payload** (window, occurrence count, and captured `frames` #322) —
+not just `first_seen` / `last_seen` / `occurrence_count` — so two observations
+sharing one occurrence window but differing in captured frames are both kept. The
+standard `scan-logs -> resolve-frames -> link-logs` pipeline re-emits the same
+`ErrorSignature` node enriched with node-level evidence links but with an
+unchanged log payload, and that enrichment-only rewrite is retained as a
+**single** observation — never double-counted. The residual
+divergence has two forms, both from idempotent-write dedup of byte-identical
+non-temporal records: (1) a byte-identical re-ingest of the whole `scan-logs`
+output is deduped to one physical record (not multiplied); and (2) even across
+**differing** scans, an individual byte-identical `LogOccurrenceBucket` (same
+signature, same hour, **same count**) is deduped to one physical record rather than
+summed, so a shared-hour/shared-count bucket contributes once on `--data-dir` but
+twice on `--graph` (which iterates bucket nodes and sums duplicates), and the
+coalesced signature's occurrence-bucket block can hold fewer occurrences on
+`--data-dir`. Both stem from non-source-aware bucket identity, whose real fix is
+tracked in **issue #361**. The `--graph` path preserves every ingested line and
+never carries the caveat; a pure `scan` store with no log records never carries
+it either. This mirrors the identical disclosure on
+[`eg query log-deltas`](./log-deltas.md); the adapter-level retention fix landed
+in issue #363. This is a disclosure only — it never changes handle resolution or
+section contents.
+
+The retained read preserves the **`forget` retraction boundary**: a
+`forget`-retracted `ErrorSignature` re-observed by a **later** `scan-logs` is not
+resurrected — only the post-retraction observation reaches the coalesced sum, so a
+re-scan after `forget` never revives a forgotten observation.
 
 ## Shortest offline workflow
 

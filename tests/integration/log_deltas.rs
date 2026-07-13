@@ -25,7 +25,8 @@ use std::{
 use aletheia_egregore::{
     GraphRecord, LOG_SCHEMA_VERSION, NodeKind, TemporalMetadata,
     ir::{
-        EdgeLabel, ErrorSignaturePayload, FrameResolution, LogOccurrenceBucketPayload, LogPayload,
+        EdgeLabel, ErrorSignaturePayload, EvidenceLink, FrameResolution,
+        LogOccurrenceBucketPayload, LogPayload,
     },
     query::{LogDeltas, RangeDeltasError, log_deltas},
     scan_repository_history, stable_id,
@@ -651,6 +652,437 @@ fn log_deltas_coalesces_split_signature_across_scan_outputs() {
 }
 
 // ---------------------------------------------------------------------------
+// Embedded coalescing parity (issue #363): a `--data-dir` store ingested with
+// two differing-content `scan-logs` outputs for the SAME signature ID must
+// coalesce exactly as the `--graph` path does over the concatenated JSONL. Two
+// distinct (non-identical) buckets avoid the byte-identical-re-ingest dedup, so
+// occurrence sums match too.
+// ---------------------------------------------------------------------------
+
+/// Same seed → same stable `ErrorSignature` ID, emitted twice with DIFFERING
+/// content: scan 1 entirely before the `[T2, T3]` window (alone → `ceased`),
+/// scan 2 first observed inside it (alone → `new`). Distinct buckets (H1 before,
+/// H2 inside) so nothing dedupes. Coalesced: merged `first_seen` (earliest,
+/// before the window) → NOT new; merged `last_seen` (latest, before
+/// `window_end`) → `ceased`.
+#[cfg(feature = "embedded-aletheiadb")]
+fn split_signature_distinct_bucket_records() -> Vec<GraphRecord> {
+    let sig = log_sig_id("split-boom");
+    let (h1_node, h1_edge) = bucket_with_edge(&sig, "2026-01-01T00:00:00Z", 3);
+    let (h2_node, h2_edge) = bucket_with_edge(&sig, NEW_BUCKET, 5);
+    vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        commit("c3sha0000", &["c2sha0000"], T3),
+        error_signature(
+            "split-boom",
+            "error",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T05:00:00Z",
+            3,
+        ),
+        error_signature("split-boom", "error", NEW_FIRST, NEW_LAST, 5),
+        h1_node,
+        h1_edge,
+        h2_node,
+        h2_edge,
+    ]
+}
+
+/// A comparable, order-independent projection of every classified signature row.
+#[cfg(feature = "embedded-aletheiadb")]
+#[allow(clippy::type_complexity)]
+fn signature_rows(
+    d: &LogDeltas,
+) -> Vec<(
+    String,
+    &'static str,
+    String,
+    String,
+    u64,
+    Option<u64>,
+    Option<u64>,
+)> {
+    let mut rows: Vec<_> = d
+        .new_signatures
+        .iter()
+        .chain(&d.ceased_signatures)
+        .chain(&d.continuing_signatures)
+        .map(|r| {
+            (
+                r.record_id.clone(),
+                r.change_class,
+                r.first_seen.clone(),
+                r.last_seen.clone(),
+                r.occurrence_count,
+                r.base_window_occurrences,
+                r.head_window_occurrences,
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn log_deltas_embedded_data_dir_coalesces_like_graph_for_differing_scans() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+
+    let records = split_signature_distinct_bucket_records();
+
+    // Build an embedded store by writing both scan outputs (same signature ID,
+    // differing content) plus their distinct buckets.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("split-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record).expect("record should write");
+    }
+    let embedded_records = sink
+        .read_all_records_log_retained()
+        .expect("log-retained read should surface both signature versions");
+    drop(sink);
+
+    // `--graph` (concatenated JSONL) vs `--data-dir` (log-retained embedded read).
+    let graph = log_deltas(&records, "c1", "c3", None, false).expect("graph range should resolve");
+    let embedded = log_deltas(&embedded_records, "c1", "c3", None, true)
+        .expect("embedded range should resolve");
+
+    // The coalesced classification + occurrence data match byte-for-byte.
+    assert_eq!(
+        signature_rows(&embedded),
+        signature_rows(&graph),
+        "the embedded --data-dir result must coalesce exactly like the --graph result"
+    );
+
+    // And concretely: the merged signature is CEASED (the split case) — NOT the
+    // last-write-wins `new` a non-retaining read would have produced.
+    let sig = log_sig_id("split-boom");
+    assert_eq!(record_ids(&embedded.ceased_signatures), vec![sig.clone()]);
+    assert!(
+        embedded.new_signatures.iter().all(|r| r.record_id != sig),
+        "the coalesced signature must not classify as new on the embedded path"
+    );
+    let row = &embedded.ceased_signatures[0];
+    assert_eq!(row.first_seen, "2026-01-01T00:00:00Z");
+    assert_eq!(row.last_seen, NEW_LAST);
+    assert_eq!(row.occurrence_count, 8, "aggregate sums both scan payloads");
+    assert_eq!(row.base_window_occurrences, Some(3));
+    assert_eq!(row.head_window_occurrences, Some(8));
+
+    // The embedded path discloses the residual byte-identical-re-ingest caveat.
+    assert!(
+        embedded.embedded_log_retention_caveat.is_some(),
+        "the embedded path must still disclose the retention caveat"
+    );
+    assert!(
+        graph.embedded_log_retention_caveat.is_none(),
+        "the --graph path must not carry the retention caveat"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Same-hour / same-count bucket dedup on the embedded read path (issue #363,
+// Codex P2). When two DIFFERING scans of the SAME signature share a
+// `LogOccurrenceBucket` for the same hour with the SAME count, that bucket record
+// is BYTE-IDENTICAL across scans (bucket ID = repository/signature/hour/width;
+// content = the same count). The second write therefore takes `write_record`'s
+// idempotent no-op path, so only ONE physical bucket node exists and
+// `read_all_records_log_retained` has nothing superseded to re-emit for it. The
+// two `ErrorSignature` records still DIFFER (distinct last_seen/count), so BOTH
+// are retained and coalesced. Consequence: the shared-hour bucket count is
+// reflected ONCE in the `--data-dir` per-window totals, whereas the `--graph`
+// path (which iterates bucket nodes over the concatenated JSONL and sums
+// duplicates, issue #361) counts it TWICE. This case legitimately diverges from
+// `--graph`; the real fix is source-aware bucket identity, tracked in issue #361.
+// This test asserts the OBSERVED `--data-dir` behavior and deliberately does NOT
+// assert `--data-dir == --graph`.
+// ---------------------------------------------------------------------------
+
+/// Same seed → same stable `ErrorSignature` ID, emitted twice with DIFFERING
+/// content (distinct `last_seen` + per-scan count), so both signature records are
+/// retained and coalesce. Both scans emit a SHARED bucket for the 12:00 hour with
+/// an IDENTICAL count (4) — byte-identical → deduped to one physical record — plus
+/// one DISTINCT-hour bucket each (13:00 x3, 14:00 x6) so the scans genuinely
+/// differ and there is non-shared occurrence data. All buckets fall inside the
+/// `[T2, T3]` window (after base T1, at/before head T3), so `base_window` is 0.
+#[cfg(feature = "embedded-aletheiadb")]
+fn split_signature_shared_same_count_bucket() -> Vec<GraphRecord> {
+    const SHARED_HOUR: &str = "2026-01-02T12:00:00Z";
+    const SCAN1_HOUR: &str = "2026-01-02T13:00:00Z";
+    const SCAN2_HOUR: &str = "2026-01-02T14:00:00Z";
+    const SCAN1_LAST: &str = "2026-01-02T13:30:00Z";
+    const SCAN2_LAST: &str = "2026-01-02T14:30:00Z";
+
+    let sig = log_sig_id("shared-hour");
+    // The byte-identical shared bucket (same signature, hour, and count) is emitted
+    // by BOTH scans; only the second write is the idempotent no-op.
+    let (shared_node, shared_edge) = bucket_with_edge(&sig, SHARED_HOUR, 4);
+    let (scan1_node, scan1_edge) = bucket_with_edge(&sig, SCAN1_HOUR, 3);
+    let (scan2_node, scan2_edge) = bucket_with_edge(&sig, SCAN2_HOUR, 6);
+    vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        commit("c3sha0000", &["c2sha0000"], T3),
+        // Two differing scan outputs of the same signature ID (distinct last_seen).
+        error_signature("shared-hour", "error", NEW_FIRST, SCAN1_LAST, 5),
+        error_signature("shared-hour", "error", NEW_FIRST, SCAN2_LAST, 8),
+        // Scan 1 buckets: the shared 12:00 bucket + its distinct 13:00 bucket.
+        shared_node.clone(),
+        shared_edge.clone(),
+        scan1_node,
+        scan1_edge,
+        // Scan 2 buckets: the SAME shared 12:00 bucket (byte-identical) + 14:00.
+        shared_node,
+        shared_edge,
+        scan2_node,
+        scan2_edge,
+    ]
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn log_deltas_embedded_dedups_shared_same_count_bucket() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+
+    let records = split_signature_shared_same_count_bucket();
+
+    // Build the embedded store by writing every record in order. The second write
+    // of the byte-identical shared bucket is an idempotent no-op, so only ONE
+    // physical shared-bucket node ever exists.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("shared-bucket-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record).expect("record should write");
+    }
+    let embedded_records = sink
+        .read_all_records_log_retained()
+        .expect("log-retained read should surface both signature versions");
+    drop(sink);
+
+    let sig = log_sig_id("shared-hour");
+
+    // --data-dir: the coalesced signature is NEW (first_seen inside the window) and
+    // its per-window occurrence total reflects the shared 12:00 bucket ONCE:
+    // shared(4) + scan1 distinct(3) + scan2 distinct(6) = 13. base_window is 0
+    // because every bucket falls after the base endpoint (T1).
+    let embedded = log_deltas(&embedded_records, "c1", "c3", None, true)
+        .expect("embedded range should resolve");
+    assert_eq!(record_ids(&embedded.new_signatures), vec![sig.clone()]);
+    let embedded_row = &embedded.new_signatures[0];
+    assert_eq!(embedded_row.occurrence_source, "occurrence_buckets");
+    assert_eq!(embedded_row.base_window_occurrences, Some(0));
+    assert_eq!(
+        embedded_row.head_window_occurrences,
+        Some(13),
+        "the byte-identical shared 12:00 bucket is deduped to one physical record, \
+         so its count (4) is reflected ONCE: 4 + 3 + 6 = 13"
+    );
+
+    // --graph: the concatenated JSONL carries TWO copies of the byte-identical
+    // shared bucket. log_deltas iterates bucket NODES and sums duplicates (never
+    // deduping by bucket record ID, issue #361), so the shared count is added TWICE:
+    // shared(4 + 4) + scan1(3) + scan2(6) = 17.
+    let graph = log_deltas(&records, "c1", "c3", None, false).expect("graph range should resolve");
+    assert_eq!(record_ids(&graph.new_signatures), vec![sig]);
+    let graph_row = &graph.new_signatures[0];
+    assert_eq!(graph_row.base_window_occurrences, Some(0));
+    assert_eq!(
+        graph_row.head_window_occurrences,
+        Some(17),
+        "the --graph path sums both byte-identical shared-bucket copies (4 + 4)"
+    );
+
+    // The two paths LEGITIMATELY diverge for this same-hour/same-count case: the
+    // gap is exactly the deduped shared-bucket count (4). This is inherent to
+    // non-source-aware bucket identity, whose real fix is issue #361 — NOT a bug in
+    // the embedded read path. We deliberately do NOT assert equality here.
+    assert_eq!(
+        graph_row.head_window_occurrences.unwrap() - embedded_row.head_window_occurrences.unwrap(),
+        4,
+        "the divergence equals the once-deduped shared-hour bucket count (issue #361)"
+    );
+
+    // The embedded path still discloses the retention caveat, which now names this
+    // shared-hour/shared-count bucket sub-case.
+    assert!(
+        embedded.embedded_log_retention_caveat.is_some(),
+        "the embedded path must disclose the retention caveat"
+    );
+    assert!(
+        embedded
+            .embedded_log_retention_caveat
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("#361"),
+        "the caveat must cite issue #361 as the tracked source-aware-identity fix"
+    );
+
+    // Determinism: the embedded classification is byte-stable across repeated runs.
+    let embedded_again = log_deltas(&embedded_records, "c1", "c3", None, true)
+        .expect("embedded range should resolve again");
+    assert_eq!(signature_rows(&embedded), signature_rows(&embedded_again));
+}
+
+/// Four signatures across the classes plus the new signature's bucket, with NO
+/// `FRAME_RESOLVES_TO` edge onto a multi-snapshot symbol (which the stricter
+/// embedded write path rejects). Exercises the single-scan embedded parity.
+#[cfg(feature = "embedded-aletheiadb")]
+fn single_scan_records() -> Vec<GraphRecord> {
+    let new_sig = log_sig_id("new-boom");
+    let (bucket_node, bucket_edge) = bucket_with_edge(&new_sig, NEW_BUCKET, 5);
+    vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        commit("c3sha0000", &["c2sha0000"], T3),
+        error_signature("new-boom", "error", NEW_FIRST, NEW_LAST, 5),
+        error_signature("ceased-warn", "warn", CEASED_FIRST, CEASED_LAST, 3),
+        error_signature("cont-error", "error", CONT_FIRST, CONT_LAST, 9),
+        error_signature("future-fatal", "fatal", FUTURE_FIRST, FUTURE_LAST, 1),
+        bucket_node,
+        bucket_edge,
+    ]
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn log_deltas_embedded_data_dir_single_scan_matches_graph() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+
+    // Regression: a single-scan embedded store is unaffected by the retention
+    // change — its result equals the `--graph` result over the same records.
+    let records = single_scan_records();
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("single-scan-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record).expect("record should write");
+    }
+    let embedded_records = sink
+        .read_all_records_log_retained()
+        .expect("log-retained read");
+    drop(sink);
+
+    let graph = log_deltas(&records, "c1", "c3", None, false).expect("graph range should resolve");
+    let embedded = log_deltas(&embedded_records, "c1", "c3", None, true)
+        .expect("embedded range should resolve");
+    assert_eq!(
+        signature_rows(&embedded),
+        signature_rows(&graph),
+        "a single-scan embedded store must match the --graph result"
+    );
+}
+
+/// The same `ErrorSignature` re-emitted with evidence links added but an
+/// IDENTICAL log payload, exactly as `resolve-frames` / `link-logs` do (they
+/// re-emit the signature node enriched with `FRAME_RESOLVES_TO` /
+/// `EMITTED_DURING` / `REFERENCES_TASK` evidence links, leaving
+/// `first_seen`/`last_seen`/`occurrence_count` untouched).
+#[cfg(feature = "embedded-aletheiadb")]
+fn error_signature_enriched(
+    seed: &str,
+    severity: &str,
+    first_seen: &str,
+    last_seen: &str,
+    occurrence_count: u64,
+) -> GraphRecord {
+    error_signature(seed, severity, first_seen, last_seen, occurrence_count).with_evidence_links(
+        vec![EvidenceLink {
+            target_record_id: Some(symbol_id("tweaked", "src/lib.rs")),
+            target_domain: "codegraph".to_owned(),
+            relation: EdgeLabel::FrameResolvesTo.as_str().to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: Some("src/lib.rs".to_owned()),
+            target_span: None,
+            target_git_commit: None,
+        }],
+    )
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn log_deltas_embedded_does_not_double_count_enrichment_rewrite() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+
+    // Issue #363 regression: the STANDARD pipeline `scan-logs -> resolve-frames ->
+    // link-logs` ingests the SAME `ErrorSignature` node twice into one embedded
+    // store — first bare (scan-logs), then enriched with evidence links
+    // (resolve-frames / link-logs) but with an IDENTICAL log payload
+    // (`first_seen`/`last_seen`/`occurrence_count` unchanged). The enriched node's
+    // differing content appends a new physical version. The log-retained read must
+    // treat these as ONE scan observation and NOT re-count the occurrence total:
+    // an enrichment rewrite is not a distinct scan.
+    let (bucket_node, bucket_edge) = bucket_with_edge(&log_sig_id("enrich-boom"), NEW_BUCKET, 5);
+    let records: Vec<GraphRecord> = vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        commit("c3sha0000", &["c2sha0000"], T3),
+        // scan-logs: the bare signature.
+        error_signature("enrich-boom", "error", NEW_FIRST, NEW_LAST, 5),
+        // resolve-frames / link-logs: the SAME signature, identical payload, only
+        // evidence links added.
+        error_signature_enriched("enrich-boom", "error", NEW_FIRST, NEW_LAST, 5),
+        // The occurrence bucket for the new signature.
+        bucket_node,
+        bucket_edge,
+    ];
+
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("enrichment-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record).expect("record should write");
+    }
+    let embedded_records = sink
+        .read_all_records_log_retained()
+        .expect("log-retained read");
+    drop(sink);
+
+    let sig = log_sig_id("enrich-boom");
+
+    // Exactly ONE `ErrorSignature` for that ID: the enrichment rewrite is not a
+    // distinct scan observation, so it is not re-emitted.
+    let sig_count = embedded_records
+        .iter()
+        .filter(|r| r.id() == sig && r.node_kind_name() == Some("ErrorSignature"))
+        .count();
+    assert_eq!(
+        sig_count, 1,
+        "the enrichment rewrite must not surface a second signature version"
+    );
+
+    // And log-deltas reports the single-scan occurrence truth (5), NOT 10.
+    let embedded = log_deltas(&embedded_records, "c1", "c3", None, true)
+        .expect("embedded range should resolve");
+    assert_eq!(record_ids(&embedded.new_signatures), vec![sig.clone()]);
+    let row = &embedded.new_signatures[0];
+    assert_eq!(
+        row.occurrence_count, 5,
+        "the aggregate occurrence must not double-count the enrichment rewrite"
+    );
+    assert_eq!(
+        row.head_window_occurrences,
+        Some(5),
+        "the per-window bucket total must not double-count"
+    );
+
+    // The enriched (current) version's evidence link survives: the retained read
+    // keeps the enriched current node, not the bare one.
+    let current_sig = embedded_records
+        .iter()
+        .find(|r| r.id() == sig && r.node_kind_name() == Some("ErrorSignature"))
+        .expect("the signature must be present");
+    assert!(
+        current_sig.evidence_links().is_some_and(|l| !l.is_empty()),
+        "the retained signature must be the enriched (evidence-link-carrying) version"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Timezone-offset window: commit committer dates carry LOCAL offsets while log
 // valid times are Z-normalized (Codex P1). Classification and bucket cutoffs
 // must compare by parsed instant, not raw RFC 3339 string order.
@@ -1091,12 +1523,12 @@ fn log_deltas_single_repo_node_count_never_claims_log_isolation() {
 // ---------------------------------------------------------------------------
 // Embedded-store retention caveat (issue #363).
 //
-// The embedded (`--data-dir`) current-state read surface retains one record per
-// stable ID, and `ErrorSignature` / `LogOccurrenceBucket` are non-temporal, so
-// multiple `scan-logs` ingests of the same stable ID collapse (last-write-wins)
-// before this query runs — the cross-scan coalescing performed on the `--graph`
-// path is not reconstructable there. We DIAGNOSE (disclose in the envelope),
-// never reject: a single-ingest store is correct and keeps working.
+// The embedded (`--data-dir`) lane loads through the log-retained read surface,
+// which surfaces every superseded non-temporal `ErrorSignature` /
+// `LogOccurrenceBucket` version that differing-content `scan-logs` ingests
+// append, so the cross-scan coalescing performed on the `--graph` path IS
+// reconstructed there. We still DIAGNOSE (disclose in the envelope) the one
+// residual divergence: byte-identical re-ingests are deduped, not multiplied.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1108,21 +1540,30 @@ fn log_deltas_embedded_source_discloses_retention_when_log_records_present() {
         .embedded_log_retention_caveat
         .as_ref()
         .expect("embedded path with log records must disclose the retention caveat");
+    // #363 landed the adapter-level retention: the embedded lane surfaces every
+    // superseded log version, so the caveat now states coalescing is
+    // reconstructed and discloses only the byte-identical-re-ingest divergence.
     assert!(
-        caveat.message.contains("last-write-wins"),
-        "the caveat must state embedded stores retain one record per stable ID (last-write-wins)"
+        caveat
+            .message
+            .contains("retain every superseded non-temporal log observation"),
+        "the caveat must state embedded stores retain every superseded log observation"
+    );
+    assert!(
+        caveat.message.contains("reconstructed here"),
+        "the caveat must state cross-scan coalescing is reconstructed on the embedded path"
     );
     assert!(
         caveat.message.contains("`--graph`"),
-        "the caveat must point to the `--graph` path for multi-scan coalescing"
+        "the caveat must reference the `--graph` path it now matches"
     );
     assert!(
-        caveat.message.contains("per-source stores"),
-        "the caveat must offer per-source stores as the alternative"
+        caveat.message.contains("byte-identical re-ingests"),
+        "the caveat must disclose the residual byte-identical-re-ingest divergence"
     );
     assert!(
         caveat.message.contains("#363"),
-        "the caveat must reference the follow-up issue tracking the real fix"
+        "the caveat must reference the issue tracking the fix"
     );
 
     // The flag is disclosure-only: classification is byte-for-byte the `--graph`
@@ -1236,7 +1677,7 @@ fn query_log_deltas_cli_embedded_data_dir_discloses_retention_caveat() {
     let message = body["embedded_log_retention_caveat"]["message"]
         .as_str()
         .expect("the embedded --data-dir path must carry the retention caveat");
-    assert!(message.contains("last-write-wins"));
+    assert!(message.contains("retain every superseded non-temporal log observation"));
     assert!(message.contains("#363"));
 
     // `--graph`: the same query must NOT carry the caveat.

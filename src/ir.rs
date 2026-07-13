@@ -2371,6 +2371,16 @@ impl GraphRecord {
         self
     }
 
+    /// Returns the evidence-link citation list when this record is a node
+    /// carrying one; `None` otherwise.
+    #[must_use]
+    pub fn evidence_links(&self) -> Option<&[EvidenceLink]> {
+        match self {
+            Self::Node { evidence_links, .. } => evidence_links.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
     /// Returns the log-signature payload when this record is a log-domain node
     /// carrying one; `None` otherwise (issues #319 / #320).
     #[must_use]

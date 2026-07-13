@@ -145,6 +145,61 @@ pub(crate) fn load_records_from_data_dir_readonly(data_dir: &Path) -> Result<Vec
     }
 }
 
+/// Loads records from an embedded store, additionally retaining every
+/// superseded non-temporal log observation (issue #363).
+///
+/// Mirrors [`load_records_from_db`] but calls
+/// [`EmbeddedAletheiaSink::read_all_records_log_retained`], so the `--data-dir`
+/// log-signature coalescers (#326 `log-deltas`, #324 `error-context`) see the
+/// duplicate `ErrorSignature` / `LogOccurrenceBucket` versions that differing
+/// `scan-logs` ingests append, exactly as the `--graph` path does over
+/// concatenated JSONL. Non-log kinds keep their single current-state record.
+pub(crate) fn load_records_from_db_log_retained(data_dir: &Path) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+            .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+        sink.read_all_records_log_retained()
+            .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// Log-retained record load that leaves the store byte-for-byte untouched (issue
+/// #363), for the strictly read-only `log-deltas` / `error-context` lanes.
+///
+/// Opening the embedded engine in place re-persists its on-disk index files, so
+/// this copies the store to a throwaway temporary directory and reads the
+/// log-retained view from the copy (mirrors [`load_records_from_data_dir_readonly`]).
+pub(crate) fn load_records_from_data_dir_log_retained_readonly(
+    data_dir: &Path,
+) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let temp =
+            tempfile::tempdir().context("failed to create temporary read-only store copy")?;
+        let copy_root = temp.path().join("store");
+        copy_dir_recursive(data_dir, &copy_root).with_context(|| {
+            format!(
+                "failed to copy store {} for read-only inspection",
+                data_dir.display()
+            )
+        })?;
+        load_records_from_db_log_retained(&copy_root)
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
 /// Recursively copies the regular files and directories under `src` into `dst`.
 ///
 /// Symlinks and other non-regular entries are skipped; this is used only to make
@@ -224,6 +279,67 @@ pub(crate) fn load_records_from_db_history_readonly(data_dir: &Path) -> Result<V
             .with_context(|| format!("failed to open embedded store {}", copy_root.display()))?;
         sink.read_all_records_including_superseded()
             .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// Like [`load_records_from_db_history`], but additionally collapses
+/// enrichment-only rewrites of a non-temporal log observation (issue #363).
+///
+/// Mirrors [`load_records_from_db_history`] but calls
+/// [`EmbeddedAletheiaSink::read_all_records_including_superseded_log_retained`],
+/// so the `--at`/`--as-of` `error-context` (#324) lane sees enrichment-only
+/// `ErrorSignature` rewrites collapsed to a single observation (never
+/// double-counted) while every non-log superseded/temporal version stays intact
+/// for valid-time reconstruction.
+pub(crate) fn load_records_from_db_history_log_retained(
+    data_dir: &Path,
+) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+            .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+        sink.read_all_records_including_superseded_log_retained()
+            .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// History-inclusive, log-retained record load that leaves the store
+/// byte-for-byte untouched (issue #363), for the strictly read-only
+/// `error-context --at`/`--as-of` lane.
+///
+/// Opening the embedded engine in place re-persists its on-disk index files, so
+/// this copies the store to a throwaway temporary directory and reads the
+/// log-retained history-inclusive view from the copy (mirrors
+/// [`load_records_from_db_history_readonly`]). The only difference from that
+/// function is the underlying read: enrichment-only log rewrites are collapsed
+/// (see [`load_records_from_db_history_log_retained`]).
+pub(crate) fn load_records_from_db_history_log_retained_readonly(
+    data_dir: &Path,
+) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let temp =
+            tempfile::tempdir().context("failed to create temporary read-only store copy")?;
+        let copy_root = temp.path().join("store");
+        copy_dir_recursive(data_dir, &copy_root).with_context(|| {
+            format!(
+                "failed to copy store {} for read-only inspection",
+                data_dir.display()
+            )
+        })?;
+        load_records_from_db_history_log_retained(&copy_root)
     }
     #[cfg(not(feature = "embedded-aletheiadb"))]
     {

@@ -361,14 +361,25 @@ bucket record ID, per #361), aggregate `occurrence_count` summed — so exactly 
 split across conflicting classes. Exit codes and the error
 taxonomy mirror #118 exactly. Rows are regression LEADS, never proof this range caused the
 failure; a ceased signature is not proof of a fix; occurrence data only reflects scanned log
-sources. Cross-scan signature coalescing is a `--graph` capability: the embedded (`--data-dir`)
-read path retains one record per stable non-temporal log ID (last-write-wins for
-`ErrorSignature`/`LogOccurrenceBucket`), so multiple `scan-logs` ingests of the same stable ID
-collapse before the query runs and coalescing is not reconstructable there — a single ingest is
-unaffected. When run over `--data-dir` with log records present, the envelope carries an
-`embedded_log_retention_caveat` disclosing this; for multi-scan aggregation combine `scan-logs`
-outputs at the `--graph` level (concatenated JSONL) or use per-source stores (the adapter-level
-retention fix is tracked in #363). Read-only, redaction-safe (no raw log text), deterministic and
+sources. Cross-scan signature coalescing now works on BOTH read paths (#363 landed the
+adapter-level retention): the embedded (`--data-dir`) lane loads through the log-retained read
+surface (`read_all_records_log_retained`), which surfaces every distinct scan OBSERVATION —
+each superseded non-temporal `ErrorSignature`/`LogOccurrenceBucket` version that
+differing-content `scan-logs` ingests append, while an enrichment-only rewrite (evidence links
+added by `resolve-frames`/`link-logs`, log payload unchanged) is retained as a single
+observation and never double-counted (retraction boundary honored — a `forget`-retracted
+observation re-observed by a LATER `scan-logs` is not resurrected; only the post-retraction
+observation reaches the coalesced sum) — so `first_seen`/`last_seen`/occurrence counts are
+reconstructed exactly as on the concatenated `--graph` JSONL. When run over `--data-dir` with log records present, the envelope still carries an
+`embedded_log_retention_caveat` disclosing a residual divergence in two forms, both from
+idempotent-write dedup of byte-identical non-temporal records: (1) byte-identical re-ingests of the
+whole `scan-logs` output are deduped to one physical record rather than multiplied, so identical
+re-scans do not inflate `--data-dir` counts the way concatenating identical JSONL does on `--graph`;
+and (2) even across differing scans, an individual byte-identical `LogOccurrenceBucket` (same
+signature, hour, and count) is deduped rather than summed, so a shared-hour/shared-count bucket
+contributes once on `--data-dir` but twice on `--graph`, leaving per-window occurrence counts
+possibly lower on `--data-dir` — inherent to non-source-aware bucket identity, deferred to #361.
+A single ingest is exact either way. Read-only, redaction-safe (no raw log text), deterministic and
 byte-identical across runs. See `docs/cli/log-deltas.md`.
 
 `eg query error-context <handle>` resolves ONE `ErrorSignature` and assembles a single
@@ -402,7 +413,15 @@ agent rows into `excluded`; `include-but-flag` keeps and flags them. `--repo` sc
 code side of the history join (log records carry no retrievable repository attribution).
 `--protected-store <dir>` matches each signature's `LogSource` `source_artifact_hash` to a
 `protected:v1:` handle at READ time (class + byte length only; raw bytes never read); the graph
-must carry zero protected handles or the run exits 1 (`protected_handle_in_graph`). All
+must carry zero protected handles or the run exits 1 (`protected_handle_in_graph`). Over
+`--data-dir` the current-state (no `--at`/`--as-of`) read loads through the log-retained surface
+(#363), so multi-scan signature coalescing (earliest `first_seen`, latest `last_seen`, summed
+occurrence, all buckets) is reconstructed exactly as on `--graph`; the envelope carries an
+`embedded_log_retention_caveat` disclosing the residual divergence in two forms (a byte-identical
+re-ingest of the whole output is deduped not multiplied; and an individual byte-identical
+`LogOccurrenceBucket` — same signature/hour/count — is deduped rather than summed, so a
+shared-hour/shared-count bucket contributes once on `--data-dir` but twice on `--graph`, deferred
+to #361). All
 timestamp ordering is by parsed UTC instant, never raw RFC 3339 string order. Rows are
 CORRELATION LEADS, never proof of cause: a resolved frame proves the backtrace NAMES a symbol,
 an `EMITTED_DURING` edge is a correlation. Read-only, redaction-safe (only the bounded
