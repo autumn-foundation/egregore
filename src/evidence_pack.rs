@@ -3404,10 +3404,10 @@ fn citation_view(
         // `MissingRequiredHandle`, matching `eg audit citations` (#372). Callers
         // with no record set (e.g. `verify_pack` — packs carry no `LogSource`)
         // pass `None` and use the context-free classifier.
-        let classified = match provenance {
-            Some(p) => classify_record_external_with_provenance(&br.record, p),
-            None => classify_record_external(&br.record),
-        };
+        let classified = provenance.map_or_else(
+            || classify_record_external(&br.record),
+            |p| classify_record_external_with_provenance(&br.record, p),
+        );
         let trust = classified.trust_class.to_owned();
         // A row satisfies the citation contract only when it carries the handle
         // its trust class requires. Mirror `citation_audit`'s exact satisfying

@@ -362,10 +362,12 @@ impl<'a> CitationProvenance<'a> {
     }
 }
 
-/// Provenance-aware sibling of [`classify_record_external`]: applies the #328
-/// `runtime_observation` provenance requirement so an unprovenanced log row
-/// classifies `MissingRequiredHandle`, not `Cited` (issue #372). Use where the
-/// record set carrying `LogSource`/`CAPTURED_FROM`/`AGGREGATES` is available.
+/// Provenance-aware sibling of [`classify_record_external`].
+///
+/// Applies the #328 `runtime_observation` provenance requirement so an
+/// unprovenanced log row classifies `MissingRequiredHandle`, not `Cited` (issue
+/// #372). Use where the record set carrying
+/// `LogSource`/`CAPTURED_FROM`/`AGGREGATES` is available.
 #[must_use]
 pub fn classify_record_external_with_provenance(
     record: &GraphRecord,

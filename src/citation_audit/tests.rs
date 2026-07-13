@@ -1039,7 +1039,7 @@ fn external_provenance_classifier_matches_audit_per_log_row() {
                         row.record_id
                     );
                 }
-                audit_status.insert(row.record_id.clone(), row.status.clone());
+                audit_status.insert(row.record_id.clone(), row.status);
             }
         }
     }
