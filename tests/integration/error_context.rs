@@ -1767,6 +1767,69 @@ fn symbol_mode_resolves_against_at_commit_reresolved_frames() {
 }
 
 #[test]
+fn at_scopes_name_only_frame_to_commit_view() {
+    // Issue #377: a name-only (module-path, no file/line) frame `app::handler`.
+    // The simple name `handler` names DIFFERENT symbol ids across commits
+    // (`src/a.rs` at c1, `src/b.rs` at c2). `error-context --at` re-runs
+    // `resolve_frames` against the commit view, so the frame must scope to the
+    // id that existed at that commit — never the union of both (which the
+    // pre-fix, non-`at`-scoped name map produced as a spurious `ambiguous`).
+    let frames = Some(vec![StackFrame {
+        frame_index: 0,
+        module_path: Some("app::handler".to_owned()),
+        file_path: None,
+        line: None,
+    }]);
+    let (id_a, sym_a) = symbol_snapshot("handler", "src/a.rs", 1, 10, "c1sha0000", T1);
+    let (id_b, sym_b) = symbol_snapshot("handler", "src/b.rs", 1, 10, "c2sha0000", T2);
+    let (sig_id, sig) = error_signature("handler-boom", "error", SIG_FIRST, SIG_LAST, 1, frames);
+    let records = vec![
+        commit("c1sha0000", &[], T1),
+        commit("c2sha0000", &["c1sha0000"], T2),
+        sym_a,
+        sym_b,
+        sig,
+    ];
+
+    let at_c1 = error_context(
+        &records,
+        &sig_id,
+        None,
+        Some("c1sha0000"),
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("resolve at c1");
+    assert_eq!(
+        at_c1.signatures[0].frames.len(),
+        1,
+        "the name-only frame scopes to a single c1 target, not the cross-commit union"
+    );
+    assert_eq!(
+        at_c1.signatures[0].frames[0].target_record_id, id_a,
+        "`--at c1` must scope the name-only frame to the c1 symbol id"
+    );
+
+    let at_c2 = error_context(
+        &records,
+        &sig_id,
+        None,
+        Some("c2sha0000"),
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("resolve at c2");
+    assert_eq!(
+        at_c2.signatures[0].frames[0].target_record_id, id_b,
+        "`--at c2` must scope the name-only frame to the c2 symbol id"
+    );
+}
+
+#[test]
 fn as_of_bounds_occurrence_view() {
     let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 8, None);
     let (early_n, early_e) = bucket_with_edge(&sig_id, "2026-01-02T12:00:00Z", 5);
