@@ -1118,21 +1118,25 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     fn impl_target_id(&self, display: &str, module_names: &[String]) -> Option<String> {
-        // `unsafe impl Trait for Type` is an ordinary non-generic impl behind
-        // a keyword prefix; strip it so the trait lookup matches the plain
-        // `impl Trait for Type` path.
-        let header = display.strip_prefix("unsafe ").unwrap_or(display);
-        let Some(target) = header
-            .strip_prefix("impl ")
-            .map(|rest| rest.split(" for ").next().unwrap_or(rest).trim())
-        else {
-            // A generic header (`impl<T> ...`) is not parsed in this slice.
-            // The legacy verbatim lookup stays: it can only match another
-            // impl display (space-containing keys never collide with
-            // identifier names), preserving the recorded self-referential
-            // edge for generic inherent impls.
-            return self.definitions.get(display.trim()).cloned();
+        // Normalize the impl header into a resolution decision. This handles
+        // `unsafe impl ...`, non-generic headers, and generic headers
+        // (`impl<T> Trait for Type<T>`, `impl GenP<u32> for Plain`) uniformly
+        // (issue #343).
+        let target = match impl_trait_target(display) {
+            ImplTargetDecision::Resolve(name) => name,
+            ImplTargetDecision::Verbatim => {
+                // A generic inherent impl (`impl<T> Type<T>`, no `for` clause)
+                // names no trait to reach. Keep the recorded self-referential
+                // edge via the verbatim display key: space-containing display
+                // keys never collide with identifier names.
+                return self.definitions.get(display.trim()).cloned();
+            }
+            // A blanket impl (`impl<T> Trait for T`) whose `for` target is a
+            // bare binder type parameter covers every type and has no single
+            // implementing-type record; it mints no IMPLEMENTS edge.
+            ImplTargetDecision::NoEdge => return None,
         };
+        let target = target.as_str();
         if target.contains("::") {
             // An absolute `crate::`/`self::`/`super::` path resolves against
             // the module-qualified key space only: a nested symbol's
@@ -1582,6 +1586,149 @@ fn import_name(text: &str) -> String {
 /// (`const`, `static`) and callables never qualify.
 fn is_impl_target_kind(symbol_kind: &str) -> bool {
     matches!(symbol_kind, "trait" | "struct" | "enum" | "type_alias")
+}
+
+/// The IMPLEMENTS-resolution decision for one impl display header
+/// (issue #343).
+enum ImplTargetDecision {
+    /// Resolve this bare trait/type name through the trait-scope walk. Generic
+    /// binders and trait-segment generic args are already stripped.
+    Resolve(String),
+    /// Preserve the legacy verbatim self-referential edge — a generic inherent
+    /// impl (`impl<T> Type<T>`) with no `for` clause names no trait.
+    Verbatim,
+    /// Mint no edge: a blanket impl (`impl<T> Trait for T`) whose `for` target
+    /// is a bare binder type parameter.
+    NoEdge,
+}
+
+/// Parses an impl display header (`impl ...`, `impl<T> ...`, or an
+/// `unsafe `-prefixed form) into its IMPLEMENTS-resolution decision.
+///
+/// Trait impls (headers with a ` for ` clause) resolve their trait segment
+/// with any generic binder and trait-segment generic args stripped, so
+/// `impl<T> GenT for Wrapper<T>` -> `GenT` and `impl GenP<u32> for Plain` ->
+/// `GenP`. A blanket impl whose `for` target is a bare binder type parameter
+/// (`impl<T> Trait for T`) is bounded out with no edge. Inherent impls (no
+/// ` for ` clause) preserve the pre-#343 behavior: a non-generic inherent impl
+/// resolves its type name verbatim, and a generic inherent impl keeps its
+/// recorded self-referential edge.
+fn impl_trait_target(display: &str) -> ImplTargetDecision {
+    let header = display.strip_prefix("unsafe ").unwrap_or(display).trim();
+    let Some(after_impl) = header.strip_prefix("impl") else {
+        return ImplTargetDecision::Verbatim;
+    };
+    let (binder_params, remainder) = match after_impl.chars().next() {
+        Some(' ') => (Vec::new(), after_impl.trim_start()),
+        Some('<') => {
+            let (params, rest) = split_generic_binder(after_impl);
+            (params, rest.trim_start())
+        }
+        // `impl` immediately followed by anything else is not a real header
+        // (e.g. an identifier that merely starts with `impl`).
+        _ => return ImplTargetDecision::Verbatim,
+    };
+    match remainder.split_once(" for ") {
+        Some((trait_seg, for_target)) => {
+            let bare_trait = strip_trait_generics(trait_seg.trim());
+            if bare_trait.is_empty() {
+                return ImplTargetDecision::NoEdge;
+            }
+            // Blanket impl: the `for` target is a bare binder type parameter.
+            if for_target_ident(for_target)
+                .is_some_and(|ident| binder_params.iter().any(|p| p == ident))
+            {
+                return ImplTargetDecision::NoEdge;
+            }
+            ImplTargetDecision::Resolve(bare_trait.to_owned())
+        }
+        None if binder_params.is_empty() => {
+            // Non-generic inherent impl: resolve the type name verbatim (no
+            // generic stripping), matching the pre-#343 path exactly.
+            ImplTargetDecision::Resolve(remainder.trim().to_owned())
+        }
+        None => ImplTargetDecision::Verbatim,
+    }
+}
+
+/// Splits a `<...>` generic binder at the front of `s` (which must start with
+/// `<`), returning its top-level type-parameter identifiers and the text after
+/// the balanced binder. An unbalanced binder yields no params and empty rest.
+fn split_generic_binder(s: &str) -> (Vec<String>, &str) {
+    let mut depth = 0usize;
+    let mut end = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end else {
+        return (Vec::new(), "");
+    };
+    (parse_binder_params(&s[1..end]), &s[end + 1..])
+}
+
+/// Parses the top-level type-parameter identifiers from a binder's inner text
+/// (`T: Into<String>, U, const N: usize, 'a` -> `[T, U, N]`). Lifetimes carry
+/// no type identifier and are skipped; `const` and bound clauses are dropped.
+fn parse_binder_params(inner: &str) -> Vec<String> {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut segments = Vec::new();
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                segments.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&inner[start..]);
+    let mut params = Vec::new();
+    for seg in segments {
+        let seg = seg.trim();
+        if seg.is_empty() || seg.starts_with('\'') {
+            continue;
+        }
+        let seg = seg.strip_prefix("const ").map_or(seg, str::trim_start);
+        let ident_end = seg
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(seg.len());
+        let ident = &seg[..ident_end];
+        if is_simple_ident(ident) {
+            params.push(ident.to_owned());
+        }
+    }
+    params
+}
+
+/// Strips generic args from an impl trait segment: `GenP<u32>` -> `GenP`,
+/// `foo::Bar<T>` -> `foo::Bar`, `Plain` -> `Plain`.
+fn strip_trait_generics(trait_seg: &str) -> &str {
+    trait_seg.split('<').next().unwrap_or(trait_seg).trim()
+}
+
+/// Returns the `for` target as a bare identifier when it is a single simple
+/// identifier (after dropping a trailing where clause), else `None`. Used to
+/// detect a blanket impl's bare-type-parameter target (`... for T`); anything
+/// carrying generics, a path, a reference, or whitespace is not a bare param.
+fn for_target_ident(for_target: &str) -> Option<&str> {
+    let target = for_target
+        .split_once(" where ")
+        .map_or(for_target, |(lhs, _)| lhs)
+        .trim();
+    is_simple_ident(target).then_some(target)
 }
 
 fn impl_display(text: &str) -> String {
@@ -2457,6 +2604,84 @@ pub fn normalize_file_code(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolve_target(display: &str) -> Option<String> {
+        match impl_trait_target(display) {
+            ImplTargetDecision::Resolve(name) => Some(name),
+            ImplTargetDecision::Verbatim | ImplTargetDecision::NoEdge => None,
+        }
+    }
+
+    #[test]
+    fn impl_trait_target_resolves_generic_trait_impls() {
+        // Generic binder, non-parameter RHS: resolve the bare trait name.
+        assert_eq!(
+            resolve_target("impl<T> GenT for Wrapper<T>"),
+            Some("GenT".to_owned())
+        );
+        // Trait-segment generic args are stripped.
+        assert_eq!(
+            resolve_target("impl GenP<u32> for Plain"),
+            Some("GenP".to_owned())
+        );
+        // Qualified generic trait path keeps the qualifier, drops the args.
+        assert_eq!(
+            resolve_target("impl<T> foo::Bar<T> for Wrapper<T>"),
+            Some("foo::Bar".to_owned())
+        );
+        // Non-generic trait impls are unchanged.
+        assert_eq!(
+            resolve_target("impl MyTrait for MyStruct<i32>"),
+            Some("MyTrait".to_owned())
+        );
+        // `unsafe` keyword prefix is transparent.
+        assert_eq!(
+            resolve_target("unsafe impl<T> GenT for Wrapper<T>"),
+            Some("GenT".to_owned())
+        );
+        // Multi-bound binder: still resolves the trait, params parsed past
+        // the bounds.
+        assert_eq!(
+            resolve_target("impl<T: Into<String>> GenT for Wrapper<T>"),
+            Some("GenT".to_owned())
+        );
+    }
+
+    #[test]
+    fn impl_trait_target_bounds_out_blanket_impls() {
+        // `for` target is a bare binder parameter: no edge.
+        assert!(matches!(
+            impl_trait_target("impl<T> Blanket for T"),
+            ImplTargetDecision::NoEdge
+        ));
+        assert!(matches!(
+            impl_trait_target("impl<'a, T> Blanket for T"),
+            ImplTargetDecision::NoEdge
+        ));
+        // A bounded binder param used bare is still blanket.
+        assert!(matches!(
+            impl_trait_target("impl<T: Clone> Blanket for T"),
+            ImplTargetDecision::NoEdge
+        ));
+        // A concrete type sharing the param's spelling but carrying generics
+        // is NOT a bare param -> still resolves.
+        assert_eq!(
+            resolve_target("impl<T> Blanket for Wrapper<T>"),
+            Some("Blanket".to_owned())
+        );
+    }
+
+    #[test]
+    fn impl_trait_target_preserves_inherent_impls() {
+        // Generic inherent impl (no `for`): verbatim self edge preserved.
+        assert!(matches!(
+            impl_trait_target("impl<T> MyStruct<T>"),
+            ImplTargetDecision::Verbatim
+        ));
+        // Non-generic inherent impl: resolve the type name verbatim, exactly
+        // as the pre-#343 path did.
+        assert_eq!(resolve_target("impl Plain"), Some("Plain".to_owned()));
+    }
 
     #[test]
     fn test_doc_attribute_text_extracts_string_forms() {

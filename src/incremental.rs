@@ -52,10 +52,16 @@ use crate::{
 /// their `DEFINES` edges and `DefinitionFact`s; older caches rebuild so reused
 /// per-file records are never missing the new symbols.
 ///
+/// v11 deepens `IMPLEMENTS` extraction (issues #343, #344): same-file generic
+/// trait impl headers now trait-edge-back (`impl<T> Trait for Type<T>` and
+/// `impl GenP<u32> for Plain`), blanket impls (`impl<T> Trait for T`) are
+/// bounded out, and inherent generic impls keep their self edge; older caches
+/// rebuild so reused per-file records carry the new edges.
+///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 10;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 11;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

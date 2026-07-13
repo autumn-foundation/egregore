@@ -949,20 +949,22 @@ fn real_scan_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
-// Generic impl headers through the real scanner (PR #296 review): issue #133
-// scopes resolving generic/blanket impls out of this slice ("extraction-
-// deepening, a separate issue; this slice exposes and honestly bounds the
-// edges that already exist"). Lock the shipped bound end-to-end over a real
-// `eg scan`: the extractor does not trait-edge-back `impl<T> Trait for
-// Type<T>` or a generic-trait instantiation `impl Trait<Args> for Type`, so
-// those impls never surface as implementor rows — and the query answers with
-// the documented `local_traits_only` honesty contract (explicit
-// machine-readable zero signal, never a fabricated row, never a silent
-// empty presented as authoritative).
+// Generic impl headers through the real scanner (issue #343): the extractor
+// now trait-edge-backs same-file generic trait impl headers. `impl<T> Trait
+// for Type<T>` (generic binder) and `impl Trait<Args> for Type` (a generic
+// trait instantiation whose trait segment carries generic args) both resolve
+// to the local trait and surface as edge-backed implementor rows. Two forms
+// stay deliberately bounded out: an inherent generic impl (`impl<T> Type<T>`,
+// no `for` clause) keeps its self-referential record edge and never surfaces
+// as a trait implementor, and a blanket impl (`impl<T> Trait for T`, whose
+// `for` target is a bare binder type parameter) mints no edge at all. The
+// query still reports the `local_traits_only` completeness bound because
+// cross-file trait resolution (issue #344) remains out of this slice.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn real_scan_generic_impls_stay_outside_edge_backed_surface() {
+#[allow(clippy::too_many_lines)]
+fn real_scan_generic_trait_impls_are_edge_backed() {
     let temp = tempfile::tempdir().expect("temp dir");
     let src = temp.path().join("src");
     fs::create_dir_all(&src).expect("mkdir src");
@@ -975,18 +977,37 @@ fn real_scan_generic_impls_stay_outside_edge_backed_surface() {
             "pub trait GenP<T> {\n",
             "    fn put(&self, value: T);\n",
             "}\n\n",
+            "pub trait Blanket {\n",
+            "    fn any(&self);\n",
+            "}\n\n",
             "pub struct Wrapper<T> {\n",
             "    inner: T,\n",
             "}\n\n",
             "pub struct Plain;\n\n",
+            // Generic binder, trait segment `GenT`, non-parameter RHS:
+            // newly edge-backed to `GenT` (implementing type `Wrapper`).
             "impl<T> GenT for Wrapper<T> {\n",
             "    fn go(&self) {}\n",
             "}\n\n",
+            // Non-generic trait impl (already edge-backed).
             "impl GenT for Plain {\n",
             "    fn go(&self) {}\n",
             "}\n\n",
+            // Generic-trait instantiation: trait segment `GenP<u32>` strips to
+            // `GenP` and newly edge-backs (implementing type `Plain`).
             "impl GenP<u32> for Plain {\n",
             "    fn put(&self, _value: u32) {}\n",
+            "}\n\n",
+            // Blanket impl: RHS `for T` is a bare binder parameter -> no edge.
+            "impl<T> Blanket for T {\n",
+            "    fn any(&self) {}\n",
+            "}\n\n",
+            // Inherent generic impl: no `for` clause -> keeps its self edge,
+            // never a trait implementor.
+            "impl<T> Wrapper<T> {\n",
+            "    fn inner_ref(&self) -> &T {\n",
+            "        &self.inner\n",
+            "    }\n",
             "}\n",
         ),
     )
@@ -1001,9 +1022,8 @@ fn real_scan_generic_impls_stay_outside_edge_backed_surface() {
         .assert()
         .success();
 
-    // GenT: only the non-generic impl is edge-backed. The generic
-    // `impl<T> GenT for Wrapper<T>` is not resolved in this slice and must
-    // never surface as an implementor row.
+    // GenT: both the non-generic impl (`Plain`) and the generic binder impl
+    // (`Wrapper`) are now edge-backed.
     let stdout = egregore()
         .args(["query", "implementors", "GenT", "--graph"])
         .arg(&graph_path)
@@ -1019,22 +1039,47 @@ fn real_scan_generic_impls_stay_outside_edge_backed_surface() {
         .collect();
     assert_eq!(
         rows.len(),
+        2,
+        "both the non-generic and generic trait impls are edge-backed: {rows:?}"
+    );
+    let types: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r["implementing_type"].as_str())
+        .collect();
+    assert!(types.contains(&"Plain"), "got: {types:?}");
+    assert!(types.contains(&"Wrapper"), "got: {types:?}");
+    for row in &rows {
+        assert_eq!(row["completeness"], "local_traits_only");
+    }
+
+    // GenP (generic trait): its instantiation `impl GenP<u32> for Plain` now
+    // strips the trait-segment generics and edge-backs to `GenP`.
+    let stdout = egregore()
+        .args(["query", "implementors", "GenP", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert_eq!(
+        rows.len(),
         1,
-        "only the non-generic impl is edge-backed: {rows:?}"
+        "the generic-trait instantiation is edge-backed: {rows:?}"
     );
     assert_eq!(rows[0]["implementing_type"], "Plain");
     assert_eq!(rows[0]["completeness"], "local_traits_only");
-    assert!(
-        !out.contains("Wrapper"),
-        "generic impl must not surface as an implementor row: {out}"
-    );
 
-    // GenP (generic trait; its only impl is the instantiation
-    // `impl GenP<u32> for Plain`, which is not trait-edge-backed): the trait
-    // resolves, and the answer is the explicit zero signal carrying the
-    // completeness bound — never a fabricated row, never a bare empty.
+    // Blanket (`impl<T> Blanket for T`): the RHS is a bare binder parameter,
+    // so no IMPLEMENTS edge is minted and the trait answers the explicit zero
+    // signal — never a fabricated blanket implementor row.
     let stdout = egregore()
-        .args(["query", "implementors", "GenP", "--graph"])
+        .args(["query", "implementors", "Blanket", "--graph"])
         .arg(&graph_path)
         .assert()
         .success()
@@ -1049,7 +1094,7 @@ fn real_scan_generic_impls_stay_outside_edge_backed_surface() {
     assert_eq!(rows.len(), 1, "one zero-signal envelope: {rows:?}");
     assert_eq!(rows[0]["ok"], true);
     assert_eq!(rows[0]["code"], "zero_implementors_recorded");
-    assert_eq!(rows[0]["trait_name"], "GenP");
+    assert_eq!(rows[0]["trait_name"], "Blanket");
     assert_eq!(rows[0]["implementors_recorded"], 0);
     assert_eq!(rows[0]["completeness"], "local_traits_only");
     assert!(
@@ -1059,12 +1104,11 @@ fn real_scan_generic_impls_stay_outside_edge_backed_surface() {
 }
 
 // ---------------------------------------------------------------------------
-// `unsafe impl` of a plain local trait for a plain local type is edge-backed
-// (PR #296 review): the header is an ordinary non-generic impl behind a
-// keyword prefix — not the generic/blanket extraction-deepening issue #133
-// scopes out — so the extractor must record the IMPLEMENTS edge to the
-// trait and the query must resolve the implementing type. A generic
-// `unsafe impl<T>` stays under the generic bound and never surfaces.
+// `unsafe impl` of a local trait is edge-backed: `unsafe ` is a transparent
+// keyword prefix on the header, so both the non-generic
+// `unsafe impl Zeroable for Foo` and — as of issue #343 — the same-file
+// generic `unsafe impl<T> Zeroable for Bar<T>` record their IMPLEMENTS edges
+// to the trait, and the query resolves each implementing type.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1118,19 +1162,30 @@ fn real_scan_unsafe_impl_is_edge_backed() {
         .lines()
         .map(|l| serde_json::from_str(l).expect("valid JSON"))
         .collect();
+    // Both the non-generic `unsafe impl Zeroable for Foo` and the generic
+    // `unsafe impl<T> Zeroable for Bar<T>` are edge-backed: `unsafe ` is
+    // transparent to header normalization, and same-file generic trait impls
+    // now trait-edge-back (issue #343).
     assert_eq!(
         rows.len(),
-        1,
-        "the non-generic unsafe impl is edge-backed: {rows:?}"
+        2,
+        "both the non-generic and generic unsafe impls are edge-backed: {rows:?}"
     );
-    assert_eq!(rows[0]["name"], "unsafe impl Zeroable for Foo");
-    assert_eq!(rows[0]["implementing_type"], "Foo");
-    assert_eq!(rows[0]["implementing_type_resolution"], "resolved");
-    assert_eq!(rows[0]["completeness"], "local_traits_only");
-    assert!(
-        !out.contains("Bar"),
-        "the generic unsafe impl stays under the generic bound: {out}"
-    );
+    let types: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r["implementing_type"].as_str())
+        .collect();
+    assert!(types.contains(&"Foo"), "got: {types:?}");
+    assert!(types.contains(&"Bar"), "got: {types:?}");
+    let foo_row = rows
+        .iter()
+        .find(|r| r["implementing_type"] == "Foo")
+        .expect("Foo row");
+    assert_eq!(foo_row["name"], "unsafe impl Zeroable for Foo");
+    assert_eq!(foo_row["implementing_type_resolution"], "resolved");
+    for row in &rows {
+        assert_eq!(row["completeness"], "local_traits_only");
+    }
 }
 
 // ---------------------------------------------------------------------------

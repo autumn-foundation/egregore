@@ -1161,11 +1161,17 @@ for Foo` (an external/std trait) produces **no** edge in this slice, and
 neither does an impl whose trait lives in another file of the same repo
 (the out-of-line module layout: `lib.rs` defines the trait, `m.rs` holds
 `impl crate::T for Foo`) — cross-file trait resolution needs a repo-wide
-type-symbol index, which is extraction-deepening reserved for a follow-up. The same bound covers generic impl headers: a generic impl
-(`impl<T> Trait for Type<T>`) and a generic-trait instantiation
-(`impl Trait<Args> for Type`) are not trait-edge-backed by the current
-extractor and never appear as implementor rows — resolving them is
-extraction-deepening, explicitly out of scope for this slice per issue #133.
+type-symbol index, which is extraction-deepening reserved for issue #344.
+Generic trait impl headers **are** trait-edge-backed as of issue #343 when the
+trait is same-file: a generic-binder impl (`impl<T> Trait for Type<T>`) and a
+generic-trait instantiation whose trait segment carries generic args
+(`impl Trait<Args> for Type`) both resolve to the local trait and appear as
+edge-backed implementor rows. Two forms stay deliberately bounded out: an
+**inherent** generic impl (`impl<T> Type<T>`, no `for` clause) keeps its
+self-referential record edge and is never a trait implementor, and a **blanket**
+impl (`impl<T> Trait for T`, whose `for` target is a bare binder type parameter)
+mints no edge at all — it covers every type and has no single implementing-type
+record. Cross-file generic trait impls remain bounded out until issue #344.
 The query surfaces this bound instead of hiding it:
 
 - Every implementor row and every zero-implementors signal carries
@@ -1300,5 +1306,6 @@ eg query implementors Renderable --graph g.jsonl
 the text format is not stable and must not be parsed.
 
 Out of scope for this verb: emitting edges for external/std traits, resolving
-generic/blanket impls (`impl<T> Trait for T`), method-level breakage analysis,
-and the outbound direction ("what does this type implement").
+cross-file trait impls (issue #344) and blanket impls (`impl<T> Trait for T`),
+method-level breakage analysis, and the outbound direction ("what does this
+type implement"). Same-file generic trait impls are in scope as of issue #343.
