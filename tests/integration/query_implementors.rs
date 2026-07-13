@@ -1106,6 +1106,140 @@ fn real_scan_generic_trait_impls_are_edge_backed() {
 }
 
 // ---------------------------------------------------------------------------
+// Turbofish trait syntax (`impl GenP::<u32> for Plain`, valid Rust in type
+// position) leaves a trailing `::` separator once the trait-segment generic
+// args are stripped. Before the fix the trait normalized to `GenP::`, which
+// the local (#343) resolver treated as a qualified path that could not match
+// the bare `GenP` trait, so no IMPLEMENTS edge was minted. The trailing
+// turbofish `::` is now dropped, so the same-file `impl GenP::<u32> for Plain`
+// edge-backs to `GenP`, exactly like the non-turbofish `impl GenP<u32>` form.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_turbofish_trait_impl_is_edge_backed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait GenP<T> {\n",
+            "    fn put(&self, value: T);\n",
+            "}\n\n",
+            "pub struct Plain;\n\n",
+            // Turbofish trait instantiation: trait segment `GenP::<u32>`
+            // normalizes to `GenP` and edge-backs (implementing type `Plain`).
+            "impl GenP::<u32> for Plain {\n",
+            "    fn put(&self, _value: u32) {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write lib.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let stdout = egregore()
+        .args(["query", "implementors", "GenP", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the turbofish trait instantiation is edge-backed: {rows:?}"
+    );
+    assert_eq!(rows[0]["implementing_type"], "Plain");
+    assert_eq!(rows[0]["trait_name"], "GenP");
+    assert_eq!(rows[0]["completeness"], "local_traits_only");
+}
+
+// ---------------------------------------------------------------------------
+// Cross-file turbofish (#344): the trait is defined in the crate root and the
+// impl in a separate `mod m;` file names it through a qualified turbofish path
+// `crate::GenP::<u32>`. The trailing turbofish `::` is dropped while the
+// internal `crate::` path separators are preserved (`crate::GenP`), so the
+// repo-wide `cross_file_implements_records` pass resolves the root trait and
+// edge-backs the implementor.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_cross_file_turbofish_trait_is_edge_backed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait GenP<T> {\n",
+            "    fn put(&self, value: T);\n",
+            "}\n\n",
+            "pub mod m;\n",
+        ),
+    )
+    .expect("write lib.rs");
+    fs::write(
+        src.join("m.rs"),
+        concat!(
+            "pub struct Foo;\n\n",
+            "impl crate::GenP::<u32> for Foo {\n",
+            "    fn put(&self, _value: u32) {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write m.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let stdout = egregore()
+        .args(["query", "implementors", "GenP", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one cross-file turbofish implementor row (Foo -> GenP): {rows:?}"
+    );
+    assert_eq!(
+        rows[0]["implementing_type"], "m::Foo",
+        "the out-of-line `impl crate::GenP::<u32> for Foo` edge-backs (trailing \
+         turbofish `::` dropped, internal path preserved): {rows:?}"
+    );
+    assert_eq!(rows[0]["trait_name"], "GenP");
+    assert_eq!(rows[0]["completeness"], "local_traits_only");
+}
+
+// ---------------------------------------------------------------------------
 // `unsafe impl` of a local trait is edge-backed: `unsafe ` is a transparent
 // keyword prefix on the header, so both the non-generic
 // `unsafe impl Zeroable for Foo` and — as of issue #343 — the same-file

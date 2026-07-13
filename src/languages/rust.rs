@@ -1790,8 +1790,16 @@ fn parse_binder_params(inner: &str) -> Vec<String> {
 
 /// Strips generic args from an impl trait segment: `GenP<u32>` -> `GenP`,
 /// `foo::Bar<T>` -> `foo::Bar`, `Plain` -> `Plain`.
+///
+/// Turbofish trait syntax (`GenP::<u32>`, valid Rust in type position) leaves a
+/// trailing `::` separator once the `<...>` args are removed; that trailing
+/// separator is stripped too so the bare name matches the trait symbol
+/// (`GenP::<u32>` -> `GenP`, `some::path::GenP::<u32>` -> `some::path::GenP`).
+/// Only a TRAILING `::` is removed — internal path separators are preserved, so
+/// a non-turbofish qualified path (`crate::T`) is unchanged.
 fn strip_trait_generics(trait_seg: &str) -> &str {
-    trait_seg.split('<').next().unwrap_or(trait_seg).trim()
+    let base = trait_seg.split('<').next().unwrap_or(trait_seg).trim();
+    base.strip_suffix("::").map_or(base, str::trim_end)
 }
 
 /// Returns the `for` target as a bare identifier when it is a single simple
@@ -2718,6 +2726,44 @@ mod tests {
         // the bounds.
         assert_eq!(
             resolve_target("impl<T: Into<String>> GenT for Wrapper<T>"),
+            Some("GenT".to_owned())
+        );
+    }
+
+    #[test]
+    fn impl_trait_target_resolves_turbofish_trait_impls() {
+        // Turbofish trait syntax `GenP::<u32>` is valid Rust in type position.
+        // After stripping the generic args, the trailing `::` separator must
+        // also be dropped so the bare trait name matches the `GenP` symbol.
+        assert_eq!(
+            resolve_target("impl GenP::<u32> for Plain"),
+            Some("GenP".to_owned())
+        );
+        // Turbofish on a qualified path strips the args and the trailing `::`
+        // while preserving the internal path separators.
+        assert_eq!(
+            resolve_target("impl some::path::GenP::<u32> for Plain"),
+            Some("some::path::GenP".to_owned())
+        );
+        // A qualified path WITHOUT turbofish keeps every `::` — only a
+        // trailing separator left by turbofish stripping is removed.
+        assert_eq!(
+            resolve_target("impl crate::T::<u32> for Foo"),
+            Some("crate::T".to_owned())
+        );
+        assert_eq!(
+            resolve_target("impl crate::T for Foo"),
+            Some("crate::T".to_owned())
+        );
+        // Spaced turbofish (valid Rust, survives `impl_display` as `GenP ::
+        // <u32>`) normalizes the same way.
+        assert_eq!(
+            resolve_target("impl GenP :: <u32> for Plain"),
+            Some("GenP".to_owned())
+        );
+        // Generic binder with a turbofish trait: bare trait still resolves.
+        assert_eq!(
+            resolve_target("impl<T> GenT::<T> for Wrapper<T>"),
             Some("GenT".to_owned())
         );
     }
