@@ -543,7 +543,9 @@ pub fn cross_file_call_records(
 /// external by construction, matching the `implementors` completeness contract
 /// (`local_traits_only`). The documented residual bound: cross-CRATE traits,
 /// non-Rust languages, blanket impls, and use-aliases of non-root modules stay
-/// out.
+/// out. A bare (unqualified) trait name whose simple name is ambiguous across
+/// the repo trait index is one such use-alias case: it is left unresolved
+/// rather than mis-bound to a root same-named trait (a wrong-target edge).
 ///
 /// Output is deterministic: edges are keyed and emitted in sorted
 /// `(source, target)` order, byte-identical across runs.
@@ -627,12 +629,42 @@ impl<'facts> ImplTargetIndex<'facts> {
     /// other path (relative-qualified or unqualified) walks the impl's module
     /// scope outward to the crate root.
     fn candidates(&self, trait_path: &str, module_names: &[String]) -> Vec<&'facts ImplTargetFact> {
-        if trait_path.contains("::")
-            && let Some(normalized) = normalize_absolute_trait_path(trait_path, module_names)
-        {
-            return self.lookup(&normalized);
+        if trait_path.contains("::") {
+            if let Some(normalized) = normalize_absolute_trait_path(trait_path, module_names) {
+                return self.lookup(&normalized);
+            }
+            // A relative-qualified path (`sibling::T`): scope-walk as before.
+            return self.scope_walk(trait_path, module_names);
+        }
+        // A BARE (unqualified) trait name whose simple name is ambiguous across
+        // the whole repo trait index (e.g. root `T` and `a::T`) may be a
+        // `use`-alias of a NON-root trait the scope walk cannot see. Rather than
+        // let the outward walk mis-bind it to a root same-named trait (a
+        // WRONG-target edge, worse than a missing one), leave it unresolved —
+        // matching the documented `local_traits_only` use-alias bound. Only an
+        // unambiguous single same-simple-name trait resolves outward.
+        if self.bare_simple_name_is_ambiguous(trait_path) {
+            return Vec::new();
         }
         self.scope_walk(trait_path, module_names)
+    }
+
+    /// Reports whether more than one distinct `trait` definition in the repo
+    /// index shares the given bare simple name. Such a bare reference cannot be
+    /// disambiguated without import-aware (`use`-decl) resolution, which is
+    /// outside this pass's documented bound, so it is left unresolved.
+    fn bare_simple_name_is_ambiguous(&self, simple: &str) -> bool {
+        let mut matches = 0usize;
+        for (qualified, facts) in &self.by_qualified {
+            let last = qualified.rsplit("::").next().unwrap_or(qualified);
+            if last == simple && facts.iter().any(|fact| fact.symbol_kind == "trait") {
+                matches += 1;
+                if matches > 1 {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Walks the module scope from the impl's own module outward to the crate
@@ -1409,6 +1441,39 @@ mod tests {
         assert!(
             implements_pairs(&records).is_empty(),
             "an ambiguous trait path mints no edge: {records:?}"
+        );
+    }
+
+    #[test]
+    fn cross_file_bare_trait_with_ambiguous_simple_name_is_unresolved() {
+        // `impl T for Foo` in src/m.rs is a bare (unqualified) trait name that,
+        // via `use crate::a::T`, means `a::T` — but the module-scope outward
+        // walk cannot see the import and would reach the root `T` at depth 0.
+        // Because the simple name `T` is ambiguous across the repo trait index
+        // (root `T` and `a::T`), the reference is left UNRESOLVED rather than
+        // mis-bound to the root trait (a wrong-target edge). Matches the
+        // documented `local_traits_only` use-alias bound.
+        let facts = impl_facts(&[
+            (
+                "src/lib.rs",
+                vec![impl_target("trait-T-root", "T", &[], "trait")],
+                vec![],
+            ),
+            (
+                "src/a.rs",
+                vec![impl_target("trait-T-a", "a::T", &["a"], "trait")],
+                vec![],
+            ),
+            (
+                "src/m.rs",
+                vec![impl_target("struct-Foo", "m::Foo", &["m"], "struct")],
+                vec![pending_impl("impl-Foo", "T", &["m"])],
+            ),
+        ]);
+        let records = cross_file_implements_records("repo", &facts);
+        assert!(
+            implements_pairs(&records).is_empty(),
+            "an ambiguous bare trait name mints no edge: {records:?}"
         );
     }
 

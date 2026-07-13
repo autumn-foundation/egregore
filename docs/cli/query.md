@@ -1182,7 +1182,12 @@ type parameter) mints no edge at all — it covers every type and has no single
 implementing-type record. The remaining honest bounds: **cross-crate** traits
 (std/deps), **non-Rust** languages, blanket impls, and a `use`-alias of a
 trait in a **non-root** module that the scope walk cannot see stay
-unresolved. The query surfaces these bounds instead of hiding them:
+unresolved. A bare (unqualified) trait name whose **simple name is ambiguous**
+across the repo trait index (e.g. a root `T` and a non-root `a::T`) is left
+unresolved too: it may be a `use`-alias of the non-root trait, and this pass
+does not read `use` declarations, so it never guesses a root binding — a
+missing edge is preferred over a wrong-target one. The query surfaces these
+bounds instead of hiding them:
 
 - Every implementor row and every zero-implementors signal carries
   `completeness: "local_traits_only"`.

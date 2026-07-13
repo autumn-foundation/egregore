@@ -2178,6 +2178,84 @@ fn real_scan_cross_file_unqualified_trait_resolves_outward() {
 }
 
 // ---------------------------------------------------------------------------
+// Ambiguous bare (unqualified) trait names are left UNRESOLVED, never
+// mis-bound to a root same-named trait (Codex review finding on #344). When an
+// out-of-line module imports a NON-ROOT trait and implements it by bare name
+// (`use crate::a::T; impl T for Foo`) while the crate root ALSO defines a
+// same-named trait, the module-scope outward walk reaches the root `T` at
+// depth 0 and would emit a WRONG IMPLEMENTS edge (root `T` gaining `Foo`, and
+// `a::T` losing its implementor). The documented `local_traits_only` bound says
+// use-alias / non-root bare trait paths stay unresolved, and a wrong-target
+// edge is worse than a missing one, so this bare-name reference — ambiguous by
+// simple name across the repo trait index — mints NO edge to the root `T`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_cross_file_bare_imported_trait_is_not_misresolved() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait T {\n",
+            "    fn go(&self);\n",
+            "}\n\n",
+            "pub mod a;\n",
+            "pub mod m;\n",
+        ),
+    )
+    .expect("write lib.rs");
+    fs::write(
+        src.join("a.rs"),
+        concat!("pub trait T {\n", "    fn go(&self);\n", "}\n"),
+    )
+    .expect("write a.rs");
+    fs::write(
+        src.join("m.rs"),
+        concat!(
+            "use crate::a::T;\n\n",
+            "pub struct Foo;\n\n",
+            "impl T for Foo {\n",
+            "    fn go(&self) {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write m.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let stdout = egregore()
+        .args(["query", "implementors", "T", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    // The bare `T` in m.rs is a `use crate::a::T` alias whose simple name is
+    // ambiguous across the repo (root `T` and `a::T`), so it stays unresolved:
+    // `Foo` must NOT appear as an implementor of any `T`.
+    assert!(
+        rows.iter()
+            .all(|r| r["implementing_type"] != "m::Foo" && r["implementing_type"] != "Foo"),
+        "bare imported trait must not mis-bind `Foo` to a same-named trait: {rows:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Record-ID handles must stay valid under temporal selectors (PR #296 review):
 // `--at` / `--as-of` resolution must accept the trait's canonical record ID,
 // not only its name.
