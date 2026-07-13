@@ -415,13 +415,18 @@ impl ValidationReport {
 struct GraphIndex<'a> {
     /// Every kind observed per node ID.
     node_kinds: BTreeMap<&'a str, BTreeSet<NodeKind>>,
-    /// The resolved importer `source_kind` per node ID (issue #369), by
+    /// The resolved importer `source_kind` per record ID (issue #369), by
     /// last-write-wins to match the daemon's `lookup_node_source_kind` (which
-    /// reverse-scans the batch, so the last record for an ID over the same
-    /// forward record sequence shadows the earlier ones). A node ID recurring
-    /// across history commits with the SAME `source_kind` still resolves to that
-    /// value; only the adversarial conflicting-value case differs from a set.
-    node_source_kinds: BTreeMap<&'a str, &'a str>,
+    /// reverse-scans the batch, so the LAST record for an ID over the same
+    /// forward record sequence shadows the earlier ones). Every record — of any
+    /// variant — overwrites via [`GraphRecord::source_kind_ref`], so the stored
+    /// value is an `Option`: a trailing record whose attribution is absent (a
+    /// node with no `source_kind`, or a non-node record sharing the ID) resolves
+    /// to `None` and thus SHADOWS an earlier attribution, exactly as the daemon
+    /// does. A node ID recurring across history commits with the SAME
+    /// `source_kind` still resolves to that value; only the adversarial
+    /// conflicting-or-cleared case differs from a set.
+    node_source_kinds: BTreeMap<&'a str, Option<&'a str>>,
     /// First node record per ID, for path/span citations.
     node_first: BTreeMap<&'a str, &'a GraphRecord>,
     /// Tombstone record IDs per deleted ID.
@@ -438,20 +443,18 @@ impl<'a> GraphIndex<'a> {
     fn build(records: &'a [GraphRecord]) -> Self {
         let mut index = Self::default();
         for record in records {
+            // Last-write-wins over forward order == first-match in reverse
+            // order, the daemon's in-batch `lookup_node_source_kind` scan. Every
+            // record (any variant) overwrites through the shared classifier, so a
+            // trailing record with no attribution shadows an earlier one exactly
+            // as the daemon resolves it (issue #369).
+            index
+                .node_source_kinds
+                .insert(record.id(), record.source_kind_ref());
             match record {
-                GraphRecord::Node {
-                    id,
-                    kind,
-                    source_kind,
-                    ..
-                } => {
+                GraphRecord::Node { id, kind, .. } => {
                     index.nodes += 1;
                     index.node_kinds.entry(id).or_default().insert(*kind);
-                    if let Some(source_kind) = source_kind {
-                        // Plain overwrite: the last record for an ID wins,
-                        // matching the daemon's reverse-scan-of-batch.
-                        index.node_source_kinds.insert(id, source_kind.as_str());
-                    }
                     index.node_first.entry(id).or_insert(record);
                 }
                 GraphRecord::Edge { .. } => index.edges += 1,
@@ -590,7 +593,11 @@ fn check_edges<'a>(
         ) && allowed_source_kinds(*label)
             .is_some_and(|allowed| kinds.iter().any(|kind| allowed.contains(kind)))
         {
-            let observed = index.node_source_kinds.get(source.as_str()).copied();
+            let observed = index
+                .node_source_kinds
+                .get(source.as_str())
+                .copied()
+                .flatten();
             let satisfied = observed == Some(required);
             if !satisfied {
                 let mut diagnostic =
@@ -2117,6 +2124,163 @@ mod tests {
             !codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
             "a Task recurring with the same github_pr source_kind must stay clean, got {codes:?}"
         );
+    }
+
+    #[test]
+    fn requested_review_from_cleared_by_later_absent_source_kind_is_rejected() {
+        // Issue #369 headline parity case: two Task records share one id — first
+        // `github_pr`, then a same-id Task carrying NO importer source_kind. The
+        // daemon's `lookup_node_source_kind` reverse-scans the batch and returns
+        // the LAST record's `source_kind` verbatim — here `None` — so
+        // `require_project_edge_source_kind` REJECTS the REQUESTED_REVIEW_FROM.
+        // The offline validator previously kept the earlier `github_pr` (a
+        // later absent value did not shadow) and PASSED, diverging from the
+        // daemon. It must now resolve the same `None` and reject.
+        let records = vec![
+            node_with_source_kind("n:task", NodeKind::Task, "github_pr"),
+            node("n:task", NodeKind::Task),
+            node("n:id", NodeKind::ExternalIdentity),
+            edge("e:rrf", EdgeLabel::RequestedReviewFrom, "n:task", "n:id"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
+            "REQUESTED_REVIEW_FROM off a Task whose github_pr attribution was \
+             cleared by a later same-id record must be rejected, got {codes:?}"
+        );
+        assert!(
+            !codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "a node-kind-correct Task source must not also trip the node-kind check, got {codes:?}"
+        );
+        let defect = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION)
+            .expect("attribution defect present");
+        assert_eq!(defect.edge_id.as_deref(), Some("e:rrf"));
+        assert_eq!(defect.record_id.as_deref(), Some("n:task"));
+        assert_eq!(defect.required_source_kind, Some("github_pr"));
+        // Resolved value is the cleared (absent) attribution, not the shadowed
+        // `github_pr` — proving None-shadowing parity with the daemon.
+        assert_eq!(defect.source_kind, None);
+    }
+
+    #[test]
+    fn reviewed_by_cleared_by_later_absent_source_kind_is_rejected() {
+        // Issue #369: the REVIEWED_BY mirror of the headline case — a
+        // `github_review` Review followed by a same-id Review with no
+        // source_kind resolves to `None` under last-write-wins and is rejected.
+        let records = vec![
+            node_with_source_kind("n:review", NodeKind::Review, "github_review"),
+            node("n:review", NodeKind::Review),
+            node("n:id", NodeKind::ExternalIdentity),
+            edge("e:rb", EdgeLabel::ReviewedBy, "n:review", "n:id"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
+            "REVIEWED_BY off a Review whose github_review attribution was cleared \
+             by a later same-id record must be rejected, got {codes:?}"
+        );
+        let defect = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION)
+            .expect("attribution defect present");
+        assert_eq!(defect.required_source_kind, Some("github_review"));
+        assert_eq!(defect.source_kind, None);
+    }
+
+    /// One same-node-ID batch shape for the `source_kind` resolution parity
+    /// tests: a name, the forward sequence of per-record importer attributions
+    /// for node ID `n:task`, and the value both the validator and the daemon
+    /// must resolve (issue #369).
+    type SourceKindPermutation = (
+        &'static str,
+        Vec<Option<&'static str>>,
+        Option<&'static str>,
+    );
+
+    /// The set of same-node-ID batch shapes exercised by the `source_kind`
+    /// resolution parity tests. `None` entries mint a same-id node with NO
+    /// importer `source_kind`; `Some` entries mint one carrying that attribution.
+    fn source_kind_resolution_permutations() -> Vec<SourceKindPermutation> {
+        vec![
+            // (name, forward sequence of per-record attributions, expected resolved value)
+            ("single_present", vec![Some("github_pr")], Some("github_pr")),
+            ("single_absent", vec![None], None),
+            ("present_then_absent", vec![Some("github_pr"), None], None),
+            (
+                "absent_then_present",
+                vec![None, Some("github_pr")],
+                Some("github_pr"),
+            ),
+            (
+                "conflicting_values",
+                vec![Some("github_pr"), Some("github_issue")],
+                Some("github_issue"),
+            ),
+            (
+                "same_value_repeats",
+                vec![Some("github_pr"), Some("github_pr")],
+                Some("github_pr"),
+            ),
+        ]
+    }
+
+    /// Builds a record batch for node ID `n:task` from a forward sequence of
+    /// per-record importer attributions (see `source_kind_resolution_permutations`).
+    fn batch_from_source_kinds(sequence: &[Option<&str>]) -> Vec<GraphRecord> {
+        sequence
+            .iter()
+            .map(|attribution| {
+                attribution.map_or_else(
+                    || node("n:task", NodeKind::Task),
+                    |kind| node_with_source_kind("n:task", NodeKind::Task, kind),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn validate_source_kind_resolution_matches_shared_batch_helper() {
+        // Issue #369 differential parity: the validator's per-ID last-write-wins
+        // index (`GraphIndex::node_source_kinds`) must resolve a node ID to the
+        // SAME value as `GraphRecord::resolve_source_kind_in_batch` — the shared
+        // helper the daemon's `lookup_node_source_kind` delegates its in-batch
+        // scan to (`src/daemon.rs`). Because the daemon delegates to that helper,
+        // matching the helper IS matching the daemon. Future drift in either
+        // resolution path becomes a test failure here, not a new bug report.
+        for (name, sequence, expected) in source_kind_resolution_permutations() {
+            let records = batch_from_source_kinds(&sequence);
+
+            // Validator resolution: its per-ID index, flattened to the resolved
+            // attribution.
+            let index = GraphIndex::build(&records);
+            let validator_resolved = index.node_source_kinds.get("n:task").copied().flatten();
+
+            // Shared helper resolution (== the daemon's in-batch scan). Outer
+            // Some proves the id is present in the batch; the inner Option is the
+            // resolved attribution.
+            let helper_outcome = GraphRecord::resolve_source_kind_in_batch("n:task", &records);
+            assert_eq!(
+                helper_outcome,
+                Some(expected),
+                "shared helper must resolve permutation `{name}` to the documented value"
+            );
+            let helper_resolved = helper_outcome.flatten();
+
+            assert_eq!(
+                validator_resolved, helper_resolved,
+                "validator and shared batch helper must resolve permutation `{name}` identically"
+            );
+            assert_eq!(
+                validator_resolved, expected,
+                "validator must resolve permutation `{name}` to the documented value"
+            );
+        }
     }
 
     #[test]
