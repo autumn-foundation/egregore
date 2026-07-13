@@ -109,11 +109,19 @@ struct ImplContext {
 /// An impl whose trait lookup is deferred until the whole file is indexed:
 /// Rust item order is insignificant, so a trait defined after its impl must
 /// edge-back all the same. Captures the module scope the impl was walked in.
+///
+/// The IMPLEMENTS-resolution `decision` is computed at walk time directly from
+/// the Tree-sitter `impl_item` node (issue #343/#344), not re-derived from the
+/// display string later: the AST fields (`trait`, `type`, `type_parameters`)
+/// bound the header structurally, so a return arrow in a binder bound
+/// (`impl<T: Fn() -> u32> Target for Wrapper<T>`), a spaced binder, or a
+/// reference/pointer blanket target can never leak across the trait/`for` split.
 #[derive(Debug, Clone)]
 struct PendingImplEdge {
     source_id: String,
     display: String,
     module_names: Vec<String>,
+    decision: ImplTargetDecision,
 }
 
 struct RustExtractor<'graph, 'source> {
@@ -612,6 +620,11 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let id = self.add_symbol(node, "impl", &qualified_name);
         self.definitions.insert(qualified_name, id.clone());
 
+        // Compute the IMPLEMENTS-resolution decision now, from the AST node,
+        // while the parse tree is in hand — never re-parsed from the display
+        // string later (issue #343/#344).
+        let decision = impl_target_decision(node, self.source, &display);
+
         // The trait lookup is deferred until the whole file is indexed
         // (`resolve_pending_impl_edges`): Rust item order is insignificant,
         // so a trait defined after this impl must edge-back all the same.
@@ -619,6 +632,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             source_id: id.clone(),
             display: display.clone(),
             module_names: self.module_names.clone(),
+            decision,
         });
 
         let previous = self.impl_context.replace(ImplContext {
@@ -1118,11 +1132,11 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     fn resolve_pending_impl_edges(&mut self) {
         let pending = std::mem::take(&mut self.pending_impl_edges);
         for entry in pending {
-            // Normalize the impl header into a resolution decision. This
-            // handles `unsafe impl ...`, non-generic headers, and generic
-            // headers (`impl<T> Trait for Type<T>`, `impl GenP<u32> for Plain`)
-            // uniformly (issue #343).
-            match impl_trait_target(&entry.display) {
+            // The resolution decision was computed at walk time from the AST
+            // node (`impl_target_decision`), covering `unsafe impl ...`,
+            // non-generic headers, and generic headers (`impl<T> Trait for
+            // Type<T>`, `impl GenP<u32> for Plain`) uniformly (issue #343).
+            match entry.decision.clone() {
                 ImplTargetDecision::Resolve(trait_name) => {
                     if let Some(target) =
                         self.resolve_impl_trait_locally(&trait_name, &entry.module_names)
@@ -1658,6 +1672,7 @@ fn is_impl_target_kind(symbol_kind: &str) -> bool {
 
 /// The IMPLEMENTS-resolution decision for one impl display header
 /// (issue #343).
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ImplTargetDecision {
     /// Resolve this bare trait/type name through the trait-scope walk. Generic
     /// binders and trait-segment generic args are already stripped.
@@ -1668,6 +1683,148 @@ enum ImplTargetDecision {
     /// Mint no edge: a blanket impl (`impl<T> Trait for T`) whose `for` target
     /// is a bare binder type parameter.
     NoEdge,
+}
+
+/// Reads a node's source text without borrowing an extractor, for the
+/// AST-driven impl-decision helpers below.
+fn node_source<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    node.utf8_text(source.as_bytes()).unwrap_or("")
+}
+
+/// Derives the IMPLEMENTS-resolution decision for an `impl_item` directly from
+/// its Tree-sitter fields (issue #343/#344), never by string-scanning the
+/// header. `impl_item` exposes three named fields: `type_parameters` (the
+/// `<...>` binder, present only on generic impls), `trait` (the implemented
+/// trait, present only on trait impls), and `type` (the implementing type).
+/// Reading them structurally means a return arrow in a binder bound
+/// (`impl<T: Fn() -> u32> Target for Wrapper<T>`), a spaced binder, or a
+/// reference/pointer blanket target can never leak across the trait/`for` split
+/// the way a character scan can.
+///
+/// - No `trait` field: an inherent impl. A generic inherent impl
+///   (`impl<T> Type<T>`) keeps its verbatim self-referential edge; a
+///   non-generic inherent impl resolves its type name verbatim (pre-#343
+///   behavior).
+/// - A `trait` field: resolve the bare trait path (generic args stripped via
+///   the AST), unless the implementing type is a blanket bare binder parameter,
+///   a reference/pointer to one, or a non-nominal type (slice, array, tuple,
+///   trait object, `impl Trait`) — those mint no edge.
+///
+/// Turbofish trait syntax (`impl GenP::<u32> for Plain`) is not valid Rust in
+/// trait position; Tree-sitter cannot represent it and emits an `ERROR` node
+/// that swallows the trait/`for` split, so there is no reliable AST to read.
+/// That single pathological-but-supported form is recovered through the
+/// header-string normalizer ([`impl_trait_target`]), keeping its output
+/// byte-identical to the pre-refactor path.
+fn impl_target_decision(node: Node<'_>, source: &str, display: &str) -> ImplTargetDecision {
+    let trait_field = node.child_by_field_name("trait");
+    let type_field = node.child_by_field_name("type");
+
+    // Turbofish `::<>` in trait position produces an `ERROR` node under the
+    // implementing-type field with no `trait` field: fall back to the
+    // header-string normalizer for that invalid-Rust-but-supported form. A
+    // `type` field that is entirely absent is likewise unreadable.
+    match type_field {
+        Some(type_node) if trait_field.is_none() && type_node.has_error() => {
+            return impl_trait_target(display);
+        }
+        None => return impl_trait_target(display),
+        _ => {}
+    }
+
+    let type_parameters = node.child_by_field_name("type_parameters");
+    let binder_params = type_parameters
+        .map(|params| binder_type_params(params, source))
+        .unwrap_or_default();
+
+    let Some(trait_node) = trait_field else {
+        // Inherent impl (no `for` clause). A generic inherent impl names no
+        // trait to reach: keep the recorded self-referential edge. A
+        // non-generic inherent impl resolves its type name verbatim.
+        return if type_parameters.is_some() {
+            ImplTargetDecision::Verbatim
+        } else {
+            type_field.map_or(ImplTargetDecision::Verbatim, |type_node| {
+                ImplTargetDecision::Resolve(node_source(type_node, source).trim().to_owned())
+            })
+        };
+    };
+
+    let bare_trait = bare_trait_path(trait_node, source);
+    if bare_trait.is_empty() {
+        return ImplTargetDecision::NoEdge;
+    }
+    // A blanket impl (`for T`, or `for &T` / `*const T` around a bare binder
+    // parameter) or a non-nominal `for` target (slice, array, tuple, trait
+    // object, `impl Trait`) has no single concrete implementing-type record:
+    // mint no edge rather than fabricate one.
+    if type_field.is_some_and(|type_node| !is_nominal_target(type_node, source, &binder_params)) {
+        return ImplTargetDecision::NoEdge;
+    }
+    ImplTargetDecision::Resolve(bare_trait)
+}
+
+/// Collects the bare type-parameter identifiers declared by a `type_parameters`
+/// binder node, reading each parameter's `name` field from the AST. Only
+/// `type_parameter` names (a `type_identifier`) are kept: lifetime parameters
+/// (`'a`) and const parameters (`const N`) carry no type identifier that could
+/// appear as a bare `for` target, so they are skipped. Bounds (`T: Fn() ->
+/// u32`) live in a sibling `bounds` field and never reach the name, so a return
+/// arrow in a bound cannot poison the set.
+fn binder_type_params(type_parameters: Node<'_>, source: &str) -> Vec<String> {
+    let mut params = Vec::new();
+    let mut cursor = type_parameters.walk();
+    for child in type_parameters.named_children(&mut cursor) {
+        if let Some(name) = child.child_by_field_name("name")
+            && name.kind() == "type_identifier"
+        {
+            params.push(node_source(name, source).to_owned());
+        }
+    }
+    params
+}
+
+/// Extracts the bare trait path from an `impl_item` `trait` field node,
+/// dropping generic arguments via the AST (never string `<>`/`::` work):
+/// `type_identifier` -> its text (`Trait`); `generic_type` -> its base `type`
+/// child recursively, so `GenP<u32>` -> `GenP` and `crate::Target<u32>` ->
+/// `crate::Target`; `scoped_type_identifier` -> its full path text (`crate::T`
+/// / `super::T` / `some::path::GenP`), preserved exactly for cross-file
+/// resolution (issue #344).
+fn bare_trait_path(trait_node: Node<'_>, source: &str) -> String {
+    if trait_node.kind() == "generic_type"
+        && let Some(base) = trait_node.child_by_field_name("type")
+    {
+        return bare_trait_path(base, source);
+    }
+    node_source(trait_node, source).trim().to_owned()
+}
+
+/// `true` when a trait impl's implementing-`type` field names a single concrete
+/// nominal type that can carry an IMPLEMENTS edge. Reference and pointer
+/// wrappers are peeled first (`&T` / `&mut T` / `&'a T` / `*const T` / `&&T` /
+/// `&[T]`), then the core is classified: a bare `type_identifier` that is one
+/// of the binder's type parameters is a blanket target (`impl<T> Trait for T`);
+/// a slice/array (`[T]` / `[T; N]`), tuple (`(T, U)`), trait object (`dyn
+/// Foo`), `impl Trait` opaque type, or unit type is non-nominal. Both cases
+/// lack a concrete implementing-type record and return `false` (mint no edge).
+/// Everything else — a concrete nominal type (`Wrapper<T>`, `crate::Thing`,
+/// `&Wrapper<T>`) — is nominal.
+fn is_nominal_target(type_node: Node<'_>, source: &str, binder_params: &[String]) -> bool {
+    let mut core = type_node;
+    while matches!(core.kind(), "reference_type" | "pointer_type") {
+        let Some(inner) = core.child_by_field_name("type") else {
+            break;
+        };
+        core = inner;
+    }
+    match core.kind() {
+        "type_identifier" => !binder_params
+            .iter()
+            .any(|param| param == node_source(core, source).trim()),
+        "array_type" | "tuple_type" | "dynamic_type" | "abstract_type" | "unit_type" => false,
+        _ => true,
+    }
 }
 
 /// Parses an impl display header (`impl ...`, `impl<T> ...`, or an
@@ -2736,6 +2893,208 @@ mod tests {
             ImplTargetDecision::Resolve(name) => Some(name),
             ImplTargetDecision::Verbatim | ImplTargetDecision::NoEdge => None,
         }
+    }
+
+    /// Locates the first `impl_item` node in a parsed tree, for the AST-based
+    /// decision tests below.
+    fn find_impl_item(node: Node<'_>) -> Option<Node<'_>> {
+        if node.kind() == "impl_item" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_impl_item(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Parses one impl header from real Rust source and returns the
+    /// AST-derived IMPLEMENTS decision, exercising `impl_target_decision`
+    /// exactly as the extractor does at walk time (never the display-string
+    /// parser, except for the turbofish recovery it internally delegates to).
+    fn ast_decision(source: &str) -> ImplTargetDecision {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load rust grammar");
+        let tree = parser.parse(source, None).expect("parse source");
+        let impl_node = find_impl_item(tree.root_node()).expect("impl_item present");
+        let display = impl_display(node_source(impl_node, source));
+        impl_target_decision(impl_node, source, &display)
+    }
+
+    /// The AST decision reduced to the resolved trait/type name, mirroring
+    /// [`resolve_target`] but driven by a real parse.
+    fn ast_resolve(source: &str) -> Option<String> {
+        match ast_decision(source) {
+            ImplTargetDecision::Resolve(name) => Some(name),
+            ImplTargetDecision::Verbatim | ImplTargetDecision::NoEdge => None,
+        }
+    }
+
+    #[test]
+    fn ast_impl_decision_resolves_generic_and_plain_trait_impls() {
+        // Generic binder, non-parameter RHS: resolve the bare trait name.
+        assert_eq!(
+            ast_resolve("impl<T> GenT for Wrapper<T> {}"),
+            Some("GenT".to_owned())
+        );
+        // Trait-segment generic args are stripped via the AST `type_arguments`.
+        assert_eq!(
+            ast_resolve("impl GenP<u32> for Plain {}"),
+            Some("GenP".to_owned())
+        );
+        // Qualified generic trait path keeps the scoped path, drops the args.
+        assert_eq!(
+            ast_resolve("impl<T> foo::Bar<T> for Wrapper<T> {}"),
+            Some("foo::Bar".to_owned())
+        );
+        assert_eq!(
+            ast_resolve("impl<T> crate::Target<u32> for Wrapper<T> {}"),
+            Some("crate::Target".to_owned())
+        );
+        // Non-generic trait impl on a concrete instantiation.
+        assert_eq!(
+            ast_resolve("impl MyTrait for MyStruct<i32> {}"),
+            Some("MyTrait".to_owned())
+        );
+        // `unsafe` keyword prefix is transparent (a child token, not a field).
+        assert_eq!(
+            ast_resolve("unsafe impl<T> GenT for Wrapper<T> {}"),
+            Some("GenT".to_owned())
+        );
+        // Multi-bound binder: the trait still resolves.
+        assert_eq!(
+            ast_resolve("impl<T: Into<String>> GenT for Wrapper<T> {}"),
+            Some("GenT".to_owned())
+        );
+        // A qualified path WITHOUT turbofish keeps every `::`.
+        assert_eq!(
+            ast_resolve("impl crate::T for Foo {}"),
+            Some("crate::T".to_owned())
+        );
+    }
+
+    #[test]
+    fn ast_impl_decision_resolves_arrow_bound_binder() {
+        // The regression case: a function-trait bound with a return arrow in
+        // the binder. The Tree-sitter `type_parameters` field bounds the binder
+        // structurally, so the `->` never leaks into the trait segment the way
+        // the pre-AST char-scan binder split did (it closed depth on the `>` of
+        // `->`, leaving `u32> Target ...`).
+        assert_eq!(
+            ast_resolve("impl<T: Fn() -> u32> Target for Wrapper<T> {}"),
+            Some("Target".to_owned())
+        );
+        assert_eq!(
+            ast_resolve("impl<T: Fn(u8) -> u32> crate::Target<u32> for Wrapper<T> {}"),
+            Some("crate::Target".to_owned())
+        );
+        // A binder param used bare with an arrow bound is still a blanket impl.
+        assert_eq!(
+            ast_decision("impl<T: Fn() -> u32> Blanket for T {}"),
+            ImplTargetDecision::NoEdge
+        );
+    }
+
+    #[test]
+    fn ast_impl_decision_resolves_turbofish_via_recovery() {
+        // Turbofish `::<>` in trait position is invalid Rust; Tree-sitter emits
+        // an ERROR node, so `impl_target_decision` recovers through the
+        // header-string normalizer and still resolves the bare trait.
+        assert_eq!(
+            ast_resolve("impl GenP::<u32> for Plain {}"),
+            Some("GenP".to_owned())
+        );
+        assert_eq!(
+            ast_resolve("impl some::path::GenP::<u32> for Plain {}"),
+            Some("some::path::GenP".to_owned())
+        );
+        assert_eq!(
+            ast_resolve("impl crate::GenP::<u32> for Foo {}"),
+            Some("crate::GenP".to_owned())
+        );
+    }
+
+    #[test]
+    fn ast_impl_decision_handles_spaced_binder() {
+        // A source-level space between `impl` and the `<T>` binder parses into
+        // the same fields, so the trait segment resolves natively.
+        assert_eq!(
+            ast_resolve("impl <T> GenT for Wrapper<T> {}"),
+            Some("GenT".to_owned())
+        );
+        assert_eq!(
+            ast_decision("impl <T> Blanket for T {}"),
+            ImplTargetDecision::NoEdge
+        );
+        assert_eq!(
+            ast_decision("impl <T> MyStruct<T> {}"),
+            ImplTargetDecision::Verbatim
+        );
+    }
+
+    #[test]
+    fn ast_impl_decision_bounds_out_blanket_and_non_nominal() {
+        // Bare binder-parameter `for` target: no edge.
+        for header in [
+            "impl<T> Blanket for T {}",
+            "impl<'a, T> Blanket for T {}",
+            "impl<T: Clone> Blanket for T {}",
+        ] {
+            assert_eq!(ast_decision(header), ImplTargetDecision::NoEdge, "{header}");
+        }
+        // Reference/pointer wrappers around a bare binder param: still blanket.
+        for header in [
+            "impl<T> Blanket for &T {}",
+            "impl<T> Blanket for &mut T {}",
+            "impl<'a, T> Blanket for &'a T {}",
+            "impl<'a, T> Blanket for &'a mut T {}",
+            "impl<T> Blanket for *const T {}",
+            "impl<T> Blanket for *mut T {}",
+            "impl<T> Blanket for &&T {}",
+            "impl<T> Blanket for &*const T {}",
+        ] {
+            assert_eq!(ast_decision(header), ImplTargetDecision::NoEdge, "{header}");
+        }
+        // Non-nominal targets (slice, array, tuple, trait object, opaque type).
+        for header in [
+            "impl<T> Blanket for [T] {}",
+            "impl<T> Blanket for [T; 4] {}",
+            "impl<T> Blanket for (T, T) {}",
+            "impl<T> Blanket for &[T] {}",
+            "impl Blanket for dyn Other {}",
+            "impl Blanket for impl Other {}",
+        ] {
+            assert_eq!(ast_decision(header), ImplTargetDecision::NoEdge, "{header}");
+        }
+        // A concrete type sharing the param spelling but carrying generics, or a
+        // reference to a concrete nominal type, still resolves.
+        assert_eq!(
+            ast_resolve("impl<T> Blanket for Wrapper<T> {}"),
+            Some("Blanket".to_owned())
+        );
+        assert_eq!(
+            ast_resolve("impl<T> Blanket for &Wrapper<T> {}"),
+            Some("Blanket".to_owned())
+        );
+    }
+
+    #[test]
+    fn ast_impl_decision_preserves_inherent_impls() {
+        // Generic inherent impl (no `for`): verbatim self edge preserved.
+        assert_eq!(
+            ast_decision("impl<T> MyStruct<T> {}"),
+            ImplTargetDecision::Verbatim
+        );
+        // Non-generic inherent impl: resolve the type name verbatim.
+        assert_eq!(ast_resolve("impl Plain {}"), Some("Plain".to_owned()));
+        assert_eq!(
+            ast_resolve("impl MyStruct<i32> {}"),
+            Some("MyStruct<i32>".to_owned())
+        );
     }
 
     #[test]

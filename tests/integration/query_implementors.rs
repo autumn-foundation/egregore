@@ -1106,6 +1106,71 @@ fn real_scan_generic_trait_impls_are_edge_backed() {
 }
 
 // ---------------------------------------------------------------------------
+// A generic trait impl whose binder carries a function-trait bound with a
+// return arrow -- `impl<T: Fn() -> u32> Target for Wrapper<T>` -- must still
+// edge-back to `Target`. The `->` in the bound is the regression trigger for
+// the pre-AST char-scan binder split: `split_generic_binder` closed depth on
+// the `>` of `->`, so the header remainder became `u32> Target for Wrapper<T>`
+// and the trait segment resolved to garbage, minting no IMPLEMENTS edge. The
+// Tree-sitter `type_parameters` field bounds the binder structurally, so the
+// return arrow can never leak into the trait segment.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_generic_impl_with_arrow_bound_is_edge_backed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait Target {\n",
+            "    fn go(&self);\n",
+            "}\n\n",
+            "pub struct Wrapper<T>(T);\n\n",
+            // Generic binder with a function-trait bound whose signature has a
+            // return arrow. The `->` must not break the binder/trait split;
+            // the trait segment is `Target` and the impl edge-backs.
+            "impl<T: Fn() -> u32> Target for Wrapper<T> {\n",
+            "    fn go(&self) {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write lib.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let stdout = egregore()
+        .args(["query", "implementors", "Target", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the arrow-bound generic trait impl is edge-backed: {rows:?}"
+    );
+    assert_eq!(rows[0]["implementing_type"], "Wrapper");
+    assert_eq!(rows[0]["trait_name"], "Target");
+    assert_eq!(rows[0]["completeness"], "local_traits_only");
+}
+
+// ---------------------------------------------------------------------------
 // A blanket impl whose `for` target is a REFERENCE (or pointer) to a bare
 // binder type parameter -- `impl<T> RefTrait for &T` (also `&mut T`, `&'a T`)
 // -- is still a blanket impl: it covers every type, has no single concrete
