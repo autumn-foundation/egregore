@@ -2180,6 +2180,16 @@ fn node_log_payload(record: &GraphRecord) -> Option<&crate::ir::LogPayload> {
     }
 }
 
+/// The parsed hour-start of an occurrence bucket, read from its payload
+/// `bucket_start` (issue #375: the window decision keys on the payload, not the
+/// node `valid_time`; a well-formed scan-logs bucket stamps the two equal).
+fn occurrence_bucket_start(record: &GraphRecord) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    match node_log_payload(record) {
+        Some(crate::ir::LogPayload::LogOccurrenceBucket(p)) => parse_rfc3339(&p.bucket_start),
+        _ => None,
+    }
+}
+
 /// True when a node has been superseded by a newer version (lifecycle filter):
 /// such a record must not count as live evidence, mirroring the tombstone
 /// exclusion `evidence_class_for_record` already applies to `Tombstone` records.
@@ -3251,6 +3261,20 @@ fn bind_occurrence_totals(
             // node count/hour still bind and both sums still balance — and consumers
             // would read per-signature occurrence counts for the WRONG incident.
             match aggregates_by_bucket.get(bucket.bucket_id.as_str()) {
+                Some(sigs) if sigs.len() > 1 => {
+                    // Issue #374: a bucket carrying co-located AGGREGATES edges to
+                    // MORE THAN ONE distinct signature is conflicting attribution —
+                    // rejected even when the filed signature is among them, so a
+                    // consumer can never read a single bucket's occurrences against
+                    // two incidents. Ordered BEFORE the `contains` arm so the
+                    // conflict is caught regardless of which signature is filed.
+                    return Err(format!(
+                        "occurrence_buckets bucket {} carries conflicting co-located AGGREGATES \
+                         attribution edges naming {} differing signatures in section {class}",
+                        bucket.bucket_id,
+                        sigs.len()
+                    ));
+                }
                 Some(sigs) if sigs.contains(total.signature_id.as_str()) => {}
                 Some(_) => {
                     return Err(format!(
@@ -3484,7 +3508,20 @@ pub fn assemble_pack(
         // must route to the same `missing_valid_time` path as a truly-absent time
         // — never silently excluded (Codex round-13 Finding 2). `parse_rfc3339`
         // returns `None` for both an absent resolved value and a malformed one.
-        match resolve_valid_time(record).and_then(|vt| parse_rfc3339(&vt)) {
+        // `occurrence_buckets` key their window decision on the PAYLOAD
+        // `bucket_start` hour, not the node `valid_time` (issue #375): a
+        // well-formed scan-logs bucket stamps the two equal, but a tampered graph
+        // could set an in-window `valid_time` while `bucket_start` is out-of-window
+        // to smuggle an out-of-window bucket in. Every other class keys on the
+        // resolved node valid time. (The verify-side Integrity check rejects any
+        // bucket where the two disagree, so this source can never diverge for a
+        // legitimate pack.)
+        let window_instant = if class == EvidenceClass::OccurrenceBuckets {
+            occurrence_bucket_start(record)
+        } else {
+            resolve_valid_time(record).and_then(|vt| parse_rfc3339(&vt))
+        };
+        match window_instant {
             // `occurrence_buckets` use the AC2 interval-intersection rule, NOT the
             // point predicate: a bucket whose hour `[bucket_start, +1h)`
             // intersects the window is included WHOLE (issue #340). Every other
@@ -5129,6 +5166,30 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     break 'integrity;
                 }
             }
+            // Issue #375: the window decision keys on the payload `bucket_start`, so
+            // a bucket whose node `valid_time` disagrees with its `bucket_start`
+            // could otherwise smuggle an out-of-window bucket into the pack (an
+            // in-window `valid_time` stamped over an out-of-window `bucket_start`).
+            // Reject any such disagreement here; a legitimate scan-logs bucket stamps
+            // the two equal.
+            for br in &section.records {
+                if let Some(crate::ir::LogPayload::LogOccurrenceBucket(p)) =
+                    node_log_payload(&br.record)
+                {
+                    let vt = resolve_valid_time(&br.record).and_then(|s| parse_rfc3339(&s));
+                    let bs = parse_rfc3339(&p.bucket_start);
+                    if !matches!((vt, bs), (Some(a), Some(b)) if a == b) {
+                        integrity_passed = false;
+                        integrity_detail = format!(
+                            "occurrence_buckets bucket {} has a node valid_time that disagrees \
+                             with its payload bucket_start in section {}",
+                            br.record.id(),
+                            section.class
+                        );
+                        break 'integrity;
+                    }
+                }
+            }
         } else if section.class == EvidenceClass::ErrorSignatures.as_wire() {
             // `error_signatures` legitimately co-locates the frame-resolution
             // attribution edges (issue #371): `ErrorSignature --FRAME_RESOLVES_TO-->
@@ -5398,9 +5459,12 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                         // #340): a bucket whose hour `[bucket_start, +1h)` intersects
                         // the window is legitimately included even when its
                         // `bucket_start` precedes `from` (a partial-overlap hour is
-                        // counted whole). The SAME predicate `assemble_pack` selected
-                        // it with, so assemble and verify agree.
-                        matches!(resolved, Some(t) if bucket_hour_intersects_window(t, from, to))
+                        // counted whole). The interval is keyed on the PAYLOAD
+                        // `bucket_start` (issue #375), NOT the node `valid_time` — the
+                        // SAME instant source `assemble_pack` selected it with, so
+                        // assemble and verify agree. (Integrity independently rejects a
+                        // bucket whose `valid_time` disagrees with its `bucket_start`.)
+                        matches!(occurrence_bucket_start(&br.record), Some(t) if bucket_hour_intersects_window(t, from, to))
                     }
                 } else if section.class == EvidenceClass::ErrorSignatures.as_wire()
                     && matches!(&br.record, GraphRecord::Edge { label, .. } if label.as_str() == "FRAME_RESOLVES_TO")
@@ -12626,6 +12690,105 @@ mod pack340_tests {
                 "frame-resolution mutation `{name}` must fail Integrity (hash recomputed)"
             );
         }
+    }
+
+    // Issue #374: verify must reject an occurrence bucket carrying CONFLICTING
+    // co-located `AGGREGATES` attribution edges naming two DIFFERENT signatures,
+    // even when the filed signature is one of them — otherwise a consumer reads a
+    // single bucket's occurrences against two incidents.
+    #[test]
+    fn verify_rejects_bucket_with_conflicting_aggregates_edges() {
+        let mut pack = assemble_cc73(&build_log_incident_records());
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "fixture pack verifies clean before mutation"
+        );
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        // `log:v1:b1-00` is a real in-window bucket already attributed to
+        // `log:v1:sig1`; inject a SECOND `AGGREGATES` edge naming a DIFFERENT real
+        // signature (`log:v1:sig2`).
+        let edge = super::fixture::aggregates("log:v1:b1-00", "log:v1:sig2");
+        let scrubbed = scrub_log_node_text(scrub_record(edge));
+        let json = serde_json::to_string(&scrubbed).unwrap();
+        let hash = blake3::hash(json.as_bytes()).to_string();
+        sec.records.push(BundleRecord {
+            record: scrubbed,
+            hash,
+        });
+        sec.records
+            .sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
+        sec.record_count = sec.records.len();
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "conflicting AGGREGATES attribution must fail Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(
+            report.integrity.detail.contains("conflicting"),
+            "{}",
+            report.integrity.detail
+        );
+    }
+
+    // Issue #375: verify Integrity must reject an occurrence bucket whose node
+    // `valid_time` disagrees with its payload `bucket_start`. The window decision
+    // keys on `bucket_start`, so a tampered graph could otherwise smuggle an
+    // out-of-window bucket in by stamping an in-window `valid_time` over an
+    // out-of-window `bucket_start`.
+    #[test]
+    fn verify_rejects_bucket_valid_time_disagreeing_with_bucket_start() {
+        let mut pack = assemble_cc73(&build_log_incident_records());
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "fixture pack verifies clean before mutation"
+        );
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        // Rewrite `log:v1:b1-00`'s node valid_time to a DIFFERENT in-window instant
+        // while leaving its payload `bucket_start` untouched (so the summary
+        // hour-bind and the window predicate — both keyed on `bucket_start` — still
+        // pass), then rehash the row.
+        {
+            let br = sec
+                .records
+                .iter_mut()
+                .find(|br| br.record.id() == "log:v1:b1-00")
+                .expect("b1-00 present in occurrence_buckets section");
+            if let GraphRecord::Node {
+                valid_time,
+                temporal,
+                ..
+            } = &mut br.record
+            {
+                *temporal = None;
+                *valid_time = Some("2026-03-20T00:00:00Z".to_owned());
+            } else {
+                panic!("b1-00 is a node");
+            }
+            let json = serde_json::to_string(&br.record).unwrap();
+            br.hash = blake3::hash(json.as_bytes()).to_string();
+        }
+        sec.records
+            .sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "valid_time != bucket_start must fail Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(
+            report.integrity.detail.contains("bucket_start"),
+            "{}",
+            report.integrity.detail
+        );
     }
 
     // ── Binding-surface boundary for the non-node-backed fields ───────────────
