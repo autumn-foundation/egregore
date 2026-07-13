@@ -6005,6 +6005,92 @@ pub(crate) mod fixture {
         LogOccurrenceBucketPayload, LogPayload, LogSourcePayload, StackFrame,
     };
 
+    /// Idempotently maps a fixture log-ID shorthand (e.g. `log:v1:sig1`) to a
+    /// citation-well-formed `log:v<N>:<64 hex>` record ID (issue #372). The #340
+    /// shorthand IDs are NOT citation-well-formed (`log:v<N>:<16+ hex>`), so after
+    /// the #372 assemble change a pack built from them records `citation.passed =
+    /// false`. Applying `wf` at every log-domain node/edge endpoint makes the
+    /// fixtures citation-complete without changing the record-building call sites.
+    ///
+    /// An already-well-formed log ID and any non-`log:` handle (a `codegraph:` /
+    /// `verification:` frame/edge target) pass through unchanged, so `wf` is safe to
+    /// apply to both endpoints of every edge helper and is stable under repeated
+    /// application. Asserts recompute the same ID via `wf("log:v1:sigN")`.
+    #[must_use]
+    pub fn wf(id: &str) -> String {
+        use std::fmt::Write as _;
+        // Already citation-well-formed? pass through.
+        if let Some(hex) = crate::ir::strip_log_id_prefix(id)
+            && hex.len() >= 16
+            && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return id.to_owned();
+        }
+        // A non-`log:` handle (codegraph/verification frame/edge target) is not a
+        // log record ID — leave it untouched.
+        if !id.starts_with("log:") {
+            return id.to_owned();
+        }
+        // Order-preserving, citation-well-formed: lowercase-hex-encode the shorthand
+        // (hex encoding preserves lexical order) and zero-pad to >=16 digits, so the
+        // summary's record_id ordering (and positional row order) exactly matches the
+        // shorthand's natural order — sig1 < sig2 < sig3, b1-00 < b1-01, etc.
+        let mut hex = String::new();
+        for b in id.bytes() {
+            let _ = write!(hex, "{b:02x}");
+        }
+        while hex.len() < 16 {
+            hex.push('0');
+        }
+        format!("log:v{LOG_SCHEMA_VERSION}:{hex}")
+    }
+
+    /// Ensures every `ErrorSignature` node in `records` has resolvable `LogSource`
+    /// provenance (issue #372): for each signature lacking a `CAPTURED_FROM` edge,
+    /// appends a `LogSource` node + `CAPTURED_FROM` edge keyed on the signature ID.
+    ///
+    /// Idempotent and coalesce-safe (a deterministic per-signature source ID). The
+    /// appended `LogSource`/`CAPTURED_FROM` records map to no evidence class, so pack
+    /// sections and record counts are unchanged; only the `runtime_observation`
+    /// citation classification flips from `MissingRequiredHandle` to `Cited`. Buckets
+    /// resolve provenance through their existing `AGGREGATES` edge to the now-
+    /// provenanced signature, so wiring signatures is sufficient.
+    #[must_use]
+    pub fn with_log_provenance(mut records: Vec<GraphRecord>) -> Vec<GraphRecord> {
+        let mut signature_ids: Vec<String> = Vec::new();
+        let mut already_captured: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for r in &records {
+            match r {
+                GraphRecord::Node {
+                    id, log: Some(p), ..
+                } if matches!(p.as_ref(), LogPayload::ErrorSignature(_)) => {
+                    signature_ids.push(id.clone());
+                }
+                GraphRecord::Edge {
+                    label: EdgeLabel::CapturedFrom,
+                    source,
+                    ..
+                } => {
+                    already_captured.insert(source.clone());
+                }
+                _ => {}
+            }
+        }
+        signature_ids.sort();
+        signature_ids.dedup();
+        for sig in signature_ids {
+            if already_captured.contains(&sig) {
+                continue;
+            }
+            // `sig` is already well-formed (minted through `wf` in `error_signature`).
+            let src_id = crate::ir::log_stable_id(&["log_source", &sig]);
+            records.push(log_source(&src_id, "app.log", "provenance-artifact-hash"));
+            records.push(captured_from(&sig, &src_id));
+        }
+        records
+    }
+
     /// A `LogSource` node (issue #320) carrying the provenance a runtime
     /// observation cites: its repo-relative source path + `source_artifact_hash`.
     /// Used to give an `ErrorSignature`'s `CAPTURED_FROM` chain a resolvable
@@ -6030,8 +6116,8 @@ pub(crate) mod fixture {
     pub fn captured_from(signature_id: &str, source_id: &str) -> GraphRecord {
         GraphRecord::edge(
             EdgeLabel::CapturedFrom,
-            signature_id.to_owned(),
-            source_id.to_owned(),
+            wf(signature_id),
+            wf(source_id),
             None,
             "ErrorSignature captured from LogSource".to_owned(),
         )
@@ -6046,7 +6132,8 @@ pub(crate) mod fixture {
         payload: LogPayload,
         valid_time: &str,
     ) -> GraphRecord {
-        GraphRecord::node(id.to_owned(), kind, None, None, None, summary)
+        // #372: mint a citation-well-formed log record ID from the fixture shorthand.
+        GraphRecord::node(wf(id), kind, None, None, None, summary)
             .with_domain("log", LOG_SCHEMA_VERSION)
             .with_log(payload)
             .with_valid_time(valid_time.to_owned(), "log_event_timestamp")
@@ -6127,8 +6214,8 @@ pub(crate) mod fixture {
     pub fn fingerprinted_as(event_id: &str, signature_id: &str) -> GraphRecord {
         GraphRecord::edge(
             EdgeLabel::FingerprintedAs,
-            event_id.to_owned(),
-            signature_id.to_owned(),
+            wf(event_id),
+            wf(signature_id),
             None,
             "LogEvent fingerprinted as ErrorSignature".to_owned(),
         )
@@ -6138,8 +6225,8 @@ pub(crate) mod fixture {
     pub fn aggregates(bucket_id: &str, signature_id: &str) -> GraphRecord {
         GraphRecord::edge(
             EdgeLabel::Aggregates,
-            bucket_id.to_owned(),
-            signature_id.to_owned(),
+            wf(bucket_id),
+            wf(signature_id),
             None,
             "LogOccurrenceBucket aggregates ErrorSignature".to_owned(),
         )
@@ -6154,8 +6241,8 @@ pub(crate) mod fixture {
     ) -> GraphRecord {
         GraphRecord::edge(
             EdgeLabel::FrameResolvesTo,
-            signature_id.to_owned(),
-            target_id.to_owned(),
+            wf(signature_id),
+            wf(target_id),
             None,
             "ErrorSignature frame resolves to symbol".to_owned(),
         )
@@ -6368,11 +6455,17 @@ pub(crate) mod fixture {
         records.push(verification_run("verification:v1:fixver", &march(10, 10)));
         records.push(validated_by("codegraph:v5:fixc", "verification:v1:fixver"));
 
-        records
+        // #372: make the fixture citation-complete — every ErrorSignature gets a
+        // resolvable LogSource + CAPTURED_FROM so the assembled pack records
+        // `citation.passed = true` (and buckets resolve via AGGREGATES → signature).
+        with_log_provenance(records)
     }
 
-    /// The three planted signature record IDs.
-    pub const LOG_SIGNATURE_IDS: [&str; 3] = ["log:v1:sig1", "log:v1:sig2", "log:v1:sig3"];
+    /// The three planted signature record IDs (citation-well-formed; issue #372).
+    #[must_use]
+    pub fn log_signature_ids() -> [String; 3] {
+        [wf("log:v1:sig1"), wf("log:v1:sig2"), wf("log:v1:sig3")]
+    }
 }
 
 #[cfg(test)]
@@ -11082,8 +11175,8 @@ mod pack338_tests {
 #[cfg(test)]
 mod pack340_tests {
     use super::fixture::{
-        EXEMPLAR_SENTINEL, LOG_SIGNATURE_IDS, WINDOW_FROM, WINDOW_TO, build_log_incident_records,
-        build_seed_records, captured_from, error_signature, log_source,
+        EXEMPLAR_SENTINEL, WINDOW_FROM, WINDOW_TO, build_log_incident_records, build_seed_records,
+        captured_from, error_signature, log_signature_ids, log_source, wf, with_log_provenance,
     };
     use super::*;
 
@@ -11240,11 +11333,11 @@ mod pack340_tests {
             panic!("error_signatures summary present");
         };
         assert_eq!(signatures.len(), 3);
-        let ids: Vec<&str> = signatures.iter().map(|s| s.signature_id.as_str()).collect();
-        assert_eq!(ids, LOG_SIGNATURE_IDS, "rows ordered by record_id");
+        let ids: Vec<String> = signatures.iter().map(|s| s.signature_id.clone()).collect();
+        assert_eq!(ids, log_signature_ids(), "rows ordered by record_id");
 
         let sig1 = &signatures[0];
-        assert_eq!(sig1.signature_id, "log:v1:sig1");
+        assert_eq!(sig1.signature_id, wf("log:v1:sig1"));
         assert_eq!(sig1.severity, "error");
         // first_seen is in-window -> unchanged; last_seen (Apr 5) clipped to `to`.
         assert_eq!(sig1.first_seen_in_window, "2026-03-02T09:00:00Z");
@@ -11364,7 +11457,7 @@ mod pack340_tests {
         };
         let sig1 = signatures
             .iter()
-            .find(|s| s.signature_id == "log:v1:sig1")
+            .find(|s| s.signature_id == wf("log:v1:sig1").as_str())
             .expect("sig1 row present");
         let labels: Vec<Option<&str>> = sig1
             .frame_resolutions
@@ -11414,7 +11507,7 @@ mod pack340_tests {
             .map(|t| (t.signature_id.as_str(), t))
             .collect();
         // sig1: sum(1..=15) = 120; the 999 + 888 out-of-window buckets excluded.
-        let s1 = by_sig["log:v1:sig1"];
+        let s1 = by_sig[wf("log:v1:sig1").as_str()];
         assert_eq!(s1.in_window_occurrences, 120);
         assert_eq!(s1.buckets.len(), 15);
         // Buckets ordered by hour.
@@ -11423,8 +11516,8 @@ mod pack340_tests {
         sorted.sort_unstable();
         assert_eq!(hours, sorted, "buckets ordered by (signature, hour)");
         // sig2: 16 * 2 = 32; sig3: 16 * 5 = 80.
-        assert_eq!(by_sig["log:v1:sig2"].in_window_occurrences, 32);
-        assert_eq!(by_sig["log:v1:sig3"].in_window_occurrences, 80);
+        assert_eq!(by_sig[wf("log:v1:sig2").as_str()].in_window_occurrences, 32);
+        assert_eq!(by_sig[wf("log:v1:sig3").as_str()].in_window_occurrences, 80);
     }
 
     #[test]
@@ -11480,6 +11573,7 @@ mod pack340_tests {
         ));
         records.push(super::fixture::aggregates("log:v1:bp-08", "log:v1:sigp"));
 
+        let records = with_log_provenance(records); // #372: citation-complete signature
         let pack = assemble_pack(
             &records,
             &load_default_catalog(),
@@ -11526,7 +11620,7 @@ mod pack340_tests {
         };
         assert_eq!(links.len(), 1, "exactly the planted chain");
         let link = &links[0];
-        assert_eq!(link.signature_id, "log:v1:sig1");
+        assert_eq!(link.signature_id, wf("log:v1:sig1"));
         assert_eq!(link.symbol_id, "codegraph:v5:sym-db");
         assert_eq!(link.commit_id, "codegraph:v5:fixc");
         assert_eq!(link.commit_valid_time, "2026-03-10T09:00:00Z");
@@ -11590,16 +11684,18 @@ mod pack340_tests {
             .find(|t| t.trust_class == "runtime_observation")
             .expect("runtime_observation tally");
         assert_eq!(tally.total, 50);
-        // #372: the assemble citation view now applies the class-wide
+        // #372: the assemble citation view applies the class-wide
         // `runtime_observation` provenance requirement (the SAME derivation
-        // `eg audit citations` uses). The #340 fixture uses human-readable
-        // shorthand IDs (`log:v1:sig1`) that are NOT citation-well-formed
-        // (`log:v<N>:<16+ hex>`), so every row is correctly `MissingRequiredHandle`
-        // — matching how `eg audit citations` classifies the identical records.
-        // The well-formed-ID + resolvable-provenance positive case is covered by
-        // `assemble_citation_verdict_passes_with_resolvable_log_provenance`.
-        assert_eq!(tally.cited, 0);
-        assert_eq!(tally.missing, 50);
+        // `eg audit citations` uses). The #340 fixture is now citation-complete —
+        // its signatures carry well-formed `log:v<N>:<hex>` IDs (via `wf`) and
+        // resolvable `LogSource`/`CAPTURED_FROM` provenance (via
+        // `with_log_provenance`), and its buckets resolve through their AGGREGATES
+        // edge — so every runtime row is legitimately `Cited`. Trust separation is
+        // unchanged: these 50 rows are tallied `runtime_observation`, never
+        // source_fact/verification. The provenance-less negative case is covered by
+        // `assemble_citation_verdict_fails_on_provenance_less_log_rows`.
+        assert_eq!(tally.cited, 50);
+        assert_eq!(tally.missing, 0);
     }
 
     // ── AC5: degradation, both directions ─────────────────────────────────────
@@ -11776,7 +11872,7 @@ mod pack340_tests {
         };
         let sig1 = signatures
             .iter()
-            .find(|s| s.signature_id == "log:v1:sig1")
+            .find(|s| s.signature_id == wf("log:v1:sig1").as_str())
             .expect("sig1 present");
         assert_eq!(sig1.frame_resolutions.len(), 1);
         assert_eq!(sig1.frame_resolutions[0].target_id, "codegraph:v5:sym-db");
@@ -12040,7 +12136,7 @@ mod pack340_tests {
         // sig1 carries frames -> a frame_chain_hash; forge it.
         let sig1 = signatures
             .iter_mut()
-            .find(|s| s.signature_id == "log:v1:sig1")
+            .find(|s| s.signature_id == wf("log:v1:sig1").as_str())
             .expect("sig1 carries frames");
         sig1.frame_chain_hash = Some(blake3::hash(b"forged frames").to_string());
         let report = verify_pack(&pack);
@@ -12116,7 +12212,7 @@ mod pack340_tests {
             };
             let total = signature_totals
                 .iter_mut()
-                .find(|t| t.signature_id == "log:v1:sig1")
+                .find(|t| t.signature_id == wf("log:v1:sig1").as_str())
                 .expect("sig1 total");
             // Drop one in-window bucket and reduce the reported total to match, so
             // the sum check passes and the reverse coverage guard is the ONLY
@@ -12153,7 +12249,7 @@ mod pack340_tests {
             // lingers in `section.records` but is now uncovered by the summary.
             let idx = signature_totals
                 .iter()
-                .position(|t| t.signature_id == "log:v1:sig1")
+                .position(|t| t.signature_id == wf("log:v1:sig1").as_str())
                 .expect("sig1 total");
             signature_totals.remove(idx);
         }
@@ -12298,7 +12394,9 @@ mod pack340_tests {
             "2026-03-02T01:00:00Z",
             99,
         ));
-        records
+        // #372: provenance the signature so included buckets resolve; the excluded
+        // unattributed bucket is not a citation row.
+        with_log_provenance(records)
     }
 
     #[test]
@@ -12329,7 +12427,7 @@ mod pack340_tests {
         assert!(
             !sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:ba-unattr"),
+                .any(|br| br.record.id() == wf("log:v1:ba-unattr").as_str()),
             "unattributed bucket excluded from section records"
         );
         // ... and surfaced under a counted `unattributed_bucket` diagnostic.
@@ -12338,7 +12436,9 @@ mod pack340_tests {
                 .iter()
                 .any(|d| d.code == "unattributed_bucket"
                     && d.evidence_class.as_deref() == Some("occurrence_buckets")
-                    && d.record_ids.iter().any(|id| id == "log:v1:ba-unattr")),
+                    && d.record_ids
+                        .iter()
+                        .any(|id| id == wf("log:v1:ba-unattr").as_str())),
             "unattributed bucket tallied under a diagnostic: {:?}",
             pack.diagnostics
         );
@@ -12348,24 +12448,25 @@ mod pack340_tests {
             panic!("occurrence_buckets summary present");
         };
         assert!(
-            signature_totals
+            signature_totals.iter().all(|t| t
+                .buckets
                 .iter()
-                .all(|t| t.buckets.iter().all(|b| b.bucket_id != "log:v1:ba-unattr")),
+                .all(|b| b.bucket_id != wf("log:v1:ba-unattr").as_str())),
             "unattributed bucket excluded from the summary"
         );
         // The attributed bucket is retained and its AGGREGATES edge co-located.
         assert!(
             sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:ba-00"),
+                .any(|br| br.record.id() == wf("log:v1:ba-00").as_str()),
             "attributed bucket retained"
         );
         assert!(
             sec.records.iter().any(|br| matches!(&br.record,
                 GraphRecord::Edge { label, source, target, .. }
                     if label.as_str() == "AGGREGATES"
-                        && source == "log:v1:ba-00"
-                        && target == "log:v1:siga")),
+                        && source == wf("log:v1:ba-00").as_str()
+                        && target == wf("log:v1:siga").as_str())),
             "attribution edge co-located as a hashed row"
         );
     }
@@ -12422,7 +12523,7 @@ mod pack340_tests {
             "log:v1:bc-conflict",
             "log:v1:sigc2",
         ));
-        records
+        with_log_provenance(records) // #372: citation-complete signatures
     }
 
     /// A minimal fixture: one signature, one clean attributed in-window bucket, and
@@ -12465,7 +12566,7 @@ mod pack340_tests {
             "log:v1:bm-mismatch",
             "log:v1:sigm",
         ));
-        records
+        with_log_provenance(records) // #372: citation-complete signatures
     }
 
     /// A minimal fixture: one signature, one clean attributed in-window bucket, and
@@ -12510,7 +12611,7 @@ mod pack340_tests {
             "log:v1:bn-missing",
             "log:v1:sign",
         ));
-        records
+        with_log_provenance(records) // #372: citation-complete signatures
     }
 
     /// A minimal fixture: one signature, one clean attributed in-window bucket, and
@@ -12555,7 +12656,7 @@ mod pack340_tests {
             "log:v1:bx-malformed",
             "log:v1:sigx",
         ));
-        records
+        with_log_provenance(records) // #372: citation-complete signatures
     }
 
     #[test]
@@ -12574,7 +12675,7 @@ mod pack340_tests {
         assert!(
             !sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bc-conflict"),
+                .any(|br| br.record.id() == wf("log:v1:bc-conflict").as_str()),
             "conflicting bucket excluded from section records"
         );
         // (c) ... and from the summary totals.
@@ -12586,7 +12687,7 @@ mod pack340_tests {
             signature_totals.iter().all(|t| t
                 .buckets
                 .iter()
-                .all(|b| b.bucket_id != "log:v1:bc-conflict")),
+                .all(|b| b.bucket_id != wf("log:v1:bc-conflict").as_str())),
             "conflicting bucket excluded from the summary"
         );
         // (d) ... under a `conflicting_bucket_attribution` diagnostic naming it.
@@ -12595,7 +12696,9 @@ mod pack340_tests {
                 .iter()
                 .any(|d| d.code == "conflicting_bucket_attribution"
                     && d.evidence_class.as_deref() == Some("occurrence_buckets")
-                    && d.record_ids.iter().any(|id| id == "log:v1:bc-conflict")),
+                    && d.record_ids
+                        .iter()
+                        .any(|id| id == wf("log:v1:bc-conflict").as_str())),
             "conflicting bucket tallied under a diagnostic: {:?}",
             pack.diagnostics
         );
@@ -12603,7 +12706,7 @@ mod pack340_tests {
         assert!(
             sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bc-ok"),
+                .any(|br| br.record.id() == wf("log:v1:bc-ok").as_str()),
             "clean attributed bucket retained"
         );
     }
@@ -12622,7 +12725,7 @@ mod pack340_tests {
         assert!(
             !sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bm-mismatch"),
+                .any(|br| br.record.id() == wf("log:v1:bm-mismatch").as_str()),
             "valid_time-mismatch bucket excluded from section records"
         );
         let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
@@ -12633,7 +12736,7 @@ mod pack340_tests {
             signature_totals.iter().all(|t| t
                 .buckets
                 .iter()
-                .all(|b| b.bucket_id != "log:v1:bm-mismatch")),
+                .all(|b| b.bucket_id != wf("log:v1:bm-mismatch").as_str())),
             "valid_time-mismatch bucket excluded from the summary"
         );
         assert!(
@@ -12641,14 +12744,16 @@ mod pack340_tests {
                 .iter()
                 .any(|d| d.code == "bucket_valid_time_mismatch"
                     && d.evidence_class.as_deref() == Some("occurrence_buckets")
-                    && d.record_ids.iter().any(|id| id == "log:v1:bm-mismatch")),
+                    && d.record_ids
+                        .iter()
+                        .any(|id| id == wf("log:v1:bm-mismatch").as_str())),
             "valid_time-mismatch bucket tallied under a diagnostic: {:?}",
             pack.diagnostics
         );
         assert!(
             sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bm-ok"),
+                .any(|br| br.record.id() == wf("log:v1:bm-ok").as_str()),
             "clean bucket retained"
         );
     }
@@ -12667,7 +12772,7 @@ mod pack340_tests {
         assert!(
             !sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bn-missing"),
+                .any(|br| br.record.id() == wf("log:v1:bn-missing").as_str()),
             "missing-valid_time bucket excluded from section records"
         );
         let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
@@ -12675,9 +12780,10 @@ mod pack340_tests {
             panic!("occurrence_buckets summary present");
         };
         assert!(
-            signature_totals
+            signature_totals.iter().all(|t| t
+                .buckets
                 .iter()
-                .all(|t| t.buckets.iter().all(|b| b.bucket_id != "log:v1:bn-missing")),
+                .all(|b| b.bucket_id != wf("log:v1:bn-missing").as_str())),
             "missing-valid_time bucket excluded from the summary"
         );
         assert!(
@@ -12685,14 +12791,16 @@ mod pack340_tests {
                 .iter()
                 .any(|d| d.code == "missing_valid_time"
                     && d.evidence_class.as_deref() == Some("occurrence_buckets")
-                    && d.record_ids.iter().any(|id| id == "log:v1:bn-missing")),
+                    && d.record_ids
+                        .iter()
+                        .any(|id| id == wf("log:v1:bn-missing").as_str())),
             "missing-valid_time bucket tallied under a diagnostic: {:?}",
             pack.diagnostics
         );
         assert!(
             sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bn-ok"),
+                .any(|br| br.record.id() == wf("log:v1:bn-ok").as_str()),
             "clean bucket retained"
         );
         // Codex #387 round-2 contract: the counted+diagnosed missing-time set MUST
@@ -12720,7 +12828,9 @@ mod pack340_tests {
         assert_eq!(mvt_diags, 1, "exactly the one genuine missing-time record");
         assert!(
             pack.gaps.iter().any(|g| g.gap_class == "missing_valid_time"
-                && g.record_ids.iter().any(|id| id == "log:v1:bn-missing")),
+                && g.record_ids
+                    .iter()
+                    .any(|id| id == wf("log:v1:bn-missing").as_str())),
             "genuine missing-valid_time bucket gets a matching gap row: {:?}",
             pack.gaps
         );
@@ -12742,7 +12852,7 @@ mod pack340_tests {
         assert!(
             !sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bx-malformed"),
+                .any(|br| br.record.id() == wf("log:v1:bx-malformed").as_str()),
             "malformed-bucket_start bucket excluded from section records"
         );
         // ... and from the summary totals.
@@ -12754,7 +12864,7 @@ mod pack340_tests {
             signature_totals.iter().all(|t| t
                 .buckets
                 .iter()
-                .all(|b| b.bucket_id != "log:v1:bx-malformed")),
+                .all(|b| b.bucket_id != wf("log:v1:bx-malformed").as_str())),
             "malformed-bucket_start bucket excluded from the summary"
         );
         // (c) ... under a NEW `malformed_bucket_start` diagnostic naming it.
@@ -12763,7 +12873,9 @@ mod pack340_tests {
                 .iter()
                 .any(|d| d.code == "malformed_bucket_start"
                     && d.evidence_class.as_deref() == Some("occurrence_buckets")
-                    && d.record_ids.iter().any(|id| id == "log:v1:bx-malformed")),
+                    && d.record_ids
+                        .iter()
+                        .any(|id| id == wf("log:v1:bx-malformed").as_str())),
             "malformed bucket tallied under a malformed_bucket_start diagnostic: {:?}",
             pack.diagnostics
         );
@@ -12774,7 +12886,9 @@ mod pack340_tests {
                 .diagnostics
                 .iter()
                 .any(|d| d.code == "missing_valid_time"
-                    && d.record_ids.iter().any(|id| id == "log:v1:bx-malformed")),
+                    && d.record_ids
+                        .iter()
+                        .any(|id| id == wf("log:v1:bx-malformed").as_str())),
             "malformed bucket must NOT get a missing_valid_time diagnostic: {:?}",
             pack.diagnostics
         );
@@ -12807,7 +12921,7 @@ mod pack340_tests {
         assert!(
             sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bx-ok"),
+                .any(|br| br.record.id() == wf("log:v1:bx-ok").as_str()),
             "clean bucket retained"
         );
     }
@@ -12840,7 +12954,7 @@ mod pack340_tests {
     /// per-source counts sum. Proves the merge keeps the earliest `first_seen`, the
     /// latest `last_seen`, and the SUMMED occurrence counts across distinct sources.
     fn two_scan_differing_extents_records() -> Vec<GraphRecord> {
-        vec![
+        with_log_provenance(vec![
             // Scan A (source A): narrow span, count 10; bucket count 4.
             error_signature(
                 "log:v1:sigX",
@@ -12866,7 +12980,7 @@ mod pack340_tests {
             ),
             super::fixture::occurrence_bucket("log:v2:bx-00-b", "2026-03-03T00:00:00Z", 6),
             super::fixture::aggregates("log:v2:bx-00-b", "log:v1:sigX"),
-        ]
+        ]) // #372: citation-complete signature
     }
 
     #[test]
@@ -12889,11 +13003,11 @@ mod pack340_tests {
         let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = &sig_sec.log_summary else {
             panic!("error_signatures summary present");
         };
-        let mut ids: Vec<&str> = signatures.iter().map(|r| r.signature_id.as_str()).collect();
+        let mut ids: Vec<String> = signatures.iter().map(|r| r.signature_id.clone()).collect();
         ids.sort_unstable();
         assert_eq!(
             ids,
-            ["log:v1:sig1", "log:v1:sig2", "log:v1:sig3"],
+            log_signature_ids(),
             "one coalesced row per signature ID"
         );
         assert_eq!(
@@ -12905,11 +13019,15 @@ mod pack340_tests {
         // Summed (doubled) occurrence counts on the merged section nodes.
         for br in &sig_sec.records {
             if let Some(crate::ir::LogPayload::ErrorSignature(p)) = node_log_payload(&br.record) {
-                let expected = match br.record.id() {
-                    "log:v1:sig1" => 240, // 120 x 2 scans
-                    "log:v1:sig2" => 60,  // 30 x 2
-                    "log:v1:sig3" => 6,   // 3 x 2
-                    other => panic!("unexpected signature {other}"),
+                let id = br.record.id();
+                let expected = if id == wf("log:v1:sig1").as_str() {
+                    240 // 120 x 2 scans
+                } else if id == wf("log:v1:sig2").as_str() {
+                    60 // 30 x 2
+                } else if id == wf("log:v1:sig3").as_str() {
+                    6 // 3 x 2
+                } else {
+                    panic!("unexpected signature {id}")
                 };
                 assert_eq!(
                     p.occurrence_count,
@@ -12932,7 +13050,7 @@ mod pack340_tests {
         };
         let sig1_total = signature_totals
             .iter()
-            .find(|t| t.signature_id == "log:v1:sig1")
+            .find(|t| t.signature_id == wf("log:v1:sig1").as_str())
             .expect("sig1 total");
         // Single-scan sum is 1+2+..+15 = 120; a byte-identical rescan collapses, so
         // the total stays 120 (buckets no longer double-count on concatenation).
@@ -12961,7 +13079,7 @@ mod pack340_tests {
         };
         assert_eq!(signatures.len(), 1, "one coalesced signature row");
         let row = &signatures[0];
-        assert_eq!(row.signature_id, "log:v1:sigX");
+        assert_eq!(row.signature_id, wf("log:v1:sigX"));
         assert_eq!(
             row.first_seen_in_window, "2026-03-02T08:00:00Z",
             "merged first_seen is the EARLIEST across scans"
@@ -13065,13 +13183,13 @@ mod pack340_tests {
             // filed under — which nothing bound before the AGGREGATES co-location.
             let sig1_idx = signature_totals
                 .iter()
-                .position(|t| t.signature_id == "log:v1:sig1")
+                .position(|t| t.signature_id == wf("log:v1:sig1").as_str())
                 .expect("sig1 total");
             let moved = signature_totals[sig1_idx].buckets.remove(0);
             signature_totals[sig1_idx].in_window_occurrences -= moved.occurrence_count;
             let sig2 = signature_totals
                 .iter_mut()
-                .find(|t| t.signature_id == "log:v1:sig2")
+                .find(|t| t.signature_id == wf("log:v1:sig2").as_str())
                 .expect("sig2 total");
             sig2.in_window_occurrences += moved.occurrence_count;
             sig2.buckets.push(moved);
@@ -13110,9 +13228,9 @@ mod pack340_tests {
             // nodes, but the AGGREGATES edges name the ORIGINAL signature.
             let total = signature_totals
                 .iter_mut()
-                .find(|t| t.signature_id == "log:v1:sig2")
+                .find(|t| t.signature_id == wf("log:v1:sig2").as_str())
                 .expect("sig2 total");
-            total.signature_id = "log:v1:sig1".to_owned();
+            total.signature_id = wf("log:v1:sig1");
             // Merge into one total per signature id would break bijection; keep it a
             // second sig1-labelled total to isolate the attribution check.
         }
@@ -13244,7 +13362,7 @@ mod pack340_tests {
             ("frame_chain_hash", |s| {
                 let sig1 = s
                     .iter_mut()
-                    .find(|r| r.signature_id == "log:v1:sig1")
+                    .find(|r| r.signature_id == wf("log:v1:sig1").as_str())
                     .expect("sig1 carries frames");
                 sig1.frame_chain_hash = Some(blake3::hash(b"forged frames").to_string());
             }),
@@ -13318,7 +13436,7 @@ mod pack340_tests {
                 {
                     let sig1 = signatures
                         .iter_mut()
-                        .find(|r| r.signature_id == "log:v1:sig1")
+                        .find(|r| r.signature_id == wf("log:v1:sig1").as_str())
                         .expect("sig1 carries a frame join");
                     sig1.frame_resolutions[0].resolution = Some("unresolved".to_owned());
                 }
@@ -13330,7 +13448,7 @@ mod pack340_tests {
                 {
                     let sig1 = signatures
                         .iter_mut()
-                        .find(|r| r.signature_id == "log:v1:sig1")
+                        .find(|r| r.signature_id == wf("log:v1:sig1").as_str())
                         .expect("sig1 carries a frame join");
                     sig1.frame_resolutions[0].frame_index = Some(9);
                 }
@@ -13342,7 +13460,7 @@ mod pack340_tests {
                 {
                     let sig1 = signatures
                         .iter_mut()
-                        .find(|r| r.signature_id == "log:v1:sig1")
+                        .find(|r| r.signature_id == wf("log:v1:sig1").as_str())
                         .expect("sig1 carries a frame join");
                     sig1.frame_resolutions[0].target_id = "codegraph:v5:ghost".to_owned();
                 }
@@ -13491,7 +13609,7 @@ mod pack340_tests {
             let br = sec
                 .records
                 .iter_mut()
-                .find(|br| br.record.id() == "log:v1:b1-00")
+                .find(|br| br.record.id() == wf("log:v1:b1-00").as_str())
                 .expect("b1-00 present in occurrence_buckets section");
             if let GraphRecord::Node {
                 valid_time,
@@ -13552,7 +13670,7 @@ mod pack340_tests {
         };
         let sig1 = signatures
             .iter_mut()
-            .find(|s| s.signature_id == "log:v1:sig1")
+            .find(|s| s.signature_id == wf("log:v1:sig1").as_str())
             .expect("sig1 carries an exemplar");
         // Rewrite the exemplar content hash WITHOUT recomputing log_summary_hash.
         sig1.exemplars[0].content_hash = "cd".repeat(32);
