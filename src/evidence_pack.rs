@@ -2180,6 +2180,105 @@ fn node_log_payload(record: &GraphRecord) -> Option<&crate::ir::LogPayload> {
     }
 }
 
+/// The parsed hour-start of an occurrence bucket, read from its payload
+/// `bucket_start` (issue #375: the window decision keys on the payload, not the
+/// node `valid_time`; a well-formed scan-logs bucket stamps the two equal).
+fn occurrence_bucket_start(record: &GraphRecord) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    match node_log_payload(record) {
+        Some(crate::ir::LogPayload::LogOccurrenceBucket(p)) => parse_rfc3339(&p.bucket_start),
+        _ => None,
+    }
+}
+
+/// The admission decision for one in-graph `LogOccurrenceBucket` during pack
+/// assembly (issues #374/#375). Centralizing the per-bucket decision in ONE
+/// function guarantees the section-membership path and the summary-building path
+/// (which both read the same in-window collection) can never disagree on which
+/// buckets are included — the section<->summary bijection `verify_pack` enforces.
+/// Every non-`Include` outcome excludes the bucket the SAME way `verify_pack`
+/// would reject it, so `assemble_pack` never emits a pack its own verify rejects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BucketAdmission {
+    /// Attributed to exactly one signature, node `valid_time` == payload
+    /// `bucket_start`, and the bucket hour intersects the window: keep it.
+    Include,
+    /// Well-formed but the bucket hour falls outside the window (excluded
+    /// silently, matching the established out-of-window drop for every class).
+    OutOfWindow,
+    /// No `AGGREGATES` edge names a signature (issue #340).
+    Unattributed,
+    /// `AGGREGATES` edges name more than one distinct signature (issue #374).
+    ConflictingAttribution,
+    /// The node `valid_time` is absent/unparseable — i.e. `valid_time_unresolved`
+    /// holds — so this bucket is in the shared `missing_valid_time` exclusion set
+    /// that `derive_gaps` also gaps (issue #375; Codex #387 round-2 gap contract).
+    MissingValidTime,
+    /// The node `valid_time` resolves fine but the payload `bucket_start` is
+    /// absent/unparseable — a DISTINCT defect from missing-valid-time. Because the
+    /// valid time resolves, `valid_time_unresolved` is false and `derive_gaps`
+    /// emits no `missing_valid_time` gap for it, so it must be diagnosed under its
+    /// OWN `malformed_bucket_start` code and never counted/diagnosed missing-time
+    /// (Codex #387 round-2: keep the counted+diagnosed missing-time set equal to
+    /// the gapped set).
+    MalformedBucketStart,
+    /// Both parse but the node `valid_time` disagrees (by instant) with the
+    /// payload `bucket_start` (issue #375).
+    ValidTimeMismatch,
+}
+
+/// Classifies one `LogOccurrenceBucket` for pack inclusion (issues #374/#375), so
+/// `assemble_pack` excludes exactly the buckets its own `verify_pack` would reject.
+/// `targets` is the set of DISTINCT signatures this bucket's `AGGREGATES` edges
+/// name (empty when none).
+///
+/// Ordering (Codex #387 round-2 gap contract): `MissingValidTime` is returned iff
+/// `valid_time_unresolved(record)` is true — the SAME predicate `derive_gaps` keys
+/// its `missing_valid_time` gap rows on — so the counted+diagnosed missing-time set
+/// stays exactly equal to the gapped set. A bucket with a resolvable node
+/// `valid_time` is therefore NEVER missing-time, even when its payload
+/// `bucket_start` is unparsable: that is the distinct `MalformedBucketStart`
+/// defect. After that, the payload `bucket_start` drives the window (an out-of-window
+/// bucket is excluded silently, matching every class), then the node `valid_time`
+/// must equal the `bucket_start` by instant, then attribution must be exactly one
+/// signature.
+fn classify_occurrence_bucket(
+    record: &GraphRecord,
+    targets: &BTreeSet<&str>,
+    from: DateTimeFixed,
+    to: DateTimeFixed,
+) -> BucketAdmission {
+    // Gap contract (Codex #387 round-2): `MissingValidTime` must match
+    // `derive_gaps`' `valid_time_unresolved` predicate EXACTLY so the
+    // counted+diagnosed missing-time set equals the gapped set. Check it FIRST.
+    if valid_time_unresolved(record) {
+        return BucketAdmission::MissingValidTime;
+    }
+    // The node `valid_time` is resolvable from here. The payload `bucket_start`
+    // drives the window decision (issue #375) and must parse; an absent/unparsable
+    // one with a resolvable valid_time is a DISTINCT defect, never missing-time.
+    let Some(bucket_start) = occurrence_bucket_start(record) else {
+        return BucketAdmission::MalformedBucketStart;
+    };
+    // An out-of-window bucket never enters the section, so it is excluded silently
+    // regardless of attribution/valid-time state (matching the pre-existing
+    // out-of-window behavior for every class).
+    if !bucket_hour_intersects_window(bucket_start, from, to) {
+        return BucketAdmission::OutOfWindow;
+    }
+    // Issue #375: the node `valid_time` (already resolvable) must equal (by instant)
+    // the payload `bucket_start`. A tampered graph could otherwise stamp an in-window
+    // `valid_time` over a differing `bucket_start`.
+    if resolve_valid_time(record).and_then(|s| parse_rfc3339(&s)) != Some(bucket_start) {
+        return BucketAdmission::ValidTimeMismatch;
+    }
+    // Issue #340/#374: attribution must be exactly one distinct signature.
+    match targets.len() {
+        0 => BucketAdmission::Unattributed,
+        1 => BucketAdmission::Include,
+        _ => BucketAdmission::ConflictingAttribution,
+    }
+}
+
 /// True when a node has been superseded by a newer version (lifecycle filter):
 /// such a record must not count as live evidence, mirroring the tombstone
 /// exclusion `evidence_class_for_record` already applies to `Tombstone` records.
@@ -3229,6 +3328,20 @@ fn bind_occurrence_totals(
             // node count/hour still bind and both sums still balance — and consumers
             // would read per-signature occurrence counts for the WRONG incident.
             match aggregates_by_bucket.get(bucket.bucket_id.as_str()) {
+                Some(sigs) if sigs.len() > 1 => {
+                    // Issue #374: a bucket carrying co-located AGGREGATES edges to
+                    // MORE THAN ONE distinct signature is conflicting attribution —
+                    // rejected even when the filed signature is among them, so a
+                    // consumer can never read a single bucket's occurrences against
+                    // two incidents. Ordered BEFORE the `contains` arm so the
+                    // conflict is caught regardless of which signature is filed.
+                    return Err(format!(
+                        "occurrence_buckets bucket {} carries conflicting co-located AGGREGATES \
+                         attribution edges naming {} differing signatures in section {class}",
+                        bucket.bucket_id,
+                        sigs.len()
+                    ));
+                }
                 Some(sigs) if sigs.contains(total.signature_id.as_str()) => {}
                 Some(_) => {
                     return Err(format!(
@@ -3450,6 +3563,29 @@ pub fn assemble_pack(
         }
     };
 
+    // --- distinct AGGREGATES attribution targets per bucket (issues #340/#374) ---
+    // A `LogOccurrenceBucket --AGGREGATES--> ErrorSignature` edge names the
+    // signature a bucket is attributed to; the set of DISTINCT signatures a
+    // bucket's edges name drives its admission decision below (0 = unattributed,
+    // 1 = attributed, >1 = conflicting). Built once from the coalesced record set,
+    // so it matches exactly what `verify_pack`'s `aggregates_by_bucket` sees.
+    let mut aggregates_targets: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for record in records {
+        if let GraphRecord::Edge {
+            label,
+            source,
+            target,
+            ..
+        } = record
+            && label.as_str() == "AGGREGATES"
+        {
+            aggregates_targets
+                .entry(source.as_str())
+                .or_default()
+                .insert(target.as_str());
+        }
+    }
+
     // --- per-class in-window records (with missing-valid-time exclusion) ---
     let mut excluded_missing_valid_time = 0usize;
     let mut in_window_by_class: BTreeMap<&'static str, Vec<GraphRecord>> = BTreeMap::new();
@@ -3457,23 +3593,100 @@ pub fn assemble_pack(
         let Some(class) = evidence_class_for_record(record) else {
             continue;
         };
+        // `occurrence_buckets` route through the centralized per-bucket admission
+        // decision (issues #374/#375): the SAME classification the section
+        // membership and the summary both consume, so `assemble_pack` never emits a
+        // bucket its own `verify_pack` would reject (conflicting attribution, a node
+        // `valid_time` disagreeing with the payload `bucket_start`, or an
+        // absent/malformed valid time). Excluded buckets are diagnosed exactly as
+        // the pre-existing `unattributed_bucket`/`missing_valid_time` idiom does.
+        if class == EvidenceClass::OccurrenceBuckets {
+            let empty_targets = BTreeSet::new();
+            let targets = aggregates_targets
+                .get(record.id())
+                .unwrap_or(&empty_targets);
+            match classify_occurrence_bucket(record, targets, from_ts, to_ts) {
+                BucketAdmission::Include => {
+                    in_window_by_class
+                        .entry(class.as_wire())
+                        .or_default()
+                        .push(record.clone());
+                }
+                // Out-of-window: excluded silently, matching every other class.
+                BucketAdmission::OutOfWindow => {}
+                BucketAdmission::Unattributed => {
+                    diagnostics.push(PackDiagnostic {
+                        code: "unattributed_bucket".to_owned(),
+                        evidence_class: Some(EvidenceClass::OccurrenceBuckets.as_wire().to_owned()),
+                        unavailable_reason: None,
+                        record_ids: vec![record.id().to_owned()],
+                        detail: "in-window LogOccurrenceBucket excluded: no AGGREGATES \
+                                 attribution edge names its signature"
+                            .to_owned(),
+                    });
+                }
+                BucketAdmission::ConflictingAttribution => {
+                    diagnostics.push(PackDiagnostic {
+                        code: "conflicting_bucket_attribution".to_owned(),
+                        evidence_class: Some(EvidenceClass::OccurrenceBuckets.as_wire().to_owned()),
+                        unavailable_reason: None,
+                        record_ids: vec![record.id().to_owned()],
+                        detail: "in-window LogOccurrenceBucket excluded: co-located AGGREGATES \
+                                 edges name more than one distinct signature"
+                            .to_owned(),
+                    });
+                }
+                BucketAdmission::MissingValidTime => {
+                    excluded_missing_valid_time += 1;
+                    diagnostics.push(PackDiagnostic {
+                        code: "missing_valid_time".to_owned(),
+                        evidence_class: Some(class.as_wire().to_owned()),
+                        unavailable_reason: None,
+                        record_ids: vec![record.id().to_owned()],
+                        detail: "class-relevant record excluded: no resolvable valid time"
+                            .to_owned(),
+                    });
+                }
+                BucketAdmission::MalformedBucketStart => {
+                    // Codex #387 round-2: the node `valid_time` resolves (so
+                    // `valid_time_unresolved` is false and `derive_gaps` emits no
+                    // `missing_valid_time` gap), but the payload `bucket_start` is
+                    // unparsable. Diagnose it under its OWN code and DO NOT count it
+                    // in `excluded_missing_valid_time` — keeping the counted,
+                    // diagnosed, and gapped missing-time sets identical.
+                    diagnostics.push(PackDiagnostic {
+                        code: "malformed_bucket_start".to_owned(),
+                        evidence_class: Some(EvidenceClass::OccurrenceBuckets.as_wire().to_owned()),
+                        unavailable_reason: None,
+                        record_ids: vec![record.id().to_owned()],
+                        detail: "in-window LogOccurrenceBucket excluded: payload bucket_start \
+                                 is absent or unparsable while the node valid_time resolves"
+                            .to_owned(),
+                    });
+                }
+                BucketAdmission::ValidTimeMismatch => {
+                    diagnostics.push(PackDiagnostic {
+                        code: "bucket_valid_time_mismatch".to_owned(),
+                        evidence_class: Some(EvidenceClass::OccurrenceBuckets.as_wire().to_owned()),
+                        unavailable_reason: None,
+                        record_ids: vec![record.id().to_owned()],
+                        detail: "in-window LogOccurrenceBucket excluded: node valid_time \
+                                 disagrees with the payload bucket_start"
+                            .to_owned(),
+                    });
+                }
+            }
+            continue;
+        }
         // Parse BEFORE deciding in/out of window: a resolved-but-malformed
         // (non-RFC3339) valid time is unresolved, NOT merely out-of-window, and
         // must route to the same `missing_valid_time` path as a truly-absent time
         // — never silently excluded (Codex round-13 Finding 2). `parse_rfc3339`
         // returns `None` for both an absent resolved value and a malformed one.
-        match resolve_valid_time(record).and_then(|vt| parse_rfc3339(&vt)) {
-            // `occurrence_buckets` use the AC2 interval-intersection rule, NOT the
-            // point predicate: a bucket whose hour `[bucket_start, +1h)`
-            // intersects the window is included WHOLE (issue #340). Every other
-            // class uses the half-open point predicate `from <= t < to`.
-            Some(parsed)
-                if if class == EvidenceClass::OccurrenceBuckets {
-                    bucket_hour_intersects_window(parsed, from_ts, to_ts)
-                } else {
-                    from_ts <= parsed && parsed < to_ts
-                } =>
-            {
+        let window_instant = resolve_valid_time(record).and_then(|vt| parse_rfc3339(&vt));
+        match window_instant {
+            // Every non-bucket class uses the half-open point predicate.
+            Some(parsed) if from_ts <= parsed && parsed < to_ts => {
                 in_window_by_class
                     .entry(class.as_wire())
                     .or_default()
@@ -3493,54 +3706,27 @@ pub fn assemble_pack(
         }
     }
 
-    // --- occurrence-bucket signature attribution (issue #340, Codex round-3) ---
+    // --- occurrence-bucket AGGREGATES co-location (issue #340, Codex round-3) ---
     // Each `occurrence_buckets` summary total attributes its buckets to a signature
     // (`total.signature_id`), but the `LogOccurrenceBucket` NODE payload carries no
     // signature field — the signature is only an identity input hashed into the
     // bucket's stable ID. So the bucket->signature binding must be carried by a
     // HASH-BOUND row for `verify_pack` to re-derive it offline: the
-    // `LogOccurrenceBucket --AGGREGATES--> ErrorSignature` edge. Those edges are
-    // co-located into the occurrence_buckets section here (P1). An in-window bucket
-    // with NO attribution edge cannot be filed under any signature, so it is
-    // EXCLUDED from BOTH the section records and the summary under a counted
-    // `unattributed_bucket` diagnostic — never silently mis-summed and never left in
-    // the section where the reverse-coverage guard would reject the freshly
-    // assembled pack (P2, the assemble<->verify consistency invariant). Mirrors the
-    // `missing_valid_time` exclusion-diagnostic idiom.
+    // `LogOccurrenceBucket --AGGREGATES--> ErrorSignature` edge, co-located here.
+    // Every in-window bucket that survives the window loop is now guaranteed singly
+    // attributed and valid_time-consistent (`classify_occurrence_bucket`, issues
+    // #374/#375), so co-locating its single attribution edge always produces a
+    // section `verify_pack` accepts (unattributed/conflicting/mismatched buckets
+    // were already excluded + diagnosed above — the assemble<->verify consistency
+    // invariant, P2). The bucket->signature summary attribution reads the SAME
+    // in-window collection, so the section<->summary bijection holds by
+    // construction.
     {
-        let bucket_ids_with_edge: BTreeSet<&str> = records
-            .iter()
-            .filter_map(|r| match r {
-                GraphRecord::Edge { label, source, .. } if label.as_str() == "AGGREGATES" => {
-                    Some(source.as_str())
-                }
-                _ => None,
-            })
-            .collect();
         if let Some(buckets) =
             in_window_by_class.get_mut(EvidenceClass::OccurrenceBuckets.as_wire())
         {
-            let existing = std::mem::take(buckets);
-            let mut included_ids: BTreeSet<String> = BTreeSet::new();
-            for bucket in existing {
-                if bucket_ids_with_edge.contains(bucket.id()) {
-                    included_ids.insert(bucket.id().to_owned());
-                    buckets.push(bucket);
-                } else {
-                    diagnostics.push(PackDiagnostic {
-                        code: "unattributed_bucket".to_owned(),
-                        evidence_class: Some(EvidenceClass::OccurrenceBuckets.as_wire().to_owned()),
-                        unavailable_reason: None,
-                        record_ids: vec![bucket.id().to_owned()],
-                        detail: "in-window LogOccurrenceBucket excluded: no AGGREGATES \
-                                 attribution edge names its signature"
-                            .to_owned(),
-                    });
-                }
-            }
-            // Co-locate every AGGREGATES attribution edge whose source is an included
-            // bucket as a hash-bound row, so verify re-derives the bucket->signature
-            // binding from tamper-evident evidence.
+            let included_ids: BTreeSet<String> =
+                buckets.iter().map(|b| b.id().to_owned()).collect();
             for record in records {
                 if let GraphRecord::Edge { label, source, .. } = record
                     && label.as_str() == "AGGREGATES"
@@ -5107,6 +5293,30 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     break 'integrity;
                 }
             }
+            // Issue #375: the window decision keys on the payload `bucket_start`, so
+            // a bucket whose node `valid_time` disagrees with its `bucket_start`
+            // could otherwise smuggle an out-of-window bucket into the pack (an
+            // in-window `valid_time` stamped over an out-of-window `bucket_start`).
+            // Reject any such disagreement here; a legitimate scan-logs bucket stamps
+            // the two equal.
+            for br in &section.records {
+                if let Some(crate::ir::LogPayload::LogOccurrenceBucket(p)) =
+                    node_log_payload(&br.record)
+                {
+                    let vt = resolve_valid_time(&br.record).and_then(|s| parse_rfc3339(&s));
+                    let bs = parse_rfc3339(&p.bucket_start);
+                    if !matches!((vt, bs), (Some(a), Some(b)) if a == b) {
+                        integrity_passed = false;
+                        integrity_detail = format!(
+                            "occurrence_buckets bucket {} has a node valid_time that disagrees \
+                             with its payload bucket_start in section {}",
+                            br.record.id(),
+                            section.class
+                        );
+                        break 'integrity;
+                    }
+                }
+            }
         } else if section.class == EvidenceClass::ErrorSignatures.as_wire() {
             // `error_signatures` legitimately co-locates the frame-resolution
             // attribution edges (issue #371): `ErrorSignature --FRAME_RESOLVES_TO-->
@@ -5376,9 +5586,12 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                         // #340): a bucket whose hour `[bucket_start, +1h)` intersects
                         // the window is legitimately included even when its
                         // `bucket_start` precedes `from` (a partial-overlap hour is
-                        // counted whole). The SAME predicate `assemble_pack` selected
-                        // it with, so assemble and verify agree.
-                        matches!(resolved, Some(t) if bucket_hour_intersects_window(t, from, to))
+                        // counted whole). The interval is keyed on the PAYLOAD
+                        // `bucket_start` (issue #375), NOT the node `valid_time` — the
+                        // SAME instant source `assemble_pack` selected it with, so
+                        // assemble and verify agree. (Integrity independently rejects a
+                        // bucket whose `valid_time` disagrees with its `bucket_start`.)
+                        matches!(occurrence_bucket_start(&br.record), Some(t) if bucket_hour_intersects_window(t, from, to))
                     }
                 } else if section.class == EvidenceClass::ErrorSignatures.as_wire()
                     && matches!(&br.record, GraphRecord::Edge { label, .. } if label.as_str() == "FRAME_RESOLVES_TO")
@@ -12012,6 +12225,448 @@ mod pack340_tests {
         );
     }
 
+    // ── Codex #387 follow-up (#374/#375): assemble-side malformed-bucket exclusion ─
+    // The new verify_pack rejections (#374 conflicting AGGREGATES attribution, #375
+    // node valid_time disagreeing with payload bucket_start) meant assemble_pack could
+    // emit a pack its OWN verify rejects on malformed source input, breaking the
+    // assemble<->verify-clean invariant. assemble_pack now EXCLUDES + DIAGNOSES those
+    // buckets during assembly, exactly as it already does for unattributed buckets.
+
+    /// A minimal fixture: two signatures, one clean attributed in-window bucket, and
+    /// one in-window bucket whose AGGREGATES edges name TWO DIFFERENT signatures
+    /// (conflicting attribution, issue #374).
+    fn records_with_conflicting_attribution_bucket() -> Vec<GraphRecord> {
+        let mut records = vec![
+            error_signature(
+                "log:v1:sigc1",
+                "error",
+                "boom one",
+                "2026-03-02T00:00:00Z",
+                "2026-03-02T05:00:00Z",
+                10,
+                Some(Vec::new()),
+            ),
+            error_signature(
+                "log:v1:sigc2",
+                "error",
+                "boom two",
+                "2026-03-02T00:00:00Z",
+                "2026-03-02T05:00:00Z",
+                20,
+                Some(Vec::new()),
+            ),
+        ];
+        // A clean, singly-attributed in-window bucket.
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:bc-ok",
+            "2026-03-02T00:00:00Z",
+            3,
+        ));
+        records.push(super::fixture::aggregates("log:v1:bc-ok", "log:v1:sigc1"));
+        // A CONFLICTING in-window bucket: AGGREGATES to TWO distinct signatures.
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:bc-conflict",
+            "2026-03-02T01:00:00Z",
+            99,
+        ));
+        records.push(super::fixture::aggregates(
+            "log:v1:bc-conflict",
+            "log:v1:sigc1",
+        ));
+        records.push(super::fixture::aggregates(
+            "log:v1:bc-conflict",
+            "log:v1:sigc2",
+        ));
+        records
+    }
+
+    /// A minimal fixture: one signature, one clean attributed in-window bucket, and
+    /// one in-window bucket whose payload `bucket_start` is in-window but whose node
+    /// `valid_time` is a DIFFERENT in-window instant (issue #375).
+    fn records_with_valid_time_mismatch_bucket() -> Vec<GraphRecord> {
+        let mut records = vec![error_signature(
+            "log:v1:sigm",
+            "error",
+            "boom",
+            "2026-03-02T00:00:00Z",
+            "2026-03-02T05:00:00Z",
+            10,
+            Some(Vec::new()),
+        )];
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:bm-ok",
+            "2026-03-02T00:00:00Z",
+            3,
+        ));
+        records.push(super::fixture::aggregates("log:v1:bm-ok", "log:v1:sigm"));
+        // In-window `bucket_start`, but node `valid_time` stamped to a DIFFERENT
+        // in-window instant (the `occurrence_bucket` helper stamps them equal, so
+        // overwrite the node valid_time here).
+        let mut mismatch =
+            super::fixture::occurrence_bucket("log:v1:bm-mismatch", "2026-03-02T01:00:00Z", 99);
+        if let GraphRecord::Node {
+            valid_time,
+            temporal,
+            ..
+        } = &mut mismatch
+        {
+            *temporal = None;
+            *valid_time = Some("2026-03-20T00:00:00Z".to_owned());
+        } else {
+            panic!("occurrence_bucket builds a node");
+        }
+        records.push(mismatch);
+        records.push(super::fixture::aggregates(
+            "log:v1:bm-mismatch",
+            "log:v1:sigm",
+        ));
+        records
+    }
+
+    /// A minimal fixture: one signature, one clean attributed in-window bucket, and
+    /// one in-window bucket (by payload `bucket_start`) whose node `valid_time` is
+    /// ABSENT (issue #375, routed to the shared `missing_valid_time` exclusion).
+    fn records_with_missing_valid_time_bucket() -> Vec<GraphRecord> {
+        let mut records = vec![error_signature(
+            "log:v1:sign",
+            "error",
+            "boom",
+            "2026-03-02T00:00:00Z",
+            "2026-03-02T05:00:00Z",
+            10,
+            Some(Vec::new()),
+        )];
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:bn-ok",
+            "2026-03-02T00:00:00Z",
+            3,
+        ));
+        records.push(super::fixture::aggregates("log:v1:bn-ok", "log:v1:sign"));
+        // In-window `bucket_start`, but the node carries NO resolvable valid time.
+        let mut missing =
+            super::fixture::occurrence_bucket("log:v1:bn-missing", "2026-03-02T01:00:00Z", 99);
+        if let GraphRecord::Node {
+            valid_time,
+            valid_time_source,
+            temporal,
+            executed_at,
+            ..
+        } = &mut missing
+        {
+            *valid_time = None;
+            *valid_time_source = None;
+            *temporal = None;
+            *executed_at = None;
+        } else {
+            panic!("occurrence_bucket builds a node");
+        }
+        records.push(missing);
+        records.push(super::fixture::aggregates(
+            "log:v1:bn-missing",
+            "log:v1:sign",
+        ));
+        records
+    }
+
+    /// A minimal fixture: one signature, one clean attributed in-window bucket, and
+    /// one bucket whose payload `bucket_start` is UNPARSABLE but whose node
+    /// `valid_time` is a resolvable in-window RFC3339 instant (Codex #387 round-2,
+    /// issues #374/#375). This is a DISTINCT defect from missing-valid-time: the
+    /// valid time resolves fine, so `valid_time_unresolved` is false and
+    /// `derive_gaps` emits no `missing_valid_time` gap for it — therefore it must
+    /// NOT be counted in `excluded_missing_valid_time` nor diagnosed
+    /// `missing_valid_time`, but under its own `malformed_bucket_start` diagnostic.
+    fn records_with_malformed_bucket_start() -> Vec<GraphRecord> {
+        let mut records = vec![error_signature(
+            "log:v1:sigx",
+            "error",
+            "boom",
+            "2026-03-02T00:00:00Z",
+            "2026-03-02T05:00:00Z",
+            10,
+            Some(Vec::new()),
+        )];
+        records.push(super::fixture::occurrence_bucket(
+            "log:v1:bx-ok",
+            "2026-03-02T00:00:00Z",
+            3,
+        ));
+        records.push(super::fixture::aggregates("log:v1:bx-ok", "log:v1:sigx"));
+        // Node `valid_time` stays the in-window instant the helper stamped; only the
+        // PAYLOAD `bucket_start` is overwritten to an unparsable string.
+        let mut malformed =
+            super::fixture::occurrence_bucket("log:v1:bx-malformed", "2026-03-02T01:00:00Z", 99);
+        if let GraphRecord::Node { log: Some(p), .. } = &mut malformed {
+            if let crate::ir::LogPayload::LogOccurrenceBucket(payload) = p.as_mut() {
+                payload.bucket_start = "not-a-timestamp".to_owned();
+            } else {
+                panic!("occurrence_bucket builds a LogOccurrenceBucket payload");
+            }
+        } else {
+            panic!("occurrence_bucket builds a node with a log payload");
+        }
+        records.push(malformed);
+        records.push(super::fixture::aggregates(
+            "log:v1:bx-malformed",
+            "log:v1:sigx",
+        ));
+        records
+    }
+
+    #[test]
+    fn assemble_excludes_conflicting_attribution_bucket_and_passes_verify() {
+        let records = records_with_conflicting_attribution_bucket();
+        let pack = assemble_cc73(&records);
+        // (a) The invariant: assemble output passes its OWN offline verify.
+        let report = verify_pack(&pack);
+        assert!(
+            report.ok,
+            "assemble<->verify consistency for a conflicting-attribution source: {:?} / {:?}",
+            report.integrity, report.window_consistency
+        );
+        let sec = section(&pack, EvidenceClass::OccurrenceBuckets);
+        // (b) The conflicting bucket is excluded from the section records.
+        assert!(
+            !sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:bc-conflict"),
+            "conflicting bucket excluded from section records"
+        );
+        // (c) ... and from the summary totals.
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        assert!(
+            signature_totals.iter().all(|t| t
+                .buckets
+                .iter()
+                .all(|b| b.bucket_id != "log:v1:bc-conflict")),
+            "conflicting bucket excluded from the summary"
+        );
+        // (d) ... under a `conflicting_bucket_attribution` diagnostic naming it.
+        assert!(
+            pack.diagnostics
+                .iter()
+                .any(|d| d.code == "conflicting_bucket_attribution"
+                    && d.evidence_class.as_deref() == Some("occurrence_buckets")
+                    && d.record_ids.iter().any(|id| id == "log:v1:bc-conflict")),
+            "conflicting bucket tallied under a diagnostic: {:?}",
+            pack.diagnostics
+        );
+        // The clean bucket is retained.
+        assert!(
+            sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:bc-ok"),
+            "clean attributed bucket retained"
+        );
+    }
+
+    #[test]
+    fn assemble_excludes_bucket_with_valid_time_mismatch_and_passes_verify() {
+        let records = records_with_valid_time_mismatch_bucket();
+        let pack = assemble_cc73(&records);
+        let report = verify_pack(&pack);
+        assert!(
+            report.ok,
+            "assemble<->verify consistency for a valid_time-mismatch source: {:?} / {:?}",
+            report.integrity, report.window_consistency
+        );
+        let sec = section(&pack, EvidenceClass::OccurrenceBuckets);
+        assert!(
+            !sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:bm-mismatch"),
+            "valid_time-mismatch bucket excluded from section records"
+        );
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        assert!(
+            signature_totals.iter().all(|t| t
+                .buckets
+                .iter()
+                .all(|b| b.bucket_id != "log:v1:bm-mismatch")),
+            "valid_time-mismatch bucket excluded from the summary"
+        );
+        assert!(
+            pack.diagnostics
+                .iter()
+                .any(|d| d.code == "bucket_valid_time_mismatch"
+                    && d.evidence_class.as_deref() == Some("occurrence_buckets")
+                    && d.record_ids.iter().any(|id| id == "log:v1:bm-mismatch")),
+            "valid_time-mismatch bucket tallied under a diagnostic: {:?}",
+            pack.diagnostics
+        );
+        assert!(
+            sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:bm-ok"),
+            "clean bucket retained"
+        );
+    }
+
+    #[test]
+    fn assemble_excludes_bucket_with_missing_valid_time_and_passes_verify() {
+        let records = records_with_missing_valid_time_bucket();
+        let pack = assemble_cc73(&records);
+        let report = verify_pack(&pack);
+        assert!(
+            report.ok,
+            "assemble<->verify consistency for a missing-valid_time source: {:?} / {:?}",
+            report.integrity, report.window_consistency
+        );
+        let sec = section(&pack, EvidenceClass::OccurrenceBuckets);
+        assert!(
+            !sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:bn-missing"),
+            "missing-valid_time bucket excluded from section records"
+        );
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        assert!(
+            signature_totals
+                .iter()
+                .all(|t| t.buckets.iter().all(|b| b.bucket_id != "log:v1:bn-missing")),
+            "missing-valid_time bucket excluded from the summary"
+        );
+        assert!(
+            pack.diagnostics
+                .iter()
+                .any(|d| d.code == "missing_valid_time"
+                    && d.evidence_class.as_deref() == Some("occurrence_buckets")
+                    && d.record_ids.iter().any(|id| id == "log:v1:bn-missing")),
+            "missing-valid_time bucket tallied under a diagnostic: {:?}",
+            pack.diagnostics
+        );
+        assert!(
+            sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:bn-ok"),
+            "clean bucket retained"
+        );
+        // Codex #387 round-2 contract: the counted+diagnosed missing-time set MUST
+        // equal the gapped set. This genuinely-`valid_time_unresolved` bucket is in
+        // all three: excluded_missing_valid_time == 1, one `missing_valid_time`
+        // diagnostic, one `missing_valid_time` gap row, all naming it.
+        assert_eq!(
+            pack.manifest.excluded_missing_valid_time, 1,
+            "genuine missing-valid_time bucket counted"
+        );
+        let mvt_diags = pack
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "missing_valid_time")
+            .count();
+        let mvt_gaps = pack
+            .gaps
+            .iter()
+            .filter(|g| g.gap_class == "missing_valid_time")
+            .count();
+        assert_eq!(
+            mvt_diags, mvt_gaps,
+            "counted+diagnosed missing-time set must equal the gapped set: {mvt_diags} diags vs {mvt_gaps} gaps"
+        );
+        assert_eq!(mvt_diags, 1, "exactly the one genuine missing-time record");
+        assert!(
+            pack.gaps.iter().any(|g| g.gap_class == "missing_valid_time"
+                && g.record_ids.iter().any(|id| id == "log:v1:bn-missing")),
+            "genuine missing-valid_time bucket gets a matching gap row: {:?}",
+            pack.gaps
+        );
+    }
+
+    #[test]
+    fn assemble_excludes_bucket_with_malformed_bucket_start_and_passes_verify() {
+        let records = records_with_malformed_bucket_start();
+        let pack = assemble_cc73(&records);
+        // (a) The invariant: assemble output passes its OWN offline verify.
+        let report = verify_pack(&pack);
+        assert!(
+            report.ok,
+            "assemble<->verify consistency for a malformed-bucket_start source: {:?} / {:?}",
+            report.integrity, report.window_consistency
+        );
+        let sec = section(&pack, EvidenceClass::OccurrenceBuckets);
+        // (b) The malformed bucket is excluded from the section records ...
+        assert!(
+            !sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:bx-malformed"),
+            "malformed-bucket_start bucket excluded from section records"
+        );
+        // ... and from the summary totals.
+        let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
+        else {
+            panic!("occurrence_buckets summary present");
+        };
+        assert!(
+            signature_totals.iter().all(|t| t
+                .buckets
+                .iter()
+                .all(|b| b.bucket_id != "log:v1:bx-malformed")),
+            "malformed-bucket_start bucket excluded from the summary"
+        );
+        // (c) ... under a NEW `malformed_bucket_start` diagnostic naming it.
+        assert!(
+            pack.diagnostics
+                .iter()
+                .any(|d| d.code == "malformed_bucket_start"
+                    && d.evidence_class.as_deref() == Some("occurrence_buckets")
+                    && d.record_ids.iter().any(|id| id == "log:v1:bx-malformed")),
+            "malformed bucket tallied under a malformed_bucket_start diagnostic: {:?}",
+            pack.diagnostics
+        );
+        // (d) It is NOT routed through the missing-valid-time path: no
+        // `missing_valid_time` diagnostic names it and it is not counted there.
+        assert!(
+            !pack
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "missing_valid_time"
+                    && d.record_ids.iter().any(|id| id == "log:v1:bx-malformed")),
+            "malformed bucket must NOT get a missing_valid_time diagnostic: {:?}",
+            pack.diagnostics
+        );
+        assert_eq!(
+            pack.manifest.excluded_missing_valid_time, 0,
+            "malformed bucket_start must not count as excluded_missing_valid_time"
+        );
+        // (e) The contract at the heart of the finding: the malformed bucket
+        // contributes to NEITHER the missing-time diagnostics NOR the missing-time
+        // gaps, and those two sets stay equal (0 == 0 here).
+        let mvt_diags = pack
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "missing_valid_time")
+            .count();
+        let mvt_gaps = pack
+            .gaps
+            .iter()
+            .filter(|g| g.gap_class == "missing_valid_time")
+            .count();
+        assert_eq!(
+            mvt_diags, mvt_gaps,
+            "counted+diagnosed missing-time set must equal the gapped set: {mvt_diags} diags vs {mvt_gaps} gaps"
+        );
+        assert_eq!(
+            mvt_diags, 0,
+            "malformed bucket_start contributes to neither missing-time diags nor gaps"
+        );
+        // The clean bucket is retained.
+        assert!(
+            sec.records
+                .iter()
+                .any(|br| br.record.id() == "log:v1:bx-ok"),
+            "clean bucket retained"
+        );
+    }
+
     // ── Codex round-6 P2: concatenated multi-scan coalescing ─────────────────
     // A `LogSource` is a NON-identity input, so the SAME repo's `scan-logs` output
     // concatenated (a documented, legitimate multi-scan workflow) carries the same
@@ -12215,6 +12870,12 @@ mod pack340_tests {
             records_with_unattributed_bucket(),
             concatenated_multi_scan_records(),
             two_scan_differing_extents_records(),
+            // Malformed-bucket fixtures (Codex #387 follow-up, issues #374/#375):
+            // assemble must self-consistently exclude these and still verify clean.
+            records_with_conflicting_attribution_bucket(),
+            records_with_valid_time_mismatch_bucket(),
+            records_with_missing_valid_time_bucket(),
+            records_with_malformed_bucket_start(),
         ];
         for records in &fixtures {
             for control in ["CC7.2", "CC7.3"] {
@@ -12615,6 +13276,105 @@ mod pack340_tests {
                 "frame-resolution mutation `{name}` must fail Integrity (hash recomputed)"
             );
         }
+    }
+
+    // Issue #374: verify must reject an occurrence bucket carrying CONFLICTING
+    // co-located `AGGREGATES` attribution edges naming two DIFFERENT signatures,
+    // even when the filed signature is one of them — otherwise a consumer reads a
+    // single bucket's occurrences against two incidents.
+    #[test]
+    fn verify_rejects_bucket_with_conflicting_aggregates_edges() {
+        let mut pack = assemble_cc73(&build_log_incident_records());
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "fixture pack verifies clean before mutation"
+        );
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        // `log:v1:b1-00` is a real in-window bucket already attributed to
+        // `log:v1:sig1`; inject a SECOND `AGGREGATES` edge naming a DIFFERENT real
+        // signature (`log:v1:sig2`).
+        let edge = super::fixture::aggregates("log:v1:b1-00", "log:v1:sig2");
+        let scrubbed = scrub_log_node_text(scrub_record(edge));
+        let json = serde_json::to_string(&scrubbed).unwrap();
+        let hash = blake3::hash(json.as_bytes()).to_string();
+        sec.records.push(BundleRecord {
+            record: scrubbed,
+            hash,
+        });
+        sec.records
+            .sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
+        sec.record_count = sec.records.len();
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "conflicting AGGREGATES attribution must fail Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(
+            report.integrity.detail.contains("conflicting"),
+            "{}",
+            report.integrity.detail
+        );
+    }
+
+    // Issue #375: verify Integrity must reject an occurrence bucket whose node
+    // `valid_time` disagrees with its payload `bucket_start`. The window decision
+    // keys on `bucket_start`, so a tampered graph could otherwise smuggle an
+    // out-of-window bucket in by stamping an in-window `valid_time` over an
+    // out-of-window `bucket_start`.
+    #[test]
+    fn verify_rejects_bucket_valid_time_disagreeing_with_bucket_start() {
+        let mut pack = assemble_cc73(&build_log_incident_records());
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "fixture pack verifies clean before mutation"
+        );
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::OccurrenceBuckets.as_wire())
+            .expect("occurrence_buckets section");
+        // Rewrite `log:v1:b1-00`'s node valid_time to a DIFFERENT in-window instant
+        // while leaving its payload `bucket_start` untouched (so the summary
+        // hour-bind and the window predicate — both keyed on `bucket_start` — still
+        // pass), then rehash the row.
+        {
+            let br = sec
+                .records
+                .iter_mut()
+                .find(|br| br.record.id() == "log:v1:b1-00")
+                .expect("b1-00 present in occurrence_buckets section");
+            if let GraphRecord::Node {
+                valid_time,
+                temporal,
+                ..
+            } = &mut br.record
+            {
+                *temporal = None;
+                *valid_time = Some("2026-03-20T00:00:00Z".to_owned());
+            } else {
+                panic!("b1-00 is a node");
+            }
+            let json = serde_json::to_string(&br.record).unwrap();
+            br.hash = blake3::hash(json.as_bytes()).to_string();
+        }
+        sec.records
+            .sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "valid_time != bucket_start must fail Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(
+            report.integrity.detail.contains("bucket_start"),
+            "{}",
+            report.integrity.detail
+        );
     }
 
     // ── Binding-surface boundary for the non-node-backed fields ───────────────
