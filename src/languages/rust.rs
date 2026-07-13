@@ -1,6 +1,9 @@
 //! Rust Tree-sitter extraction.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use tree_sitter::{Node, Parser};
 
@@ -13,7 +16,10 @@ use crate::{
             SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, node_name,
             path_segments, reference_text, span,
         },
-        cross_file::{CallKind, CallSiteFact, DefinitionFact, FileFacts, OutOfLineModFact},
+        cross_file::{
+            CallKind, CallSiteFact, DefinitionFact, FileFacts, ImplTargetFact, OutOfLineModFact,
+            PendingImplFact,
+        },
     },
     redaction::REDACTION_POLICY_VERSION,
 };
@@ -106,11 +112,19 @@ struct ImplContext {
 /// An impl whose trait lookup is deferred until the whole file is indexed:
 /// Rust item order is insignificant, so a trait defined after its impl must
 /// edge-back all the same. Captures the module scope the impl was walked in.
+///
+/// The IMPLEMENTS-resolution `decision` is computed at walk time directly from
+/// the Tree-sitter `impl_item` node (issue #343/#344), not re-derived from the
+/// display string later: the AST fields (`trait`, `type`, `type_parameters`)
+/// bound the header structurally, so a return arrow in a binder bound
+/// (`impl<T: Fn() -> u32> Target for Wrapper<T>`), a spaced binder, or a
+/// reference/pointer blanket target can never leak across the trait/`for` split.
 #[derive(Debug, Clone)]
 struct PendingImplEdge {
     source_id: String,
     display: String,
     module_names: Vec<String>,
+    decision: ImplTargetDecision,
 }
 
 struct RustExtractor<'graph, 'source> {
@@ -135,6 +149,16 @@ struct RustExtractor<'graph, 'source> {
     /// from another module) consults this instead of `definitions`, so a
     /// later value-namespace item (`fn T()`) can never capture an impl edge.
     type_definitions: BTreeMap<String, String>,
+    /// Simple names each `use` declaration binds into scope, keyed by the
+    /// module chain (`module_names`) in force where the `use` appears — the
+    /// same chain an impl records — so an import in a scope `S` is visible to
+    /// an impl whose chain has `S` as a prefix (the impl's own module and its
+    /// descendants). Drives the AST-derived IMPORT-SHADOW VETO on both
+    /// IMPLEMENTS resolution paths (issues #343/#344 round 9): a bare
+    /// trait/type name shadowed by a same-final-segment `use` refers to the
+    /// import, not any local same-name definition, so the impl is left
+    /// unresolved (correct import-aware resolution is follow-up #393).
+    imports_by_scope: BTreeMap<Vec<String>, BTreeSet<String>>,
     /// Impl trait lookups deferred to after the walk (source order).
     pending_impl_edges: Vec<PendingImplEdge>,
     symbol_bodies: Vec<SymbolBody>,
@@ -178,6 +202,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             definitions: BTreeMap::new(),
             qualified_definitions: BTreeMap::new(),
             type_definitions: BTreeMap::new(),
+            imports_by_scope: BTreeMap::new(),
             pending_impl_edges: Vec::new(),
             symbol_bodies: Vec::new(),
             symbol_ordinals: BTreeMap::new(),
@@ -360,6 +385,27 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     fn extract_import(&mut self, node: Node<'_>) {
+        // Record the simple names this `use` binds into the current module
+        // scope for the import-shadow veto (issues #343/#344 round 9). Keyed by
+        // the live module chain so visibility follows module nesting.
+        //
+        // Only a MODULE-ITEM `use` feeds the veto: a `use` inside a function
+        // body / block / expression is invisible at module level, so it must
+        // never shadow a module-level impl's bare trait name (round-10 Codex
+        // finding). A module item's `use_declaration` sits directly under the
+        // `source_file` root or a `mod_item`'s `declaration_list` body; a
+        // block-local `use` sits under a `block`, so its parent kind reveals
+        // the difference. Non-module-item imports still emit their Import node
+        // and IMPORTS edge below — only the veto index skips them.
+        if is_module_item_use(node) {
+            let bound = self.collect_use_bound_names(node);
+            if !bound.is_empty() {
+                self.imports_by_scope
+                    .entry(self.module_names.clone())
+                    .or_default()
+                    .extend(bound);
+            }
+        }
         let name = import_name(self.node_text(node));
         let id = stable_id(&[
             "node",
@@ -394,6 +440,24 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         );
     }
 
+    /// Collects the simple names a `use` declaration binds into its enclosing
+    /// scope. Thin `&self` wrapper over the free [`use_bound_names`] worker so
+    /// the same AST walk is unit-testable in isolation.
+    fn collect_use_bound_names(&self, node: Node<'_>) -> Vec<String> {
+        use_bound_names(node, self.source)
+    }
+
+    /// Reports whether a `use` import visible in the impl's module scope binds
+    /// the bare simple name `bare`. Thin `&self` wrapper over the free
+    /// [`scope_imports_bare_name`] predicate — the SINGLE shared answer behind
+    /// the import-shadow veto on BOTH IMPLEMENTS resolution paths (the local
+    /// per-file resolver consults it directly, the deferred cross-file pass
+    /// reads it off `PendingImplFact::shadowed_by_use`), so the two paths can
+    /// never diverge (issues #343/#344 round 9).
+    fn scope_imports_bare_name(&self, module_names: &[String], bare: &str) -> bool {
+        scope_imports_bare_name(&self.imports_by_scope, module_names, bare)
+    }
+
     fn extract_named_symbol(&mut self, node: Node<'_>, symbol_kind: &str) {
         let Some(local_name) = node_name(node, self.source) else {
             self.walk_children(node);
@@ -407,6 +471,15 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         // key spaces: value-namespace items (`const`, `static`, functions)
         // must never shadow a trait or type in impl trait resolution.
         if is_impl_target_kind(symbol_kind) {
+            // Export this trait/type for the repo-wide cross-file IMPLEMENTS
+            // pass (issue #344), keyed on the crate-root-relative qualified
+            // name so an out-of-line impl in another file can resolve to it.
+            self.facts.impl_targets.push(ImplTargetFact {
+                id: id.clone(),
+                qualified_name: qualified_name.clone(),
+                module_path: self.module_names.clone(),
+                symbol_kind: symbol_kind.to_owned(),
+            });
             self.qualified_definitions
                 .insert(qualified_name, id.clone());
             self.type_definitions.insert(local_name, id);
@@ -600,6 +673,11 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let id = self.add_symbol(node, "impl", &qualified_name);
         self.definitions.insert(qualified_name, id.clone());
 
+        // Compute the IMPLEMENTS-resolution decision now, from the AST node,
+        // while the parse tree is in hand — never re-parsed from the display
+        // string later (issue #343/#344).
+        let decision = impl_target_decision(node, self.source, &display);
+
         // The trait lookup is deferred until the whole file is indexed
         // (`resolve_pending_impl_edges`): Rust item order is insignificant,
         // so a trait defined after this impl must edge-back all the same.
@@ -607,6 +685,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             source_id: id.clone(),
             display: display.clone(),
             module_names: self.module_names.clone(),
+            decision,
         });
 
         let previous = self.impl_context.replace(ImplContext {
@@ -1106,33 +1185,74 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     fn resolve_pending_impl_edges(&mut self) {
         let pending = std::mem::take(&mut self.pending_impl_edges);
         for entry in pending {
-            if let Some(target) = self.impl_target_id(&entry.display, &entry.module_names) {
-                self.add_edge(
-                    EdgeLabel::Implements,
-                    entry.source_id,
-                    target,
-                    format!("{} implementation relationship", entry.display),
-                );
+            // The resolution decision was computed at walk time from the AST
+            // node (`impl_target_decision`), covering `unsafe impl ...`,
+            // non-generic headers, and generic headers (`impl<T> Trait for
+            // Type<T>`, `impl GenP<u32> for Plain`) uniformly (issue #343).
+            match entry.decision.clone() {
+                ImplTargetDecision::Resolve(trait_name) => {
+                    if let Some(target) =
+                        self.resolve_impl_trait_locally(&trait_name, &entry.module_names)
+                    {
+                        self.add_edge(
+                            EdgeLabel::Implements,
+                            entry.source_id,
+                            target,
+                            format!("{} implementation relationship", entry.display),
+                        );
+                    } else {
+                        // The trait/type is not defined in THIS file. Defer to
+                        // the repo-wide cross-file IMPLEMENTS pass (issue #344),
+                        // which retries the same trait path against every
+                        // file's exported trait/type definitions. Local
+                        // resolution always wins, so a resolved edge here is
+                        // never re-emitted cross-file.
+                        //
+                        // Carry the AST-derived import-shadow verdict forward:
+                        // when this bare trait/type name is shadowed by a `use`
+                        // visible in the impl's module scope, the cross-file
+                        // resolver must veto it too (name refers to the import),
+                        // so the two paths share one answer via the same
+                        // predicate (issues #343/#344 round 9, follow-up #393).
+                        let shadowed_by_use = !trait_name.contains("::")
+                            && self.scope_imports_bare_name(&entry.module_names, &trait_name);
+                        self.facts.pending_impls.push(PendingImplFact {
+                            source_id: entry.source_id,
+                            trait_path: trait_name,
+                            module_names: entry.module_names,
+                            shadowed_by_use,
+                        });
+                    }
+                }
+                ImplTargetDecision::Verbatim => {
+                    // A generic inherent impl (`impl<T> Type<T>`, no `for`
+                    // clause) names no trait to reach. Keep the recorded
+                    // self-referential edge via the verbatim display key:
+                    // space-containing display keys never collide with
+                    // identifier names. No cross-file lookup (no trait named).
+                    if let Some(target) = self.definitions.get(entry.display.trim()).cloned() {
+                        self.add_edge(
+                            EdgeLabel::Implements,
+                            entry.source_id,
+                            target,
+                            format!("{} implementation relationship", entry.display),
+                        );
+                    }
+                }
+                // A blanket impl (`impl<T> Trait for T`) whose `for` target is
+                // a bare binder type parameter covers every type and has no
+                // single implementing-type record; it mints no IMPLEMENTS edge.
+                ImplTargetDecision::NoEdge => {}
             }
         }
     }
 
-    fn impl_target_id(&self, display: &str, module_names: &[String]) -> Option<String> {
-        // `unsafe impl Trait for Type` is an ordinary non-generic impl behind
-        // a keyword prefix; strip it so the trait lookup matches the plain
-        // `impl Trait for Type` path.
-        let header = display.strip_prefix("unsafe ").unwrap_or(display);
-        let Some(target) = header
-            .strip_prefix("impl ")
-            .map(|rest| rest.split(" for ").next().unwrap_or(rest).trim())
-        else {
-            // A generic header (`impl<T> ...`) is not parsed in this slice.
-            // The legacy verbatim lookup stays: it can only match another
-            // impl display (space-containing keys never collide with
-            // identifier names), preserving the recorded self-referential
-            // edge for generic inherent impls.
-            return self.definitions.get(display.trim()).cloned();
-        };
+    /// Resolves a normalized impl trait path against THIS file's indexed
+    /// trait/type definitions only, returning the target record ID when the
+    /// trait is defined locally. A miss means the trait is defined in another
+    /// file (or is external) and the impl is deferred to the repo-wide
+    /// cross-file pass (issue #344).
+    fn resolve_impl_trait_locally(&self, target: &str, module_names: &[String]) -> Option<String> {
         if target.contains("::") {
             // An absolute `crate::`/`self::`/`super::` path resolves against
             // the module-qualified key space only: a nested symbol's
@@ -1162,26 +1282,120 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             // never capture an IMPLEMENTS edge.
             return None;
         }
-        // An unqualified trait name resolves in the impl's module scope
-        // first, walking outward to the crate root through the
+        if target.contains("::") {
+            // An absolute `crate::`/`self::`/`super::` path resolves against
+            // the module-qualified key space only: a nested symbol's
+            // bare-name alias in `definitions` must never shadow the root
+            // item the path denotes.
+            if let Some(normalized) = Self::normalize_local_trait_path(target, module_names) {
+                return self.qualified_definitions.get(&normalized).cloned();
+            }
+            // A relative qualified path (`sibling::T`) resolves in the
+            // impl's module scope first, walking outward to the crate root
+            // (`m::sibling::T`, then `sibling::T`) — mirroring the
+            // unqualified scope walk. Cross-crate paths (`std::fmt::Debug`)
+            // match nothing and stay unresolved.
+            for depth in (0..=module_names.len()).rev() {
+                let candidate = if depth == 0 {
+                    target.to_owned()
+                } else {
+                    format!("{}::{target}", module_names[..depth].join("::"))
+                };
+                if let Some(id) = self.qualified_definitions.get(&candidate) {
+                    return Some(id.clone());
+                }
+            }
+            // No general `definitions` fallback here: beyond the qualified
+            // impl-target keys the scope walk already checked, that map
+            // holds only value-namespace and callable names, which must
+            // never capture an IMPLEMENTS edge.
+            return None;
+        }
+        // Own-module definition wins at depth 0 BEFORE the veto (round-10 Codex
+        // finding): a trait/type defined in the impl's OWN module binds a bare
+        // name directly. In real Rust a same-module `use Name` PLUS a same-module
+        // `item Name` is a name collision (a compile error), so trusting the
+        // own-module definition here is safe and never masks a valid import —
+        // and it keeps an ancestor/root `use` from ever suppressing an impl of a
+        // same-named trait declared IN this module.
+        let own_scope_candidate = if module_names.is_empty() {
+            target.to_owned()
+        } else {
+            format!("{}::{target}", module_names.join("::"))
+        };
+        if let Some(id) = self.qualified_definitions.get(&own_scope_candidate) {
+            return Some(id.clone());
+        }
+        // Import-shadow veto (issues #343/#344): a module-item `use` in the
+        // impl's OWN module scope whose final bound segment equals this bare name
+        // means the bare name refers to the IMPORT, not any outward same-name
+        // definition. Leave the impl unresolved rather than walk outward to a
+        // shallower/root same-name def — this is the AST-derived, name-shadow
+        // boolean that closes the bare-name wrong-edge family (external/std
+        // imports the local index cannot see AND non-root local aliases alike),
+        // a strict generalization of the round-8 same-name ambiguity guard
+        // below. Only the impl's own module scope is consulted (Rust `use`
+        // visibility is not inherited) and only module-item imports feed it, so
+        // block-local and ancestor-scope imports never fire. A qualified path
+        // never reaches here, so this only vetoes bare names. Correct
+        // import-aware resolution is follow-up #393.
+        if self.scope_imports_bare_name(module_names, target) {
+            return None;
+        }
+        // The own-module level was already checked above; now walk OUTWARD from
+        // the nearest enclosing module to the crate root through the
         // qualified-only key space, so a same-named trait in an unrelated
-        // nested module can never shadow the in-scope one via its bare
-        // alias.
-        for depth in (0..=module_names.len()).rev() {
+        // nested module can never shadow the in-scope one via its bare alias.
+        for depth in (0..module_names.len()).rev() {
             let candidate = if depth == 0 {
                 target.to_owned()
             } else {
                 format!("{}::{target}", module_names[..depth].join("::"))
             };
             if let Some(id) = self.qualified_definitions.get(&candidate) {
+                // A match found only by walking OUTWARD to a shallower/root
+                // module is the exact shape of the round-8 finding: `mod m { use
+                // crate::a::T; impl T for X }` scope-walks bare `T` past the
+                // (absent) `m::T` and binds the ROOT `T`, but the `use` alias
+                // means `a::T`. When such an outward bind's simple name is
+                // ambiguous across this file's impl-target definitions (root `T`
+                // AND `a::T`), a `use` alias could redirect it, so leave it
+                // unresolved rather than mint a WRONG edge — the local/inline
+                // analog of the cross-file guard, sharing its counting predicate
+                // ([`bare_simple_name_is_ambiguous`]) so the two never diverge.
+                if self.bare_name_is_ambiguous(target) {
+                    return None;
+                }
                 return Some(id.clone());
             }
         }
         // Final fallback: the bare alias still covers names the scope walk
         // cannot see, such as use-imported traits from another module — but
         // only through the type-namespace view, so a later value-namespace
-        // item (`fn T()`) can never capture the edge.
+        // item (`fn T()`) can never capture the edge. This lookup is inherently
+        // an outward/foreign bind (the scope walk already missed every
+        // in-scope module), so the same-name ambiguity guard applies here too:
+        // an ambiguous bare alias (`a::T` AND `b::T`, no in-scope `T`) picks one
+        // arbitrarily by insertion order, exactly the WRONG-edge class the guard
+        // closes.
+        if self.bare_name_is_ambiguous(target) {
+            return None;
+        }
         self.type_definitions.get(target).cloned()
+    }
+
+    /// Reports whether the bare simple name `target` is ambiguous across THIS
+    /// file's impl-target definitions — more than one distinct qualified name
+    /// (root `T`, `a::T`, …) shares it. Delegates to the shared
+    /// [`bare_simple_name_is_ambiguous`] counting predicate over the
+    /// impl-target-only `qualified_definitions` key space (already
+    /// [`is_impl_target_kind`]-filtered at insertion), so the local guard and
+    /// the cross-file guard count the same target-kinds the same way.
+    fn bare_name_is_ambiguous(&self, target: &str) -> bool {
+        bare_simple_name_is_ambiguous(
+            target,
+            self.qualified_definitions.keys().map(String::as_str),
+        )
     }
 
     /// Resolves a `crate::` / `self::` / `super::` qualifier on an impl's
@@ -1580,8 +1794,502 @@ fn import_name(text: &str) -> String {
 /// Returns `true` when a symbol of this kind can be the target of an
 /// `IMPLEMENTS` edge: traits and type-defining items. Value-namespace items
 /// (`const`, `static`) and callables never qualify.
-fn is_impl_target_kind(symbol_kind: &str) -> bool {
+///
+/// Shared with the cross-file IMPLEMENTS resolver so its ambiguity guard and
+/// this extractor's target-kind gate never diverge a target-kind at a time.
+pub(crate) fn is_impl_target_kind(symbol_kind: &str) -> bool {
     matches!(symbol_kind, "trait" | "struct" | "enum" | "type_alias")
+}
+
+/// Reports whether more than one distinct qualified name in `qualified_names`
+/// ends in the bare simple name `simple`.
+///
+/// This is the single COUNTING predicate behind the same-name ambiguity bound
+/// on BOTH IMPLEMENTS resolution paths — the local per-file resolver
+/// ([`RustExtractor::resolve_impl_trait_locally`]) and the repo-wide cross-file
+/// pass (`ImplTargetIndex::bare_simple_name_is_ambiguous`) — so neither guard
+/// can drift a target-kind or a counting rule from the other one entry point at
+/// a time. Callers pass only impl-target-kind qualified names
+/// ([`is_impl_target_kind`]), so a value-namespace collision never triggers it.
+///
+/// A bare (unqualified) reference whose simple name is ambiguous cannot be
+/// disambiguated without import-aware (`use`-decl) resolution, which is outside
+/// this slice's documented `local_traits_only` bound (follow-up #393): when it
+/// would otherwise bind to a same-named ROOT/outer definition that a `use`
+/// alias could actually redirect elsewhere, the caller leaves it unresolved
+/// rather than mint a WRONG-target edge.
+pub(crate) fn bare_simple_name_is_ambiguous<'a>(
+    simple: &str,
+    qualified_names: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let mut matches = 0usize;
+    for qualified in qualified_names {
+        let last = qualified.rsplit("::").next().unwrap_or(qualified);
+        if last == simple {
+            matches += 1;
+            if matches > 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Collects the simple names a `use` declaration binds into its enclosing
+/// scope, walking the Tree-sitter parse tree (never a text parse of the
+/// display string). Handles the plain (`use a::b::T;` → `T`), alias
+/// (`use a::b::T as U;` → the bound alias `U`), and grouped
+/// (`use a::{B, C::D};` → `B`, `D`, including nested groups) forms. A glob
+/// import (`use a::*;`) binds no specific simple name, so it contributes
+/// nothing and never vetoes a bare impl-target name (issues #343/#344 round 9).
+fn use_bound_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(argument) = node.child_by_field_name("argument") {
+        collect_use_tree_names(argument, source, &mut names);
+    }
+    names
+}
+
+/// Recursive worker for [`use_bound_names`], appending each bound simple name
+/// reachable from a use-tree node. Only the node kinds that introduce a
+/// nameable binding contribute; `use_wildcard` (glob) and separator tokens
+/// fall through and add nothing.
+fn collect_use_tree_names(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" | "type_identifier" => {
+            out.push(node_source(node, source).trim().to_owned());
+        }
+        "scoped_identifier" => {
+            // The bound name is the final `name` segment (`a::b::T` → `T`).
+            if let Some(name) = node.child_by_field_name("name")
+                && matches!(name.kind(), "identifier" | "type_identifier")
+            {
+                out.push(node_source(name, source).trim().to_owned());
+            }
+        }
+        "use_as_clause" => {
+            // `path as alias` binds the alias, not the path's final segment.
+            if let Some(alias) = node.child_by_field_name("alias")
+                && matches!(alias.kind(), "identifier" | "type_identifier")
+            {
+                out.push(node_source(alias, source).trim().to_owned());
+            }
+        }
+        "scoped_use_list" => {
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_use_tree_names(list, source, out);
+            }
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_use_tree_names(child, source, out);
+            }
+        }
+        // `use_wildcard` (glob) names no specific simple name; separator tokens
+        // (`{`, `,`, `}`) carry none either.
+        _ => {}
+    }
+}
+
+/// Reports whether a `use_declaration` is a MODULE ITEM — a direct child of the
+/// `source_file` root or of a `mod_item`'s `declaration_list` body — as opposed
+/// to a `use` nested inside a function body, `block`, or expression. Only a
+/// module-item `use` is visible to module-level impls, so only it feeds the
+/// import-shadow veto index (round-10 Codex finding: a block-local
+/// `fn helper() { use std::fmt::Display; }` must never shadow a module-level
+/// `impl Display for Foo`). A block-local `use`'s parent is a `block`; a
+/// module-item `use`'s parent is `source_file` or `declaration_list`.
+fn is_module_item_use(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| matches!(parent.kind(), "source_file" | "declaration_list"))
+}
+
+/// Reports whether a module-item `use` import in the impl's OWN module scope
+/// binds the bare simple name `bare`. Rust's `use` visibility is NOT inherited
+/// by child modules: an import declared in an ancestor/root scope cannot shadow
+/// a bare name inside `mod m`, so the veto consults ONLY the impl's exact own
+/// module-scope key — never prefix/ancestor scopes (round-10 Codex finding). A
+/// block-local `use` never reaches this index at all (see [`is_module_item_use`]).
+/// This is the SINGLE shared predicate behind the import-shadow veto on BOTH
+/// IMPLEMENTS resolution paths: the local per-file resolver consults it directly,
+/// and the deferred cross-file pass reads the same answer off the
+/// `PendingImplFact::shadowed_by_use` boolean this predicate sets at extraction
+/// time — so the two paths can never diverge (issues #343/#344; correct
+/// import-aware resolution is follow-up #393).
+fn scope_imports_bare_name(
+    imports_by_scope: &BTreeMap<Vec<String>, BTreeSet<String>>,
+    module_names: &[String],
+    bare: &str,
+) -> bool {
+    imports_by_scope
+        .get(module_names)
+        .is_some_and(|names| names.contains(bare))
+}
+
+/// The IMPLEMENTS-resolution decision for one impl display header
+/// (issue #343).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImplTargetDecision {
+    /// Resolve this bare trait/type name through the trait-scope walk. Generic
+    /// binders and trait-segment generic args are already stripped.
+    Resolve(String),
+    /// Preserve the legacy verbatim self-referential edge — a generic inherent
+    /// impl (`impl<T> Type<T>`) with no `for` clause names no trait.
+    Verbatim,
+    /// Mint no edge: a blanket impl (`impl<T> Trait for T`) whose `for` target
+    /// is a bare binder type parameter.
+    NoEdge,
+}
+
+/// Reads a node's source text without borrowing an extractor, for the
+/// AST-driven impl-decision helpers below.
+fn node_source<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    node.utf8_text(source.as_bytes()).unwrap_or("")
+}
+
+/// Derives the IMPLEMENTS-resolution decision for an `impl_item` directly from
+/// its Tree-sitter fields (issue #343/#344), never by string-scanning the
+/// header. `impl_item` exposes three named fields: `type_parameters` (the
+/// `<...>` binder, present only on generic impls), `trait` (the implemented
+/// trait, present only on trait impls), and `type` (the implementing type).
+/// Reading them structurally means a return arrow in a binder bound
+/// (`impl<T: Fn() -> u32> Target for Wrapper<T>`), a spaced binder, or a
+/// reference/pointer blanket target can never leak across the trait/`for` split
+/// the way a character scan can.
+///
+/// - No `trait` field: an inherent impl. A generic inherent impl
+///   (`impl<T> Type<T>`) keeps its verbatim self-referential edge; a
+///   non-generic inherent impl resolves its type name verbatim (pre-#343
+///   behavior).
+/// - A `trait` field: resolve the bare trait path (generic args stripped via
+///   the AST), unless the implementing type is a blanket bare binder parameter,
+///   a reference/pointer to one, or a non-nominal type (slice, array, tuple,
+///   trait object, `impl Trait`) — those mint no edge.
+///
+/// Turbofish trait syntax (`impl GenP::<u32> for Plain`) is not valid Rust in
+/// trait position; Tree-sitter cannot represent it and emits an `ERROR` node
+/// that swallows the trait/`for` split, so there is no reliable AST to read.
+/// That single pathological-but-supported form is recovered through the
+/// header-string normalizer ([`impl_trait_target`]), keeping its output
+/// byte-identical to the pre-refactor path.
+fn impl_target_decision(node: Node<'_>, source: &str, display: &str) -> ImplTargetDecision {
+    let trait_field = node.child_by_field_name("trait");
+    let type_field = node.child_by_field_name("type");
+
+    // Turbofish `::<>` in trait position produces an `ERROR` node under the
+    // implementing-type field with no `trait` field: fall back to the
+    // header-string normalizer for that invalid-Rust-but-supported form. A
+    // `type` field that is entirely absent is likewise unreadable.
+    match type_field {
+        Some(type_node) if trait_field.is_none() && type_node.has_error() => {
+            return impl_trait_target(display);
+        }
+        None => return impl_trait_target(display),
+        _ => {}
+    }
+
+    let type_parameters = node.child_by_field_name("type_parameters");
+    let binder_params = type_parameters
+        .map(|params| binder_type_params(params, source))
+        .unwrap_or_default();
+
+    let Some(trait_node) = trait_field else {
+        // Inherent impl (no `for` clause). A generic inherent impl names no
+        // trait to reach: keep the recorded self-referential edge. A
+        // non-generic inherent impl resolves its type name verbatim.
+        return if type_parameters.is_some() {
+            ImplTargetDecision::Verbatim
+        } else {
+            type_field.map_or(ImplTargetDecision::Verbatim, |type_node| {
+                ImplTargetDecision::Resolve(node_source(type_node, source).trim().to_owned())
+            })
+        };
+    };
+
+    // A negative impl (`impl !Trait for Foo`) asserts that the type explicitly
+    // does NOT implement the trait. Tree-sitter keeps the `!` as an unnamed
+    // child token BEFORE the `trait` field (the field itself reads as the bare
+    // trait name), so reading the trait field alone would resolve it like a
+    // positive impl and mint a wrong IMPLEMENTS edge. Detect the `!` and mint no
+    // edge — a negative impl never implements the trait it names.
+    if is_negative_impl(node) {
+        return ImplTargetDecision::NoEdge;
+    }
+
+    let bare_trait = bare_trait_path(trait_node, source);
+    if bare_trait.is_empty() {
+        return ImplTargetDecision::NoEdge;
+    }
+    // A blanket impl (`for T`, or `for &T` / `*const T` around a bare binder
+    // parameter) or a non-nominal `for` target (slice, array, tuple, trait
+    // object, `impl Trait`) has no single concrete implementing-type record:
+    // mint no edge rather than fabricate one.
+    if type_field.is_some_and(|type_node| !is_nominal_target(type_node, source, &binder_params)) {
+        return ImplTargetDecision::NoEdge;
+    }
+    ImplTargetDecision::Resolve(bare_trait)
+}
+
+/// `true` when an `impl_item` is a negative impl (`impl !Trait for Foo`).
+/// Tree-sitter parses the leading `!` as an unnamed `!` child token sitting
+/// between the `impl` keyword and the `trait` field, so the field itself carries
+/// only the bare trait name. Scanning the impl node's direct children for that
+/// `!` token is the reliable AST signal; the string header never has to be
+/// consulted.
+fn is_negative_impl(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| child.kind() == "!")
+}
+
+/// Collects the bare type-parameter identifiers declared by a `type_parameters`
+/// binder node, reading each parameter's `name` field from the AST. Only
+/// `type_parameter` names (a `type_identifier`) are kept: lifetime parameters
+/// (`'a`) and const parameters (`const N`) carry no type identifier that could
+/// appear as a bare `for` target, so they are skipped. Bounds (`T: Fn() ->
+/// u32`) live in a sibling `bounds` field and never reach the name, so a return
+/// arrow in a bound cannot poison the set.
+fn binder_type_params(type_parameters: Node<'_>, source: &str) -> Vec<String> {
+    let mut params = Vec::new();
+    let mut cursor = type_parameters.walk();
+    for child in type_parameters.named_children(&mut cursor) {
+        if let Some(name) = child.child_by_field_name("name")
+            && name.kind() == "type_identifier"
+        {
+            params.push(node_source(name, source).to_owned());
+        }
+    }
+    params
+}
+
+/// Extracts the bare trait path from an `impl_item` `trait` field node,
+/// dropping generic arguments via the AST (never string `<>`/`::` work):
+/// `type_identifier` -> its text (`Trait`); `generic_type` -> its base `type`
+/// child recursively, so `GenP<u32>` -> `GenP` and `crate::Target<u32>` ->
+/// `crate::Target`; `scoped_type_identifier` -> its full path text (`crate::T`
+/// / `super::T` / `some::path::GenP`), preserved exactly for cross-file
+/// resolution (issue #344).
+fn bare_trait_path(trait_node: Node<'_>, source: &str) -> String {
+    if trait_node.kind() == "generic_type"
+        && let Some(base) = trait_node.child_by_field_name("type")
+    {
+        return bare_trait_path(base, source);
+    }
+    node_source(trait_node, source).trim().to_owned()
+}
+
+/// `true` when a trait impl's implementing-`type` field names a single concrete
+/// nominal type that can carry an IMPLEMENTS edge. Reference and pointer
+/// wrappers are peeled first (`&T` / `&mut T` / `&'a T` / `*const T` / `&&T` /
+/// `&[T]`), then the core is classified: a bare `type_identifier` that is one
+/// of the binder's type parameters is a blanket target (`impl<T> Trait for T`);
+/// a slice/array (`[T]` / `[T; N]`), tuple (`(T, U)`), trait object (`dyn
+/// Foo`), `impl Trait` opaque type, or unit type is non-nominal. Both cases
+/// lack a concrete implementing-type record and return `false` (mint no edge).
+/// Everything else — a concrete nominal type (`Wrapper<T>`, `crate::Thing`,
+/// `&Wrapper<T>`) — is nominal.
+fn is_nominal_target(type_node: Node<'_>, source: &str, binder_params: &[String]) -> bool {
+    let mut core = type_node;
+    while matches!(core.kind(), "reference_type" | "pointer_type") {
+        let Some(inner) = core.child_by_field_name("type") else {
+            break;
+        };
+        core = inner;
+    }
+    match core.kind() {
+        "type_identifier" => !binder_params
+            .iter()
+            .any(|param| param == node_source(core, source).trim()),
+        "array_type" | "tuple_type" | "dynamic_type" | "abstract_type" | "unit_type" => false,
+        _ => true,
+    }
+}
+
+/// Parses an impl display header (`impl ...`, `impl<T> ...`, or an
+/// `unsafe `-prefixed form) into its IMPLEMENTS-resolution decision.
+///
+/// Trait impls (headers with a ` for ` clause) resolve their trait segment
+/// with any generic binder and trait-segment generic args stripped, so
+/// `impl<T> GenT for Wrapper<T>` -> `GenT` and `impl GenP<u32> for Plain` ->
+/// `GenP`. A blanket impl whose `for` target is a bare binder type parameter
+/// (`impl<T> Trait for T`) is bounded out with no edge. Inherent impls (no
+/// ` for ` clause) preserve the pre-#343 behavior: a non-generic inherent impl
+/// resolves its type name verbatim, and a generic inherent impl keeps its
+/// recorded self-referential edge.
+fn impl_trait_target(display: &str) -> ImplTargetDecision {
+    let header = display.strip_prefix("unsafe ").unwrap_or(display).trim();
+    let Some(after_impl) = header.strip_prefix("impl") else {
+        return ImplTargetDecision::Verbatim;
+    };
+    // `impl` must be followed by a space or `<` to open a real header; an
+    // identifier that merely starts with `impl` (`implement_service`) is not.
+    match after_impl.chars().next() {
+        Some(' ' | '<') => {}
+        _ => return ImplTargetDecision::Verbatim,
+    }
+    // Skip an optional `<...>` binder whether or not a space precedes it: a
+    // source-level space (`impl <T> Trait for T`) survives `impl_display` as
+    // `impl <T> ...`, so the binder must be stripped after trimming the space,
+    // not left to poison the trait segment.
+    let trimmed = after_impl.trim_start();
+    let (binder_params, remainder) = if trimmed.starts_with('<') {
+        let (params, rest) = split_generic_binder(trimmed);
+        (params, rest.trim_start())
+    } else {
+        (Vec::new(), trimmed)
+    };
+    match remainder.split_once(" for ") {
+        Some((trait_seg, for_target)) => {
+            let bare_trait = strip_trait_generics(trait_seg.trim());
+            if bare_trait.is_empty() {
+                return ImplTargetDecision::NoEdge;
+            }
+            // Blanket impl: the `for` target reduces to a bare binder type
+            // parameter, even through reference/pointer sigils and lifetimes
+            // (`impl<T> Trait for &T` / `&mut T` / `&'a T` / `*const T` are as
+            // blanket as `impl<T> Trait for T`), or it is a non-nominal type
+            // (slice, tuple, trait object) that names no single local type.
+            // Either way there is no concrete implementing-type record, so mint
+            // no edge rather than fabricate one.
+            let for_core = for_target_core(for_target);
+            if binder_params.iter().any(|p| p == for_core) || is_non_nominal_target(for_core) {
+                return ImplTargetDecision::NoEdge;
+            }
+            ImplTargetDecision::Resolve(bare_trait.to_owned())
+        }
+        None if binder_params.is_empty() => {
+            // Non-generic inherent impl: resolve the type name verbatim (no
+            // generic stripping), matching the pre-#343 path exactly.
+            ImplTargetDecision::Resolve(remainder.trim().to_owned())
+        }
+        None => ImplTargetDecision::Verbatim,
+    }
+}
+
+/// Splits a `<...>` generic binder at the front of `s` (which must start with
+/// `<`), returning its top-level type-parameter identifiers and the text after
+/// the balanced binder. An unbalanced binder yields no params and empty rest.
+fn split_generic_binder(s: &str) -> (Vec<String>, &str) {
+    let mut depth = 0usize;
+    let mut end = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end else {
+        return (Vec::new(), "");
+    };
+    (parse_binder_params(&s[1..end]), &s[end + 1..])
+}
+
+/// Parses the top-level type-parameter identifiers from a binder's inner text
+/// (`T: Into<String>, U, const N: usize, 'a` -> `[T, U, N]`). Lifetimes carry
+/// no type identifier and are skipped; `const` and bound clauses are dropped.
+fn parse_binder_params(inner: &str) -> Vec<String> {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut segments = Vec::new();
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                segments.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&inner[start..]);
+    let mut params = Vec::new();
+    for seg in segments {
+        let seg = seg.trim();
+        if seg.is_empty() || seg.starts_with('\'') {
+            continue;
+        }
+        let seg = seg.strip_prefix("const ").map_or(seg, str::trim_start);
+        let ident_end = seg
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(seg.len());
+        let ident = &seg[..ident_end];
+        if is_simple_ident(ident) {
+            params.push(ident.to_owned());
+        }
+    }
+    params
+}
+
+/// Strips generic args from an impl trait segment: `GenP<u32>` -> `GenP`,
+/// `foo::Bar<T>` -> `foo::Bar`, `Plain` -> `Plain`.
+///
+/// Turbofish trait syntax (`GenP::<u32>`, valid Rust in type position) leaves a
+/// trailing `::` separator once the `<...>` args are removed; that trailing
+/// separator is stripped too so the bare name matches the trait symbol
+/// (`GenP::<u32>` -> `GenP`, `some::path::GenP::<u32>` -> `some::path::GenP`).
+/// Only a TRAILING `::` is removed — internal path separators are preserved, so
+/// a non-turbofish qualified path (`crate::T`) is unchanged.
+fn strip_trait_generics(trait_seg: &str) -> &str {
+    let base = trait_seg.split('<').next().unwrap_or(trait_seg).trim();
+    base.strip_suffix("::").map_or(base, str::trim_end)
+}
+
+/// Reduces a trait impl's `for` target to the core type text used for the
+/// blanket / non-nominal bound-out check. Drops a trailing where clause, then
+/// repeatedly strips leading reference and pointer sigils with their optional
+/// lifetimes and `mut` (`&`, `&mut`, `&'a`, `&'a mut`, `*const`, `*mut`, in any
+/// combination), returning the innermost wrapped type text. A bare binder param
+/// stays itself (`T` -> `T`), a reference to one reduces to it (`&'a mut T` ->
+/// `T`), and a concrete nominal target is preserved for the caller's resolve
+/// path (`Wrapper<T>` -> `Wrapper<T>`, `&Wrapper<T>` -> `Wrapper<T>`).
+fn for_target_core(for_target: &str) -> &str {
+    let mut core = for_target
+        .split_once(" where ")
+        .map_or(for_target, |(lhs, _)| lhs)
+        .trim();
+    loop {
+        let before = core;
+        if let Some(rest) = core.strip_prefix('&') {
+            let rest = rest.trim_start();
+            // Optional lifetime (`'a`), then optional `mut`.
+            let rest = rest.strip_prefix('\'').map_or(rest, |after_tick| {
+                let end = after_tick
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(after_tick.len());
+                after_tick[end..].trim_start()
+            });
+            core = rest.strip_prefix("mut ").map_or(rest, str::trim_start);
+        } else if let Some(rest) = core.strip_prefix("*const ") {
+            core = rest.trim_start();
+        } else if let Some(rest) = core.strip_prefix("*mut ") {
+            core = rest.trim_start();
+        }
+        if core == before {
+            break;
+        }
+    }
+    core
+}
+
+/// `true` when a trait impl's sigil-stripped `for` target core cannot name a
+/// single local nominal type: a slice/array (`[T]`), a tuple (`(T, U)`), or a
+/// trait object / opaque type (`dyn Foo`, `impl Foo`). Such targets have no
+/// concrete implementing-type record, so they mint no IMPLEMENTS edge.
+fn is_non_nominal_target(core: &str) -> bool {
+    core.starts_with('[')
+        || core.starts_with('(')
+        || core == "dyn"
+        || core == "impl"
+        || core.starts_with("dyn ")
+        || core.starts_with("impl ")
 }
 
 fn impl_display(text: &str) -> String {
@@ -2457,6 +3165,583 @@ pub fn normalize_file_code(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolve_target(display: &str) -> Option<String> {
+        match impl_trait_target(display) {
+            ImplTargetDecision::Resolve(name) => Some(name),
+            ImplTargetDecision::Verbatim | ImplTargetDecision::NoEdge => None,
+        }
+    }
+
+    /// Locates the first `impl_item` node in a parsed tree, for the AST-based
+    /// decision tests below.
+    fn find_impl_item(node: Node<'_>) -> Option<Node<'_>> {
+        if node.kind() == "impl_item" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_impl_item(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Parses one impl header from real Rust source and returns the
+    /// AST-derived IMPLEMENTS decision, exercising `impl_target_decision`
+    /// exactly as the extractor does at walk time (never the display-string
+    /// parser, except for the turbofish recovery it internally delegates to).
+    fn ast_decision(source: &str) -> ImplTargetDecision {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load rust grammar");
+        let tree = parser.parse(source, None).expect("parse source");
+        let impl_node = find_impl_item(tree.root_node()).expect("impl_item present");
+        let display = impl_display(node_source(impl_node, source));
+        impl_target_decision(impl_node, source, &display)
+    }
+
+    /// The AST decision reduced to the resolved trait/type name, mirroring
+    /// [`resolve_target`] but driven by a real parse.
+    fn ast_resolve(source: &str) -> Option<String> {
+        match ast_decision(source) {
+            ImplTargetDecision::Resolve(name) => Some(name),
+            ImplTargetDecision::Verbatim | ImplTargetDecision::NoEdge => None,
+        }
+    }
+
+    #[test]
+    fn bare_simple_name_ambiguity_counts_distinct_same_simple_name_targets() {
+        // Two distinct qualified names sharing the simple name `T` (root `T`
+        // and `a::T`) — the round-8 collision — is ambiguous.
+        assert!(bare_simple_name_is_ambiguous(
+            "T",
+            ["T", "a::T", "m::Foo"].into_iter()
+        ));
+        // A lone same-simple-name target is unambiguous — the guard must not
+        // over-suppress a legitimate single-name resolve.
+        assert!(!bare_simple_name_is_ambiguous(
+            "T",
+            ["T", "m::Bar"].into_iter()
+        ));
+        // A single deeply-nested definition is still unambiguous.
+        assert!(!bare_simple_name_is_ambiguous(
+            "T",
+            ["a::b::T", "a::Foo"].into_iter()
+        ));
+        // Two nested same-simple-name definitions with no root are ambiguous
+        // (the type-alias-fallback wrong-edge class).
+        assert!(bare_simple_name_is_ambiguous(
+            "T",
+            ["a::T", "b::T"].into_iter()
+        ));
+        // A name absent from the index is unambiguous (zero matches).
+        assert!(!bare_simple_name_is_ambiguous(
+            "Missing",
+            ["T", "a::T"].into_iter()
+        ));
+    }
+
+    /// Locates the first `use_declaration` node in a parsed tree, for the
+    /// import-shadow-veto helper tests below.
+    fn find_use_declaration(node: Node<'_>) -> Option<Node<'_>> {
+        if node.kind() == "use_declaration" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_use_declaration(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Parses one `use` declaration from real Rust source and returns the
+    /// simple names it binds into scope, driving [`use_bound_names`] exactly as
+    /// the extractor does at walk time.
+    fn parse_use_bound_names(source: &str) -> Vec<String> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load rust grammar");
+        let tree = parser.parse(source, None).expect("parse source");
+        let use_node = find_use_declaration(tree.root_node()).expect("use_declaration present");
+        use_bound_names(use_node, source)
+    }
+
+    #[test]
+    fn use_bound_names_covers_plain_alias_grouped_and_glob() {
+        // Plain `use a::b::T;` binds the final segment `T`.
+        assert_eq!(parse_use_bound_names("use a::b::T;"), vec!["T".to_owned()]);
+        // A bare `use T;` binds `T`.
+        assert_eq!(parse_use_bound_names("use T;"), vec!["T".to_owned()]);
+        // `use a::b::T as U;` binds the ALIAS `U`, never the path segment `T`.
+        assert_eq!(
+            parse_use_bound_names("use a::b::T as U;"),
+            vec!["U".to_owned()]
+        );
+        // A grouped `use a::{B, C::D};` binds each leaf simple name.
+        assert_eq!(
+            parse_use_bound_names("use a::{B, C::D};"),
+            vec!["B".to_owned(), "D".to_owned()]
+        );
+        // A grouped import with an inner alias binds the alias.
+        assert_eq!(
+            parse_use_bound_names("use a::{B, C::D as E};"),
+            vec!["B".to_owned(), "E".to_owned()]
+        );
+        // A glob `use a::*;` names no specific simple name — it must contribute
+        // nothing, so it never vetoes a bare impl-target name.
+        assert!(parse_use_bound_names("use a::*;").is_empty());
+        // A grouped glob leaf contributes nothing either.
+        assert_eq!(
+            parse_use_bound_names("use a::{B, c::*};"),
+            vec!["B".to_owned()]
+        );
+    }
+
+    #[test]
+    fn scope_imports_bare_name_consults_only_the_impls_own_scope() {
+        // Rust `use` visibility is NOT inherited by child modules: the veto
+        // consults ONLY the impl's exact own module-scope key (round-10 Codex
+        // finding). A file-top `use` (scope `[]`) binding `Display` shadows a
+        // bare name at file top, but NOT one inside a descendant module.
+        let mut imports: BTreeMap<Vec<String>, BTreeSet<String>> = BTreeMap::new();
+        imports.insert(Vec::new(), BTreeSet::from(["Display".to_owned()]));
+        assert!(scope_imports_bare_name(&imports, &[], "Display"));
+        // Ancestor/root `use` does NOT match a child scope.
+        assert!(!scope_imports_bare_name(
+            &imports,
+            &["m".to_owned(), "n".to_owned()],
+            "Display"
+        ));
+        // A name it does not bind is never shadowed.
+        assert!(!scope_imports_bare_name(&imports, &[], "Other"));
+
+        // A `use` inside `mod m` (scope `["m"]`) shadows a bare name in `m`
+        // only, never at file top, in a descendant, or in a sibling module.
+        let mut nested: BTreeMap<Vec<String>, BTreeSet<String>> = BTreeMap::new();
+        nested.insert(vec!["m".to_owned()], BTreeSet::from(["Display".to_owned()]));
+        assert!(scope_imports_bare_name(
+            &nested,
+            &["m".to_owned()],
+            "Display"
+        ));
+        // A descendant `mod m::inner` does NOT inherit `mod m`'s import.
+        assert!(!scope_imports_bare_name(
+            &nested,
+            &["m".to_owned(), "inner".to_owned()],
+            "Display"
+        ));
+        // File top cannot see the import declared inside `mod m`.
+        assert!(!scope_imports_bare_name(&nested, &[], "Display"));
+        // An unrelated sibling module `mod other` cannot see `mod m`'s import.
+        assert!(!scope_imports_bare_name(
+            &nested,
+            &["other".to_owned()],
+            "Display"
+        ));
+    }
+
+    #[test]
+    fn is_module_item_use_distinguishes_module_and_block_scope() {
+        // A module-item `use` (file-top or inside a `mod` body) feeds the veto;
+        // a block-local `use` inside a function body does NOT (round-10 Codex
+        // finding: a block-local `use` is invisible to module-level impls).
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load rust grammar");
+
+        // File-top `use` — a direct child of `source_file`.
+        let top = "use std::fmt::Display;\n";
+        let tree = parser.parse(top, None).expect("parse");
+        let node = find_use_declaration(tree.root_node()).expect("use present");
+        assert!(is_module_item_use(node), "file-top use is a module item");
+
+        // `use` inside a `mod m { ... }` body — a child of `declaration_list`.
+        let in_mod = "mod m { use std::fmt::Display; }\n";
+        let tree = parser.parse(in_mod, None).expect("parse");
+        let node = find_use_declaration(tree.root_node()).expect("use present");
+        assert!(
+            is_module_item_use(node),
+            "use inside a mod body is a module item"
+        );
+
+        // Block-local `use` inside a function body — a child of `block`.
+        let in_fn = "fn helper() { use std::fmt::Display; let _ = 0; }\n";
+        let tree = parser.parse(in_fn, None).expect("parse");
+        let node = find_use_declaration(tree.root_node()).expect("use present");
+        assert!(
+            !is_module_item_use(node),
+            "block-local use is NOT a module item"
+        );
+    }
+
+    #[test]
+    fn ast_impl_decision_resolves_generic_and_plain_trait_impls() {
+        // Generic binder, non-parameter RHS: resolve the bare trait name.
+        assert_eq!(
+            ast_resolve("impl<T> GenT for Wrapper<T> {}"),
+            Some("GenT".to_owned())
+        );
+        // Trait-segment generic args are stripped via the AST `type_arguments`.
+        assert_eq!(
+            ast_resolve("impl GenP<u32> for Plain {}"),
+            Some("GenP".to_owned())
+        );
+        // Qualified generic trait path keeps the scoped path, drops the args.
+        assert_eq!(
+            ast_resolve("impl<T> foo::Bar<T> for Wrapper<T> {}"),
+            Some("foo::Bar".to_owned())
+        );
+        assert_eq!(
+            ast_resolve("impl<T> crate::Target<u32> for Wrapper<T> {}"),
+            Some("crate::Target".to_owned())
+        );
+        // Non-generic trait impl on a concrete instantiation.
+        assert_eq!(
+            ast_resolve("impl MyTrait for MyStruct<i32> {}"),
+            Some("MyTrait".to_owned())
+        );
+        // `unsafe` keyword prefix is transparent (a child token, not a field).
+        assert_eq!(
+            ast_resolve("unsafe impl<T> GenT for Wrapper<T> {}"),
+            Some("GenT".to_owned())
+        );
+        // Multi-bound binder: the trait still resolves.
+        assert_eq!(
+            ast_resolve("impl<T: Into<String>> GenT for Wrapper<T> {}"),
+            Some("GenT".to_owned())
+        );
+        // A qualified path WITHOUT turbofish keeps every `::`.
+        assert_eq!(
+            ast_resolve("impl crate::T for Foo {}"),
+            Some("crate::T".to_owned())
+        );
+    }
+
+    #[test]
+    fn ast_impl_decision_resolves_arrow_bound_binder() {
+        // The regression case: a function-trait bound with a return arrow in
+        // the binder. The Tree-sitter `type_parameters` field bounds the binder
+        // structurally, so the `->` never leaks into the trait segment the way
+        // the pre-AST char-scan binder split did (it closed depth on the `>` of
+        // `->`, leaving `u32> Target ...`).
+        assert_eq!(
+            ast_resolve("impl<T: Fn() -> u32> Target for Wrapper<T> {}"),
+            Some("Target".to_owned())
+        );
+        assert_eq!(
+            ast_resolve("impl<T: Fn(u8) -> u32> crate::Target<u32> for Wrapper<T> {}"),
+            Some("crate::Target".to_owned())
+        );
+        // A binder param used bare with an arrow bound is still a blanket impl.
+        assert_eq!(
+            ast_decision("impl<T: Fn() -> u32> Blanket for T {}"),
+            ImplTargetDecision::NoEdge
+        );
+    }
+
+    #[test]
+    fn ast_impl_decision_resolves_turbofish_via_recovery() {
+        // Turbofish `::<>` in trait position is invalid Rust; Tree-sitter emits
+        // an ERROR node, so `impl_target_decision` recovers through the
+        // header-string normalizer and still resolves the bare trait.
+        assert_eq!(
+            ast_resolve("impl GenP::<u32> for Plain {}"),
+            Some("GenP".to_owned())
+        );
+        assert_eq!(
+            ast_resolve("impl some::path::GenP::<u32> for Plain {}"),
+            Some("some::path::GenP".to_owned())
+        );
+        assert_eq!(
+            ast_resolve("impl crate::GenP::<u32> for Foo {}"),
+            Some("crate::GenP".to_owned())
+        );
+    }
+
+    #[test]
+    fn ast_impl_decision_handles_spaced_binder() {
+        // A source-level space between `impl` and the `<T>` binder parses into
+        // the same fields, so the trait segment resolves natively.
+        assert_eq!(
+            ast_resolve("impl <T> GenT for Wrapper<T> {}"),
+            Some("GenT".to_owned())
+        );
+        assert_eq!(
+            ast_decision("impl <T> Blanket for T {}"),
+            ImplTargetDecision::NoEdge
+        );
+        assert_eq!(
+            ast_decision("impl <T> MyStruct<T> {}"),
+            ImplTargetDecision::Verbatim
+        );
+    }
+
+    #[test]
+    fn ast_impl_decision_bounds_out_blanket_and_non_nominal() {
+        // Bare binder-parameter `for` target: no edge.
+        for header in [
+            "impl<T> Blanket for T {}",
+            "impl<'a, T> Blanket for T {}",
+            "impl<T: Clone> Blanket for T {}",
+        ] {
+            assert_eq!(ast_decision(header), ImplTargetDecision::NoEdge, "{header}");
+        }
+        // Reference/pointer wrappers around a bare binder param: still blanket.
+        for header in [
+            "impl<T> Blanket for &T {}",
+            "impl<T> Blanket for &mut T {}",
+            "impl<'a, T> Blanket for &'a T {}",
+            "impl<'a, T> Blanket for &'a mut T {}",
+            "impl<T> Blanket for *const T {}",
+            "impl<T> Blanket for *mut T {}",
+            "impl<T> Blanket for &&T {}",
+            "impl<T> Blanket for &*const T {}",
+        ] {
+            assert_eq!(ast_decision(header), ImplTargetDecision::NoEdge, "{header}");
+        }
+        // Non-nominal targets (slice, array, tuple, trait object, opaque type).
+        for header in [
+            "impl<T> Blanket for [T] {}",
+            "impl<T> Blanket for [T; 4] {}",
+            "impl<T> Blanket for (T, T) {}",
+            "impl<T> Blanket for &[T] {}",
+            "impl Blanket for dyn Other {}",
+            "impl Blanket for impl Other {}",
+        ] {
+            assert_eq!(ast_decision(header), ImplTargetDecision::NoEdge, "{header}");
+        }
+        // A concrete type sharing the param spelling but carrying generics, or a
+        // reference to a concrete nominal type, still resolves.
+        assert_eq!(
+            ast_resolve("impl<T> Blanket for Wrapper<T> {}"),
+            Some("Blanket".to_owned())
+        );
+        assert_eq!(
+            ast_resolve("impl<T> Blanket for &Wrapper<T> {}"),
+            Some("Blanket".to_owned())
+        );
+    }
+
+    #[test]
+    fn ast_impl_decision_negative_impl_mints_no_edge() {
+        // A negative impl asserts the type does NOT implement the trait; the `!`
+        // token lives outside the `trait` field, so reading the field alone
+        // would wrongly resolve `LocalAuto`. It must mint no edge.
+        assert_eq!(
+            ast_decision("impl !LocalAuto for Foo {}"),
+            ImplTargetDecision::NoEdge
+        );
+        assert_eq!(
+            ast_decision("impl<T> !LocalAuto for Wrapper<T> {}"),
+            ImplTargetDecision::NoEdge
+        );
+        assert_eq!(
+            ast_decision("unsafe impl !Send for Foo {}"),
+            ImplTargetDecision::NoEdge
+        );
+    }
+
+    #[test]
+    fn ast_impl_decision_preserves_inherent_impls() {
+        // Generic inherent impl (no `for`): verbatim self edge preserved.
+        assert_eq!(
+            ast_decision("impl<T> MyStruct<T> {}"),
+            ImplTargetDecision::Verbatim
+        );
+        // Non-generic inherent impl: resolve the type name verbatim.
+        assert_eq!(ast_resolve("impl Plain {}"), Some("Plain".to_owned()));
+        assert_eq!(
+            ast_resolve("impl MyStruct<i32> {}"),
+            Some("MyStruct<i32>".to_owned())
+        );
+    }
+
+    #[test]
+    fn impl_trait_target_resolves_generic_trait_impls() {
+        // Generic binder, non-parameter RHS: resolve the bare trait name.
+        assert_eq!(
+            resolve_target("impl<T> GenT for Wrapper<T>"),
+            Some("GenT".to_owned())
+        );
+        // Trait-segment generic args are stripped.
+        assert_eq!(
+            resolve_target("impl GenP<u32> for Plain"),
+            Some("GenP".to_owned())
+        );
+        // Qualified generic trait path keeps the qualifier, drops the args.
+        assert_eq!(
+            resolve_target("impl<T> foo::Bar<T> for Wrapper<T>"),
+            Some("foo::Bar".to_owned())
+        );
+        // Non-generic trait impls are unchanged.
+        assert_eq!(
+            resolve_target("impl MyTrait for MyStruct<i32>"),
+            Some("MyTrait".to_owned())
+        );
+        // `unsafe` keyword prefix is transparent.
+        assert_eq!(
+            resolve_target("unsafe impl<T> GenT for Wrapper<T>"),
+            Some("GenT".to_owned())
+        );
+        // Multi-bound binder: still resolves the trait, params parsed past
+        // the bounds.
+        assert_eq!(
+            resolve_target("impl<T: Into<String>> GenT for Wrapper<T>"),
+            Some("GenT".to_owned())
+        );
+    }
+
+    #[test]
+    fn impl_trait_target_resolves_turbofish_trait_impls() {
+        // Turbofish trait syntax `GenP::<u32>` is valid Rust in type position.
+        // After stripping the generic args, the trailing `::` separator must
+        // also be dropped so the bare trait name matches the `GenP` symbol.
+        assert_eq!(
+            resolve_target("impl GenP::<u32> for Plain"),
+            Some("GenP".to_owned())
+        );
+        // Turbofish on a qualified path strips the args and the trailing `::`
+        // while preserving the internal path separators.
+        assert_eq!(
+            resolve_target("impl some::path::GenP::<u32> for Plain"),
+            Some("some::path::GenP".to_owned())
+        );
+        // A qualified path WITHOUT turbofish keeps every `::` — only a
+        // trailing separator left by turbofish stripping is removed.
+        assert_eq!(
+            resolve_target("impl crate::T::<u32> for Foo"),
+            Some("crate::T".to_owned())
+        );
+        assert_eq!(
+            resolve_target("impl crate::T for Foo"),
+            Some("crate::T".to_owned())
+        );
+        // Spaced turbofish (valid Rust, survives `impl_display` as `GenP ::
+        // <u32>`) normalizes the same way.
+        assert_eq!(
+            resolve_target("impl GenP :: <u32> for Plain"),
+            Some("GenP".to_owned())
+        );
+        // Generic binder with a turbofish trait: bare trait still resolves.
+        assert_eq!(
+            resolve_target("impl<T> GenT::<T> for Wrapper<T>"),
+            Some("GenT".to_owned())
+        );
+    }
+
+    #[test]
+    fn impl_trait_target_resolves_spaced_generic_binder() {
+        // A source-level space between `impl` and the `<T>` binder is valid
+        // Rust and survives `impl_display` normalization as `impl <T> ...`.
+        // The binder must still be skipped so the trait segment resolves.
+        assert_eq!(
+            resolve_target("impl <T> GenT for Wrapper<T>"),
+            Some("GenT".to_owned())
+        );
+        // Spaced blanket impl is still bounded out.
+        assert!(matches!(
+            impl_trait_target("impl <T> Blanket for T"),
+            ImplTargetDecision::NoEdge
+        ));
+        // Spaced generic inherent impl keeps its verbatim self edge.
+        assert!(matches!(
+            impl_trait_target("impl <T> MyStruct<T>"),
+            ImplTargetDecision::Verbatim
+        ));
+        // `unsafe` + spaced binder is transparent too.
+        assert_eq!(
+            resolve_target("unsafe impl <T> GenT for Wrapper<T>"),
+            Some("GenT".to_owned())
+        );
+    }
+
+    #[test]
+    fn impl_trait_target_bounds_out_blanket_impls() {
+        // `for` target is a bare binder parameter: no edge.
+        assert!(matches!(
+            impl_trait_target("impl<T> Blanket for T"),
+            ImplTargetDecision::NoEdge
+        ));
+        assert!(matches!(
+            impl_trait_target("impl<'a, T> Blanket for T"),
+            ImplTargetDecision::NoEdge
+        ));
+        // A bounded binder param used bare is still blanket.
+        assert!(matches!(
+            impl_trait_target("impl<T: Clone> Blanket for T"),
+            ImplTargetDecision::NoEdge
+        ));
+        // A concrete type sharing the param's spelling but carrying generics
+        // is NOT a bare param -> still resolves.
+        assert_eq!(
+            resolve_target("impl<T> Blanket for Wrapper<T>"),
+            Some("Blanket".to_owned())
+        );
+    }
+
+    #[test]
+    fn impl_trait_target_bounds_out_reference_blanket_impls() {
+        // A reference/pointer around a bare binder parameter is still a
+        // blanket impl: strip the sigils and lifetimes, recognize the binder
+        // param, mint no edge. Before the fix the `&` broke the bare-`T`
+        // filter and the header fell through to `Resolve`, fabricating an
+        // IMPLEMENTS edge with no concrete implementing-type record.
+        for header in [
+            "impl<T> Blanket for &T",
+            "impl<T> Blanket for &mut T",
+            "impl<'a, T> Blanket for &'a T",
+            "impl<'a, T> Blanket for &'a mut T",
+            "impl<T> Blanket for *const T",
+            "impl<T> Blanket for *mut T",
+            // Combined / repeated sigils still reduce to the binder param.
+            "impl<T> Blanket for &&T",
+            "impl<T> Blanket for &*const T",
+        ] {
+            assert!(
+                matches!(impl_trait_target(header), ImplTargetDecision::NoEdge),
+                "{header} must be bounded out"
+            );
+        }
+        // Non-nominal `for` targets (slice, tuple, trait object, opaque type)
+        // name no local nominal type and mint no edge either.
+        for header in [
+            "impl<T> Blanket for [T]",
+            "impl<T> Blanket for (T, T)",
+            "impl<T> Blanket for &[T]",
+            "impl Blanket for dyn Other",
+            "impl Blanket for impl Other",
+        ] {
+            assert!(
+                matches!(impl_trait_target(header), ImplTargetDecision::NoEdge),
+                "{header} must be bounded out"
+            );
+        }
+        // A reference to a CONCRETE nominal type is not a binder-param blanket
+        // impl -> still resolves the trait (implementing type `&Wrapper`).
+        assert_eq!(
+            resolve_target("impl<T> Blanket for &Wrapper<T>"),
+            Some("Blanket".to_owned())
+        );
+    }
+
+    #[test]
+    fn impl_trait_target_preserves_inherent_impls() {
+        // Generic inherent impl (no `for`): verbatim self edge preserved.
+        assert!(matches!(
+            impl_trait_target("impl<T> MyStruct<T>"),
+            ImplTargetDecision::Verbatim
+        ));
+        // Non-generic inherent impl: resolve the type name verbatim, exactly
+        // as the pre-#343 path did.
+        assert_eq!(resolve_target("impl Plain"), Some("Plain".to_owned()));
+    }
 
     #[test]
     fn test_doc_attribute_text_extracts_string_forms() {
