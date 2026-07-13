@@ -264,8 +264,11 @@ pub const LOG_EMBEDDED_RETENTION_CAVEAT: &str = "Embedded (`--data-dir`) stores 
 /// runs over the embedded (`--data-dir`) read path AND the store holds at least
 /// one `ErrorSignature` record (issue #363).
 ///
-/// Surfaces the embedded-store last-write-wins limitation in the machine-readable
-/// envelope, not only the docs. Present only on the embedded path with log
+/// Discloses in the machine-readable envelope (not only the docs) that the
+/// embedded read path now retains superseded non-temporal log observations, so
+/// cross-scan coalescing is reconstructed to match `--graph` for differing-content
+/// scans, leaving only a residual byte-identical-reingest idempotency divergence.
+/// Present only on the embedded path with log
 /// records; absent for `--graph` queries and for embedded stores with no log
 /// records (where single-ingest results are exact and no disclosure is warranted).
 /// The `message` is a fixed string ([`LOG_EMBEDDED_RETENTION_CAVEAT`]), so the
@@ -778,17 +781,19 @@ pub fn log_deltas(
     };
 
     // Embedded-store retention caveat (issue #363): the embedded `--data-dir`
-    // current-state read surface returns one record per stable ID, and
-    // `ErrorSignature` / `LogOccurrenceBucket` are non-temporal, so multiple
-    // `scan-logs` ingests of the same stable ID are collapsed (last-write-wins)
-    // BEFORE this query runs — the cross-scan coalescing performed above cannot
-    // be reconstructed from the embedded path. DIAGNOSE rather than reject: a
-    // single-ingest store is correct and must keep working, so the caveat is
-    // gated on log records actually being present (`sig_groups` holds every
-    // `ErrorSignature` node encountered, regardless of classification). The
-    // `--graph` path preserves every ingested line, so it never carries this
-    // caveat. Fixed string, no wall clock — byte-stable. See issue #363 and
-    // docs/cli/log-deltas.md.
+    // read path now retains superseded non-temporal log observations
+    // (`ErrorSignature` / `LogOccurrenceBucket`), so multiple `scan-logs` ingests
+    // of the same stable ID whose captured content differs are coalesced above
+    // exactly like the `--graph` path rather than collapsed to a single
+    // last-write-wins record. One residual divergence remains: byte-identical
+    // re-ingests are idempotent (deduped to one physical record) instead of
+    // multiplied, so identical re-scans do not inflate counts here the way
+    // concatenating identical JSONL does on `--graph`. DIAGNOSE rather than
+    // reject: a single-ingest store is exact, so the caveat is gated on log
+    // records actually being present (`sig_groups` holds every `ErrorSignature`
+    // node encountered, regardless of classification). The `--graph` path never
+    // carries this caveat. Fixed string, no wall clock — byte-stable. See issue
+    // #363 and docs/cli/log-deltas.md.
     let embedded_log_retention_caveat = if embedded_source && !sig_groups.is_empty() {
         Some(LogEmbeddedRetentionCaveat {
             message: LOG_EMBEDDED_RETENTION_CAVEAT,
