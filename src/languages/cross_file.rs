@@ -165,6 +165,16 @@ pub struct PendingImplFact {
     /// The impl's enclosing module path (crate-root-relative).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub module_names: Vec<String>,
+    /// `true` when a `use` import visible in the impl's module scope binds the
+    /// same bare final segment as this (bare) trait/type name — the name refers
+    /// to the IMPORT, not any repo same-name definition, so the cross-file
+    /// resolver mints NO edge (AST-derived import-shadow veto, issues
+    /// #343/#344 round 9). Set at extraction time from the same predicate the
+    /// local per-file resolver uses, so the two IMPLEMENTS paths never diverge.
+    /// Only ever `true` for a bare `trait_path`; a qualified path is never
+    /// shadowed. Correct import-aware resolution is follow-up #393.
+    #[serde(default)]
+    pub shadowed_by_use: bool,
 }
 
 /// Cross-file resolution facts exported by one file's extraction.
@@ -561,6 +571,16 @@ pub fn cross_file_implements_records(
     let mut edges: BTreeMap<(String, String), String> = BTreeMap::new();
     for facts in facts_by_file.values() {
         for pending in &facts.pending_impls {
+            // Import-shadow veto (issues #343/#344 round 9): a bare trait/type
+            // name shadowed by a `use` visible in the impl's module scope refers
+            // to the import, never a repo same-name definition. The extractor
+            // recorded this AST-derived verdict; honor it here so an external/std
+            // import (invisible to the impl-target index, so the same-name
+            // ambiguity guard below cannot catch it) or a non-root local alias
+            // never mints a WRONG edge. Correct import-aware resolution is #393.
+            if pending.shadowed_by_use {
+                continue;
+            }
             if let Some(target) = index.resolve(pending) {
                 let summary = format!(
                     "{} implementation relationship (cross-file)",
@@ -1346,6 +1366,7 @@ mod tests {
             source_id: source_id.to_owned(),
             trait_path: trait_path.to_owned(),
             module_names: module.iter().map(|s| (*s).to_owned()).collect(),
+            shadowed_by_use: false,
         }
     }
 

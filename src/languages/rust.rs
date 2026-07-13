@@ -1,6 +1,9 @@
 //! Rust Tree-sitter extraction.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use tree_sitter::{Node, Parser};
 
@@ -146,6 +149,16 @@ struct RustExtractor<'graph, 'source> {
     /// from another module) consults this instead of `definitions`, so a
     /// later value-namespace item (`fn T()`) can never capture an impl edge.
     type_definitions: BTreeMap<String, String>,
+    /// Simple names each `use` declaration binds into scope, keyed by the
+    /// module chain (`module_names`) in force where the `use` appears — the
+    /// same chain an impl records — so an import in a scope `S` is visible to
+    /// an impl whose chain has `S` as a prefix (the impl's own module and its
+    /// descendants). Drives the AST-derived IMPORT-SHADOW VETO on both
+    /// IMPLEMENTS resolution paths (issues #343/#344 round 9): a bare
+    /// trait/type name shadowed by a same-final-segment `use` refers to the
+    /// import, not any local same-name definition, so the impl is left
+    /// unresolved (correct import-aware resolution is follow-up #393).
+    imports_by_scope: BTreeMap<Vec<String>, BTreeSet<String>>,
     /// Impl trait lookups deferred to after the walk (source order).
     pending_impl_edges: Vec<PendingImplEdge>,
     symbol_bodies: Vec<SymbolBody>,
@@ -189,6 +202,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             definitions: BTreeMap::new(),
             qualified_definitions: BTreeMap::new(),
             type_definitions: BTreeMap::new(),
+            imports_by_scope: BTreeMap::new(),
             pending_impl_edges: Vec::new(),
             symbol_bodies: Vec::new(),
             symbol_ordinals: BTreeMap::new(),
@@ -371,6 +385,16 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     fn extract_import(&mut self, node: Node<'_>) {
+        // Record the simple names this `use` binds into the current module
+        // scope for the import-shadow veto (issues #343/#344 round 9). Keyed by
+        // the live module chain so visibility follows module nesting.
+        let bound = self.collect_use_bound_names(node);
+        if !bound.is_empty() {
+            self.imports_by_scope
+                .entry(self.module_names.clone())
+                .or_default()
+                .extend(bound);
+        }
         let name = import_name(self.node_text(node));
         let id = stable_id(&[
             "node",
@@ -403,6 +427,24 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             id,
             format!("{} imports {name}", self.owner_name()),
         );
+    }
+
+    /// Collects the simple names a `use` declaration binds into its enclosing
+    /// scope. Thin `&self` wrapper over the free [`use_bound_names`] worker so
+    /// the same AST walk is unit-testable in isolation.
+    fn collect_use_bound_names(&self, node: Node<'_>) -> Vec<String> {
+        use_bound_names(node, self.source)
+    }
+
+    /// Reports whether a `use` import visible in the impl's module scope binds
+    /// the bare simple name `bare`. Thin `&self` wrapper over the free
+    /// [`scope_imports_bare_name`] predicate — the SINGLE shared answer behind
+    /// the import-shadow veto on BOTH IMPLEMENTS resolution paths (the local
+    /// per-file resolver consults it directly, the deferred cross-file pass
+    /// reads it off `PendingImplFact::shadowed_by_use`), so the two paths can
+    /// never diverge (issues #343/#344 round 9).
+    fn scope_imports_bare_name(&self, module_names: &[String], bare: &str) -> bool {
+        scope_imports_bare_name(&self.imports_by_scope, module_names, bare)
     }
 
     fn extract_named_symbol(&mut self, node: Node<'_>, symbol_kind: &str) {
@@ -1154,10 +1196,20 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                         // file's exported trait/type definitions. Local
                         // resolution always wins, so a resolved edge here is
                         // never re-emitted cross-file.
+                        //
+                        // Carry the AST-derived import-shadow verdict forward:
+                        // when this bare trait/type name is shadowed by a `use`
+                        // visible in the impl's module scope, the cross-file
+                        // resolver must veto it too (name refers to the import),
+                        // so the two paths share one answer via the same
+                        // predicate (issues #343/#344 round 9, follow-up #393).
+                        let shadowed_by_use = !trait_name.contains("::")
+                            && self.scope_imports_bare_name(&entry.module_names, &trait_name);
                         self.facts.pending_impls.push(PendingImplFact {
                             source_id: entry.source_id,
                             trait_path: trait_name,
                             module_names: entry.module_names,
+                            shadowed_by_use,
                         });
                     }
                 }
@@ -1246,6 +1298,19 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             // impl-target keys the scope walk already checked, that map
             // holds only value-namespace and callable names, which must
             // never capture an IMPLEMENTS edge.
+            return None;
+        }
+        // Import-shadow veto (issues #343/#344 round 9): a `use` visible in the
+        // impl's module scope whose final bound segment equals this bare name
+        // means the bare name refers to the IMPORT, not any local same-name
+        // definition. Leave the impl unresolved REGARDLESS of a local same-name
+        // def — this is the AST-derived, name-shadow boolean that closes the
+        // whole bare-name wrong-edge family at once (external/std imports the
+        // local index cannot see AND non-root local aliases alike), a strict
+        // generalization of the round-8 same-name ambiguity guard below. A
+        // qualified path never reaches here, so this only vetoes bare names.
+        // Correct import-aware resolution is follow-up #393.
+        if self.scope_imports_bare_name(module_names, target) {
             return None;
         }
         // An unqualified trait name resolves in the impl's module scope
@@ -1742,6 +1807,84 @@ pub(crate) fn bare_simple_name_is_ambiguous<'a>(
         }
     }
     false
+}
+
+/// Collects the simple names a `use` declaration binds into its enclosing
+/// scope, walking the Tree-sitter parse tree (never a text parse of the
+/// display string). Handles the plain (`use a::b::T;` → `T`), alias
+/// (`use a::b::T as U;` → the bound alias `U`), and grouped
+/// (`use a::{B, C::D};` → `B`, `D`, including nested groups) forms. A glob
+/// import (`use a::*;`) binds no specific simple name, so it contributes
+/// nothing and never vetoes a bare impl-target name (issues #343/#344 round 9).
+fn use_bound_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(argument) = node.child_by_field_name("argument") {
+        collect_use_tree_names(argument, source, &mut names);
+    }
+    names
+}
+
+/// Recursive worker for [`use_bound_names`], appending each bound simple name
+/// reachable from a use-tree node. Only the node kinds that introduce a
+/// nameable binding contribute; `use_wildcard` (glob) and separator tokens
+/// fall through and add nothing.
+fn collect_use_tree_names(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" | "type_identifier" => {
+            out.push(node_source(node, source).trim().to_owned());
+        }
+        "scoped_identifier" => {
+            // The bound name is the final `name` segment (`a::b::T` → `T`).
+            if let Some(name) = node.child_by_field_name("name")
+                && matches!(name.kind(), "identifier" | "type_identifier")
+            {
+                out.push(node_source(name, source).trim().to_owned());
+            }
+        }
+        "use_as_clause" => {
+            // `path as alias` binds the alias, not the path's final segment.
+            if let Some(alias) = node.child_by_field_name("alias")
+                && matches!(alias.kind(), "identifier" | "type_identifier")
+            {
+                out.push(node_source(alias, source).trim().to_owned());
+            }
+        }
+        "scoped_use_list" => {
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_use_tree_names(list, source, out);
+            }
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_use_tree_names(child, source, out);
+            }
+        }
+        // `use_wildcard` (glob) names no specific simple name; separator tokens
+        // (`{`, `,`, `}`) carry none either.
+        _ => {}
+    }
+}
+
+/// Reports whether a `use` import visible in the impl's module scope binds the
+/// bare simple name `bare`. An import declared in scope `S` is visible to an
+/// impl whose module chain has `S` as a prefix — the impl's own module and
+/// every descendant. This is the SINGLE shared predicate behind the
+/// import-shadow veto on BOTH IMPLEMENTS resolution paths: the local per-file
+/// resolver consults it directly, and the deferred cross-file pass reads the
+/// same answer off the `PendingImplFact::shadowed_by_use` boolean this predicate
+/// sets at extraction time — so the two paths can never diverge (issues
+/// #343/#344 round 9; correct import-aware resolution is follow-up #393).
+fn scope_imports_bare_name(
+    imports_by_scope: &BTreeMap<Vec<String>, BTreeSet<String>>,
+    module_names: &[String],
+    bare: &str,
+) -> bool {
+    (0..=module_names.len()).any(|depth| {
+        imports_by_scope
+            .get(&module_names[..depth])
+            .is_some_and(|names| names.contains(bare))
+    })
 }
 
 /// The IMPLEMENTS-resolution decision for one impl display header
@@ -3058,6 +3201,104 @@ mod tests {
         assert!(!bare_simple_name_is_ambiguous(
             "Missing",
             ["T", "a::T"].into_iter()
+        ));
+    }
+
+    /// Locates the first `use_declaration` node in a parsed tree, for the
+    /// import-shadow-veto helper tests below.
+    fn find_use_declaration(node: Node<'_>) -> Option<Node<'_>> {
+        if node.kind() == "use_declaration" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_use_declaration(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Parses one `use` declaration from real Rust source and returns the
+    /// simple names it binds into scope, driving [`use_bound_names`] exactly as
+    /// the extractor does at walk time.
+    fn parse_use_bound_names(source: &str) -> Vec<String> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load rust grammar");
+        let tree = parser.parse(source, None).expect("parse source");
+        let use_node = find_use_declaration(tree.root_node()).expect("use_declaration present");
+        use_bound_names(use_node, source)
+    }
+
+    #[test]
+    fn use_bound_names_covers_plain_alias_grouped_and_glob() {
+        // Plain `use a::b::T;` binds the final segment `T`.
+        assert_eq!(parse_use_bound_names("use a::b::T;"), vec!["T".to_owned()]);
+        // A bare `use T;` binds `T`.
+        assert_eq!(parse_use_bound_names("use T;"), vec!["T".to_owned()]);
+        // `use a::b::T as U;` binds the ALIAS `U`, never the path segment `T`.
+        assert_eq!(
+            parse_use_bound_names("use a::b::T as U;"),
+            vec!["U".to_owned()]
+        );
+        // A grouped `use a::{B, C::D};` binds each leaf simple name.
+        assert_eq!(
+            parse_use_bound_names("use a::{B, C::D};"),
+            vec!["B".to_owned(), "D".to_owned()]
+        );
+        // A grouped import with an inner alias binds the alias.
+        assert_eq!(
+            parse_use_bound_names("use a::{B, C::D as E};"),
+            vec!["B".to_owned(), "E".to_owned()]
+        );
+        // A glob `use a::*;` names no specific simple name — it must contribute
+        // nothing, so it never vetoes a bare impl-target name.
+        assert!(parse_use_bound_names("use a::*;").is_empty());
+        // A grouped glob leaf contributes nothing either.
+        assert_eq!(
+            parse_use_bound_names("use a::{B, c::*};"),
+            vec!["B".to_owned()]
+        );
+    }
+
+    #[test]
+    fn scope_imports_bare_name_applies_module_scope_visibility() {
+        // A file-top `use` (scope `[]`) binding `Display` is visible to an impl
+        // in any descendant module chain, and directly at file top.
+        let mut imports: BTreeMap<Vec<String>, BTreeSet<String>> = BTreeMap::new();
+        imports.insert(Vec::new(), BTreeSet::from(["Display".to_owned()]));
+        assert!(scope_imports_bare_name(&imports, &[], "Display"));
+        assert!(scope_imports_bare_name(
+            &imports,
+            &["m".to_owned(), "n".to_owned()],
+            "Display"
+        ));
+        // A name it does not bind is never shadowed.
+        assert!(!scope_imports_bare_name(&imports, &[], "Other"));
+
+        // A `use` inside `mod m` (scope `["m"]`) is visible in `m` and its
+        // descendants, but NOT at file top or in an unrelated sibling module.
+        let mut nested: BTreeMap<Vec<String>, BTreeSet<String>> = BTreeMap::new();
+        nested.insert(vec!["m".to_owned()], BTreeSet::from(["Display".to_owned()]));
+        assert!(scope_imports_bare_name(
+            &nested,
+            &["m".to_owned()],
+            "Display"
+        ));
+        assert!(scope_imports_bare_name(
+            &nested,
+            &["m".to_owned(), "inner".to_owned()],
+            "Display"
+        ));
+        // File top cannot see the import declared inside `mod m`.
+        assert!(!scope_imports_bare_name(&nested, &[], "Display"));
+        // An unrelated sibling module `mod other` cannot see `mod m`'s import.
+        assert!(!scope_imports_bare_name(
+            &nested,
+            &["other".to_owned()],
+            "Display"
         ));
     }
 

@@ -62,10 +62,18 @@ use crate::{
 /// older caches rebuild so reused per-file records carry both the new facts
 /// and the new edges.
 ///
+/// v12 adds the serde-default `shadowed_by_use` boolean to each per-file
+/// `pending_impls` fact (issues #343/#344 round 9): the AST-derived
+/// import-shadow verdict a bare trait/type impl carries into the repo-wide
+/// cross-file pass, so a `use` (external/std or non-root local alias) that
+/// shadows the bare name vetoes the wrong `IMPLEMENTS` edge. The field is
+/// serde-default, but a bump forces older caches to rebuild so reused per-file
+/// facts carry the verdict rather than defaulting it to `false`.
+///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 11;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 12;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

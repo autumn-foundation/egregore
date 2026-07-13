@@ -1211,6 +1211,30 @@ once resolved is now left unresolved — a rare potential wrong-edge converted i
 a rare missed-edge, the honest-bound direction consistent with
 `local_traits_only`.
 
+**Import-shadow veto (the general bare-name bound).** The same-name ambiguity
+rule above only sees definitions the impl-target index *already knows*. An
+external or std trait brought in by a `use` — `use std::fmt::Display;` — is not
+in that index, so an ambiguity count of one would let the scope walk mis-bind a
+bare `impl Display for Foo` to a same-named **local** `trait Display`. To close
+the entire shadowing family at once, a bare (unqualified) trait/type name that
+is shadowed by a `use` import **visible in the impl's module scope** — a `use`
+whose final bound segment equals that bare name, declared in the impl's own
+module or any enclosing scope up to the file top — is left **unresolved** on
+**both** the local per-file and the repo-wide cross-file resolution paths,
+**regardless of whether the import target is locally known**. This is a
+deterministic, AST-derived name-shadow boolean (it detects the shadowing `use`,
+it does **not** resolve the import), computed once at extraction time and shared
+by both paths so they cannot diverge. It covers external/std imports, `use
+crate::a::T` aliases of a non-root local definition, and grouped/aliased `use`
+forms alike (a glob `use a::*;` names no specific segment and never vetoes). The
+accepted recall trade-off: a legitimate `use crate::Display; impl Display for
+Foo` whose import target **is** the local trait is now *also* left unresolved —
+an honest missing edge in place of a possible wrong one. Correct import-aware
+resolution (binding the bare name to exactly the trait the `use` names) is
+deferred to follow-up **#393**. The incremental-cache schema version bumps to
+**12** for the serde-default `shadowed_by_use` field this veto records on each
+deferred pending-impl fact; older caches rebuild.
+
 **Multi-crate-root packages are not partitioned by crate root in this slice.**
 The repo-wide index keys on the crate-root-relative **qualified name**, so when
 a package has more than one crate root (`src/lib.rs` plus `src/bin/tool.rs` or

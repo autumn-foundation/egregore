@@ -1888,11 +1888,13 @@ fn real_scan_unqualified_trait_resolves_in_impl_module_scope() {
             .collect()
     };
 
-    // Root impl resolves the root trait — never m::T's bare alias.
+    // Root impl resolves the root trait — never m::T's bare alias. (No `use` of
+    // `T` is in scope, so the import-shadow veto does not fire here.)
     let root = types_for("T");
     assert_eq!(root, vec!["Foo".to_owned()], "root impl -> root trait");
 
-    // Same-module impl resolves its own module's trait.
+    // Same-module impl resolves its own module's trait. (No `use` of `T` in
+    // scope either, so the veto does not fire.)
     let nested = types_for("m::T");
     assert_eq!(
         nested,
@@ -1900,12 +1902,18 @@ fn real_scan_unqualified_trait_resolves_in_impl_module_scope() {
         "module impl -> module trait"
     );
 
-    // No k::Out exists: the walk falls outward to the crate root.
+    // Round-9 reconciliation: `mod k { use super::Out; impl Out for Kid }`
+    // shadows the bare `Out` with a `use` in scope `k`, so the AST-derived
+    // import-shadow veto (issues #343/#344) now leaves the impl UNRESOLVED
+    // rather than walking outward to the root `Out`. This is the documented
+    // recall trade-off — a `use` of the resolved name (even when the import
+    // target IS the local trait) is left unresolved; correct import-aware
+    // resolution is follow-up #393. The root `Out` therefore gains no
+    // implementor.
     let outward = types_for("Out");
-    assert_eq!(
-        outward,
-        vec!["k::Kid".to_owned()],
-        "walk-outward -> root trait"
+    assert!(
+        outward.is_empty(),
+        "import-shadowed bare `impl Out for Kid` is left unresolved (#393): {outward:?}"
     );
 }
 
@@ -2105,12 +2113,20 @@ fn real_scan_relative_qualified_trait_path_resolves_in_module_scope() {
 }
 
 // ---------------------------------------------------------------------------
-// The impl trait fallback never crosses into the value namespace (PR #296
+// The impl trait resolver never crosses into the value namespace (PR #296
 // review): with `mod m { trait T }`, `use m::T;`, `impl T for Foo`, and a
 // later `fn T()`, the function overwrites the bare `T` alias in the general
-// reference-definition map. The impl target fallback must consult only
-// symbols that can be IMPLEMENTS targets, so the edge lands on the trait via
-// the use-import fallback and the function never receives implementor rows.
+// reference-definition map. The resolver must never bind an IMPLEMENTS edge to
+// that value-namespace `fn T` — the standing invariant this test guards.
+//
+// Round-9 reconciliation: the bare `impl T for Foo` is shadowed by `use m::T;`
+// in its module scope, so the AST-derived import-shadow veto (issues
+// #343/#344) now leaves it UNRESOLVED rather than resolving it to `m::T` — the
+// documented recall trade-off (a `use` of the resolved name, even when the
+// import target IS the local trait, is left unresolved; correct import-aware
+// resolution is follow-up #393). `m::T` therefore gains no implementor. The
+// value-namespace guard below is unaffected and remains the load-bearing
+// assertion.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -2146,7 +2162,10 @@ fn real_scan_use_imported_trait_beats_value_namespace_shadow() {
         .assert()
         .success();
 
-    // The use-imported trait owns the implementor.
+    // The bare `impl T for Foo` is shadowed by `use m::T;` in scope, so the
+    // import-shadow veto leaves it unresolved (recall trade-off, #393): `m::T`
+    // gains no implementor rather than mint an edge for a name that syntactically
+    // refers to the import.
     let stdout = egregore()
         .args(["query", "implementors", "m::T", "--graph"])
         .arg(&graph_path)
@@ -2160,15 +2179,14 @@ fn real_scan_use_imported_trait_beats_value_namespace_shadow() {
         .lines()
         .map(|l| serde_json::from_str(l).expect("valid JSON"))
         .collect();
-    assert_eq!(
-        rows.len(),
-        1,
-        "the use-imported trait owns the implementor: {rows:?}"
+    assert!(
+        rows.iter()
+            .all(|r| r["implementing_type"] != "Foo" && r["implementing_type"] != "m::Foo"),
+        "the import-shadowed bare impl is left unresolved (recall trade-off, #393): {rows:?}"
     );
-    assert_eq!(rows[0]["implementing_type"], "Foo");
-    assert_eq!(rows[0]["trait_name"], "m::T");
 
-    // The value-namespace fn named T never receives an IMPLEMENTS edge.
+    // The value-namespace fn named T never receives an IMPLEMENTS edge — the
+    // load-bearing invariant, unaffected by the veto.
     let graph_text = fs::read_to_string(&graph_path).expect("read graph");
     let fn_id = graph_text
         .lines()
@@ -2635,6 +2653,184 @@ fn real_scan_local_unambiguous_bare_impl_still_resolves_outward() {
         vec!["m::Bar"],
         "unambiguous bare `impl T` in a nested module still resolves outward to the \
          lone root trait T: {rows:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round-9 review: the import-shadow veto closes the general bare-name wrong-edge
+// family, not just the SAME-NAME-ambiguous cases the round-8 counting guard saw.
+// An EXTERNAL/std trait brought in by `use std::fmt::Display;` is invisible to
+// the local impl-target index, so the same-name ambiguity guard sees only ONE
+// `Display` (the root) and does NOT fire; the module-scope outward walk then
+// binds bare `Display` to the local ROOT trait and mints a WRONG IMPLEMENTS
+// edge. The fix records, from the AST, that a `use` visible in the impl's module
+// scope ends in the SAME bare segment as the trait name, and leaves the impl
+// unresolved regardless of whether the import target is locally known. Correct
+// import-aware resolution is follow-up #393.
+//
+// Local (inline-module) path: `mod m { use std::fmt::Display; impl<T> Display
+// for Foo<T> }` alongside a root `pub trait Display {}`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_local_generic_external_import_is_not_misresolved() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    // All items live in one scanned source file (inline module), so this
+    // exercises the LOCAL per-file resolver, not the cross-file pass.
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait Display {}\n\n",
+            "pub mod m {\n",
+            "    use std::fmt::Display;\n\n",
+            "    pub struct Foo<T>(T);\n\n",
+            "    impl<T> Display for Foo<T> {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write lib.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    // The root trait `Display` must gain NO implementor: bare `Display` in `m`
+    // refers to the `use std::fmt::Display` import, not the local root trait.
+    let stdout = egregore()
+        .args(["query", "implementors", "Display", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert!(
+        !rows
+            .iter()
+            .filter_map(|r| r["implementing_type"].as_str())
+            .any(|ty| ty == "m::Foo"),
+        "root trait Display must not gain the std-imported Foo as an implementor: {rows:?}"
+    );
+
+    // Stronger bound: no IMPLEMENTS edge targets the ROOT trait `Display`.
+    let graph = fs::read_to_string(&graph_path).expect("read graph");
+    let records: Vec<serde_json::Value> = graph
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    let root_display_id = records
+        .iter()
+        .find(|r| {
+            r["record_type"] == "node" && r["symbol_kind"] == "trait" && r["name"] == "Display"
+        })
+        .and_then(|r| r["id"].as_str().map(str::to_owned))
+        .expect("root trait Display node present");
+    let implements_to_root = records
+        .iter()
+        .filter(|r| r["record_type"] == "edge" && r["label"] == "IMPLEMENTS")
+        .filter_map(|r| r["target"].as_str())
+        .any(|target| target == root_display_id);
+    assert!(
+        !implements_to_root,
+        "no IMPLEMENTS edge may target the root trait Display: {records:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round-9 review: the cross-file analog of the import-shadow veto. An out-of-line
+// module (`src/m.rs`) imports an EXTERNAL/std trait by `use std::fmt::Display;`
+// and implements it by bare name, while `src/lib.rs` defines a same-named root
+// trait. The std import is invisible to the repo impl-target index, so the
+// same-name ambiguity guard sees only the root `Display` and does NOT fire; the
+// cross-file scope walk then binds bare `Display` to the root trait — a WRONG
+// cross-file IMPLEMENTS edge. The `PendingImplFact` now carries an AST-derived
+// `shadowed_by_use` boolean set at extraction time, and the cross-file resolver
+// vetoes when it is true. Correct import-aware resolution is follow-up #393.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_cross_file_external_import_is_not_misresolved() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!("pub trait Display {}\n\n", "pub mod m;\n"),
+    )
+    .expect("write lib.rs");
+    fs::write(
+        src.join("m.rs"),
+        concat!(
+            "use std::fmt::Display;\n\n",
+            "pub struct Foo;\n\n",
+            "impl Display for Foo {}\n",
+        ),
+    )
+    .expect("write m.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    // The root trait `Display` must gain NO implementor: bare `Display` in m.rs
+    // refers to the `use std::fmt::Display` import, not the local root trait.
+    let stdout = egregore()
+        .args(["query", "implementors", "Display", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert!(
+        rows.iter()
+            .all(|r| r["implementing_type"] != "m::Foo" && r["implementing_type"] != "Foo"),
+        "root trait Display must not gain the std-imported cross-file Foo: {rows:?}"
+    );
+
+    // Stronger bound: no cross-file IMPLEMENTS edge targets the ROOT `Display`.
+    let graph = fs::read_to_string(&graph_path).expect("read graph");
+    let records: Vec<serde_json::Value> = graph
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    let root_display_id = records
+        .iter()
+        .find(|r| {
+            r["record_type"] == "node" && r["symbol_kind"] == "trait" && r["name"] == "Display"
+        })
+        .and_then(|r| r["id"].as_str().map(str::to_owned))
+        .expect("root trait Display node present");
+    let implements_to_root = records
+        .iter()
+        .filter(|r| r["record_type"] == "edge" && r["label"] == "IMPLEMENTS")
+        .filter_map(|r| r["target"].as_str())
+        .any(|target| target == root_display_id);
+    assert!(
+        !implements_to_root,
+        "no cross-file IMPLEMENTS edge may target the root trait Display: {records:?}"
     );
 }
 
