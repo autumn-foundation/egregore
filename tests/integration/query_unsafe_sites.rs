@@ -589,18 +589,19 @@ fn unsafe_sites_enclosing_symbol_is_explicit_null_when_top_level() {
 }
 
 // ---------------------------------------------------------------------------
-// Enclosing symbol: signature-only trait methods attach to the trait
+// Enclosing symbol: signature-only trait methods attach to their own Symbol
 // ---------------------------------------------------------------------------
 
 #[test]
-fn unsafe_fn_trait_signature_encloses_to_containing_trait() {
-    // Documented decision, not an accident: the extractor never symbolizes
-    // signature-only declarations (`function_signature_item`), so an
-    // `unsafe fn` trait-method signature has no `Symbol` of its own and the
-    // innermost `DEFINES`-owned covering symbol is the containing trait.
-    // The row's own file/span handle still cites the exact declaration.
-    // Symbolizing signature-only declarations would be a repo-wide extractor
-    // change outside this lane's scope (see docs/cli/unsafe-sites.md).
+fn unsafe_fn_trait_signature_encloses_to_method_symbol() {
+    // Documented decision (issue #342): signature-only trait-method
+    // declarations (`function_signature_item` inside a trait body) are now
+    // first-class `Symbol` records, mirroring default-bodied trait methods.
+    // The `unsafe fn` signature therefore has its own covering Symbol whose
+    // span is smaller than the enclosing trait, so the innermost-span
+    // resolver attributes the site to the method, not the trait. No lane code
+    // changed — the re-attribution comes purely from the new Symbol's span
+    // (see docs/cli/unsafe-sites.md).
     let temp = tempfile::tempdir().expect("temp dir");
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
@@ -632,10 +633,10 @@ fn unsafe_fn_trait_signature_encloses_to_containing_trait() {
     // (`unsafe fn poke(&self);` sits on line 2 of the fixture).
     assert_eq!(site["span"]["start_line"], 2);
     assert_eq!(site["span"]["end_line"], 2);
-    // The enclosing symbol is the containing trait, because no Symbol record
-    // exists for the signature-only method.
-    assert_eq!(site["enclosing_symbol"]["name"], "Device");
-    assert_eq!(site["enclosing_symbol"]["symbol_kind"], "trait");
+    // The enclosing symbol is now the signature-only method's own Symbol,
+    // whose span is smaller than the containing trait's.
+    assert_eq!(site["enclosing_symbol"]["name"], "poke");
+    assert_eq!(site["enclosing_symbol"]["symbol_kind"], "function");
 }
 
 // ---------------------------------------------------------------------------

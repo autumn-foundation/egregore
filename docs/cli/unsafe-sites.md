@@ -119,10 +119,13 @@ The enclosing symbol is the innermost `DEFINES`-owned `Symbol` whose span
 covers the site. For an `unsafe fn` item or an `unsafe impl` block that is
 the declared symbol itself; for an `unsafe { .. }` block it is the containing
 function or item. For a signature-only trait method (`trait T { unsafe fn
-f(); }`) it is the **containing trait**: the extractor does not symbolize
-signature-only declarations, so no `Symbol` record exists for `f` itself,
-while the row's own file/span handle still cites the exact `unsafe fn`
-declaration. A site with no covering symbol span carries an explicit `null`.
+f(); }`) it is the **method itself**: issue #342 makes signature-only trait
+method declarations first-class `Symbol` records (mirroring default-bodied
+trait methods), so the innermost covering symbol is the method's own `Symbol`,
+whose span is smaller than the containing trait's. A site with no covering
+symbol span carries an explicit `null`. (Foreign function declarations inside
+an `extern` block are still symbol-less, so an `unsafe fn` there attributes to
+its nearest covering symbol, or `null` at file top level.)
 
 ## Scoping and temporal selectors
 

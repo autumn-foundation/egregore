@@ -59,6 +59,13 @@ never a silent empty payload, never synthesized items (AC6).
   `const`, `static`, `module`, plus re-export rows. Methods, trait members,
   and `impl` blocks are declaration details of their owning items, not
   surface items.
+- Trait methods — both default-bodied and signature-only (issue #342) — are
+  recorded with the same kind (`function`), visibility (`private`, since a
+  trait item carries no `pub` modifier), and owner (the enclosing file/module,
+  not the trait) as each other. They are therefore **excluded from the
+  public-API surface as private**, exactly as default-bodied trait methods
+  are; the enclosing `pub trait` is the surface item. Symbolizing a
+  signature-only trait method never adds a public-API row.
 - Glob re-exports (`pub use m::*;`) cannot be enumerated without name
   resolution: they yield a `glob_reexport_unresolved` diagnostic naming the
   re-export record — never guessed item rows.
