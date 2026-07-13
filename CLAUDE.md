@@ -367,7 +367,9 @@ surface (`read_all_records_log_retained`), which surfaces every distinct scan OB
 each superseded non-temporal `ErrorSignature`/`LogOccurrenceBucket` version that
 differing-content `scan-logs` ingests append, while an enrichment-only rewrite (evidence links
 added by `resolve-frames`/`link-logs`, log payload unchanged) is retained as a single
-observation and never double-counted — so `first_seen`/`last_seen`/occurrence counts are
+observation and never double-counted (retraction boundary honored — a `forget`-retracted
+observation re-observed by a LATER `scan-logs` is not resurrected; only the post-retraction
+observation reaches the coalesced sum) — so `first_seen`/`last_seen`/occurrence counts are
 reconstructed exactly as on the concatenated `--graph` JSONL. When run over `--data-dir` with log records present, the envelope still carries an
 `embedded_log_retention_caveat` disclosing a residual divergence in two forms, both from
 idempotent-write dedup of byte-identical non-temporal records: (1) byte-identical re-ingests of the

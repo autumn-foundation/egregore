@@ -870,6 +870,185 @@ impl EmbeddedAletheiaSink {
         Ok(records)
     }
 
+    /// Maps each retracted stable ID to the HIGHEST `egregore_seq` among the
+    /// tombstones that retracted it — the retraction boundary the log-retained
+    /// reads enforce (issue #363).
+    ///
+    /// A `forget` retraction of a log-domain ID writes a tombstone. When a later
+    /// `scan-logs` re-observes the SAME stable ID it appends a new physical
+    /// version with a higher `egregore_seq`, superseding the tombstone; the
+    /// current-state read then correctly exposes only that post-retraction
+    /// observation. The append-only store still holds the pre-retraction physical
+    /// version, though, so the retained log sweep must suppress any version at or
+    /// below this boundary to avoid resurrecting the forgotten observation. The
+    /// MAX seq per deleted ID handles a record retracted more than once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a physical tombstone node cannot be read.
+    fn log_tombstone_boundary(&self) -> AdapterResult<BTreeMap<String, u64>> {
+        let mut boundary: BTreeMap<String, u64> = BTreeMap::new();
+        for &tombstone_node_id in self.tombstone_ids.values() {
+            let node = self
+                .db
+                .get_node(tombstone_node_id)
+                .map_err(|error| read_back_error("log_tombstone_boundary", error.to_string()))?;
+            let Some(deleted_id) = optional_str_property(
+                "log_tombstone_boundary",
+                "deleted_id",
+                node.get_property("deleted_id"),
+            )?
+            else {
+                continue;
+            };
+            let seq = self
+                .tombstone_node_seqs
+                .get(&tombstone_node_id)
+                .copied()
+                .unwrap_or(0);
+            boundary
+                .entry(deleted_id)
+                .and_modify(|current| *current = (*current).max(seq))
+                .or_insert(seq);
+        }
+        Ok(boundary)
+    }
+
+    /// Returns the complete, retraction-boundary-correct set of non-temporal
+    /// **log-domain** node records (`ErrorSignature` / `LogOccurrenceBucket`) for
+    /// the retained read lanes — the single shared implementation behind both
+    /// [`Self::read_all_records_log_retained`] and
+    /// [`Self::read_all_records_including_superseded_log_retained`] (issue #363).
+    ///
+    /// Each lane strips its own log-domain node records and appends this set, so
+    /// the two can never drift in how they retain, collapse, or suppress log
+    /// observations.
+    ///
+    /// # What the set contains
+    ///
+    /// Every DISTINCT scan observation of every non-tombstoned log signature /
+    /// bucket, keyed by [`log_observation_key`], keeping the LATEST physical
+    /// version per `(record_id, observation_key)`. Enrichment-only rewrites
+    /// (identical log payload, `FRAME_RESOLVES_TO` / `EMITTED_DURING` /
+    /// `REFERENCES_TASK` evidence links added by `resolve-frames` / `link-logs`)
+    /// share their scan payload's key and collapse to the single latest (enriched)
+    /// version, so occurrence counts are never doubled and resolved frames /
+    /// evidence links are preserved. Genuinely distinct scan payloads (differing
+    /// `first_seen` / `last_seen` / `occurrence_count`, or differing #322 captured
+    /// frames) have distinct keys and are all retained, so the #326 / #324
+    /// cross-scan coalescers reconstruct on `--data-dir` exactly what they do on
+    /// the concatenated `--graph` JSONL.
+    ///
+    /// # Retraction boundary (issue #363, Codex P2)
+    ///
+    /// A physical version whose `egregore_seq` is at or below the LATEST tombstone
+    /// written for its stable ID ([`Self::log_tombstone_boundary`]) was written at
+    /// or before a `forget` retraction and is suppressed: a re-scan after `forget`
+    /// never resurrects a pre-retraction observation. A fully-retracted ID (an
+    /// active tombstone with no later re-observation) is in `active_tombstoned`
+    /// and skipped entirely, matching the current-state read.
+    ///
+    /// The set is sorted by `(egregore_seq, record_id)` for determinism; the log
+    /// coalescers group by stable ID and are order-insensitive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a physical record cannot be read.
+    fn retained_log_observation_records(&self) -> AdapterResult<Vec<GraphRecord>> {
+        let active_tombstoned = self.active_deleted_ids()?;
+        let boundary = self.log_tombstone_boundary()?;
+        // Latest-seq record per (stable_id, observation_key). Distinct scan
+        // payloads have distinct keys and are all kept; enrichment rewrites share
+        // a key and collapse to the newest (enriched) version.
+        let mut latest: BTreeMap<(String, String), (u64, GraphRecord)> = BTreeMap::new();
+        // Defensive: a log-kind node with no coalesce-relevant payload cannot be
+        // an enrichment duplicate of a payload-bearing observation, so retain it.
+        let mut keyless: Vec<(u64, GraphRecord)> = Vec::new();
+        for node_id in self.db.get_all_node_ids() {
+            let node = self.db.get_node(node_id).map_err(|error| {
+                read_back_error("retained_log_observation_records", error.to_string())
+            })?;
+            // Node records only — tombstones and edges are not "node".
+            if optional_str_property(
+                "retained_log_observation_records",
+                "record_type",
+                node.get_property("record_type"),
+            )?
+            .as_deref()
+                != Some("node")
+            {
+                continue;
+            }
+            // Restrict to the two non-temporal log-domain kinds.
+            if !matches!(
+                optional_str_property(
+                    "retained_log_observation_records",
+                    "kind",
+                    node.get_property("kind"),
+                )?
+                .as_deref(),
+                Some("ErrorSignature" | "LogOccurrenceBucket")
+            ) {
+                continue;
+            }
+            let Some(record_id) = optional_str_property(
+                "retained_log_observation_records",
+                "codegraph_id",
+                node.get_property("codegraph_id"),
+            )?
+            else {
+                continue;
+            };
+            // Non-temporal only (log signatures/buckets are non-temporal;
+            // defensive against a stray temporal log node).
+            if !self.node_lookup.non_temporal.contains_key(&record_id) {
+                continue;
+            }
+            // Fully retracted (active tombstone, no later re-observation) → skip.
+            if active_tombstoned.contains(record_id.as_str()) {
+                continue;
+            }
+            let seq = optional_str_property(
+                "retained_log_observation_records",
+                "egregore_seq",
+                node.get_property("egregore_seq"),
+            )?
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+            // Retraction boundary: suppress any version written at or before the
+            // latest tombstone for this stable ID (a re-scan after `forget` must
+            // not resurrect a pre-retraction observation).
+            if boundary
+                .get(record_id.as_str())
+                .is_some_and(|&max_seq| seq <= max_seq)
+            {
+                continue;
+            }
+            let record = self.read_node_record(&record_id, node_id)?;
+            match log_observation_key(&record) {
+                Some(key) => match latest.entry((record_id, key)) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((seq, record));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if seq >= entry.get().0 {
+                            *entry.get_mut() = (seq, record);
+                        }
+                    }
+                },
+                None => keyless.push((seq, record)),
+            }
+        }
+        let mut out: Vec<(u64, GraphRecord)> = latest.into_values().collect();
+        out.extend(keyless);
+        out.sort_by(|(a_seq, a_record), (b_seq, b_record)| {
+            a_seq
+                .cmp(b_seq)
+                .then_with(|| a_record.id().cmp(b_record.id()))
+        });
+        Ok(out.into_iter().map(|(_, record)| record).collect())
+    }
+
     /// Like [`Self::read_all_records`], but additionally re-emits every
     /// superseded (non-current) physical version of a non-temporal **log-domain**
     /// node (`kind` `ErrorSignature` or `LogOccurrenceBucket`) that is a
@@ -927,110 +1106,38 @@ impl EmbeddedAletheiaSink {
     ///   the `--graph` path, where concatenating identical JSONL does.
     /// * Actively tombstoned IDs stay suppressed, matching
     ///   [`Self::read_all_records`].
+    /// * A `forget`-retracted log observation is NOT resurrected by a later
+    ///   re-scan: [`Self::retained_log_observation_records`] suppresses every
+    ///   physical version at or below the latest tombstone for its stable ID
+    ///   (the retraction boundary), so only post-retraction re-observations
+    ///   survive into the coalesced sum.
     ///
-    /// Superseded versions are appended in write (`egregore_seq`) order after the
-    /// current-state slice; the log coalescers group by stable ID and are
-    /// order-insensitive, so no consumer depends on interleaving them with the
-    /// current versions.
+    /// # Implementation
+    ///
+    /// The log-domain node records are stripped from the current-state read and
+    /// replaced by [`Self::retained_log_observation_records`] — the single shared
+    /// set both retained lanes append, so the current-state and history-inclusive
+    /// variants cannot drift. The set is appended in `(egregore_seq, record_id)`
+    /// order after the non-log records; the log coalescers group by stable ID and
+    /// are order-insensitive, so no consumer depends on interleaving.
     ///
     /// # Errors
     ///
     /// Returns an error if a physical record cannot be read.
     pub fn read_all_records_log_retained(&self) -> AdapterResult<Vec<GraphRecord>> {
-        let mut records = self.read_all_records()?;
-        let active_tombstoned = self.active_deleted_ids()?;
-        // Per stable ID, the set of observation keys already represented — seeded
-        // lazily with the CURRENT version's key so an enrichment rewrite of the
-        // current observation is never re-emitted.
-        let mut seen_keys: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
-            std::collections::BTreeMap::new();
-        let mut superseded: Vec<(u64, GraphRecord)> = Vec::new();
-        for node_id in self.db.get_all_node_ids() {
-            let node = self.db.get_node(node_id).map_err(|error| {
-                read_back_error("read_all_records_log_retained", error.to_string())
-            })?;
-            // Node records only — tombstones and edges are not "node".
-            if optional_str_property(
-                "read_all_records_log_retained",
-                "record_type",
-                node.get_property("record_type"),
-            )?
-            .as_deref()
-                != Some("node")
-            {
-                continue;
-            }
-            // Restrict to the two non-temporal log-domain kinds; every other
-            // kind keeps its single current-state record (non-log behaviour
-            // unchanged).
-            if !matches!(
-                optional_str_property(
-                    "read_all_records_log_retained",
-                    "kind",
-                    node.get_property("kind"),
-                )?
-                .as_deref(),
-                Some("ErrorSignature" | "LogOccurrenceBucket")
-            ) {
-                continue;
-            }
-            let Some(record_id) = optional_str_property(
-                "read_all_records_log_retained",
-                "codegraph_id",
-                node.get_property("codegraph_id"),
-            )?
-            else {
-                continue;
-            };
-            if active_tombstoned.contains(record_id.as_str()) {
-                continue;
-            }
-            // Emit only SUPERSEDED (non-current) versions; the current version is
-            // already in `records` via `read_all_records`.
-            match self.node_lookup.non_temporal.get(&record_id) {
-                Some(current) if *current == node_id => continue, // current, already emitted
-                Some(_) => {}                                     // superseded → candidate
-                None => continue, // not a non-temporal node (defensive)
-            }
-            let record = self.read_node_record(&record_id, node_id)?;
-            // Seed this ID's seen-key set with the CURRENT version's observation
-            // key, so an enrichment rewrite of the current observation is not
-            // re-emitted.
-            let seen = seen_keys.entry(record_id.clone()).or_insert_with(|| {
-                let mut set = std::collections::BTreeSet::new();
-                if let Some(&current) = self.node_lookup.non_temporal.get(&record_id)
-                    && let Ok(current_record) = self.read_node_record(&record_id, current)
-                    && let Some(key) = log_observation_key(&current_record)
-                {
-                    set.insert(key);
-                }
-                set
-            });
-            // Retain only a DISTINCT scan observation: a superseded version whose
-            // coalesce-relevant log payload differs from the current version and
-            // from every already-retained superseded version. Enrichment-only
-            // rewrites (identical payload, evidence links added) collapse to an
-            // already-seen key and are dropped — never double-counted.
-            // A payload-less log node is defensive: retain it (it cannot be an
-            // enrichment duplicate of a payload-bearing observation). A
-            // payload-bearing version is retained only when its key is new;
-            // a duplicate key (including an enrichment rewrite) is skipped.
-            if let Some(key) = log_observation_key(&record)
-                && !seen.insert(key)
-            {
-                continue;
-            }
-            let seq = optional_str_property(
-                "read_all_records_log_retained",
-                "egregore_seq",
-                node.get_property("egregore_seq"),
-            )?
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-            superseded.push((seq, record));
-        }
-        superseded.sort_by_key(|(seq, _)| *seq);
-        records.extend(superseded.into_iter().map(|(_, record)| record));
+        // Strip the current-state read's log-domain node records and replace them
+        // with the shared, retraction-boundary-correct set. This keeps the two
+        // retained lanes byte-for-byte identical in log handling and lets the
+        // helper suppress pre-retraction observations a naive superseded-version
+        // sweep would resurrect (issue #363). Tombstones, edges, temporal
+        // snapshots, project nodes and every non-log record pass through
+        // untouched.
+        let mut records: Vec<GraphRecord> = self
+            .read_all_records()?
+            .into_iter()
+            .filter(|record| !is_log_domain_node(record))
+            .collect();
+        records.extend(self.retained_log_observation_records()?);
         Ok(records)
     }
 
@@ -1098,34 +1205,22 @@ impl EmbeddedAletheiaSink {
     pub fn read_all_records_including_superseded_log_retained(
         &self,
     ) -> AdapterResult<Vec<GraphRecord>> {
-        let records = self.read_all_records_including_superseded()?;
-        // Pass 1: for every log-domain node record carrying a coalesce-relevant
-        // payload, record the index of its LAST occurrence keyed by
-        // (stable_id, observation_key). Because the wrapped read emits
-        // non-temporal versions in ascending write order, that last occurrence is
-        // the latest (enriched) write of that observation.
-        let mut last_index: std::collections::HashMap<(String, String), usize> =
-            std::collections::HashMap::new();
-        for (idx, record) in records.iter().enumerate() {
-            if let Some(key) = log_observation_key(record) {
-                last_index.insert((record.id().to_owned(), key), idx);
-            }
-        }
-        // Pass 2: emit every non-log record unchanged; emit a log-domain payload
-        // record only at its last-occurrence index, dropping earlier duplicates
-        // (enrichment rewrites AND identical-observation duplicates of the same
-        // key). Distinct observations have distinct keys, so both survive.
-        let mut out = Vec::with_capacity(records.len());
-        for (idx, record) in records.into_iter().enumerate() {
-            if let Some(key) = log_observation_key(&record) {
-                let entry = (record.id().to_owned(), key);
-                if last_index.get(&entry) != Some(&idx) {
-                    continue;
-                }
-            }
-            out.push(record);
-        }
-        Ok(out)
+        // Strip the history-inclusive read's log-domain node records and replace
+        // them with the SAME shared, retraction-boundary-correct set the
+        // current-state lane uses, so the two lanes cannot drift (issue #363).
+        // Non-log temporal snapshots, superseded non-log versions, tombstones,
+        // edges and project nodes pass through untouched, so `--at` / `--as-of`
+        // valid-time reconstruction is byte-for-byte unaffected. The shared
+        // helper also enforces the `forget` retraction boundary, which the raw
+        // history read cannot (it deliberately re-emits every physical version,
+        // including pre-retraction ones, for transaction-time views).
+        let mut records: Vec<GraphRecord> = self
+            .read_all_records_including_superseded()?
+            .into_iter()
+            .filter(|record| !is_log_domain_node(record))
+            .collect();
+        records.extend(self.retained_log_observation_records()?);
+        Ok(records)
     }
 
     /// Reads all physical records stored in the database for inspection.
@@ -3704,6 +3799,20 @@ fn log_observation_key(record: &GraphRecord) -> Option<String> {
     }
 }
 
+/// Returns `true` for a `GraphRecord::Node` whose kind is one of the two
+/// non-temporal log-domain kinds (`ErrorSignature` / `LogOccurrenceBucket`) —
+/// exactly the node records the retained reads strip and replace with
+/// [`EmbeddedAletheiaSink::retained_log_observation_records`] (issue #363).
+/// Edges and tombstones report `None` from `node_kind_name` and are never
+/// matched, so `LogSource` / `LogEvent` nodes and all non-log records pass
+/// through untouched.
+fn is_log_domain_node(record: &GraphRecord) -> bool {
+    matches!(
+        record.node_kind_name(),
+        Some("ErrorSignature" | "LogOccurrenceBucket")
+    )
+}
+
 fn check_read_deadline(record_id: &str, deadline: Option<Instant>) -> AdapterResult<()> {
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err(AdapterError::TimedOut {
@@ -5147,6 +5256,127 @@ mod tests {
             commits(&retained),
             commits(&unfiltered),
             "non-log temporal versions are untouched by the log-retained post-filter"
+        );
+    }
+
+    /// Sums the `occurrence_count` across every `ErrorSignature` physical
+    /// version of `sig_id` in a record slice — the value the #326/#324
+    /// cross-scan coalescers reconstruct on the `--data-dir` retained read.
+    fn summed_signature_occurrences(records: &[GraphRecord], sig_id: &str) -> u64 {
+        records
+            .iter()
+            .filter(|r| r.id() == sig_id && r.node_kind_name() == Some("ErrorSignature"))
+            .filter_map(GraphRecord::log_payload)
+            .filter_map(|payload| match payload {
+                crate::ir::LogPayload::ErrorSignature(sig) => Some(sig.occurrence_count),
+                _ => None,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn read_all_records_log_retained_honors_forget_retraction_boundary() {
+        // Issue #363 (Codex P2): `forget` can tombstone a log-domain
+        // `ErrorSignature` (a log ID is non-codegraph, non-temporal). If a LATER
+        // `scan-logs` writes the SAME stable ID with a DISTINCT payload, that
+        // write supersedes the tombstone (higher seq), so the current-state read
+        // correctly exposes only the post-forget version. The log-retained read
+        // must NOT resurrect the pre-forget observation from the append-only
+        // physical history: superseded versions written at or before the
+        // retraction are suppressed.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("log-retained-forget-boundary-store");
+        let sig_id = "log:v1:forget-boundary-boom";
+        // v1 (occurrence A=3) → forget/tombstone → v2 (occurrence B=5, distinct).
+        let v1 = error_signature_record(sig_id, "2026-01-01T00:00:00Z", "2026-01-01T05:00:00Z", 3);
+        // The tombstone mirrors exactly what `eg forget` mints for a log ID: a
+        // same-domain `log:v1:<hash>` tombstone (issue #231/#363).
+        let (tombstone_id, tombstone_version) = crate::forget::retraction_tombstone_id(sig_id);
+        let tombstone = GraphRecord::Tombstone {
+            id: tombstone_id,
+            schema_version: tombstone_version,
+            deleted_id: sig_id.to_owned(),
+            summary: "retracted: leaked value".to_owned(),
+            producer: None,
+        };
+        let v2 = error_signature_record(sig_id, "2026-01-02T12:00:00Z", "2026-01-02T13:00:00Z", 5);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&v1).expect("v1 should write");
+        sink.write_record(&tombstone)
+            .expect("tombstone should write");
+        sink.write_record(&v2)
+            .expect("post-forget re-scan should write");
+
+        // Baseline: the current-state read already shows only the post-forget
+        // version (the later write superseded the tombstone).
+        let current = sink.read_all_records().expect("current read");
+        assert_eq!(
+            summed_signature_occurrences(&current, sig_id),
+            5,
+            "current-state read shows only the post-forget observation"
+        );
+
+        let retained = sink
+            .read_all_records_log_retained()
+            .expect("log-retained read");
+        assert_eq!(
+            summed_signature_occurrences(&retained, sig_id),
+            5,
+            "the pre-forget observation (occurrence 3) must NOT be resurrected into the sum"
+        );
+
+        let history_retained = sink
+            .read_all_records_including_superseded_log_retained()
+            .expect("log-retained history read");
+        assert_eq!(
+            summed_signature_occurrences(&history_retained, sig_id),
+            5,
+            "the history-inclusive log-retained read must also honor the retraction boundary"
+        );
+    }
+
+    #[test]
+    fn read_all_records_log_retained_fully_suppresses_active_tombstone() {
+        // Issue #363 (Codex P2): the simple retraction case — a log ID tombstoned
+        // with NO later write — stays fully suppressed in both retained reads
+        // (regression guard alongside the re-scan-after-forget boundary).
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("log-retained-fully-retracted-store");
+        let sig_id = "log:v1:fully-retracted-boom";
+        let v1 = error_signature_record(sig_id, "2026-01-01T00:00:00Z", "2026-01-01T05:00:00Z", 3);
+        let (tombstone_id, tombstone_version) = crate::forget::retraction_tombstone_id(sig_id);
+        let tombstone = GraphRecord::Tombstone {
+            id: tombstone_id,
+            schema_version: tombstone_version,
+            deleted_id: sig_id.to_owned(),
+            summary: "retracted: leaked value".to_owned(),
+            producer: None,
+        };
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&v1).expect("v1 should write");
+        sink.write_record(&tombstone)
+            .expect("tombstone should write");
+
+        let present = |records: &[GraphRecord]| {
+            records
+                .iter()
+                .any(|r| r.id() == sig_id && r.node_kind_name() == Some("ErrorSignature"))
+        };
+
+        let retained = sink
+            .read_all_records_log_retained()
+            .expect("log-retained read");
+        assert!(
+            !present(&retained),
+            "a fully-retracted log signature stays suppressed in the current-state log-retained read"
+        );
+
+        let history_retained = sink
+            .read_all_records_including_superseded_log_retained()
+            .expect("log-retained history read");
+        assert!(
+            !present(&history_retained),
+            "a fully-retracted log signature stays suppressed in the history log-retained read"
         );
     }
 

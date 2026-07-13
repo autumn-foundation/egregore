@@ -134,6 +134,11 @@ it either. This mirrors the identical disclosure on
 in issue #363. This is a disclosure only — it never changes handle resolution or
 section contents.
 
+The retained read preserves the **`forget` retraction boundary**: a
+`forget`-retracted `ErrorSignature` re-observed by a **later** `scan-logs` is not
+resurrected — only the post-retraction observation reaches the coalesced sum, so a
+re-scan after `forget` never revives a forgotten observation.
+
 ## Shortest offline workflow
 
 ```powershell

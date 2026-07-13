@@ -2270,6 +2270,81 @@ fn embedded_data_dir_coalesces_signature_block_like_graph() {
     assert!(graph.embedded_log_retention_caveat.is_none());
 }
 
+/// Issue #363 (Codex P2): a `forget`-retracted log observation is NOT resurrected
+/// by a later re-scan on the `--data-dir` retained read. A signature is written
+/// (occurrence 3), then tombstoned (as `eg forget` does — a log ID is
+/// non-`codegraph:`, non-temporal, so retraction is allowed), then re-observed by
+/// a later scan with a DISTINCT payload (occurrence 5). The current-state read
+/// exposes only the post-forget version; the log-retained read must too — the
+/// pre-retraction observation is suppressed by the retraction boundary, so the
+/// coalesced `error-context` occurrence is 5, never 3 + 5 = 8.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_data_dir_honors_forget_retraction_boundary_in_error_context() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+    use aletheia_egregore::forget::retraction_tombstone_id;
+
+    // v1 (occurrence 3) → forget/tombstone → v2 (occurrence 5, distinct window).
+    let (sig_id, sig1) = error_signature(
+        "boom",
+        "error",
+        "2026-01-02T10:00:00Z",
+        "2026-01-02T11:00:00Z",
+        3,
+        None,
+    );
+    let (sig_id2, sig2) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 5, None);
+    assert_eq!(sig_id, sig_id2, "same seed → same stable signature ID");
+    // The tombstone mirrors exactly what `eg forget` mints for a log ID.
+    let (tombstone_id, tombstone_version) = retraction_tombstone_id(&sig_id);
+    let tombstone = GraphRecord::Tombstone {
+        id: tombstone_id,
+        schema_version: tombstone_version,
+        deleted_id: sig_id.clone(),
+        summary: "retracted: leaked value".to_owned(),
+        producer: None,
+    };
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("forget-boundary-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    sink.write_record(&sig1).expect("v1 should write");
+    sink.write_record(&tombstone)
+        .expect("tombstone should write");
+    sink.write_record(&sig2)
+        .expect("post-forget re-scan should write");
+    let embedded_records = sink
+        .read_all_records_log_retained()
+        .expect("log-retained read");
+    drop(sink);
+
+    let embedded = error_context(
+        &embedded_records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        true,
+    )
+    .expect("embedded resolve");
+
+    assert_eq!(
+        embedded.signatures.len(),
+        1,
+        "the retracted-then-re-observed signature coalesces to one row"
+    );
+    let e = &embedded.signatures[0];
+    // Only the post-forget observation survives — never 3 + 5 = 8.
+    assert_eq!(
+        e.occurrence_count, 5,
+        "the pre-forget observation must not be resurrected into the coalesced sum"
+    );
+    assert_eq!(e.first_seen, SIG_FIRST);
+    assert_eq!(e.last_seen, SIG_LAST);
+}
+
 /// Issue #363 (Codex P2): the same-hour/same-count `LogOccurrenceBucket` sub-case.
 /// When two DIFFERING scans of one signature share a bucket for the same hour with
 /// the SAME count, that bucket record is BYTE-IDENTICAL (same ID AND content), so

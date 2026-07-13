@@ -218,6 +218,13 @@ envelope carries an `embedded_log_retention_caveat` object (a fixed `message`)
 disclosing both forms of this residual divergence. The adapter-level retention fix
 landed in **issue #363**.
 
+The retention preserves the **`forget` retraction boundary**: if an
+`ErrorSignature` was retracted with `eg forget` and a **later** `scan-logs`
+re-observes the same stable ID, the log-retained read surfaces only the
+post-retraction observation — the pre-retraction observation is **not**
+resurrected into the coalesced sum (a re-scan after `forget` never revives a
+forgotten observation).
+
 ## Change classes
 
 Every in-scope `ErrorSignature`, after coalescing, is classified against the
