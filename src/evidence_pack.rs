@@ -742,7 +742,10 @@ pub fn load_default_catalog() -> ControlCatalog {
 // and Window-consistency (every row's resolved valid time inside the window).
 
 use crate::bundle::{BundleRecord, VerificationVerdict, scrub_record};
-use crate::citation_audit::{CitationStatus, citation_trust_class, classify_record_external};
+use crate::citation_audit::{
+    CitationProvenance, CitationStatus, citation_trust_class,
+    classify_record_external_with_provenance,
+};
 use crate::ir::{GraphRecord, TemporalMetadata};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1374,6 +1377,15 @@ pub struct PackVerdicts {
     pub safety: VerificationVerdict,
     /// Per-trust-class citation tallies, canonically ordered.
     pub citation_tallies: Vec<ClassCitationTally>,
+    /// BLAKE3 binding hash over the canonical serialization of the citation verdict
+    /// (`passed` + `detail`) and `citation_tallies` (issue #372, Part 4). Recomputed
+    /// by `verify_pack`'s Integrity check and compared, so a hand-edited
+    /// `citation.passed` (false→true) with a stale hash fails Integrity — which is
+    /// what lets `verify_pack`'s Coverage floor trust the recorded citation verdict.
+    /// `#[serde(default)]` keeps a pre-#372 pack (empty string) parseable; such a
+    /// pack fails Integrity against the non-empty recompute, as intended.
+    #[serde(default)]
+    pub citation_binding_hash: String,
 }
 
 /// A complete, self-contained, control-scoped evidence pack (AC1).
@@ -2924,6 +2936,19 @@ fn hash_log_summary(summary: &LogEvidenceSummary) -> String {
     blake3::hash(serialized.as_bytes()).to_string()
 }
 
+/// Canonical BLAKE3 binding hash over the citation verdict + tallies (issue #372,
+/// Part 4). Computed at assemble into `PackVerdicts::citation_binding_hash` and
+/// recomputed by `verify_pack`'s Integrity so a hand-edited `citation.passed`
+/// (false→true) with a stale hash is caught — the integrity anchor that lets
+/// `verify_pack`'s Coverage floor trust the recorded citation verdict. Uses the
+/// same `serde_json::to_string` canonicalization as `hash_log_summary` and the
+/// per-record `BundleRecord.hash`, so byte-stability holds across runs.
+fn hash_citation_verdict(citation: &VerificationVerdict, tallies: &[ClassCitationTally]) -> String {
+    let payload = (citation.passed, citation.detail.as_str(), tallies);
+    let serialized = serde_json::to_string(&payload).unwrap_or_default();
+    blake3::hash(serialized.as_bytes()).to_string()
+}
+
 /// Binds a section's derived `log_summary` (issue #340) into `verify_pack`'s
 /// Integrity so a tampered summary value fails verification, mirroring the
 /// `review_coverage` `measurement` bind. Returns `Err(detail)` on any mismatch.
@@ -3384,8 +3409,24 @@ fn bind_occurrence_totals(
 }
 
 /// The trust-class citation view of a set of section rows, reused for both the
-/// assemble-time citation verdict and `verify_pack`'s coverage check (AC4).
-fn citation_view(rows: &[&BundleRecord]) -> (Vec<ClassCitationTally>, bool, bool) {
+/// assemble-time citation verdict and `verify_pack`'s Coverage check (AC4).
+///
+/// Runtime rows require `LogSource` provenance (source path + `source_artifact_hash`)
+/// to be cited (#328/#372), resolved through the provided [`CitationProvenance`]
+/// index. Assemble builds the index over the full input graph; `verify_pack` builds
+/// it over the pack's OWN co-located section rows (the `CAPTURED_FROM` edges +
+/// `LogSource` nodes carried since #372). BOTH surfaces therefore INDEPENDENTLY
+/// enforce the requirement: a provenance-less runtime row is `MissingRequiredHandle`
+/// and fails the non-code gate on either side, and neither ever counts a runtime row
+/// cited by its own ID. This is what lets `verify_pack` stop trusting the
+/// self-declared `citation.passed` — it re-derives the answer offline.
+///
+/// Classifies section rows into per-trust-class citation tallies and the two gate
+/// predicates (code >= 95% cited; non-code 100% cited).
+fn citation_view(
+    rows: &[&BundleRecord],
+    prov: &CitationProvenance,
+) -> (Vec<ClassCitationTally>, bool, bool) {
     // (tallies, code_gate_pass, non_code_gate_pass)
     // per_class entry: (total, cited, missing, excluded)
     let mut per_class: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
@@ -3393,7 +3434,11 @@ fn citation_view(rows: &[&BundleRecord]) -> (Vec<ClassCitationTally>, bool, bool
     let mut code_cited = 0usize;
     let mut non_code_ok = true;
     for br in rows {
-        let classified = classify_record_external(&br.record);
+        // Apply the class-wide `runtime_observation` provenance requirement (#328) so
+        // an unprovenanced log row is `MissingRequiredHandle`, matching `eg audit
+        // citations` (#372). Non-runtime rows are context-free (the index is ignored
+        // for them).
+        let classified = classify_record_external_with_provenance(&br.record, prov);
         let trust = classified.trust_class.to_owned();
         // A row satisfies the citation contract only when it carries the handle
         // its trust class requires. Mirror `citation_audit`'s exact satisfying
@@ -3782,6 +3827,173 @@ pub fn assemble_pack(
         }
     }
 
+    // --- error-signature source-provenance co-location (issue #372, Codex P2) ---
+    // Every `error_signatures` row is a `runtime_observation` whose citation
+    // requirement (#328/#372) is a resolvable `LogSource` (source path +
+    // `source_artifact_hash`) reached via `ErrorSignature --CAPTURED_FROM-->
+    // LogSource`. The signature NODE payload carries no source hash — the source is
+    // only reachable through the edge — so `verify_pack` can re-derive the
+    // provenance OFFLINE (the #372 verifier-bypass close: verify must NOT trust the
+    // self-declared `citation.passed`) only if the pack CARRIES both the
+    // `CAPTURED_FROM` edge AND the target `LogSource` node as hash-bound rows.
+    // Mirror the #340/#371 AGGREGATES/FRAME_RESOLVES_TO co-location: for each
+    // included in-window signature, co-locate every `CAPTURED_FROM` edge it sources
+    // plus the de-duped target `LogSource` node (a source may back multiple
+    // signatures — append each unique `LogSource` once). `LogSource` maps to no
+    // evidence class, so it never auto-enters a section; `scrub_log_node_text`
+    // no-ops it, keeping the redaction-safe path + hash (no log text ever enters).
+    // Buckets need no separate loop: a bucket resolves provenance by hopping
+    // `bucket --AGGREGATES--> signature --CAPTURED_FROM--> LogSource`, and
+    // `verify_pack` builds ONE provenance index over ALL section rows combined, so a
+    // bucket's in-window signature's co-located `CAPTURED_FROM` + `LogSource` are in
+    // hand. Unlike the bucket case there is NO exclusion: a signature with no
+    // `CAPTURED_FROM` edge is legitimate (it simply stays uncited — never
+    // fabricated), so every in-window signature stays and only its provenance rows
+    // (if any) are appended.
+    {
+        if let Some(signatures) =
+            in_window_by_class.get_mut(EvidenceClass::ErrorSignatures.as_wire())
+        {
+            let signature_ids: BTreeSet<String> = signatures
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        node_log_payload(r),
+                        Some(crate::ir::LogPayload::ErrorSignature(_))
+                    )
+                })
+                .map(|r| r.id().to_owned())
+                .collect();
+            // Collect the CAPTURED_FROM edges sourced at an included signature and
+            // the distinct LogSource IDs they name as targets.
+            let mut captured_edges: Vec<GraphRecord> = Vec::new();
+            let mut wanted_sources: BTreeSet<String> = BTreeSet::new();
+            for record in records {
+                if let GraphRecord::Edge {
+                    label,
+                    source,
+                    target,
+                    ..
+                } = record
+                    && label.as_str() == "CAPTURED_FROM"
+                    && signature_ids.contains(source.as_str())
+                {
+                    captured_edges.push(record.clone());
+                    wanted_sources.insert(target.clone());
+                }
+            }
+            // De-dupe LogSource nodes: append each unique target LogSource once.
+            let mut seen_source: BTreeSet<String> = BTreeSet::new();
+            for record in records {
+                if let GraphRecord::Node { kind, .. } = record
+                    && kind.as_str() == "LogSource"
+                    && wanted_sources.contains(record.id())
+                    && seen_source.insert(record.id().to_owned())
+                {
+                    signatures.push(record.clone());
+                }
+            }
+            signatures.extend(captured_edges);
+        }
+    }
+
+    // --- occurrence-bucket source-provenance co-location (issue #372) ---
+    // A bucket is a `runtime_observation` row whose provenance resolves by hopping
+    // `bucket --AGGREGATES--> signature --CAPTURED_FROM--> LogSource`. `verify_pack`
+    // builds ONE provenance index over ALL section rows combined, so when the
+    // bucket's aggregated signature is an IN-WINDOW `error_signatures` row its
+    // `CAPTURED_FROM` + `LogSource` are ALREADY co-located there (above) and the
+    // bucket resolves with no extra rows. But an in-window bucket may aggregate an
+    // OUT-OF-WINDOW signature (its `first_seen` precedes the window while its hourly
+    // buckets fall inside): that signature is absent from every section, so verify
+    // could not otherwise re-derive the bucket's provenance and would (wrongly) fail
+    // Coverage on a validly-assembled pack. Co-locate that signature's
+    // `CAPTURED_FROM` + `LogSource` into `occurrence_buckets` for exactly those
+    // cases, de-duped, so every in-window bucket's provenance is carried by the pack
+    // without double-carrying an already-co-located in-window signature.
+    //
+    // The exclusion must key off whether the signature's provenance is ACTUALLY
+    // carried by a PRESENT `error_signatures` section — NOT merely off "the
+    // signature is in-window" (issue #372, Codex P2). soc2-v1 always co-maps
+    // `error_signatures` with `occurrence_buckets`, so the default path carries an
+    // in-window signature's provenance there. But a custom catalog can map
+    // `occurrence_buckets` WITHOUT `error_signatures`: then NO section carries the
+    // in-window signature, so excluding it here would strand the bucket's
+    // provenance — `assemble_pack` still passes citation (full-graph index) while
+    // `verify_pack` (which rebuilds its index from the pack's OWN section rows)
+    // fails Coverage on a validly-assembled pack (assemble<->verify divergence). So
+    // exclude a bucket's aggregated signature from bucket-side co-location ONLY when
+    // `error_signatures` is a mapped section (its provenance is co-located there);
+    // otherwise co-locate regardless of window. LogSource nodes / CAPTURED_FROM
+    // edges are BTreeSet-de-duped so nothing double-carries when both sections carry
+    // a shared source.
+    {
+        // `error_signatures` is a PRESENT section IFF this control maps that class.
+        let error_signatures_mapped = control
+            .evidence_classes
+            .iter()
+            .any(|cr| cr.class == EvidenceClass::ErrorSignatures);
+        let in_window_sig_ids: BTreeSet<String> = in_window_by_class
+            .get(EvidenceClass::ErrorSignatures.as_wire())
+            .into_iter()
+            .flatten()
+            .filter(|r| {
+                matches!(
+                    node_log_payload(r),
+                    Some(crate::ir::LogPayload::ErrorSignature(_))
+                )
+            })
+            .map(|r| r.id().to_owned())
+            .collect();
+        if let Some(buckets) =
+            in_window_by_class.get_mut(EvidenceClass::OccurrenceBuckets.as_wire())
+        {
+            // Signatures the co-located AGGREGATES edges attribute in-window buckets
+            // to, EXCLUDING only those whose provenance is already carried by a
+            // PRESENT `error_signatures` section (mapped class AND in-window). When
+            // `error_signatures` is not mapped, no section carries any signature's
+            // provenance, so none are excluded — every aggregated signature's
+            // `CAPTURED_FROM` + `LogSource` is co-located here regardless of window.
+            let aggregated_sig_ids: BTreeSet<String> = buckets
+                .iter()
+                .filter_map(|r| match r {
+                    GraphRecord::Edge { label, target, .. } if label.as_str() == "AGGREGATES" => {
+                        Some(target.clone())
+                    }
+                    _ => None,
+                })
+                .filter(|sig| !(error_signatures_mapped && in_window_sig_ids.contains(sig)))
+                .collect();
+            let mut captured_edges: Vec<GraphRecord> = Vec::new();
+            let mut wanted_sources: BTreeSet<String> = BTreeSet::new();
+            for record in records {
+                if let GraphRecord::Edge {
+                    label,
+                    source,
+                    target,
+                    ..
+                } = record
+                    && label.as_str() == "CAPTURED_FROM"
+                    && aggregated_sig_ids.contains(source.as_str())
+                {
+                    captured_edges.push(record.clone());
+                    wanted_sources.insert(target.clone());
+                }
+            }
+            let mut seen_source: BTreeSet<String> = BTreeSet::new();
+            for record in records {
+                if let GraphRecord::Node { kind, .. } = record
+                    && kind.as_str() == "LogSource"
+                    && wanted_sources.contains(record.id())
+                    && seen_source.insert(record.id().to_owned())
+                {
+                    buckets.push(record.clone());
+                }
+            }
+            buckets.extend(captured_edges);
+        }
+    }
+
     // --- review coverage measurement over in-window merged PRs ---
     // Delegated to the SHARED review-coverage derivation (issue #339, AC7) so the
     // pack's `review_coverage` section / `merged_pr_without_approving_review` gap
@@ -3993,8 +4205,13 @@ pub fn assemble_pack(
     );
 
     // --- citation verdict ---
+    // The provenance index is built from the FULL coalesced input (which carries
+    // the `LogSource` nodes + `CAPTURED_FROM`/`AGGREGATES` edges), so an
+    // in-window `runtime_observation` row is gated on resolvable provenance
+    // exactly as `eg audit citations` gates it (issue #372).
+    let prov = CitationProvenance::build(records);
     let row_refs: Vec<&BundleRecord> = all_section_rows.iter().collect();
-    let (citation_tallies, code_pass, non_code_pass) = citation_view(&row_refs);
+    let (citation_tallies, code_pass, non_code_pass) = citation_view(&row_refs, &prov);
     let citation_ok = code_pass && non_code_pass;
 
     // --- integrity is structurally guaranteed at assemble time ---
@@ -4069,6 +4286,10 @@ pub fn assemble_pack(
     let gates_ok_without_safety =
         required_passed && citation_ok && review_coverage_gate_ok && integrity.passed;
 
+    // Integrity-bind the citation verdict + tallies (issue #372, Part 4) so
+    // `verify_pack` can trust `pack.verdicts.citation.passed` when flooring Coverage.
+    let citation_binding_hash = hash_citation_verdict(&citation, &citation_tallies);
+
     let verdicts = PackVerdicts {
         // Placeholder; recomputed once safety is known.
         ok: gates_ok_without_safety,
@@ -4078,6 +4299,7 @@ pub fn assemble_pack(
         integrity,
         safety,
         citation_tallies,
+        citation_binding_hash,
     };
 
     // --- manifest counts (recomputed identically in verify_pack's Integrity
@@ -5271,22 +5493,74 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                 })
                 .map(|br| br.record.id())
                 .collect();
+            // The signatures a present bucket's AGGREGATES edge attributes to. A
+            // co-located `CAPTURED_FROM` provenance edge (issue #372) is admitted IFF
+            // its SOURCE is one of these aggregated signatures — the bucket-side analog
+            // of the error_signatures rule (source is a present signature). This lets
+            // verify re-derive the provenance of a bucket whose aggregated signature is
+            // OUT OF WINDOW (absent from error_signatures) without admitting an
+            // arbitrary edge.
+            let aggregated_signature_ids: BTreeSet<&str> = section
+                .records
+                .iter()
+                .filter_map(|br| match &br.record {
+                    GraphRecord::Edge {
+                        label,
+                        source,
+                        target,
+                        ..
+                    } if label.as_str() == "AGGREGATES"
+                        && bucket_node_ids.contains(source.as_str()) =>
+                    {
+                        Some(target.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            // The `CAPTURED_FROM` targets (`LogSource` IDs) named by an admitted
+            // co-located provenance edge; a co-located `LogSource` node is admitted IFF
+            // it is one of these targets.
+            let captured_source_ids: BTreeSet<&str> = section
+                .records
+                .iter()
+                .filter_map(|br| match &br.record {
+                    GraphRecord::Edge {
+                        label,
+                        source,
+                        target,
+                        ..
+                    } if label.as_str() == "CAPTURED_FROM"
+                        && aggregated_signature_ids.contains(source.as_str()) =>
+                    {
+                        Some(target.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
             for br in &section.records {
                 let admitted = match &br.record {
                     GraphRecord::Edge { label, source, .. } => {
-                        label.as_str() == "AGGREGATES" && bucket_node_ids.contains(source.as_str())
+                        (label.as_str() == "AGGREGATES"
+                            && bucket_node_ids.contains(source.as_str()))
+                            || (label.as_str() == "CAPTURED_FROM"
+                                && aggregated_signature_ids.contains(source.as_str()))
                     }
                     _ => {
-                        evidence_class_for_record(&br.record).map(|c| c.as_wire())
-                            == Some(section.class.as_str())
+                        (matches!(
+                            node_log_payload(&br.record),
+                            Some(crate::ir::LogPayload::LogSource(_))
+                        ) && captured_source_ids.contains(br.record.id()))
+                            || evidence_class_for_record(&br.record).map(|c| c.as_wire())
+                                == Some(section.class.as_str())
                     }
                 };
                 if !admitted {
                     integrity_passed = false;
                     integrity_detail = format!(
-                        "record {} in section {} is neither an occurrence_buckets record nor \
-                         an AGGREGATES attribution edge for a present bucket (section \
-                         membership mismatch)",
+                        "record {} in section {} is neither an occurrence_buckets record, an \
+                         AGGREGATES attribution edge for a present bucket, a CAPTURED_FROM \
+                         provenance edge for an aggregated signature, nor a LogSource named by \
+                         such an edge (section membership mismatch)",
                         br.record.id(),
                         section.class,
                     );
@@ -5340,23 +5614,56 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                 })
                 .map(|br| br.record.id())
                 .collect();
+            // The `CAPTURED_FROM` targets co-located for source-provenance
+            // re-derivation (issue #372): the `LogSource` IDs named by a
+            // `CAPTURED_FROM` edge whose SOURCE is a present signature. A co-located
+            // `LogSource` node is admitted IFF it is one of these targets — bounded
+            // exactly like the AGGREGATES/FRAME_RESOLVES_TO exemptions, so a bare
+            // `LogSource` (or one named by no in-section signature) is still rejected.
+            let captured_source_ids: BTreeSet<&str> = section
+                .records
+                .iter()
+                .filter_map(|br| match &br.record {
+                    GraphRecord::Edge {
+                        label,
+                        source,
+                        target,
+                        ..
+                    } if label.as_str() == "CAPTURED_FROM"
+                        && signature_node_ids.contains(source.as_str()) =>
+                    {
+                        Some(target.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
             for br in &section.records {
                 let admitted = match &br.record {
+                    // A co-located `CAPTURED_FROM` / `FRAME_RESOLVES_TO` attribution
+                    // edge sourced at a present signature (issues #372 / #371).
                     GraphRecord::Edge { label, source, .. } => {
-                        label.as_str() == "FRAME_RESOLVES_TO"
+                        (label.as_str() == "FRAME_RESOLVES_TO" || label.as_str() == "CAPTURED_FROM")
                             && signature_node_ids.contains(source.as_str())
                     }
+                    // A co-located `LogSource` provenance node (issue #372) named by
+                    // a present `CAPTURED_FROM` edge, OR a native `error_signatures`
+                    // record (an `ErrorSignature` node).
                     _ => {
-                        evidence_class_for_record(&br.record).map(|c| c.as_wire())
-                            == Some(section.class.as_str())
+                        (matches!(
+                            node_log_payload(&br.record),
+                            Some(crate::ir::LogPayload::LogSource(_))
+                        ) && captured_source_ids.contains(br.record.id()))
+                            || evidence_class_for_record(&br.record).map(|c| c.as_wire())
+                                == Some(section.class.as_str())
                     }
                 };
                 if !admitted {
                     integrity_passed = false;
                     integrity_detail = format!(
-                        "record {} in section {} is neither an error_signatures record nor \
-                         a FRAME_RESOLVES_TO attribution edge for a present signature (section \
-                         membership mismatch)",
+                        "record {} in section {} is neither an error_signatures record, a \
+                         CAPTURED_FROM/FRAME_RESOLVES_TO attribution edge for a present \
+                         signature, nor a LogSource named by a present CAPTURED_FROM edge \
+                         (section membership mismatch)",
                         br.record.id(),
                         section.class,
                     );
@@ -5424,21 +5731,72 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
             );
         }
     }
+    // Integrity-bind the recorded citation verdict + tallies (issue #372, Part 4):
+    // recompute the binding hash and compare. A hand-edited `citation.passed`
+    // (false→true) with a stale `citation_binding_hash` fails here, which is what
+    // makes the Coverage floor below (clamping against `pack.verdicts.citation.passed`)
+    // trustworthy. A pre-#372 pack (empty stored hash) fails against the non-empty
+    // recompute, as intended — its citation verdict is unbound and cannot be trusted.
+    if integrity_passed {
+        let recomputed =
+            hash_citation_verdict(&pack.verdicts.citation, &pack.verdicts.citation_tallies);
+        if recomputed != pack.verdicts.citation_binding_hash {
+            integrity_passed = false;
+            "citation_binding_hash does not bind verdicts.citation + citation_tallies \
+             (citation verdict tampered or unbound)"
+                .clone_into(&mut integrity_detail);
+        }
+    }
     let integrity = VerificationVerdict {
         passed: integrity_passed,
         detail: integrity_detail,
     };
 
-    // Coverage: same citation thresholds.
-    let (_tallies, code_pass, non_code_pass) = citation_view(&all_rows);
-    let coverage_ok = code_pass && non_code_pass;
+    // Coverage: re-derive the citation answer OFFLINE from the pack's OWN carried
+    // rows, then FLOOR it by the recorded assemble verdict (issue #372, Codex P2).
+    // Since #372 a pack CO-LOCATES its runtime-observation provenance as hash-bound
+    // rows — the `CAPTURED_FROM` edges + target `LogSource` nodes in the
+    // `error_signatures` section, plus the `AGGREGATES` edges in `occurrence_buckets`
+    // — so a `CitationProvenance` index built over ALL section rows combined resolves
+    // each signature (`--CAPTURED_FROM--> LogSource`) and bucket
+    // (`--AGGREGATES--> signature --CAPTURED_FROM--> LogSource`) exactly as assemble's
+    // full-graph index did. `verify_pack` therefore no longer TRUSTS the self-declared
+    // `citation.passed`: a forged/hand-edited pack that flips `citation.passed` true
+    // (and recomputes `citation_binding_hash` so the Part-4 Integrity bind passes) but
+    // carries NO co-located `LogSource` for a runtime row has that row re-derived as
+    // `MissingRequiredHandle` here → the non-code gate fails → Coverage fails,
+    // independent of the (forged) stored verdict. The floor stays as DEFENSE IN DEPTH
+    // (together with the integrity-bound `citation_binding_hash`): Coverage passes only
+    // when BOTH the independent re-derivation AND the recorded verdict pass — verify
+    // may CONFIRM or DOWNGRADE, never UPGRADE.
+    let owned_section_records: Vec<GraphRecord> =
+        all_rows.iter().map(|br| br.record.clone()).collect();
+    let pack_prov = CitationProvenance::build(&owned_section_records);
+    let (_tallies, code_pass, non_code_pass) = citation_view(&all_rows, &pack_prov);
+    let recompute_ok = code_pass && non_code_pass;
+    let coverage_ok = recompute_ok && pack.verdicts.citation.passed;
+    let coverage_detail = if !recompute_ok {
+        // The offline re-derivation is now the PRIMARY decision. A provenance-less or
+        // forged runtime row (no co-located LogSource resolvable from the carried
+        // rows) is re-derived MissingRequiredHandle and fails here — the honest
+        // diagnostic on the failing path (a non-recomputable runtime row does NOT
+        // pass; it fails).
+        "citation thresholds not met (verify re-derived log provenance from the pack's \
+         own co-located CAPTURED_FROM/LogSource rows; a runtime row without resolvable \
+         provenance is MissingRequiredHandle)"
+            .to_owned()
+    } else if !pack.verdicts.citation.passed {
+        // Re-derivation passed but the recorded verdict failed: the floor honors the
+        // integrity-bound recorded assemble verdict (verify never UPGRADES it).
+        "recorded assemble citation verdict failed; verify honors it (Coverage floor)".to_owned()
+    } else {
+        "code rows >=95% cited; non-code/runtime rows cited (log provenance re-derived \
+         offline from carried rows)"
+            .to_owned()
+    };
     let coverage = VerificationVerdict {
         passed: coverage_ok,
-        detail: if coverage_ok {
-            "code rows >=95% cited; non-code rows 100% cited".to_owned()
-        } else {
-            "citation thresholds not met".to_owned()
-        },
+        detail: coverage_detail,
     };
 
     // Safety scans the WHOLE artifact (records AND every non-record text field),
@@ -5572,13 +5930,20 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                         .get(br.record.id())
                         .is_some_and(|times| times.contains(&t)))
                 } else if section.class == EvidenceClass::OccurrenceBuckets.as_wire() {
-                    if matches!(&br.record, GraphRecord::Edge { label, .. } if label.as_str() == "AGGREGATES")
+                    if matches!(&br.record, GraphRecord::Edge { label, .. } if label.as_str() == "AGGREGATES" || label.as_str() == "CAPTURED_FROM")
+                        || matches!(
+                            node_log_payload(&br.record),
+                            Some(crate::ir::LogPayload::LogSource(_))
+                        )
                     {
-                        // A co-located `AGGREGATES` attribution edge (issue #340,
-                        // Codex round-3 P1) carries no valid time of its own; its
-                        // window relevance rides the bucket it binds (the bucket row
-                        // IS held to the interval rule below). Section membership
-                        // already restricts it to edges sourced at a present bucket.
+                        // A co-located `AGGREGATES` (issue #340, Codex round-3 P1) /
+                        // `CAPTURED_FROM` (issue #372) attribution edge carries no valid
+                        // time of its own, and a co-located `LogSource` provenance node
+                        // (issue #372) is a SOURCE-RESOLUTION aid whose own `valid_time`
+                        // may fall outside the window: their window relevance rides the
+                        // bucket they back (the bucket row IS held to the interval rule
+                        // below). Section membership already restricts them to a present
+                        // bucket / an aggregated signature / a LogSource so named.
                         true
                     } else {
                         // `occurrence_buckets` bucket rows are admitted by the AC2
@@ -5594,13 +5959,21 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                         matches!(occurrence_bucket_start(&br.record), Some(t) if bucket_hour_intersects_window(t, from, to))
                     }
                 } else if section.class == EvidenceClass::ErrorSignatures.as_wire()
-                    && matches!(&br.record, GraphRecord::Edge { label, .. } if label.as_str() == "FRAME_RESOLVES_TO")
+                    && (matches!(&br.record, GraphRecord::Edge { label, .. } if label.as_str() == "FRAME_RESOLVES_TO" || label.as_str() == "CAPTURED_FROM")
+                        || matches!(
+                            node_log_payload(&br.record),
+                            Some(crate::ir::LogPayload::LogSource(_))
+                        ))
                 {
-                    // A co-located `FRAME_RESOLVES_TO` attribution edge (issue #371)
-                    // carries no valid time of its own; its window relevance rides the
-                    // signature it binds (the signature NODE is held to the point
-                    // predicate below). Section membership already restricts it to
-                    // edges sourced at a present signature.
+                    // A co-located `FRAME_RESOLVES_TO` (issue #371) / `CAPTURED_FROM`
+                    // (issue #372) attribution edge carries no valid time of its own,
+                    // and a co-located `LogSource` provenance node (issue #372) is a
+                    // SOURCE-RESOLUTION aid whose own `valid_time` (a log-event
+                    // timestamp) may legitimately fall outside the window: their window
+                    // relevance rides the signature they bind (the signature NODE is
+                    // held to the point predicate below). Section membership already
+                    // restricts them to edges sourced at — and a LogSource named by — a
+                    // present signature.
                     true
                 } else {
                     matches!(resolved, Some(t) if from <= t && t < to)
@@ -5979,8 +6352,126 @@ pub(crate) mod fixture {
 
     use crate::ir::{
         ErrorSignaturePayload, FrameResolution, LOG_SCHEMA_VERSION, LogEventPayload,
-        LogOccurrenceBucketPayload, LogPayload, StackFrame,
+        LogOccurrenceBucketPayload, LogPayload, LogSourcePayload, StackFrame,
     };
+
+    /// Idempotently maps a fixture log-ID shorthand (e.g. `log:v1:sig1`) to a
+    /// citation-well-formed `log:v<N>:<64 hex>` record ID (issue #372). The #340
+    /// shorthand IDs are NOT citation-well-formed (`log:v<N>:<16+ hex>`), so after
+    /// the #372 assemble change a pack built from them records `citation.passed =
+    /// false`. Applying `wf` at every log-domain node/edge endpoint makes the
+    /// fixtures citation-complete without changing the record-building call sites.
+    ///
+    /// An already-well-formed log ID and any non-`log:` handle (a `codegraph:` /
+    /// `verification:` frame/edge target) pass through unchanged, so `wf` is safe to
+    /// apply to both endpoints of every edge helper and is stable under repeated
+    /// application. Asserts recompute the same ID via `wf("log:v1:sigN")`.
+    #[must_use]
+    pub fn wf(id: &str) -> String {
+        use std::fmt::Write as _;
+        // Already citation-well-formed? pass through.
+        if let Some(hex) = crate::ir::strip_log_id_prefix(id)
+            && hex.len() >= 16
+            && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return id.to_owned();
+        }
+        // A non-`log:` handle (codegraph/verification frame/edge target) is not a
+        // log record ID — leave it untouched.
+        if !id.starts_with("log:") {
+            return id.to_owned();
+        }
+        // Order-preserving, citation-well-formed: lowercase-hex-encode the shorthand
+        // (hex encoding preserves lexical order) and zero-pad to >=16 digits, so the
+        // summary's record_id ordering (and positional row order) exactly matches the
+        // shorthand's natural order — sig1 < sig2 < sig3, b1-00 < b1-01, etc.
+        let mut hex = String::new();
+        for b in id.bytes() {
+            let _ = write!(hex, "{b:02x}");
+        }
+        while hex.len() < 16 {
+            hex.push('0');
+        }
+        format!("log:v{LOG_SCHEMA_VERSION}:{hex}")
+    }
+
+    /// Ensures every `ErrorSignature` node in `records` has resolvable `LogSource`
+    /// provenance (issue #372): for each signature lacking a `CAPTURED_FROM` edge,
+    /// appends a `LogSource` node + `CAPTURED_FROM` edge keyed on the signature ID.
+    ///
+    /// Idempotent and coalesce-safe (a deterministic per-signature source ID). The
+    /// appended `LogSource`/`CAPTURED_FROM` records map to no evidence class, so pack
+    /// sections and record counts are unchanged; only the `runtime_observation`
+    /// citation classification flips from `MissingRequiredHandle` to `Cited`. Buckets
+    /// resolve provenance through their existing `AGGREGATES` edge to the now-
+    /// provenanced signature, so wiring signatures is sufficient.
+    #[must_use]
+    pub fn with_log_provenance(mut records: Vec<GraphRecord>) -> Vec<GraphRecord> {
+        let mut signature_ids: Vec<String> = Vec::new();
+        let mut already_captured: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for r in &records {
+            match r {
+                GraphRecord::Node {
+                    id, log: Some(p), ..
+                } if matches!(p.as_ref(), LogPayload::ErrorSignature(_)) => {
+                    signature_ids.push(id.clone());
+                }
+                GraphRecord::Edge {
+                    label: EdgeLabel::CapturedFrom,
+                    source,
+                    ..
+                } => {
+                    already_captured.insert(source.clone());
+                }
+                _ => {}
+            }
+        }
+        signature_ids.sort();
+        signature_ids.dedup();
+        for sig in signature_ids {
+            if already_captured.contains(&sig) {
+                continue;
+            }
+            // `sig` is already well-formed (minted through `wf` in `error_signature`).
+            let src_id = crate::ir::log_stable_id(&["log_source", &sig]);
+            records.push(log_source(&src_id, "app.log", "provenance-artifact-hash"));
+            records.push(captured_from(&sig, &src_id));
+        }
+        records
+    }
+
+    /// A `LogSource` node (issue #320) carrying the provenance a runtime
+    /// observation cites: its repo-relative source path + `source_artifact_hash`.
+    /// Used to give an `ErrorSignature`'s `CAPTURED_FROM` chain a resolvable
+    /// source so the class-wide `runtime_observation` citation requirement is
+    /// satisfied (issue #372).
+    pub fn log_source(id: &str, path: &str, hash: &str) -> GraphRecord {
+        log_node(
+            id,
+            NodeKind::LogSource,
+            format!("log source {path}"),
+            LogPayload::LogSource(LogSourcePayload {
+                source_relative_path: path.to_owned(),
+                source_format_version: "plain-v1".to_owned(),
+                source_artifact_hash: hash.to_owned(),
+                line_count: 10,
+            }),
+            WINDOW_FROM,
+        )
+    }
+
+    /// An `ErrorSignature --CAPTURED_FROM--> LogSource` edge (issue #320) that
+    /// makes a signature's runtime provenance resolvable (issue #372).
+    pub fn captured_from(signature_id: &str, source_id: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::CapturedFrom,
+            wf(signature_id),
+            wf(source_id),
+            None,
+            "ErrorSignature captured from LogSource".to_owned(),
+        )
+    }
 
     /// A benign, redaction-safe normalized template for a signature (NOT raw log
     /// text — these are the bounded excerpts the shipping log domain stores).
@@ -5991,7 +6482,8 @@ pub(crate) mod fixture {
         payload: LogPayload,
         valid_time: &str,
     ) -> GraphRecord {
-        GraphRecord::node(id.to_owned(), kind, None, None, None, summary)
+        // #372: mint a citation-well-formed log record ID from the fixture shorthand.
+        GraphRecord::node(wf(id), kind, None, None, None, summary)
             .with_domain("log", LOG_SCHEMA_VERSION)
             .with_log(payload)
             .with_valid_time(valid_time.to_owned(), "log_event_timestamp")
@@ -6072,8 +6564,8 @@ pub(crate) mod fixture {
     pub fn fingerprinted_as(event_id: &str, signature_id: &str) -> GraphRecord {
         GraphRecord::edge(
             EdgeLabel::FingerprintedAs,
-            event_id.to_owned(),
-            signature_id.to_owned(),
+            wf(event_id),
+            wf(signature_id),
             None,
             "LogEvent fingerprinted as ErrorSignature".to_owned(),
         )
@@ -6083,8 +6575,8 @@ pub(crate) mod fixture {
     pub fn aggregates(bucket_id: &str, signature_id: &str) -> GraphRecord {
         GraphRecord::edge(
             EdgeLabel::Aggregates,
-            bucket_id.to_owned(),
-            signature_id.to_owned(),
+            wf(bucket_id),
+            wf(signature_id),
             None,
             "LogOccurrenceBucket aggregates ErrorSignature".to_owned(),
         )
@@ -6099,8 +6591,8 @@ pub(crate) mod fixture {
     ) -> GraphRecord {
         GraphRecord::edge(
             EdgeLabel::FrameResolvesTo,
-            signature_id.to_owned(),
-            target_id.to_owned(),
+            wf(signature_id),
+            wf(target_id),
             None,
             "ErrorSignature frame resolves to symbol".to_owned(),
         )
@@ -6313,11 +6805,17 @@ pub(crate) mod fixture {
         records.push(verification_run("verification:v1:fixver", &march(10, 10)));
         records.push(validated_by("codegraph:v5:fixc", "verification:v1:fixver"));
 
-        records
+        // #372: make the fixture citation-complete — every ErrorSignature gets a
+        // resolvable LogSource + CAPTURED_FROM so the assembled pack records
+        // `citation.passed = true` (and buckets resolve via AGGREGATES → signature).
+        with_log_provenance(records)
     }
 
-    /// The three planted signature record IDs.
-    pub const LOG_SIGNATURE_IDS: [&str; 3] = ["log:v1:sig1", "log:v1:sig2", "log:v1:sig3"];
+    /// The three planted signature record IDs (citation-well-formed; issue #372).
+    #[must_use]
+    pub fn log_signature_ids() -> [String; 3] {
+        [wf("log:v1:sig1"), wf("log:v1:sig2"), wf("log:v1:sig3")]
+    }
 }
 
 #[cfg(test)]
@@ -8826,7 +9324,7 @@ mod pack338_tests {
         let mut audit_excluded = 0usize;
         let mut audit_missing = 0usize;
         for br in &structural.records {
-            let row = classify_record_external(&br.record);
+            let row = crate::citation_audit::classify_record_external(&br.record);
             assert_eq!(row.trust_class, "source_fact");
             audit_total += 1;
             match row.status {
@@ -11027,8 +11525,8 @@ mod pack338_tests {
 #[cfg(test)]
 mod pack340_tests {
     use super::fixture::{
-        EXEMPLAR_SENTINEL, LOG_SIGNATURE_IDS, WINDOW_FROM, WINDOW_TO, build_log_incident_records,
-        build_seed_records, error_signature,
+        EXEMPLAR_SENTINEL, WINDOW_FROM, WINDOW_TO, build_log_incident_records, build_seed_records,
+        captured_from, error_signature, log_signature_ids, log_source, wf, with_log_provenance,
     };
     use super::*;
 
@@ -11059,6 +11557,252 @@ mod pack340_tests {
             .unwrap_or_else(|| panic!("section {} present", class.as_wire()))
     }
 
+    // ── #372: assemble applies the class-wide runtime-provenance requirement ───
+    //
+    // A CC7.3 pack over an in-window `ErrorSignature` with a citation-well-formed
+    // `log:v2:<hex>` ID but NO resolvable `LogSource`/`CAPTURED_FROM` provenance
+    // must FAIL the pack's assemble-time citation verdict — exactly as `eg audit
+    // citations` fails the identical record (issue #372). The context-free
+    // classifier used to (wrongly) count such a row Cited by its own ID.
+    //
+    // Uses well-formed hex IDs (not the #340 shorthand `log:v1:sig1` fixture, whose
+    // IDs are not citation-well-formed) so the deciding factor is provenance, not
+    // ID shape.
+    fn well_formed_signature(provenanced: bool) -> Vec<GraphRecord> {
+        let sig_id = crate::ir::log_stable_id(&["error_signature", "repo372", "tpl", "error"]);
+        let mut records = vec![error_signature(
+            &sig_id,
+            "error",
+            "connection refused to HOST",
+            "2026-03-02T09:00:00Z", // first_seen in-window
+            "2026-03-02T10:00:00Z", // last_seen in-window
+            5,
+            None,
+        )];
+        if provenanced {
+            let src_id = crate::ir::log_stable_id(&["log_source", "repo372", "app.log", "h1"]);
+            records.push(log_source(&src_id, "app.log", "abc123"));
+            records.push(captured_from(&sig_id, &src_id));
+        }
+        records
+    }
+
+    #[test]
+    fn assemble_citation_verdict_fails_on_provenance_less_log_rows() {
+        let records = well_formed_signature(false);
+        let pack = assemble_cc73(&records);
+        // The signature surfaced as a runtime_observation row.
+        let tally = pack
+            .verdicts
+            .citation_tallies
+            .iter()
+            .find(|t| t.trust_class == "runtime_observation")
+            .expect("runtime_observation tally present");
+        assert!(tally.total >= 1, "the signature surfaced as a runtime row");
+        assert_eq!(
+            tally.missing, tally.total,
+            "every provenance-less runtime row is MissingRequiredHandle (#372)"
+        );
+        assert!(
+            !pack.verdicts.citation.passed,
+            "a provenance-less runtime observation must fail the pack citation gate \
+             (#372), exactly as eg audit citations fails it"
+        );
+    }
+
+    // #372 positive: with a resolvable `LogSource` + `CAPTURED_FROM` co-located in
+    // the INPUT graph (which assemble's full-records provenance index sees — NOT
+    // co-located into pack sections), the runtime row resolves its provenance and
+    // the citation verdict passes.
+    #[test]
+    fn assemble_citation_verdict_passes_with_resolvable_log_provenance() {
+        let records = well_formed_signature(true);
+        let pack = assemble_cc73(&records);
+        let tally = pack
+            .verdicts
+            .citation_tallies
+            .iter()
+            .find(|t| t.trust_class == "runtime_observation")
+            .expect("runtime_observation tally present");
+        assert_eq!(
+            tally.cited, tally.total,
+            "resolvable provenance cites every runtime row (#372)"
+        );
+        assert!(
+            pack.verdicts.citation.passed,
+            "resolvable LogSource provenance must satisfy the runtime citation gate (#372)"
+        );
+        assert!(
+            verify_pack(&pack).ok,
+            "the provenance-complete pack still self-verifies clean"
+        );
+    }
+
+    // ── #372 verify-side floor + integrity bind (Codex P2) ────────────────────
+    //
+    // The hole: `verify_pack`'s Coverage recompute used the CONTEXT-FREE classifier,
+    // which counts an unprovenanced `runtime_observation` row cited by its own ID —
+    // so a pack whose assemble-time `citation.passed` is FALSE still verified `ok`,
+    // masking the recorded failure. The fix floors Coverage against the recorded
+    // (integrity-bound) citation verdict: verify may confirm or downgrade it, never
+    // upgrade it.
+
+    #[test]
+    fn verify_rejects_provenance_less_pack() {
+        // A well-formed-ID but PROVENANCE-LESS ErrorSignature: no co-located LogSource
+        // reaches the sections, so verify re-derives the runtime row as
+        // MissingRequiredHandle OFFLINE and fails Coverage — independent of (and
+        // additionally floored by) the recorded citation verdict.
+        let pack = assemble_cc73(&well_formed_signature(false));
+        assert!(
+            !pack.verdicts.citation.passed,
+            "provenance-less runtime rows fail the assemble citation gate (#372)"
+        );
+        let report = verify_pack(&pack);
+        assert!(
+            !report.coverage.passed,
+            "verify Coverage re-derives the missing provenance and fails: {}",
+            report.coverage.detail
+        );
+        assert!(
+            !report.ok,
+            "an invalid, provenance-less pack must not verify ok"
+        );
+    }
+
+    #[test]
+    fn verify_accepts_citation_complete_pack() {
+        // The upgraded, citation-complete #340 fixture: well-formed IDs + resolvable
+        // provenance -> assemble records citation.passed = true -> verify stays clean.
+        let pack = assemble_cc73(&build_log_incident_records());
+        assert!(
+            pack.verdicts.citation.passed,
+            "the citation-complete fixture passes the assemble citation gate"
+        );
+        assert!(
+            verify_pack(&pack).ok,
+            "a legit citation-complete pack still verifies clean"
+        );
+        // Carriage: the provenance is actually PRESENT as hash-bound rows in the
+        // error_signatures section (issue #372) — this is what lets verify re-derive
+        // it offline. Assert both a co-located `LogSource` NODE and a `CAPTURED_FROM`
+        // edge whose SOURCE is a present signature are carried.
+        let sec = section(&pack, EvidenceClass::ErrorSignatures);
+        let signature_ids: BTreeSet<&str> = sec
+            .records
+            .iter()
+            .filter(|br| {
+                matches!(
+                    node_log_payload(&br.record),
+                    Some(crate::ir::LogPayload::ErrorSignature(_))
+                )
+            })
+            .map(|br| br.record.id())
+            .collect();
+        let has_log_source = sec.records.iter().any(|br| {
+            matches!(
+                node_log_payload(&br.record),
+                Some(crate::ir::LogPayload::LogSource(_))
+            )
+        });
+        let has_captured_from = sec.records.iter().any(|br| {
+            matches!(&br.record,
+                GraphRecord::Edge { label, source, .. }
+                    if label.as_str() == "CAPTURED_FROM" && signature_ids.contains(source.as_str()))
+        });
+        assert!(
+            has_log_source,
+            "a co-located LogSource provenance node is carried in error_signatures"
+        );
+        assert!(
+            has_captured_from,
+            "a co-located CAPTURED_FROM edge (source = present signature) is carried"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_forged_pack_with_selfconsistent_binding() {
+        // THE #372 acceptance test (Codex P2, thread PRRT_kwDOSfiCJs6Qg8F3): the exact
+        // verifier bypass. Assemble a PROVENANCE-LESS pack (well-formed-ID signature,
+        // NO LogSource in input -> no co-located LogSource in sections), so assemble
+        // records `citation.passed = false`. Then FORGE the pack: flip
+        // `citation.passed` to true AND recompute `citation_binding_hash` over the
+        // mutated verdict + tallies so the Part-4 Integrity binding check PASSES (a
+        // SELF-CONSISTENT forgery — the old floor, which trusted the integrity-bound
+        // `citation.passed`, would have accepted this).
+        let mut pack = assemble_cc73(&well_formed_signature(false));
+        assert!(
+            !pack.verdicts.citation.passed,
+            "provenance-less pack records a failed citation verdict"
+        );
+        pack.verdicts.citation.passed = true; // the lie
+        pack.verdicts.citation.detail =
+            "code rows >=95% cited; non-code rows 100% cited".to_owned();
+        // Recompute the binding hash so Integrity's citation bind is self-consistent.
+        pack.verdicts.citation_binding_hash =
+            hash_citation_verdict(&pack.verdicts.citation, &pack.verdicts.citation_tallies);
+
+        let report = verify_pack(&pack);
+        // Integrity now PASSES (the forged verdict + hash bind is self-consistent).
+        assert!(
+            report.integrity.passed,
+            "the self-consistent forgery passes the integrity binding check: {}",
+            report.integrity.detail
+        );
+        // But Coverage FAILS: verify re-derives the runtime row's provenance from the
+        // section rows, finds NO co-located LogSource for the signature, classifies it
+        // MissingRequiredHandle, and fails the non-code gate — INDEPENDENT of the
+        // forged stored verdict. This is the closed bypass.
+        assert!(
+            !report.coverage.passed,
+            "verify re-derives provenance offline and rejects the forged pack: {}",
+            report.coverage.detail
+        );
+        assert!(
+            !report.ok,
+            "a forged pack with a self-consistent citation binding must NOT verify ok"
+        );
+    }
+
+    #[test]
+    fn verify_rederives_runtime_provenance_offline() {
+        // A citation-complete pack containing runtime rows: verify no longer trusts
+        // the self-declared `citation.passed`. It re-derives each runtime row's
+        // provenance OFFLINE from the pack's OWN co-located CAPTURED_FROM/LogSource
+        // section rows (issue #372, Codex P2) and passes Coverage because every row
+        // resolves — never by excluding runtime rows from the gate.
+        let pack = assemble_cc73(&build_log_incident_records());
+        let report = verify_pack(&pack);
+        assert!(
+            report.coverage.passed,
+            "citation-complete pack passes Coverage: {}",
+            report.coverage.detail
+        );
+        assert!(
+            report.coverage.detail.contains("re-derived offline"),
+            "Coverage detail states the offline re-derivation: {}",
+            report.coverage.detail
+        );
+    }
+
+    #[test]
+    fn verify_catches_flipped_citation_verdict() {
+        // Assemble a provenance-less pack (recorded citation.passed = false), then
+        // flip it to true WITHOUT recomputing `citation_binding_hash`. The Part 4
+        // integrity bind must catch the stale hash, so the floor cannot be defeated
+        // by hand-editing the recorded verdict.
+        let mut pack = assemble_cc73(&well_formed_signature(false));
+        assert!(!pack.verdicts.citation.passed);
+        pack.verdicts.citation.passed = true; // lie; binding hash NOT recomputed
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a flipped citation.passed with a stale binding hash fails Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
     // ── AC1: error_signatures ─────────────────────────────────────────────────
     #[test]
     fn error_signatures_populate_with_clipped_span_and_frame_joins() {
@@ -11069,13 +11813,31 @@ mod pack340_tests {
         assert_eq!(sec.outcome, ClassOutcome::Pass);
         assert!(sec.unavailable_reason.is_none());
         // All three in-window signatures surface as hashed rows, plus sig1's one
-        // co-located `FRAME_RESOLVES_TO` attribution edge (issue #371): 3 nodes + 1
-        // edge = 4 hashed rows.
-        assert_eq!(sec.record_count, 4);
+        // co-located `FRAME_RESOLVES_TO` attribution edge (issue #371), plus the
+        // co-located source-provenance rows (issue #372): each signature carries one
+        // `CAPTURED_FROM` edge to a distinct `LogSource` node (3 edges + 3 nodes). So
+        // 3 signature nodes + 3 LogSource nodes + 1 frame edge + 3 CAPTURED_FROM edges
+        // = 10 hashed rows.
+        assert_eq!(sec.record_count, 10);
         let sig_node_rows = sec
             .records
             .iter()
-            .filter(|br| matches!(br.record, GraphRecord::Node { .. }))
+            .filter(|br| {
+                matches!(
+                    node_log_payload(&br.record),
+                    Some(crate::ir::LogPayload::ErrorSignature(_))
+                )
+            })
+            .count();
+        let source_node_rows = sec
+            .records
+            .iter()
+            .filter(|br| {
+                matches!(
+                    node_log_payload(&br.record),
+                    Some(crate::ir::LogPayload::LogSource(_))
+                )
+            })
             .count();
         let frame_edge_rows = sec
             .records
@@ -11085,10 +11847,26 @@ mod pack340_tests {
                 GraphRecord::Edge { label, .. } if label.as_str() == "FRAME_RESOLVES_TO")
             })
             .count();
+        let captured_edge_rows = sec
+            .records
+            .iter()
+            .filter(|br| {
+                matches!(&br.record,
+                GraphRecord::Edge { label, .. } if label.as_str() == "CAPTURED_FROM")
+            })
+            .count();
         assert_eq!(sig_node_rows, 3, "3 in-window ErrorSignature nodes");
+        assert_eq!(
+            source_node_rows, 3,
+            "one co-located LogSource provenance node per signature (issue #372)"
+        );
         assert_eq!(
             frame_edge_rows, 1,
             "sig1's single FRAME_RESOLVES_TO attribution edge co-located"
+        );
+        assert_eq!(
+            captured_edge_rows, 3,
+            "one co-located CAPTURED_FROM provenance edge per signature (issue #372)"
         );
         // Zero `unavailable` markers when records present (AC1).
         assert!(
@@ -11104,11 +11882,11 @@ mod pack340_tests {
             panic!("error_signatures summary present");
         };
         assert_eq!(signatures.len(), 3);
-        let ids: Vec<&str> = signatures.iter().map(|s| s.signature_id.as_str()).collect();
-        assert_eq!(ids, LOG_SIGNATURE_IDS, "rows ordered by record_id");
+        let ids: Vec<String> = signatures.iter().map(|s| s.signature_id.clone()).collect();
+        assert_eq!(ids, log_signature_ids(), "rows ordered by record_id");
 
         let sig1 = &signatures[0];
-        assert_eq!(sig1.signature_id, "log:v1:sig1");
+        assert_eq!(sig1.signature_id, wf("log:v1:sig1"));
         assert_eq!(sig1.severity, "error");
         // first_seen is in-window -> unchanged; last_seen (Apr 5) clipped to `to`.
         assert_eq!(sig1.first_seen_in_window, "2026-03-02T09:00:00Z");
@@ -11228,7 +12006,7 @@ mod pack340_tests {
         };
         let sig1 = signatures
             .iter()
-            .find(|s| s.signature_id == "log:v1:sig1")
+            .find(|s| s.signature_id == wf("log:v1:sig1").as_str())
             .expect("sig1 row present");
         let labels: Vec<Option<&str>> = sig1
             .frame_resolutions
@@ -11278,7 +12056,7 @@ mod pack340_tests {
             .map(|t| (t.signature_id.as_str(), t))
             .collect();
         // sig1: sum(1..=15) = 120; the 999 + 888 out-of-window buckets excluded.
-        let s1 = by_sig["log:v1:sig1"];
+        let s1 = by_sig[wf("log:v1:sig1").as_str()];
         assert_eq!(s1.in_window_occurrences, 120);
         assert_eq!(s1.buckets.len(), 15);
         // Buckets ordered by hour.
@@ -11287,8 +12065,103 @@ mod pack340_tests {
         sorted.sort_unstable();
         assert_eq!(hours, sorted, "buckets ordered by (signature, hour)");
         // sig2: 16 * 2 = 32; sig3: 16 * 5 = 80.
-        assert_eq!(by_sig["log:v1:sig2"].in_window_occurrences, 32);
-        assert_eq!(by_sig["log:v1:sig3"].in_window_occurrences, 80);
+        assert_eq!(by_sig[wf("log:v1:sig2").as_str()].in_window_occurrences, 32);
+        assert_eq!(by_sig[wf("log:v1:sig3").as_str()].in_window_occurrences, 80);
+    }
+
+    // ── #372 Codex P2: occurrence-only catalog must carry bucket provenance ───────
+    //
+    // A custom catalog can map `occurrence_buckets` WITHOUT `error_signatures`. The
+    // in-window bucket provenance co-location (issue #372) excluded a bucket's
+    // aggregated signature from bucket-side co-location whenever that signature was
+    // an in-window `error_signatures` row — ASSUMING its `CAPTURED_FROM`/`LogSource`
+    // is carried by the error_signatures section. But with no error_signatures
+    // section mapped, the provenance is co-located NOWHERE: `assemble_pack` still
+    // passes citation (full-graph index) while `verify_pack` — which rebuilds the
+    // provenance index from the pack's OWN section rows — re-derives the bucket as
+    // `MissingRequiredHandle` and fails Coverage. A freshly-assembled pack must
+    // survive its own verify. The fix co-locates the signature's provenance into
+    // `occurrence_buckets` when `error_signatures` is absent from the pack.
+    #[test]
+    fn assemble_and_verify_occurrence_only_catalog_carries_bucket_provenance() {
+        // Catalog mapping ONE control to `occurrence_buckets` ONLY (no
+        // `error_signatures`). soc2-v1 always co-maps both CC7.x classes, so this
+        // scenario is only reachable through a custom catalog.
+        let catalog = ControlCatalog {
+            catalog_id: "occ-only-v1".to_owned(),
+            schema_version: CatalogSchemaVersion {
+                domain: "control_catalog".to_owned(),
+                kind: "ControlCatalog".to_owned(),
+                version: 1,
+            },
+            controls: vec![Control {
+                control_id: "OCC1".to_owned(),
+                title: "occurrence buckets only".to_owned(),
+                evidence_classes: vec![ClassRequirement {
+                    class: EvidenceClass::OccurrenceBuckets,
+                    requirement: Requirement::Optional,
+                }],
+            }],
+        };
+
+        // An in-window `ErrorSignature` with resolvable `LogSource`/`CAPTURED_FROM`
+        // provenance (via `with_log_provenance`) and one in-window
+        // `LogOccurrenceBucket` aggregating it.
+        let sig_id = crate::ir::log_stable_id(&["error_signature", "occ", "tpl", "error"]);
+        let mut records = vec![error_signature(
+            &sig_id,
+            "error",
+            "connection refused to HOST",
+            "2026-03-02T09:00:00Z",
+            "2026-03-02T10:00:00Z",
+            5,
+            None,
+        )];
+        let bucket_id = crate::ir::log_stable_id(&["bucket", "occ", "0900"]);
+        records.push(super::fixture::occurrence_bucket(
+            &bucket_id,
+            "2026-03-02T09:00:00Z",
+            5,
+        ));
+        records.push(super::fixture::aggregates(&bucket_id, &sig_id));
+        let records = with_log_provenance(records);
+
+        let pack = assemble_pack(&records, &catalog, "OCC1", &win(), 1.0, "test-0.0.0", None)
+            .expect("assembles");
+
+        // No error_signatures section at all (catalog does not map it).
+        assert!(
+            pack.sections
+                .iter()
+                .all(|s| s.class != EvidenceClass::ErrorSignatures.as_wire()),
+            "occurrence-only catalog emits no error_signatures section",
+        );
+        let occ = section(&pack, EvidenceClass::OccurrenceBuckets);
+        assert_eq!(occ.status, "present");
+        assert!(
+            occ.record_count > 0,
+            "occurrence_buckets section carries the in-window bucket rows",
+        );
+
+        // assemble-time citation passes (it uses the FULL input-graph index).
+        assert!(
+            pack.verdicts.citation.passed,
+            "assemble citation passes on the full-graph index",
+        );
+
+        // The bug: verify rebuilds provenance from the pack's OWN rows. Before the
+        // fix the bucket's in-window signature provenance is co-located nowhere, so
+        // the bucket re-derives MissingRequiredHandle and Coverage fails.
+        let report = verify_pack(&pack);
+        assert!(
+            report.coverage.passed,
+            "verify Coverage must pass on a freshly-assembled occurrence-only pack: {}",
+            report.coverage.detail,
+        );
+        assert!(
+            report.ok,
+            "verify_pack ok on a freshly-assembled occurrence-only pack: {report:?}",
+        );
     }
 
     #[test]
@@ -11344,6 +12217,7 @@ mod pack340_tests {
         ));
         records.push(super::fixture::aggregates("log:v1:bp-08", "log:v1:sigp"));
 
+        let records = with_log_provenance(records); // #372: citation-complete signature
         let pack = assemble_pack(
             &records,
             &load_default_catalog(),
@@ -11357,19 +12231,30 @@ mod pack340_tests {
         let sec = section(&pack, EvidenceClass::OccurrenceBuckets);
         // 05:00 (whole), 06:00, 07:00 (whole) included; 04:00 and 08:00 excluded.
         // Each of the 3 included buckets co-locates its AGGREGATES attribution edge
-        // (issue #340, Codex round-3): 3 nodes + 3 edges = 6 hashed rows.
-        assert_eq!(sec.record_count, 6);
+        // (issue #340, Codex round-3): 3 nodes + 3 edges. `sigp`'s first_seen (05:00)
+        // is BEFORE the window (05:30), so the signature is OUT of window and absent
+        // from error_signatures — its source-provenance is therefore co-located HERE
+        // (issue #372) so verify can re-derive the buckets' provenance: 1 CAPTURED_FROM
+        // edge + 1 LogSource node. 3 + 3 + 2 = 8 hashed rows.
+        assert_eq!(sec.record_count, 8);
         let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
         else {
             panic!("summary present");
         };
         assert_eq!(signature_totals[0].in_window_occurrences, 7 + 3 + 5);
-        // The partial-overlap bucket survives verify Window-consistency.
+        // The partial-overlap bucket survives verify Window-consistency, AND verify
+        // re-derives every bucket's provenance from the co-located CAPTURED_FROM +
+        // LogSource even though the aggregated signature is out of window (issue #372).
         let report = verify_pack(&pack);
         assert!(
             report.window_consistency.passed,
             "{:?}",
             report.window_consistency
+        );
+        assert!(
+            report.coverage.passed,
+            "verify re-derives out-of-window-signature bucket provenance: {}",
+            report.coverage.detail
         );
         assert!(report.ok, "verify passes for partial-overlap buckets");
     }
@@ -11390,7 +12275,7 @@ mod pack340_tests {
         };
         assert_eq!(links.len(), 1, "exactly the planted chain");
         let link = &links[0];
-        assert_eq!(link.signature_id, "log:v1:sig1");
+        assert_eq!(link.signature_id, wf("log:v1:sig1"));
         assert_eq!(link.symbol_id, "codegraph:v5:sym-db");
         assert_eq!(link.commit_id, "codegraph:v5:fixc");
         assert_eq!(link.commit_valid_time, "2026-03-10T09:00:00Z");
@@ -11434,9 +12319,13 @@ mod pack340_tests {
     fn log_rows_reported_runtime_observation_never_source_or_verification() {
         let records = build_log_incident_records();
         let pack = assemble_cc73(&records);
-        // All error_signatures + occurrence_buckets rows tallied runtime_observation.
+        // All error_signatures + occurrence_buckets rows tallied runtime_observation:
+        // 3 ErrorSignature nodes + 47 LogOccurrenceBucket nodes + the 3 co-located
+        // `LogSource` provenance nodes (issue #372; each itself a runtime_observation
+        // cited from its own payload). The co-located CAPTURED_FROM/FRAME_RESOLVES_TO/
+        // AGGREGATES edges are NOT runtime_observation. = 53.
         let counts = &pack.manifest.included_record_counts;
-        assert_eq!(counts.get("runtime_observation").copied(), Some(3 + 47));
+        assert_eq!(counts.get("runtime_observation").copied(), Some(3 + 47 + 3));
         assert!(
             !counts.contains_key("source_fact"),
             "log rows never tallied source_fact"
@@ -11445,15 +12334,26 @@ mod pack340_tests {
             !counts.contains_key("verification_evidence"),
             "log rows never tallied verification_evidence"
         );
-        // Non-code 100%-handle rule: every runtime_observation row is cited.
+        // Trust separation (this test's invariant) is unchanged: all 53 log rows
+        // (signatures, buckets, and co-located LogSource nodes) are tallied
+        // `runtime_observation`, never source_fact/verification.
         let tally = pack
             .verdicts
             .citation_tallies
             .iter()
             .find(|t| t.trust_class == "runtime_observation")
             .expect("runtime_observation tally");
-        assert_eq!(tally.total, 50);
-        assert_eq!(tally.cited, 50);
+        assert_eq!(tally.total, 53);
+        // #372: the assemble citation view applies the class-wide
+        // `runtime_observation` provenance requirement (the SAME derivation
+        // `eg audit citations` uses). The #340 fixture is now citation-complete —
+        // its signatures carry well-formed `log:v<N>:<hex>` IDs (via `wf`) and
+        // resolvable `LogSource`/`CAPTURED_FROM` provenance (via
+        // `with_log_provenance`, now co-located into the sections too), and its
+        // buckets resolve through their AGGREGATES edge — so every runtime row is
+        // legitimately `Cited`. The provenance-less negative case is covered by
+        // `assemble_citation_verdict_fails_on_provenance_less_log_rows`.
+        assert_eq!(tally.cited, 53);
         assert_eq!(tally.missing, 0);
     }
 
@@ -11631,7 +12531,7 @@ mod pack340_tests {
         };
         let sig1 = signatures
             .iter()
-            .find(|s| s.signature_id == "log:v1:sig1")
+            .find(|s| s.signature_id == wf("log:v1:sig1").as_str())
             .expect("sig1 present");
         assert_eq!(sig1.frame_resolutions.len(), 1);
         assert_eq!(sig1.frame_resolutions[0].target_id, "codegraph:v5:sym-db");
@@ -11798,6 +12698,70 @@ mod pack340_tests {
         );
     }
 
+    #[test]
+    fn verify_rejects_unrelated_log_source_injected_into_section() {
+        // #372 membership-breadth guard (Codex P2, thread PRRT_kwDOSfiCJs6Qg8F3):
+        // `verify_pack` re-derives runtime provenance OFFLINE from the co-located
+        // `CAPTURED_FROM` edges + `LogSource` nodes carried in the error_signatures
+        // section. That co-location is a BOUNDED membership exemption — a `LogSource`
+        // node is admitted IFF it is the target of a co-located `CAPTURED_FROM` edge
+        // whose SOURCE is a present in-section signature. This proves the exemption is
+        // NOT too broad: an UNRELATED `LogSource` (named by no co-located
+        // `CAPTURED_FROM`) smuggled into the section is rejected by the membership
+        // check itself, not by an incidental count/hash check.
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        // Baseline: the citation-complete #340 fixture verifies clean before tampering.
+        assert!(
+            verify_pack(&pack).ok,
+            "the citation-complete #340 fixture verifies clean before tampering"
+        );
+
+        // A well-formed, non-empty `LogSource` that is NOT the target of any
+        // co-located `CAPTURED_FROM` edge in the section.
+        let stray_id =
+            crate::ir::log_stable_id(&["log_source", "unrelated", "stray.log", "hstray"]);
+        let stray = log_source(&stray_id, "stray.log", "deadbeefdeadbeef");
+        let scrubbed = crate::bundle::scrub_record(stray);
+        let hash = blake3::hash(serde_json::to_string(&scrubbed).unwrap().as_bytes()).to_string();
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+            .expect("error_signatures section");
+        sec.records.push(BundleRecord {
+            record: scrubbed,
+            hash,
+        });
+        sec.record_count = sec.records.len();
+
+        // Recompute the manifest aggregates so the injected row is self-consistent
+        // there: the manifest-count recheck can NOT catch it, isolating the
+        // section-membership exemption as the SOLE check able to reject the row.
+        let (rec_counts, tup_counts) = {
+            let all_rows: Vec<&BundleRecord> = pack
+                .sections
+                .iter()
+                .flat_map(|s| s.records.iter())
+                .collect();
+            compute_manifest_counts(all_rows.iter().copied())
+        };
+        pack.manifest.included_record_counts = rec_counts;
+        pack.manifest.tuple_counts = tup_counts;
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "an unrelated LogSource (named by no co-located CAPTURED_FROM) violates the \
+             bounded section-membership exemption and must fail Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(
+            !report.ok,
+            "a pack with an unrelated LogSource smuggled into error_signatures must not verify ok"
+        );
+    }
+
     // ── AC7: verify BINDS the derived log summaries (tamper-evidence, issue #340)
     // The `log_summary` values are the derived evidence consumers read, but they
     // ride OUTSIDE the hashed `records`. Without an Integrity bind an attacker can
@@ -11895,7 +12859,7 @@ mod pack340_tests {
         // sig1 carries frames -> a frame_chain_hash; forge it.
         let sig1 = signatures
             .iter_mut()
-            .find(|s| s.signature_id == "log:v1:sig1")
+            .find(|s| s.signature_id == wf("log:v1:sig1").as_str())
             .expect("sig1 carries frames");
         sig1.frame_chain_hash = Some(blake3::hash(b"forged frames").to_string());
         let report = verify_pack(&pack);
@@ -11971,7 +12935,7 @@ mod pack340_tests {
             };
             let total = signature_totals
                 .iter_mut()
-                .find(|t| t.signature_id == "log:v1:sig1")
+                .find(|t| t.signature_id == wf("log:v1:sig1").as_str())
                 .expect("sig1 total");
             // Drop one in-window bucket and reduce the reported total to match, so
             // the sum check passes and the reverse coverage guard is the ONLY
@@ -12008,7 +12972,7 @@ mod pack340_tests {
             // lingers in `section.records` but is now uncovered by the summary.
             let idx = signature_totals
                 .iter()
-                .position(|t| t.signature_id == "log:v1:sig1")
+                .position(|t| t.signature_id == wf("log:v1:sig1").as_str())
                 .expect("sig1 total");
             signature_totals.remove(idx);
         }
@@ -12153,7 +13117,9 @@ mod pack340_tests {
             "2026-03-02T01:00:00Z",
             99,
         ));
-        records
+        // #372: provenance the signature so included buckets resolve; the excluded
+        // unattributed bucket is not a citation row.
+        with_log_provenance(records)
     }
 
     #[test]
@@ -12184,7 +13150,7 @@ mod pack340_tests {
         assert!(
             !sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:ba-unattr"),
+                .any(|br| br.record.id() == wf("log:v1:ba-unattr").as_str()),
             "unattributed bucket excluded from section records"
         );
         // ... and surfaced under a counted `unattributed_bucket` diagnostic.
@@ -12193,7 +13159,9 @@ mod pack340_tests {
                 .iter()
                 .any(|d| d.code == "unattributed_bucket"
                     && d.evidence_class.as_deref() == Some("occurrence_buckets")
-                    && d.record_ids.iter().any(|id| id == "log:v1:ba-unattr")),
+                    && d.record_ids
+                        .iter()
+                        .any(|id| id == wf("log:v1:ba-unattr").as_str())),
             "unattributed bucket tallied under a diagnostic: {:?}",
             pack.diagnostics
         );
@@ -12203,24 +13171,25 @@ mod pack340_tests {
             panic!("occurrence_buckets summary present");
         };
         assert!(
-            signature_totals
+            signature_totals.iter().all(|t| t
+                .buckets
                 .iter()
-                .all(|t| t.buckets.iter().all(|b| b.bucket_id != "log:v1:ba-unattr")),
+                .all(|b| b.bucket_id != wf("log:v1:ba-unattr").as_str())),
             "unattributed bucket excluded from the summary"
         );
         // The attributed bucket is retained and its AGGREGATES edge co-located.
         assert!(
             sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:ba-00"),
+                .any(|br| br.record.id() == wf("log:v1:ba-00").as_str()),
             "attributed bucket retained"
         );
         assert!(
             sec.records.iter().any(|br| matches!(&br.record,
                 GraphRecord::Edge { label, source, target, .. }
                     if label.as_str() == "AGGREGATES"
-                        && source == "log:v1:ba-00"
-                        && target == "log:v1:siga")),
+                        && source == wf("log:v1:ba-00").as_str()
+                        && target == wf("log:v1:siga").as_str())),
             "attribution edge co-located as a hashed row"
         );
     }
@@ -12277,7 +13246,7 @@ mod pack340_tests {
             "log:v1:bc-conflict",
             "log:v1:sigc2",
         ));
-        records
+        with_log_provenance(records) // #372: citation-complete signatures
     }
 
     /// A minimal fixture: one signature, one clean attributed in-window bucket, and
@@ -12320,7 +13289,7 @@ mod pack340_tests {
             "log:v1:bm-mismatch",
             "log:v1:sigm",
         ));
-        records
+        with_log_provenance(records) // #372: citation-complete signatures
     }
 
     /// A minimal fixture: one signature, one clean attributed in-window bucket, and
@@ -12365,7 +13334,7 @@ mod pack340_tests {
             "log:v1:bn-missing",
             "log:v1:sign",
         ));
-        records
+        with_log_provenance(records) // #372: citation-complete signatures
     }
 
     /// A minimal fixture: one signature, one clean attributed in-window bucket, and
@@ -12410,7 +13379,7 @@ mod pack340_tests {
             "log:v1:bx-malformed",
             "log:v1:sigx",
         ));
-        records
+        with_log_provenance(records) // #372: citation-complete signatures
     }
 
     #[test]
@@ -12429,7 +13398,7 @@ mod pack340_tests {
         assert!(
             !sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bc-conflict"),
+                .any(|br| br.record.id() == wf("log:v1:bc-conflict").as_str()),
             "conflicting bucket excluded from section records"
         );
         // (c) ... and from the summary totals.
@@ -12441,7 +13410,7 @@ mod pack340_tests {
             signature_totals.iter().all(|t| t
                 .buckets
                 .iter()
-                .all(|b| b.bucket_id != "log:v1:bc-conflict")),
+                .all(|b| b.bucket_id != wf("log:v1:bc-conflict").as_str())),
             "conflicting bucket excluded from the summary"
         );
         // (d) ... under a `conflicting_bucket_attribution` diagnostic naming it.
@@ -12450,7 +13419,9 @@ mod pack340_tests {
                 .iter()
                 .any(|d| d.code == "conflicting_bucket_attribution"
                     && d.evidence_class.as_deref() == Some("occurrence_buckets")
-                    && d.record_ids.iter().any(|id| id == "log:v1:bc-conflict")),
+                    && d.record_ids
+                        .iter()
+                        .any(|id| id == wf("log:v1:bc-conflict").as_str())),
             "conflicting bucket tallied under a diagnostic: {:?}",
             pack.diagnostics
         );
@@ -12458,7 +13429,7 @@ mod pack340_tests {
         assert!(
             sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bc-ok"),
+                .any(|br| br.record.id() == wf("log:v1:bc-ok").as_str()),
             "clean attributed bucket retained"
         );
     }
@@ -12477,7 +13448,7 @@ mod pack340_tests {
         assert!(
             !sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bm-mismatch"),
+                .any(|br| br.record.id() == wf("log:v1:bm-mismatch").as_str()),
             "valid_time-mismatch bucket excluded from section records"
         );
         let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
@@ -12488,7 +13459,7 @@ mod pack340_tests {
             signature_totals.iter().all(|t| t
                 .buckets
                 .iter()
-                .all(|b| b.bucket_id != "log:v1:bm-mismatch")),
+                .all(|b| b.bucket_id != wf("log:v1:bm-mismatch").as_str())),
             "valid_time-mismatch bucket excluded from the summary"
         );
         assert!(
@@ -12496,14 +13467,16 @@ mod pack340_tests {
                 .iter()
                 .any(|d| d.code == "bucket_valid_time_mismatch"
                     && d.evidence_class.as_deref() == Some("occurrence_buckets")
-                    && d.record_ids.iter().any(|id| id == "log:v1:bm-mismatch")),
+                    && d.record_ids
+                        .iter()
+                        .any(|id| id == wf("log:v1:bm-mismatch").as_str())),
             "valid_time-mismatch bucket tallied under a diagnostic: {:?}",
             pack.diagnostics
         );
         assert!(
             sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bm-ok"),
+                .any(|br| br.record.id() == wf("log:v1:bm-ok").as_str()),
             "clean bucket retained"
         );
     }
@@ -12522,7 +13495,7 @@ mod pack340_tests {
         assert!(
             !sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bn-missing"),
+                .any(|br| br.record.id() == wf("log:v1:bn-missing").as_str()),
             "missing-valid_time bucket excluded from section records"
         );
         let Some(LogEvidenceSummary::OccurrenceBuckets { signature_totals }) = &sec.log_summary
@@ -12530,9 +13503,10 @@ mod pack340_tests {
             panic!("occurrence_buckets summary present");
         };
         assert!(
-            signature_totals
+            signature_totals.iter().all(|t| t
+                .buckets
                 .iter()
-                .all(|t| t.buckets.iter().all(|b| b.bucket_id != "log:v1:bn-missing")),
+                .all(|b| b.bucket_id != wf("log:v1:bn-missing").as_str())),
             "missing-valid_time bucket excluded from the summary"
         );
         assert!(
@@ -12540,14 +13514,16 @@ mod pack340_tests {
                 .iter()
                 .any(|d| d.code == "missing_valid_time"
                     && d.evidence_class.as_deref() == Some("occurrence_buckets")
-                    && d.record_ids.iter().any(|id| id == "log:v1:bn-missing")),
+                    && d.record_ids
+                        .iter()
+                        .any(|id| id == wf("log:v1:bn-missing").as_str())),
             "missing-valid_time bucket tallied under a diagnostic: {:?}",
             pack.diagnostics
         );
         assert!(
             sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bn-ok"),
+                .any(|br| br.record.id() == wf("log:v1:bn-ok").as_str()),
             "clean bucket retained"
         );
         // Codex #387 round-2 contract: the counted+diagnosed missing-time set MUST
@@ -12575,7 +13551,9 @@ mod pack340_tests {
         assert_eq!(mvt_diags, 1, "exactly the one genuine missing-time record");
         assert!(
             pack.gaps.iter().any(|g| g.gap_class == "missing_valid_time"
-                && g.record_ids.iter().any(|id| id == "log:v1:bn-missing")),
+                && g.record_ids
+                    .iter()
+                    .any(|id| id == wf("log:v1:bn-missing").as_str())),
             "genuine missing-valid_time bucket gets a matching gap row: {:?}",
             pack.gaps
         );
@@ -12597,7 +13575,7 @@ mod pack340_tests {
         assert!(
             !sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bx-malformed"),
+                .any(|br| br.record.id() == wf("log:v1:bx-malformed").as_str()),
             "malformed-bucket_start bucket excluded from section records"
         );
         // ... and from the summary totals.
@@ -12609,7 +13587,7 @@ mod pack340_tests {
             signature_totals.iter().all(|t| t
                 .buckets
                 .iter()
-                .all(|b| b.bucket_id != "log:v1:bx-malformed")),
+                .all(|b| b.bucket_id != wf("log:v1:bx-malformed").as_str())),
             "malformed-bucket_start bucket excluded from the summary"
         );
         // (c) ... under a NEW `malformed_bucket_start` diagnostic naming it.
@@ -12618,7 +13596,9 @@ mod pack340_tests {
                 .iter()
                 .any(|d| d.code == "malformed_bucket_start"
                     && d.evidence_class.as_deref() == Some("occurrence_buckets")
-                    && d.record_ids.iter().any(|id| id == "log:v1:bx-malformed")),
+                    && d.record_ids
+                        .iter()
+                        .any(|id| id == wf("log:v1:bx-malformed").as_str())),
             "malformed bucket tallied under a malformed_bucket_start diagnostic: {:?}",
             pack.diagnostics
         );
@@ -12629,7 +13609,9 @@ mod pack340_tests {
                 .diagnostics
                 .iter()
                 .any(|d| d.code == "missing_valid_time"
-                    && d.record_ids.iter().any(|id| id == "log:v1:bx-malformed")),
+                    && d.record_ids
+                        .iter()
+                        .any(|id| id == wf("log:v1:bx-malformed").as_str())),
             "malformed bucket must NOT get a missing_valid_time diagnostic: {:?}",
             pack.diagnostics
         );
@@ -12662,7 +13644,7 @@ mod pack340_tests {
         assert!(
             sec.records
                 .iter()
-                .any(|br| br.record.id() == "log:v1:bx-ok"),
+                .any(|br| br.record.id() == wf("log:v1:bx-ok").as_str()),
             "clean bucket retained"
         );
     }
@@ -12695,7 +13677,7 @@ mod pack340_tests {
     /// per-source counts sum. Proves the merge keeps the earliest `first_seen`, the
     /// latest `last_seen`, and the SUMMED occurrence counts across distinct sources.
     fn two_scan_differing_extents_records() -> Vec<GraphRecord> {
-        vec![
+        with_log_provenance(vec![
             // Scan A (source A): narrow span, count 10; bucket count 4.
             error_signature(
                 "log:v1:sigX",
@@ -12721,7 +13703,7 @@ mod pack340_tests {
             ),
             super::fixture::occurrence_bucket("log:v2:bx-00-b", "2026-03-03T00:00:00Z", 6),
             super::fixture::aggregates("log:v2:bx-00-b", "log:v1:sigX"),
-        ]
+        ]) // #372: citation-complete signature
     }
 
     #[test]
@@ -12744,27 +13726,32 @@ mod pack340_tests {
         let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = &sig_sec.log_summary else {
             panic!("error_signatures summary present");
         };
-        let mut ids: Vec<&str> = signatures.iter().map(|r| r.signature_id.as_str()).collect();
+        let mut ids: Vec<String> = signatures.iter().map(|r| r.signature_id.clone()).collect();
         ids.sort_unstable();
         assert_eq!(
             ids,
-            ["log:v1:sig1", "log:v1:sig2", "log:v1:sig3"],
+            log_signature_ids(),
             "one coalesced row per signature ID"
         );
         assert_eq!(
-            sig_sec.record_count, 4,
-            "one hashed ErrorSignature node per stable ID (3) plus sig1's single \
-             coalesced FRAME_RESOLVES_TO attribution edge (issue #371)"
+            sig_sec.record_count, 10,
+            "one hashed ErrorSignature node per stable ID (3), sig1's single coalesced \
+             FRAME_RESOLVES_TO attribution edge (issue #371), plus the coalesced \
+             source-provenance rows (issue #372): 3 CAPTURED_FROM edges + 3 LogSource nodes"
         );
 
         // Summed (doubled) occurrence counts on the merged section nodes.
         for br in &sig_sec.records {
             if let Some(crate::ir::LogPayload::ErrorSignature(p)) = node_log_payload(&br.record) {
-                let expected = match br.record.id() {
-                    "log:v1:sig1" => 240, // 120 x 2 scans
-                    "log:v1:sig2" => 60,  // 30 x 2
-                    "log:v1:sig3" => 6,   // 3 x 2
-                    other => panic!("unexpected signature {other}"),
+                let id = br.record.id();
+                let expected = if id == wf("log:v1:sig1").as_str() {
+                    240 // 120 x 2 scans
+                } else if id == wf("log:v1:sig2").as_str() {
+                    60 // 30 x 2
+                } else if id == wf("log:v1:sig3").as_str() {
+                    6 // 3 x 2
+                } else {
+                    panic!("unexpected signature {id}")
                 };
                 assert_eq!(
                     p.occurrence_count,
@@ -12787,7 +13774,7 @@ mod pack340_tests {
         };
         let sig1_total = signature_totals
             .iter()
-            .find(|t| t.signature_id == "log:v1:sig1")
+            .find(|t| t.signature_id == wf("log:v1:sig1").as_str())
             .expect("sig1 total");
         // Single-scan sum is 1+2+..+15 = 120; a byte-identical rescan collapses, so
         // the total stays 120 (buckets no longer double-count on concatenation).
@@ -12816,7 +13803,7 @@ mod pack340_tests {
         };
         assert_eq!(signatures.len(), 1, "one coalesced signature row");
         let row = &signatures[0];
-        assert_eq!(row.signature_id, "log:v1:sigX");
+        assert_eq!(row.signature_id, wf("log:v1:sigX"));
         assert_eq!(
             row.first_seen_in_window, "2026-03-02T08:00:00Z",
             "merged first_seen is the EARLIEST across scans"
@@ -12920,13 +13907,13 @@ mod pack340_tests {
             // filed under — which nothing bound before the AGGREGATES co-location.
             let sig1_idx = signature_totals
                 .iter()
-                .position(|t| t.signature_id == "log:v1:sig1")
+                .position(|t| t.signature_id == wf("log:v1:sig1").as_str())
                 .expect("sig1 total");
             let moved = signature_totals[sig1_idx].buckets.remove(0);
             signature_totals[sig1_idx].in_window_occurrences -= moved.occurrence_count;
             let sig2 = signature_totals
                 .iter_mut()
-                .find(|t| t.signature_id == "log:v1:sig2")
+                .find(|t| t.signature_id == wf("log:v1:sig2").as_str())
                 .expect("sig2 total");
             sig2.in_window_occurrences += moved.occurrence_count;
             sig2.buckets.push(moved);
@@ -12965,9 +13952,9 @@ mod pack340_tests {
             // nodes, but the AGGREGATES edges name the ORIGINAL signature.
             let total = signature_totals
                 .iter_mut()
-                .find(|t| t.signature_id == "log:v1:sig2")
+                .find(|t| t.signature_id == wf("log:v1:sig2").as_str())
                 .expect("sig2 total");
-            total.signature_id = "log:v1:sig1".to_owned();
+            total.signature_id = wf("log:v1:sig1");
             // Merge into one total per signature id would break bijection; keep it a
             // second sig1-labelled total to isolate the attribution check.
         }
@@ -13099,7 +14086,7 @@ mod pack340_tests {
             ("frame_chain_hash", |s| {
                 let sig1 = s
                     .iter_mut()
-                    .find(|r| r.signature_id == "log:v1:sig1")
+                    .find(|r| r.signature_id == wf("log:v1:sig1").as_str())
                     .expect("sig1 carries frames");
                 sig1.frame_chain_hash = Some(blake3::hash(b"forged frames").to_string());
             }),
@@ -13173,7 +14160,7 @@ mod pack340_tests {
                 {
                     let sig1 = signatures
                         .iter_mut()
-                        .find(|r| r.signature_id == "log:v1:sig1")
+                        .find(|r| r.signature_id == wf("log:v1:sig1").as_str())
                         .expect("sig1 carries a frame join");
                     sig1.frame_resolutions[0].resolution = Some("unresolved".to_owned());
                 }
@@ -13185,7 +14172,7 @@ mod pack340_tests {
                 {
                     let sig1 = signatures
                         .iter_mut()
-                        .find(|r| r.signature_id == "log:v1:sig1")
+                        .find(|r| r.signature_id == wf("log:v1:sig1").as_str())
                         .expect("sig1 carries a frame join");
                     sig1.frame_resolutions[0].frame_index = Some(9);
                 }
@@ -13197,7 +14184,7 @@ mod pack340_tests {
                 {
                     let sig1 = signatures
                         .iter_mut()
-                        .find(|r| r.signature_id == "log:v1:sig1")
+                        .find(|r| r.signature_id == wf("log:v1:sig1").as_str())
                         .expect("sig1 carries a frame join");
                     sig1.frame_resolutions[0].target_id = "codegraph:v5:ghost".to_owned();
                 }
@@ -13346,7 +14333,7 @@ mod pack340_tests {
             let br = sec
                 .records
                 .iter_mut()
-                .find(|br| br.record.id() == "log:v1:b1-00")
+                .find(|br| br.record.id() == wf("log:v1:b1-00").as_str())
                 .expect("b1-00 present in occurrence_buckets section");
             if let GraphRecord::Node {
                 valid_time,
@@ -13407,7 +14394,7 @@ mod pack340_tests {
         };
         let sig1 = signatures
             .iter_mut()
-            .find(|s| s.signature_id == "log:v1:sig1")
+            .find(|s| s.signature_id == wf("log:v1:sig1").as_str())
             .expect("sig1 carries an exemplar");
         // Rewrite the exemplar content hash WITHOUT recomputing log_summary_hash.
         sig1.exemplars[0].content_hash = "cd".repeat(32);
