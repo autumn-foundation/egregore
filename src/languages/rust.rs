@@ -1750,6 +1750,16 @@ fn impl_target_decision(node: Node<'_>, source: &str, display: &str) -> ImplTarg
         };
     };
 
+    // A negative impl (`impl !Trait for Foo`) asserts that the type explicitly
+    // does NOT implement the trait. Tree-sitter keeps the `!` as an unnamed
+    // child token BEFORE the `trait` field (the field itself reads as the bare
+    // trait name), so reading the trait field alone would resolve it like a
+    // positive impl and mint a wrong IMPLEMENTS edge. Detect the `!` and mint no
+    // edge — a negative impl never implements the trait it names.
+    if is_negative_impl(node) {
+        return ImplTargetDecision::NoEdge;
+    }
+
     let bare_trait = bare_trait_path(trait_node, source);
     if bare_trait.is_empty() {
         return ImplTargetDecision::NoEdge;
@@ -1762,6 +1772,17 @@ fn impl_target_decision(node: Node<'_>, source: &str, display: &str) -> ImplTarg
         return ImplTargetDecision::NoEdge;
     }
     ImplTargetDecision::Resolve(bare_trait)
+}
+
+/// `true` when an `impl_item` is a negative impl (`impl !Trait for Foo`).
+/// Tree-sitter parses the leading `!` as an unnamed `!` child token sitting
+/// between the `impl` keyword and the `trait` field, so the field itself carries
+/// only the bare trait name. Scanning the impl node's direct children for that
+/// `!` token is the reliable AST signal; the string header never has to be
+/// consulted.
+fn is_negative_impl(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| child.kind() == "!")
 }
 
 /// Collects the bare type-parameter identifiers declared by a `type_parameters`
@@ -3079,6 +3100,25 @@ mod tests {
         assert_eq!(
             ast_resolve("impl<T> Blanket for &Wrapper<T> {}"),
             Some("Blanket".to_owned())
+        );
+    }
+
+    #[test]
+    fn ast_impl_decision_negative_impl_mints_no_edge() {
+        // A negative impl asserts the type does NOT implement the trait; the `!`
+        // token lives outside the `trait` field, so reading the field alone
+        // would wrongly resolve `LocalAuto`. It must mint no edge.
+        assert_eq!(
+            ast_decision("impl !LocalAuto for Foo {}"),
+            ImplTargetDecision::NoEdge
+        );
+        assert_eq!(
+            ast_decision("impl<T> !LocalAuto for Wrapper<T> {}"),
+            ImplTargetDecision::NoEdge
+        );
+        assert_eq!(
+            ast_decision("unsafe impl !Send for Foo {}"),
+            ImplTargetDecision::NoEdge
         );
     }
 

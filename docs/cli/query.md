@@ -1179,15 +1179,31 @@ bounded out: an **inherent** generic impl (`impl<T> Type<T>`, no `for` clause)
 keeps its self-referential record edge and is never a trait implementor, and a
 **blanket** impl (`impl<T> Trait for T`, whose `for` target is a bare binder
 type parameter) mints no edge at all — it covers every type and has no single
-implementing-type record. The remaining honest bounds: **cross-crate** traits
-(std/deps), **non-Rust** languages, blanket impls, and a `use`-alias of a
-trait in a **non-root** module that the scope walk cannot see stay
-unresolved. A bare (unqualified) trait name whose **simple name is ambiguous**
-across the repo trait index (e.g. a root `T` and a non-root `a::T`) is left
-unresolved too: it may be a `use`-alias of the non-root trait, and this pass
-does not read `use` declarations, so it never guesses a root binding — a
-missing edge is preferred over a wrong-target one. The query surfaces these
-bounds instead of hiding them:
+implementing-type record. A **negative** impl (`impl !Trait for Foo`, e.g.
+`impl !Send for Foo`) also mints **no** edge: it asserts that the type
+explicitly does *not* implement the trait, so it never edge-backs and never
+surfaces `Foo` as an implementor of `Trait`. The remaining honest bounds:
+**cross-crate** traits (std/deps), **non-Rust** languages, blanket impls, and a
+`use`-alias of a trait in a **non-root** module that the scope walk cannot see
+stay unresolved. A bare (unqualified) trait name whose **simple name is
+ambiguous** across the repo trait index (e.g. a root `T` and a non-root `a::T`)
+is left unresolved too: it may be a `use`-alias of the non-root trait, and this
+pass does not read `use` declarations, so it never guesses a root binding — a
+missing edge is preferred over a wrong-target one.
+
+**Multi-crate-root packages are not partitioned by crate root in this slice.**
+The repo-wide index keys on the crate-root-relative **qualified name**, so when
+a package has more than one crate root (`src/lib.rs` plus `src/bin/tool.rs` or
+`src/main.rs`) a root `trait T` in each root shares the qualified name `T`. A
+`crate::`-qualified trait path (or a bare name) that matches **more than one**
+such definition is left **unresolved** (no edge) rather than silently picking
+one and mis-targeting a cross-root edge — the same "resolve only a unique
+match" rule that guards ambiguous bare names. This means a legitimate
+`impl crate::T for Foo` in the library is not edge-backed when a binary crate
+root also defines a root `T`; a missing edge is preferred over a wrong cross-root
+one. Full crate-root partitioning of the index (so each root's `T` is distinct)
+is tracked as a deferred follow-up. The query surfaces these bounds instead of
+hiding them:
 
 - Every implementor row and every zero-implementors signal carries
   `completeness: "local_traits_only"`.

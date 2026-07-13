@@ -1247,6 +1247,78 @@ fn real_scan_reference_blanket_trait_impls_are_bounded_out() {
 }
 
 // ---------------------------------------------------------------------------
+// A negative impl (`impl !LocalAuto for Foo`) asserts that the type explicitly
+// does NOT implement the trait. Tree-sitter keeps the `!` token OUTSIDE the
+// `trait` field, so the AST path (issue #343/#344 refactor) read the trait as
+// `LocalAuto` and resolved it like a positive impl -- minting a WRONG IMPLEMENTS
+// edge so `query implementors LocalAuto` reported a type that does not
+// implement it. A negative impl must mint no edge; only the concrete positive
+// `impl LocalAuto for Bar` edge-backs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_negative_impl_emits_no_implements_edge() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    // The extractor only PARSES this source (Tree-sitter), never compiles it, so
+    // the `negative_impls` feature gate is irrelevant to extraction.
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait LocalAuto {}\n\n",
+            "pub struct Foo;\n",
+            "pub struct Bar;\n\n",
+            // Negative impl: Foo explicitly does NOT implement LocalAuto -> no
+            // edge, so Foo must never surface as an implementor.
+            "impl !LocalAuto for Foo {}\n\n",
+            // Positive impl: the only edge-backed implementor.
+            "impl LocalAuto for Bar {}\n",
+        ),
+    )
+    .expect("write lib.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let stdout = egregore()
+        .args(["query", "implementors", "LocalAuto", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the positive `impl LocalAuto for Bar` edge-backs; the negative \
+         `impl !LocalAuto for Foo` mints no implementor: {rows:?}"
+    );
+    assert_eq!(rows[0]["implementing_type"], "Bar");
+    let types: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r["implementing_type"].as_str())
+        .collect();
+    assert!(
+        !types.contains(&"Foo"),
+        "a negative impl must never report the type as an implementor: {types:?}"
+    );
+    assert_eq!(rows[0]["completeness"], "local_traits_only");
+}
+
+// ---------------------------------------------------------------------------
 // Turbofish trait syntax (`impl GenP::<u32> for Plain`, valid Rust in type
 // position) leaves a trailing `::` separator once the trait-segment generic
 // args are stripped. Before the fix the trait normalized to `GenP::`, which
@@ -1378,6 +1450,89 @@ fn real_scan_cross_file_turbofish_trait_is_edge_backed() {
     );
     assert_eq!(rows[0]["trait_name"], "GenP");
     assert_eq!(rows[0]["completeness"], "local_traits_only");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-crate-root conservative bound (issue #344 review): when a package has
+// two crate roots (`src/lib.rs` + `src/bin/tool.rs`), a root `trait T` in each
+// gets the SAME crate-root-relative qualified name `T`. The repo-wide impl
+// index keys only on that qualified name, so `crate::T` matches BOTH root
+// definitions. The resolver must leave that multi-candidate match UNRESOLVED
+// (mint no edge) rather than silently pick one and mis-target a cross-root
+// edge — a lib `impl crate::T for Foo` must never resolve to the binary's `T`.
+// This is a GREEN regression guard: the resolver already resolves only unique
+// matches (`[only]`), so no behavior change was needed. Full crate-root
+// partitioning of the index is a deferred follow-up, not this slice.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_multi_crate_root_same_name_trait_is_unresolved() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    let bin = src.join("bin");
+    fs::create_dir_all(&bin).expect("mkdir src/bin");
+    // Library crate root defines `trait T` and an out-of-line `impl crate::T
+    // for Foo` in a submodule (forcing the repo-wide cross-file resolver).
+    fs::write(
+        src.join("lib.rs"),
+        concat!("pub trait T {}\n", "pub mod m;\n"),
+    )
+    .expect("write lib.rs");
+    fs::write(
+        src.join("m.rs"),
+        concat!("pub struct Foo;\n", "impl crate::T for Foo {}\n"),
+    )
+    .expect("write m.rs");
+    // Binary crate root ALSO defines a root `trait T` -> same qualified name.
+    fs::write(
+        bin.join("tool.rs"),
+        concat!("pub trait T {}\n", "fn main() {}\n"),
+    )
+    .expect("write bin/tool.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    // No IMPLEMENTS edge whatsoever names `Foo`: the graph must carry zero
+    // cross-root edges. (A raw text scan of the graph is the tightest guard.)
+    let graph_text = fs::read_to_string(&graph_path).expect("read graph");
+    for line in graph_text.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+        assert!(
+            v["label"] != "IMPLEMENTS",
+            "no IMPLEMENTS edge may be minted for the ambiguous cross-root `crate::T`: {line}"
+        );
+    }
+
+    // The query answers the zero-implementors signal for the trait(s) named
+    // `T`; `Foo` must never appear as an implementor of either crate root's `T`.
+    let stdout = egregore()
+        .args(["query", "implementors", "T", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    assert!(
+        !out.contains("Foo"),
+        "a multi-crate-root same-name trait must not mis-target `Foo`: {out}"
+    );
+    for line in out.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+        assert_eq!(
+            v["code"], "zero_implementors_recorded",
+            "each crate root's `T` reports zero implementors, never a mis-targeted row: {line}"
+        );
+        assert_eq!(v["implementors_recorded"], 0, "{line}");
+    }
 }
 
 // ---------------------------------------------------------------------------
