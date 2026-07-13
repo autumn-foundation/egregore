@@ -1686,15 +1686,22 @@ fn impl_trait_target(display: &str) -> ImplTargetDecision {
     let Some(after_impl) = header.strip_prefix("impl") else {
         return ImplTargetDecision::Verbatim;
     };
-    let (binder_params, remainder) = match after_impl.chars().next() {
-        Some(' ') => (Vec::new(), after_impl.trim_start()),
-        Some('<') => {
-            let (params, rest) = split_generic_binder(after_impl);
-            (params, rest.trim_start())
-        }
-        // `impl` immediately followed by anything else is not a real header
-        // (e.g. an identifier that merely starts with `impl`).
+    // `impl` must be followed by a space or `<` to open a real header; an
+    // identifier that merely starts with `impl` (`implement_service`) is not.
+    match after_impl.chars().next() {
+        Some(' ' | '<') => {}
         _ => return ImplTargetDecision::Verbatim,
+    }
+    // Skip an optional `<...>` binder whether or not a space precedes it: a
+    // source-level space (`impl <T> Trait for T`) survives `impl_display` as
+    // `impl <T> ...`, so the binder must be stripped after trimming the space,
+    // not left to poison the trait segment.
+    let trimmed = after_impl.trim_start();
+    let (binder_params, remainder) = if trimmed.starts_with('<') {
+        let (params, rest) = split_generic_binder(trimmed);
+        (params, rest.trim_start())
+    } else {
+        (Vec::new(), trimmed)
     };
     match remainder.split_once(" for ") {
         Some((trait_seg, for_target)) => {
@@ -2711,6 +2718,32 @@ mod tests {
         // the bounds.
         assert_eq!(
             resolve_target("impl<T: Into<String>> GenT for Wrapper<T>"),
+            Some("GenT".to_owned())
+        );
+    }
+
+    #[test]
+    fn impl_trait_target_resolves_spaced_generic_binder() {
+        // A source-level space between `impl` and the `<T>` binder is valid
+        // Rust and survives `impl_display` normalization as `impl <T> ...`.
+        // The binder must still be skipped so the trait segment resolves.
+        assert_eq!(
+            resolve_target("impl <T> GenT for Wrapper<T>"),
+            Some("GenT".to_owned())
+        );
+        // Spaced blanket impl is still bounded out.
+        assert!(matches!(
+            impl_trait_target("impl <T> Blanket for T"),
+            ImplTargetDecision::NoEdge
+        ));
+        // Spaced generic inherent impl keeps its verbatim self edge.
+        assert!(matches!(
+            impl_trait_target("impl <T> MyStruct<T>"),
+            ImplTargetDecision::Verbatim
+        ));
+        // `unsafe` + spaced binder is transparent too.
+        assert_eq!(
+            resolve_target("unsafe impl <T> GenT for Wrapper<T>"),
             Some("GenT".to_owned())
         );
     }
