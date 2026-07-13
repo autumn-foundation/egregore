@@ -98,16 +98,19 @@ while the flag is set exits 1 with `protected_handle_in_graph`.
 
 When the query runs over an embedded (`--data-dir`) store that holds at least one
 `ErrorSignature`, the response carries an `embedded_log_retention_caveat`
-disclosing that the embedded current-state read surface retains exactly one
-record per stable non-temporal log ID (last-write-wins for `ErrorSignature` /
-`LogOccurrenceBucket`). Multiple `scan-logs` ingests of the same stable ID are
-therefore collapsed **before** this query runs, so the cross-scan coalescing the
-`--graph` path performs is not reconstructable there. The `--graph` path
-preserves every ingested line and never carries the caveat; a pure `scan` store
-with no log records never carries it either. This mirrors the identical
-disclosure on [`eg query log-deltas`](./log-deltas.md); the underlying
-adapter-layer fix is tracked in issue #363. This is a disclosure only — it never
-changes handle resolution or section contents.
+disclosing that the embedded lane now loads through the **log-retained** read
+surface, which surfaces every **superseded** non-temporal `ErrorSignature` /
+`LogOccurrenceBucket` version that differing-content `scan-logs` ingests append.
+The cross-scan coalescing the `--graph` path performs (earliest `first_seen`,
+latest `last_seen`, summed occurrence counts, all buckets) is therefore
+reconstructed **exactly** on `--data-dir` for differing-content scans. The one
+residual divergence is that byte-identical re-ingests are deduped to one physical
+record (not multiplied). The `--graph` path preserves every ingested line and
+never carries the caveat; a pure `scan` store with no log records never carries
+it either. This mirrors the identical disclosure on
+[`eg query log-deltas`](./log-deltas.md); the adapter-level retention fix landed
+in issue #363. This is a disclosure only — it never changes handle resolution or
+section contents.
 
 ## Shortest offline workflow
 

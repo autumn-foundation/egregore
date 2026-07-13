@@ -2094,9 +2094,10 @@ fn repo_scope_caveat_present_only_when_repo_set() {
 // ---------------------------------------------------------------------------
 // Embedded-store log-retention caveat (issue #363 disclosure), mirroring the
 // sibling `eg query log-deltas` disclosure. When error-context runs over an
-// embedded (`--data-dir`) store the current-state read surface retains one
-// record per stable non-temporal log ID (last-write-wins), so multi-scan
-// coalescing is not reconstructable there. The `--graph` path preserves every
+// embedded (`--data-dir`) store the log-retained read surface surfaces every
+// superseded non-temporal log version, so multi-scan coalescing IS reconstructed
+// there for differing-content scans; the caveat now discloses only the residual
+// byte-identical-re-ingest divergence. The `--graph` path preserves every
 // ingested line and must NOT carry the caveat.
 // ---------------------------------------------------------------------------
 
@@ -2126,20 +2127,26 @@ fn embedded_source_discloses_log_retention_caveat() {
         aletheia_egregore::query::LOG_EMBEDDED_RETENTION_CAVEAT
     );
     assert!(
-        caveat.message.contains("last-write-wins"),
-        "the caveat must state embedded stores retain one record per stable ID (last-write-wins)"
+        caveat
+            .message
+            .contains("retain every superseded non-temporal log observation"),
+        "the caveat must state embedded stores retain every superseded log observation"
+    );
+    assert!(
+        caveat.message.contains("reconstructed here"),
+        "the caveat must state cross-scan coalescing is reconstructed on the embedded path"
     );
     assert!(
         caveat.message.contains("`--graph`"),
-        "the caveat must point to the `--graph` path for multi-scan coalescing"
+        "the caveat must reference the `--graph` path it now matches"
     );
     assert!(
-        caveat.message.contains("per-source stores"),
-        "the caveat must offer per-source stores as the alternative"
+        caveat.message.contains("byte-identical re-ingests"),
+        "the caveat must disclose the residual byte-identical-re-ingest divergence"
     );
     assert!(
         caveat.message.contains("#363"),
-        "the caveat must reference the follow-up issue tracking the real fix"
+        "the caveat must reference the issue tracking the fix"
     );
 
     // Disclosure-only: resolution is unchanged by the flag.
@@ -2165,6 +2172,102 @@ fn graph_source_never_carries_log_retention_caveat() {
         ctx.embedded_log_retention_caveat.is_none(),
         "the --graph path preserves every ingested line and must not carry the retention caveat"
     );
+}
+
+/// Issue #363: a `--data-dir` store ingested with two differing-content
+/// `scan-logs` outputs for the SAME signature ID must coalesce the signature
+/// block (earliest `first_seen`, latest `last_seen`, summed occurrence, both
+/// buckets) exactly as the `--graph` path does — the log-retained read surfaces
+/// both physical versions. Distinct buckets avoid the byte-identical re-ingest
+/// dedup, so occurrence data matches too.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_data_dir_coalesces_signature_block_like_graph() {
+    use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
+
+    // Two scans of one fingerprint: scan 1 earlier/lower count, scan 2 later.
+    let (sig_id, sig1) = error_signature(
+        "boom",
+        "error",
+        "2026-01-02T10:00:00Z",
+        "2026-01-02T11:00:00Z",
+        3,
+        None,
+    );
+    let (sig_id2, sig2) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 5, None);
+    assert_eq!(sig_id, sig_id2, "same seed → same stable signature ID");
+    let (b1n, b1e) = bucket_with_edge(&sig_id, "2026-01-02T10:00:00Z", 3);
+    let (b2n, b2e) = bucket_with_edge(&sig_id, "2026-01-02T12:00:00Z", 5);
+    let records = vec![sig1, sig2, b1n, b1e, b2n, b2e];
+
+    // Build the embedded store, then read it back with log retention.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record).expect("record should write");
+    }
+    let embedded_records = sink
+        .read_all_records_log_retained()
+        .expect("log-retained read should surface both signature versions");
+    drop(sink);
+
+    let graph = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("graph resolve");
+    let embedded = error_context(
+        &embedded_records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        true,
+    )
+    .expect("embedded resolve");
+
+    let g = &graph.signatures[0];
+    let e = &embedded.signatures[0];
+    // Coalesced identity + occurrence data match the --graph path.
+    assert_eq!(e.first_seen, g.first_seen);
+    assert_eq!(e.last_seen, g.last_seen);
+    assert_eq!(e.occurrence_count, g.occurrence_count);
+    // And concretely the coalesced values (earliest, latest, summed).
+    assert_eq!(e.first_seen, "2026-01-02T10:00:00Z");
+    assert_eq!(e.last_seen, SIG_LAST);
+    assert_eq!(e.occurrence_count, 8);
+    // Both buckets survive on the embedded path, matching --graph.
+    let g_buckets: Vec<(String, u64)> = g
+        .buckets
+        .iter()
+        .map(|b| (b.bucket_start.clone(), b.occurrence_count))
+        .collect();
+    let e_buckets: Vec<(String, u64)> = e
+        .buckets
+        .iter()
+        .map(|b| (b.bucket_start.clone(), b.occurrence_count))
+        .collect();
+    assert_eq!(e_buckets, g_buckets);
+    assert_eq!(
+        e_buckets,
+        vec![
+            ("2026-01-02T10:00:00Z".to_owned(), 3),
+            ("2026-01-02T12:00:00Z".to_owned(), 5),
+        ]
+    );
+
+    // The embedded path discloses the residual retention caveat; --graph does not.
+    assert!(embedded.embedded_log_retention_caveat.is_some());
+    assert!(graph.embedded_log_retention_caveat.is_none());
 }
 
 #[test]

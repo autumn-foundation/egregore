@@ -870,6 +870,114 @@ impl EmbeddedAletheiaSink {
         Ok(records)
     }
 
+    /// Like [`Self::read_all_records`], but additionally re-emits every
+    /// *superseded* (non-current) physical version of a non-temporal
+    /// **log-domain** node whose `kind` is `ErrorSignature` or
+    /// `LogOccurrenceBucket` (issue #363).
+    ///
+    /// # Why the log domain needs this
+    ///
+    /// `ErrorSignature` and `LogOccurrenceBucket` are non-temporal nodes whose
+    /// stable ID is content-independent of the `LogSource` they were captured
+    /// from: a signature's ID is `(repository, fingerprint_algorithm, template,
+    /// severity)` and a bucket's is `(repository, signature, hour, width)`. A
+    /// second `scan-logs` ingest of the *same* fingerprint from a *different*
+    /// captured log therefore mints another physical node with the SAME stable
+    /// ID but its own `first_seen` / `last_seen` / `occurrence_count`. The
+    /// current-state read ([`Self::read_all_records`]) collapses those to the
+    /// latest write (last-write-wins), which is exactly the duplicate slice the
+    /// `--graph` cross-scan coalescers (#326 `log-deltas`, #324 `error-context`)
+    /// need to reconstruct the true `first_seen`/`last_seen`/summed occurrence
+    /// counts. This method surfaces the superseded physical versions so those
+    /// coalescers operate on `--data-dir` exactly as they do on the concatenated
+    /// `--graph` JSONL for scans whose captured content differs.
+    ///
+    /// # What stays the same
+    ///
+    /// * Every OTHER non-temporal kind keeps its single current-state record —
+    ///   only `ErrorSignature` / `LogOccurrenceBucket` versions are re-emitted —
+    ///   so non-log query behaviour over `--data-dir` is byte-for-byte unchanged.
+    /// * Byte-identical re-ingests of the same `scan-logs` output are deduped to
+    ///   one physical node by [`GraphSink::write_record`]'s idempotent no-op path
+    ///   (an unchanged non-temporal write creates no new node), so identical
+    ///   re-scans do NOT multiply counts here — the one residual divergence from
+    ///   the `--graph` path, where concatenating identical JSONL does.
+    /// * Actively tombstoned IDs stay suppressed, matching
+    ///   [`Self::read_all_records`].
+    ///
+    /// Superseded versions are appended in write (`egregore_seq`) order after the
+    /// current-state slice; the log coalescers group by stable ID and are
+    /// order-insensitive, so no consumer depends on interleaving them with the
+    /// current versions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a physical record cannot be read.
+    pub fn read_all_records_log_retained(&self) -> AdapterResult<Vec<GraphRecord>> {
+        let mut records = self.read_all_records()?;
+        let active_tombstoned = self.active_deleted_ids()?;
+        let mut superseded: Vec<(u64, GraphRecord)> = Vec::new();
+        for node_id in self.db.get_all_node_ids() {
+            let node = self.db.get_node(node_id).map_err(|error| {
+                read_back_error("read_all_records_log_retained", error.to_string())
+            })?;
+            // Node records only — tombstones and edges are not "node".
+            if optional_str_property(
+                "read_all_records_log_retained",
+                "record_type",
+                node.get_property("record_type"),
+            )?
+            .as_deref()
+                != Some("node")
+            {
+                continue;
+            }
+            // Restrict to the two non-temporal log-domain kinds; every other
+            // kind keeps its single current-state record (non-log behaviour
+            // unchanged).
+            if !matches!(
+                optional_str_property(
+                    "read_all_records_log_retained",
+                    "kind",
+                    node.get_property("kind"),
+                )?
+                .as_deref(),
+                Some("ErrorSignature" | "LogOccurrenceBucket")
+            ) {
+                continue;
+            }
+            let Some(record_id) = optional_str_property(
+                "read_all_records_log_retained",
+                "codegraph_id",
+                node.get_property("codegraph_id"),
+            )?
+            else {
+                continue;
+            };
+            if active_tombstoned.contains(record_id.as_str()) {
+                continue;
+            }
+            // Emit only SUPERSEDED (non-current) versions; the current version is
+            // already in `records` via `read_all_records`.
+            match self.node_lookup.non_temporal.get(&record_id) {
+                Some(current) if *current == node_id => continue, // current, already emitted
+                Some(_) => {}                                     // superseded → emit
+                None => continue, // not a non-temporal node (defensive)
+            }
+            let seq = optional_str_property(
+                "read_all_records_log_retained",
+                "egregore_seq",
+                node.get_property("egregore_seq"),
+            )?
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+            superseded.push((seq, self.read_node_record(&record_id, node_id)?));
+        }
+        superseded.sort_by_key(|(seq, _)| *seq);
+        records.extend(superseded.into_iter().map(|(_, record)| record));
+        Ok(records)
+    }
+
     /// Reads all physical records stored in the database for inspection.
     /// This retrieves every single node, tombstone, and edge physically stored in `AletheiaDB`
     /// without temporal deduplication, tombstone filtering, or schema version validation.
@@ -4415,6 +4523,136 @@ mod tests {
             .expect("edge target should be readable");
 
         assert_eq!(edge_target, updated_symbol_node_id);
+    }
+
+    /// Builds an `ErrorSignature` log-domain node with the given valid-time
+    /// bounds. Distinct `first_seen`/`last_seen`/`occurrence_count` values keep
+    /// the node CONTENT distinct while the caller reuses one stable record ID —
+    /// exactly what two `scan-logs` outputs for one repo produce (issue #363).
+    fn error_signature_record(
+        id: &str,
+        first_seen: &str,
+        last_seen: &str,
+        occurrence_count: u64,
+    ) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::ErrorSignature,
+            None,
+            None,
+            Some("error signature".to_owned()),
+            format!("Error signature x{occurrence_count}"),
+        )
+        .with_domain("log", crate::ir::LOG_SCHEMA_VERSION)
+        .with_log(crate::ir::LogPayload::ErrorSignature(
+            crate::ir::ErrorSignaturePayload {
+                fingerprint_algorithm: "template-v1".to_owned(),
+                template_excerpt: "template boom".to_owned(),
+                severity: "error".to_owned(),
+                occurrence_count,
+                first_seen: first_seen.to_owned(),
+                last_seen: last_seen.to_owned(),
+                frames: None,
+            },
+        ))
+        .with_valid_time(first_seen, "log_event_timestamp")
+    }
+
+    #[test]
+    fn read_all_records_log_retained_surfaces_superseded_log_signature_versions() {
+        // Issue #363: two `scan-logs` ingests of the same fingerprint (identical
+        // stable ID, DIFFERING captured content) each append a physical
+        // `ErrorSignature` node. The current-state read collapses them to the
+        // latest, but the log-retained read must surface BOTH so the #326/#324
+        // cross-scan coalescers reconstruct on `--data-dir` what they do on the
+        // concatenated `--graph` JSONL.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("log-retained-store");
+        let sig_id = "log:v1:retained-boom";
+        let v1 = error_signature_record(sig_id, "2026-01-01T00:00:00Z", "2026-01-01T05:00:00Z", 3);
+        let v2 = error_signature_record(sig_id, "2026-01-02T12:00:00Z", "2026-01-02T13:00:00Z", 5);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&v1).expect("v1 should write");
+        sink.write_record(&v2).expect("v2 should write");
+
+        let count = |records: &[GraphRecord]| {
+            records
+                .iter()
+                .filter(|r| r.id() == sig_id && r.node_kind_name() == Some("ErrorSignature"))
+                .count()
+        };
+
+        let current = sink.read_all_records().expect("current read");
+        assert_eq!(
+            count(&current),
+            1,
+            "current-state read collapses to the latest signature version"
+        );
+
+        let retained = sink
+            .read_all_records_log_retained()
+            .expect("log-retained read");
+        assert_eq!(
+            count(&retained),
+            2,
+            "log-retained read surfaces both physical signature versions"
+        );
+    }
+
+    #[test]
+    fn read_all_records_log_retained_dedupes_byte_identical_reingest() {
+        // Issue #363 residual divergence: a byte-identical re-ingest of the same
+        // `scan-logs` output is an idempotent no-op (no new physical node), so the
+        // log-retained read still surfaces exactly ONE record — identical rescans
+        // never multiply counts on `--data-dir`.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("log-retained-idempotent-store");
+        let sig_id = "log:v1:idempotent-boom";
+        let sig = error_signature_record(sig_id, "2026-01-01T00:00:00Z", "2026-01-01T05:00:00Z", 3);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&sig).expect("first write should succeed");
+        sink.write_record(&sig)
+            .expect("identical re-ingest should be a no-op");
+
+        let retained = sink
+            .read_all_records_log_retained()
+            .expect("log-retained read");
+        let count = retained
+            .iter()
+            .filter(|r| r.id() == sig_id && r.node_kind_name() == Some("ErrorSignature"))
+            .count();
+        assert_eq!(
+            count, 1,
+            "a byte-identical re-ingest is deduped to one physical record"
+        );
+    }
+
+    /// Issue #363: a non-log non-temporal kind re-ingested with differing content
+    /// keeps its SINGLE current-state record in the log-retained read — only
+    /// `ErrorSignature` / `LogOccurrenceBucket` versions are retained, so non-log
+    /// query behaviour is unchanged.
+    #[test]
+    fn read_all_records_log_retained_leaves_non_log_kinds_collapsed() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("log-retained-nonlog-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&current_symbol_record(&symbol_id, "v1", 20))
+            .expect("v1 should write");
+        sink.write_record(&current_symbol_record(&symbol_id, "v2", 42))
+            .expect("v2 should write");
+
+        let retained = sink
+            .read_all_records_log_retained()
+            .expect("log-retained read");
+        let count = retained
+            .iter()
+            .filter(|r| r.id() == symbol_id && r.node_kind_name() == Some("Symbol"))
+            .count();
+        assert_eq!(
+            count, 1,
+            "non-log non-temporal kinds keep their single current-state record"
+        );
     }
 
     #[test]

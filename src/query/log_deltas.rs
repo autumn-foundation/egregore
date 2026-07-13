@@ -41,18 +41,20 @@
 //! classes (an earlier scan → `ceased`, a later scan first-seen in-range →
 //! `new`) and double-count its occurrences.
 //!
-//! Coalescing is a **`--graph`-only** capability. The embedded (`--data-dir`)
-//! current-state read surface returns one record per stable ID, and
-//! `ErrorSignature` / `LogOccurrenceBucket` are non-temporal, so multiple
-//! `scan-logs` ingests of the same stable ID collapse (last-write-wins) BEFORE
-//! this query runs — the duplicate records coalescing needs are already gone. On
-//! the embedded path `first_seen` / `last_seen` and occurrence counts reflect
-//! only the retained record and the split-signature case can misclassify; a
-//! single ingest is unaffected. `log_deltas`'s `embedded_source` argument gates a
-//! [`LogEmbeddedRetentionCaveat`] that discloses this in the envelope when the
-//! embedded path is used and log records are present (issue #363). The
-//! adapter-level fix (retaining duplicate non-temporal log records) is out of
-//! #326's scope and tracked in #363.
+//! Coalescing works on BOTH read paths. The embedded (`--data-dir`) lane loads
+//! records through the log-retained read surface
+//! ([`EmbeddedAletheiaSink::read_all_records_log_retained`](crate::adapters)),
+//! which surfaces every superseded non-temporal `ErrorSignature` /
+//! `LogOccurrenceBucket` version that differing-content `scan-logs` ingests
+//! append — so the same duplicate slice the coalescer needs is present, and
+//! `first_seen` / `last_seen` / occurrence counts are reconstructed exactly as on
+//! the concatenated `--graph` JSONL (issue #363, which landed the adapter-level
+//! retention). `log_deltas`'s `embedded_source` argument still gates a
+//! [`LogEmbeddedRetentionCaveat`] disclosing the one residual divergence: a
+//! byte-identical re-ingest of the same `scan-logs` output is an idempotent no-op
+//! (deduped to one physical record) rather than multiplied, so identical rescans
+//! do not inflate `--data-dir` counts the way concatenating identical JSONL does
+//! on `--graph`. A single ingest is exact either way.
 //!
 //! # Classification (closed, mutually exclusive, precedence-ordered)
 //!
@@ -233,33 +235,30 @@ pub struct LogRepoScopeCaveat {
 /// Envelope caveat emitted ONLY on the embedded (`--data-dir`) read path when
 /// the store holds at least one `ErrorSignature` record (issue #363).
 ///
-/// The embedded store's current-state read surface
-/// ([`EmbeddedAletheiaSink::read_all_records`](crate::adapters)) returns exactly
-/// one record per stable ID. `ErrorSignature` and `LogOccurrenceBucket` are
-/// NON-temporal nodes, so ingesting multiple `scan-logs` outputs of the SAME
-/// stable signature/bucket ID retains a single record (last-write-wins); the
-/// duplicate records are gone before this query runs. The cross-scan coalescing
-/// this query performs on the `--graph` path — grouping duplicate signatures by
-/// stable ID and merging earliest `first_seen` / latest `last_seen` / summed
-/// occurrence counts BEFORE classification — therefore CANNOT be reconstructed
-/// from a `--data-dir` store: `first_seen` / `last_seen` and occurrence counts
-/// reflect only the retained record, and a multi-scan split-signature case can
-/// misclassify. A SINGLE `scan-logs` ingest is unaffected and correct.
+/// `ErrorSignature` and `LogOccurrenceBucket` are NON-temporal nodes, so
+/// ingesting multiple `scan-logs` outputs of the SAME stable signature/bucket ID
+/// appends a superseded physical version per differing-content scan. The
+/// embedded log-retained read surface
+/// ([`EmbeddedAletheiaSink::read_all_records_log_retained`](crate::adapters))
+/// surfaces every one of those versions, so the cross-scan coalescing this query
+/// performs on the `--graph` path — grouping duplicate signatures by stable ID
+/// and merging earliest `first_seen` / latest `last_seen` / summed occurrence
+/// counts BEFORE classification — IS reconstructed on `--data-dir` for scans
+/// whose captured content differs.
 ///
-/// For multi-scan aggregation, combine `scan-logs` outputs at the `--graph`
-/// level (concatenated JSONL) or use per-source stores. The store/adapter-layer
-/// fix — a log-domain-aware embedded read path that retains duplicate
-/// non-temporal log records — is out of #326's frozen scope and tracked in
-/// issue #363.
-pub const LOG_EMBEDDED_RETENTION_CAVEAT: &str = "Embedded (`--data-dir`) stores retain exactly one \
-     record per stable non-temporal log ID (last-write-wins for `ErrorSignature` / \
-     `LogOccurrenceBucket`). Multiple `scan-logs` ingests of the same stable signature/bucket ID \
-     are therefore collapsed BEFORE this query runs, so the cross-scan coalescing performed on the \
-     `--graph` path is NOT reconstructable here: `first_seen`, `last_seen`, and occurrence counts \
-     reflect only the retained record, and a multi-scan split-signature case can misclassify. A \
-     single `scan-logs` ingest is unaffected. For multi-scan aggregation, combine `scan-logs` \
-     outputs at the `--graph` level (concatenated JSONL) or use per-source stores. Tracked in \
-     issue #363.";
+/// The caveat remains a disclosure because one residual divergence persists: a
+/// byte-identical re-ingest of the same `scan-logs` output is an idempotent
+/// no-op (deduped to one physical record) rather than multiplied, so identical
+/// re-scans do not inflate `--data-dir` counts the way concatenating identical
+/// JSONL does on `--graph`. A SINGLE `scan-logs` ingest is exact either way.
+pub const LOG_EMBEDDED_RETENTION_CAVEAT: &str = "Embedded (`--data-dir`) stores retain every \
+     superseded non-temporal log observation (`ErrorSignature` / `LogOccurrenceBucket`), so the \
+     cross-scan coalescing performed on the `--graph` path (earliest `first_seen`, latest \
+     `last_seen`, summed occurrence counts) is reconstructed here for scans whose captured content \
+     differs. One residual divergence from `--graph`: byte-identical re-ingests of the same \
+     `scan-logs` output are idempotent (deduped to one physical record) rather than multiplied, so \
+     identical re-scans do not inflate counts on `--data-dir` the way concatenating identical JSONL \
+     does on `--graph`. Issue #363.";
 
 /// Advisory disclosure attached to a [`LogDeltas`] response whenever the query
 /// runs over the embedded (`--data-dir`) read path AND the store holds at least
@@ -379,8 +378,10 @@ pub struct LogDeltas {
     pub repo_scope_caveat: Option<LogRepoScopeCaveat>,
     /// Embedded-store retention caveat, present only when the query ran over the
     /// embedded (`--data-dir`) read path AND the store holds at least one
-    /// `ErrorSignature` record (issue #363): cross-scan coalescing is not
-    /// reconstructable on the embedded path — see [`LogEmbeddedRetentionCaveat`].
+    /// `ErrorSignature` record (issue #363): cross-scan coalescing IS
+    /// reconstructed on the embedded path (the log-retained read surfaces every
+    /// superseded log version), leaving only the byte-identical-re-ingest
+    /// idempotency divergence to disclose — see [`LogEmbeddedRetentionCaveat`].
     /// Absent (omitted from JSON) for `--graph` queries and for embedded stores
     /// with no log records.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -420,13 +421,14 @@ enum LogDeltaClass {
 /// reversed, or no ancestor path connects the endpoints — the same taxonomy as
 /// [`range_deltas`](super::range_deltas).
 /// `embedded_source` records whether the caller loaded `records` from the
-/// embedded (`--data-dir`) read path rather than a `--graph` JSONL. On the
-/// embedded path the current-state read surface retains one record per stable ID
-/// (last-write-wins for non-temporal `ErrorSignature` / `LogOccurrenceBucket`
-/// nodes), so cross-scan coalescing cannot be reconstructed; when it is set AND
-/// the store holds at least one `ErrorSignature`, the response carries
-/// [`LogEmbeddedRetentionCaveat`] disclosing this (issue #363). It never changes
-/// classification — only whether the caveat is emitted.
+/// embedded (`--data-dir`) read path rather than a `--graph` JSONL. That path now
+/// loads through the log-retained read surface, which surfaces every superseded
+/// non-temporal `ErrorSignature` / `LogOccurrenceBucket` version, so cross-scan
+/// coalescing IS reconstructed for differing-content scans; when it is set AND
+/// the store holds at least one `ErrorSignature`, the response still carries
+/// [`LogEmbeddedRetentionCaveat`] disclosing the one residual divergence
+/// (byte-identical re-ingests are deduped, not multiplied) (issue #363). It never
+/// changes classification — only whether the caveat is emitted.
 #[allow(clippy::missing_panics_doc)]
 pub fn log_deltas(
     records: &[GraphRecord],

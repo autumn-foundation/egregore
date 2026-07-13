@@ -269,15 +269,16 @@ pub struct ErrorContext {
     pub repo_scope_caveat: Option<&'static str>,
     /// Embedded-store retention caveat, present only when the query ran over the
     /// embedded (`--data-dir`) read path AND the store holds at least one
-    /// `ErrorSignature` record (issue #363): the embedded current-state read
-    /// surface retains one record per stable non-temporal log ID
-    /// (last-write-wins for `ErrorSignature` / `LogOccurrenceBucket`), so
-    /// multiple `scan-logs` ingests of the same stable ID are collapsed before
-    /// this query runs and the `--graph` cross-scan view is not reconstructable
-    /// here — see [`LogEmbeddedRetentionCaveat`]. Absent (omitted from JSON) for
-    /// `--graph` queries and for embedded stores with no `ErrorSignature`
-    /// records (a plain `scan` store, where no disclosure is warranted). Reuses
-    /// the `log-deltas` (#326) disclosure verbatim; the string is lane-agnostic.
+    /// `ErrorSignature` record (issue #363): the embedded lane now loads through
+    /// the log-retained read surface, which surfaces every superseded
+    /// non-temporal `ErrorSignature` / `LogOccurrenceBucket` version, so the
+    /// `--graph` cross-scan view IS reconstructed here for differing-content
+    /// scans — leaving only the byte-identical-re-ingest idempotency divergence
+    /// to disclose — see [`LogEmbeddedRetentionCaveat`]. Absent (omitted from
+    /// JSON) for `--graph` queries and for embedded stores with no
+    /// `ErrorSignature` records (a plain `scan` store, where no disclosure is
+    /// warranted). Reuses the `log-deltas` (#326) disclosure verbatim; the string
+    /// is lane-agnostic.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedded_log_retention_caveat: Option<LogEmbeddedRetentionCaveat>,
     /// Always-present advisory ([`ERROR_CONTEXT_DISCLAIMER`]).
@@ -560,12 +561,13 @@ fn prefix_resolution(sig_ids: &BTreeSet<&str>, needle: &str) -> HandleResolution
 /// superseded rows are excluded or flagged. `protected_store`, when set,
 /// resolves protected payload handles at read time. `embedded_source` is `true`
 /// only when the caller loaded the records from an embedded (`--data-dir`) store
-/// rather than a `--graph` JSONL: the embedded current-state read surface
-/// retains one record per stable non-temporal log ID (last-write-wins for
-/// `ErrorSignature` / `LogOccurrenceBucket`), so cross-scan coalescing cannot be
-/// reconstructed; when it is set AND the store holds at least one
-/// `ErrorSignature`, the response carries [`LogEmbeddedRetentionCaveat`]
-/// disclosing this (issue #363). It never changes resolution or section
+/// rather than a `--graph` JSONL: that path now loads through the log-retained
+/// read surface, which surfaces every superseded non-temporal `ErrorSignature` /
+/// `LogOccurrenceBucket` version, so cross-scan coalescing IS reconstructed for
+/// differing-content scans; when it is set AND the store holds at least one
+/// `ErrorSignature`, the response still carries [`LogEmbeddedRetentionCaveat`]
+/// disclosing the one residual divergence (byte-identical re-ingests are deduped,
+/// not multiplied) (issue #363). It never changes resolution or section
 /// contents — only whether the caveat is emitted.
 ///
 /// # Errors

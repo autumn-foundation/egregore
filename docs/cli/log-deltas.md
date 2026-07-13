@@ -76,11 +76,13 @@ issue #362.
 Separately, whenever the query runs over the embedded (`--data-dir`) read path
 **and** the store holds at least one `ErrorSignature`, the response carries an
 `embedded_log_retention_caveat` object (a fixed `message`) disclosing that
-embedded stores retain one record per stable non-temporal log ID
-(last-write-wins), so cross-scan coalescing is **not** reconstructable there — see
-[`--graph` only](#--graph-only-coalescing-is-not-reconstructable-on---data-dir-issue-363)
-above. The field is omitted for `--graph` queries and for embedded stores with no
-log records, and is deterministic (fixed string, no wall clock).
+embedded stores now retain **every superseded** non-temporal log observation, so
+cross-scan coalescing **is** reconstructed there for differing-content scans, and
+that the one residual divergence is that byte-identical re-ingests are deduped
+(not multiplied) — see
+[embedded coalescing](#embedded---data-dir-coalescing-issue-363) below. The field
+is omitted for `--graph` queries and for embedded stores with no log records, and
+is deterministic (fixed string, no wall clock).
 
 ## Shortest offline workflow
 
@@ -165,26 +167,27 @@ that observed it before the range landing in `ceased_signatures` while a later
 scan that first observed it in-range lands in `new_signatures`. In a store built
 from a single `scan-logs` output this is moot (each signature ID appears once).
 
-### `--graph` only: coalescing is not reconstructable on `--data-dir` (issue #363)
+### Embedded (`--data-dir`) coalescing (issue #363)
 
-Cross-scan coalescing is a **`--graph`** capability. The embedded (`--data-dir`)
-current-state read surface returns exactly **one record per stable ID**, and
-`ErrorSignature` / `LogOccurrenceBucket` are **non-temporal** nodes, so ingesting
-multiple `scan-logs` outputs of the **same** stable signature/bucket ID retains a
-single record (**last-write-wins**) — the duplicate records the coalescing needs
-are gone before `log-deltas` runs. On the `--data-dir` path, therefore,
-`first_seen` / `last_seen` and occurrence counts reflect only the **retained**
-record, and the split-signature case above can **misclassify**.
+Cross-scan coalescing works on **both** read paths. `ErrorSignature` /
+`LogOccurrenceBucket` are **non-temporal** nodes, so ingesting multiple
+`scan-logs` outputs of the **same** stable signature/bucket ID with differing
+captured content appends a **superseded** physical version per scan. The embedded
+(`--data-dir`) lane loads records through the **log-retained** read surface
+(`read_all_records_log_retained`), which surfaces every one of those versions —
+so the same duplicate slice the coalescer needs is present, and `first_seen` /
+`last_seen` / occurrence counts are reconstructed **exactly** as on the
+concatenated `--graph` JSONL. The split-signature case above therefore classifies
+identically on `--data-dir` and `--graph`.
 
-A **single** `scan-logs` ingest is unaffected and correct — this only bites
-multi-scan aggregation on the embedded path. When the query runs over
-`--data-dir` **and** the store holds at least one `ErrorSignature`, the response
-envelope carries an `embedded_log_retention_caveat` object (a fixed `message`)
-disclosing this. To aggregate across scans, combine `scan-logs` outputs at the
-**`--graph`** level (concatenated JSONL) or use **per-source stores**. The
-store/adapter-layer fix — a log-domain-aware embedded read path that retains
-duplicate non-temporal log records — is out of this command's scope and tracked
-in **issue #363**.
+One residual divergence remains: a **byte-identical** re-ingest of the same
+`scan-logs` output is an idempotent no-op (deduped to one physical record) rather
+than multiplied, so identical re-scans do **not** inflate `--data-dir` counts the
+way concatenating identical JSONL does on `--graph`. A **single** `scan-logs`
+ingest is exact either way. When the query runs over `--data-dir` **and** the
+store holds at least one `ErrorSignature`, the response envelope carries an
+`embedded_log_retention_caveat` object (a fixed `message`) disclosing this
+residual divergence. The adapter-level retention fix landed in **issue #363**.
 
 ## Change classes
 
