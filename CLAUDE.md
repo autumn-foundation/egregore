@@ -137,7 +137,7 @@ cargo run -- query log-deltas <sha> <sha> --graph combined.graph.jsonl          
 cargo run -- query log-deltas ffffffffffff <head_sha> --graph combined.graph.jsonl # exit 2 (missing_commit)
 
 # One error signature's full cross-domain context bundle (issue #324)
-cargo run -- query error-context log:v1:<hex> --graph combined.graph.jsonl        # exit 0 (record ID)
+cargo run -- query error-context log:v2:<hex> --graph combined.graph.jsonl        # exit 0 (record ID)
 cargo run -- query error-context <hex_prefix> --graph combined.graph.jsonl        # exit 0 unique / exit 1 ambiguous
 cargo run -- query error-context <symbol_name> --graph combined.graph.jsonl       # exit 0 (frames resolved to it)
 cargo run -- query error-context <handle> --graph combined.graph.jsonl --at <sha> # re-resolve frames at a commit view
@@ -331,12 +331,11 @@ per-occurrence timestamps), so a bucket straddling a commit instant cannot be su
 count may include occurrences up to one bucket width (1 hour) past the exact endpoint when it
 falls mid-hour; the "fully-before" predicate is deliberately not used (it would under-count
 instead), and endpoint-exact counts require a #320 schema change tracked in #364. Per-window bucket counts
-and the aggregate `occurrence_count` both SUM across all scanned sources: a
-`LogOccurrenceBucket` record ID is `(repository/signature/hour/width)` and omits `LogSource`,
-so distinct sources sharing a bucket ID are preserved by summing (never deduped by bucket ID);
-the symmetric cost is that concatenating the identical `scan-logs` output multiplies counts,
-so scan each source once (or use per-source stores). Fully source-attributed counts require
-source-aware bucket identity, a #320 schema change out of #326's scope, tracked in issue #361. All timestamp comparisons
+and the aggregate `occurrence_count` both SUM across all scanned sources: since issue #361 a
+`LogOccurrenceBucket` record ID is source-aware — `(repository/signature/hour/width/source_id)` —
+so distinct sources mint DISTINCT bucket IDs whose per-source counts each sum in, while a genuine
+rescan of identical bytes mints the SAME bucket ID and is deduped (collapsed) before summing;
+concatenating the identical `scan-logs` output therefore no longer double-counts buckets. All timestamp comparisons
 (window derivation, classification, bucket cutoffs) are by parsed UTC instant, never raw RFC
 3339 string order, because commit committer dates carry local offsets (`%cI`) while scan-logs
 times are Z-normalized — a lexical comparison would misclassify across offsets. `--repo`
@@ -356,8 +355,8 @@ signatures is tracked in #362. Because `LogSource` is a non-identity input (a si
 stable ID is `(repository_id, fingerprint_algorithm, template, severity)` only), a graph
 combining multiple `scan-logs` outputs for one repo carries the same signature record ID more
 than once; those records are grouped by stable ID and merged BEFORE classifying — earliest
-`first_seen`, latest `last_seen` (by instant), buckets summed across the group (not deduped by
-bucket record ID, per #361), aggregate `occurrence_count` summed — so exactly one row per signature ID is emitted, never
+`first_seen`, latest `last_seen` (by instant), distinct buckets summed across the group (deduped by
+source-aware bucket record ID, per #361), aggregate `occurrence_count` summed — so exactly one row per signature ID is emitted, never
 split across conflicting classes. Exit codes and the error
 taxonomy mirror #118 exactly. Rows are regression LEADS, never proof this range caused the
 failure; a ceased signature is not proof of a fix; occurrence data only reflects scanned log
@@ -370,15 +369,14 @@ added by `resolve-frames`/`link-logs`, log payload unchanged) is retained as a s
 observation and never double-counted (retraction boundary honored — a `forget`-retracted
 observation re-observed by a LATER `scan-logs` is not resurrected; only the post-retraction
 observation reaches the coalesced sum) — so `first_seen`/`last_seen`/occurrence counts are
-reconstructed exactly as on the concatenated `--graph` JSONL. When run over `--data-dir` with log records present, the envelope still carries an
-`embedded_log_retention_caveat` disclosing a residual divergence in two forms, both from
-idempotent-write dedup of byte-identical non-temporal records: (1) byte-identical re-ingests of the
-whole `scan-logs` output are deduped to one physical record rather than multiplied, so identical
-re-scans do not inflate `--data-dir` counts the way concatenating identical JSONL does on `--graph`;
-and (2) even across differing scans, an individual byte-identical `LogOccurrenceBucket` (same
-signature, hour, and count) is deduped rather than summed, so a shared-hour/shared-count bucket
-contributes once on `--data-dir` but twice on `--graph`, leaving per-window occurrence counts
-possibly lower on `--data-dir` — inherent to non-source-aware bucket identity, deferred to #361.
+reconstructed exactly as on the concatenated `--graph` JSONL. Since issue #361 made bucket identity
+source-aware, per-window occurrence counts CONVERGE across `--graph` and `--data-dir` (distinct
+sources sum on both, rescans collapse on both). When run over `--data-dir` with log records present,
+the envelope still carries an `embedded_log_retention_caveat` disclosing the ONE residual divergence,
+rooted purely in idempotent-write dedup of byte-identical non-temporal records (not a bucket-identity
+gap): a byte-identical re-ingest of the whole `scan-logs` output is deduped to one physical record on
+`--data-dir` but summed on `--graph`, so concatenating identical JSONL inflates the `--graph` aggregate
+`occurrence_count` while an identical re-scan does not inflate `--data-dir`.
 A single ingest is exact either way. Read-only, redaction-safe (no raw log text), deterministic and
 byte-identical across runs. See `docs/cli/log-deltas.md`.
 
@@ -389,11 +387,12 @@ kind, edge label, or trust class: the `query context` (#38) cross-domain bundle 
 half (seeded from each resolved frame target via `record_context`), the #322
 `FRAME_RESOLVES_TO` / #323 `EMITTED_DURING`+`REFERENCES_TASK` / #320 `AGGREGATES`+`CAPTURED_FROM`
 log-edge topology for the runtime half, and the #118 `range_deltas` mechanics for the history
-`first_seen_range`. Handle resolution has three precedence-ordered modes: exact `log:v1:<hex>`
-record ID; a fingerprint/template-hash hex prefix (unique → resolve; ≥2 → `ambiguous` exit 1
+`first_seen_range`. Handle resolution has three precedence-ordered modes (the `log:v<N>:` prefix
+is matched version-agnostically, so both v1 fixtures and real v2 handles resolve): exact
+`log:v2:<hex>` record ID; a fingerprint/template-hash hex prefix (unique → resolve; ≥2 → `ambiguous` exit 1
 with all candidate IDs; a bare hex prefix matching none falls through to symbol-name mode); and
 an exact `Symbol` name whose frames resolved to it (a symbol named by MANY signatures returns
-ALL of them, exit 0 — not ambiguity). A well-formed `log:v1:` handle that is not an
+ALL of them, exit 0 — not ambiguity). A well-formed `log:v2:` handle that is not an
 `ErrorSignature` (absent, or a `LogSource`/bucket ID) is `no_match` (exit 2), never silently
 prefix-matched. Sections are trust-separated with a `trust_class` on every row: `signatures`
 (`runtime_observation` — identity + `template_excerpt` + occurrence buckets + resolved frames),
@@ -416,12 +415,13 @@ code side of the history join (log records carry no retrievable repository attri
 must carry zero protected handles or the run exits 1 (`protected_handle_in_graph`). Over
 `--data-dir` the current-state (no `--at`/`--as-of`) read loads through the log-retained surface
 (#363), so multi-scan signature coalescing (earliest `first_seen`, latest `last_seen`, summed
-occurrence, all buckets) is reconstructed exactly as on `--graph`; the envelope carries an
-`embedded_log_retention_caveat` disclosing the residual divergence in two forms (a byte-identical
-re-ingest of the whole output is deduped not multiplied; and an individual byte-identical
-`LogOccurrenceBucket` — same signature/hour/count — is deduped rather than summed, so a
-shared-hour/shared-count bucket contributes once on `--data-dir` but twice on `--graph`, deferred
-to #361). All
+occurrence, all buckets) is reconstructed exactly as on `--graph`; since issue #361 made bucket
+identity source-aware, the occurrence-bucket block CONVERGES across `--graph` and `--data-dir`
+(distinct sources sum on both, rescans collapse on both). The envelope carries an
+`embedded_log_retention_caveat` disclosing the ONE residual divergence, rooted purely in
+idempotent-write dedup of byte-identical non-temporal records (not a bucket-identity gap): a
+byte-identical re-ingest of the whole output is deduped to one physical record on `--data-dir`
+but summed on `--graph`. All
 timestamp ordering is by parsed UTC instant, never raw RFC 3339 string order. Rows are
 CORRELATION LEADS, never proof of cause: a resolved frame proves the backtrace NAMES a symbol,
 an `EMITTED_DURING` edge is a correlation. Read-only, redaction-safe (only the bounded
@@ -720,9 +720,9 @@ or when any non-code trust-class row lacks a source/evidence/policy handle. Log-
 (issues #328, #376): the audit drives all three log query workflows that return
 `runtime_observation` rows — `log-deltas` (#326), `error-context` (#324), and the subsystem
 `log_signatures` section (#325) — gating every returned runtime-observation signature
-row on a well-formed `log:v1:` record ID PLUS its `LogSource` provenance (source path +
+row on a well-formed `log:v2:` record ID PLUS its `LogSource` provenance (source path +
 `source_artifact_hash`, resolved through an at-least-one present `CAPTURED_FROM`/`AGGREGATES`
-`LogSource`; the `log:v1:` ID satisfies the template-hash requirement, a disclosed schema
+`LogSource`; the `log:v2:` ID satisfies the template-hash requirement, a disclosed schema
 shape). The requirement is class-wide, so ANY other lane that surfaces a log row (e.g. `memory`)
 applies it too. `runtime_observation` is its own rate-gated lane at the strictest default
 `--min-log-citation 1.0` (validated to [0,1]; out-of-range exits 2), separate from the binary
@@ -825,7 +825,7 @@ Issue #340 folds runtime log-graph incident evidence (foundation: umbrella #319,
 #320 `ErrorSignature`/fingerprint scan, #322 `FRAME_RESOLVES_TO`, #326
 log-deltas) into the CC7.2/CC7.3 sections — pure pack-side population, no new
 graph domain/kind/edge/trust class. `error_signatures` rows carry each signature's
-`log:v1:` ID, severity, `template_hash`, `frame_chain_hash`, first/last-seen
+`log:v2:` ID, severity, `template_hash`, `frame_chain_hash`, first/last-seen
 **clipped to the window**, content-addressed `protected:v1:` exemplar handles
 (handle + hash only, never log text, #60 discipline), and each `FRAME_RESOLVES_TO`
 join with its `frame_resolution` label propagated verbatim (#152/#134).

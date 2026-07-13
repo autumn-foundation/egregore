@@ -146,22 +146,18 @@ split across conflicting classes. The merge is:
 
 - **`first_seen`** = the earliest across the group (by parsed instant);
 - **`last_seen`** = the latest across the group (by parsed instant);
-- **occurrence buckets** = **every** linked bucket node, **summed** across the
-  group with **no dedup by bucket record ID** (see below);
+- **occurrence buckets** = every **distinct** linked bucket node, **deduped by
+  bucket record ID** then summed across the group (see below);
 - **aggregate `occurrence_count`** = the sum of the group's per-scan counts.
 
-Both the per-window bucket counts and the aggregate `occurrence_count` **sum**
-across every scanned source. A `LogOccurrenceBucket` record ID is
-`(repository_id, signature_id, bucket_start, bucket_width)` and **omits
-`LogSource`**, so two **distinct** sources observing the same signature in the
-same hour mint the **same** bucket record ID with their own per-source counts.
-Summing (rather than deduping by bucket ID) preserves both sources and keeps the
-window counts consistent with the aggregate. The symmetric cost is that
-concatenating the **identical** `scan-logs` output multiplies counts (a
-degenerate, user-error input) — so **scan each source once**, or use
-per-source / per-repository stores. Fully source-attributed counts require
-source-aware bucket identity, a log-graph (#320) schema change out of this
-command's scope, tracked in **issue #361**.
+Since **issue #361** a `LogOccurrenceBucket` record ID is **source-aware**:
+`(repository_id, signature_id, bucket_start, bucket_width, source_id)`. Two
+**distinct** sources observing the same signature in the same hour therefore mint
+**distinct** bucket record IDs whose per-source counts each sum in, while a
+genuine **rescan** of identical bytes mints the **same** bucket ID and is
+**deduped** (collapsed) — so concatenating the identical `scan-logs` output no
+longer double-counts buckets. Per-window bucket counts stay consistent with the
+aggregate `occurrence_count`, which sums the coalesced signatures.
 
 Without this coalescing a single stable signature could split — an earlier scan
 that observed it before the range landing in `ceased_signatures` while a later
@@ -194,29 +190,26 @@ That enrichment-only rewrite is the **same** observation (identical payload, onl
 observation and never double-counts occurrences. The retained current version is
 always the enriched one, so resolved frames and evidence links are preserved.
 
-One residual divergence remains, in two forms, both rooted in the idempotent-write
-dedup of byte-identical non-temporal records:
+Since **issue #361** made `LogOccurrenceBucket` identity source-aware, the former
+same-hour/same-count bucket divergence is **gone**: distinct sources mint distinct
+bucket IDs (summed on both paths) and a genuine rescan mints the same bucket ID
+(deduped on both paths — `--graph` dedups by record ID before summing,
+`--data-dir` dedups at write time), so **per-window occurrence counts converge**.
 
-1. A **byte-identical** re-ingest of the *entire* same `scan-logs` output is an
-   idempotent no-op (deduped to one physical record) rather than multiplied, so
-   identical re-scans do **not** inflate `--data-dir` counts the way concatenating
-   identical JSONL does on `--graph`.
-2. Even across **differing** scans, an individual **byte-identical**
-   `LogOccurrenceBucket` — same signature, same hour, **same count** (so the same
-   record ID *and* the same content) — is deduped to one physical record rather
-   than summed. Such a shared-hour/shared-count bucket therefore contributes its
-   count **once** on `--data-dir` but **twice** on `--graph`, whose concatenated
-   JSONL carries both copies and whose bucket-sum iterates bucket **nodes** without
-   deduping by bucket record ID (see #361). Per-window occurrence counts
-   (`base_window_occurrences` / `head_window_occurrences`) can therefore be **lower**
-   on `--data-dir` for this case. This is inherent to non-source-aware bucket
-   identity; the real fix is source-aware bucket identity, tracked in **issue #361**.
+**One residual divergence remains**, rooted purely in the idempotent-write dedup
+of byte-identical non-temporal records — **not** a bucket-identity gap: a
+**byte-identical** re-ingest of the *entire* same `scan-logs` output (the same
+signature record appended twice) is an idempotent no-op on `--data-dir` (deduped to
+one physical record) but is **summed** on `--graph` (which groups duplicate
+signatures by stable ID and sums their aggregate `occurrence_count`). So
+concatenating identical JSONL inflates the `--graph` aggregate count while an
+identical re-scan does not inflate `--data-dir`.
 
 A **single** `scan-logs` ingest is exact either way. When the query runs over
 `--data-dir` **and** the store holds at least one `ErrorSignature`, the response
 envelope carries an `embedded_log_retention_caveat` object (a fixed `message`)
-disclosing both forms of this residual divergence. The adapter-level retention fix
-landed in **issue #363**.
+disclosing this residual divergence. The adapter-level retention fix landed in
+**issue #363**.
 
 The retention preserves the **`forget` retraction boundary**: if an
 `ErrorSignature` was retracted with `eg forget` and a **later** `scan-logs`
@@ -341,7 +334,7 @@ valid times.
   "occurrence_count_granularity": "hourly_bucket",
   "new_signatures": [
     {
-      "record_id": "log:v1:...",
+      "record_id": "log:v2:...",
       "schema_version": 1,
       "change_class": "new_signature",
       "severity": "error",

@@ -70,7 +70,7 @@ stdout carries a deterministic summary envelope:
 ```json
 {"ok":true,"command":"resolve-frames","at_commit":null,"as_of":null,
  "totals":{"signatures_with_frames":1,"resolved":1,"ambiguous":1,"path_only":1,"unresolved":1,"external":1},
- "signatures":[{"signature_id":"log:v1:…","resolved":1,"ambiguous":1,"path_only":1,"unresolved":1,"external":1}],
+ "signatures":[{"signature_id":"log:v2:…","resolved":1,"ambiguous":1,"path_only":1,"unresolved":1,"external":1}],
  "disclaimer":"A frame binding proves that the backtrace frame NAMES the symbol; …"}
 ```
 

@@ -364,7 +364,7 @@ Rows are coalesced by stable signature ID (a graph combining multiple
 
 | Field | Type | Always present | Description |
 |-------|------|----------------|-------------|
-| `record_id` | string | yes | Stable `ErrorSignature` record ID (`log:v1:…`). |
+| `record_id` | string | yes | Stable `ErrorSignature` record ID (`log:v2:…`). |
 | `kind` | string | yes | Always `"ErrorSignature"`. |
 | `trust_class` | string | yes | Always `"runtime_observation"`. |
 | `schema_version` | number | yes | Log-domain schema version. |

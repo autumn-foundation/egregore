@@ -40,7 +40,16 @@ incremental producers. New domains use their own constants:
 | `artifact` | `ARTIFACT_SCHEMA_VERSION` | artifact records |
 | `project` | `PROJECT_SCHEMA_VERSION` | project-graph records |
 | `semantic` | `SEMANTIC_SCHEMA_VERSION` | semantic-drift records |
-| `log` | `LOG_SCHEMA_VERSION` | log-signature records (`LogSource`, `ErrorSignature`, `LogEvent`, `LogOccurrenceBucket`) — compatibility class `additive`, version 1 |
+| `log` | `LOG_SCHEMA_VERSION` | log-signature records (`LogSource`, `ErrorSignature`, `LogEvent`, `LogOccurrenceBucket`) — version 2 |
+
+The `log` domain was bumped 1 → 2 by issue #361 (source-aware
+`LogOccurrenceBucket` identity: the owning `LogSource` is folded into the
+bucket's stable ID and carried as a required `source_id` payload field). This
+is a `breaking` bump — a v1 bucket's stable ID differs from its v2 identity,
+so old readers reject v1-vs-v2 mismatches with `unknown_schema_version` rather
+than silently coercing. No `migrating` one-way transform manifest is provided
+because the remedy is a **re-scan / re-ingest**: `eg scan-logs` regenerates every
+log record under the v2 identity deterministically from the source log.
 
 Rationale: per-domain and per-kind scoping lets #6, #11, #13, #14, and #15 land
 independently. A new project `Task` shape must not force a version bump for

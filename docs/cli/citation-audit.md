@@ -74,7 +74,7 @@ The report ends with a `gate` block and a top-level `ok`:
 |-------|---------|
 | `code_gate_pass` | **Fails** when fewer than `min_code_citation` (default 95%) of code-answer rows carry a stable record ID plus a repo-relative file/span handle or a documented absent-span reason (AC4). |
 | `non_code_handle_gate_pass` | **Fails** when any agent-memory, project, artifact, verification, redaction, protected-artifact, or user-context row lacks at least one source / verification / task / policy-audit / protected-payload handle (AC5). |
-| `log_gate_pass` | **Fails** when fewer than `min_log_citation` (default 100%) of `runtime_observation` (log-domain) rows carry their required citation — a well-formed `log:v1:` record ID plus `LogSource` provenance (issue #328). A below-threshold lane emits a `below_log_citation_threshold` diagnostic naming the specific failing workflow, the `runtime_observation` class, and the measured rate (issues #328, #376). |
+| `log_gate_pass` | **Fails** when fewer than `min_log_citation` (default 100%) of `runtime_observation` (log-domain) rows carry their required citation — a well-formed `log:v2:` record ID plus `LogSource` provenance (issue #328). A below-threshold lane emits a `below_log_citation_threshold` diagnostic naming the specific failing workflow, the `runtime_observation` class, and the measured rate (issues #328, #376). |
 | `unclassified_missing_rows` | Missing-handle rows that lack a classifying diagnostic. The success metric requires this to be `0`. |
 | `ok` | `true` only when the code, non-code, and log gates all pass and `unclassified_missing_rows == 0`. |
 
@@ -113,7 +113,7 @@ Runtime log observations (`LogSource`, `ErrorSignature`, `LogEvent`,
 about its execution, deterministically parsed but never verified. Every returned
 `runtime_observation` row must carry:
 
-- a stable, well-formed `log:v1:` record ID, **and**
+- a stable, well-formed `log:v2:` record ID, **and**
 - its `LogSource` provenance: the source path **and** the `source_artifact_hash`.
   A `LogSource` is cited from its own payload. An `ErrorSignature` / `LogEvent` /
   `LogOccurrenceBucket` gets provenance by resolving its `CAPTURED_FROM` /
@@ -123,10 +123,12 @@ about its execution, deterministically parsed but never verified. Every returned
   `missing_required_handle` failure, never credited by its own ID.
 
 The template hash is **not** a standalone field: the `ErrorSignature` template is
-hashed into the content-addressed `log:v1:` record ID (identity = repository,
-algorithm, normalized template, severity), so a well-formed `log:v1:` ID *is* the
-citation of the template-hash requirement. This is a disclosed schema shape (part
-of the #361–#364 log-graph known-limitation cluster), not a new field.
+hashed into the content-addressed `log:v<N>:` record ID (identity = repository,
+algorithm, normalized template, severity), so a well-formed `log:v<N>:` ID *is* the
+citation of the template-hash requirement. The version-agnostic check accepts any
+`log:v<N>:` prefix (the log domain is at v2 since issue #361 made bucket identity
+source-aware). This is a disclosed schema shape (part of the #362–#364 log-graph
+known-limitation cluster), not a new field.
 
 A signature's resolved backtrace-frame targets (`FRAME_RESOLVES_TO`, #322) and
 its overlapping symbol deltas are **code rows**, audited under the existing

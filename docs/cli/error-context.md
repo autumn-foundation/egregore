@@ -34,7 +34,7 @@ eg query error-context <HANDLE> --data-dir <DIR>  [--repo <SELECTOR>] [--as-of <
 
 `<HANDLE>` resolves an `ErrorSignature` three ways, in precedence order:
 
-1. **Exact record ID** — a `log:v1:<hex>` `ErrorSignature` stable ID.
+1. **Exact record ID** — a `log:v2:<hex>` `ErrorSignature` stable ID.
 2. **Fingerprint / template-hash prefix** — a hex prefix of the signature's
    stable-ID hex tail. A unique prefix resolves; a prefix matching two or more
    signatures is **ambiguous** (exit 1, all candidate IDs listed). A bare hex
@@ -43,7 +43,7 @@ eg query error-context <HANDLE> --data-dir <DIR>  [--repo <SELECTOR>] [--as-of <
    it (`FRAME_RESOLVES_TO`). A symbol named by *many* signatures returns **all**
    of them (exit 0) — this is not ambiguity.
 
-A well-formed `log:v1:` handle that is not an `ErrorSignature` (absent, or a
+A well-formed `log:v2:` handle that is not an `ErrorSignature` (absent, or a
 `LogSource` / `LogOccurrenceBucket` ID) is `no_match` (exit 2), never silently
 prefix-matched.
 
@@ -117,17 +117,15 @@ sharing one occurrence window but differing in captured frames are both kept. Th
 standard `scan-logs -> resolve-frames -> link-logs` pipeline re-emits the same
 `ErrorSignature` node enriched with node-level evidence links but with an
 unchanged log payload, and that enrichment-only rewrite is retained as a
-**single** observation — never double-counted. The residual
-divergence has two forms, both from idempotent-write dedup of byte-identical
-non-temporal records: (1) a byte-identical re-ingest of the whole `scan-logs`
-output is deduped to one physical record (not multiplied); and (2) even across
-**differing** scans, an individual byte-identical `LogOccurrenceBucket` (same
-signature, same hour, **same count**) is deduped to one physical record rather than
-summed, so a shared-hour/shared-count bucket contributes once on `--data-dir` but
-twice on `--graph` (which iterates bucket nodes and sums duplicates), and the
-coalesced signature's occurrence-bucket block can hold fewer occurrences on
-`--data-dir`. Both stem from non-source-aware bucket identity, whose real fix is
-tracked in **issue #361**. The `--graph` path preserves every ingested line and
+**single** observation — never double-counted. Since **issue #361** made
+`LogOccurrenceBucket` identity source-aware, the former same-hour/same-count bucket
+divergence is **gone**: distinct sources mint distinct bucket IDs (summed on both
+paths) and a rescan mints the same bucket ID (deduped on both paths), so the
+occurrence-bucket block **converges** across `--graph` and `--data-dir`. The one
+residual divergence stems purely from idempotent-write dedup of byte-identical
+non-temporal records (not bucket identity): a byte-identical re-ingest of the whole
+`scan-logs` output is deduped to one physical record on `--data-dir` but summed on
+`--graph`. The `--graph` path preserves every ingested line and
 never carries the caveat; a pure `scan` store with no log records never carries
 it either. This mirrors the identical disclosure on
 [`eg query log-deltas`](./log-deltas.md); the adapter-level retention fix landed
@@ -155,7 +153,7 @@ eg link-logs --graph resolved.graph.jsonl --graph agent.graph.jsonl --out linked
 Get-Content graph.jsonl, history.graph.jsonl, linked.graph.jsonl | Set-Content combined.graph.jsonl
 
 # Assemble the cross-domain error-context bundle
-eg query error-context log:v1:<hex> --graph combined.graph.jsonl
+eg query error-context log:v2:<hex> --graph combined.graph.jsonl
 ```
 
 ## Response shape
@@ -163,11 +161,11 @@ eg query error-context log:v1:<hex> --graph combined.graph.jsonl
 ```json
 {
   "ok": true,
-  "handle": "log:v1:<hex>",
-  "signature_ids": ["log:v1:<hex>"],
+  "handle": "log:v2:<hex>",
+  "signature_ids": ["log:v2:<hex>"],
   "signatures": [
     {
-      "record_id": "log:v1:<hex>",
+      "record_id": "log:v2:<hex>",
       "schema_version": 1,
       "trust_class": "runtime_observation",
       "severity": "error",
@@ -176,14 +174,14 @@ eg query error-context log:v1:<hex> --graph combined.graph.jsonl
       "first_seen": "2026-01-02T12:00:00Z",
       "last_seen": "2026-01-02T13:00:00Z",
       "occurrence_count": 5,
-      "source_handles": [{ "record_id": "log:v1:<hex>", "source_relative_path": "app.log", "source_artifact_hash": "<blake3-hex>" }],
-      "buckets": [{ "record_id": "log:v1:<hex>", "bucket_start": "2026-01-02T12:00:00Z", "bucket_width": "1h", "occurrence_count": 5 }],
+      "source_handles": [{ "record_id": "log:v2:<hex>", "source_relative_path": "app.log", "source_artifact_hash": "<blake3-hex>" }],
+      "buckets": [{ "record_id": "log:v2:<hex>", "bucket_start": "2026-01-02T12:00:00Z", "bucket_width": "1h", "occurrence_count": 5 }],
       "frames": [{ "frame_index": 0, "frame_resolution": "resolved", "target_record_id": "codegraph:v5:<hex>" }]
     }
   ],
   "first_seen_range": {
     "status": "history",
-    "anchor_signature_id": "log:v1:<hex>",
+    "anchor_signature_id": "log:v2:<hex>",
     "first_seen": "2026-01-02T12:00:00Z",
     "base_commit": "<sha>",
     "head_commit": "<sha>",

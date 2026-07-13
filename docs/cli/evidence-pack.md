@@ -36,7 +36,7 @@ eg audit evidence-pack assemble --control CC8.1 \
 
 | Contract | Role in the pack |
 |----------|------------------|
-| #337 control catalog (`eg audit control-catalog`) | The control → evidence-class map. The manifest echoes the catalog id/version and its `control_catalog:v1:<hash>` pin. |
+| #337 control catalog (`eg audit control-catalog`) | The control → evidence-class map. The manifest echoes the catalog id/version and its `control_catalog:v2:<hash>` pin. |
 | #68 evidence bundle (`eg bundle export/verify`) | The scrub-to-hash primitive (`scrub_record` + BLAKE3), canonical ordering, and the integrity/coverage/safety verify verdicts. |
 | #65 citation audit (`eg audit citations`) | The per-trust-class citation classification the pack's citation gate reuses byte-for-byte. |
 | #118 deltas / #157 public-API deltas | Section-level disclaimers propagated verbatim into the `structural_deltas` / `public_api_deltas` sections. |
@@ -219,7 +219,7 @@ Three sections carry the evidence, each with a section-level disclaimer:
 
 **`error_signatures`** — one hashed `ErrorSignature` row per in-window signature
 (the point predicate on the signature's `first_seen`), plus a `log_summary`
-carrying, per signature: the `log:v1:` record ID, `severity`, a `template_hash`
+carrying, per signature: the `log:v2:` record ID, `severity`, a `template_hash`
 (BLAKE3 of the normalized template excerpt — a redaction-safe fingerprint, never
 raw text), a `frame_chain_hash` when frames were captured, the **first/last-seen
 valid times clipped to the window** (`first_seen_in_window`/`last_seen_in_window`),
@@ -261,22 +261,26 @@ label + `frame_index` + endpoint IDs — **never log or frame text** (the edge i
 no-op for the log-text scrub), so the zero-raw-log Safety invariant holds.
 
 **Concatenated multi-scan coalescing** (issue #340, Codex round-6). A `LogSource`
-is a **non-identity** input: an `ErrorSignature`'s stable ID is
-`(repository_id, fingerprint_algorithm, template, severity)` and a
-`LogOccurrenceBucket`'s ID omits `LogSource` likewise. A graph built by
-concatenating several `scan-logs` outputs for one repo (a documented, legitimate
-multi-scan workflow) therefore carries the **same stable log ID once per scan**.
-`assemble` **coalesces duplicate log records by stable ID at assemble time**,
-BEFORE window filtering and summary building, mirroring the `query log-deltas`
-cross-scan semantics: `ErrorSignature` records sharing an ID merge to one node
-with the **earliest `first_seen`, latest `last_seen`** (by parsed UTC instant) and
-**summed `occurrence_count`**; `LogOccurrenceBucket` records sharing an ID have
-their counts **summed** (never deduped by bucket record ID, per issue #361);
-`LogSource`/`LogEvent` nodes and log-domain edges collapse to their first
-occurrence. Exactly **one summary row and one hashed section node per stable ID**
-results, so the concatenated pack still passes its own offline `verify` — the
-hard assemble↔verify consistency invariant. A single-scan graph has no duplicate
-log IDs, so coalescing is a no-op and every existing pack is byte-identical.
+is a **non-identity** input for an `ErrorSignature`: its stable ID is
+`(repository_id, fingerprint_algorithm, template, severity)`. A
+`LogOccurrenceBucket`'s ID, by contrast, **is** source-aware since **issue #361**:
+`(repository_id, signature_id, bucket_start, bucket_width, source_id)`. A graph
+built by concatenating several `scan-logs` outputs for one repo (a documented,
+legitimate multi-scan workflow) therefore carries the **same stable signature ID
+once per scan**, while distinct sources mint distinct bucket IDs. `assemble`
+**coalesces duplicate log records by stable ID at assemble time**, BEFORE window
+filtering and summary building, mirroring the `query log-deltas` cross-scan
+semantics: `ErrorSignature` records sharing an ID merge to one node with the
+**earliest `first_seen`, latest `last_seen`** (by parsed UTC instant) and
+**summed `occurrence_count`**; `LogOccurrenceBucket` records sharing an ID are
+**deduped to one node** (a shared bucket ID is a genuine byte-identical rescan
+since #361, so collapse it — distinct sources carry distinct IDs and sum in
+`occurrence_buckets` totals); `LogSource`/`LogEvent` nodes and log-domain edges
+collapse to their first occurrence. Exactly **one summary row and one hashed
+section node per stable ID** results, so the concatenated pack still passes its own
+offline `verify` — the hard assemble↔verify consistency invariant. A single-scan
+graph has no duplicate log IDs, so coalescing is a no-op and every existing pack is
+byte-identical.
 
 **`occurrence_buckets`** — the **bucket window rule differs from the point
 predicate every other class uses**. A `LogOccurrenceBucket` row is in-window iff
