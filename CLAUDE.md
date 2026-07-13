@@ -698,14 +698,17 @@ reports, per workflow and overall, whether returned rows carry the citation hand
 trust class requires. The default gate fails when fewer than 95% of code-answer rows carry a
 stable record ID plus a repo-relative file/span handle (or a documented absent-span reason),
 or when any non-code trust-class row lacks a source/evidence/policy handle. Log-domain coverage
-(issue #328): the `log-deltas` lane (the one covered log workflow on trunk — the only `eg query`
-verb returning `runtime_observation` rows) gates every returned runtime-observation signature
+(issues #328, #376): the audit drives all three log query workflows that return
+`runtime_observation` rows — `log-deltas` (#326), `error-context` (#324), and the subsystem
+`log_signatures` section (#325) — gating every returned runtime-observation signature
 row on a well-formed `log:v1:` record ID PLUS its `LogSource` provenance (source path +
 `source_artifact_hash`, resolved through an at-least-one present `CAPTURED_FROM`/`AGGREGATES`
 `LogSource`; the `log:v1:` ID satisfies the template-hash requirement, a disclosed schema
-shape). `runtime_observation` is its own rate-gated lane at the strictest default
+shape). The requirement is class-wide, so ANY other lane that surfaces a log row (e.g. `memory`)
+applies it too. `runtime_observation` is its own rate-gated lane at the strictest default
 `--min-log-citation 1.0` (validated to [0,1]; out-of-range exits 2), separate from the binary
-non-code gate; a below-threshold lane emits `below_log_citation_threshold`. Resolved-frame and
+non-code gate; a below-threshold lane emits `below_log_citation_threshold` naming the SPECIFIC
+failing workflow (never a hard-coded `log-deltas`). Resolved-frame and
 overlapping-symbol-delta rows are audited as code rows. Standing invariant: an agent-authored
 claim is never counted as evidence for itself, and a runtime observation is never counted as
 verification. Output is deterministic and redaction-safe — record IDs, handles, hashes,

@@ -25,10 +25,11 @@ use crate::evidence_freshness::FreshnessVerdict;
 use crate::ir::{EdgeLabel, GraphRecord, LogPayload, LogSourcePayload, SourceSpan};
 use crate::query::{
     self, FailureHandleError, RepositoryIndex, ResolvedFailureTarget, change_impact_context,
-    changes_context, failure_history_context, largest_semantic_drifts, log_deltas,
+    changes_context, error_context, failure_history_context, largest_semantic_drifts, log_deltas,
     memory_audit_context, resolve_drift_target, resolve_failure_handle, subsystem_context,
     symbol_context, task_evidence_context,
 };
+use crate::temporal_status::SupersessionMode;
 
 /// Default gate threshold: fraction of code-answer rows that must carry a
 /// stable record ID plus a repo-relative file/span handle or a documented
@@ -1973,6 +1974,141 @@ fn drive_log_deltas(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
     builder
 }
 
+/// Stable `ErrorSignature` node IDs present in the record set, sorted ascending
+/// so the error-context lane drives them in deterministic order.
+fn error_signature_ids(records: &[GraphRecord]) -> Vec<String> {
+    records
+        .iter()
+        .filter(|r| r.node_kind_name() == Some("ErrorSignature"))
+        .map(|r| r.id().to_owned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// `eg query error-context` (issue #324) — one signature's full cross-domain
+/// context bundle, wired into the citation audit by issue #376.
+///
+/// This is the second covered log-domain workflow (alongside `log-deltas` and
+/// `log_signatures`). Each `ErrorSignature` node present in the set is resolved by
+/// its exact `log:v1:` ID; every returned [`SignatureBlock`] is a runtime
+/// observation whose citation requirement is class-wide (`push_record`
+/// reclassifies it through `classify_log_handle`), so a signature with no
+/// `CAPTURED_FROM` `LogSource` provenance is a citation failure. Each block's
+/// resolved-frame targets are code rows audited under the existing code-handle
+/// rule — a dangling/tombstoned target is a `MissingRequiredHandle` code-lane
+/// failure, never silently dropped (mirrors `drive_log_deltas`).
+///
+/// A record set carrying no `ErrorSignature` nodes reports the lane disabled with
+/// a stable reason rather than skipping it.
+fn drive_error_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let sig_ids = error_signature_ids(records);
+    if sig_ids.is_empty() {
+        return WorkflowBuilder::disabled(
+            "error-context",
+            "runtime_observation",
+            "no_error_signatures",
+            records,
+        );
+    }
+
+    let mut builder = WorkflowBuilder::new("error-context", "runtime_observation", records);
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let tombstoned = tombstoned_ids(records);
+    for sig_id in &sig_ids {
+        // Resolve each signature by its exact `log:v1:` ID (the default view: no
+        // repo scope, no commit/instant pin, exclude superseded rows, no protected
+        // store, `--graph` read path).
+        let Ok(ctx) = error_context(
+            records,
+            sig_id,
+            None,
+            None,
+            None,
+            SupersessionMode::Exclude,
+            None,
+            false,
+        ) else {
+            continue;
+        };
+        for block in &ctx.signatures {
+            // The signature block is a runtime observation: `push_record`
+            // reclassifies it through the class-wide log-provenance rule, so it
+            // must carry its full `log:v1:` ID + `LogSource` citation. A block whose
+            // node is absent/invisible is never silently dropped.
+            match by_id.get(block.record_id.as_str()) {
+                Some(record) => {
+                    builder.push_record(record);
+                    builder.note_redaction(record);
+                }
+                _ => builder.push_classified(
+                    missing(&block.record_id, "runtime_observation"),
+                    String::new(),
+                ),
+            }
+            // Resolved-frame targets are code rows, audited under the code-handle
+            // rule exactly as `drive_log_deltas` does: present+visible → cited by
+            // its own handle; dangling or tombstoned-and-unsuperseded → a
+            // `MissingRequiredHandle` code-lane failure.
+            for frame in &block.frames {
+                let target_id = frame.target_record_id.as_str();
+                match by_id.get(target_id) {
+                    Some(record)
+                        if node_visible(target_id, has_temporal_anchor(record), &tombstoned) =>
+                    {
+                        builder.push_record(record);
+                    }
+                    _ => builder.push_classified(missing(target_id, "source_fact"), String::new()),
+                }
+            }
+        }
+    }
+    builder
+}
+
+/// The subsystem `log_signatures` section (issue #325) — runtime error
+/// signatures whose frames resolve under a subsystem prefix, wired into the
+/// citation audit by issue #376.
+///
+/// This is a SEPARATE workflow from `drive_subsystem` (which covers the code
+/// sections): the same class-wide log-provenance rule applies to each surfaced
+/// `SubsystemLogSignature`, so a signature lacking `CAPTURED_FROM` provenance is
+/// a citation failure. The section's frame targets are path-only (no record ID),
+/// and the resolved code frame targets are already covered by `drive_subsystem`;
+/// this lane audits only the runtime-observation signature rows. When no scanned
+/// signature resolves under any driven prefix the lane reports disabled.
+fn drive_log_signatures(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("log_signatures", "runtime_observation", records);
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let mut any_row = false;
+    for prefix in subsystem_prefixes(records) {
+        let Ok(ctx) = subsystem_context(records, &prefix) else {
+            continue;
+        };
+        for sig in &ctx.log_signatures {
+            any_row = true;
+            match by_id.get(sig.record_id) {
+                Some(record) => {
+                    builder.push_record(record);
+                    builder.note_redaction(record);
+                }
+                _ => builder
+                    .push_classified(missing(sig.record_id, "runtime_observation"), String::new()),
+            }
+        }
+    }
+    if any_row {
+        builder
+    } else {
+        WorkflowBuilder::disabled(
+            "log_signatures",
+            "runtime_observation",
+            "no_in_prefix_signatures",
+            records,
+        )
+    }
+}
+
 /// `eg query evidence-freshness` — per-observation freshness verdicts. Each
 /// verdict row pairs an agent-authored observation with its cited code handle;
 /// both must carry their required citation, and stale/unresolved verdicts emit a
@@ -2065,10 +2201,12 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         drive_changes(records),
         drive_context(records),
         drive_drift(records),
+        drive_error_context(records),
         drive_evidence_freshness(freshness_records),
         drive_failures(records, &repo_index),
         drive_file(records),
         drive_log_deltas(records),
+        drive_log_signatures(records),
         drive_manifest_deps(records),
         drive_memory(records),
         drive_policy(records),
@@ -2096,16 +2234,34 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
     }
 
     let gate = evaluate_gate(&workflows, &diagnostics, config);
-    // A below-threshold log lane emits a stable diagnostic naming the workflow,
-    // the trust class, and the measured rate, then re-sorts to stay byte-stable.
-    if !gate.log_gate_pass {
-        diagnostics.push(AuditDiagnostic {
-            code: "below_log_citation_threshold".to_owned(),
-            workflow: "log-deltas",
-            source_record_id: None,
-            target_handle: Some(format!("{:.6}", gate.log_citation_completeness)),
-            relation: Some("runtime_observation".to_owned()),
-        });
+    // A below-threshold log lane emits a stable diagnostic naming the SPECIFIC
+    // failing workflow (issue #376): the audit now drives three log query
+    // workflows (`log-deltas`, `error-context`, `log_signatures`) plus any other
+    // lane that can surface a `runtime_observation` row (e.g. `memory`), so the
+    // diagnostic must name whichever lane fell short rather than a single
+    // hard-coded name. The aggregate `log_gate_pass` (issue #328) stays the sole
+    // overall ok/exit determinant — this loop only classifies which lane failed.
+    let mut log_lane_diagnostics: Vec<AuditDiagnostic> = Vec::new();
+    for workflow in &workflows {
+        let (satisfied, total) = log_row_completeness(&workflow.rows);
+        if total == 0 {
+            continue;
+        }
+        // Counts are small row tallies; precision loss is not a concern.
+        #[allow(clippy::cast_precision_loss)]
+        let rate = satisfied as f64 / total as f64;
+        if rate + GATE_EPSILON < config.min_log_citation {
+            log_lane_diagnostics.push(AuditDiagnostic {
+                code: "below_log_citation_threshold".to_owned(),
+                workflow: workflow.workflow,
+                source_record_id: None,
+                target_handle: Some(format!("{rate:.6}")),
+                relation: Some("runtime_observation".to_owned()),
+            });
+        }
+    }
+    if !log_lane_diagnostics.is_empty() {
+        diagnostics.append(&mut log_lane_diagnostics);
         diagnostics.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         diagnostics.dedup();
     }
@@ -2124,6 +2280,26 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         gate,
         diagnostics,
     }
+}
+
+/// Returns `(satisfied, total)` `runtime_observation` row counts for one
+/// workflow's classified rows — the per-workflow analog of the aggregate log
+/// lane, used to name the specific below-threshold workflow (issue #376).
+fn log_row_completeness(rows: &[RowClassification]) -> (usize, usize) {
+    let mut total = 0usize;
+    let mut satisfied = 0usize;
+    for row in rows {
+        if row.trust_class == "runtime_observation" {
+            total += 1;
+            if matches!(
+                row.status,
+                CitationStatus::Cited | CitationStatus::AbsentHandleDocumented
+            ) {
+                satisfied += 1;
+            }
+        }
+    }
+    (satisfied, total)
 }
 
 /// Evaluates the three citation gates over the classified workflow rows.

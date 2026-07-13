@@ -944,6 +944,236 @@ fn runtime_observation_via_memory_requires_provenance_classwide() {
         "an uncited runtime observation must fail the log gate"
     );
     assert!(!report.ok);
+    // #376: the `below_log_citation_threshold` diagnostic names the SPECIFIC
+    // workflow whose runtime-observation rows fell short — here the `memory`
+    // lane surfaced the provenance-less signature — never a hard-coded
+    // `log-deltas`. (The same signature also surfaces via the `error-context`
+    // lane, which names itself too.)
+    let named: Vec<&str> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "below_log_citation_threshold")
+        .map(|d| d.workflow)
+        .collect();
+    assert!(
+        named.contains(&"memory"),
+        "the memory lane must name itself in the below-threshold diagnostic: {named:?}"
+    );
+    assert!(
+        !named.contains(&"log-deltas"),
+        "the log-deltas lane is disabled here (no commit range) and must not be named: {named:?}"
+    );
+}
+
+// ── #376: the two remaining log query workflows are citation-gated ─────────
+//
+// `eg audit citations` now drives three log query workflows (`log-deltas`,
+// `error-context`, `log_signatures`). Each surfaces `runtime_observation` rows
+// that are gated by the SAME class-wide provenance rule, and a below-threshold
+// lane names ITSELF in the `below_log_citation_threshold` diagnostic.
+
+/// A Symbol node at `path` with a well-formed span — a live code frame target.
+fn symbol_at(id: &str, path: &str) -> GraphRecord {
+    let mut sym = node(id, NodeKind::Symbol);
+    if let GraphRecord::Node {
+        repo_relative_path,
+        span,
+        ..
+    } = &mut sym
+    {
+        repo_relative_path.replace(path.to_owned());
+        *span = Some(mk_span(10, 20));
+    }
+    sym
+}
+
+/// The `below_log_citation_threshold` diagnostic workflow names in a report.
+fn below_log_workflows(report: &CitationAuditReport) -> Vec<&'static str> {
+    report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "below_log_citation_threshold")
+        .map(|d| d.workflow)
+        .collect()
+}
+
+// #376 RED (error-context): a well-formed `log:v1:` ErrorSignature with NO
+// CAPTURED_FROM/LogSource provenance, surfaced through the error-context lane,
+// is a `MissingRequiredHandle` runtime observation that fails the log gate and
+// makes the lane name itself in the diagnostic.
+#[test]
+fn error_context_uncited_signature_fails_log_gate() {
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let records = vec![error_signature_node(&sig_id)];
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let ec = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == "error-context")
+        .expect("error-context workflow present");
+    assert!(
+        ec.enabled,
+        "error-context is enabled when a signature is present"
+    );
+    let row = ec
+        .rows
+        .iter()
+        .find(|r| r.record_id == sig_id)
+        .expect("the signature surfaces as an error-context row");
+    assert_eq!(row.trust_class, "runtime_observation");
+    assert_eq!(
+        row.status,
+        CitationStatus::MissingRequiredHandle,
+        "a provenance-less signature is never cited via the error-context lane"
+    );
+    assert!(!report.gate.log_gate_pass);
+    assert!(!report.ok);
+    assert!(
+        below_log_workflows(&report).contains(&"error-context"),
+        "the error-context lane must name itself: {:?}",
+        below_log_workflows(&report)
+    );
+}
+
+// #376 GREEN (error-context): the same signature WITH a valid CAPTURED_FROM →
+// LogSource(non-empty hash) is cited, and the lane contributes no diagnostic.
+#[test]
+fn error_context_cited_signature_passes() {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let records = vec![
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_id),
+    ];
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let ec = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == "error-context")
+        .expect("error-context workflow present");
+    let row = ec
+        .rows
+        .iter()
+        .find(|r| r.record_id == sig_id)
+        .expect("the signature surfaces as an error-context row");
+    assert_eq!(
+        row.status,
+        CitationStatus::Cited,
+        "a signature with CAPTURED_FROM provenance is cited"
+    );
+    assert!(report.gate.log_gate_pass);
+    assert!(report.ok);
+    assert!(
+        !below_log_workflows(&report).contains(&"error-context"),
+        "a fully cited error-context lane emits no below-threshold diagnostic"
+    );
+}
+
+// #376 RED (log_signatures): a signature whose FRAME_RESOLVES_TO edge resolves
+// under a driven subsystem prefix (so it enters the `log_signatures` section)
+// but carries NO CAPTURED_FROM provenance is a `MissingRequiredHandle` runtime
+// observation that fails the log gate and makes the lane name itself.
+#[test]
+fn log_signatures_uncited_signature_fails_log_gate() {
+    let sym_id = "codegraph:v1:frame_target";
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let records = vec![
+        symbol_at(sym_id, "src/lib.rs"),
+        error_signature_node(&sig_id),
+        frame_resolves_to(&sig_id, sym_id),
+    ];
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let ls = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == "log_signatures")
+        .expect("log_signatures workflow present");
+    assert!(
+        ls.enabled,
+        "log_signatures is enabled when a signature resolves under a prefix"
+    );
+    let row = ls
+        .rows
+        .iter()
+        .find(|r| r.record_id == sig_id)
+        .expect("the signature surfaces as a log_signatures row");
+    assert_eq!(row.trust_class, "runtime_observation");
+    assert_eq!(row.status, CitationStatus::MissingRequiredHandle);
+    assert!(!report.gate.log_gate_pass);
+    assert!(!report.ok);
+    assert!(
+        below_log_workflows(&report).contains(&"log_signatures"),
+        "the log_signatures lane must name itself: {:?}",
+        below_log_workflows(&report)
+    );
+}
+
+// #376 GREEN (log_signatures): the same frame-resolved signature WITH valid
+// CAPTURED_FROM provenance is cited and the lane contributes no diagnostic.
+#[test]
+fn log_signatures_cited_signature_passes() {
+    let sym_id = "codegraph:v1:frame_target";
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let records = vec![
+        symbol_at(sym_id, "src/lib.rs"),
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_id),
+        frame_resolves_to(&sig_id, sym_id),
+    ];
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let ls = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == "log_signatures")
+        .expect("log_signatures workflow present");
+    let row = ls
+        .rows
+        .iter()
+        .find(|r| r.record_id == sig_id)
+        .expect("the signature surfaces as a log_signatures row");
+    assert_eq!(
+        row.status,
+        CitationStatus::Cited,
+        "a frame-resolved signature with CAPTURED_FROM provenance is cited"
+    );
+    assert!(report.gate.log_gate_pass);
+    assert!(report.ok);
+    assert!(
+        !below_log_workflows(&report).contains(&"log_signatures"),
+        "a fully cited log_signatures lane emits no below-threshold diagnostic"
+    );
+}
+
+// #376: the report over a combined log corpus driving all three log lanes is
+// byte-identical across runs (deterministic serialized output).
+#[test]
+fn three_log_lanes_report_is_byte_identical() {
+    let sym_id = "codegraph:v1:frame_target";
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let records = vec![
+        symbol_at(sym_id, "src/lib.rs"),
+        commit_node("c1sha", &[], "2026-01-01T00:00:00Z"),
+        commit_node("c3sha", &["c1sha"], "2026-01-03T00:00:00Z"),
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_id),
+        frame_resolves_to(&sig_id, sym_id),
+    ];
+    let first =
+        serde_json::to_string(&run_citation_audit(&records, &AuditConfig::default())).unwrap();
+    for _ in 0..3 {
+        let again =
+            serde_json::to_string(&run_citation_audit(&records, &AuditConfig::default())).unwrap();
+        assert_eq!(first, again, "audit output must be deterministic");
+    }
 }
 
 // ── #328 Finding B: tombstoned log provenance is not reachable ─────────────
