@@ -143,10 +143,11 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
         ]),
         EdgeLabel::Calls | EdgeLabel::Mentions => Some(&[NodeKind::Diagnostic, NodeKind::Symbol]),
         EdgeLabel::Imports => Some(&[NodeKind::Import]),
-        // A `Review` may only be anchored to a `Commit` (issue #334). The AC
-        // requires this Review→Commit target rule even though the PR-side
-        // `MERGED_AS` is intentionally absent here.
-        EdgeLabel::ReviewsCommit => Some(&[NodeKind::Commit]),
+        // The commit-anchor project edges terminate at a `Commit` only: a PR
+        // `Task —MERGED_AS→ Commit` (issue #333) and its review-side mirror
+        // `Review —REVIEWS_COMMIT→ Commit` (issue #334), matching the daemon's
+        // `validate_project_edge` target rule (issue #386).
+        EdgeLabel::MergedAs | EdgeLabel::ReviewsCommit => Some(&[NodeKind::Commit]),
         // ── Log-signature domain (issues #319 / #322 / #327) ─────────────────
         // `LogEvent —FINGERPRINTED_AS→ ErrorSignature` (an exemplar is
         // fingerprinted as one signature) and `LogOccurrenceBucket —AGGREGATES→
@@ -211,16 +212,21 @@ const fn allowed_source_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
         // signature only (docs/schema/log-graph.md). Combined because the source
         // set is identical (clippy `match_same_arms`).
         EdgeLabel::FrameResolvesTo | EdgeLabel::EmittedDuring => Some(&[NodeKind::ErrorSignature]),
-        // ── Reviewer-identity domain (issue #335) ───────────────────────────
-        // `Review —REVIEWED_BY→ ExternalIdentity`: only a `Review` is authored
-        // by a reviewer identity. `Task —REQUESTED_REVIEW_FROM→
-        // ExternalIdentity`: only the PR `Task` requests a review. The schema
-        // and daemon frame both edges directionally, so a schema-correct
-        // `ExternalIdentity` target reached from a wrong-kind source (e.g. a
-        // `Task —REVIEWED_BY→` or a `Review —REQUESTED_REVIEW_FROM→`) is invalid
-        // attribution the pre-ingest gate must reject.
-        EdgeLabel::ReviewedBy => Some(&[NodeKind::Review]),
-        EdgeLabel::RequestedReviewFrom => Some(&[NodeKind::Task]),
+        // ── Reviewer-identity (issue #335) & commit-anchor (issues #333/#334)
+        //    project edges ─────────────────────────────────────────────────
+        // Review-source edges: `Review —REVIEWED_BY→ ExternalIdentity` (only a
+        // `Review` is authored by a reviewer identity) and `Review
+        // —REVIEWS_COMMIT→ Commit` (only a `Review` anchors to the commit it
+        // reviewed). Task-source edges: `Task —REQUESTED_REVIEW_FROM→
+        // ExternalIdentity` (only the PR `Task` requests a review) and `Task
+        // —MERGED_AS→ Commit` (only the PR `Task` records its merge commit). The
+        // schema and daemon frame every edge directionally, so a schema-correct
+        // target reached from a wrong-kind source is invalid attribution the
+        // pre-ingest gate must reject (issue #386). The Review-source and
+        // Task-source labels are each combined because the source set is
+        // identical (clippy `match_same_arms`).
+        EdgeLabel::ReviewedBy | EdgeLabel::ReviewsCommit => Some(&[NodeKind::Review]),
+        EdgeLabel::RequestedReviewFrom | EdgeLabel::MergedAs => Some(&[NodeKind::Task]),
         // ── Review-state history (issue #336) ───────────────────────────────
         // `ReviewStateTransition —TRANSITIONS_REVIEW→ Review`: only a
         // `ReviewStateTransition` transitions a review, so a schema-correct
@@ -231,24 +237,33 @@ const fn allowed_source_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
     }
 }
 
-/// The importer `source_kind` a reviewer-identity edge requires on its SOURCE
-/// node (issue #369), matching the daemon's `require_project_edge_source_kind`
-/// gate in `validate_project_edge`.
+/// The importer `source_kind` an importer-only project edge requires on its
+/// SOURCE node (issues #369, #386), matching the daemon's
+/// `require_project_edge_source_kind` gate in `validate_project_edge`.
 ///
 /// Distinct from `allowed_source_kinds`, which constrains the source NODE KIND:
 /// this constrains the finer importer-origin `source_kind` STRING the node
 /// carries (`github_review` / `github_pr`), so a kind-correct but mis-attributed
-/// source can never mint a reviewer-identity binding the daemon would reject.
-/// Only the two reviewer-identity edges are constrained; every other label
-/// returns `None` (unconstrained) via the `_ => None` arm.
+/// source can never mint a reviewer-identity (`REVIEWED_BY` /
+/// `REQUESTED_REVIEW_FROM`, #335) or commit-anchor (`MERGED_AS` #333 /
+/// `REVIEWS_COMMIT` #334) binding the daemon would reject. Only those four edges
+/// are constrained; every other label returns `None` (unconstrained) via the
+/// `_ => None` arm.
 const fn required_source_kind(label: EdgeLabel) -> Option<&'static str> {
     match label {
-        // `Review —REVIEWED_BY→ ExternalIdentity` must originate from an
-        // importer-stamped `github_review` Review.
-        EdgeLabel::ReviewedBy => Some(SOURCE_KIND_REVIEW),
-        // `Task —REQUESTED_REVIEW_FROM→ ExternalIdentity` must originate from a
-        // `github_pr` PR Task — never a `github_issue` Task.
-        EdgeLabel::RequestedReviewFrom => Some(SOURCE_KIND_PR),
+        // A `github_review` Review source: `Review —REVIEWED_BY→
+        // ExternalIdentity` (issue #335) and `Review —REVIEWS_COMMIT→ Commit`
+        // (issue #334) must both originate from an importer-stamped
+        // `github_review` Review.
+        EdgeLabel::ReviewedBy | EdgeLabel::ReviewsCommit => Some(SOURCE_KIND_REVIEW),
+        // A `github_pr` PR Task source: `Task —REQUESTED_REVIEW_FROM→
+        // ExternalIdentity` (issue #335) and `Task —MERGED_AS→ Commit` (issue
+        // #333) must both originate from a `github_pr` PR Task — never a
+        // `github_issue` Task. The daemon's `require_project_edge_source_kind`
+        // gates all four, so the offline gate must too (issues #369, #386). Each
+        // group is combined because the required value is identical (clippy
+        // `match_same_arms`).
+        EdgeLabel::RequestedReviewFrom | EdgeLabel::MergedAs => Some(SOURCE_KIND_PR),
         _ => None,
     }
 }
@@ -2193,6 +2208,155 @@ mod tests {
         assert_eq!(defect.source_kind, None);
     }
 
+    #[test]
+    fn merged_as_and_reviews_commit_with_correct_source_and_target_are_clean() {
+        // Issue #386: MERGED_AS from a `github_pr` Task and REVIEWS_COMMIT from a
+        // `github_review` Review, each anchored to a Commit, carry the importer
+        // source_kind and node kinds the daemon requires, so both pass every gate.
+        let records = vec![
+            node_with_source_kind("n:pr", NodeKind::Task, "github_pr"),
+            node_with_source_kind("n:review", NodeKind::Review, "github_review"),
+            node("n:commit", NodeKind::Commit),
+            edge("e:ma", EdgeLabel::MergedAs, "n:pr", "n:commit"),
+            edge("e:rc", EdgeLabel::ReviewsCommit, "n:review", "n:commit"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&EDGE_SOURCE_KIND_VIOLATION)
+                && !codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION)
+                && !codes.contains(&EDGE_TARGET_KIND_VIOLATION),
+            "well-formed commit-anchor edges must be clean, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn merged_as_from_github_issue_task_is_rejected() {
+        // Issue #386: MERGED_AS must originate from a `github_pr` Task; a
+        // node-kind-correct but `github_issue` Task is a binding the daemon
+        // rejects via require_project_edge_source_kind, so the offline gate must
+        // too. The node-kind check passes (source is a Task), so the attribution
+        // defect is the only source-side one.
+        let records = vec![
+            node_with_source_kind("n:task", NodeKind::Task, "github_issue"),
+            node("n:commit", NodeKind::Commit),
+            edge("e:ma", EdgeLabel::MergedAs, "n:task", "n:commit"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
+            "MERGED_AS off a github_issue Task must be rejected, got {codes:?}"
+        );
+        assert!(
+            !codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "a node-kind-correct Task source must not also trip the node-kind check, got {codes:?}"
+        );
+        let defect = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION)
+            .expect("attribution defect present");
+        assert_eq!(defect.edge_id.as_deref(), Some("e:ma"));
+        assert_eq!(defect.record_id.as_deref(), Some("n:task"));
+        assert_eq!(defect.required_source_kind, Some("github_pr"));
+        assert_eq!(defect.source_kind.as_deref(), Some("github_issue"));
+    }
+
+    #[test]
+    fn reviews_commit_from_review_without_source_kind_is_rejected() {
+        // Issue #386: REVIEWS_COMMIT must originate from a `github_review`
+        // Review; a node-kind-correct Review carrying no importer source_kind (a
+        // generic/hand-authored Review) is a binding the daemon rejects, so the
+        // offline gate must too. The node-kind check passes (source is a Review).
+        let records = vec![
+            node("n:review", NodeKind::Review),
+            node("n:commit", NodeKind::Commit),
+            edge("e:rc", EdgeLabel::ReviewsCommit, "n:review", "n:commit"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
+            "REVIEWS_COMMIT from a source lacking source_kind github_review must be rejected, got {codes:?}"
+        );
+        assert!(
+            !codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "a node-kind-correct Review source must not also trip the node-kind check, got {codes:?}"
+        );
+        let defect = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION)
+            .expect("attribution defect present");
+        assert_eq!(defect.edge_id.as_deref(), Some("e:rc"));
+        assert_eq!(defect.record_id.as_deref(), Some("n:review"));
+        assert_eq!(defect.required_source_kind, Some("github_review"));
+        assert_eq!(defect.source_kind, None);
+    }
+
+    #[test]
+    fn merged_as_from_wrong_source_kind_node_is_rejected_once() {
+        // Issue #386: MERGED_AS must originate from a `Task`; a `Review` source
+        // is a wrong node kind the gate rejects as `edge_source_kind_violation`.
+        // The finer attribution gate runs only when the node kind is already
+        // valid, so the wrong-kind source is reported once, never doubled.
+        let records = vec![
+            node("n:review", NodeKind::Review),
+            node("n:commit", NodeKind::Commit),
+            edge("e:ma", EdgeLabel::MergedAs, "n:review", "n:commit"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "Review—MERGED_AS→Commit must be rejected, got {codes:?}"
+        );
+        assert!(
+            !codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
+            "a wrong-kind source must not also trip the attribution gate, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn reviews_commit_from_wrong_source_kind_node_is_rejected_once() {
+        // Issue #386: REVIEWS_COMMIT must originate from a `Review`; a `Task`
+        // source is a wrong node kind reported once as `edge_source_kind_violation`,
+        // never doubled with the attribution defect.
+        let records = vec![
+            node("n:task", NodeKind::Task),
+            node("n:commit", NodeKind::Commit),
+            edge("e:rc", EdgeLabel::ReviewsCommit, "n:task", "n:commit"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "Task—REVIEWS_COMMIT→Commit must be rejected, got {codes:?}"
+        );
+        assert!(
+            !codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
+            "a wrong-kind source must not also trip the attribution gate, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn merged_as_to_wrong_target_is_rejected() {
+        // Issue #386: MERGED_AS must terminate at a `Commit`; a `Symbol` target
+        // is a target-kind violation (the daemon requires the Commit target too).
+        let records = vec![
+            node_with_source_kind("n:pr", NodeKind::Task, "github_pr"),
+            node("n:sym", NodeKind::Symbol),
+            edge("e:ma", EdgeLabel::MergedAs, "n:pr", "n:sym"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_TARGET_KIND_VIOLATION),
+            "MERGED_AS→Symbol must be rejected, got {codes:?}"
+        );
+    }
+
     /// One same-node-ID batch shape for the `source_kind` resolution parity
     /// tests: a name, the forward sequence of per-record importer attributions
     /// for node ID `n:task`, and the value both the validator and the daemon
@@ -2279,6 +2443,38 @@ mod tests {
             assert_eq!(
                 validator_resolved, expected,
                 "validator must resolve permutation `{name}` to the documented value"
+            );
+        }
+    }
+
+    #[test]
+    fn gated_edge_source_kind_requirements_match_daemon() {
+        // Issue #386 differential parity: for every project edge the daemon's
+        // `validate_project_edge` gates through `require_project_edge_source_kind`,
+        // the offline validator's `required_source_kind` and `allowed_source_kinds`
+        // helpers must encode the SAME (source node kind, importer source_kind)
+        // pair the daemon's arm hard-codes (`src/daemon.rs`
+        // MergedAs|ReviewsCommit and ReviewedBy|RequestedReviewFrom arms). Any
+        // future drift on either surface becomes a failure here, not a new bug.
+        // The expected column mirrors the daemon's literals verbatim.
+        let expected: &[(EdgeLabel, NodeKind, &str)] = &[
+            (EdgeLabel::MergedAs, NodeKind::Task, "github_pr"),
+            (EdgeLabel::ReviewsCommit, NodeKind::Review, "github_review"),
+            (EdgeLabel::ReviewedBy, NodeKind::Review, "github_review"),
+            (EdgeLabel::RequestedReviewFrom, NodeKind::Task, "github_pr"),
+        ];
+        for &(label, from_kind, from_source_kind) in expected {
+            assert_eq!(
+                required_source_kind(label),
+                Some(from_source_kind),
+                "{} required source_kind must match the daemon",
+                label.as_str()
+            );
+            assert_eq!(
+                allowed_source_kinds(label),
+                Some([from_kind].as_slice()),
+                "{} allowed source node kind must match the daemon",
+                label.as_str()
             );
         }
     }
