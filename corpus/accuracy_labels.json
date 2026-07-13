@@ -82,6 +82,14 @@
       "span": { "start_byte": 306, "end_byte": 355, "start_line": 20, "end_line": 22 }
     },
     {
+      "id": "sym-mytrait-method-sig",
+      "kind": "Symbol",
+      "repo_relative_path": "src/lib.rs",
+      "name": "trait_method",
+      "symbol_kind": "function",
+      "span": { "start_byte": 330, "end_byte": 353, "start_line": 21, "end_line": 21 }
+    },
+    {
       "id": "sym-impl-mytrait",
       "kind": "Symbol",
       "repo_relative_path": "src/lib.rs",
@@ -152,6 +160,7 @@
     { "label": "DEFINES", "source": "sym-impl-mystruct", "target": "sym-impl-mystruct-get-value" },
     { "label": "IMPLEMENTS", "source": "sym-impl-mystruct", "target": "sym-impl-mystruct" },
     { "label": "DEFINES", "source": "file-lib", "target": "sym-mytrait" },
+    { "label": "DEFINES", "source": "file-lib", "target": "sym-mytrait-method-sig" },
     { "label": "DEFINES", "source": "file-lib", "target": "sym-impl-mytrait" },
     { "label": "DEFINES", "source": "sym-impl-mytrait", "target": "sym-impl-mytrait-method" },
     { "label": "IMPLEMENTS", "source": "sym-impl-mytrait", "target": "sym-mytrait" },

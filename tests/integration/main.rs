@@ -99,6 +99,7 @@ mod task_query;
 mod temporal;
 mod temporal_status;
 mod token_cost;
+mod trait_method_signatures;
 mod traj;
 mod transaction_time;
 mod transitive_callees;

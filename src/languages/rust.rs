@@ -843,14 +843,52 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         current
     }
 
-    /// Visits a trait-method or foreign-function signature: emits a
-    /// deterministic `UnsafeSite` record when the declaration is an
-    /// `unsafe fn` (issue #222). Signature items register no symbol of their
-    /// own today; walking continues unchanged.
+    /// Visits a trait-method or foreign-function signature.
+    ///
+    /// Emits a deterministic `UnsafeSite` record when the declaration is an
+    /// `unsafe fn` (issue #222).
+    ///
+    /// A `function_signature_item` appears in two contexts, both routed here.
+    /// A signature-only trait method (nearest enclosing item is a
+    /// `trait_item`) is a first-class citable `Symbol`, recorded exactly like
+    /// a default-bodied trait method — kind `"function"`, `qualify(local_name)`
+    /// qualified name, a `DEFINES` edge from the owning scope (a trait
+    /// establishes no owner scope), plus the same `definitions` registration
+    /// and `DefinitionFact` so a call to a body-less trait method has a
+    /// definition to resolve to (issue #342). A foreign declaration inside an
+    /// `extern` block (nearest enclosing item is a `foreign_mod_item`) is out
+    /// of scope: it mints no Symbol, matching the pre-#342 behavior.
     fn extract_function_signature(&mut self, node: Node<'_>) {
         if has_unsafe_modifier(node) {
             self.emit_unsafe_site(node, "fn");
         }
+        if !signature_is_trait_method(node) {
+            // Foreign (`extern` block) declaration: symbol-less, out of scope.
+            self.walk_children(node);
+            return;
+        }
+        let Some(local_name) = node_name(node, self.source) else {
+            self.walk_children(node);
+            return;
+        };
+        // A signature-only item never carries an `impl_context` (impl methods
+        // always have bodies), so the kind/name selection mirrors
+        // `extract_function`'s free-item branch: kind `"function"`, qualified
+        // by the enclosing module path only.
+        let qualified_name = self.qualify(&local_name);
+        let id = self.add_symbol(node, "function", &qualified_name);
+        self.definitions.insert(local_name.clone(), id.clone());
+        self.definitions.insert(qualified_name.clone(), id.clone());
+        self.facts.definitions.push(DefinitionFact {
+            id,
+            qualified_name: qualified_name.clone(),
+            simple_name: local_name.clone(),
+            match_segments: self.definition_match_segments(&local_name),
+            symbol_kind: "function".to_owned(),
+            repo_relative_path: self.file.repo_relative_path.clone(),
+        });
+        // No `SymbolBody` and no `collect_call_sites`: a signature-only
+        // declaration has no body to scan for call sites.
         self.walk_children(node);
     }
 
@@ -1347,6 +1385,24 @@ fn has_unsafe_modifier(node: Node<'_>) -> bool {
                 }
             }
             _ => {}
+        }
+    }
+    false
+}
+
+/// True when the nearest enclosing item of a `function_signature_item` is a
+/// `trait_item` (mint a Symbol per issue #342), false when it is a
+/// `foreign_mod_item` (`extern` block — symbol-less, out of scope). Both wrap
+/// the signature in a `declaration_list`; the classification walks the
+/// ancestor chain to the first of the two item kinds, so it is robust to
+/// grammar nesting.
+fn signature_is_trait_method(node: Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        match current.kind() {
+            "trait_item" => return true,
+            "foreign_mod_item" => return false,
+            _ => ancestor = current.parent(),
         }
     }
     false
