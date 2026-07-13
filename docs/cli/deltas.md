@@ -96,8 +96,33 @@ fail with stable machine-readable diagnostics (`{"ok":false,"error":
 | Both endpoints resolve to the same commit | `identical_endpoints` | `1` |
 | Base is a descendant of head | `reversed_range` | `1` |
 | No ancestor path connects the endpoints | `no_path` | `1` |
+| Unscoped multi-repository store, endpoints ambiguous across repositories | `repo_scope_required` | `1` |
 | Commit prefix matches nothing | `missing_commit` | `2` |
 | Store has no commit history | `empty_history` | `2` |
+
+### `repo_scope_required` (issue #341)
+
+In an unscoped multi-repository store the endpoints are resolved against every
+repository's `Commit` nodes. When a commit SHA is present in more than one
+repository (a fork, a mirrored history, the same upstream ingested twice) or the
+two endpoints resolve into different repositories, the range cannot be attributed
+to a single repository. Rather than silently collapse the shared SHA to one match
+or splice two repositories' topologies, the query refuses with a stable
+diagnostic (exit `1`, the same malformed/ambiguous-input class as
+`ambiguous_commit_prefix`), naming every candidate repository and telling the
+caller to pass `--repo <SELECTOR>`:
+
+```json
+{"ok":false,"error":{"error_type":"repo_scope_required","candidate_repositories":[{"repository_id":"codegraph:v5:...","repository_name":"widget-a"},{"repository_id":"codegraph:v5:...","repository_name":"widget-b"}]}}
+```
+
+Ambiguity is never resolved by picking a repository implicitly. When both
+endpoints unambiguously belong to a single common repository the query succeeds,
+with commit resolution, topology, and snapshot selection all gated to that
+repository — so a foreign repository's same-SHA commits, parents, and snapshots
+can never leak into the range. Single-repository stores and `--repo`-scoped calls
+are unaffected. This mirrors the repository-gating precedent established for the
+co-change coupling lane in PR #312 (issue #153).
 
 ## Response shape
 

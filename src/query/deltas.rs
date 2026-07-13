@@ -144,6 +144,18 @@ pub struct RangeDeltas<'a> {
     pub semantic_drift: RangeDriftSection<'a>,
 }
 
+/// One repository that could own a range endpoint in an unscoped
+/// multi-repository store (issue #341). Redaction-safe: identity + display
+/// name only.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RepoScopeCandidate {
+    /// The `Repository` node's stable record ID.
+    pub repository_id: String,
+    /// The repository's human-facing display name, when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_name: Option<String>,
+}
+
 /// Errors that can occur while resolving a range-deltas query.
 ///
 /// Each variant serializes to a stable machine-readable diagnostic
@@ -185,6 +197,17 @@ pub enum RangeDeltasError {
     },
     /// The store history is empty (no commits present).
     EmptyHistory,
+    /// The store holds more than one repository and the range endpoints could
+    /// not be unambiguously attributed to a single one — a shared/mirrored SHA
+    /// owned by several repositories, or the two endpoints resolving into
+    /// different repositories. Ambiguity is never resolved by implicitly
+    /// picking a repository (issue #341, mirrors PR #312's gating); the caller
+    /// must pass `--repo <SELECTOR>`.
+    RepoScopeRequired {
+        /// The candidate repository identities the endpoints could belong to,
+        /// sorted ascending by record ID.
+        candidate_repositories: Vec<RepoScopeCandidate>,
+    },
 }
 
 /// Internal endpoint delta classes used while resolving introducing commits.
@@ -268,6 +291,131 @@ impl<'a> ResolvedCommitRange<'a> {
         }
         None
     }
+}
+
+/// The effective repository gate for a range query over a possibly
+/// multi-repository store (issue #341).
+#[derive(Debug)]
+pub(super) enum RangeScope {
+    /// No gating: no explicit selector and the store holds at most one
+    /// repository. Byte-identical to the pre-#341 union behavior.
+    Unscoped,
+    /// Gate every commit and snapshot to one repository's owned records —
+    /// either the explicit `--repo` selector, or the single common owner
+    /// inferred for both endpoints in an unscoped multi-repository store.
+    Owned {
+        index: RepositoryIndex,
+        repository_id: String,
+    },
+}
+
+impl RangeScope {
+    /// The `in_scope` predicate the shared resolvers consume.
+    pub(super) fn in_scope(&self, id: &str) -> bool {
+        match self {
+            Self::Unscoped => true,
+            Self::Owned {
+                index,
+                repository_id,
+            } => index.owner_of(id) == Some(repository_id.as_str()),
+        }
+    }
+}
+
+/// The set of repositories owning any `Commit` node whose SHA matches `prefix`.
+///
+/// Only owned commits (attributable through the `CONTAINS` topology, like
+/// `range_deltas`/`log_deltas`) are counted; an unowned matching commit cannot
+/// bleed a foreign repository into the answer, so it is left to the downstream
+/// `resolve_commit_prefix` to diagnose.
+fn endpoint_repository_owners(
+    records: &[GraphRecord],
+    index: &RepositoryIndex,
+    prefix: &str,
+) -> BTreeSet<String> {
+    let needle = prefix.to_lowercase();
+    let mut owners = BTreeSet::new();
+    for r in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Commit,
+            name: Some(sha),
+            ..
+        } = r
+        {
+            if sha.to_lowercase().starts_with(&needle)
+                && let Some(owner) = index.owner_of(r.id())
+            {
+                owners.insert(owner.to_owned());
+            }
+        }
+    }
+    owners
+}
+
+/// Resolve the effective repository gate for a range query, refusing an
+/// un-anchored endpoint resolution that is ambiguous across repositories
+/// (issue #341). Never implicitly picks a repository.
+pub(super) fn resolve_range_scope(
+    records: &[GraphRecord],
+    base_prefix: &str,
+    head_prefix: &str,
+    repo_scope: Option<&str>,
+) -> Result<RangeScope, RangeDeltasError> {
+    // Explicit `--repo`: gate to the selected repository (already resolved to a
+    // record ID by the CLI). Unchanged pre-#341 behavior.
+    if let Some(scope) = repo_scope {
+        return Ok(RangeScope::Owned {
+            index: RepositoryIndex::build(records),
+            repository_id: scope.to_owned(),
+        });
+    }
+
+    // Unscoped: only a multi-repository store can splice two repositories'
+    // histories. A single-repository (or repository-less) store keeps the
+    // byte-identical union behavior.
+    let index = RepositoryIndex::build(records);
+    if index.repository_ids().len() <= 1 {
+        return Ok(RangeScope::Unscoped);
+    }
+
+    // Multi-repository, unscoped: attribute each endpoint to its owning
+    // repositories.
+    let base_owners = endpoint_repository_owners(records, &index, base_prefix);
+    let head_owners = endpoint_repository_owners(records, &index, head_prefix);
+
+    // An endpoint matching no owned commit is a missing/foreign-topology
+    // problem that `--repo` cannot fix; fall through so the downstream resolver
+    // emits the precise `missing_commit`/`ambiguous_commit_prefix` diagnostic.
+    if base_owners.is_empty() || head_owners.is_empty() {
+        return Ok(RangeScope::Unscoped);
+    }
+
+    // Both endpoints unambiguously belong to one common repository: gate to it,
+    // mirroring PR #312's `effective_in_scope` discipline.
+    if base_owners.len() == 1 && head_owners == base_owners {
+        let repository_id = base_owners.into_iter().next().unwrap_or_default();
+        return Ok(RangeScope::Owned {
+            index,
+            repository_id,
+        });
+    }
+
+    // Ambiguous (a shared SHA owned by several repositories) or split (the two
+    // endpoints resolve into different repositories): refuse, naming every
+    // candidate. Never pick implicitly.
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
+    candidates.extend(base_owners);
+    candidates.extend(head_owners);
+    let candidate_repositories = candidates
+        .into_iter()
+        .map(|id| RepoScopeCandidate {
+            repository_name: index.display_of(&id).map(str::to_owned),
+            repository_id: id,
+        })
+        .collect();
+    Err(RangeDeltasError::RepoScopeRequired {
+        candidate_repositories,
+    })
 }
 
 /// Resolves one commit handle (full SHA or unique prefix) against the
@@ -522,16 +670,13 @@ pub fn range_deltas<'a>(
     head_prefix: &str,
     repo_scope: Option<&str>,
 ) -> Result<RangeDeltas<'a>, RangeDeltasError> {
-    // Repository scoping mirrors `changes_context`: in a shared store two
-    // repositories can carry the same commit SHA, so commit resolution and
-    // snapshot selection are gated by owning repository when a scope is set.
-    let repo_index = repo_scope.map(|_| RepositoryIndex::build(records));
-    let in_scope = |id: &str| -> bool {
-        match (repo_scope, repo_index.as_ref()) {
-            (Some(scope), Some(index)) => index.owner_of(id) == Some(scope),
-            _ => true,
-        }
-    };
+    // Repository gating (issue #341): in a shared store two repositories can
+    // carry the same commit SHA, so commit resolution and snapshot selection
+    // are anchored to one repository — either the explicit `--repo` selector or
+    // the single common owner both endpoints resolve to; an unscoped ambiguous
+    // resolution is refused rather than silently unified.
+    let scope = resolve_range_scope(records, base_prefix, head_prefix, repo_scope)?;
+    let in_scope = |id: &str| scope.in_scope(id);
 
     let range = resolve_commit_range(records, base_prefix, head_prefix, &in_scope)?;
     let base_sha = range.base_sha;
@@ -770,3 +915,176 @@ pub fn range_deltas<'a>(
 // ---------------------------------------------------------------------------
 // As-of file symbol listing (issue #158)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod repo_scope_tests {
+    use super::*;
+    use crate::ir::{IdentitySource, RepositoryIdentityPayload, TemporalMetadata, stable_id};
+
+    /// Builds a `Repository` node with a remote-derived identity.
+    fn repo_node(repo_id: &str, display: &str, basename: &str, remote: &str) -> GraphRecord {
+        GraphRecord::node(
+            repo_id.to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(display.to_owned()),
+            format!("Repository {display}"),
+        )
+        .with_repository_identity(RepositoryIdentityPayload {
+            identity_source: IdentitySource::Remote,
+            remote_url: Some(remote.to_owned()),
+            root_commit_sha: None,
+            canonical_path: None,
+            basename: basename.to_owned(),
+        })
+    }
+
+    /// A `Commit` node repo-scoped by record ID, plus a `CONTAINS` edge from its
+    /// owning repository so `RepositoryIndex` can attribute it.
+    fn commit_owned(repo_id: &str, sha: &str, parents: &[&str]) -> Vec<GraphRecord> {
+        let commit_id = stable_id(&["node", "commit", repo_id, sha]);
+        let commit = GraphRecord::node(
+            commit_id.clone(),
+            NodeKind::Commit,
+            None,
+            None,
+            Some(sha.to_owned()),
+            format!("Commit {sha}"),
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: sha.to_owned(),
+            git_parent_commits: parents.iter().map(|p| (*p).to_owned()).collect(),
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: None,
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        });
+        let edge = GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id.to_owned(),
+            commit_id,
+            Some("1.0".to_owned()),
+            "Repository contains commit".to_owned(),
+        );
+        vec![commit, edge]
+    }
+
+    const REMOTE_A: &str = "https://example.test/widget-a.git";
+    const REMOTE_B: &str = "https://example.test/widget-b.git";
+
+    fn repo_a_id() -> String {
+        stable_id(&["repository", "remote", REMOTE_A])
+    }
+
+    fn repo_b_id() -> String {
+        stable_id(&["repository", "remote", REMOTE_B])
+    }
+
+    /// One repository, linear history `aa1 -> aa2`.
+    fn single_repo_records() -> Vec<GraphRecord> {
+        let a = repo_a_id();
+        let mut records = vec![repo_node(&a, "widget-a", "widget-a", REMOTE_A)];
+        records.extend(commit_owned(&a, "aa10000000", &[]));
+        records.extend(commit_owned(&a, "aa20000000", &["aa10000000"]));
+        records
+    }
+
+    /// Two repositories, each linear, sharing one duplicate SHA `dupsha0000`.
+    fn multi_repo_records() -> Vec<GraphRecord> {
+        let a = repo_a_id();
+        let b = repo_b_id();
+        let mut records = vec![
+            repo_node(&a, "widget-a", "widget-a", REMOTE_A),
+            repo_node(&b, "widget-b", "widget-b", REMOTE_B),
+        ];
+        records.extend(commit_owned(&a, "aa10000000", &[]));
+        records.extend(commit_owned(&a, "aa20000000", &["aa10000000"]));
+        records.extend(commit_owned(&a, "dupsha0000", &["aa20000000"]));
+        records.extend(commit_owned(&b, "bb10000000", &[]));
+        records.extend(commit_owned(&b, "bb20000000", &["bb10000000"]));
+        records.extend(commit_owned(&b, "dupsha0000", &["bb20000000"]));
+        records
+    }
+
+    #[test]
+    fn single_repo_store_is_unscoped() {
+        let records = single_repo_records();
+        let scope = resolve_range_scope(&records, "aa10000000", "aa20000000", None)
+            .expect("single-repo store resolves without gating");
+        assert!(matches!(scope, RangeScope::Unscoped));
+    }
+
+    #[test]
+    fn shared_sha_endpoint_refuses_with_sorted_candidates() {
+        let records = multi_repo_records();
+        let err = resolve_range_scope(&records, "aa10000000", "dupsha0000", None)
+            .expect_err("shared-SHA endpoint must refuse");
+        let RangeDeltasError::RepoScopeRequired {
+            candidate_repositories,
+        } = err
+        else {
+            panic!("expected RepoScopeRequired, got {err:?}");
+        };
+        let ids: Vec<&str> = candidate_repositories
+            .iter()
+            .map(|c| c.repository_id.as_str())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "candidate ids must be sorted ascending");
+        assert!(ids.contains(&repo_a_id().as_str()));
+        assert!(ids.contains(&repo_b_id().as_str()));
+        // Display names are carried when recorded.
+        assert!(
+            candidate_repositories
+                .iter()
+                .all(|c| c.repository_name.is_some())
+        );
+    }
+
+    #[test]
+    fn split_endpoints_refuse() {
+        let records = multi_repo_records();
+        let err = resolve_range_scope(&records, "aa10000000", "bb20000000", None)
+            .expect_err("split endpoints must refuse");
+        let RangeDeltasError::RepoScopeRequired {
+            candidate_repositories,
+        } = err
+        else {
+            panic!("expected RepoScopeRequired, got {err:?}");
+        };
+        let ids: Vec<&str> = candidate_repositories
+            .iter()
+            .map(|c| c.repository_id.as_str())
+            .collect();
+        assert!(ids.contains(&repo_a_id().as_str()));
+        assert!(ids.contains(&repo_b_id().as_str()));
+    }
+
+    #[test]
+    fn single_common_owner_gates_to_that_repo() {
+        let records = multi_repo_records();
+        let scope = resolve_range_scope(&records, "aa10000000", "aa20000000", None)
+            .expect("single-common-owner endpoints resolve");
+        match scope {
+            RangeScope::Owned { repository_id, .. } => {
+                assert_eq!(repository_id, repo_a_id());
+            }
+            RangeScope::Unscoped => panic!("expected Owned gating to repo A"),
+        }
+    }
+
+    #[test]
+    fn explicit_repo_scope_is_owned() {
+        let records = multi_repo_records();
+        let scope = resolve_range_scope(&records, "aa10000000", "aa20000000", Some(&repo_b_id()))
+            .expect("explicit scope resolves");
+        match scope {
+            RangeScope::Owned { repository_id, .. } => {
+                assert_eq!(repository_id, repo_b_id());
+            }
+            RangeScope::Unscoped => panic!("explicit --repo must gate"),
+        }
+    }
+}
