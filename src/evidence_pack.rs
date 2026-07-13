@@ -2058,14 +2058,25 @@ fn build_section_records(records: Vec<GraphRecord>) -> Vec<BundleRecord> {
 /// * `LogEvent.event_excerpt` is REPLACED by its fingerprint (exemplars already
 ///   ride the summary as content-addressed handles, never as section text).
 ///
+/// It also clears the free-text `summary` of a co-located `FRAME_RESOLVES_TO`
+/// edge (issue #371, Codex P2 Safety/redaction): that required field is
+/// synthesized safely by `eg resolve-frames`, but an older/hand-authored
+/// importer could populate it with raw backtrace/log text, and neither
+/// `bundle::scrub_record` (SECRET-redacts an edge summary only) nor `pack_safety`
+/// (secret + Node-only scrubbed-field checks) strips non-secret text, so it would
+/// otherwise ride the hashed section row while Safety still passes. The #371 bind
+/// recomputes each row's `frame_resolution` / `frame_index` / endpoint IDs from
+/// the edge's typed fields — never its summary — so clearing it is round-trip
+/// safe. Centralized here because every co-located section row (including these
+/// frame edges) flows through `build_section_records` -> `scrub_log_node_text`.
+///
 /// A no-op for every non-log node (`log: None`) and for `LogSource` /
 /// `LogOccurrenceBucket` payloads, which carry no free-text field.
 fn scrub_log_node_text(mut record: GraphRecord) -> GraphRecord {
-    if let GraphRecord::Node {
-        log: Some(payload), ..
-    } = &mut record
-    {
-        match payload.as_mut() {
+    match &mut record {
+        GraphRecord::Node {
+            log: Some(payload), ..
+        } => match payload.as_mut() {
             crate::ir::LogPayload::ErrorSignature(p) => {
                 p.template_excerpt = blake3::hash(p.template_excerpt.as_bytes()).to_string();
                 if let Some(frames) = p.frames.as_mut() {
@@ -2077,7 +2088,15 @@ fn scrub_log_node_text(mut record: GraphRecord) -> GraphRecord {
             }
             crate::ir::LogPayload::LogSource(_) | crate::ir::LogPayload::LogOccurrenceBucket(_) => {
             }
+        },
+        GraphRecord::Edge {
+            label: crate::ir::EdgeLabel::FrameResolvesTo,
+            summary,
+            ..
+        } => {
+            summary.clear();
         }
+        _ => {}
     }
     record
 }
@@ -3568,9 +3587,12 @@ pub fn assemble_pack(
     // re-derives each row's frame joins from tamper-evident evidence. Unlike the
     // bucket case there is NO exclusion: a signature with zero frame edges is
     // legitimate (never mis-attributed), so every in-window signature stays and only
-    // its frame edges (if any) are appended. The edge rows carry only edge identity +
-    // label + `frame_index` + endpoint IDs — never log or frame free text — so the
-    // zero-raw-log Safety invariant holds (an edge is a no-op for `scrub_log_node_text`).
+    // its frame edges (if any) are appended. The bind reads only edge identity +
+    // label + `frame_index` + endpoint IDs; the edge's REQUIRED free-text `summary`
+    // is not read here, but an older/hand-authored importer could populate it with
+    // raw backtrace/log text, so `scrub_log_node_text` clears a FRAME_RESOLVES_TO
+    // edge's summary in `build_section_records` before it enters a hashed row —
+    // preserving the zero-raw-log Safety invariant (issue #371, Codex P2).
     {
         if let Some(signatures) =
             in_window_by_class.get_mut(EvidenceClass::ErrorSignatures.as_wire())
@@ -11330,6 +11352,68 @@ mod pack340_tests {
                 "raw log template/frame text `{raw}` must never appear in the pack"
             );
         }
+    }
+
+    /// Issue #371 (Codex P2 Safety/redaction): a co-located `FRAME_RESOLVES_TO`
+    /// edge's REQUIRED free-text `summary` must never carry raw log/backtrace text
+    /// into a hashed `error_signatures` row. `resolve-frames` synthesizes a safe
+    /// summary, but an older/hand-authored importer can populate that field with
+    /// anything; `bundle::scrub_record` only SECRET-redacts an edge summary and
+    /// `scrub_log_node_text` is a Node-only no-op for edges, so non-secret raw
+    /// text would otherwise ride the hashed row while Safety (secret + Node
+    /// scrubbed-field checks) still passes. The #371 binding recomputes from
+    /// `frame_resolution` + `frame_index` + endpoint IDs only, so clearing the
+    /// summary preserves the assemble->verify round-trip.
+    #[test]
+    fn co_located_frame_edge_summary_raw_text_never_rides_the_pack() {
+        const RAW_FRAME_SENTINEL: &str = "RAW_FRAME_SENTINEL_backtrace_line";
+        let mut records = build_log_incident_records();
+        // Plant raw backtrace text in the sig1 FRAME_RESOLVES_TO edge summary the
+        // way an older/hand-authored importer could (the field is a required
+        // String that deserializes verbatim from graph JSONL).
+        let mut planted = false;
+        for r in &mut records {
+            if let GraphRecord::Edge { label, summary, .. } = r
+                && label.as_str() == "FRAME_RESOLVES_TO"
+            {
+                *summary = format!("{RAW_FRAME_SENTINEL} at src/db.rs:42 in app::db::connect");
+                planted = true;
+            }
+        }
+        assert!(
+            planted,
+            "fixture carries a FRAME_RESOLVES_TO edge to plant on"
+        );
+
+        let pack = assemble_cc73(&records);
+
+        // (a) The sentinel must be absent from the whole assembled artifact.
+        let serialized = serde_json::to_string(&pack).expect("serializes");
+        assert!(
+            !serialized.contains(RAW_FRAME_SENTINEL),
+            "raw frame-edge summary text must never appear in the assembled pack"
+        );
+
+        // (b) Safety passes AND the round-trip verifies clean.
+        let report = verify_pack(&pack);
+        assert!(report.safety.passed, "{:?}", report.safety);
+        assert!(report.integrity.passed, "{:?}", report.integrity);
+        assert!(
+            report.ok,
+            "round-trip verify clean after frame-summary scrub"
+        );
+
+        // The #371 binding is preserved: sig1 still carries its resolved frame join.
+        let sec = section(&pack, EvidenceClass::ErrorSignatures);
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = &sec.log_summary else {
+            panic!("error_signatures summary present");
+        };
+        let sig1 = signatures
+            .iter()
+            .find(|s| s.signature_id == "log:v1:sig1")
+            .expect("sig1 present");
+        assert_eq!(sig1.frame_resolutions.len(), 1);
+        assert_eq!(sig1.frame_resolutions[0].target_id, "codegraph:v5:sym-db");
     }
 
     /// Codex round-4 P2: the `error_signatures` section's hashed records must NOT
