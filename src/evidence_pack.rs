@@ -1377,6 +1377,15 @@ pub struct PackVerdicts {
     pub safety: VerificationVerdict,
     /// Per-trust-class citation tallies, canonically ordered.
     pub citation_tallies: Vec<ClassCitationTally>,
+    /// BLAKE3 binding hash over the canonical serialization of the citation verdict
+    /// (`passed` + `detail`) and `citation_tallies` (issue #372, Part 4). Recomputed
+    /// by `verify_pack`'s Integrity check and compared, so a hand-edited
+    /// `citation.passed` (false→true) with a stale hash fails Integrity — which is
+    /// what lets `verify_pack`'s Coverage floor trust the recorded citation verdict.
+    /// `#[serde(default)]` keeps a pre-#372 pack (empty string) parseable; such a
+    /// pack fails Integrity against the non-empty recompute, as intended.
+    #[serde(default)]
+    pub citation_binding_hash: String,
 }
 
 /// A complete, self-contained, control-scoped evidence pack (AC1).
@@ -2927,6 +2936,19 @@ fn hash_log_summary(summary: &LogEvidenceSummary) -> String {
     blake3::hash(serialized.as_bytes()).to_string()
 }
 
+/// Canonical BLAKE3 binding hash over the citation verdict + tallies (issue #372,
+/// Part 4). Computed at assemble into `PackVerdicts::citation_binding_hash` and
+/// recomputed by `verify_pack`'s Integrity so a hand-edited `citation.passed`
+/// (false→true) with a stale hash is caught — the integrity anchor that lets
+/// `verify_pack`'s Coverage floor trust the recorded citation verdict. Uses the
+/// same `serde_json::to_string` canonicalization as `hash_log_summary` and the
+/// per-record `BundleRecord.hash`, so byte-stability holds across runs.
+fn hash_citation_verdict(citation: &VerificationVerdict, tallies: &[ClassCitationTally]) -> String {
+    let payload = (citation.passed, citation.detail.as_str(), tallies);
+    let serialized = serde_json::to_string(&payload).unwrap_or_default();
+    blake3::hash(serialized.as_bytes()).to_string()
+}
+
 /// Binds a section's derived `log_summary` (issue #340) into `verify_pack`'s
 /// Integrity so a tampered summary value fails verification, mirroring the
 /// `review_coverage` `measurement` bind. Returns `Err(detail)` on any mismatch.
@@ -3388,26 +3410,67 @@ fn bind_occurrence_totals(
 
 /// The trust-class citation view of a set of section rows, reused for both the
 /// assemble-time citation verdict and `verify_pack`'s coverage check (AC4).
+/// How [`citation_view`] treats `runtime_observation` (log-domain) rows.
+///
+/// Runtime rows require `LogSource` provenance (source path + `source_artifact_hash`)
+/// to be cited (#328), which is only resolvable when the surrounding
+/// `LogSource`/`CAPTURED_FROM`/`AGGREGATES` records are in hand. Assemble has the
+/// full input graph and [`enforces`](LogCitationMode::Enforce) that requirement;
+/// `verify_pack` does not (packs carry no `LogSource` nodes by design), so it marks
+/// runtime rows [`NotRecomputable`](LogCitationMode::NotRecomputable) — a
+/// capability-degraded state that never fabricates a cited-by-own-ID pass and never
+/// itself fails the gate, leaving the recorded assemble citation verdict (Part 2's
+/// floor, integrity-bound in Part 4) to decide (issue #372).
+#[derive(Clone, Copy)]
+enum LogCitationMode<'a> {
+    /// Enforce the runtime-provenance requirement against the provided context
+    /// (assemble, over the full input graph).
+    Enforce(&'a CitationProvenance<'a>),
+    /// Runtime provenance cannot be re-derived here (verify, over the pack alone):
+    /// runtime rows are counted but excluded from the pass/fail gate.
+    NotRecomputable,
+}
+
+/// Classifies section rows into per-trust-class citation tallies and the two
+/// gate predicates, plus a count of runtime rows whose provenance could not be
+/// re-derived (`> 0` only under [`LogCitationMode::NotRecomputable`]).
 fn citation_view(
     rows: &[&BundleRecord],
-    provenance: Option<&CitationProvenance>,
-) -> (Vec<ClassCitationTally>, bool, bool) {
-    // (tallies, code_gate_pass, non_code_gate_pass)
+    mode: LogCitationMode,
+) -> (Vec<ClassCitationTally>, bool, bool, usize) {
+    // (tallies, code_gate_pass, non_code_gate_pass, not_recomputable_runtime_rows)
     // per_class entry: (total, cited, missing, excluded)
     let mut per_class: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
     let mut code_total = 0usize;
     let mut code_cited = 0usize;
     let mut non_code_ok = true;
+    let mut not_recomputable = 0usize;
     for br in rows {
-        // With a provenance context, apply the class-wide `runtime_observation`
-        // provenance requirement (#328) so an unprovenanced log row is
-        // `MissingRequiredHandle`, matching `eg audit citations` (#372). Callers
-        // with no record set (e.g. `verify_pack` — packs carry no `LogSource`)
-        // pass `None` and use the context-free classifier.
-        let classified = provenance.map_or_else(
-            || classify_record_external(&br.record),
-            |p| classify_record_external_with_provenance(&br.record, p),
-        );
+        // A `runtime_observation` row's citation turns on `LogSource` provenance,
+        // which `verify_pack` cannot re-derive from the pack alone (no `LogSource`
+        // nodes). Under `NotRecomputable` such a row is capability-degraded: counted
+        // (so the marker can be surfaced) but NEITHER cited NOR missing, and excluded
+        // from BOTH gate predicates — so a citation-complete pack still passes while
+        // the recorded assemble verdict (never re-derived here) remains the authority.
+        if matches!(mode, LogCitationMode::NotRecomputable)
+            && citation_trust_class(&br.record) == "runtime_observation"
+        {
+            not_recomputable += 1;
+            let entry = per_class
+                .entry("runtime_observation".to_owned())
+                .or_insert((0, 0, 0, 0));
+            entry.0 += 1;
+            entry.3 += 1;
+            continue;
+        }
+        // Assemble applies the class-wide `runtime_observation` provenance
+        // requirement (#328) so an unprovenanced log row is `MissingRequiredHandle`,
+        // matching `eg audit citations` (#372). Non-runtime rows are context-free in
+        // both modes.
+        let classified = match mode {
+            LogCitationMode::Enforce(p) => classify_record_external_with_provenance(&br.record, p),
+            LogCitationMode::NotRecomputable => classify_record_external(&br.record),
+        };
         let trust = classified.trust_class.to_owned();
         // A row satisfies the citation contract only when it carries the handle
         // its trust class requires. Mirror `citation_audit`'s exact satisfying
@@ -3459,7 +3522,7 @@ fn citation_view(
             },
         )
         .collect();
-    (tallies, code_pass, non_code_ok)
+    (tallies, code_pass, non_code_ok, not_recomputable)
 }
 
 /// Assembles a control-scoped, time-windowed evidence pack (AC1-AC10).
@@ -4013,7 +4076,8 @@ pub fn assemble_pack(
     // exactly as `eg audit citations` gates it (issue #372).
     let prov = CitationProvenance::build(records);
     let row_refs: Vec<&BundleRecord> = all_section_rows.iter().collect();
-    let (citation_tallies, code_pass, non_code_pass) = citation_view(&row_refs, Some(&prov));
+    let (citation_tallies, code_pass, non_code_pass, _not_recomputable) =
+        citation_view(&row_refs, LogCitationMode::Enforce(&prov));
     let citation_ok = code_pass && non_code_pass;
 
     // --- integrity is structurally guaranteed at assemble time ---
@@ -4088,6 +4152,10 @@ pub fn assemble_pack(
     let gates_ok_without_safety =
         required_passed && citation_ok && review_coverage_gate_ok && integrity.passed;
 
+    // Integrity-bind the citation verdict + tallies (issue #372, Part 4) so
+    // `verify_pack` can trust `pack.verdicts.citation.passed` when flooring Coverage.
+    let citation_binding_hash = hash_citation_verdict(&citation, &citation_tallies);
+
     let verdicts = PackVerdicts {
         // Placeholder; recomputed once safety is known.
         ok: gates_ok_without_safety,
@@ -4097,6 +4165,7 @@ pub fn assemble_pack(
         integrity,
         safety,
         citation_tallies,
+        citation_binding_hash,
     };
 
     // --- manifest counts (recomputed identically in verify_pack's Integrity
@@ -5443,25 +5512,59 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
             );
         }
     }
+    // Integrity-bind the recorded citation verdict + tallies (issue #372, Part 4):
+    // recompute the binding hash and compare. A hand-edited `citation.passed`
+    // (false→true) with a stale `citation_binding_hash` fails here, which is what
+    // makes the Coverage floor below (clamping against `pack.verdicts.citation.passed`)
+    // trustworthy. A pre-#372 pack (empty stored hash) fails against the non-empty
+    // recompute, as intended — its citation verdict is unbound and cannot be trusted.
+    if integrity_passed {
+        let recomputed =
+            hash_citation_verdict(&pack.verdicts.citation, &pack.verdicts.citation_tallies);
+        if recomputed != pack.verdicts.citation_binding_hash {
+            integrity_passed = false;
+            "citation_binding_hash does not bind verdicts.citation + citation_tallies \
+             (citation verdict tampered or unbound)"
+                .clone_into(&mut integrity_detail);
+        }
+    }
     let integrity = VerificationVerdict {
         passed: integrity_passed,
         detail: integrity_detail,
     };
 
-    // Coverage: same citation thresholds. Packs carry no `LogSource` nodes or
-    // `CAPTURED_FROM`/`AGGREGATES` edges by design, so runtime provenance cannot
-    // be resolved here; it is enforced at ASSEMBLE (over the full input) and the
-    // pack is otherwise bound by its integrity/log_summary hashes — passing
-    // `None` keeps `verify_pack` the same for log rows (issue #372).
-    let (_tallies, code_pass, non_code_pass) = citation_view(&all_rows, None);
-    let coverage_ok = code_pass && non_code_pass;
+    // Coverage: same citation thresholds, FLOORED by the recorded assemble verdict
+    // (issue #372). Packs carry no `LogSource` nodes or `CAPTURED_FROM`/`AGGREGATES`
+    // edges by design, so `verify_pack` cannot re-derive a `runtime_observation`
+    // row's provenance — it marks those rows `NotRecomputable` (counted, but excluded
+    // from the gate so a citation-complete pack still passes). The context-free
+    // recompute could otherwise (wrongly) count an unprovenanced log row cited by its
+    // own ID and mask an assemble-time citation failure, accepting an invalid pack.
+    // The floor closes that hole: verify may CONFIRM or DOWNGRADE the recorded
+    // citation verdict, never UPGRADE it. `pack.verdicts.citation.passed` is
+    // integrity-bound above, so the clamp is trustworthy.
+    let (_tallies, code_pass, non_code_pass, not_recomputable) =
+        citation_view(&all_rows, LogCitationMode::NotRecomputable);
+    let recompute_ok = code_pass && non_code_pass;
+    let coverage_ok = recompute_ok && pack.verdicts.citation.passed;
+    let coverage_detail = if !pack.verdicts.citation.passed {
+        "recorded assemble citation verdict failed; verify honors it (verify cannot \
+         re-derive log provenance to re-confirm)"
+            .to_owned()
+    } else if !recompute_ok {
+        "citation thresholds not met".to_owned()
+    } else if not_recomputable > 0 {
+        format!(
+            "code/non-code cited; {not_recomputable} runtime rows \
+             log_citation_not_recomputable — verify cannot re-derive log provenance, \
+             relying on the integrity-bound recorded assemble verdict"
+        )
+    } else {
+        "code rows >=95% cited; non-code rows 100% cited".to_owned()
+    };
     let coverage = VerificationVerdict {
         passed: coverage_ok,
-        detail: if coverage_ok {
-            "code rows >=95% cited; non-code rows 100% cited".to_owned()
-        } else {
-            "citation thresholds not met".to_owned()
-        },
+        detail: coverage_detail,
     };
 
     // Safety scans the WHOLE artifact (records AND every non-record text field),
