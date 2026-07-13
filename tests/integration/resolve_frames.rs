@@ -12,9 +12,12 @@
 use std::{fs, path::Path};
 
 use aletheia_egregore::{
-    Graph,
-    ir::{GraphRecord, NodeKind, SourceSpan},
-    log_graph,
+    Graph, LOG_SCHEMA_VERSION,
+    ir::{
+        EdgeLabel, ErrorSignaturePayload, FrameResolution, GraphRecord, LogPayload, NodeKind,
+        SnapshotHead, SourceSnapshotPayload, SourceSpan, StackFrame, TemporalMetadata,
+    },
+    log_graph, log_resolve, log_stable_id, stable_id,
 };
 use assert_cmd::Command;
 use serde_json::Value;
@@ -362,5 +365,297 @@ fn output_contains_no_raw_log_payload_text() {
             .unwrap()
             .contains(RAW_SECRET),
         "the raw secret must never appear in the envelope"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #377: `--at` commit-view scoping for name-only (module-path) frames.
+//
+// The file:line frame branch routes through `location_context`, which applies
+// commit-view selection. The name-only branch consulted a `symbols_by_name`
+// map built from EVERY Symbol node (global-tombstone-filtered only), never
+// `at_commit` — so under `--at <commit>` a module-only frame could name-match a
+// symbol that did not exist at the commit view (added after it, live at HEAD),
+// returned as a confidence-`1.0` `resolved`. These tests scope the map through
+// the same commit/HEAD view-selection the file:line branch uses.
+// ---------------------------------------------------------------------------
+
+const AT_REPO: &str = "issue377-repo";
+const C0: &str = "c0sha000000";
+const C1: &str = "c1sha000000";
+const C2: &str = "c2sha000000";
+const T1_377: &str = "2026-01-01T00:00:00Z";
+const T2_377: &str = "2026-01-02T00:00:00Z";
+
+fn at_temporal(commit: &str, valid_time: &str) -> TemporalMetadata {
+    TemporalMetadata {
+        git_commit: commit.to_owned(),
+        git_parent_commits: Vec::new(),
+        valid_time: valid_time.to_owned(),
+        author_time: Some(valid_time.to_owned()),
+        observed_at: valid_time.to_owned(),
+        valid_time_source: Some("git_commit_committer_date".to_owned()),
+    }
+}
+
+/// A history-backed `Symbol` snapshot at one commit. Identity is keyed on
+/// `(path, name)`, so the same `name` at a different `path` is a distinct id.
+fn at_symbol(name: &str, path: &str, commit: &str, valid_time: &str) -> (String, GraphRecord) {
+    let id = stable_id(&["node", "symbol", path, name]);
+    let node = GraphRecord::node(
+        id.clone(),
+        NodeKind::Symbol,
+        Some(path.to_owned()),
+        Some(span(1, 10)),
+        Some(name.to_owned()),
+        format!("symbol {name}@{commit}"),
+    )
+    .with_temporal(at_temporal(commit, valid_time));
+    (id, node)
+}
+
+fn at_commit_node(sha: &str, valid_time: &str) -> GraphRecord {
+    GraphRecord::node(
+        stable_id(&["node", "commit", AT_REPO, sha]),
+        NodeKind::Commit,
+        None,
+        None,
+        Some(sha.to_owned()),
+        format!("Commit {sha}"),
+    )
+    .with_temporal(at_temporal(sha, valid_time))
+}
+
+/// A `Repository` node whose stamped HEAD snapshot anchors the current-state
+/// view (mirrors the `location_context` HEAD filter).
+fn at_repo_node(head: &str) -> (String, GraphRecord) {
+    let id = stable_id(&["node", "Repository", AT_REPO]);
+    let node = GraphRecord::node(
+        id.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some(AT_REPO.to_owned()),
+        format!("Repository {AT_REPO}"),
+    )
+    .with_source_snapshot(SourceSnapshotPayload {
+        head: SnapshotHead::Commit {
+            sha: head.to_owned(),
+        },
+        dirty: false,
+        repository_id: id.clone(),
+        scanned_at: FIXED_TIME.to_owned(),
+    });
+    (id, node)
+}
+
+fn contains(parent: &str, child: &str) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::Contains,
+        parent.to_owned(),
+        child.to_owned(),
+        None,
+        "contains".to_owned(),
+    )
+}
+
+/// An `ErrorSignature` carrying the given backtrace frames.
+fn at_signature(seed: &str, frames: Vec<StackFrame>) -> (String, GraphRecord) {
+    let id = log_stable_id(&["error_signature", AT_REPO, "template-v1", seed]);
+    let node = GraphRecord::node(
+        id.clone(),
+        NodeKind::ErrorSignature,
+        None,
+        None,
+        Some("error signature".to_owned()),
+        format!("error signature {seed}"),
+    )
+    .with_domain("log", LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::ErrorSignature(ErrorSignaturePayload {
+        fingerprint_algorithm: "template-v1".to_owned(),
+        template_excerpt: format!("template {seed}"),
+        severity: "error".to_owned(),
+        occurrence_count: 1,
+        first_seen: "2026-01-02T12:00:00Z".to_owned(),
+        last_seen: "2026-01-02T13:00:00Z".to_owned(),
+        frames: Some(frames),
+    }))
+    .with_valid_time("2026-01-02T12:00:00Z", "log_event_timestamp");
+    (id, node)
+}
+
+/// A name-only (module-path, no file/line) frame.
+fn name_only_frame(module_path: &str) -> StackFrame {
+    StackFrame {
+        frame_index: 0,
+        module_path: Some(module_path.to_owned()),
+        file_path: None,
+        line: None,
+    }
+}
+
+/// `(target_id, frame_resolution)` for every `FRAME_RESOLVES_TO` edge emitted
+/// for `sig_id`, in canonical output order.
+fn frame_targets(records: &[GraphRecord], sig_id: &str) -> Vec<(String, FrameResolution)> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Edge {
+                label: EdgeLabel::FrameResolvesTo,
+                source,
+                target,
+                frame_resolution: Some(res),
+                ..
+            } if source == sig_id => Some((target.clone(), *res)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn module_only_frame_under_at_resolves_against_commit_view() {
+    // The same simple name `handler` names DIFFERENT symbol ids across commits:
+    // `src/a.rs` at c1, `src/b.rs` at c2 (HEAD). A name-only frame `app::handler`
+    // must resolve to the id that existed at the requested view, never the union
+    // of both (which the pre-fix map produced → a spurious `ambiguous`).
+    let (id_a, sym_a) = at_symbol("handler", "src/a.rs", C1, T1_377);
+    let (id_b, sym_b) = at_symbol("handler", "src/b.rs", C2, T2_377);
+    let (repo_id, repo) = at_repo_node(C2);
+    let (sig_id, sig) = at_signature("handler-boom", vec![name_only_frame("app::handler")]);
+    let records = vec![
+        repo,
+        at_commit_node(C1, T1_377),
+        at_commit_node(C2, T2_377),
+        contains(&repo_id, &id_a),
+        contains(&repo_id, &id_b),
+        sym_a,
+        sym_b,
+        sig,
+    ];
+
+    let at_c1 = log_resolve::resolve_frames(&records, Some(C1));
+    assert_eq!(
+        frame_targets(&at_c1.records, &sig_id),
+        vec![(id_a, FrameResolution::Resolved)],
+        "`--at c1` must resolve the name-only frame to the c1 symbol id only"
+    );
+
+    let at_c2 = log_resolve::resolve_frames(&records, Some(C2));
+    assert_eq!(
+        frame_targets(&at_c2.records, &sig_id),
+        vec![(id_b.clone(), FrameResolution::Resolved)],
+        "`--at c2` must resolve the name-only frame to the c2 symbol id only"
+    );
+
+    let head = log_resolve::resolve_frames(&records, None);
+    assert_eq!(
+        frame_targets(&head.records, &sig_id),
+        vec![(id_b, FrameResolution::Resolved)],
+        "the HEAD (c2) view must resolve to the HEAD symbol id, not the pre-HEAD one"
+    );
+}
+
+#[test]
+fn name_only_frame_for_symbol_absent_at_commit_is_not_stale_resolved() {
+    // `foo` exists only at c2 (HEAD), never at c0. A name-only frame `app::foo`
+    // under `--at c0` must NOT be `resolved` to the HEAD `foo`; the commit view
+    // has no such symbol, so the ladder falls to `unresolved`.
+    let (foo_id, foo) = at_symbol("foo", "src/x.rs", C2, T2_377);
+    let (repo_id, repo) = at_repo_node(C2);
+    let (sig_id, sig) = at_signature("foo-boom", vec![name_only_frame("app::foo")]);
+    let records = vec![
+        repo,
+        at_commit_node(C0, T1_377),
+        at_commit_node(C2, T2_377),
+        contains(&repo_id, &foo_id),
+        foo,
+        sig,
+    ];
+
+    let at_c0 = log_resolve::resolve_frames(&records, Some(C0));
+    let targets = frame_targets(&at_c0.records, &sig_id);
+    assert!(
+        !targets
+            .iter()
+            .any(|(t, res)| *res == FrameResolution::Resolved && *t == foo_id),
+        "a symbol absent at the commit view must never be a stale `resolved` target: {targets:?}"
+    );
+    assert_eq!(
+        targets.iter().map(|(_, res)| *res).collect::<Vec<_>>(),
+        vec![FrameResolution::Unresolved],
+        "the frame must be reported `unresolved` at c0, not resolved to the HEAD symbol"
+    );
+
+    // Positive control: at c2 (where `foo` lives) it resolves to `foo`.
+    let at_c2 = log_resolve::resolve_frames(&records, Some(C2));
+    assert_eq!(
+        frame_targets(&at_c2.records, &sig_id),
+        vec![(foo_id, FrameResolution::Resolved)],
+        "`--at c2` must resolve `app::foo` to the c2 symbol id"
+    );
+}
+
+#[test]
+fn cli_resolve_frames_at_scopes_name_only_frame() {
+    // Same scenario as the unit test, driven end-to-end through the built binary
+    // with `--at c1`: the emitted FRAME_RESOLVES_TO edge must target the c1 id.
+    let (id_a, sym_a) = at_symbol("handler", "src/a.rs", C1, T1_377);
+    let (id_b, sym_b) = at_symbol("handler", "src/b.rs", C2, T2_377);
+    let (repo_id, repo) = at_repo_node(C2);
+    let (sig_id, sig) = at_signature("handler-boom", vec![name_only_frame("app::handler")]);
+
+    let code = Graph::from_records(vec![
+        repo,
+        at_commit_node(C1, T1_377),
+        at_commit_node(C2, T2_377),
+        contains(&repo_id, &id_a),
+        contains(&repo_id, &id_b),
+        sym_a,
+        sym_b,
+    ])
+    .to_jsonl()
+    .expect("serialize code graph");
+    let log = Graph::from_records(vec![sig])
+        .to_jsonl()
+        .expect("serialize log graph");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let code_path = dir.path().join("code.graph.jsonl");
+    let log_path = dir.path().join("log.graph.jsonl");
+    let out_path = dir.path().join("resolved.jsonl");
+    fs::write(&code_path, code).expect("write code graph");
+    fs::write(&log_path, log).expect("write log graph");
+
+    egregore()
+        .arg("resolve-frames")
+        .arg(&log_path)
+        .arg("--graph")
+        .arg(&code_path)
+        .arg("--at")
+        .arg(C1)
+        .arg("--out")
+        .arg(&out_path)
+        .assert()
+        .success();
+
+    let out = fs::read_to_string(&out_path).expect("read out");
+    let records = parse_records(&out);
+    let edges: Vec<&Value> = frame_edges(&records);
+    let targets: Vec<(&str, &str)> = edges
+        .iter()
+        .filter(|e| e.get("source").and_then(Value::as_str) == Some(sig_id.as_str()))
+        .map(|e| {
+            (
+                e.get("target").and_then(Value::as_str).unwrap_or_default(),
+                e.get("frame_resolution")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        targets,
+        vec![(id_a.as_str(), "resolved")],
+        "CLI `resolve-frames --at c1` must scope the name-only frame to the c1 id"
     );
 }

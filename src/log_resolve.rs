@@ -35,9 +35,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use chrono::DateTime;
+
 use crate::ir::{
     EdgeLabel, EvidenceLink, FrameResolution, GraphRecord, LOG_SCHEMA_VERSION, LogPayload,
-    NodeKind, SourceSpan, StackFrame, log_stable_id,
+    NodeKind, SnapshotHead, SourceSpan, StackFrame, log_stable_id,
 };
 use crate::query::{RepositoryIndex, location_context};
 use crate::schema_version::domain_from_record_id;
@@ -124,6 +126,16 @@ pub fn resolve_frames(records: &[GraphRecord], at_commit: Option<&str>) -> Resol
     let index = RepositoryIndex::build(records);
 
     // Symbol-name → set of live symbol record IDs (for name-only frames).
+    //
+    // The name map MUST honor the same commit/HEAD view selection the file:line
+    // branch gets for free through `location_context` (issue #377): otherwise a
+    // module-only frame under `--at <commit>` could name-match a symbol that did
+    // not exist at that view (added after it, live at HEAD) and be reported as a
+    // confidence-`1.0` `resolved`. This mirrors `location_context`'s selection
+    // (`file_at_point.rs`) exactly — with `at_commit`, only records whose
+    // `temporal.git_commit` equals that commit participate; without it, the
+    // current-state view drops tombstoned ids and history-backed snapshots that
+    // are not at the repository's stamped HEAD, keeping newest-version-per-ID.
     let mut symbols_by_name: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     let tombstoned: BTreeSet<&str> = records
         .iter()
@@ -132,14 +144,66 @@ pub fn resolve_frames(records: &[GraphRecord], at_commit: Option<&str>) -> Resol
             _ => None,
         })
         .collect();
-    for r in records {
+
+    // HEAD-commit SHA per repository from the stamped source snapshot (issue
+    // #82), later record winning deterministically — the anchor for the
+    // current-state view of a history graph.
+    let mut repo_heads: BTreeMap<&str, &str> = BTreeMap::new();
+    for record in records {
         if let GraphRecord::Node {
+            kind: NodeKind::Repository,
+            id,
+            source_snapshot: Some(snapshot),
+            ..
+        } = record
+            && let SnapshotHead::Commit { sha } = &snapshot.head
+        {
+            repo_heads.insert(id.as_str(), sha.as_str());
+        }
+    }
+
+    // Select the viewed Symbol version per stable ID, then key by name.
+    let mut viewed_symbols: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
+    for record in records {
+        let GraphRecord::Node {
             id,
             kind: NodeKind::Symbol,
-            name: Some(name),
+            temporal,
             ..
-        } = r
-            && !tombstoned.contains(id.as_str())
+        } = record
+        else {
+            continue;
+        };
+        if let Some(commit) = at_commit {
+            if temporal.as_ref().map(|t| t.git_commit.as_str()) != Some(commit) {
+                continue;
+            }
+        } else {
+            if tombstoned.contains(id.as_str()) {
+                continue;
+            }
+            // A history-backed record is the current state only at the stamped
+            // HEAD commit. Records without a resolvable owner or stamped head
+            // keep the newest-version-per-ID view.
+            if let Some(t) = temporal
+                && let Some(head) = index.owner_of(id).and_then(|repo| repo_heads.get(repo))
+                && t.git_commit != *head
+            {
+                continue;
+            }
+        }
+        // Newest-version-per-ID, independent of record emission order.
+        let replace = viewed_symbols
+            .get(id.as_str())
+            .is_none_or(|existing| version_recency_key(record) >= version_recency_key(existing));
+        if replace {
+            viewed_symbols.insert(id.as_str(), record);
+        }
+    }
+    for (&id, &record) in &viewed_symbols {
+        if let GraphRecord::Node {
+            name: Some(name), ..
+        } = record
         {
             symbols_by_name.entry(name).or_default().insert(id);
         }
@@ -484,6 +548,25 @@ fn is_external(frame: &StackFrame) -> bool {
         return true;
     }
     false
+}
+
+/// Recency ordering for two versions of one stable record ID in the
+/// current-state view, mirroring `location_context`'s selection
+/// (`file_at_point::version_recency_key`): a non-temporal (current-scan) record
+/// outranks every history-backed snapshot; history-backed snapshots order by
+/// parsed valid time (unparseable valid times sort oldest), with the commit SHA
+/// as a deterministic tiebreak for equal-time commits (e.g. rebases).
+fn version_recency_key(record: &GraphRecord) -> (u8, Option<DateTime<chrono::FixedOffset>>, &str) {
+    let GraphRecord::Node { temporal, .. } = record else {
+        return (0, None, "");
+    };
+    temporal.as_ref().map_or((1, None, ""), |t| {
+        (
+            0,
+            DateTime::parse_from_rfc3339(&t.valid_time).ok(),
+            t.git_commit.as_str(),
+        )
+    })
 }
 
 /// The last `::`-delimited segment of a frame's module path (the simple symbol
