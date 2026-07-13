@@ -1186,10 +1186,19 @@ surfaces `Foo` as an implementor of `Trait`. The remaining honest bounds:
 **cross-crate** traits (std/deps), **non-Rust** languages, blanket impls, and a
 `use`-alias of a trait in a **non-root** module that the scope walk cannot see
 stay unresolved. A bare (unqualified) name whose **simple name is
-ambiguous** across the repo impl-target index is left unresolved too: it may be
-a `use`-alias of a non-root definition, and this pass does not read `use`
-declarations, so it never guesses a root binding — a missing edge is preferred
-over a wrong-target one. The ambiguity bound covers **all impl-target kinds**
+ambiguous** across the same-file or repo impl-target definitions is left
+unresolved too: it may be a `use`-alias of a non-root definition, and neither
+resolution path reads `use` declarations, so neither guesses a root binding — a
+missing edge is preferred over a wrong-target one. This same-name ambiguity
+bound applies on **both** resolution paths, sharing one counting predicate so
+they cannot diverge: the **local/inline-module** per-file resolver (a bare name
+that a same-file scope walk resolves only by reaching **outward** to a
+same-named root/outer definition — e.g. `mod m { use crate::a::T; impl<U> T for
+Foo<U> {} }` beside a root `trait T` — is left unresolved rather than mis-bound
+to the root), and the repo-wide **cross-file** pass (an out-of-line impl whose
+bare trait/type name is ambiguous across the repo index). A bare name that
+resolves in the impl's **own** module is trusted verbatim and never suppressed.
+The ambiguity bound covers **all impl-target kinds**
 (traits **and** type-defining targets: `struct` / `enum` / `type_alias`), not
 just traits, because a non-generic inherent impl (`impl Foo {}`) carries the
 **type** name `Foo` as its bare reference and the scope walk resolves bare names

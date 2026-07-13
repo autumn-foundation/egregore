@@ -669,21 +669,21 @@ impl<'facts> ImplTargetIndex<'facts> {
     /// a rare potential WRONG-edge converted into a rare MISSED-edge, consistent
     /// with `local_traits_only`.
     fn bare_simple_name_is_ambiguous(&self, simple: &str) -> bool {
-        let mut matches = 0usize;
-        for (qualified, facts) in &self.by_qualified {
-            let last = qualified.rsplit("::").next().unwrap_or(qualified);
-            if last == simple
-                && facts
+        // Share the local resolver's COUNTING predicate over exactly the
+        // impl-target qualified names, so the local (per-file) and cross-file
+        // ambiguity bounds can never drift a target-kind or a counting rule
+        // apart. Only qualified names carrying at least one impl-target-kind
+        // fact ([`is_impl_target_kind`]) are counted — a value-namespace
+        // collision never triggers the guard.
+        crate::languages::rust::bare_simple_name_is_ambiguous(
+            simple,
+            self.by_qualified.iter().filter_map(|(qualified, facts)| {
+                facts
                     .iter()
                     .any(|fact| is_impl_target_kind(&fact.symbol_kind))
-            {
-                matches += 1;
-                if matches > 1 {
-                    return true;
-                }
-            }
-        }
-        false
+                    .then_some(*qualified)
+            }),
+        )
     }
 
     /// Walks the module scope from the impl's own module outward to the crate

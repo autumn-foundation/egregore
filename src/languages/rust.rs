@@ -1260,14 +1260,51 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 format!("{}::{target}", module_names[..depth].join("::"))
             };
             if let Some(id) = self.qualified_definitions.get(&candidate) {
+                // A match in the impl's OWN module (the deepest, first-checked
+                // level) is what a bare name means and is trusted verbatim. A
+                // match found only by walking OUTWARD to a shallower/root module
+                // is the exact shape of the round-8 finding: `mod m { use
+                // crate::a::T; impl T for X }` scope-walks bare `T` past the
+                // (absent) `m::T` and binds the ROOT `T`, but the `use` alias
+                // means `a::T`. When such an outward bind's simple name is
+                // ambiguous across this file's impl-target definitions (root `T`
+                // AND `a::T`), a `use` alias could redirect it, so leave it
+                // unresolved rather than mint a WRONG edge — the local/inline
+                // analog of the cross-file guard, sharing its counting predicate
+                // ([`bare_simple_name_is_ambiguous`]) so the two never diverge.
+                if depth < module_names.len() && self.bare_name_is_ambiguous(target) {
+                    return None;
+                }
                 return Some(id.clone());
             }
         }
         // Final fallback: the bare alias still covers names the scope walk
         // cannot see, such as use-imported traits from another module — but
         // only through the type-namespace view, so a later value-namespace
-        // item (`fn T()`) can never capture the edge.
+        // item (`fn T()`) can never capture the edge. This lookup is inherently
+        // an outward/foreign bind (the scope walk already missed every
+        // in-scope module), so the same-name ambiguity guard applies here too:
+        // an ambiguous bare alias (`a::T` AND `b::T`, no in-scope `T`) picks one
+        // arbitrarily by insertion order, exactly the WRONG-edge class the guard
+        // closes.
+        if self.bare_name_is_ambiguous(target) {
+            return None;
+        }
         self.type_definitions.get(target).cloned()
+    }
+
+    /// Reports whether the bare simple name `target` is ambiguous across THIS
+    /// file's impl-target definitions — more than one distinct qualified name
+    /// (root `T`, `a::T`, …) shares it. Delegates to the shared
+    /// [`bare_simple_name_is_ambiguous`] counting predicate over the
+    /// impl-target-only `qualified_definitions` key space (already
+    /// [`is_impl_target_kind`]-filtered at insertion), so the local guard and
+    /// the cross-file guard count the same target-kinds the same way.
+    fn bare_name_is_ambiguous(&self, target: &str) -> bool {
+        bare_simple_name_is_ambiguous(
+            target,
+            self.qualified_definitions.keys().map(String::as_str),
+        )
     }
 
     /// Resolves a `crate::` / `self::` / `super::` qualifier on an impl's
@@ -1671,6 +1708,40 @@ fn import_name(text: &str) -> String {
 /// this extractor's target-kind gate never diverge a target-kind at a time.
 pub(crate) fn is_impl_target_kind(symbol_kind: &str) -> bool {
     matches!(symbol_kind, "trait" | "struct" | "enum" | "type_alias")
+}
+
+/// Reports whether more than one distinct qualified name in `qualified_names`
+/// ends in the bare simple name `simple`.
+///
+/// This is the single COUNTING predicate behind the same-name ambiguity bound
+/// on BOTH IMPLEMENTS resolution paths — the local per-file resolver
+/// ([`RustExtractor::resolve_impl_trait_locally`]) and the repo-wide cross-file
+/// pass (`ImplTargetIndex::bare_simple_name_is_ambiguous`) — so neither guard
+/// can drift a target-kind or a counting rule from the other one entry point at
+/// a time. Callers pass only impl-target-kind qualified names
+/// ([`is_impl_target_kind`]), so a value-namespace collision never triggers it.
+///
+/// A bare (unqualified) reference whose simple name is ambiguous cannot be
+/// disambiguated without import-aware (`use`-decl) resolution, which is outside
+/// this slice's documented `local_traits_only` bound (follow-up #393): when it
+/// would otherwise bind to a same-named ROOT/outer definition that a `use`
+/// alias could actually redirect elsewhere, the caller leaves it unresolved
+/// rather than mint a WRONG-target edge.
+pub(crate) fn bare_simple_name_is_ambiguous<'a>(
+    simple: &str,
+    qualified_names: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let mut matches = 0usize;
+    for qualified in qualified_names {
+        let last = qualified.rsplit("::").next().unwrap_or(qualified);
+        if last == simple {
+            matches += 1;
+            if matches > 1 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The IMPLEMENTS-resolution decision for one impl display header
@@ -2956,6 +3027,38 @@ mod tests {
             ImplTargetDecision::Resolve(name) => Some(name),
             ImplTargetDecision::Verbatim | ImplTargetDecision::NoEdge => None,
         }
+    }
+
+    #[test]
+    fn bare_simple_name_ambiguity_counts_distinct_same_simple_name_targets() {
+        // Two distinct qualified names sharing the simple name `T` (root `T`
+        // and `a::T`) — the round-8 collision — is ambiguous.
+        assert!(bare_simple_name_is_ambiguous(
+            "T",
+            ["T", "a::T", "m::Foo"].into_iter()
+        ));
+        // A lone same-simple-name target is unambiguous — the guard must not
+        // over-suppress a legitimate single-name resolve.
+        assert!(!bare_simple_name_is_ambiguous(
+            "T",
+            ["T", "m::Bar"].into_iter()
+        ));
+        // A single deeply-nested definition is still unambiguous.
+        assert!(!bare_simple_name_is_ambiguous(
+            "T",
+            ["a::b::T", "a::Foo"].into_iter()
+        ));
+        // Two nested same-simple-name definitions with no root are ambiguous
+        // (the type-alias-fallback wrong-edge class).
+        assert!(bare_simple_name_is_ambiguous(
+            "T",
+            ["a::T", "b::T"].into_iter()
+        ));
+        // A name absent from the index is unambiguous (zero matches).
+        assert!(!bare_simple_name_is_ambiguous(
+            "Missing",
+            ["T", "a::T"].into_iter()
+        ));
     }
 
     #[test]

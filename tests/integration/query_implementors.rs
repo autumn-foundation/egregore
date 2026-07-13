@@ -2490,6 +2490,155 @@ fn real_scan_cross_file_bare_inherent_impl_is_not_misresolved() {
 }
 
 // ---------------------------------------------------------------------------
+// Round-8 review: the LOCAL/inline-module analog of the cross-file bare-import
+// finding. A generic impl inside an INLINE module implements a `use`-aliased
+// non-root trait by bare name while the same file also holds a same-named ROOT
+// trait. The generic-impl `Resolve(bare_trait)` path fed the LOCAL per-file
+// scope walk, which (not import-aware) walked bare `T` OUTWARD past the absent
+// `m::T` and bound the ROOT `T` at depth 0 — a WRONG IMPLEMENTS edge, since the
+// `use crate::a::T` alias means `a::T`. Non-root use-aliases are documented out
+// of scope, so this must be UNRESOLVED, not a wrong edge. The local resolver now
+// mirrors the cross-file same-name ambiguity guard (via a shared predicate).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_local_generic_alias_impl_is_not_misresolved() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    // All three items live in one scanned source file (inline modules), so this
+    // exercises the LOCAL per-file resolver, not the cross-file pass.
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait T {}\n\n",
+            "pub mod a {\n",
+            "    pub trait T {}\n",
+            "}\n\n",
+            "pub mod m {\n",
+            "    use crate::a::T;\n\n",
+            "    pub struct Foo<U>(U);\n\n",
+            "    impl<U> T for Foo<U> {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write lib.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    // The root trait `T` must gain NO implementor: binding `Foo` to it is the
+    // wrong-edge regression (the `use crate::a::T` alias means `a::T`).
+    let stdout = egregore()
+        .args(["query", "implementors", "T", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert!(
+        !rows
+            .iter()
+            .filter_map(|r| r["implementing_type"].as_str())
+            .any(|ty| ty == "m::Foo"),
+        "root trait T must not gain the use-aliased Foo as an implementor: {rows:?}"
+    );
+
+    // Stronger bound: no IMPLEMENTS edge targets the ROOT trait `T`. Locate the
+    // root `T` node id and assert no IMPLEMENTS edge points to it.
+    let graph = fs::read_to_string(&graph_path).expect("read graph");
+    let records: Vec<serde_json::Value> = graph
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    let root_t_id = records
+        .iter()
+        .find(|r| r["record_type"] == "node" && r["symbol_kind"] == "trait" && r["name"] == "T")
+        .and_then(|r| r["id"].as_str().map(str::to_owned))
+        .expect("root trait T node present");
+    let implements_to_root_t = records
+        .iter()
+        .filter(|r| r["record_type"] == "edge" && r["label"] == "IMPLEMENTS")
+        .filter_map(|r| r["target"].as_str())
+        .any(|target| target == root_t_id);
+    assert!(
+        !implements_to_root_t,
+        "no IMPLEMENTS edge may target the root trait T: {records:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The same-name ambiguity guard must NOT over-suppress a legitimate single-name
+// outward resolve. A lone trait `T` at the crate root implemented by bare name
+// from a nested inline module (`mod m { impl T for X }`, no same-name collision)
+// still resolves outward to the root trait — the guard only fires when the bare
+// simple name is ambiguous across the file's impl-target definitions.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_local_unambiguous_bare_impl_still_resolves_outward() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait T {}\n\n",
+            "pub mod m {\n",
+            "    pub struct Bar;\n\n",
+            "    impl T for Bar {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write lib.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let stdout = egregore()
+        .args(["query", "implementors", "T", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    let implementing_types: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r["implementing_type"].as_str())
+        .collect();
+    assert_eq!(
+        implementing_types,
+        vec!["m::Bar"],
+        "unambiguous bare `impl T` in a nested module still resolves outward to the \
+         lone root trait T: {rows:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Record-ID handles must stay valid under temporal selectors (PR #296 review):
 // `--at` / `--as-of` resolution must accept the trait's canonical record ID,
 // not only its name.
