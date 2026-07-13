@@ -615,13 +615,20 @@ pub fn export_bundle(
         }
     }
 
-    // Validate coverage threshold
+    // Validate coverage threshold. A bundle carries its whole BFS closure —
+    // including reachable `LogSource` nodes and `CAPTURED_FROM`/`AGGREGATES` edges
+    // — so the class-wide `runtime_observation` provenance requirement (#328) is
+    // resolvable here, and building the index from the SAME scrubbed closure that
+    // `verify_bundle` sees keeps export and verify in agreement (issue #372).
+    let closure: Vec<GraphRecord> = bundle_records.iter().map(|br| br.record.clone()).collect();
+    let prov = crate::citation_audit::CitationProvenance::build(&closure);
     let mut total_valid = 0usize;
     let mut non_code_valid = true;
     let total_records_count = bundle_records.len();
 
     for br in &bundle_records {
-        let classified = crate::citation_audit::classify_record_external(&br.record);
+        let classified =
+            crate::citation_audit::classify_record_external_with_provenance(&br.record, &prov);
         let trust_class = classified.trust_class;
 
         let is_valid =
@@ -777,9 +784,15 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
         }
     }
 
+    // Build the provenance index from the bundle's own closure so verify applies
+    // the same class-wide `runtime_observation` provenance requirement (#328) that
+    // `export_bundle` applied over the identical scrubbed closure (issue #372).
+    let closure: Vec<GraphRecord> = bundle.records.iter().map(|br| br.record.clone()).collect();
+    let prov = crate::citation_audit::CitationProvenance::build(&closure);
     if coverage_passed {
         for br in &bundle.records {
-            let classified = crate::citation_audit::classify_record_external(&br.record);
+            let classified =
+                crate::citation_audit::classify_record_external_with_provenance(&br.record, &prov);
             let trust_class = classified.trust_class;
 
             let is_valid =
