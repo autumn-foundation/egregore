@@ -17,7 +17,7 @@ use crate::{
     ir::{Graph, GraphRecord, ProducerKind, SCHEMA_VERSION, stable_id, versioned_stable_id},
     languages::cross_file::{
         FileFacts, apply_out_of_line_test_scope, cross_file_call_records,
-        label_same_file_call_resolutions,
+        cross_file_implements_records, label_same_file_call_resolutions,
     },
     repository_record_from_identity, scan_source_file_records,
     schema_version::validate_record_version,
@@ -52,10 +52,28 @@ use crate::{
 /// their `DEFINES` edges and `DefinitionFact`s; older caches rebuild so reused
 /// per-file records are never missing the new symbols.
 ///
+/// v11 deepens `IMPLEMENTS` extraction (issues #343, #344): same-file generic
+/// trait impl headers now trait-edge-back (`impl<T> Trait for Type<T>` and
+/// `impl GenP<u32> for Plain`), blanket impls (`impl<T> Trait for T`) are
+/// bounded out, and inherent generic impls keep their self edge. #344 also
+/// widens the serialized per-file `FileFacts` with `impl_targets` (exported
+/// trait/type definitions) and `pending_impls` (locally-unresolved trait
+/// impls) so the repo-wide pass can edge-back out-of-line cross-file impls;
+/// older caches rebuild so reused per-file records carry both the new facts
+/// and the new edges.
+///
+/// v12 adds the serde-default `shadowed_by_use` boolean to each per-file
+/// `pending_impls` fact (issues #343/#344 round 9): the AST-derived
+/// import-shadow verdict a bare trait/type impl carries into the repo-wide
+/// cross-file pass, so a `use` (external/std or non-root local alias) that
+/// shadows the bare name vetoes the wrong `IMPLEMENTS` edge. The field is
+/// serde-default, but a bump forces older caches to rebuild so reused per-file
+/// facts carry the verdict rather than defaulting it to `false`.
+///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 10;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 12;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -335,7 +353,16 @@ fn scan_repository_incremental_at_inner(
         .filter(|(_, cached_file)| !cached_file.facts.is_empty())
         .map(|(path, cached_file)| (path.clone(), cached_file.facts.clone()))
         .collect();
-    let cross_file_records = cross_file_call_records(&repository_id, &facts_by_file);
+    let mut cross_file_records = cross_file_call_records(&repository_id, &facts_by_file);
+    // Repo-wide cross-file trait resolution (issue #344): recomputed from the
+    // same `facts_by_file` as the CALLS pass, so a change on either side of an
+    // out-of-line impl re-derives its IMPLEMENTS edge. Folded into the same
+    // recomputed-record stream and ID set so its edges are tombstoned on
+    // removal exactly like cross-file CALLS edges.
+    cross_file_records.extend(cross_file_implements_records(
+        &repository_id,
+        &facts_by_file,
+    ));
     let cross_file_ids: BTreeSet<String> = cross_file_records
         .iter()
         .map(|record| record.id().to_owned())

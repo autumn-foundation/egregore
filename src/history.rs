@@ -202,6 +202,15 @@ fn scan_repository_history_inner(
         {
             graph.push(record.with_temporal(commit.temporal()));
         }
+        // Repo-wide cross-file trait resolution (issue #344) for this commit's
+        // tree: an out-of-line impl whose trait lives in another file
+        // edge-backs here, stamped with the commit's temporal provenance.
+        for record in crate::languages::cross_file::cross_file_implements_records(
+            &repository_id,
+            &facts_by_file,
+        ) {
+            graph.push(record.with_temporal(commit.temporal()));
+        }
         // Same-file resolution labeling (issue #134) over this commit's slice.
         crate::languages::cross_file::label_same_file_call_resolutions(
             &mut graph.records_mut()[commit_records_start..],

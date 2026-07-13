@@ -270,6 +270,15 @@ fn scan_repository_at_with_override_inner(
     for record in languages::cross_file::cross_file_call_records(&repository_id, &facts_by_file) {
         graph.push(record.with_valid_time_inferred(transaction_time));
     }
+    // Repo-wide cross-file trait resolution (issue #344): an out-of-line impl
+    // (`impl crate::T for Foo` in a `mod m;` file) whose trait is defined in
+    // another file resolves against every file's exported trait/type
+    // definitions here, so it edge-backs instead of dropping.
+    for record in
+        languages::cross_file::cross_file_implements_records(&repository_id, &facts_by_file)
+    {
+        graph.push(record.with_valid_time_inferred(transaction_time));
+    }
     // Same-file resolution labeling (issue #134): stamp per-file CALLS edges
     // backed by Tree-sitter call sites with the shared resolution status.
     languages::cross_file::label_same_file_call_resolutions(graph.records_mut(), &facts_by_file);

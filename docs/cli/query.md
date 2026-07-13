@@ -1154,19 +1154,107 @@ to `parsed_only` instead.
 
 ### Completeness contract (`local_traits_only`)
 
-The extractor records an `IMPLEMENTS` edge only when the trait definition was
-resolvable in the extraction scope — that is, for **locally-defined traits**,
-where "locally" means **the same source file as the impl**. `impl Display
-for Foo` (an external/std trait) produces **no** edge in this slice, and
-neither does an impl whose trait lives in another file of the same repo
-(the out-of-line module layout: `lib.rs` defines the trait, `m.rs` holds
-`impl crate::T for Foo`) — cross-file trait resolution needs a repo-wide
-type-symbol index, which is extraction-deepening reserved for a follow-up. The same bound covers generic impl headers: a generic impl
-(`impl<T> Trait for Type<T>`) and a generic-trait instantiation
-(`impl Trait<Args> for Type`) are not trait-edge-backed by the current
-extractor and never appear as implementor rows — resolving them is
-extraction-deepening, explicitly out of scope for this slice per issue #133.
-The query surfaces this bound instead of hiding it:
+The extractor records an `IMPLEMENTS` edge for a trait whose definition is
+resolvable **anywhere in the scanned repository**. As of issue #344 this
+includes **cross-file out-of-line trait impls**: the common module layout where
+`src/lib.rs` defines `trait T` and a separate `mod m;` file (`src/m.rs`) holds
+`impl crate::T for Foo` now edge-backs. A repo-wide index of every trait/type
+definition is built after per-file extraction, and each impl the per-file pass
+could not resolve locally is retried against it with the same
+`crate::`/`self::`/`super::` and module-scope-walk semantics as same-file
+resolution (an unqualified `impl Draw for Button` in `m.rs` walks outward to a
+crate-root `Draw`; an absolute `impl crate::T for Foo` resolves from the crate
+root). Local resolution still wins, so an edge is never emitted twice, and the
+pass recomputes from cached per-file facts each scan, so editing either side
+re-derives (or retires) the edge.
+
+`impl Display for Foo` (an external/std trait) still produces **no** edge: an
+unresolved or ambiguous trait path is left edge-free rather than diagnosed,
+because a cross-crate trait is external by construction — this is exactly what
+`local_traits_only` means. Generic trait impl headers **are** trait-edge-backed
+as of issue #343 (a generic-binder impl `impl<T> Trait for Type<T>` and a
+generic-trait instantiation `impl Trait<Args> for Type` both resolve their
+trait), and this now applies cross-file too. Two forms stay deliberately
+bounded out: an **inherent** generic impl (`impl<T> Type<T>`, no `for` clause)
+keeps its self-referential record edge and is never a trait implementor, and a
+**blanket** impl (`impl<T> Trait for T`, whose `for` target is a bare binder
+type parameter) mints no edge at all — it covers every type and has no single
+implementing-type record. A **negative** impl (`impl !Trait for Foo`, e.g.
+`impl !Send for Foo`) also mints **no** edge: it asserts that the type
+explicitly does *not* implement the trait, so it never edge-backs and never
+surfaces `Foo` as an implementor of `Trait`. The remaining honest bounds:
+**cross-crate** traits (std/deps), **non-Rust** languages, blanket impls, and a
+`use`-alias of a trait in a **non-root** module that the scope walk cannot see
+stay unresolved. A bare (unqualified) name whose **simple name is
+ambiguous** across the same-file or repo impl-target definitions is left
+unresolved too: it may be a `use`-alias of a non-root definition, and neither
+resolution path reads `use` declarations, so neither guesses a root binding — a
+missing edge is preferred over a wrong-target one. This same-name ambiguity
+bound applies on **both** resolution paths, sharing one counting predicate so
+they cannot diverge: the **local/inline-module** per-file resolver (a bare name
+that a same-file scope walk resolves only by reaching **outward** to a
+same-named root/outer definition — e.g. `mod m { use crate::a::T; impl<U> T for
+Foo<U> {} }` beside a root `trait T` — is left unresolved rather than mis-bound
+to the root), and the repo-wide **cross-file** pass (an out-of-line impl whose
+bare trait/type name is ambiguous across the repo index). A bare name that
+resolves in the impl's **own** module is trusted verbatim and never suppressed.
+The ambiguity bound covers **all impl-target kinds**
+(traits **and** type-defining targets: `struct` / `enum` / `type_alias`), not
+just traits, because a non-generic inherent impl (`impl Foo {}`) carries the
+**type** name `Foo` as its bare reference and the scope walk resolves bare names
+against every one of those kinds. So a bare name shared across crate/module
+scopes by any impl-target kind — a root `T` and a non-root `a::T` (traits), or a
+root `struct Foo` and a `use`-aliased `a::Foo` behind `impl Foo {}` (types) — is
+left unresolved rather than mis-targeted. The accepted trade-off: when a trait
+`T` and an unrelated type `T` coexist across files, a bare `impl T for X` that
+once resolved is now left unresolved — a rare potential wrong-edge converted into
+a rare missed-edge, the honest-bound direction consistent with
+`local_traits_only`.
+
+**Import-shadow veto (the general bare-name bound).** The same-name ambiguity
+rule above only sees definitions the impl-target index *already knows*. An
+external or std trait brought in by a `use` — `use std::fmt::Display;` — is not
+in that index, so an ambiguity count of one would let the scope walk mis-bind a
+bare `impl Display for Foo` to a same-named **local** `trait Display`. To close
+the entire shadowing family at once, a bare (unqualified) trait/type name that
+is shadowed by a `use` import in the impl's **own module scope** — a **module-item**
+`use` (a direct `use` item of the impl's own module, *not* one nested inside a
+function body or block) whose final bound segment equals that bare name — is left
+**unresolved** on **both** the local per-file and the repo-wide cross-file
+resolution paths, **unless the bare name resolves to a definition in the impl's
+own module** (an own-module definition wins at depth 0 *before* the veto, because
+a same-module `use` plus a same-name item is a compile error in real Rust, so the
+definition is the only valid reading). The veto matches Rust's non-inherited `use`
+visibility: it consults **only** the impl's own module-scope imports — an
+ancestor/root or sibling-module `use` never shadows a bare name inside `mod m`,
+and a **block-local** `use` inside a function body is invisible to module-level
+impls and never feeds the veto at all. This is a deterministic, AST-derived
+name-shadow boolean (it detects the shadowing `use`, it does **not** resolve the
+import), computed once at extraction time and shared by both paths so they cannot
+diverge. It covers external/std imports, `use crate::a::T` aliases of a non-root
+local definition, and grouped/aliased `use` forms alike (a glob `use a::*;` names
+no specific segment and never vetoes). The
+accepted recall trade-off: a legitimate `use crate::Display; impl Display for
+Foo` whose import target **is** the local trait is now *also* left unresolved —
+an honest missing edge in place of a possible wrong one. Correct import-aware
+resolution (binding the bare name to exactly the trait the `use` names) is
+deferred to follow-up **#393**. The incremental-cache schema version bumps to
+**12** for the serde-default `shadowed_by_use` field this veto records on each
+deferred pending-impl fact; older caches rebuild.
+
+**Multi-crate-root packages are not partitioned by crate root in this slice.**
+The repo-wide index keys on the crate-root-relative **qualified name**, so when
+a package has more than one crate root (`src/lib.rs` plus `src/bin/tool.rs` or
+`src/main.rs`) a root `trait T` in each root shares the qualified name `T`. A
+`crate::`-qualified trait path (or a bare name) that matches **more than one**
+such definition is left **unresolved** (no edge) rather than silently picking
+one and mis-targeting a cross-root edge — the same "resolve only a unique
+match" rule that guards ambiguous bare names. This means a legitimate
+`impl crate::T for Foo` in the library is not edge-backed when a binary crate
+root also defines a root `T`; a missing edge is preferred over a wrong cross-root
+one. Full crate-root partitioning of the index (so each root's `T` is distinct)
+is tracked as a deferred follow-up. The query surfaces these bounds instead of
+hiding them:
 
 - Every implementor row and every zero-implementors signal carries
   `completeness: "local_traits_only"`.
@@ -1299,6 +1387,8 @@ eg query implementors Renderable --graph g.jsonl
 `Circle (impl Renderable for Circle) implements Renderable @ src/shapes.rs:7 (completeness: local_traits_only)`);
 the text format is not stable and must not be parsed.
 
-Out of scope for this verb: emitting edges for external/std traits, resolving
-generic/blanket impls (`impl<T> Trait for T`), method-level breakage analysis,
-and the outbound direction ("what does this type implement").
+Out of scope for this verb: emitting edges for external/std (cross-crate)
+traits, blanket impls (`impl<T> Trait for T`), method-level breakage analysis,
+and the outbound direction ("what does this type implement"). Same-file generic
+trait impls are in scope as of issue #343; cross-file out-of-line trait impls
+are in scope as of issue #344.
