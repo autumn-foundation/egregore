@@ -415,10 +415,13 @@ impl ValidationReport {
 struct GraphIndex<'a> {
     /// Every kind observed per node ID.
     node_kinds: BTreeMap<&'a str, BTreeSet<NodeKind>>,
-    /// Every importer `source_kind` observed per node ID (issue #369). A node
-    /// ID may recur across history commits; the set holds every attribution
-    /// seen, so a match against any is a match.
-    node_source_kinds: BTreeMap<&'a str, BTreeSet<&'a str>>,
+    /// The resolved importer `source_kind` per node ID (issue #369), by
+    /// last-write-wins to match the daemon's `lookup_node_source_kind` (which
+    /// reverse-scans the batch, so the last record for an ID over the same
+    /// forward record sequence shadows the earlier ones). A node ID recurring
+    /// across history commits with the SAME `source_kind` still resolves to that
+    /// value; only the adversarial conflicting-value case differs from a set.
+    node_source_kinds: BTreeMap<&'a str, &'a str>,
     /// First node record per ID, for path/span citations.
     node_first: BTreeMap<&'a str, &'a GraphRecord>,
     /// Tombstone record IDs per deleted ID.
@@ -445,11 +448,9 @@ impl<'a> GraphIndex<'a> {
                     index.nodes += 1;
                     index.node_kinds.entry(id).or_default().insert(*kind);
                     if let Some(source_kind) = source_kind {
-                        index
-                            .node_source_kinds
-                            .entry(id)
-                            .or_default()
-                            .insert(source_kind.as_str());
+                        // Plain overwrite: the last record for an ID wins,
+                        // matching the daemon's reverse-scan-of-batch.
+                        index.node_source_kinds.insert(id, source_kind.as_str());
                     }
                     index.node_first.entry(id).or_insert(record);
                 }
@@ -589,8 +590,8 @@ fn check_edges<'a>(
         ) && allowed_source_kinds(*label)
             .is_some_and(|allowed| kinds.iter().any(|kind| allowed.contains(kind)))
         {
-            let observed = index.node_source_kinds.get(source.as_str());
-            let satisfied = observed.is_some_and(|set| set.contains(required));
+            let observed = index.node_source_kinds.get(source.as_str()).copied();
+            let satisfied = observed == Some(required);
             if !satisfied {
                 let mut diagnostic =
                     ValidationDiagnostic::new(EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION);
@@ -598,9 +599,7 @@ fn check_edges<'a>(
                 diagnostic.relation = Some(label.as_str().to_owned());
                 diagnostic.endpoint = Some("source");
                 diagnostic.record_id = Some(source.clone());
-                diagnostic.source_kind = observed
-                    .and_then(|set| set.iter().next().copied())
-                    .map(str::to_owned);
+                diagnostic.source_kind = observed.map(str::to_owned);
                 diagnostic.required_source_kind = Some(required);
                 index.cite_node(&mut diagnostic, source);
                 diagnostics.insert(diagnostic);
@@ -2042,6 +2041,82 @@ mod tests {
             .expect("attribution defect present");
         assert_eq!(defect.required_source_kind, Some("github_pr"));
         assert_eq!(defect.source_kind.as_deref(), Some("github_issue"));
+    }
+
+    #[test]
+    fn requested_review_from_shadowed_by_later_github_issue_is_rejected() {
+        // Issue #369 parity: the daemon resolves a node's `source_kind` via
+        // last-write-wins (`lookup_node_source_kind` reverse-scans the batch),
+        // so two Task records sharing one id — first `github_pr`, then
+        // `github_issue` — resolve to `github_issue`, and the daemon rejects a
+        // REQUESTED_REVIEW_FROM off it. The offline validator must resolve the
+        // same single value, not any-match over the set.
+        let records = vec![
+            node_with_source_kind("n:task", NodeKind::Task, "github_pr"),
+            node_with_source_kind("n:task", NodeKind::Task, "github_issue"),
+            node("n:id", NodeKind::ExternalIdentity),
+            edge("e:rrf", EdgeLabel::RequestedReviewFrom, "n:task", "n:id"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
+            "REQUESTED_REVIEW_FROM off a Task shadowed to github_issue must be rejected, got {codes:?}"
+        );
+        let defect = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION)
+            .expect("attribution defect present");
+        assert_eq!(defect.required_source_kind, Some("github_pr"));
+        assert_eq!(defect.source_kind.as_deref(), Some("github_issue"));
+    }
+
+    #[test]
+    fn reviewed_by_shadowed_by_later_source_kind_is_rejected() {
+        // Issue #369 parity: two Review records sharing one id — first
+        // `github_review`, then a non-`github_review` attribution — resolve to
+        // the later value under last-write-wins, so REVIEWED_BY off it is a
+        // binding the daemon rejects and the offline validator must too.
+        let records = vec![
+            node_with_source_kind("n:review", NodeKind::Review, "github_review"),
+            node_with_source_kind("n:review", NodeKind::Review, "local_jsonl"),
+            node("n:id", NodeKind::ExternalIdentity),
+            edge("e:rb", EdgeLabel::ReviewedBy, "n:review", "n:id"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
+            "REVIEWED_BY off a Review shadowed to local_jsonl must be rejected, got {codes:?}"
+        );
+        let defect = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION)
+            .expect("attribution defect present");
+        assert_eq!(defect.required_source_kind, Some("github_review"));
+        assert_eq!(defect.source_kind.as_deref(), Some("local_jsonl"));
+    }
+
+    #[test]
+    fn reviewer_identity_source_kind_recurring_same_value_stays_clean() {
+        // Issue #369 parity guard: a node ID that recurs across history commits
+        // with the SAME required source_kind still resolves to that value under
+        // last-write-wins, so the legitimate recurring case must stay clean —
+        // only the adversarial conflicting-value case changes behavior.
+        let records = vec![
+            node_with_source_kind("n:task", NodeKind::Task, "github_pr"),
+            node_with_source_kind("n:task", NodeKind::Task, "github_pr"),
+            node("n:id", NodeKind::ExternalIdentity),
+            edge("e:rrf", EdgeLabel::RequestedReviewFrom, "n:task", "n:id"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
+            "a Task recurring with the same github_pr source_kind must stay clean, got {codes:?}"
+        );
     }
 
     #[test]
