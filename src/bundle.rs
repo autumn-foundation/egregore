@@ -862,3 +862,138 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
         safety,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! #372: the bundle coverage gate applies the class-wide
+    //! `runtime_observation` provenance requirement over the SAME BFS closure
+    //! both `export_bundle` and `verify_bundle` see, so a provenance-less
+    //! `ErrorSignature` pulled into a bundle is uncited on both — never counted
+    //! Cited by its own ID via the context-free catch-all.
+    use super::{export_bundle, verify_bundle};
+    use crate::ir::{
+        EdgeLabel, ErrorSignaturePayload, FrameResolution, GraphRecord, LOG_SCHEMA_VERSION,
+        LogPayload, LogSourcePayload, NodeKind, SourceSpan,
+    };
+
+    fn symbol(id: &str, path: &str, name: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some(path.to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 10,
+                end_line: 20,
+            }),
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    fn error_signature(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::ErrorSignature,
+            None,
+            None,
+            Some("error signature".to_owned()),
+            "error signature".to_owned(),
+        )
+        .with_domain("log", LOG_SCHEMA_VERSION)
+        .with_log(LogPayload::ErrorSignature(ErrorSignaturePayload {
+            fingerprint_algorithm: "template-v1".to_owned(),
+            template_excerpt: "connection refused to HOST".to_owned(),
+            severity: "error".to_owned(),
+            occurrence_count: 3,
+            first_seen: "2026-03-02T09:00:00Z".to_owned(),
+            last_seen: "2026-03-02T10:00:00Z".to_owned(),
+            frames: None,
+        }))
+    }
+
+    fn log_source(id: &str, path: &str, hash: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::LogSource,
+            Some(path.to_owned()),
+            None,
+            Some(path.to_owned()),
+            "log source".to_owned(),
+        )
+        .with_domain("log", LOG_SCHEMA_VERSION)
+        .with_log(LogPayload::LogSource(LogSourcePayload {
+            source_relative_path: path.to_owned(),
+            source_format_version: "plain-v1".to_owned(),
+            source_artifact_hash: hash.to_owned(),
+            line_count: 10,
+        }))
+    }
+
+    fn frame_resolves_to(signature_id: &str, symbol_id: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::FrameResolvesTo,
+            signature_id.to_owned(),
+            symbol_id.to_owned(),
+            None,
+            "frame resolves to symbol".to_owned(),
+        )
+        .with_frame_resolution(FrameResolution::Resolved)
+        .with_frame_index(0)
+    }
+
+    fn captured_from(signature_id: &str, source_id: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::CapturedFrom,
+            signature_id.to_owned(),
+            source_id.to_owned(),
+            None,
+            "captured from".to_owned(),
+        )
+    }
+
+    // #372 RED-neg: a well-cited Symbol root reaches a provenance-less
+    // ErrorSignature via FRAME_RESOLVES_TO (no LogSource in the graph). The
+    // signature is a runtime_observation row with no resolvable provenance, so the
+    // bundle coverage gate must reject the export.
+    #[test]
+    fn export_rejects_provenance_less_log_row_in_closure() {
+        let sig_id = crate::ir::log_stable_id(&["error_signature", "repo372b", "tpl", "error"]);
+        let sym_id = "codegraph:v5:sym-db";
+        let records = vec![
+            symbol(sym_id, "src/db.rs", "connect"),
+            error_signature(&sig_id),
+            frame_resolves_to(&sig_id, sym_id),
+        ];
+        let result = export_bundle(&records, "symbol:connect", "0.1.0");
+        assert!(
+            result.is_err(),
+            "a provenance-less runtime observation pulled into the closure must fail \
+             the bundle coverage gate (#372)"
+        );
+    }
+
+    // #372 RED-pos: adding a resolvable LogSource + CAPTURED_FROM (reachable in the
+    // SAME closure) cites the signature, so export succeeds and verify_bundle —
+    // which rebuilds the provenance index from the bundle's own closure — passes.
+    #[test]
+    fn export_and_verify_accept_provenance_complete_log_row() {
+        let sig_id = crate::ir::log_stable_id(&["error_signature", "repo372b", "tpl", "error"]);
+        let src_id = crate::ir::log_stable_id(&["log_source", "repo372b", "app.log", "h1"]);
+        let sym_id = "codegraph:v5:sym-db";
+        let records = vec![
+            symbol(sym_id, "src/db.rs", "connect"),
+            error_signature(&sig_id),
+            frame_resolves_to(&sig_id, sym_id),
+            log_source(&src_id, "app.log", "abc123"),
+            captured_from(&sig_id, &src_id),
+        ];
+        let bundle = export_bundle(&records, "symbol:connect", "0.1.0")
+            .expect("provenance-complete closure exports");
+        assert!(
+            verify_bundle(&bundle).ok,
+            "verify rebuilds the provenance index from the bundle closure and passes (#372)"
+        );
+    }
+}
