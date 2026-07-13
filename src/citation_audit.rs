@@ -331,9 +331,47 @@ pub fn citation_trust_class(record: &GraphRecord) -> &'static str {
 }
 
 /// Classifies a record's citation status for external use.
+///
+/// This is context-free: it has no record set, so a `runtime_observation` row
+/// falls to the catch-all and is cited by its own ID. Use
+/// [`classify_record_external_with_provenance`] where the surrounding
+/// `LogSource`/`CAPTURED_FROM`/`AGGREGATES` records are available so the
+/// class-wide log-provenance requirement (#328) is enforced (issue #372).
 #[must_use]
 pub fn classify_record_external(record: &GraphRecord) -> RowClassification {
     classify_record(record).row
+}
+
+/// Public log-domain provenance context for the shared citation classifier.
+///
+/// Wraps the #328 [`LogProvenanceIndex`] so evidence-pack and bundle citation
+/// gates apply the class-wide `runtime_observation` provenance requirement via
+/// the SAME derivation `eg audit citations` uses (issue #372) — not a fork.
+pub struct CitationProvenance<'a> {
+    index: LogProvenanceIndex<'a>,
+}
+
+impl<'a> CitationProvenance<'a> {
+    /// Builds the provenance context from the record set that carries the
+    /// `LogSource` nodes and `CAPTURED_FROM`/`AGGREGATES` edges.
+    #[must_use]
+    pub fn build(records: &'a [GraphRecord]) -> Self {
+        Self {
+            index: LogProvenanceIndex::build(records),
+        }
+    }
+}
+
+/// Provenance-aware sibling of [`classify_record_external`]: applies the #328
+/// `runtime_observation` provenance requirement so an unprovenanced log row
+/// classifies `MissingRequiredHandle`, not `Cited` (issue #372). Use where the
+/// record set carrying `LogSource`/`CAPTURED_FROM`/`AGGREGATES` is available.
+#[must_use]
+pub fn classify_record_external_with_provenance(
+    record: &GraphRecord,
+    provenance: &CitationProvenance,
+) -> RowClassification {
+    classify_record_provenanced(record, &provenance.index).row
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +882,26 @@ fn classify_record(record: &GraphRecord) -> Classified {
     }
 }
 
+/// Classifies a record, applying the class-wide `runtime_observation` provenance
+/// requirement (#328) against `index`. Shared by [`WorkflowBuilder::push_record`]
+/// and [`classify_record_external_with_provenance`] so the audit and the
+/// pack/bundle citation gates never diverge on a log row (issue #372): the
+/// context-free [`classify_record`] catch-all would otherwise cite a
+/// provenance-less log record by its own ID. A row already excluded
+/// (protected/unverified) keeps that status.
+fn classify_record_provenanced(record: &GraphRecord, index: &LogProvenanceIndex) -> Classified {
+    let classified = classify_record(record);
+    if classified.row.trust_class == "runtime_observation"
+        && !matches!(
+            classified.row.status,
+            CitationStatus::ExcludedProtected | CitationStatus::ExcludedUnverified
+        )
+    {
+        return classify_log_handle(index, record);
+    }
+    classified
+}
+
 /// Returns a cited row when a required handle is present, else a missing row.
 fn cited_or_missing(id: &str, trust: &'static str, handle: Option<String>) -> Classified {
     handle.map_or_else(|| missing(id, trust), |handle| cited(id, trust, handle))
@@ -948,15 +1006,7 @@ impl<'a> WorkflowBuilder<'a> {
     /// catch-all would otherwise cite a provenance-less log record by its own ID.
     /// A row already excluded (protected/unverified) keeps that status.
     fn push_record(&mut self, record: &GraphRecord) {
-        let mut classified = classify_record(record);
-        if classified.row.trust_class == "runtime_observation"
-            && !matches!(
-                classified.row.status,
-                CitationStatus::ExcludedProtected | CitationStatus::ExcludedUnverified
-            )
-        {
-            classified = classify_log_handle(&self.provenance, record);
-        }
+        let classified = classify_record_provenanced(record, &self.provenance);
         self.push_classified(classified, temporal_key(record));
     }
 
