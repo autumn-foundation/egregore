@@ -14,8 +14,8 @@ use std::{fs, path::Path};
 use aletheia_egregore::{
     Graph, LOG_SCHEMA_VERSION,
     ir::{
-        EdgeLabel, ErrorSignaturePayload, FrameResolution, GraphRecord, LogPayload, NodeKind,
-        SnapshotHead, SourceSnapshotPayload, SourceSpan, StackFrame, TemporalMetadata,
+        EdgeLabel, ErrorSignaturePayload, EvidenceLink, FrameResolution, GraphRecord, LogPayload,
+        NodeKind, SnapshotHead, SourceSnapshotPayload, SourceSpan, StackFrame, TemporalMetadata,
     },
     log_graph, log_resolve, log_stable_id, stable_id,
 };
@@ -657,5 +657,119 @@ fn cli_resolve_frames_at_scopes_name_only_frame() {
         targets,
         vec![(id_a.as_str(), "resolved")],
         "CLI `resolve-frames --at c1` must scope the name-only frame to the c1 id"
+    );
+}
+
+/// Like [`at_symbol`] but with an explicit span, so an UNCHANGED symbol can be
+/// modeled across commits sharing ONE stable id (same path+name) while differing
+/// in `git_commit` and span.
+fn at_symbol_span(
+    name: &str,
+    path: &str,
+    commit: &str,
+    valid_time: &str,
+    sp: SourceSpan,
+) -> (String, GraphRecord) {
+    let id = stable_id(&["node", "symbol", path, name]);
+    let node = GraphRecord::node(
+        id.clone(),
+        NodeKind::Symbol,
+        Some(path.to_owned()),
+        Some(sp),
+        Some(name.to_owned()),
+        format!("symbol {name}@{commit}"),
+    )
+    .with_temporal(at_temporal(commit, valid_time));
+    (id, node)
+}
+
+/// The mirrored `EvidenceLink` on the signature node citing `target_id`.
+fn frame_evidence_link<'a>(
+    records: &'a [GraphRecord],
+    sig_id: &str,
+    target_id: &str,
+) -> &'a EvidenceLink {
+    records
+        .iter()
+        .find_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                evidence_links: Some(links),
+                ..
+            } if id == sig_id => links
+                .iter()
+                .find(|l| l.target_record_id.as_deref() == Some(target_id)),
+            _ => None,
+        })
+        .expect("signature must carry a FRAME_RESOLVES_TO evidence link for the target")
+}
+
+#[test]
+fn name_only_frame_citation_uses_commit_view_snapshot_not_first_in_slice() {
+    // Codex P2 on PR #382 (follow-up to #377): an UNCHANGED symbol keeps ONE
+    // stable id across two commit snapshots (same path+name), differing only in
+    // `git_commit` and span. The OLDER c1 snapshot is emitted FIRST in the slice.
+    // A name-only frame `app::handler` resolves to that shared id; the mirrored
+    // EvidenceLink citation (`target_git_commit` / `target_span`) MUST reflect
+    // the requested view's snapshot, never the emission-order-first (older) one
+    // that a plain `record_by_id` returns.
+    let (id, sym_c1) = at_symbol_span("handler", "src/a.rs", C1, T1_377, span(1, 10));
+    let (id2, sym_c2) = at_symbol_span("handler", "src/a.rs", C2, T2_377, span(5, 25));
+    assert_eq!(
+        id, id2,
+        "an unchanged symbol keeps one stable id across commit snapshots"
+    );
+    let (repo_id, repo) = at_repo_node(C2);
+    let (sig_id, sig) = at_signature("handler-boom", vec![name_only_frame("app::handler")]);
+    let records = vec![
+        repo,
+        at_commit_node(C1, T1_377),
+        at_commit_node(C2, T2_377),
+        contains(&repo_id, &id),
+        sym_c1, // older snapshot emitted FIRST — `record_by_id` would return this
+        sym_c2,
+        sig,
+    ];
+
+    // `--at c2`: citation must anchor the c2 snapshot (commit c2, span 5..25).
+    let at_c2 = log_resolve::resolve_frames(&records, Some(C2));
+    let link_c2 = frame_evidence_link(&at_c2.records, &sig_id, &id);
+    assert_eq!(
+        link_c2.target_git_commit.as_deref(),
+        Some(C2),
+        "the `--at c2` citation must anchor the c2 snapshot, not the emission-first c1 one"
+    );
+    assert_eq!(
+        link_c2.target_span,
+        Some(span(5, 25)),
+        "the `--at c2` citation span must be the c2 snapshot span"
+    );
+
+    // HEAD view (repo head == c2): same requirement.
+    let head = log_resolve::resolve_frames(&records, None);
+    let link_head = frame_evidence_link(&head.records, &sig_id, &id);
+    assert_eq!(
+        link_head.target_git_commit.as_deref(),
+        Some(C2),
+        "the HEAD-view citation must anchor the HEAD (c2) snapshot"
+    );
+    assert_eq!(
+        link_head.target_span,
+        Some(span(5, 25)),
+        "the HEAD-view citation span must be the c2 snapshot span"
+    );
+
+    // `--at c1`: citation must anchor the c1 snapshot (commit c1, span 1..10).
+    let at_c1 = log_resolve::resolve_frames(&records, Some(C1));
+    let link_c1 = frame_evidence_link(&at_c1.records, &sig_id, &id);
+    assert_eq!(
+        link_c1.target_git_commit.as_deref(),
+        Some(C1),
+        "the `--at c1` citation must anchor the c1 snapshot"
+    );
+    assert_eq!(
+        link_c1.target_span,
+        Some(span(1, 10)),
+        "the `--at c1` citation span must be the c1 snapshot span"
     );
 }

@@ -254,7 +254,14 @@ pub fn resolve_frames(records: &[GraphRecord], at_commit: Option<&str>) -> Resol
         };
 
         for frame in frames {
-            match classify_frame(records, &index, &symbols_by_name, frame, at_commit) {
+            match classify_frame(
+                records,
+                &index,
+                &symbols_by_name,
+                &viewed_symbols,
+                frame,
+                at_commit,
+            ) {
                 FrameOutcome::External => tally.external += 1,
                 FrameOutcome::Resolved {
                     target,
@@ -455,6 +462,7 @@ fn classify_frame(
     records: &[GraphRecord],
     index: &RepositoryIndex,
     symbols_by_name: &BTreeMap<&str, BTreeSet<&str>>,
+    viewed_symbols: &BTreeMap<&str, &GraphRecord>,
     frame: &StackFrame,
     at_commit: Option<&str>,
 ) -> FrameOutcome {
@@ -494,7 +502,7 @@ fn classify_frame(
             0 => {}
             1 => {
                 let target = (*ids.iter().next().expect("len==1")).to_owned();
-                let (path, span, commit) = candidate_handles(records, &target);
+                let (path, span, commit) = candidate_handles(viewed_symbols, &target);
                 return FrameOutcome::Resolved {
                     target,
                     path,
@@ -506,7 +514,7 @@ fn classify_frame(
                 let candidates = ids
                     .iter()
                     .map(|id| {
-                        let (path, span, commit) = candidate_handles(records, id);
+                        let (path, span, commit) = candidate_handles(viewed_symbols, id);
                         ((*id).to_owned(), path, span, commit)
                     })
                     .collect();
@@ -518,13 +526,23 @@ fn classify_frame(
     FrameOutcome::Unresolved
 }
 
-/// Returns the `(path, span, commit)` handles for a record ID, all `None` when
-/// the record is absent.
+/// Returns the `(path, span, commit)` handles for a view-selected symbol ID,
+/// all `None` when the ID is absent from the view.
+///
+/// The name-only frame branch resolves an ID out of `symbols_by_name`, which is
+/// keyed on the commit/HEAD view-selected `viewed_symbols` (issue #377). The
+/// citation handles MUST come from that SAME view-selected snapshot: a
+/// scan-history graph carries one snapshot per commit under a shared stable ID
+/// (an unchanged symbol keeps its ID across commits, differing in `git_commit`
+/// and span), so reading the first emission-order snapshot for the ID would
+/// anchor the mirrored [`EvidenceLink`]'s `target_span`/`target_git_commit` to
+/// an arbitrary — possibly older — commit that need not match the requested
+/// view (Codex P2 on #382, follow-up to #377).
 fn candidate_handles(
-    records: &[GraphRecord],
+    viewed_symbols: &BTreeMap<&str, &GraphRecord>,
     id: &str,
 ) -> (Option<String>, Option<SourceSpan>, Option<String>) {
-    record_by_id(records, id).map_or((None, None, None), |r| {
+    viewed_symbols.get(id).map_or((None, None, None), |r| {
         let (span, commit) = span_and_commit(r);
         (path_of(r), span, commit)
     })
@@ -587,10 +605,6 @@ fn frames_of<'a>(records: &'a [GraphRecord], signature_id: &str) -> Option<&'a [
         }
     }
     None
-}
-
-fn record_by_id<'a>(records: &'a [GraphRecord], id: &str) -> Option<&'a GraphRecord> {
-    records.iter().find(|r| r.id() == id)
 }
 
 fn path_of(record: &GraphRecord) -> Option<String> {
