@@ -240,6 +240,26 @@ redaction-safe fingerprints the summary already exposes. `LogEvent` exemplar
 `event_excerpt` text is likewise fingerprinted (exemplars ride the summary as
 content-addressed handles, never as section text).
 
+The section **co-locates each signature's `ErrorSignature --FRAME_RESOLVES_TO-->
+{Symbol|File|Diagnostic}` attribution edge** as a hash-bound row (issue #371),
+mirroring the `occurrence_buckets` `AGGREGATES` treatment. The signature *node*
+payload carries **no frame-resolution field**, so each row's `frame_resolutions`
+(the verbatim `frame_resolution` label + `frame_index`, the #152/#134 precedent)
+would otherwise be bound ONLY by the whole-summary `log_summary_hash` — weaker than
+the `template_hash`/`frame_chain_hash`/`severity`/span fields, which `verify`
+recomputes from the co-located node. With the edges co-located, `verify` re-derives
+each row's frame joins directly from these tamper-evident rows (an exact per-signature
+bijection using the same `(frame_index, target_id)` ordering `assemble` used), so a
+**moved `frame_index`, a relabeled or retargeted resolution, a dropped edge, or an
+added/smuggled edge all fail Integrity even when the whole-summary hash is
+recomputed**. Unlike the bucket case there is **no exclusion**: a signature with zero
+frame edges is legitimate (never mis-attributed), so every in-window signature stays
+and only its frame edges (if any) are appended. A `FRAME_RESOLVES_TO` edge carries no
+valid time of its own; its window relevance rides the signature it binds, and
+Window-consistency admits it on that basis. The edge rows carry only edge identity +
+label + `frame_index` + endpoint IDs — **never log or frame text** (the edge is a
+no-op for the log-text scrub), so the zero-raw-log Safety invariant holds.
+
 **Concatenated multi-scan coalescing** (issue #340, Codex round-6). A `LogSource`
 is a **non-identity** input: an `ErrorSignature`'s stable ID is
 `(repository_id, fingerprint_algorithm, template, severity)` and a
@@ -311,7 +331,15 @@ node's (log-text-scrubbed) payload — `template_hash` binds directly to the nod
 stored template fingerprint and `frame_chain_hash` recomputes over the node's
 redacted (fingerprinted-path) frame chain, so the per-node bind still catches a
 forged summary fingerprint even with the whole-summary hash recomputed, without any
-raw log or frame text surviving in the pack — and each `occurrence_buckets` bucket
+raw log or frame text surviving in the pack. Each `error_signatures` row's
+**`frame_resolutions`** is likewise re-derived from the section's co-located
+`FRAME_RESOLVES_TO` attribution edges (issue #371, an exact per-signature bijection),
+so a moved `frame_index`, a relabeled/retargeted resolution, a dropped edge, or an
+added/smuggled edge fails Integrity with the whole-summary hash recomputed. Those
+edges are held to a **bounded membership exemption** (mirroring the `AGGREGATES`
+one): only a `FRAME_RESOLVES_TO` edge whose source is an `ErrorSignature` node
+present in the same section is admitted; any other edge, or an attribution edge for
+an absent signature, fails Integrity. Each `occurrence_buckets` bucket
 must resolve to a present
 hashed `LogOccurrenceBucket` node with a matching count and hour while every
 `in_window_occurrences` must equal the recomputed sum — so the occurrence total

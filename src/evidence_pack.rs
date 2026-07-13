@@ -2058,14 +2058,25 @@ fn build_section_records(records: Vec<GraphRecord>) -> Vec<BundleRecord> {
 /// * `LogEvent.event_excerpt` is REPLACED by its fingerprint (exemplars already
 ///   ride the summary as content-addressed handles, never as section text).
 ///
+/// It also clears the free-text `summary` of a co-located `FRAME_RESOLVES_TO`
+/// edge (issue #371, Codex P2 Safety/redaction): that required field is
+/// synthesized safely by `eg resolve-frames`, but an older/hand-authored
+/// importer could populate it with raw backtrace/log text, and neither
+/// `bundle::scrub_record` (SECRET-redacts an edge summary only) nor `pack_safety`
+/// (secret + Node-only scrubbed-field checks) strips non-secret text, so it would
+/// otherwise ride the hashed section row while Safety still passes. The #371 bind
+/// recomputes each row's `frame_resolution` / `frame_index` / endpoint IDs from
+/// the edge's typed fields — never its summary — so clearing it is round-trip
+/// safe. Centralized here because every co-located section row (including these
+/// frame edges) flows through `build_section_records` -> `scrub_log_node_text`.
+///
 /// A no-op for every non-log node (`log: None`) and for `LogSource` /
 /// `LogOccurrenceBucket` payloads, which carry no free-text field.
 fn scrub_log_node_text(mut record: GraphRecord) -> GraphRecord {
-    if let GraphRecord::Node {
-        log: Some(payload), ..
-    } = &mut record
-    {
-        match payload.as_mut() {
+    match &mut record {
+        GraphRecord::Node {
+            log: Some(payload), ..
+        } => match payload.as_mut() {
             crate::ir::LogPayload::ErrorSignature(p) => {
                 p.template_excerpt = blake3::hash(p.template_excerpt.as_bytes()).to_string();
                 if let Some(frames) = p.frames.as_mut() {
@@ -2077,7 +2088,15 @@ fn scrub_log_node_text(mut record: GraphRecord) -> GraphRecord {
             }
             crate::ir::LogPayload::LogSource(_) | crate::ir::LogPayload::LogOccurrenceBucket(_) => {
             }
+        },
+        GraphRecord::Edge {
+            label: crate::ir::EdgeLabel::FrameResolvesTo,
+            summary,
+            ..
+        } => {
+            summary.clear();
         }
+        _ => {}
     }
     record
 }
@@ -2386,6 +2405,42 @@ fn coalesce_log_records(records: &[GraphRecord]) -> Vec<GraphRecord> {
     out
 }
 
+/// Derives the sorted `FrameResolutionJoin` set for one signature from its
+/// `FRAME_RESOLVES_TO` edges (issue #371) — the resolution label + `frame_index`
+/// propagated verbatim (#152/#134), ordered by `(frame_index, target_id)`. This is
+/// the SINGLE derivation shared by `build_error_signature_rows` (assemble, from the
+/// whole-graph join index) and `bind_error_signature_rows` (verify, from the
+/// co-located hashed edge rows), so a summary row's frame joins and their verify-time
+/// recompute can never diverge.
+fn frame_resolution_joins(edges: &[&GraphRecord]) -> Vec<FrameResolutionJoin> {
+    let mut joins: Vec<FrameResolutionJoin> = edges
+        .iter()
+        .filter_map(|&edge| match edge {
+            GraphRecord::Edge { target, .. } => Some(FrameResolutionJoin {
+                frame_index: edge.frame_index(),
+                resolution: edge.frame_resolution().map(|r| r.as_str().to_owned()),
+                target_id: target.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+    joins.sort_by(|a, b| {
+        a.frame_index
+            .cmp(&b.frame_index)
+            .then_with(|| a.target_id.cmp(&b.target_id))
+            // `resolution` is the final tiebreaker (issue #371, Codex round-7 P2):
+            // `log_resolve` folds resolution into the FRAME_RESOLVES_TO edge id, so a
+            // graph can carry two edges sharing (signature, frame_index, target) but
+            // differing in resolution. Without this key those joins compare EQUAL and a
+            // stable sort would preserve each caller's differing input order — assemble
+            // (input edge order) and verify (canonically id-sorted section rows) would
+            // then disagree and reject a freshly assembled pack. This makes the shared
+            // derivation TOTAL and input-order-independent on BOTH paths.
+            .then_with(|| a.resolution.cmp(&b.resolution))
+    });
+    joins
+}
+
 /// Builds the `error_signatures` summary rows (AC1) from the in-window signature
 /// nodes plus the exemplar (`FINGERPRINTED_AS`) and frame-resolution
 /// (`FRAME_RESOLVES_TO`) joins over the whole record set. Redaction-safe: every
@@ -2452,25 +2507,14 @@ fn build_error_signature_rows(
         });
         exemplars.dedup();
 
-        // Frame joins: propagate the resolution label verbatim (#152/#134).
-        let mut frame_resolutions: Vec<FrameResolutionJoin> = frame_edges_by_signature
-            .get(&signature_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|edge| match edge {
-                GraphRecord::Edge { target, .. } => Some(FrameResolutionJoin {
-                    frame_index: edge.frame_index(),
-                    resolution: edge.frame_resolution().map(|r| r.as_str().to_owned()),
-                    target_id: target.clone(),
-                }),
-                _ => None,
-            })
-            .collect();
-        frame_resolutions.sort_by(|a, b| {
-            a.frame_index
-                .cmp(&b.frame_index)
-                .then_with(|| a.target_id.cmp(&b.target_id))
-        });
+        // Frame joins: propagate the resolution label verbatim (#152/#134),
+        // through the shared derivation `verify` recomputes against (issue #371).
+        let empty: Vec<&GraphRecord> = Vec::new();
+        let frame_resolutions = frame_resolution_joins(
+            frame_edges_by_signature
+                .get(&signature_id)
+                .unwrap_or(&empty),
+        );
 
         rows.push(ErrorSignatureRow {
             signature_id,
@@ -2621,6 +2665,14 @@ fn build_remediation_links(
             .then_with(|| a.symbol_id.cmp(&b.symbol_id))
             .then_with(|| a.commit_id.cmp(&b.commit_id))
             .then_with(|| a.commit_valid_time.cmp(&b.commit_valid_time))
+            // `frame_index`/`frame_resolution` complete the key (issue #371, Codex
+            // round-7 P2): two FRAME_RESOLVES_TO edges sharing (signature, target)
+            // but differing in resolution mint two remediation rows identical on
+            // every key above; without these tiebreakers a stable sort preserves the
+            // caller's input edge order and the derived leads (and the pack bytes)
+            // would depend on it.
+            .then_with(|| a.frame_index.cmp(&b.frame_index))
+            .then_with(|| a.frame_resolution.cmp(&b.frame_resolution))
     });
     rows.dedup();
     rows
@@ -2879,7 +2931,30 @@ fn bind_log_summary_integrity(section: &EvidenceSection, window: &Window) -> Res
     match summary {
         LogEvidenceSummary::ErrorSignatures { signatures } => {
             require_summary_on_class(&section.class, "error_signatures")?;
-            bind_error_signature_rows(&section.class, signatures, &node_by_id, window)
+            // The frame-resolution attribution rides the co-located
+            // `ErrorSignature --FRAME_RESOLVES_TO--> target` edges (issue #371),
+            // mirroring the occurrence_buckets AGGREGATES bind (issue #340, round-3
+            // P1): the signature NODE carries no frame-resolution field, so each
+            // row's `frame_resolutions` is bound against these hash-bound edges,
+            // grouped by their source signature — not the node.
+            let mut frame_edges_by_signature: BTreeMap<&str, Vec<&GraphRecord>> = BTreeMap::new();
+            for br in &section.records {
+                if let GraphRecord::Edge { label, source, .. } = &br.record
+                    && label.as_str() == "FRAME_RESOLVES_TO"
+                {
+                    frame_edges_by_signature
+                        .entry(source.as_str())
+                        .or_default()
+                        .push(&br.record);
+                }
+            }
+            bind_error_signature_rows(
+                &section.class,
+                signatures,
+                &node_by_id,
+                &frame_edges_by_signature,
+                window,
+            )
         }
         LogEvidenceSummary::OccurrenceBuckets { signature_totals } => {
             require_summary_on_class(&section.class, "occurrence_buckets")?;
@@ -2937,12 +3012,15 @@ fn require_summary_on_class(class: &str, expected: &str) -> Result<(), String> {
 /// Binds every `error_signatures` summary row to its backing hashed `ErrorSignature`
 /// node in the section (issue #340): an exact one-to-one correspondence, and each
 /// row's `template_hash`, `frame_chain_hash`, `severity`, and window-clipped span
-/// recomputed from the node payload. The exemplar/frame-resolution fields ride
-/// edges absent from the pack and are bound by the whole-summary hash only.
+/// recomputed from the node payload. The `frame_resolutions` field is additionally
+/// re-derived from the co-located `FRAME_RESOLVES_TO` edges (issue #371). Only the
+/// exemplar handles ride a node absent from the pack (the redaction-scrubbed
+/// `LogEvent`) and are bound by the whole-summary hash alone.
 fn bind_error_signature_rows(
     class: &str,
     signatures: &[ErrorSignatureRow],
     node_by_id: &BTreeMap<&str, &GraphRecord>,
+    frame_edges_by_signature: &BTreeMap<&str, Vec<&GraphRecord>>,
     window: &Window,
 ) -> Result<(), String> {
     // Exact bijection: one summary row per section ErrorSignature node, so a
@@ -3051,6 +3129,39 @@ fn bind_error_signature_rows(
                 ));
             }
         }
+        // Frame-resolution attribution bind (issue #371).
+        bind_frame_resolutions(class, row, frame_edges_by_signature)?;
+    }
+    Ok(())
+}
+
+/// Binds one `error_signatures` row's `frame_resolutions` to the co-located
+/// `FRAME_RESOLVES_TO` edges sourced at its signature (issue #371): the row must
+/// EQUAL the shared `frame_resolution_joins` derivation of those edges — the EXACT
+/// mapping + ordering `build_error_signature_rows` used — so a relabeled resolution,
+/// a moved `frame_index`, a retargeted edge, a dropped edge, or an added/smuggled
+/// edge all break the equality, and the whole-summary hash is no longer the sole
+/// binding surface for these two fields. Section membership already restricts the
+/// co-located edges to `FRAME_RESOLVES_TO` edges sourced at a present signature node,
+/// and the caller's row bijection guarantees every such source has exactly one
+/// summary row, so no frame edge escapes this per-row check.
+fn bind_frame_resolutions(
+    class: &str,
+    row: &ErrorSignatureRow,
+    frame_edges_by_signature: &BTreeMap<&str, Vec<&GraphRecord>>,
+) -> Result<(), String> {
+    let empty: Vec<&GraphRecord> = Vec::new();
+    let expected = frame_resolution_joins(
+        frame_edges_by_signature
+            .get(row.signature_id.as_str())
+            .unwrap_or(&empty),
+    );
+    if row.frame_resolutions != expected {
+        return Err(format!(
+            "error_signatures row {} frame_resolutions do not bind their \
+             co-located FRAME_RESOLVES_TO edges in section {class}",
+            row.signature_id
+        ));
     }
     Ok(())
 }
@@ -3458,6 +3569,50 @@ pub fn assemble_pack(
                     && included_ids.contains(source.as_str())
                 {
                     buckets.push(record.clone());
+                }
+            }
+        }
+    }
+
+    // --- error-signature frame-resolution attribution (issue #371) ---
+    // Each `error_signatures` summary row propagates its `FRAME_RESOLVES_TO` edges
+    // verbatim as `frame_resolutions` (the resolution label + `frame_index`, issues
+    // #152/#134), but the summary's `template_hash`/`frame_chain_hash`/severity/span
+    // fields are recomputed by `verify_pack` from the co-located `ErrorSignature`
+    // NODE while the `frame_resolution`/`frame_index` fields were bound ONLY by the
+    // whole-summary hash — weaker than every node-backed field. Mirror the #340/#365
+    // AGGREGATES treatment: co-locate every
+    // `ErrorSignature --FRAME_RESOLVES_TO--> {Symbol|File|Diagnostic}` edge whose
+    // SOURCE is an included in-window signature as a hash-bound row, so `verify_pack`
+    // re-derives each row's frame joins from tamper-evident evidence. Unlike the
+    // bucket case there is NO exclusion: a signature with zero frame edges is
+    // legitimate (never mis-attributed), so every in-window signature stays and only
+    // its frame edges (if any) are appended. The bind reads only edge identity +
+    // label + `frame_index` + endpoint IDs; the edge's REQUIRED free-text `summary`
+    // is not read here, but an older/hand-authored importer could populate it with
+    // raw backtrace/log text, so `scrub_log_node_text` clears a FRAME_RESOLVES_TO
+    // edge's summary in `build_section_records` before it enters a hashed row —
+    // preserving the zero-raw-log Safety invariant (issue #371, Codex P2).
+    {
+        if let Some(signatures) =
+            in_window_by_class.get_mut(EvidenceClass::ErrorSignatures.as_wire())
+        {
+            let signature_ids: BTreeSet<String> = signatures
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        node_log_payload(r),
+                        Some(crate::ir::LogPayload::ErrorSignature(_))
+                    )
+                })
+                .map(|r| r.id().to_owned())
+                .collect();
+            for record in records {
+                if let GraphRecord::Edge { label, source, .. } = record
+                    && label.as_str() == "FRAME_RESOLVES_TO"
+                    && signature_ids.contains(source.as_str())
+                {
+                    signatures.push(record.clone());
                 }
             }
         }
@@ -4155,6 +4310,32 @@ fn pack_safety(rows: &[BundleRecord]) -> (bool, String) {
             return (
                 false,
                 format!("record {record_id} retains scrubbed field '{field}'"),
+            );
+        }
+        // Co-located `FRAME_RESOLVES_TO` attribution edges (issue #371) carry a
+        // required free-text `summary` that `scrub_log_node_text` clears at
+        // assemble time. But `verify_pack` reads `section.records` AS-IS and never
+        // re-runs that scrub, the frame binding derives only
+        // `frame_index`/`resolution`/`target_id` (never `summary`), and the checks
+        // above only catch secrets (`detect_secret`) and Node scrubbed fields
+        // (`first_unscrubbed_field` is a no-op for edges). So a NON-secret raw
+        // backtrace placed in this summary — with the row hash recomputed so
+        // Integrity passes — would otherwise verify clean. Treat a nonempty
+        // co-located frame-edge summary as an unscrubbed field so verify FAILS
+        // Safety, mirroring the assemble-side scrub discipline.
+        if let GraphRecord::Edge {
+            label: crate::ir::EdgeLabel::FrameResolvesTo,
+            summary,
+            ..
+        } = &br.record
+            && !summary.is_empty()
+        {
+            return (
+                false,
+                format!(
+                    "record {record_id} retains scrubbed field 'summary' \
+                     (co-located FRAME_RESOLVES_TO edge)"
+                ),
             );
         }
     }
@@ -4948,6 +5129,52 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     break 'integrity;
                 }
             }
+        } else if section.class == EvidenceClass::ErrorSignatures.as_wire() {
+            // `error_signatures` legitimately co-locates the frame-resolution
+            // attribution edges (issue #371): `ErrorSignature --FRAME_RESOLVES_TO-->
+            // {Symbol|File|Diagnostic}`, the hash-bound binding verify re-derives each
+            // row's `frame_resolution`/`frame_index` from. Those edges map to no
+            // evidence class, so the class check cannot apply to them — but the
+            // exemption is BOUNDED (mirroring occurrence_buckets/review_coverage): an
+            // edge is admitted IFF it is a FRAME_RESOLVES_TO edge whose SOURCE is an
+            // ErrorSignature node present in the section. Anything else (a node mapping
+            // to a non-error_signatures class, an unrelated edge label, a
+            // FRAME_RESOLVES_TO edge sourced at a non-present signature) still fails
+            // Integrity, so nothing can be smuggled in as a fake attribution.
+            let signature_node_ids: BTreeSet<&str> = section
+                .records
+                .iter()
+                .filter(|br| {
+                    matches!(
+                        node_log_payload(&br.record),
+                        Some(crate::ir::LogPayload::ErrorSignature(_))
+                    )
+                })
+                .map(|br| br.record.id())
+                .collect();
+            for br in &section.records {
+                let admitted = match &br.record {
+                    GraphRecord::Edge { label, source, .. } => {
+                        label.as_str() == "FRAME_RESOLVES_TO"
+                            && signature_node_ids.contains(source.as_str())
+                    }
+                    _ => {
+                        evidence_class_for_record(&br.record).map(|c| c.as_wire())
+                            == Some(section.class.as_str())
+                    }
+                };
+                if !admitted {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "record {} in section {} is neither an error_signatures record nor \
+                         a FRAME_RESOLVES_TO attribution edge for a present signature (section \
+                         membership mismatch)",
+                        br.record.id(),
+                        section.class,
+                    );
+                    break 'integrity;
+                }
+            }
         } else {
             for br in &section.records {
                 let actual = evidence_class_for_record(&br.record).map(|c| c.as_wire());
@@ -5175,6 +5402,15 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                         // it with, so assemble and verify agree.
                         matches!(resolved, Some(t) if bucket_hour_intersects_window(t, from, to))
                     }
+                } else if section.class == EvidenceClass::ErrorSignatures.as_wire()
+                    && matches!(&br.record, GraphRecord::Edge { label, .. } if label.as_str() == "FRAME_RESOLVES_TO")
+                {
+                    // A co-located `FRAME_RESOLVES_TO` attribution edge (issue #371)
+                    // carries no valid time of its own; its window relevance rides the
+                    // signature it binds (the signature NODE is held to the point
+                    // predicate below). Section membership already restricts it to
+                    // edges sourced at a present signature.
+                    true
                 } else {
                     matches!(resolved, Some(t) if from <= t && t < to)
                 };
@@ -10637,8 +10873,28 @@ mod pack340_tests {
         assert_eq!(sec.status, "present");
         assert_eq!(sec.outcome, ClassOutcome::Pass);
         assert!(sec.unavailable_reason.is_none());
-        // All three in-window signatures surface as hashed rows.
-        assert_eq!(sec.record_count, 3);
+        // All three in-window signatures surface as hashed rows, plus sig1's one
+        // co-located `FRAME_RESOLVES_TO` attribution edge (issue #371): 3 nodes + 1
+        // edge = 4 hashed rows.
+        assert_eq!(sec.record_count, 4);
+        let sig_node_rows = sec
+            .records
+            .iter()
+            .filter(|br| matches!(br.record, GraphRecord::Node { .. }))
+            .count();
+        let frame_edge_rows = sec
+            .records
+            .iter()
+            .filter(|br| {
+                matches!(&br.record,
+                GraphRecord::Edge { label, .. } if label.as_str() == "FRAME_RESOLVES_TO")
+            })
+            .count();
+        assert_eq!(sig_node_rows, 3, "3 in-window ErrorSignature nodes");
+        assert_eq!(
+            frame_edge_rows, 1,
+            "sig1's single FRAME_RESOLVES_TO attribution edge co-located"
+        );
         // Zero `unavailable` markers when records present (AC1).
         assert!(
             !pack
@@ -10690,6 +10946,105 @@ mod pack340_tests {
         // sig2/sig3 carry no frames.
         assert!(signatures[1].frame_chain_hash.is_none());
         assert!(signatures[1].frame_resolutions.is_empty());
+    }
+
+    // Builds a `sig1 --FRAME_RESOLVES_TO--> codegraph:v5:sym-db` edge at
+    // frame_index 0 with a caller-chosen resolution and an explicit stable id.
+    // The real `log_resolve::resolve_frames` folds `resolution` into the edge id,
+    // so two edges sharing (signature, frame_index, target) but differing in
+    // resolution coexist as distinct records — this helper reproduces that (the
+    // `fixture::frame_resolves_to` id omits resolution, so it would collapse the
+    // pair under `coalesce_log_records`).
+    fn frame_edge_with_id(id: &str, resolution: crate::ir::FrameResolution) -> GraphRecord {
+        let mut e =
+            super::fixture::frame_resolves_to("log:v1:sig1", "codegraph:v5:sym-db", resolution, 0);
+        if let GraphRecord::Edge { id: eid, .. } = &mut e {
+            *eid = id.to_owned();
+        }
+        e
+    }
+
+    // Issue #371, Codex round-7 P2: when a graph carries two FRAME_RESOLVES_TO
+    // edges for the SAME signature+frame_index+target but DIFFERENT resolution,
+    // the shared `frame_resolution_joins` derivation must be a TOTAL order so
+    // assemble (which sees the input edge order) and verify (which sees the
+    // canonically id-sorted section rows) agree, and the assembled pack is
+    // byte-identical regardless of input edge order. Without `resolution` in the
+    // sort key the two joins compare EQUAL, a stable sort preserves each caller's
+    // differing input order, and (a) verify rejects the freshly assembled pack
+    // and (b) reversing the input edges changes the pack bytes.
+    #[test]
+    fn frame_join_ordering_is_total_over_resolution_across_assemble_and_verify() {
+        // Craft ids so the section's id-ascending canonical order is the REVERSE
+        // of the input order below: "...path_only" < "...resolved" lexically.
+        let id_resolved = "log:v1:edge-frame-sig1-symdb-resolved";
+        let id_path_only = "log:v1:edge-frame-sig1-symdb-path_only";
+
+        // Base incident, minus its built-in single FRAME_RESOLVES_TO edge so this
+        // test wholly controls sig1's frame edges.
+        let base: Vec<GraphRecord> = build_log_incident_records()
+            .into_iter()
+            .filter(|r| {
+                !matches!(r,
+                    GraphRecord::Edge { label, .. } if label.as_str() == "FRAME_RESOLVES_TO")
+            })
+            .collect();
+
+        let e_resolved = frame_edge_with_id(id_resolved, crate::ir::FrameResolution::Resolved);
+        let e_path_only = frame_edge_with_id(id_path_only, crate::ir::FrameResolution::PathOnly);
+
+        // Forward input order: resolved (larger id) FIRST, path_only (smaller id)
+        // SECOND — the reverse of the section's id-ascending order.
+        let mut fwd = base.clone();
+        fwd.push(e_resolved.clone());
+        fwd.push(e_path_only.clone());
+
+        // Reversed input order: same two edges, swapped.
+        let mut rev = base;
+        rev.push(e_path_only);
+        rev.push(e_resolved);
+
+        let pack_fwd = assemble_cc73(&fwd);
+        let pack_rev = assemble_cc73(&rev);
+
+        // (a) Round-trip: a freshly assembled pack must pass its own verify. Before
+        // the fix, assemble records [resolved, path_only] (input order) while verify
+        // recomputes [path_only, resolved] (section id order), so integrity fails.
+        let report = verify_pack(&pack_fwd);
+        assert!(
+            report.ok,
+            "freshly assembled pack must pass verify (round-trip): {report:?}"
+        );
+
+        // (b) Determinism: the assembled pack must be byte-identical regardless of
+        // the caller's input edge order. Before the fix the tied joins keep input
+        // order, so the two packs diverge.
+        let bytes_fwd = serde_json::to_vec(&pack_fwd).expect("serialize fwd");
+        let bytes_rev = serde_json::to_vec(&pack_rev).expect("serialize rev");
+        assert_eq!(
+            bytes_fwd, bytes_rev,
+            "pack bytes must be independent of input FRAME_RESOLVES_TO edge order"
+        );
+
+        // Both packs must land on the total order (path_only < resolved).
+        let sec = section(&pack_fwd, EvidenceClass::ErrorSignatures);
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = &sec.log_summary else {
+            panic!("error_signatures summary present");
+        };
+        let sig1 = signatures
+            .iter()
+            .find(|s| s.signature_id == "log:v1:sig1")
+            .expect("sig1 row present");
+        let labels: Vec<Option<&str>> = sig1
+            .frame_resolutions
+            .iter()
+            .map(|j| j.resolution.as_deref())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![Some("path_only"), Some("resolved")],
+            "frame joins sorted by (frame_index, target_id, resolution)"
+        );
     }
 
     // ── AC2: occurrence_buckets ───────────────────────────────────────────────
@@ -11023,6 +11378,136 @@ mod pack340_tests {
                 "raw log template/frame text `{raw}` must never appear in the pack"
             );
         }
+    }
+
+    /// Issue #371 (Codex P2 Safety/redaction): a co-located `FRAME_RESOLVES_TO`
+    /// edge's REQUIRED free-text `summary` must never carry raw log/backtrace text
+    /// into a hashed `error_signatures` row. `resolve-frames` synthesizes a safe
+    /// summary, but an older/hand-authored importer can populate that field with
+    /// anything; `bundle::scrub_record` only SECRET-redacts an edge summary and
+    /// `scrub_log_node_text` is a Node-only no-op for edges, so non-secret raw
+    /// text would otherwise ride the hashed row while Safety (secret + Node
+    /// scrubbed-field checks) still passes. The #371 binding recomputes from
+    /// `frame_resolution` + `frame_index` + endpoint IDs only, so clearing the
+    /// summary preserves the assemble->verify round-trip.
+    #[test]
+    fn co_located_frame_edge_summary_raw_text_never_rides_the_pack() {
+        const RAW_FRAME_SENTINEL: &str = "RAW_FRAME_SENTINEL_backtrace_line";
+        let mut records = build_log_incident_records();
+        // Plant raw backtrace text in the sig1 FRAME_RESOLVES_TO edge summary the
+        // way an older/hand-authored importer could (the field is a required
+        // String that deserializes verbatim from graph JSONL).
+        let mut planted = false;
+        for r in &mut records {
+            if let GraphRecord::Edge { label, summary, .. } = r
+                && label.as_str() == "FRAME_RESOLVES_TO"
+            {
+                *summary = format!("{RAW_FRAME_SENTINEL} at src/db.rs:42 in app::db::connect");
+                planted = true;
+            }
+        }
+        assert!(
+            planted,
+            "fixture carries a FRAME_RESOLVES_TO edge to plant on"
+        );
+
+        let pack = assemble_cc73(&records);
+
+        // (a) The sentinel must be absent from the whole assembled artifact.
+        let serialized = serde_json::to_string(&pack).expect("serializes");
+        assert!(
+            !serialized.contains(RAW_FRAME_SENTINEL),
+            "raw frame-edge summary text must never appear in the assembled pack"
+        );
+
+        // (b) Safety passes AND the round-trip verifies clean.
+        let report = verify_pack(&pack);
+        assert!(report.safety.passed, "{:?}", report.safety);
+        assert!(report.integrity.passed, "{:?}", report.integrity);
+        assert!(
+            report.ok,
+            "round-trip verify clean after frame-summary scrub"
+        );
+
+        // The #371 binding is preserved: sig1 still carries its resolved frame join.
+        let sec = section(&pack, EvidenceClass::ErrorSignatures);
+        let Some(LogEvidenceSummary::ErrorSignatures { signatures }) = &sec.log_summary else {
+            panic!("error_signatures summary present");
+        };
+        let sig1 = signatures
+            .iter()
+            .find(|s| s.signature_id == "log:v1:sig1")
+            .expect("sig1 present");
+        assert_eq!(sig1.frame_resolutions.len(), 1);
+        assert_eq!(sig1.frame_resolutions[0].target_id, "codegraph:v5:sym-db");
+    }
+
+    /// Issue #371 (Codex P2 verify-side follow-on): the assemble-side scrub clears
+    /// a co-located `FRAME_RESOLVES_TO` edge's free-text `summary`, but
+    /// `verify_pack` reads `section.records` AS-IS and never re-runs
+    /// `scrub_log_node_text`. The frame binding derives only
+    /// `frame_index`/`resolution`/`target_id` and ignores `summary`, and pack
+    /// Safety only runs `detect_secret` + a Node-only `first_unscrubbed_field`, so
+    /// a NON-secret raw backtrace injected into such an edge summary — with the
+    /// row hash recomputed so Integrity passes — would verify clean without an
+    /// explicit verify-side check. Safety must reject a nonempty co-located
+    /// frame-edge summary.
+    #[test]
+    fn verify_rejects_raw_text_in_co_located_frame_edge_summary() {
+        const RAW_FRAME_SENTINEL: &str = "RAW_FRAME_SENTINEL_backtrace_line";
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+
+        // A clean assembled pack (summaries already cleared) verifies ok.
+        assert!(
+            verify_pack(&pack).ok,
+            "clean assembled pack verifies before tampering"
+        );
+
+        // Inject raw backtrace text into a co-located FRAME_RESOLVES_TO edge row's
+        // summary and RECOMPUTE that row's content hash so Integrity still passes
+        // — only the new Safety check can catch it.
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+            .expect("error_signatures section");
+        let mut injected = false;
+        for br in &mut sec.records {
+            if let GraphRecord::Edge { label, summary, .. } = &mut br.record
+                && label.as_str() == "FRAME_RESOLVES_TO"
+            {
+                *summary = format!("{RAW_FRAME_SENTINEL} at src/db.rs:42 in app::db::connect");
+                br.hash =
+                    blake3::hash(serde_json::to_string(&br.record).unwrap().as_bytes()).to_string();
+                injected = true;
+                break;
+            }
+        }
+        assert!(
+            injected,
+            "clean pack co-locates a FRAME_RESOLVES_TO edge row to inject on"
+        );
+
+        let report = verify_pack(&pack);
+        // Integrity still passes — the row hash was recomputed to match, so only
+        // the new Safety check stands between the tamper and a clean verdict.
+        assert!(
+            report.integrity.passed,
+            "row hash recomputed so Integrity passes: {}",
+            report.integrity.detail
+        );
+        // Safety must reject the nonempty co-located frame-edge summary.
+        assert!(
+            !report.safety.passed,
+            "a nonempty co-located FRAME_RESOLVES_TO summary must fail Safety"
+        );
+        assert!(
+            report.safety.detail.contains("summary"),
+            "Safety detail names the frame-edge summary: {}",
+            report.safety.detail
+        );
+        assert!(!report.ok, "verify rejects the tampered pack");
     }
 
     /// Codex round-4 P2: the `error_signatures` section's hashed records must NOT
@@ -11627,8 +12112,9 @@ mod pack340_tests {
             "one coalesced row per signature ID"
         );
         assert_eq!(
-            sig_sec.record_count, 3,
-            "one hashed ErrorSignature node per stable ID"
+            sig_sec.record_count, 4,
+            "one hashed ErrorSignature node per stable ID (3) plus sig1's single \
+             coalesced FRAME_RESOLVES_TO attribution edge (issue #371)"
         );
 
         // Summed (doubled) occurrence counts on the merged section nodes.
@@ -11948,11 +12434,13 @@ mod pack340_tests {
     #[test]
     fn systematic_error_signature_summary_mutations_fail_verify() {
         // Every NODE-BACKED error-signature summary field + row operation must fail
-        // verify even with the whole-summary hash recomputed. (The exemplar and
-        // frame-resolution fields ride edges/nodes that CANNOT be co-located — the
-        // LogEvent exemplar node carries redaction-scrubbed excerpt text whose
-        // presence would violate the zero-raw-log Safety invariant — so those are
-        // bound solely by the whole-summary hash and are exercised separately.)
+        // verify even with the whole-summary hash recomputed. (The exemplar fields
+        // ride the LogEvent node, which CANNOT be co-located — it carries
+        // redaction-scrubbed excerpt text whose presence would violate the
+        // zero-raw-log Safety invariant — so those are bound solely by the
+        // whole-summary hash and are exercised separately. The `frame_resolutions`
+        // field IS now independently bound to co-located FRAME_RESOLVES_TO edges
+        // (issue #371) and is exercised by its own systematic suite.)
         type Mutation = fn(&mut Vec<ErrorSignatureRow>);
         let cases: &[(&str, Mutation)] = &[
             ("template_hash", |s| {
@@ -12014,19 +12502,146 @@ mod pack340_tests {
         }
     }
 
+    #[test]
+    fn systematic_frame_resolution_summary_mutations_fail_verify() {
+        // Issue #371: the `frame_resolution` label and `frame_index` on an
+        // error_signatures row are now INDEPENDENTLY bound to the co-located
+        // `FRAME_RESOLVES_TO` edges (mirroring the #340/#365 AGGREGATES bind), not
+        // just the whole-summary hash. Every case ALSO recomputes the whole-summary
+        // `log_summary_hash` (and `record_count` when it touches records), so the
+        // independent edge recompute — never the whole-summary hash — is the only
+        // thing that can catch it. Each mutation moves, drops, adds, relabels, or
+        // retargets a frame resolution from either the summary side or the co-located
+        // edge side, and must fail Integrity.
+        type Mutation = fn(&mut EvidenceSection);
+        let cases: &[(&str, Mutation)] = &[
+            // Relabel the resolution in the SUMMARY only: the co-located edge still
+            // says `resolved`, so the per-row recompute diverges.
+            ("relabel_resolution_in_summary", |sec| {
+                if let Some(LogEvidenceSummary::ErrorSignatures { signatures }) =
+                    sec.log_summary.as_mut()
+                {
+                    let sig1 = signatures
+                        .iter_mut()
+                        .find(|r| r.signature_id == "log:v1:sig1")
+                        .expect("sig1 carries a frame join");
+                    sig1.frame_resolutions[0].resolution = Some("unresolved".to_owned());
+                }
+            }),
+            // Move the `frame_index` in the SUMMARY only.
+            ("move_frame_index_in_summary", |sec| {
+                if let Some(LogEvidenceSummary::ErrorSignatures { signatures }) =
+                    sec.log_summary.as_mut()
+                {
+                    let sig1 = signatures
+                        .iter_mut()
+                        .find(|r| r.signature_id == "log:v1:sig1")
+                        .expect("sig1 carries a frame join");
+                    sig1.frame_resolutions[0].frame_index = Some(9);
+                }
+            }),
+            // Retarget the resolution in the SUMMARY only.
+            ("retarget_resolution_in_summary", |sec| {
+                if let Some(LogEvidenceSummary::ErrorSignatures { signatures }) =
+                    sec.log_summary.as_mut()
+                {
+                    let sig1 = signatures
+                        .iter_mut()
+                        .find(|r| r.signature_id == "log:v1:sig1")
+                        .expect("sig1 carries a frame join");
+                    sig1.frame_resolutions[0].target_id = "codegraph:v5:ghost".to_owned();
+                }
+            }),
+            // Drop the co-located FRAME_RESOLVES_TO edge but keep the summary join —
+            // the row now claims a frame resolution with no backing edge.
+            ("drop_frame_edge", |sec| {
+                sec.records.retain(|br| {
+                    !matches!(&br.record,
+                        GraphRecord::Edge { label, .. } if label.as_str() == "FRAME_RESOLVES_TO")
+                });
+                sec.record_count = sec.records.len();
+            }),
+            // Relabel the co-located EDGE (rehashing its row) while leaving the
+            // summary join untouched — the summary no longer matches the edge it is
+            // bound to.
+            ("relabel_frame_edge_row", |sec| {
+                sec.records.retain(|br| {
+                    !matches!(&br.record,
+                        GraphRecord::Edge { label, .. } if label.as_str() == "FRAME_RESOLVES_TO")
+                });
+                let relabeled = super::fixture::frame_resolves_to(
+                    "log:v1:sig1",
+                    "codegraph:v5:sym-db",
+                    crate::ir::FrameResolution::Unresolved,
+                    0,
+                );
+                let scrubbed = scrub_log_node_text(scrub_record(relabeled));
+                let json = serde_json::to_string(&scrubbed).unwrap();
+                let hash = blake3::hash(json.as_bytes()).to_string();
+                sec.records.push(BundleRecord {
+                    record: scrubbed,
+                    hash,
+                });
+                sec.records
+                    .sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
+                sec.record_count = sec.records.len();
+            }),
+            // Smuggle a NEW FRAME_RESOLVES_TO edge sourced at sig2 (which the summary
+            // says has NO frames) into the section. Membership admits it (sourced at a
+            // present signature), but the per-row recompute rejects sig2's now-nonempty
+            // reconstruction against its empty summary join.
+            ("add_smuggled_frame_edge", |sec| {
+                let edge = super::fixture::frame_resolves_to(
+                    "log:v1:sig2",
+                    "codegraph:v5:sym-db",
+                    crate::ir::FrameResolution::Resolved,
+                    0,
+                );
+                let scrubbed = scrub_log_node_text(scrub_record(edge));
+                let json = serde_json::to_string(&scrubbed).unwrap();
+                let hash = blake3::hash(json.as_bytes()).to_string();
+                sec.records.push(BundleRecord {
+                    record: scrubbed,
+                    hash,
+                });
+                sec.records
+                    .sort_by(|a, b| section_sort_key(&a.record).cmp(&section_sort_key(&b.record)));
+                sec.record_count = sec.records.len();
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut pack = assemble_cc73(&build_log_incident_records());
+            let sec = pack
+                .sections
+                .iter_mut()
+                .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+                .expect("error_signatures section");
+            mutate(sec);
+            // Recompute the whole-summary hash so it can NEVER be what catches the
+            // tamper — only the independent frame-edge recompute can.
+            sec.log_summary_hash = Some(hash_log_summary(sec.log_summary.as_ref().unwrap()));
+            let report = verify_pack(&pack);
+            assert!(
+                !report.integrity.passed,
+                "frame-resolution mutation `{name}` must fail Integrity (hash recomputed)"
+            );
+        }
+    }
+
     // ── Binding-surface boundary for the non-node-backed fields ───────────────
-    // The exemplar (`protected_handle`/`content_hash`/`source_line`) and
-    // `frame_resolutions` fields on an `error_signatures` row, and EVERY
-    // `remediation_links` field, ride edges/nodes that CANNOT be co-located as
-    // hashed rows: the `LogEvent` exemplar node carries redaction-scrubbed excerpt
-    // text whose presence would violate the zero-raw-log Safety invariant, and the
-    // `remediation_links` section is defined to carry ZERO hashed rows (a
-    // remediation commit may legitimately fall OUTSIDE the evidence window). Their
-    // SOLE binding surface is therefore the whole-summary `log_summary_hash`: a
-    // tamper that does NOT recompute that hash fails Integrity (asserted here); a
-    // tamper that also recomputes it is equivalent to re-deriving the summary and is
-    // the pack's general fabricate-a-consistent-artifact threat, out of scope for an
-    // offline internal-consistency check.
+    // The exemplar (`protected_handle`/`content_hash`/`source_line`) fields on an
+    // `error_signatures` row, and EVERY `remediation_links` field, ride edges/nodes
+    // that CANNOT be co-located as hashed rows: the `LogEvent` exemplar node carries
+    // redaction-scrubbed excerpt text whose presence would violate the zero-raw-log
+    // Safety invariant, and the `remediation_links` section is defined to carry ZERO
+    // hashed rows (a remediation commit may legitimately fall OUTSIDE the evidence
+    // window). Their SOLE binding surface is therefore the whole-summary
+    // `log_summary_hash`: a tamper that does NOT recompute that hash fails Integrity
+    // (asserted here); a tamper that also recomputes it is equivalent to re-deriving
+    // the summary and is the pack's general fabricate-a-consistent-artifact threat,
+    // out of scope for an offline internal-consistency check. (The `frame_resolutions`
+    // field is the EXCEPTION closed by issue #371 — it now co-locates its
+    // FRAME_RESOLVES_TO edges and is independently bound, tested above.)
 
     #[test]
     fn exemplar_handle_tamper_is_caught_by_whole_summary_hash() {
