@@ -2835,6 +2835,147 @@ fn real_scan_cross_file_external_import_is_not_misresolved() {
 }
 
 // ---------------------------------------------------------------------------
+// Round-10 review (Codex): the round-9 import-shadow veto must respect Rust's
+// real `use` visibility rules, or it drops VALID IMPLEMENTS edges. A `use`
+// inside a function body / block is NOT visible to module-level impls, so it
+// must never veto. One file: a block-local `use std::fmt::Display` inside a
+// helper fn must not suppress the module-level `impl Display for Foo`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_block_local_use_does_not_shadow_impl() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait Display {}\n\n",
+            "pub struct Foo;\n\n",
+            "fn helper() {\n",
+            "    use std::fmt::Display;\n",
+            "    let _ = 0;\n",
+            "}\n\n",
+            "impl Display for Foo {}\n",
+        ),
+    )
+    .expect("write lib.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    // The block-local `use` is invisible to the module-level impl, so bare
+    // `Display` resolves to the local root trait — the impl must edge-back and
+    // `Display` must report `Foo` as an implementor.
+    let stdout = egregore()
+        .args(["query", "implementors", "Display", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert!(
+        rows.iter()
+            .filter_map(|r| r["implementing_type"].as_str())
+            .any(|ty| ty == "Foo"),
+        "block-local `use` must not veto the module-level impl; Foo must implement Display: {rows:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round-10 review (Codex): imports are NOT inherited by child modules, so an
+// ancestor/root `use` cannot shadow anything inside `mod m`. One file: a root
+// `use std::fmt::Display` must not shadow the bare `Display` in `mod m`, which
+// resolves to m's own trait `Display` — the impl inside `m` must edge-back.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_ancestor_use_does_not_shadow_own_module_impl() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "use std::fmt::Display;\n\n",
+            "pub trait UnusedOuter {}\n\n",
+            "pub mod m {\n",
+            "    pub trait Display {}\n\n",
+            "    pub struct Foo;\n\n",
+            "    impl Display for Foo {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write lib.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    // The root `use std::fmt::Display` is not inherited by `mod m`, so bare
+    // `Display` inside `m` resolves to m's own trait — m::Foo must implement it.
+    let stdout = egregore()
+        .args(["query", "implementors", "m::Display", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert!(
+        rows.iter()
+            .filter_map(|r| r["implementing_type"].as_str())
+            .any(|ty| ty == "m::Foo"),
+        "ancestor `use` must not shadow m's own-module trait; m::Foo must implement m::Display: {rows:?}"
+    );
+
+    // Stronger bound: an IMPLEMENTS edge targets m's own trait `Display`.
+    let graph = fs::read_to_string(&graph_path).expect("read graph");
+    let records: Vec<serde_json::Value> = graph
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    let m_display_id = records
+        .iter()
+        .find(|r| {
+            r["record_type"] == "node" && r["symbol_kind"] == "trait" && r["name"] == "m::Display"
+        })
+        .and_then(|r| r["id"].as_str().map(str::to_owned))
+        .expect("m::Display trait node present");
+    let implements_to_m_display = records
+        .iter()
+        .filter(|r| r["record_type"] == "edge" && r["label"] == "IMPLEMENTS")
+        .filter_map(|r| r["target"].as_str())
+        .any(|target| target == m_display_id);
+    assert!(
+        implements_to_m_display,
+        "an IMPLEMENTS edge must target m's own trait Display: {records:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Record-ID handles must stay valid under temporal selectors (PR #296 review):
 // `--at` / `--as-of` resolution must accept the trait's canonical record ID,
 // not only its name.

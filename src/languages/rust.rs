@@ -388,12 +388,23 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         // Record the simple names this `use` binds into the current module
         // scope for the import-shadow veto (issues #343/#344 round 9). Keyed by
         // the live module chain so visibility follows module nesting.
-        let bound = self.collect_use_bound_names(node);
-        if !bound.is_empty() {
-            self.imports_by_scope
-                .entry(self.module_names.clone())
-                .or_default()
-                .extend(bound);
+        //
+        // Only a MODULE-ITEM `use` feeds the veto: a `use` inside a function
+        // body / block / expression is invisible at module level, so it must
+        // never shadow a module-level impl's bare trait name (round-10 Codex
+        // finding). A module item's `use_declaration` sits directly under the
+        // `source_file` root or a `mod_item`'s `declaration_list` body; a
+        // block-local `use` sits under a `block`, so its parent kind reveals
+        // the difference. Non-module-item imports still emit their Import node
+        // and IMPORTS edge below — only the veto index skips them.
+        if is_module_item_use(node) {
+            let bound = self.collect_use_bound_names(node);
+            if !bound.is_empty() {
+                self.imports_by_scope
+                    .entry(self.module_names.clone())
+                    .or_default()
+                    .extend(bound);
+            }
         }
         let name = import_name(self.node_text(node));
         let id = stable_id(&[
@@ -1300,35 +1311,50 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             // never capture an IMPLEMENTS edge.
             return None;
         }
-        // Import-shadow veto (issues #343/#344 round 9): a `use` visible in the
-        // impl's module scope whose final bound segment equals this bare name
-        // means the bare name refers to the IMPORT, not any local same-name
-        // definition. Leave the impl unresolved REGARDLESS of a local same-name
-        // def — this is the AST-derived, name-shadow boolean that closes the
-        // whole bare-name wrong-edge family at once (external/std imports the
-        // local index cannot see AND non-root local aliases alike), a strict
-        // generalization of the round-8 same-name ambiguity guard below. A
-        // qualified path never reaches here, so this only vetoes bare names.
-        // Correct import-aware resolution is follow-up #393.
+        // Own-module definition wins at depth 0 BEFORE the veto (round-10 Codex
+        // finding): a trait/type defined in the impl's OWN module binds a bare
+        // name directly. In real Rust a same-module `use Name` PLUS a same-module
+        // `item Name` is a name collision (a compile error), so trusting the
+        // own-module definition here is safe and never masks a valid import —
+        // and it keeps an ancestor/root `use` from ever suppressing an impl of a
+        // same-named trait declared IN this module.
+        let own_scope_candidate = if module_names.is_empty() {
+            target.to_owned()
+        } else {
+            format!("{}::{target}", module_names.join("::"))
+        };
+        if let Some(id) = self.qualified_definitions.get(&own_scope_candidate) {
+            return Some(id.clone());
+        }
+        // Import-shadow veto (issues #343/#344): a module-item `use` in the
+        // impl's OWN module scope whose final bound segment equals this bare name
+        // means the bare name refers to the IMPORT, not any outward same-name
+        // definition. Leave the impl unresolved rather than walk outward to a
+        // shallower/root same-name def — this is the AST-derived, name-shadow
+        // boolean that closes the bare-name wrong-edge family (external/std
+        // imports the local index cannot see AND non-root local aliases alike),
+        // a strict generalization of the round-8 same-name ambiguity guard
+        // below. Only the impl's own module scope is consulted (Rust `use`
+        // visibility is not inherited) and only module-item imports feed it, so
+        // block-local and ancestor-scope imports never fire. A qualified path
+        // never reaches here, so this only vetoes bare names. Correct
+        // import-aware resolution is follow-up #393.
         if self.scope_imports_bare_name(module_names, target) {
             return None;
         }
-        // An unqualified trait name resolves in the impl's module scope
-        // first, walking outward to the crate root through the
+        // The own-module level was already checked above; now walk OUTWARD from
+        // the nearest enclosing module to the crate root through the
         // qualified-only key space, so a same-named trait in an unrelated
-        // nested module can never shadow the in-scope one via its bare
-        // alias.
-        for depth in (0..=module_names.len()).rev() {
+        // nested module can never shadow the in-scope one via its bare alias.
+        for depth in (0..module_names.len()).rev() {
             let candidate = if depth == 0 {
                 target.to_owned()
             } else {
                 format!("{}::{target}", module_names[..depth].join("::"))
             };
             if let Some(id) = self.qualified_definitions.get(&candidate) {
-                // A match in the impl's OWN module (the deepest, first-checked
-                // level) is what a bare name means and is trusted verbatim. A
-                // match found only by walking OUTWARD to a shallower/root module
-                // is the exact shape of the round-8 finding: `mod m { use
+                // A match found only by walking OUTWARD to a shallower/root
+                // module is the exact shape of the round-8 finding: `mod m { use
                 // crate::a::T; impl T for X }` scope-walks bare `T` past the
                 // (absent) `m::T` and binds the ROOT `T`, but the `use` alias
                 // means `a::T`. When such an outward bind's simple name is
@@ -1337,7 +1363,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 // unresolved rather than mint a WRONG edge — the local/inline
                 // analog of the cross-file guard, sharing its counting predicate
                 // ([`bare_simple_name_is_ambiguous`]) so the two never diverge.
-                if depth < module_names.len() && self.bare_name_is_ambiguous(target) {
+                if self.bare_name_is_ambiguous(target) {
                     return None;
                 }
                 return Some(id.clone());
@@ -1866,25 +1892,39 @@ fn collect_use_tree_names(node: Node<'_>, source: &str, out: &mut Vec<String>) {
     }
 }
 
-/// Reports whether a `use` import visible in the impl's module scope binds the
-/// bare simple name `bare`. An import declared in scope `S` is visible to an
-/// impl whose module chain has `S` as a prefix — the impl's own module and
-/// every descendant. This is the SINGLE shared predicate behind the
-/// import-shadow veto on BOTH IMPLEMENTS resolution paths: the local per-file
-/// resolver consults it directly, and the deferred cross-file pass reads the
-/// same answer off the `PendingImplFact::shadowed_by_use` boolean this predicate
-/// sets at extraction time — so the two paths can never diverge (issues
-/// #343/#344 round 9; correct import-aware resolution is follow-up #393).
+/// Reports whether a `use_declaration` is a MODULE ITEM — a direct child of the
+/// `source_file` root or of a `mod_item`'s `declaration_list` body — as opposed
+/// to a `use` nested inside a function body, `block`, or expression. Only a
+/// module-item `use` is visible to module-level impls, so only it feeds the
+/// import-shadow veto index (round-10 Codex finding: a block-local
+/// `fn helper() { use std::fmt::Display; }` must never shadow a module-level
+/// `impl Display for Foo`). A block-local `use`'s parent is a `block`; a
+/// module-item `use`'s parent is `source_file` or `declaration_list`.
+fn is_module_item_use(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| matches!(parent.kind(), "source_file" | "declaration_list"))
+}
+
+/// Reports whether a module-item `use` import in the impl's OWN module scope
+/// binds the bare simple name `bare`. Rust's `use` visibility is NOT inherited
+/// by child modules: an import declared in an ancestor/root scope cannot shadow
+/// a bare name inside `mod m`, so the veto consults ONLY the impl's exact own
+/// module-scope key — never prefix/ancestor scopes (round-10 Codex finding). A
+/// block-local `use` never reaches this index at all (see [`is_module_item_use`]).
+/// This is the SINGLE shared predicate behind the import-shadow veto on BOTH
+/// IMPLEMENTS resolution paths: the local per-file resolver consults it directly,
+/// and the deferred cross-file pass reads the same answer off the
+/// `PendingImplFact::shadowed_by_use` boolean this predicate sets at extraction
+/// time — so the two paths can never diverge (issues #343/#344; correct
+/// import-aware resolution is follow-up #393).
 fn scope_imports_bare_name(
     imports_by_scope: &BTreeMap<Vec<String>, BTreeSet<String>>,
     module_names: &[String],
     bare: &str,
 ) -> bool {
-    (0..=module_names.len()).any(|depth| {
-        imports_by_scope
-            .get(&module_names[..depth])
-            .is_some_and(|names| names.contains(bare))
-    })
+    imports_by_scope
+        .get(module_names)
+        .is_some_and(|names| names.contains(bare))
 }
 
 /// The IMPLEMENTS-resolution decision for one impl display header
@@ -3264,13 +3304,16 @@ mod tests {
     }
 
     #[test]
-    fn scope_imports_bare_name_applies_module_scope_visibility() {
-        // A file-top `use` (scope `[]`) binding `Display` is visible to an impl
-        // in any descendant module chain, and directly at file top.
+    fn scope_imports_bare_name_consults_only_the_impls_own_scope() {
+        // Rust `use` visibility is NOT inherited by child modules: the veto
+        // consults ONLY the impl's exact own module-scope key (round-10 Codex
+        // finding). A file-top `use` (scope `[]`) binding `Display` shadows a
+        // bare name at file top, but NOT one inside a descendant module.
         let mut imports: BTreeMap<Vec<String>, BTreeSet<String>> = BTreeMap::new();
         imports.insert(Vec::new(), BTreeSet::from(["Display".to_owned()]));
         assert!(scope_imports_bare_name(&imports, &[], "Display"));
-        assert!(scope_imports_bare_name(
+        // Ancestor/root `use` does NOT match a child scope.
+        assert!(!scope_imports_bare_name(
             &imports,
             &["m".to_owned(), "n".to_owned()],
             "Display"
@@ -3278,8 +3321,8 @@ mod tests {
         // A name it does not bind is never shadowed.
         assert!(!scope_imports_bare_name(&imports, &[], "Other"));
 
-        // A `use` inside `mod m` (scope `["m"]`) is visible in `m` and its
-        // descendants, but NOT at file top or in an unrelated sibling module.
+        // A `use` inside `mod m` (scope `["m"]`) shadows a bare name in `m`
+        // only, never at file top, in a descendant, or in a sibling module.
         let mut nested: BTreeMap<Vec<String>, BTreeSet<String>> = BTreeMap::new();
         nested.insert(vec!["m".to_owned()], BTreeSet::from(["Display".to_owned()]));
         assert!(scope_imports_bare_name(
@@ -3287,7 +3330,8 @@ mod tests {
             &["m".to_owned()],
             "Display"
         ));
-        assert!(scope_imports_bare_name(
+        // A descendant `mod m::inner` does NOT inherit `mod m`'s import.
+        assert!(!scope_imports_bare_name(
             &nested,
             &["m".to_owned(), "inner".to_owned()],
             "Display"
@@ -3300,6 +3344,41 @@ mod tests {
             &["other".to_owned()],
             "Display"
         ));
+    }
+
+    #[test]
+    fn is_module_item_use_distinguishes_module_and_block_scope() {
+        // A module-item `use` (file-top or inside a `mod` body) feeds the veto;
+        // a block-local `use` inside a function body does NOT (round-10 Codex
+        // finding: a block-local `use` is invisible to module-level impls).
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load rust grammar");
+
+        // File-top `use` — a direct child of `source_file`.
+        let top = "use std::fmt::Display;\n";
+        let tree = parser.parse(top, None).expect("parse");
+        let node = find_use_declaration(tree.root_node()).expect("use present");
+        assert!(is_module_item_use(node), "file-top use is a module item");
+
+        // `use` inside a `mod m { ... }` body — a child of `declaration_list`.
+        let in_mod = "mod m { use std::fmt::Display; }\n";
+        let tree = parser.parse(in_mod, None).expect("parse");
+        let node = find_use_declaration(tree.root_node()).expect("use present");
+        assert!(
+            is_module_item_use(node),
+            "use inside a mod body is a module item"
+        );
+
+        // Block-local `use` inside a function body — a child of `block`.
+        let in_fn = "fn helper() { use std::fmt::Display; let _ = 0; }\n";
+        let tree = parser.parse(in_fn, None).expect("parse");
+        let node = find_use_declaration(tree.root_node()).expect("use present");
+        assert!(
+            !is_module_item_use(node),
+            "block-local use is NOT a module item"
+        );
     }
 
     #[test]

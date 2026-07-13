@@ -1217,16 +1217,23 @@ external or std trait brought in by a `use` — `use std::fmt::Display;` — is 
 in that index, so an ambiguity count of one would let the scope walk mis-bind a
 bare `impl Display for Foo` to a same-named **local** `trait Display`. To close
 the entire shadowing family at once, a bare (unqualified) trait/type name that
-is shadowed by a `use` import **visible in the impl's module scope** — a `use`
-whose final bound segment equals that bare name, declared in the impl's own
-module or any enclosing scope up to the file top — is left **unresolved** on
-**both** the local per-file and the repo-wide cross-file resolution paths,
-**regardless of whether the import target is locally known**. This is a
-deterministic, AST-derived name-shadow boolean (it detects the shadowing `use`,
-it does **not** resolve the import), computed once at extraction time and shared
-by both paths so they cannot diverge. It covers external/std imports, `use
-crate::a::T` aliases of a non-root local definition, and grouped/aliased `use`
-forms alike (a glob `use a::*;` names no specific segment and never vetoes). The
+is shadowed by a `use` import in the impl's **own module scope** — a **module-item**
+`use` (a direct `use` item of the impl's own module, *not* one nested inside a
+function body or block) whose final bound segment equals that bare name — is left
+**unresolved** on **both** the local per-file and the repo-wide cross-file
+resolution paths, **unless the bare name resolves to a definition in the impl's
+own module** (an own-module definition wins at depth 0 *before* the veto, because
+a same-module `use` plus a same-name item is a compile error in real Rust, so the
+definition is the only valid reading). The veto matches Rust's non-inherited `use`
+visibility: it consults **only** the impl's own module-scope imports — an
+ancestor/root or sibling-module `use` never shadows a bare name inside `mod m`,
+and a **block-local** `use` inside a function body is invisible to module-level
+impls and never feeds the veto at all. This is a deterministic, AST-derived
+name-shadow boolean (it detects the shadowing `use`, it does **not** resolve the
+import), computed once at extraction time and shared by both paths so they cannot
+diverge. It covers external/std imports, `use crate::a::T` aliases of a non-root
+local definition, and grouped/aliased `use` forms alike (a glob `use a::*;` names
+no specific segment and never vetoes). The
 accepted recall trade-off: a legitimate `use crate::Display; impl Display for
 Foo` whose import target **is** the local trait is now *also* left unresolved —
 an honest missing edge in place of a possible wrong one. Correct import-aware
