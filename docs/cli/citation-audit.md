@@ -74,7 +74,7 @@ The report ends with a `gate` block and a top-level `ok`:
 |-------|---------|
 | `code_gate_pass` | **Fails** when fewer than `min_code_citation` (default 95%) of code-answer rows carry a stable record ID plus a repo-relative file/span handle or a documented absent-span reason (AC4). |
 | `non_code_handle_gate_pass` | **Fails** when any agent-memory, project, artifact, verification, redaction, protected-artifact, or user-context row lacks at least one source / verification / task / policy-audit / protected-payload handle (AC5). |
-| `log_gate_pass` | **Fails** when fewer than `min_log_citation` (default 100%) of `runtime_observation` (log-domain) rows carry their required citation — a well-formed `log:v1:` record ID plus `LogSource` provenance (issue #328). A below-threshold lane emits a `below_log_citation_threshold` diagnostic naming the workflow, the `runtime_observation` class, and the measured rate. |
+| `log_gate_pass` | **Fails** when fewer than `min_log_citation` (default 100%) of `runtime_observation` (log-domain) rows carry their required citation — a well-formed `log:v1:` record ID plus `LogSource` provenance (issue #328). A below-threshold lane emits a `below_log_citation_threshold` diagnostic naming the specific failing workflow, the `runtime_observation` class, and the measured rate (issues #328, #376). |
 | `unclassified_missing_rows` | Missing-handle rows that lack a classifying diagnostic. The success metric requires this to be `0`. |
 | `ok` | `true` only when the code, non-code, and log gates all pass and `unclassified_missing_rows == 0`. |
 
@@ -138,16 +138,39 @@ handle, and a dangling target is never counted as cited.
 
 `symbol`, `file`, `drift`, `semantic`, and `manifest-deps` (code-oriented) plus
 the cross-domain lanes `context`, `subsystem`, `task`, `memory`, `failures`,
-`change-impact`, `policy`, `candidates`, `changes`, `evidence-freshness`, and
-`log-deltas`. The `manifest-deps` lane gates every returned
-`DependencyDeclaration` row on its stable record ID plus the repo-relative
-`Cargo.toml` handle (a spanless path-cited source fact). The `log-deltas` lane
-(`eg query log-deltas`, #326) is the one covered log-domain workflow on trunk —
-the only `eg query` verb that returns `runtime_observation` rows; its classified
-signature rows are gated by `--min-log-citation` while its resolved-frame and
-overlapping-symbol-delta rows are gated as code rows. (When `eg query
-error-context` (#324) and the subsystem log section (#325) land, their drivers
-join this lane.) A workflow with
+`change-impact`, `policy`, `candidates`, `changes`, `evidence-freshness`,
+`log-deltas`, `error-context`, and `log_signatures`. The `manifest-deps` lane
+gates every returned `DependencyDeclaration` row on its stable record ID plus the
+repo-relative `Cargo.toml` handle (a spanless path-cited source fact). The audit
+drives **three** log query workflows, each returning `runtime_observation` rows
+gated by `--min-log-citation` (their resolved-frame and overlapping-symbol-delta
+rows are gated as code rows):
+
+- `log-deltas` (`eg query log-deltas`, #326) — runtime error-signature deltas
+  across a commit range.
+- `error-context` (`eg query error-context`, #324) — one signature's full
+  cross-domain context bundle, driven once per `ErrorSignature` in the set. The
+  lane classifies **every row the envelope returns**, each from its OWN identity
+  (`record_id` plus `git_commit`), not just the signature and frame rows: the
+  signature's occurrence `buckets` (`LogOccurrenceBucket` runtime observations,
+  gated through the same class-wide `LogSource` provenance rule), its resolved
+  `frames`, and each of the five cross-domain sections — `source_facts`,
+  `observations`, `project_state`, `artifacts`, and `verification_evidence` — is
+  gated by its trust class exactly as the `context` lane gates that bundle. A
+  `source_facts` record returned in multiple temporal versions (distinct
+  `git_commit`s from a scan-history graph) is classified once **per version**, so
+  an uncited version can never hide behind a cited one. A returned row whose
+  target record is absent/tombstoned is a `MissingRequiredHandle` failure, never
+  silently dropped; `unresolved` targets emit `unresolved_evidence_link`
+  diagnostics; and superseded/contradicted rows are reported excluded.
+- `log_signatures` (the subsystem `log_signatures` section, `eg query
+  subsystem`, #325) — signatures whose frames resolve under a subsystem prefix.
+
+Because the `runtime_observation` citation requirement is class-wide, ANY lane
+that surfaces a log row (e.g. `memory` reaching an `ErrorSignature` as supporting
+evidence) applies the same rule, and a below-threshold lane names ITSELF in the
+`below_log_citation_threshold` diagnostic (issue #376) — never a hard-coded
+`log-deltas`. A workflow with
 nothing to return in the fixture reports zero rows rather than disappearing; one
 that needs inputs the fixture lacks (e.g. `semantic` without an embedded vector
 index, or `changes` without a commit range) is reported `enabled: false` with a
@@ -170,7 +193,7 @@ later uncited version cannot hide behind an earlier cited one.
 | `redacted_field` | A row carries a redaction marker or policy version. |
 | `protected_payload` | A row references a protected raw payload, withheld by hash/handle only. |
 | `unsupported_workflow` | A workflow could not run (e.g. `semantic` without an embedded store). |
-| `below_log_citation_threshold` | The `runtime_observation` (log-domain) lane fell below `min_log_citation`; names the `log-deltas` workflow, the `runtime_observation` class, and the measured rate (issue #328). |
+| `below_log_citation_threshold` | A `runtime_observation` (log-domain) lane fell below `min_log_citation`; names the **specific** failing workflow (`log-deltas`, `error-context`, `log_signatures`, or any other lane that surfaced a log row), the `runtime_observation` class, and the measured rate (issues #328, #376). |
 | `missing_record_id` | A row (code or log) carries no well-formed stable record ID. |
 
 ### Safety: no raw payloads (AC8)

@@ -81,10 +81,11 @@ repo-relative prefix. Path matching is segment-aware: `src/alpha` never bleeds i
 form of the same trust-separated bundle, and `eg query locate <path>:<line>` (issue
 #212) is the positional entry into that same contract. See `docs/cli/query.md`.
 
-Runtime error-signatures are **not yet** part of the subsystem envelope. Folding the
-log-graph `log_signatures` section into it is tracked as open issue #325 ("Fold error
-signatures into the subsystem context envelope"). Until it lands, a RepoRoom that
-wants runtime context queries the log surface directly (§2.3).
+Runtime error-signatures are part of the subsystem envelope: the log-graph
+`log_signatures` section was folded into it by issue #325 (shipped in PR #368), so a
+RepoRoom's subsystem knowledge panel surfaces both code facts and the runtime error
+signatures whose frames resolve under the prefix, and can also query the log surface
+directly (§2.3).
 
 ### 2.2 ReviewRoom approval and provenance → the compliance track
 

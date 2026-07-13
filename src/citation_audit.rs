@@ -25,10 +25,11 @@ use crate::evidence_freshness::FreshnessVerdict;
 use crate::ir::{EdgeLabel, GraphRecord, LogPayload, LogSourcePayload, SourceSpan};
 use crate::query::{
     self, FailureHandleError, RepositoryIndex, ResolvedFailureTarget, change_impact_context,
-    changes_context, failure_history_context, largest_semantic_drifts, log_deltas,
+    changes_context, error_context, failure_history_context, largest_semantic_drifts, log_deltas,
     memory_audit_context, resolve_drift_target, resolve_failure_handle, subsystem_context,
     symbol_context, task_evidence_context,
 };
+use crate::temporal_status::SupersessionMode;
 
 /// Default gate threshold: fraction of code-answer rows that must carry a
 /// stable record ID plus a repo-relative file/span handle or a documented
@@ -1973,6 +1974,245 @@ fn drive_log_deltas(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
     builder
 }
 
+/// Stable `ErrorSignature` node IDs present in the record set, sorted ascending
+/// so the error-context lane drives them in deterministic order.
+fn error_signature_ids(records: &[GraphRecord]) -> Vec<String> {
+    records
+        .iter()
+        .filter(|r| r.node_kind_name() == Some("ErrorSignature"))
+        .map(|r| r.id().to_owned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// `eg query error-context` (issue #324) — one signature's full cross-domain
+/// context bundle, wired into the citation audit by issue #376.
+///
+/// This is the second covered log-domain workflow (alongside `log-deltas` and
+/// `log_signatures`). Each `ErrorSignature` node present in the set is resolved by
+/// its exact `log:v1:` ID; every returned [`SignatureBlock`] is a runtime
+/// observation whose citation requirement is class-wide (`push_record`
+/// reclassifies it through `classify_log_handle`), so a signature with no
+/// `CAPTURED_FROM` `LogSource` provenance is a citation failure. Each block's
+/// resolved-frame targets are code rows audited under the existing code-handle
+/// rule — a dangling/tombstoned target is a `MissingRequiredHandle` code-lane
+/// failure, never silently dropped (mirrors `drive_log_deltas`).
+///
+/// A record set carrying no `ErrorSignature` nodes reports the lane disabled with
+/// a stable reason rather than skipping it.
+#[allow(clippy::too_many_lines)]
+fn drive_error_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let sig_ids = error_signature_ids(records);
+    if sig_ids.is_empty() {
+        return WorkflowBuilder::disabled(
+            "error-context",
+            "runtime_observation",
+            "no_error_signatures",
+            records,
+        );
+    }
+
+    let mut builder = WorkflowBuilder::new("error-context", "runtime_observation", records);
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    // A `(record_id, git_commit)`-keyed node index so EVERY temporal version of a
+    // stable ID resolves to its OWN record, never collapsing to whichever single
+    // version an ID-only lookup kept. `error_context` preserves each frame-target
+    // source-fact version keyed by `(record_id, git_commit)` (a scan-history
+    // response can return several versions of one symbol), so an ID-only lookup
+    // here would classify one version and let the others' rows — possibly uncited —
+    // escape the code gate (Codex P2, #376). A `Row.git_commit` is exactly
+    // `temporal.git_commit` (or `None` for a non-temporal record), matching this
+    // key. Last-write-wins on a duplicate `(id, git_commit)` mirrors the query's
+    // own `source_facts` map, so the version the audit classifies is the version
+    // the query returned.
+    let by_id_commit: BTreeMap<(&str, Option<&str>), &GraphRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node { id, temporal, .. } => Some((
+                (
+                    id.as_str(),
+                    temporal.as_ref().map(|t| t.git_commit.as_str()),
+                ),
+                r,
+            )),
+            _ => None,
+        })
+        .collect();
+    let tombstoned = tombstoned_ids(records);
+    for sig_id in &sig_ids {
+        // Resolve each signature by its exact `log:v1:` ID (the default view: no
+        // repo scope, no commit/instant pin, exclude superseded rows, no protected
+        // store, `--graph` read path).
+        let Ok(ctx) = error_context(
+            records,
+            sig_id,
+            None,
+            None,
+            None,
+            SupersessionMode::Exclude,
+            None,
+            false,
+        ) else {
+            continue;
+        };
+        for block in &ctx.signatures {
+            // The signature block is a runtime observation: `push_record`
+            // reclassifies it through the class-wide log-provenance rule, so it
+            // must carry its full `log:v1:` ID + `LogSource` citation. A block whose
+            // node is absent/invisible is never silently dropped.
+            match by_id.get(block.record_id.as_str()) {
+                Some(record) => {
+                    builder.push_record(record);
+                    builder.note_redaction(record);
+                }
+                _ => builder.push_classified(
+                    missing(&block.record_id, "runtime_observation"),
+                    String::new(),
+                ),
+            }
+            // Resolved-frame targets are code rows, audited under the code-handle
+            // rule exactly as `drive_log_deltas` does: present+visible → cited by
+            // its own handle; dangling or tombstoned-and-unsuperseded → a
+            // `MissingRequiredHandle` code-lane failure.
+            for frame in &block.frames {
+                let target_id = frame.target_record_id.as_str();
+                match by_id.get(target_id) {
+                    Some(record)
+                        if node_visible(target_id, has_temporal_anchor(record), &tombstoned) =>
+                    {
+                        builder.push_record(record);
+                    }
+                    _ => builder.push_classified(missing(target_id, "source_fact"), String::new()),
+                }
+            }
+            // Occurrence buckets are `LogOccurrenceBucket` runtime-observation
+            // rows the public response serializes as `buckets[].record_id`. Each
+            // must go through `push_record` so the class-wide log-provenance rule
+            // fires (a bucket resolves its `LogSource` via
+            // `AGGREGATES` → signature → `CAPTURED_FROM`), so a cited signature
+            // carrying a provenance-less bucket still fails the log gate (Codex P2,
+            // #376) — a returned bucket is never dropped. Buckets are non-temporal
+            // log nodes (one version per stable ID), so the ID-only `by_id` lookup
+            // is exact here.
+            for bucket in &block.buckets {
+                let bucket_id = bucket.record_id.as_str();
+                match by_id.get(bucket_id) {
+                    Some(record)
+                        if node_visible(bucket_id, has_temporal_anchor(record), &tombstoned) =>
+                    {
+                        builder.push_record(record);
+                    }
+                    _ => builder
+                        .push_classified(missing(bucket_id, "runtime_observation"), String::new()),
+                }
+            }
+        }
+
+        // Cross-domain sections: `eg query error-context`'s code/agent/project/
+        // artifact/verification half IS the `query context` (#38) bundle, and the
+        // public response returns every one of these rows — so, exactly as
+        // `drive_context` gates that bundle, each returned row is a public row the
+        // audit must classify or the gate can pass while a returned row is uncited
+        // (Codex P2, #376). Resolve every row by its OWN `(record_id, git_commit)`
+        // identity, never an ID-only lookup: `error_context` preserves each
+        // frame-target `source_fact` version separately (a scan-history response
+        // can return several versions of one stable ID), and an ID-only lookup here
+        // would collapse them onto a single record and let an uncited version
+        // escape the code gate. Present-and-visible → its normal handle rule via
+        // `push_record` (a runtime row re-fires the class-wide provenance rule;
+        // code/non-code rows get their handle rule); absent or
+        // tombstoned-and-unsuperseded → a `missing` failure in the section's trust
+        // lane keyed on the row's own `git_commit` so distinct versions stay
+        // distinct, never silently dropped (mirroring the signature/frame handling
+        // above). Sections are already deterministically ordered by the query, so
+        // iteration stays byte-stable.
+        for (section, trust) in [
+            (&ctx.source_facts, "source_fact"),
+            (&ctx.observations, "agent_authored"),
+            (&ctx.project_state, "project_state"),
+            (&ctx.artifacts, "artifact"),
+            (&ctx.verification_evidence, "verification_evidence"),
+        ] {
+            for row in section {
+                let id = row.record_id.as_str();
+                match by_id_commit.get(&(id, row.git_commit.as_deref())) {
+                    Some(record) if node_visible(id, has_temporal_anchor(record), &tombstoned) => {
+                        builder.push_record(record);
+                        builder.note_redaction(record);
+                    }
+                    _ => builder.push_classified(
+                        missing(id, trust),
+                        row.git_commit.clone().unwrap_or_default(),
+                    ),
+                }
+            }
+        }
+        // Unresolved evidence-link targets: a diagnostic per dangling link, never a
+        // silent drop — exactly as `drive_context` reports them.
+        for unresolved in &ctx.unresolved {
+            builder.add_diagnostic(
+                "unresolved_evidence_link".to_owned(),
+                Some(unresolved.source_record_id.clone()),
+                Some(unresolved.target_handle.clone()),
+                Some(unresolved.relation.clone()),
+            );
+        }
+        // Rows the supersession policy removed are reported as excluded (never
+        // counted toward the citation ratio), mirroring `drive_memory`'s excluded
+        // handling and `push_record`'s ExcludedUnverified skip.
+        for excluded in &ctx.excluded {
+            if let Some(record) = by_id.get(excluded.record_id.as_str()) {
+                builder.push_excluded(record, CitationStatus::ExcludedUnverified);
+            }
+        }
+    }
+    builder
+}
+
+/// The subsystem `log_signatures` section (issue #325) — runtime error
+/// signatures whose frames resolve under a subsystem prefix, wired into the
+/// citation audit by issue #376.
+///
+/// This is a SEPARATE workflow from `drive_subsystem` (which covers the code
+/// sections): the same class-wide log-provenance rule applies to each surfaced
+/// `SubsystemLogSignature`, so a signature lacking `CAPTURED_FROM` provenance is
+/// a citation failure. The section's frame targets are path-only (no record ID),
+/// and the resolved code frame targets are already covered by `drive_subsystem`;
+/// this lane audits only the runtime-observation signature rows. When no scanned
+/// signature resolves under any driven prefix the lane reports disabled.
+fn drive_log_signatures(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("log_signatures", "runtime_observation", records);
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let mut any_row = false;
+    for prefix in subsystem_prefixes(records) {
+        let Ok(ctx) = subsystem_context(records, &prefix) else {
+            continue;
+        };
+        for sig in &ctx.log_signatures {
+            any_row = true;
+            match by_id.get(sig.record_id) {
+                Some(record) => {
+                    builder.push_record(record);
+                    builder.note_redaction(record);
+                }
+                _ => builder
+                    .push_classified(missing(sig.record_id, "runtime_observation"), String::new()),
+            }
+        }
+    }
+    if any_row {
+        builder
+    } else {
+        WorkflowBuilder::disabled(
+            "log_signatures",
+            "runtime_observation",
+            "no_in_prefix_signatures",
+            records,
+        )
+    }
+}
+
 /// `eg query evidence-freshness` — per-observation freshness verdicts. Each
 /// verdict row pairs an agent-authored observation with its cited code handle;
 /// both must carry their required citation, and stale/unresolved verdicts emit a
@@ -2065,10 +2305,12 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         drive_changes(records),
         drive_context(records),
         drive_drift(records),
+        drive_error_context(records),
         drive_evidence_freshness(freshness_records),
         drive_failures(records, &repo_index),
         drive_file(records),
         drive_log_deltas(records),
+        drive_log_signatures(records),
         drive_manifest_deps(records),
         drive_memory(records),
         drive_policy(records),
@@ -2096,16 +2338,34 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
     }
 
     let gate = evaluate_gate(&workflows, &diagnostics, config);
-    // A below-threshold log lane emits a stable diagnostic naming the workflow,
-    // the trust class, and the measured rate, then re-sorts to stay byte-stable.
-    if !gate.log_gate_pass {
-        diagnostics.push(AuditDiagnostic {
-            code: "below_log_citation_threshold".to_owned(),
-            workflow: "log-deltas",
-            source_record_id: None,
-            target_handle: Some(format!("{:.6}", gate.log_citation_completeness)),
-            relation: Some("runtime_observation".to_owned()),
-        });
+    // A below-threshold log lane emits a stable diagnostic naming the SPECIFIC
+    // failing workflow (issue #376): the audit now drives three log query
+    // workflows (`log-deltas`, `error-context`, `log_signatures`) plus any other
+    // lane that can surface a `runtime_observation` row (e.g. `memory`), so the
+    // diagnostic must name whichever lane fell short rather than a single
+    // hard-coded name. The aggregate `log_gate_pass` (issue #328) stays the sole
+    // overall ok/exit determinant — this loop only classifies which lane failed.
+    let mut log_lane_diagnostics: Vec<AuditDiagnostic> = Vec::new();
+    for workflow in &workflows {
+        let (satisfied, total) = log_row_completeness(&workflow.rows);
+        if total == 0 {
+            continue;
+        }
+        // Counts are small row tallies; precision loss is not a concern.
+        #[allow(clippy::cast_precision_loss)]
+        let rate = satisfied as f64 / total as f64;
+        if rate + GATE_EPSILON < config.min_log_citation {
+            log_lane_diagnostics.push(AuditDiagnostic {
+                code: "below_log_citation_threshold".to_owned(),
+                workflow: workflow.workflow,
+                source_record_id: None,
+                target_handle: Some(format!("{rate:.6}")),
+                relation: Some("runtime_observation".to_owned()),
+            });
+        }
+    }
+    if !log_lane_diagnostics.is_empty() {
+        diagnostics.append(&mut log_lane_diagnostics);
         diagnostics.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         diagnostics.dedup();
     }
@@ -2124,6 +2384,26 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         gate,
         diagnostics,
     }
+}
+
+/// Returns `(satisfied, total)` `runtime_observation` row counts for one
+/// workflow's classified rows — the per-workflow analog of the aggregate log
+/// lane, used to name the specific below-threshold workflow (issue #376).
+fn log_row_completeness(rows: &[RowClassification]) -> (usize, usize) {
+    let mut total = 0usize;
+    let mut satisfied = 0usize;
+    for row in rows {
+        if row.trust_class == "runtime_observation" {
+            total += 1;
+            if matches!(
+                row.status,
+                CitationStatus::Cited | CitationStatus::AbsentHandleDocumented
+            ) {
+                satisfied += 1;
+            }
+        }
+    }
+    (satisfied, total)
 }
 
 /// Evaluates the three citation gates over the classified workflow rows.

@@ -970,6 +970,9 @@ fn covers_all_public_query_workflows() {
         "changes",
         "evidence-freshness",
         "log-deltas",
+        // #376: the two remaining log query workflows are now covered.
+        "error-context",
+        "log_signatures",
     ] {
         assert!(names.contains(&expected), "workflow {expected} missing");
     }
@@ -1017,6 +1020,17 @@ fn covers_all_public_query_workflows() {
     assert!(
         rows_for("log-deltas") >= 2,
         "log-deltas lane should surface the seeded runtime-observation signatures"
+    );
+    // #376: the error-context lane resolves every seeded ErrorSignature and the
+    // log_signatures lane surfaces each signature whose frame resolves under a
+    // subsystem prefix — both are runtime-observation log query workflows.
+    assert!(
+        rows_for("error-context") >= 2,
+        "error-context lane should surface both seeded runtime-observation signatures"
+    );
+    assert!(
+        rows_for("log_signatures") >= 1,
+        "log_signatures lane should surface the frame-resolved runtime-observation signature"
     );
 }
 
@@ -1255,12 +1269,33 @@ fn log_lane_red_path_uncited_fails_gate() {
             < 1.0
     );
     let diags = report["diagnostics"].as_array().unwrap();
-    let below = diags
+    // #376: the diagnostic names the SPECIFIC failing workflow. The uncited
+    // orphan signature surfaces through both the `log-deltas` and `error-context`
+    // log query lanes, so each emits its own below-threshold diagnostic naming
+    // itself — never a single hard-coded `log-deltas`.
+    let below: Vec<&Value> = diags
         .iter()
-        .find(|d| d["code"] == "below_log_citation_threshold")
-        .expect("below_log_citation_threshold diagnostic must be present");
-    assert_eq!(below["workflow"], "log-deltas");
-    assert_eq!(below["relation"], "runtime_observation");
+        .filter(|d| d["code"] == "below_log_citation_threshold")
+        .collect();
+    assert!(
+        !below.is_empty(),
+        "below_log_citation_threshold diagnostic must be present"
+    );
+    for d in &below {
+        assert_eq!(d["relation"], "runtime_observation");
+    }
+    let named: Vec<&str> = below
+        .iter()
+        .map(|d| d["workflow"].as_str().unwrap())
+        .collect();
+    assert!(
+        named.contains(&"log-deltas"),
+        "the log-deltas lane must name itself: {named:?}"
+    );
+    assert!(
+        named.contains(&"error-context"),
+        "the error-context lane must name itself: {named:?}"
+    );
 }
 
 // #328: an out-of-range --min-log-citation is a usage error (exit 2), mirroring
