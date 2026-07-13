@@ -742,7 +742,10 @@ pub fn load_default_catalog() -> ControlCatalog {
 // and Window-consistency (every row's resolved valid time inside the window).
 
 use crate::bundle::{BundleRecord, VerificationVerdict, scrub_record};
-use crate::citation_audit::{CitationStatus, citation_trust_class, classify_record_external};
+use crate::citation_audit::{
+    CitationProvenance, CitationStatus, citation_trust_class, classify_record_external,
+    classify_record_external_with_provenance,
+};
 use crate::ir::{GraphRecord, TemporalMetadata};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -3385,7 +3388,10 @@ fn bind_occurrence_totals(
 
 /// The trust-class citation view of a set of section rows, reused for both the
 /// assemble-time citation verdict and `verify_pack`'s coverage check (AC4).
-fn citation_view(rows: &[&BundleRecord]) -> (Vec<ClassCitationTally>, bool, bool) {
+fn citation_view(
+    rows: &[&BundleRecord],
+    provenance: Option<&CitationProvenance>,
+) -> (Vec<ClassCitationTally>, bool, bool) {
     // (tallies, code_gate_pass, non_code_gate_pass)
     // per_class entry: (total, cited, missing, excluded)
     let mut per_class: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
@@ -3393,7 +3399,15 @@ fn citation_view(rows: &[&BundleRecord]) -> (Vec<ClassCitationTally>, bool, bool
     let mut code_cited = 0usize;
     let mut non_code_ok = true;
     for br in rows {
-        let classified = classify_record_external(&br.record);
+        // With a provenance context, apply the class-wide `runtime_observation`
+        // provenance requirement (#328) so an unprovenanced log row is
+        // `MissingRequiredHandle`, matching `eg audit citations` (#372). Callers
+        // with no record set (e.g. `verify_pack` — packs carry no `LogSource`)
+        // pass `None` and use the context-free classifier.
+        let classified = match provenance {
+            Some(p) => classify_record_external_with_provenance(&br.record, p),
+            None => classify_record_external(&br.record),
+        };
         let trust = classified.trust_class.to_owned();
         // A row satisfies the citation contract only when it carries the handle
         // its trust class requires. Mirror `citation_audit`'s exact satisfying
@@ -3993,8 +4007,13 @@ pub fn assemble_pack(
     );
 
     // --- citation verdict ---
+    // The provenance index is built from the FULL coalesced input (which carries
+    // the `LogSource` nodes + `CAPTURED_FROM`/`AGGREGATES` edges), so an
+    // in-window `runtime_observation` row is gated on resolvable provenance
+    // exactly as `eg audit citations` gates it (issue #372).
+    let prov = CitationProvenance::build(records);
     let row_refs: Vec<&BundleRecord> = all_section_rows.iter().collect();
-    let (citation_tallies, code_pass, non_code_pass) = citation_view(&row_refs);
+    let (citation_tallies, code_pass, non_code_pass) = citation_view(&row_refs, Some(&prov));
     let citation_ok = code_pass && non_code_pass;
 
     // --- integrity is structurally guaranteed at assemble time ---
@@ -5429,8 +5448,12 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
         detail: integrity_detail,
     };
 
-    // Coverage: same citation thresholds.
-    let (_tallies, code_pass, non_code_pass) = citation_view(&all_rows);
+    // Coverage: same citation thresholds. Packs carry no `LogSource` nodes or
+    // `CAPTURED_FROM`/`AGGREGATES` edges by design, so runtime provenance cannot
+    // be resolved here; it is enforced at ASSEMBLE (over the full input) and the
+    // pack is otherwise bound by its integrity/log_summary hashes — passing
+    // `None` keeps `verify_pack` the same for log rows (issue #372).
+    let (_tallies, code_pass, non_code_pass) = citation_view(&all_rows, None);
     let coverage_ok = code_pass && non_code_pass;
     let coverage = VerificationVerdict {
         passed: coverage_ok,
@@ -11093,15 +11116,50 @@ mod pack340_tests {
 
     // ── #372: assemble applies the class-wide runtime-provenance requirement ───
     //
-    // The #340 log fixture carries NO `LogSource`/`CAPTURED_FROM`, so every
-    // `ErrorSignature` / `LogOccurrenceBucket` row in a CC7.3 pack is
-    // provenance-less. `eg audit citations` fails the identical records, so the
-    // pack's assemble-time citation verdict must fail them too (issue #372) — the
-    // context-free classifier used to (wrongly) count them Cited by their own ID.
+    // A CC7.3 pack over an in-window `ErrorSignature` with a citation-well-formed
+    // `log:v2:<hex>` ID but NO resolvable `LogSource`/`CAPTURED_FROM` provenance
+    // must FAIL the pack's assemble-time citation verdict — exactly as `eg audit
+    // citations` fails the identical record (issue #372). The context-free
+    // classifier used to (wrongly) count such a row Cited by its own ID.
+    //
+    // Uses well-formed hex IDs (not the #340 shorthand `log:v1:sig1` fixture, whose
+    // IDs are not citation-well-formed) so the deciding factor is provenance, not
+    // ID shape.
+    fn well_formed_signature(provenanced: bool) -> Vec<GraphRecord> {
+        let sig_id = crate::ir::log_stable_id(&["error_signature", "repo372", "tpl", "error"]);
+        let mut records = vec![error_signature(
+            &sig_id,
+            "error",
+            "connection refused to HOST",
+            "2026-03-02T09:00:00Z", // first_seen in-window
+            "2026-03-02T10:00:00Z", // last_seen in-window
+            5,
+            None,
+        )];
+        if provenanced {
+            let src_id = crate::ir::log_stable_id(&["log_source", "repo372", "app.log", "h1"]);
+            records.push(log_source(&src_id, "app.log", "abc123"));
+            records.push(captured_from(&sig_id, &src_id));
+        }
+        records
+    }
+
     #[test]
     fn assemble_citation_verdict_fails_on_provenance_less_log_rows() {
-        let records = build_log_incident_records();
+        let records = well_formed_signature(false);
         let pack = assemble_cc73(&records);
+        // The signature surfaced as a runtime_observation row.
+        let tally = pack
+            .verdicts
+            .citation_tallies
+            .iter()
+            .find(|t| t.trust_class == "runtime_observation")
+            .expect("runtime_observation tally present");
+        assert!(tally.total >= 1, "the signature surfaced as a runtime row");
+        assert_eq!(
+            tally.missing, tally.total,
+            "every provenance-less runtime row is MissingRequiredHandle (#372)"
+        );
         assert!(
             !pack.verdicts.citation.passed,
             "a provenance-less runtime observation must fail the pack citation gate \
@@ -11109,19 +11167,24 @@ mod pack340_tests {
         );
     }
 
-    // #372 positive: with a resolvable `LogSource` + `CAPTURED_FROM` for every
-    // in-window signature co-located in the INPUT graph (which assemble's
-    // full-records provenance index sees — NOT co-located into pack sections), the
-    // runtime rows resolve their provenance and the citation verdict passes.
+    // #372 positive: with a resolvable `LogSource` + `CAPTURED_FROM` co-located in
+    // the INPUT graph (which assemble's full-records provenance index sees — NOT
+    // co-located into pack sections), the runtime row resolves its provenance and
+    // the citation verdict passes.
     #[test]
     fn assemble_citation_verdict_passes_with_resolvable_log_provenance() {
-        let mut records = build_log_incident_records();
-        for (i, sig) in LOG_SIGNATURE_IDS.iter().enumerate() {
-            let src = format!("log:v1:prov-src-{i}");
-            records.push(log_source(&src, &format!("app-{i}.log"), &format!("hash{i}")));
-            records.push(captured_from(sig, &src));
-        }
+        let records = well_formed_signature(true);
         let pack = assemble_cc73(&records);
+        let tally = pack
+            .verdicts
+            .citation_tallies
+            .iter()
+            .find(|t| t.trust_class == "runtime_observation")
+            .expect("runtime_observation tally present");
+        assert_eq!(
+            tally.cited, tally.total,
+            "resolvable provenance cites every runtime row (#372)"
+        );
         assert!(
             pack.verdicts.citation.passed,
             "resolvable LogSource provenance must satisfy the runtime citation gate (#372)"
@@ -11518,7 +11581,8 @@ mod pack340_tests {
             !counts.contains_key("verification_evidence"),
             "log rows never tallied verification_evidence"
         );
-        // Non-code 100%-handle rule: every runtime_observation row is cited.
+        // Trust separation (this test's invariant) is unchanged: all 50 log rows
+        // are tallied `runtime_observation`, never source_fact/verification.
         let tally = pack
             .verdicts
             .citation_tallies
@@ -11526,8 +11590,16 @@ mod pack340_tests {
             .find(|t| t.trust_class == "runtime_observation")
             .expect("runtime_observation tally");
         assert_eq!(tally.total, 50);
-        assert_eq!(tally.cited, 50);
-        assert_eq!(tally.missing, 0);
+        // #372: the assemble citation view now applies the class-wide
+        // `runtime_observation` provenance requirement (the SAME derivation
+        // `eg audit citations` uses). The #340 fixture uses human-readable
+        // shorthand IDs (`log:v1:sig1`) that are NOT citation-well-formed
+        // (`log:v<N>:<16+ hex>`), so every row is correctly `MissingRequiredHandle`
+        // — matching how `eg audit citations` classifies the identical records.
+        // The well-formed-ID + resolvable-provenance positive case is covered by
+        // `assemble_citation_verdict_passes_with_resolvable_log_provenance`.
+        assert_eq!(tally.cited, 0);
+        assert_eq!(tally.missing, 50);
     }
 
     // ── AC5: degradation, both directions ─────────────────────────────────────
