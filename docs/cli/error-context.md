@@ -78,6 +78,12 @@ buckets, and runs are never repository-filtered.
 machine-readable `unsupported_combination` envelope (mirroring
 `eg resolve-frames`).
 
+Over `--data-dir`, the `--at`/`--as-of` lane loads through the same log-retained
+read surface as the current-state lane, so an enrichment-only `ErrorSignature`
+rewrite is collapsed to a **single** observation here too (never double-counted),
+while every non-log superseded/temporal version stays intact for valid-time
+reconstruction (issue #363).
+
 ### `--supersession`
 
 `--supersession exclude` (default) removes superseded/contradicted agent rows

@@ -1034,6 +1034,100 @@ impl EmbeddedAletheiaSink {
         Ok(records)
     }
 
+    /// Like [`Self::read_all_records_including_superseded`], but collapses
+    /// enrichment-only rewrites of a non-temporal **log-domain** node
+    /// (`ErrorSignature` / `LogOccurrenceBucket`) to a single physical version
+    /// while leaving every OTHER superseded/temporal record fully intact (issue
+    /// #363).
+    ///
+    /// # Why the temporal lane needs its own log-retained variant
+    ///
+    /// The history-inclusive read
+    /// ([`Self::read_all_records_including_superseded`]) is the transaction-time /
+    /// valid-time reconstruction surface: it deliberately re-emits EVERY physical
+    /// non-temporal node version so a `--tx-as-of` / `--at` / `--as-of` view can
+    /// pick the version live at that point. That is exactly right for versioned
+    /// facts, but it also re-emits the SAME log observation twice whenever the
+    /// standard pipeline `scan-logs -> resolve-frames -> link-logs` rewrites an
+    /// `ErrorSignature` to attach `FRAME_RESOLVES_TO` / `EMITTED_DURING` /
+    /// `REFERENCES_TASK` evidence links while leaving the log payload
+    /// (`first_seen`/`last_seen`/`occurrence_count`) untouched. Both physical
+    /// versions share the same scan observation, so the `error-context` (#324)
+    /// coalescer — which SUMS `occurrence_count` across duplicate-ID signatures —
+    /// double-counts them on the `--at`/`--as-of` `--data-dir` lane, the residual
+    /// hole the non-temporal [`Self::read_all_records_log_retained`] already
+    /// closes for the current-state lane.
+    ///
+    /// # What this variant does — and does not — change
+    ///
+    /// This is a POST-FILTER over
+    /// [`Self::read_all_records_including_superseded`], applying the SAME
+    /// observation-key dedup ([`log_observation_key`]) that
+    /// [`Self::read_all_records_log_retained`] uses, but ONLY to log-domain node
+    /// records that carry a coalesce-relevant log payload
+    /// (`ErrorSignature` / `LogOccurrenceBucket`). For each such record it keeps
+    /// only the LAST occurrence of a given `(stable_id, observation_key)` pair in
+    /// the returned order. The wrapped read already emits every non-temporal node
+    /// version in ascending `egregore_seq` write order, so the last occurrence is
+    /// the LATEST write — i.e. the ENRICHED version carrying the evidence links —
+    /// and the earlier bare rewrite is dropped.
+    ///
+    /// Net effect:
+    ///
+    /// * Distinct scan OBSERVATIONS survive: two `scan-logs` ingests with
+    ///   differing `first_seen`/`last_seen`/`occurrence_count` map to different
+    ///   observation keys, so both are retained and the coalescer reconstructs the
+    ///   true earliest/latest/summed values exactly as on `--graph`.
+    /// * Enrichment-only rewrites (identical log payload, evidence links added)
+    ///   collapse to their single latest (enriched) version, so occurrence counts
+    ///   are never doubled and the resolved frames / evidence links are preserved.
+    /// * Every NON-log record — temporal snapshots, tombstones, edges, project
+    ///   nodes, superseded non-log versions — is passed through untouched, so
+    ///   `--at`/`--as-of` valid-time reconstruction is byte-for-byte unaffected.
+    ///   A log node carrying no coalesce-relevant payload (`LogSource` /
+    ///   `LogEvent`, whose [`log_observation_key`] is `None`) is likewise passed
+    ///   through unchanged.
+    ///
+    /// The shared [`Self::read_all_records_including_superseded`] is intentionally
+    /// left untouched: its other callers (transaction-time views) require the full
+    /// unfiltered version stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a physical record cannot be read.
+    pub fn read_all_records_including_superseded_log_retained(
+        &self,
+    ) -> AdapterResult<Vec<GraphRecord>> {
+        let records = self.read_all_records_including_superseded()?;
+        // Pass 1: for every log-domain node record carrying a coalesce-relevant
+        // payload, record the index of its LAST occurrence keyed by
+        // (stable_id, observation_key). Because the wrapped read emits
+        // non-temporal versions in ascending write order, that last occurrence is
+        // the latest (enriched) write of that observation.
+        let mut last_index: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+        for (idx, record) in records.iter().enumerate() {
+            if let Some(key) = log_observation_key(record) {
+                last_index.insert((record.id().to_owned(), key), idx);
+            }
+        }
+        // Pass 2: emit every non-log record unchanged; emit a log-domain payload
+        // record only at its last-occurrence index, dropping earlier duplicates
+        // (enrichment rewrites AND identical-observation duplicates of the same
+        // key). Distinct observations have distinct keys, so both survive.
+        let mut out = Vec::with_capacity(records.len());
+        for (idx, record) in records.into_iter().enumerate() {
+            if let Some(key) = log_observation_key(&record) {
+                let entry = (record.id().to_owned(), key);
+                if last_index.get(&entry) != Some(&idx) {
+                    continue;
+                }
+            }
+            out.push(record);
+        }
+        Ok(out)
+    }
+
     /// Reads all physical records stored in the database for inspection.
     /// This retrieves every single node, tombstone, and edge physically stored in `AletheiaDB`
     /// without temporal deduplication, tombstone filtering, or schema version validation.
@@ -4739,6 +4833,150 @@ mod tests {
         assert_eq!(
             count, 1,
             "non-log non-temporal kinds keep their single current-state record"
+        );
+    }
+
+    /// Issue #363 (Codex P2): the history-inclusive log-retained read collapses
+    /// an enrichment-only `ErrorSignature` rewrite (identical log payload,
+    /// evidence links added) to its single latest (enriched) version, while the
+    /// unfiltered history read re-emits both — the exact double-count source on
+    /// the `error-context --at`/`--as-of` `--data-dir` temporal lane.
+    #[test]
+    fn read_all_records_including_superseded_log_retained_collapses_enrichment_rewrite() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("temporal-enrichment-store");
+        let sig_id = "log:v1:enrich-boom";
+        let bare =
+            error_signature_record(sig_id, "2026-01-01T00:00:00Z", "2026-01-01T05:00:00Z", 7);
+        // Same log payload, an evidence link added (as resolve-frames emits).
+        let enriched = bare.clone().with_evidence_links(vec![EvidenceLink {
+            target_record_id: Some("codegraph:v1:target".to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "FRAME_RESOLVES_TO".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&bare).expect("bare should write");
+        sink.write_record(&enriched)
+            .expect("enrichment rewrite should write a new physical version");
+
+        let count = |records: &[GraphRecord]| {
+            records
+                .iter()
+                .filter(|r| r.id() == sig_id && r.node_kind_name() == Some("ErrorSignature"))
+                .count()
+        };
+
+        let unfiltered = sink
+            .read_all_records_including_superseded()
+            .expect("history read");
+        assert_eq!(
+            count(&unfiltered),
+            2,
+            "the unfiltered history read re-emits both physical versions (double-count source)"
+        );
+
+        let retained = sink
+            .read_all_records_including_superseded_log_retained()
+            .expect("log-retained history read");
+        let versions: Vec<&GraphRecord> = retained
+            .iter()
+            .filter(|r| r.id() == sig_id && r.node_kind_name() == Some("ErrorSignature"))
+            .collect();
+        assert_eq!(
+            versions.len(),
+            1,
+            "the enrichment rewrite collapses to one physical version"
+        );
+        assert!(
+            versions[0]
+                .evidence_links()
+                .is_some_and(|links| !links.is_empty()),
+            "the retained version is the ENRICHED one (carries the evidence links)"
+        );
+    }
+
+    /// Issue #363: distinct scan observations (differing log payload) both survive
+    /// the log-retained history read — only same-observation rewrites collapse.
+    #[test]
+    fn read_all_records_including_superseded_log_retained_retains_distinct_observations() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("temporal-distinct-store");
+        let sig_id = "log:v1:distinct-boom";
+        let v1 = error_signature_record(sig_id, "2026-01-01T00:00:00Z", "2026-01-01T05:00:00Z", 3);
+        let v2 = error_signature_record(sig_id, "2026-01-02T12:00:00Z", "2026-01-02T13:00:00Z", 5);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&v1).expect("v1 should write");
+        sink.write_record(&v2).expect("v2 should write");
+
+        let retained = sink
+            .read_all_records_including_superseded_log_retained()
+            .expect("log-retained history read");
+        let count = retained
+            .iter()
+            .filter(|r| r.id() == sig_id && r.node_kind_name() == Some("ErrorSignature"))
+            .count();
+        assert_eq!(
+            count, 2,
+            "two distinct scan observations both survive the log-retained history read"
+        );
+    }
+
+    /// Issue #363: the log-retained history read leaves non-log temporal versions
+    /// fully intact — `--at`/`--as-of` valid-time reconstruction is unaffected.
+    #[test]
+    fn read_all_records_including_superseded_log_retained_leaves_temporal_versions_intact() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("temporal-nonlog-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+        let v1 = symbol_record(
+            &symbol_id,
+            "v1",
+            TemporalMetadata {
+                git_commit: "c1".to_owned(),
+                git_parent_commits: vec![],
+                valid_time: "2026-01-01T00:00:00Z".to_owned(),
+                author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+                observed_at: "2026-01-01T00:00:00Z".to_owned(),
+                valid_time_source: Some("git_commit_committer_date".to_owned()),
+            },
+        );
+        let v2 = symbol_record(
+            &symbol_id,
+            "v2",
+            TemporalMetadata {
+                git_commit: "c2".to_owned(),
+                git_parent_commits: vec!["c1".to_owned()],
+                valid_time: "2026-01-02T00:00:00Z".to_owned(),
+                author_time: Some("2026-01-02T00:00:00Z".to_owned()),
+                observed_at: "2026-01-02T00:00:00Z".to_owned(),
+                valid_time_source: Some("git_commit_committer_date".to_owned()),
+            },
+        );
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&v1).expect("v1 should write");
+        sink.write_record(&v2).expect("v2 should write");
+
+        let unfiltered = sink
+            .read_all_records_including_superseded()
+            .expect("history read");
+        let retained = sink
+            .read_all_records_including_superseded_log_retained()
+            .expect("log-retained history read");
+        let commits = |records: &[GraphRecord]| {
+            records
+                .iter()
+                .filter(|r| r.id() == symbol_id && r.node_kind_name() == Some("Symbol"))
+                .count()
+        };
+        assert_eq!(
+            commits(&retained),
+            commits(&unfiltered),
+            "non-log temporal versions are untouched by the log-retained post-filter"
         );
     }
 

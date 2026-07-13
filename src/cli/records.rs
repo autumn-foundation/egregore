@@ -287,6 +287,67 @@ pub(crate) fn load_records_from_db_history_readonly(data_dir: &Path) -> Result<V
     }
 }
 
+/// Like [`load_records_from_db_history`], but additionally collapses
+/// enrichment-only rewrites of a non-temporal log observation (issue #363).
+///
+/// Mirrors [`load_records_from_db_history`] but calls
+/// [`EmbeddedAletheiaSink::read_all_records_including_superseded_log_retained`],
+/// so the `--at`/`--as-of` `error-context` (#324) lane sees enrichment-only
+/// `ErrorSignature` rewrites collapsed to a single observation (never
+/// double-counted) while every non-log superseded/temporal version stays intact
+/// for valid-time reconstruction.
+pub(crate) fn load_records_from_db_history_log_retained(
+    data_dir: &Path,
+) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+            .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+        sink.read_all_records_including_superseded_log_retained()
+            .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// History-inclusive, log-retained record load that leaves the store
+/// byte-for-byte untouched (issue #363), for the strictly read-only
+/// `error-context --at`/`--as-of` lane.
+///
+/// Opening the embedded engine in place re-persists its on-disk index files, so
+/// this copies the store to a throwaway temporary directory and reads the
+/// log-retained history-inclusive view from the copy (mirrors
+/// [`load_records_from_db_history_readonly`]). The only difference from that
+/// function is the underlying read: enrichment-only log rewrites are collapsed
+/// (see [`load_records_from_db_history_log_retained`]).
+pub(crate) fn load_records_from_db_history_log_retained_readonly(
+    data_dir: &Path,
+) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let temp =
+            tempfile::tempdir().context("failed to create temporary read-only store copy")?;
+        let copy_root = temp.path().join("store");
+        copy_dir_recursive(data_dir, &copy_root).with_context(|| {
+            format!(
+                "failed to copy store {} for read-only inspection",
+                data_dir.display()
+            )
+        })?;
+        load_records_from_db_history_log_retained(&copy_root)
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
 /// History-inclusive record load for the strictly read-only evidence-freshness
 /// command. `--graph` is already read-only; `--data-dir` reads a throwaway copy.
 pub(crate) fn load_evidence_freshness_records(

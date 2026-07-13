@@ -5117,11 +5117,16 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = match (graph.as_deref(), data_dir.as_deref()) {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) if at.is_some() || as_of.is_some() => {
-                    // `--at`/`--as-of` need the history-inclusive read, which via
-                    // `read_all_records_including_superseded` already surfaces
-                    // every physical log version — so it retains multi-scan log
-                    // observations too (issue #363).
-                    load_records_from_db_history_readonly(dir)?
+                    // `--at`/`--as-of` need the history-inclusive read so a pinned
+                    // commit/instant view can pick the version live at that point.
+                    // The log-retained variant additionally collapses
+                    // enrichment-only `ErrorSignature` rewrites (identical log
+                    // payload, evidence links added by `resolve-frames`/
+                    // `link-logs`) to a single observation, so the coalescer never
+                    // double-counts `occurrence_count` on this lane, while every
+                    // non-log superseded/temporal version stays intact for
+                    // valid-time reconstruction (issue #363).
+                    load_records_from_db_history_log_retained_readonly(dir)?
                 }
                 (None, Some(dir)) => load_records_from_data_dir_log_retained_readonly(dir)?,
                 (Some(_), Some(_)) => {
