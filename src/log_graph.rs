@@ -501,12 +501,18 @@ pub fn scan_log_records(
             entry.1 |= occ.bucket_from_timestamp;
         }
         for (bucket_start, (count, from_ts)) in buckets {
+            // Source-aware bucket identity (issue #361, schema v2): fold the
+            // owning `LogSource` in (LAST, after BUCKET_WIDTH) so two distinct
+            // sources observing the same signature/hour mint DISTINCT bucket IDs
+            // (summed downstream) while a genuine rescan of identical bytes mints
+            // the SAME bucket ID (collapsed as a duplicate).
             let bucket_id = log_stable_id(&[
                 "log_occurrence_bucket",
                 repository_id,
                 &signature_id,
                 &bucket_start,
                 BUCKET_WIDTH,
+                &source_id,
             ]);
             let source = if from_ts {
                 VALID_TIME_SOURCE_EVENT
@@ -529,6 +535,7 @@ pub fn scan_log_records(
                     bucket_start: bucket_start.clone(),
                     bucket_width: BUCKET_WIDTH.to_owned(),
                     occurrence_count: count,
+                    source_id: source_id.clone(),
                 }))
                 .with_valid_time(bucket_start.clone(), source),
             );

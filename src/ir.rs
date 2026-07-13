@@ -34,7 +34,14 @@ pub const USER_CONTEXT_SCHEMA_VERSION: u32 = 1;
 /// Schema version for the log-signature domain (`LogSource`, `ErrorSignature`,
 /// `LogEvent`, `LogOccurrenceBucket`). Documented in `docs/schema/log-graph.md`
 /// (issues #319 / #320).
-pub const LOG_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (issue #361): source-aware `LogOccurrenceBucket` identity — the owning
+/// `LogSource` is folded into the bucket's stable ID and carried as a citable
+/// `source_id` payload field, so two distinct sources observing the same
+/// signature/hour mint DISTINCT bucket IDs (summed downstream) while a genuine
+/// rescan of identical bytes mints the SAME bucket ID (collapsed). A breaking
+/// bump: re-scan to regenerate buckets under the new identity.
+pub const LOG_SCHEMA_VERSION: u32 = 2;
 
 /// Minimum replay tolerance for semantic drift scores.
 /// Documented in `docs/schema/semantic-drift.md`.
@@ -534,7 +541,11 @@ pub struct LogEventPayload {
 /// Payload for a `LogOccurrenceBucket` node: an hourly occurrence count.
 ///
 /// Identity inputs: `repository_id`, `signature_id`, `bucket_start`,
-/// `bucket_width`. `occurrence_count` and producer are non-identity.
+/// `bucket_width`, and `source_id` (issue #361, schema v2). `occurrence_count`
+/// and producer are non-identity. Folding the owning `LogSource` into identity
+/// makes two distinct sources observing the same signature/hour mint DISTINCT
+/// bucket IDs (summed downstream), while a genuine rescan of identical bytes
+/// mints the SAME bucket ID (collapsed as a duplicate).
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LogOccurrenceBucketPayload {
     /// RFC 3339 UTC start of the bucket, floored to the hour.
@@ -543,6 +554,10 @@ pub struct LogOccurrenceBucketPayload {
     pub bucket_width: String,
     /// Occurrences of the signature within this bucket. Non-identity.
     pub occurrence_count: u64,
+    /// Stable `log:v<N>:` handle to the owning `LogSource`. Identity input
+    /// (issue #361): distinguishes buckets from distinct sources sharing a
+    /// signature/hour from a genuine rescan of the same source.
+    pub source_id: String,
 }
 
 /// A typed citation from an agent-memory node to another graph record.
@@ -3380,9 +3395,9 @@ pub fn user_context_stable_id(parts: &[&str]) -> String {
 
 /// Builds a stable log-signature record ID (issues #319 / #320).
 ///
-/// Uses the `log:v1:` prefix so runtime log-signature records cannot collide
-/// with code, memory, verification, artifact, project, semantic, or
-/// user-context IDs. Parts are hashed verbatim (no lowercasing) so log content
+/// Uses the `log:v<N>:` prefix (the schema version is [`LOG_SCHEMA_VERSION`]) so
+/// runtime log-signature records cannot collide with code, memory, verification,
+/// artifact, project, semantic, or user-context IDs. Parts are hashed verbatim (no lowercasing) so log content
 /// identity is preserved exactly; the producer envelope and its version fields
 /// are never identity inputs, so two binary versions over identical input mint
 /// identical IDs. Documented in `docs/schema/log-graph.md`.
@@ -3394,6 +3409,24 @@ pub fn log_stable_id(parts: &[&str]) -> String {
         hasher.update(b"\0");
     }
     format!("log:v{LOG_SCHEMA_VERSION}:{}", hasher.finalize().to_hex())
+}
+
+/// Strips a version-agnostic `log:v<N>:` stable-ID prefix (see [`log_stable_id`]),
+/// returning the hex tail (which may be a partial prefix for prefix-matching).
+///
+/// Accepts ANY positive integer schema version so both superseded `log:v1:`
+/// handles and current `log:v2:` handles (issue #361 bumped the log schema) both
+/// resolve. Returns `None` for a non-`log` domain or a malformed version segment;
+/// the hex tail is returned verbatim without hex-digit validation, so callers that
+/// need it (e.g. citation auditing) apply their own tail checks.
+#[must_use]
+pub fn strip_log_id_prefix(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix("log:v")?;
+    let (version, hex) = rest.split_once(':')?;
+    if version.is_empty() || !version.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(hex)
 }
 
 /// Builds a stable agent-memory record ID.
@@ -3412,4 +3445,30 @@ pub fn agent_memory_stable_id(parts: &[&str]) -> String {
         "agent_memory:v{AGENT_MEMORY_SCHEMA_VERSION}:{}",
         hasher.finalize().to_hex()
     )
+}
+
+#[cfg(test)]
+mod strip_prefix_tests {
+    use super::strip_log_id_prefix;
+
+    #[test]
+    fn strip_log_id_prefix_is_version_agnostic() {
+        // Both the superseded v1 and current v2 (issue #361) prefixes resolve,
+        // returning the hex tail unchanged so exact-ID and prefix resolution work.
+        assert_eq!(strip_log_id_prefix("log:v1:deadbeef"), Some("deadbeef"));
+        assert_eq!(strip_log_id_prefix("log:v2:deadbeef"), Some("deadbeef"));
+        // Multi-digit versions are accepted (future-proof).
+        assert_eq!(strip_log_id_prefix("log:v10:abc"), Some("abc"));
+        // A partial hex tail (prefix-resolution needle) round-trips.
+        assert_eq!(strip_log_id_prefix("log:v2:dead"), Some("dead"));
+    }
+
+    #[test]
+    fn strip_log_id_prefix_rejects_non_log_and_malformed() {
+        assert_eq!(strip_log_id_prefix("codegraph:v5:abc"), None);
+        assert_eq!(strip_log_id_prefix("log:abc"), None);
+        assert_eq!(strip_log_id_prefix("log:v:abc"), None);
+        assert_eq!(strip_log_id_prefix("log:vx:abc"), None);
+        assert_eq!(strip_log_id_prefix("some_symbol"), None);
+    }
 }

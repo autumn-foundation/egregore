@@ -259,13 +259,14 @@ adapter boundary; Vertere-specific semantics stay in Vertere (§6).
 The single-writer, filesystem-local model is correct for the local daemon and needs
 concrete work before a multi-tenant cloud deployment. Open tracking issues:
 
-- **Log retention and identity.** `LogOccurrenceBucket` identity is not source-aware,
-  so distinct sources and rescans are not distinguished in per-window counts
-  (issue #361); the embedded read path collapses duplicate non-temporal log records,
-  breaking multi-scan coalescing for `eg query log-deltas --data-dir` (issue #363);
-  log records carry no persisted repository attribution, so `--repo` cannot filter
-  log signatures (issue #362); endpoint-exact occurrence counts need sub-hour
-  per-occurrence timestamps (issue #364).
+- **Log retention and identity.** `LogOccurrenceBucket` identity is now source-aware
+  (the owning `LogSource` is folded into the bucket's stable ID and carried as a
+  citable `source_id` field), so distinct sources and rescans are distinguished in
+  per-window counts and those counts converge across `--graph` and `--data-dir`
+  (**resolved, issue #361**, schema v2). Remaining: log records carry no persisted
+  repository attribution, so `--repo` cannot filter log signatures (issue #362);
+  endpoint-exact occurrence counts need sub-hour per-occurrence timestamps
+  (issue #364).
 - **Evidence-pack hardening.** Bind `frame_resolution` labels on error-signature
   evidence-pack rows via co-located `FRAME_RESOLVES_TO` edges (issue #371); extend the
   `runtime_observation` provenance requirement to the shared citation classifier used

@@ -1271,6 +1271,7 @@ fn occurrence_bucket_node(id: &str, bucket_start: &str) -> GraphRecord {
             bucket_start: bucket_start.to_owned(),
             bucket_width: "1h".to_owned(),
             occurrence_count: 3,
+            source_id: "log:v2:fixture-source".to_owned(),
         },
     ))
 }

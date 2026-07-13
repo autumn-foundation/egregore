@@ -3787,9 +3787,11 @@ fn read_back_error(record_id: &str, message: impl Into<String>) -> AdapterError 
 /// * `ErrorSignature`: the full [`crate::ir::ErrorSignaturePayload`], including
 ///   the `frames` chain, so two observations differing only in captured frames
 ///   are retained.
-/// * `LogOccurrenceBucket`: the full bucket payload. Byte-identical buckets are
-///   already write-deduped, so this is effectively a no-op for buckets, but the
-///   rule is applied uniformly.
+/// * `LogOccurrenceBucket`: the full bucket payload, which since issue #361
+///   carries the owning `source_id` as an identity input — so distinct sources
+///   get distinct payload keys AND distinct record IDs, while a byte-identical
+///   rescan is already write-deduped. This is effectively a no-op for buckets
+///   (same ID ⟹ same content), but the rule is applied uniformly.
 fn log_observation_key(record: &GraphRecord) -> Option<String> {
     let payload = record.log_payload()?;
     match payload {
@@ -4918,7 +4920,7 @@ mod tests {
         // concatenated `--graph` JSONL.
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let data_dir = temp.path().join("log-retained-store");
-        let sig_id = "log:v1:retained-boom";
+        let sig_id = "log:v2:retained-boom";
         let v1 = error_signature_record(sig_id, "2026-01-01T00:00:00Z", "2026-01-01T05:00:00Z", 3);
         let v2 = error_signature_record(sig_id, "2026-01-02T12:00:00Z", "2026-01-02T13:00:00Z", 5);
         let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
@@ -4957,7 +4959,7 @@ mod tests {
         // never multiply counts on `--data-dir`.
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let data_dir = temp.path().join("log-retained-idempotent-store");
-        let sig_id = "log:v1:idempotent-boom";
+        let sig_id = "log:v2:idempotent-boom";
         let sig = error_signature_record(sig_id, "2026-01-01T00:00:00Z", "2026-01-01T05:00:00Z", 3);
         let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
         sink.write_record(&sig).expect("first write should succeed");
@@ -4989,7 +4991,7 @@ mod tests {
         // keeps both.
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let data_dir = temp.path().join("log-retained-distinct-payload-store");
-        let sig_id = "log:v1:distinct-payload-boom";
+        let sig_id = "log:v2:distinct-payload-boom";
         let frames_a = vec![crate::ir::StackFrame {
             frame_index: 0,
             module_path: Some("app::alpha".to_owned()),
@@ -5070,7 +5072,7 @@ mod tests {
     fn read_all_records_including_superseded_log_retained_collapses_enrichment_rewrite() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let data_dir = temp.path().join("temporal-enrichment-store");
-        let sig_id = "log:v1:enrich-boom";
+        let sig_id = "log:v2:enrich-boom";
         let bare =
             error_signature_record(sig_id, "2026-01-01T00:00:00Z", "2026-01-01T05:00:00Z", 7);
         // Same log payload, an evidence link added (as resolve-frames emits).
@@ -5131,7 +5133,7 @@ mod tests {
     fn read_all_records_including_superseded_log_retained_retains_distinct_observations() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let data_dir = temp.path().join("temporal-distinct-store");
-        let sig_id = "log:v1:distinct-boom";
+        let sig_id = "log:v2:distinct-boom";
         let v1 = error_signature_record(sig_id, "2026-01-01T00:00:00Z", "2026-01-01T05:00:00Z", 3);
         let v2 = error_signature_record(sig_id, "2026-01-02T12:00:00Z", "2026-01-02T13:00:00Z", 5);
         let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
@@ -5160,7 +5162,7 @@ mod tests {
     fn read_all_records_including_superseded_log_retained_retains_distinct_payload_same_window() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let data_dir = temp.path().join("temporal-distinct-payload-store");
-        let sig_id = "log:v1:temporal-distinct-payload-boom";
+        let sig_id = "log:v2:temporal-distinct-payload-boom";
         let frames_a = vec![crate::ir::StackFrame {
             frame_index: 0,
             module_path: Some("app::alpha".to_owned()),
@@ -5286,7 +5288,7 @@ mod tests {
         // retraction are suppressed.
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let data_dir = temp.path().join("log-retained-forget-boundary-store");
-        let sig_id = "log:v1:forget-boundary-boom";
+        let sig_id = "log:v2:forget-boundary-boom";
         // v1 (occurrence A=3) → forget/tombstone → v2 (occurrence B=5, distinct).
         let v1 = error_signature_record(sig_id, "2026-01-01T00:00:00Z", "2026-01-01T05:00:00Z", 3);
         // The tombstone mirrors exactly what `eg forget` mints for a log ID: a
@@ -5342,7 +5344,7 @@ mod tests {
         // (regression guard alongside the re-scan-after-forget boundary).
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let data_dir = temp.path().join("log-retained-fully-retracted-store");
-        let sig_id = "log:v1:fully-retracted-boom";
+        let sig_id = "log:v2:fully-retracted-boom";
         let v1 = error_signature_record(sig_id, "2026-01-01T00:00:00Z", "2026-01-01T05:00:00Z", 3);
         let (tombstone_id, tombstone_version) = crate::forget::retraction_tombstone_id(sig_id);
         let tombstone = GraphRecord::Tombstone {

@@ -194,8 +194,24 @@ fn frame_resolves(sig: &str, target: &str, index: u32, resolution: FrameResoluti
     }
 }
 
+/// The default `LogSource` handle folded into a single-source fixture bucket ID.
+const DEFAULT_SOURCE: &str = "log:v2:source-default";
+
 fn bucket_with_edge(sig: &str, bucket_start: &str, count: u64) -> (GraphRecord, GraphRecord) {
-    let bucket_id = log_stable_id(&["log_occurrence_bucket", sig, bucket_start]);
+    bucket_with_source(sig, bucket_start, count, DEFAULT_SOURCE)
+}
+
+/// A `LogOccurrenceBucket` node plus its `AGGREGATES` edge, attributed to an
+/// explicit `source_id` (issue #361). The `source_id` is folded LAST into the
+/// bucket's stable ID (matching production ordering), so distinct sources mint
+/// DISTINCT bucket IDs while a rescan of the same source mints the SAME ID.
+fn bucket_with_source(
+    sig: &str,
+    bucket_start: &str,
+    count: u64,
+    source_id: &str,
+) -> (GraphRecord, GraphRecord) {
+    let bucket_id = log_stable_id(&["log_occurrence_bucket", sig, bucket_start, source_id]);
     let node = GraphRecord::node(
         bucket_id.clone(),
         NodeKind::LogOccurrenceBucket,
@@ -210,6 +226,7 @@ fn bucket_with_edge(sig: &str, bucket_start: &str, count: u64) -> (GraphRecord, 
             bucket_start: bucket_start.to_owned(),
             bucket_width: "1h".to_owned(),
             occurrence_count: count,
+            source_id: source_id.to_owned(),
         },
     ))
     .with_valid_time(bucket_start, "log_event_timestamp");
@@ -472,7 +489,7 @@ fn well_formed_absent_signature_id_is_no_match() {
 fn resolves_unique_fingerprint_prefix() {
     let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 3, None);
     let records = vec![sig];
-    let hex = sig_id.strip_prefix("log:v1:").unwrap();
+    let hex = sig_id.strip_prefix("log:v2:").unwrap();
     let prefix = &hex[..12]; // long enough to be unique
     let ctx = error_context(
         &records,
@@ -502,7 +519,7 @@ fn ambiguous_prefix_fixture() -> (Vec<GraphRecord>, String, Vec<String>) {
     }
     let mut by_first: BTreeMap<char, Vec<String>> = BTreeMap::new();
     for id in &ids {
-        let hex = id.strip_prefix("log:v1:").unwrap();
+        let hex = id.strip_prefix("log:v2:").unwrap();
         let first = hex.chars().next().unwrap();
         by_first.entry(first).or_default().push(id.clone());
     }
@@ -512,7 +529,7 @@ fn ambiguous_prefix_fixture() -> (Vec<GraphRecord>, String, Vec<String>) {
         .expect("20 signatures over 16 hex digits must collide on a first digit");
     let mut candidates: Vec<String> = ids
         .iter()
-        .filter(|id| id.strip_prefix("log:v1:").unwrap().starts_with(*first))
+        .filter(|id| id.strip_prefix("log:v2:").unwrap().starts_with(*first))
         .cloned()
         .collect();
     candidates.sort();
@@ -2204,8 +2221,12 @@ fn embedded_source_discloses_log_retention_caveat() {
         "the caveat must reference the `--graph` path it now matches"
     );
     assert!(
-        caveat.message.contains("byte-identical re-ingests"),
-        "the caveat must disclose the residual byte-identical-re-ingest divergence"
+        caveat.message.contains("converge"),
+        "the caveat must disclose that per-window counts now converge (issue #361)"
+    );
+    assert!(
+        caveat.message.contains("byte-identical re-ingest"),
+        "the caveat must disclose the residual idempotent-write re-ingest divergence"
     );
     assert!(
         caveat.message.contains("#363"),
@@ -2408,20 +2429,15 @@ fn embedded_data_dir_honors_forget_retraction_boundary_in_error_context() {
     assert_eq!(e.last_seen, SIG_LAST);
 }
 
-/// Issue #363 (Codex P2): the same-hour/same-count `LogOccurrenceBucket` sub-case.
-/// When two DIFFERING scans of one signature share a bucket for the same hour with
-/// the SAME count, that bucket record is BYTE-IDENTICAL (same ID AND content), so
-/// its second write is an idempotent no-op → only ONE physical bucket node. The
-/// two `ErrorSignature` records still differ, so both are retained and coalesced.
-/// Consequence: the coalesced signature's occurrence-bucket block holds the shared
-/// bucket ONCE on `--data-dir`, whereas `--graph` (which iterates bucket nodes over
-/// the concatenated JSONL, never deduping by bucket record ID) holds it TWICE. This
-/// case LEGITIMATELY diverges from `--graph`; the real fix is source-aware bucket
-/// identity, tracked in issue #361. We assert the OBSERVED behavior and do NOT
-/// assert `--data-dir == --graph` for the bucket block.
+/// Issue #361: source-aware bucket identity makes the occurrence-bucket block
+/// CONVERGE across `--graph` and `--data-dir`. A RESCAN of the same source emits
+/// a byte-identical shared bucket that collapses on BOTH paths (`--graph` dedups
+/// by record ID; `--data-dir` idempotent-write-dedups), and DISTINCT sources mint
+/// DISTINCT bucket IDs that both survive on both paths. This test proves the
+/// rescan case converges (no divergence in the bucket block).
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
-fn embedded_data_dir_dedups_shared_same_count_bucket_block() {
+fn embedded_data_dir_bucket_block_converges_with_graph() {
     use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink};
 
     // Two differing scans of one fingerprint (distinct last_seen + count).
@@ -2435,9 +2451,9 @@ fn embedded_data_dir_dedups_shared_same_count_bucket_block() {
     );
     let (sig_id2, sig2) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 5, None);
     assert_eq!(sig_id, sig_id2, "same seed → same stable signature ID");
-    // A SHARED 12:00 bucket with an IDENTICAL count (4) is emitted by BOTH scans →
-    // byte-identical record → deduped on the embedded path. Plus one DISTINCT-hour
-    // bucket per scan so the block has non-shared occurrence data too.
+    // A SHARED 12:00 bucket from the SAME (default) source is emitted by BOTH scans
+    // → identical source-aware bucket ID and identical bytes → collapses on both
+    // paths. Plus one DISTINCT-hour bucket per scan so the block has non-shared data.
     let (shared_n, shared_e) = bucket_with_edge(&sig_id, "2026-01-02T12:00:00Z", 4);
     let (d1n, d1e) = bucket_with_edge(&sig_id, "2026-01-02T10:00:00Z", 3);
     let (d2n, d2e) = bucket_with_edge(&sig_id, "2026-01-02T13:00:00Z", 6);
@@ -2503,39 +2519,34 @@ fn embedded_data_dir_dedups_shared_same_count_bucket_block() {
             .sum()
     };
 
-    // --graph: the shared 12:00 bucket appears TWICE (both byte-identical copies),
-    // so the bucket-block total sums it twice: 3 + 4 + 4 + 6 = 17.
+    // The identical rescan bucket collapses on BOTH paths (source-aware identity,
+    // #361): it appears ONCE, and the block total is 3 + 4 + 6 = 13 on both.
     assert_eq!(
         shared_rows(&graph),
-        2,
-        "--graph carries both shared-bucket copies"
+        1,
+        "--graph dedups the identical rescan"
     );
-    assert_eq!(total(&graph), 17);
-
-    // --data-dir: the byte-identical shared bucket is deduped to one physical node,
-    // so it appears ONCE and its count is reflected once: 3 + 4 + 6 = 13.
     assert_eq!(
         shared_rows(&embedded),
         1,
-        "the byte-identical shared bucket is deduped to one physical record on --data-dir"
+        "--data-dir idempotent-write-dedups the identical rescan"
     );
+    assert_eq!(total(&graph), 13);
     assert_eq!(total(&embedded), 13);
+    assert_eq!(
+        total(&graph),
+        total(&embedded),
+        "the occurrence-bucket block CONVERGES across --graph and --data-dir (#361)"
+    );
 
-    // The two paths LEGITIMATELY diverge here by exactly the once-deduped shared
-    // count (4) — inherent to non-source-aware bucket identity (issue #361), NOT a
-    // bug in the embedded read path. Deliberately NOT asserting block equality.
-    // (Coalesced signature IDENTITY parity — first_seen/last_seen/aggregate — is
-    // covered by `embedded_data_dir_coalesces_signature_block_like_graph`; this
-    // sub-case affects only duplicate buckets.)
-    assert_eq!(total(&graph) - total(&embedded), 4);
-
-    // The embedded path still discloses the retention caveat, which now names this
-    // shared-hour/shared-count bucket sub-case and cites #361.
+    // The embedded path still discloses the retention caveat (idempotent-write
+    // residual), which now describes convergence and cites #361.
     let caveat = embedded
         .embedded_log_retention_caveat
         .as_ref()
         .expect("embedded path with an ErrorSignature must disclose the retention caveat");
     assert!(caveat.message.contains("#361"));
+    assert!(caveat.message.contains("converge"));
     assert!(graph.embedded_log_retention_caveat.is_none());
 }
 

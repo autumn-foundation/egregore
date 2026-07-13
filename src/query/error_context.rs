@@ -42,7 +42,7 @@ use super::{
 };
 use crate::ir::{
     CorrelationBasis, EdgeLabel, ErrorSignaturePayload, GraphRecord, LogPayload, NodeKind,
-    SourceSpan,
+    SourceSpan, strip_log_id_prefix,
 };
 use crate::log_resolve;
 use crate::protected::{PROTECTED_HANDLE_PREFIX, ProtectedStore};
@@ -64,10 +64,6 @@ pub const ERROR_CONTEXT_DISCLAIMER: &str = "Rows are CORRELATION LEADS, never pr
 pub const REPO_SCOPE_CAVEAT: &str = "--repo scopes only the code-side first_seen_range \
      symbol-delta join; log records carry no retrievable repository attribution, so the signature, \
      frame, bucket, and EMITTED_DURING observation sections are NOT repository-filtered.";
-
-/// The `log:v1:` stable-ID prefix every `ErrorSignature`/`LogSource`/bucket ID
-/// carries (see [`log_stable_id`](crate::ir::log_stable_id)).
-const LOG_ID_PREFIX: &str = "log:v1:";
 
 /// A universal, redaction-safe projection of one `&GraphRecord` for a
 /// trust-separated context section.
@@ -475,12 +471,12 @@ fn resolve_handle(
         .collect();
 
     // ── 1a: exact record-ID match ────────────────────────────────────────────
-    if let Some(needle) = handle.strip_prefix(LOG_ID_PREFIX) {
+    if let Some(needle) = strip_log_id_prefix(handle) {
         if sig_ids.contains(handle) {
             return HandleResolution::Signatures(vec![handle.to_owned()]);
         }
-        // A `log:v1:`-shaped handle only ever names a log record; resolve it as a
-        // fingerprint prefix over signature hex tails, never as a symbol name.
+        // A `log:v<N>:`-shaped handle only ever names a log record; resolve it as
+        // a fingerprint prefix over signature hex tails, never as a symbol name.
         return prefix_resolution(&sig_ids, needle);
     }
 
@@ -539,10 +535,7 @@ fn prefix_resolution(sig_ids: &BTreeSet<&str>, needle: &str) -> HandleResolution
     }
     let candidates: Vec<String> = sig_ids
         .iter()
-        .filter(|id| {
-            id.strip_prefix(LOG_ID_PREFIX)
-                .is_some_and(|hex| hex.starts_with(needle))
-        })
+        .filter(|id| strip_log_id_prefix(id).is_some_and(|hex| hex.starts_with(needle)))
         .map(|id| (*id).to_owned())
         .collect();
     match candidates.len() {
@@ -721,8 +714,13 @@ pub fn error_context(
     }
 
     // Occurrence buckets per signature, bounded by `--as-of` on the valid axis.
+    // Buckets are DEDUPED by record ID (issue #361, source-aware identity): a
+    // bucket ID is now (repository/signature/hour/width/SOURCE), so distinct
+    // sources mint distinct bucket IDs (each listed once) while a genuine rescan
+    // of identical bytes mints the SAME bucket ID (collapsed as a duplicate).
     let as_of_instant = as_of.and_then(parse_instant);
     let mut buckets_by_sig: BTreeMap<&str, Vec<BucketRow>> = BTreeMap::new();
+    let mut seen_bucket_ids: BTreeSet<&str> = BTreeSet::new();
     for r in records {
         let GraphRecord::Node {
             id,
@@ -735,6 +733,9 @@ pub fn error_context(
         let LogPayload::LogOccurrenceBucket(bucket) = payload.as_ref() else {
             continue;
         };
+        if !seen_bucket_ids.insert(id.as_str()) {
+            continue;
+        }
         let Some(sigs) = bucket_targets.get(id.as_str()) else {
             continue;
         };

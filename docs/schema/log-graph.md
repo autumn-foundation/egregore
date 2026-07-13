@@ -1,8 +1,10 @@
-# Log-Signature Domain Schema - v1
+# Log-Signature Domain Schema - v2
 
-Runtime log observations (issues #319 / #320). `schema_version` = `1`. Domain
-prefix `log:v1:`. Compatibility class **additive** per
-[`schema-versioning.md`](schema-versioning.md).
+Runtime log observations (issues #319 / #320). `schema_version` = `2` (bumped
+1 → 2 by issue #361: source-aware `LogOccurrenceBucket` identity). Domain prefix
+`log:v2:`. The v1 → v2 change was a `breaking` bump per
+[`schema-versioning.md`](schema-versioning.md); re-scan to regenerate log
+records under the v2 identity.
 
 The `scan-logs` command ([`docs/cli/scan-logs.md`](../cli/scan-logs.md)) is the
 producer. Records are deterministic, filesystem-local, and redaction-safe. Raw
@@ -53,7 +55,8 @@ payload), serialized internally-tagged on `log_kind`.
 - **`LogEvent`**: `event_excerpt` (redacted, ≤200 chars), `event_content_hash`,
   `source_line`, `severity`.
 - **`LogOccurrenceBucket`**: `bucket_start` (RFC 3339 UTC, hour-floored),
-  `bucket_width` (`1h`), `occurrence_count`.
+  `bucket_width` (`1h`), `occurrence_count`, and (issue #361) `source_id` — a
+  `log:v2:` handle to the owning `LogSource`, a required identity input.
 
 ## Edge labels
 
@@ -127,7 +130,7 @@ blame.
 
 ## Stable-ID identity
 
-IDs are `log:v1:<blake3>` over the NUL-joined identity parts below (content is
+IDs are `log:v2:<blake3>` over the NUL-joined identity parts below (content is
 hashed verbatim — no lowercasing). The **producer envelope and its version
 fields are never identity inputs**, so two binary versions over identical input
 mint identical IDs. Line endings are normalized (`\r\n`/`\r` → `\n`) before
@@ -138,10 +141,19 @@ hashing, so CRLF and LF checkouts yield identical IDs.
 | `LogSource` | `repository_id`, `source_relative_path`, `source_artifact_hash` | `line_count`, capture/transaction time, producer |
 | `ErrorSignature` | `repository_id`, `fingerprint_algorithm`, `normalized_template`, `severity` | `occurrence_count`, `first_seen`, `last_seen`, **`frames`**, producer, capture time |
 | `LogEvent` | `repository_id`, `signature_id`, `event_valid_time`, `event_content_hash` | `source_line`, byte offsets, producer, capture time |
-| `LogOccurrenceBucket` | `repository_id`, `signature_id`, `bucket_start`, `bucket_width` | `occurrence_count`, producer, capture time |
+| `LogOccurrenceBucket` | `repository_id`, `signature_id`, `bucket_start`, `bucket_width`, `source_id` | `occurrence_count`, producer, capture time |
 
 `normalized_template` is the `template-v1` fingerprint **after** redaction, so a
 secret never enters the fingerprint hash preimage.
+
+Since **schema v2** (issue #361) `LogOccurrenceBucket` identity is **source-aware**:
+the owning `LogSource` (`source_id`) is folded into the bucket's stable ID and
+carried as a required, citable payload field. Two distinct sources (e.g. two app
+instances) observing the same signature in the same hour therefore mint **distinct**
+bucket IDs whose per-source counts **sum** via per-signature aggregation, while a
+genuine **rescan** of identical bytes mints the **same** bucket ID and **collapses**
+as a duplicate. This is what lets downstream consumers tell "rescan (count once)"
+apart from "distinct sources (sum)" — a bucket ID collision is now always a rescan.
 
 ## Aggregation storage design
 

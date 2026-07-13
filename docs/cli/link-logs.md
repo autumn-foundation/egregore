@@ -72,7 +72,7 @@ silently chosen.
   **repository anchor** — the sole `Repository` node's stable ID. Each
   signature's repository is *verified* by recomputing its `LogSource` stable ID
   against that anchor
-  (`log:v1:blake3("log_source", anchor, source_relative_path,
+  (`log:v2:blake3("log_source", anchor, source_relative_path,
   source_artifact_hash)`) and checking it equals the stored `LogSource` ID; this
   reads the repository identity the ID hash already encoded, with **no new
   stored field**. A signature whose `LogSource` does not recompute to the anchor
@@ -129,7 +129,7 @@ re-emitted. A deterministic JSON envelope is printed to stdout:
     "tolerance_seconds": 0,
     "temporal_correlation_enabled": true
   },
-  "signatures": [ { "signature_id": "log:v1:…", "content_hash_join": 1,
+  "signatures": [ { "signature_id": "log:v2:…", "content_hash_join": 1,
                     "temporal_correlation": 2, "task_links": 1,
                     "uncorrelated": false } ],
   "disclaimer": "An EMITTED_DURING edge is a correlation lead, never causation. …"

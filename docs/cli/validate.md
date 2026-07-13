@@ -204,12 +204,12 @@ spans, and counts.
 ```json
 {"code":"dangling_edge_endpoint","edge_id":"codegraph:v5:…","relation":"CALLS","endpoint":"target","missing_id":"codegraph:v5:…"}
 {"code":"edge_target_kind_violation","edge_id":"codegraph:v5:…","relation":"DEFINES","target_id":"codegraph:v5:…","target_kind":"Import","allowed_kinds":["Symbol"],"repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":12,"start_line":1,"end_line":1}}
-{"code":"edge_source_kind_violation","edge_id":"log:v1:…","relation":"CAPTURED_FROM","endpoint":"source","allowed_kinds":["ErrorSignature","LogEvent"],"record_id":"log:v1:…","kind":"LogOccurrenceBucket","repo_relative_path":"app.log","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
+{"code":"edge_source_kind_violation","edge_id":"log:v2:…","relation":"CAPTURED_FROM","endpoint":"source","allowed_kinds":["ErrorSignature","LogEvent"],"record_id":"log:v2:…","kind":"LogOccurrenceBucket","repo_relative_path":"app.log","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
 {"code":"edge_to_tombstoned_record","edge_id":"codegraph:v5:…","relation":"CALLS","endpoint":"target","tombstoned_id":"codegraph:v5:…","tombstone_id":"codegraph:v5:…"}
 {"code":"orphan_node","record_id":"codegraph:v5:…","kind":"Symbol","repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
 {"code":"tombstone_strands_live_edge","tombstone_id":"codegraph:v5:…","deleted_id":"codegraph:v5:…","stranded_edge_ids":["codegraph:v5:…"],"repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
-{"code":"missing_log_structural_edge","relation":"CAPTURED_FROM","record_id":"log:v1:…","kind":"LogEvent","repo_relative_path":"app.log","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
-{"code":"duplicate_log_structural_edge","relation":"FINGERPRINTED_AS","stranded_edge_ids":["log:v1:…","log:v1:…"],"record_id":"log:v1:…","kind":"LogEvent","repo_relative_path":"app.log","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
+{"code":"missing_log_structural_edge","relation":"CAPTURED_FROM","record_id":"log:v2:…","kind":"LogEvent","repo_relative_path":"app.log","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
+{"code":"duplicate_log_structural_edge","relation":"FINGERPRINTED_AS","stranded_edge_ids":["log:v2:…","log:v2:…"],"record_id":"log:v2:…","kind":"LogEvent","repo_relative_path":"app.log","span":{"start_byte":0,"end_byte":10,"start_line":1,"end_line":1}}
 ```
 
 The final stdout line is always a machine-readable summary:

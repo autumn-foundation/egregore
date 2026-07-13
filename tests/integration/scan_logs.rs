@@ -155,15 +155,15 @@ fn every_record_carries_identity_and_producer_envelope() {
     for record in &records {
         let id = record["id"].as_str().expect("record has id");
         assert!(
-            id.starts_with("log:v1:"),
-            "id must be log:v1:-prefixed: {id}"
+            id.starts_with("log:v2:"),
+            "id must be log:v2:-prefixed: {id}"
         );
-        assert_eq!(record["schema_version"], 1, "log schema version is 1");
+        assert_eq!(record["schema_version"], 2, "log schema version is 2");
 
         let producer = &record["producer"];
         assert_eq!(producer["producer_kind"], "log_importer");
         let comps = &producer["producer_components"];
-        assert_eq!(comps["importer_schema_version"], "1");
+        assert_eq!(comps["importer_schema_version"], "2");
         assert_eq!(comps["fingerprint_algorithm"], "template-v1");
         assert!(
             comps["source_format_version"].is_string(),
