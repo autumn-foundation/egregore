@@ -1106,6 +1106,82 @@ fn real_scan_generic_trait_impls_are_edge_backed() {
 }
 
 // ---------------------------------------------------------------------------
+// A blanket impl whose `for` target is a REFERENCE (or pointer) to a bare
+// binder type parameter -- `impl<T> RefTrait for &T` (also `&mut T`, `&'a T`)
+// -- is still a blanket impl: it covers every type, has no single concrete
+// implementing-type record, and must stay bounded out (issue #343's "blanket
+// impls bounded out" decision). Before the fix the sigil (`&`) broke the bare
+// `T` filter, so `&T` fell through to `Resolve` and fabricated an IMPLEMENTS
+// edge with no concrete type record. Only the concrete `impl RefTrait for
+// Owned` edge-backs; the reference/pointer blanket impls mint no edge.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn real_scan_reference_blanket_trait_impls_are_bounded_out() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait RefTrait {\n",
+            "    fn go(&self);\n",
+            "}\n\n",
+            "pub struct Owned;\n\n",
+            // Concrete nominal impl: the only edge-backed implementor.
+            "impl RefTrait for Owned {\n",
+            "    fn go(&self) {}\n",
+            "}\n\n",
+            // Blanket over a shared reference to a binder param -> no edge.
+            "impl<T> RefTrait for &T {\n",
+            "    fn go(&self) {}\n",
+            "}\n\n",
+            // Blanket over a mutable reference to a binder param -> no edge.
+            "impl<T> RefTrait for &mut T {\n",
+            "    fn go(&self) {}\n",
+            "}\n\n",
+            // Blanket over a lifetime-annotated reference -> no edge.
+            "impl<'a, T> RefTrait for &'a T {\n",
+            "    fn go(&self) {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write lib.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let stdout = egregore()
+        .args(["query", "implementors", "RefTrait", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the concrete `impl RefTrait for Owned` is edge-backed; the \
+         reference/pointer blanket impls mint no fabricated implementor: {rows:?}"
+    );
+    assert_eq!(rows[0]["implementing_type"], "Owned");
+    assert_eq!(rows[0]["completeness"], "local_traits_only");
+}
+
+// ---------------------------------------------------------------------------
 // Turbofish trait syntax (`impl GenP::<u32> for Plain`, valid Rust in type
 // position) leaves a trailing `::` separator once the trait-segment generic
 // args are stripped. Before the fix the trait normalized to `GenP::`, which

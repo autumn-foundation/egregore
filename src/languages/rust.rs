@@ -1709,10 +1709,15 @@ fn impl_trait_target(display: &str) -> ImplTargetDecision {
             if bare_trait.is_empty() {
                 return ImplTargetDecision::NoEdge;
             }
-            // Blanket impl: the `for` target is a bare binder type parameter.
-            if for_target_ident(for_target)
-                .is_some_and(|ident| binder_params.iter().any(|p| p == ident))
-            {
+            // Blanket impl: the `for` target reduces to a bare binder type
+            // parameter, even through reference/pointer sigils and lifetimes
+            // (`impl<T> Trait for &T` / `&mut T` / `&'a T` / `*const T` are as
+            // blanket as `impl<T> Trait for T`), or it is a non-nominal type
+            // (slice, tuple, trait object) that names no single local type.
+            // Either way there is no concrete implementing-type record, so mint
+            // no edge rather than fabricate one.
+            let for_core = for_target_core(for_target);
+            if binder_params.iter().any(|p| p == for_core) || is_non_nominal_target(for_core) {
                 return ImplTargetDecision::NoEdge;
             }
             ImplTargetDecision::Resolve(bare_trait.to_owned())
@@ -1802,16 +1807,54 @@ fn strip_trait_generics(trait_seg: &str) -> &str {
     base.strip_suffix("::").map_or(base, str::trim_end)
 }
 
-/// Returns the `for` target as a bare identifier when it is a single simple
-/// identifier (after dropping a trailing where clause), else `None`. Used to
-/// detect a blanket impl's bare-type-parameter target (`... for T`); anything
-/// carrying generics, a path, a reference, or whitespace is not a bare param.
-fn for_target_ident(for_target: &str) -> Option<&str> {
-    let target = for_target
+/// Reduces a trait impl's `for` target to the core type text used for the
+/// blanket / non-nominal bound-out check. Drops a trailing where clause, then
+/// repeatedly strips leading reference and pointer sigils with their optional
+/// lifetimes and `mut` (`&`, `&mut`, `&'a`, `&'a mut`, `*const`, `*mut`, in any
+/// combination), returning the innermost wrapped type text. A bare binder param
+/// stays itself (`T` -> `T`), a reference to one reduces to it (`&'a mut T` ->
+/// `T`), and a concrete nominal target is preserved for the caller's resolve
+/// path (`Wrapper<T>` -> `Wrapper<T>`, `&Wrapper<T>` -> `Wrapper<T>`).
+fn for_target_core(for_target: &str) -> &str {
+    let mut core = for_target
         .split_once(" where ")
         .map_or(for_target, |(lhs, _)| lhs)
         .trim();
-    is_simple_ident(target).then_some(target)
+    loop {
+        let before = core;
+        if let Some(rest) = core.strip_prefix('&') {
+            let rest = rest.trim_start();
+            // Optional lifetime (`'a`), then optional `mut`.
+            let rest = rest.strip_prefix('\'').map_or(rest, |after_tick| {
+                let end = after_tick
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(after_tick.len());
+                after_tick[end..].trim_start()
+            });
+            core = rest.strip_prefix("mut ").map_or(rest, str::trim_start);
+        } else if let Some(rest) = core.strip_prefix("*const ") {
+            core = rest.trim_start();
+        } else if let Some(rest) = core.strip_prefix("*mut ") {
+            core = rest.trim_start();
+        }
+        if core == before {
+            break;
+        }
+    }
+    core
+}
+
+/// `true` when a trait impl's sigil-stripped `for` target core cannot name a
+/// single local nominal type: a slice/array (`[T]`), a tuple (`(T, U)`), or a
+/// trait object / opaque type (`dyn Foo`, `impl Foo`). Such targets have no
+/// concrete implementing-type record, so they mint no IMPLEMENTS edge.
+fn is_non_nominal_target(core: &str) -> bool {
+    core.starts_with('[')
+        || core.starts_with('(')
+        || core == "dyn"
+        || core == "impl"
+        || core.starts_with("dyn ")
+        || core.starts_with("impl ")
 }
 
 fn impl_display(text: &str) -> String {
@@ -2814,6 +2857,51 @@ mod tests {
         // is NOT a bare param -> still resolves.
         assert_eq!(
             resolve_target("impl<T> Blanket for Wrapper<T>"),
+            Some("Blanket".to_owned())
+        );
+    }
+
+    #[test]
+    fn impl_trait_target_bounds_out_reference_blanket_impls() {
+        // A reference/pointer around a bare binder parameter is still a
+        // blanket impl: strip the sigils and lifetimes, recognize the binder
+        // param, mint no edge. Before the fix the `&` broke the bare-`T`
+        // filter and the header fell through to `Resolve`, fabricating an
+        // IMPLEMENTS edge with no concrete implementing-type record.
+        for header in [
+            "impl<T> Blanket for &T",
+            "impl<T> Blanket for &mut T",
+            "impl<'a, T> Blanket for &'a T",
+            "impl<'a, T> Blanket for &'a mut T",
+            "impl<T> Blanket for *const T",
+            "impl<T> Blanket for *mut T",
+            // Combined / repeated sigils still reduce to the binder param.
+            "impl<T> Blanket for &&T",
+            "impl<T> Blanket for &*const T",
+        ] {
+            assert!(
+                matches!(impl_trait_target(header), ImplTargetDecision::NoEdge),
+                "{header} must be bounded out"
+            );
+        }
+        // Non-nominal `for` targets (slice, tuple, trait object, opaque type)
+        // name no local nominal type and mint no edge either.
+        for header in [
+            "impl<T> Blanket for [T]",
+            "impl<T> Blanket for (T, T)",
+            "impl<T> Blanket for &[T]",
+            "impl Blanket for dyn Other",
+            "impl Blanket for impl Other",
+        ] {
+            assert!(
+                matches!(impl_trait_target(header), ImplTargetDecision::NoEdge),
+                "{header} must be bounded out"
+            );
+        }
+        // A reference to a CONCRETE nominal type is not a binder-param blanket
+        // impl -> still resolves the trait (implementing type `&Wrapper`).
+        assert_eq!(
+            resolve_target("impl<T> Blanket for &Wrapper<T>"),
             Some("Blanket".to_owned())
         );
     }
