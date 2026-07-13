@@ -422,7 +422,9 @@ fn zero_implementors_signal_exit0() {
     assert_eq!(v["implementors_recorded"], 0);
     assert_eq!(v["completeness"], "local_traits_only");
     assert!(
-        v["note"].as_str().is_some_and(|n| n.contains("locally")),
+        v["note"]
+            .as_str()
+            .is_some_and(|n| n.contains("external/std")),
         "zero answer must carry the local-traits-only incompleteness note: {v}"
     );
 }
@@ -1769,7 +1771,12 @@ fn real_scan_use_imported_trait_beats_value_namespace_shadow() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn real_scan_cross_file_trait_is_honestly_bounded() {
+fn real_scan_cross_file_trait_is_edge_backed() {
+    // Out-of-line module layout (issue #344): the trait is defined in the
+    // crate root and the impl lives in a separate `mod m;` file that names it
+    // through `crate::T`. Per-file extraction resolves impls only against the
+    // file it is walking, so before #344 this emitted ZERO edges; the repo-wide
+    // `cross_file_implements_records` pass now edge-backs it.
     let temp = tempfile::tempdir().expect("temp dir");
     let src = temp.path().join("src");
     fs::create_dir_all(&src).expect("mkdir src");
@@ -1816,17 +1823,83 @@ fn real_scan_cross_file_trait_is_honestly_bounded() {
         .lines()
         .map(|l| serde_json::from_str(l).expect("valid JSON"))
         .collect();
-    assert_eq!(rows.len(), 1, "one zero-signal envelope: {rows:?}");
     assert_eq!(
-        rows[0]["code"], "zero_implementors_recorded",
-        "cross-file impls are not edge-backed in this slice — the answer \
-         is the explicit honest zero, never a fabricated row: {rows:?}"
+        rows.len(),
+        1,
+        "exactly one cross-file implementor row (Foo -> T): {rows:?}"
+    );
+    assert_eq!(
+        rows[0]["implementing_type"], "m::Foo",
+        "the out-of-line `impl crate::T for Foo` edge-backs to Foo (resolved \
+         to its module-qualified name): {rows:?}"
     );
     assert_eq!(rows[0]["completeness"], "local_traits_only");
-    assert!(
-        rows[0]["note"].as_str().is_some_and(|n| !n.is_empty()),
-        "the zero signal must carry the incompleteness note: {rows:?}"
+}
+
+// ---------------------------------------------------------------------------
+// Cross-file out-of-line resolution also handles an UNQUALIFIED trait name
+// (issue #344): an `impl Draw for Button` inside a separate `mod widgets;`
+// file resolves outward through the module scope to the crate-root `Draw`
+// trait, exactly like the same-file unqualified scope walk. Re-scanning after
+// editing one side re-derives the edge (parity with the CALLS pass), because
+// the pass recomputes from `FileFacts` every scan.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_cross_file_unqualified_trait_resolves_outward() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait Draw {\n",
+            "    fn draw(&self);\n",
+            "}\n\n",
+            "pub mod widgets;\n",
+        ),
+    )
+    .expect("write lib.rs");
+    fs::write(
+        src.join("widgets.rs"),
+        concat!(
+            "pub struct Button;\n\n",
+            "impl Draw for Button {\n",
+            "    fn draw(&self) {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write widgets.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let stdout = egregore()
+        .args(["query", "implementors", "Draw", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one cross-file implementor row (Button -> Draw): {rows:?}"
     );
+    assert_eq!(rows[0]["implementing_type"], "widgets::Button");
+    assert_eq!(rows[0]["completeness"], "local_traits_only");
 }
 
 // ---------------------------------------------------------------------------

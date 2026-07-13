@@ -126,6 +126,46 @@ pub struct OutOfLineModFact {
     pub under_inline_path_override: bool,
 }
 
+/// An IMPLEMENTS-eligible trait/type definition exported for the repo-wide
+/// cross-file `IMPLEMENTS` resolution pass (issue #344).
+///
+/// Only symbols whose kind can be an `IMPLEMENTS` target are exported here —
+/// value-namespace items and callables never enter this index, so an out-of-line
+/// impl can never bind its trait to a same-named function.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImplTargetFact {
+    /// Stable record ID of the trait/type Symbol node.
+    pub id: String,
+    /// Crate-root-relative qualified name (`m::T`; root items bare `T`), the
+    /// key the repo-wide index resolves an impl's trait path against.
+    pub qualified_name: String,
+    /// The declaring module path (crate-root-relative), for provenance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub module_path: Vec<String>,
+    /// Symbol kind, restricted to the `IMPLEMENTS`-target set
+    /// (`trait`/`struct`/`enum`/`type_alias`).
+    pub symbol_kind: String,
+}
+
+/// A trait impl that failed to resolve its trait LOCALLY, deferred to the
+/// repo-wide cross-file `IMPLEMENTS` pass (issue #344).
+///
+/// Carries the parsed+normalized trait path exactly as the local resolver saw
+/// it (`crate::T`, `T`, `super::T`, `sibling::T`; generic binders and trait
+/// generic args already stripped) plus the declaring module scope, so the
+/// repo-wide pass can replay the same crate/self/super + scope-walk resolution
+/// against every file's [`ImplTargetFact`]s.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PendingImplFact {
+    /// Stable record ID of the `impl` Symbol node (the edge source).
+    pub source_id: String,
+    /// The normalized trait path as written on the impl header.
+    pub trait_path: String,
+    /// The impl's enclosing module path (crate-root-relative).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub module_names: Vec<String>,
+}
+
 /// Cross-file resolution facts exported by one file's extraction.
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileFacts {
@@ -138,16 +178,25 @@ pub struct FileFacts {
     /// Out-of-line module declarations in the file (issue #223).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub out_of_line_mods: Vec<OutOfLineModFact>,
+    /// IMPLEMENTS-eligible trait/type definitions in the file (issue #344).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub impl_targets: Vec<ImplTargetFact>,
+    /// Trait impls that failed local resolution, deferred to the repo-wide
+    /// cross-file `IMPLEMENTS` pass (issue #344).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_impls: Vec<PendingImplFact>,
 }
 
 impl FileFacts {
-    /// Returns `true` when the file exported no definitions, call sites, or
-    /// out-of-line module declarations.
+    /// Returns `true` when the file exported no cross-file resolution facts of
+    /// any kind.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.definitions.is_empty()
             && self.call_sites.is_empty()
             && self.out_of_line_mods.is_empty()
+            && self.impl_targets.is_empty()
+            && self.pending_impls.is_empty()
     }
 }
 
@@ -472,6 +521,179 @@ pub fn cross_file_call_records(
         );
     }
     records
+}
+
+/// Computes the cross-file `IMPLEMENTS` records for one scanned tree
+/// (issue #344).
+///
+/// Per-file extraction resolves an impl's trait only against definitions in the
+/// file it is walking, so the common out-of-line module layout
+/// (`trait T` in `src/lib.rs`, `impl crate::T for Foo` in `src/m.rs`) emitted
+/// ZERO `IMPLEMENTS` edges. This pass closes that recall gap: it builds a
+/// repo-wide index of every [`ImplTargetFact`] keyed by crate-root-relative
+/// qualified name and resolves each [`PendingImplFact`] — an impl the per-file
+/// pass could not resolve locally — with the SAME crate/self/super +
+/// module-scope-walk semantics the local resolver uses, minting one
+/// `IMPLEMENTS` edge per unique resolution.
+///
+/// Only impls that missed local resolution are deferred here, so a locally
+/// resolved edge is never duplicated. An unresolved or ambiguous trait path is
+/// left edge-free rather than diagnosed: an out-of-line impl of an external/std
+/// trait (`impl Debug for Foo`) is the overwhelming unresolved case and is
+/// external by construction, matching the `implementors` completeness contract
+/// (`local_traits_only`). The documented residual bound: cross-CRATE traits,
+/// non-Rust languages, blanket impls, and use-aliases of non-root modules stay
+/// out.
+///
+/// Output is deterministic: edges are keyed and emitted in sorted
+/// `(source, target)` order, byte-identical across runs.
+#[must_use]
+pub fn cross_file_implements_records(
+    _repository_id: &str,
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> Vec<GraphRecord> {
+    let index = ImplTargetIndex::build(facts_by_file);
+    // (source impl ID, trait target ID) -> summary, deduplicating so a source
+    // never mints two edges to one target.
+    let mut edges: BTreeMap<(String, String), String> = BTreeMap::new();
+    for facts in facts_by_file.values() {
+        for pending in &facts.pending_impls {
+            if let Some(target) = index.resolve(pending) {
+                let summary = format!(
+                    "{} implementation relationship (cross-file)",
+                    pending.trait_path
+                );
+                edges
+                    .entry((pending.source_id.clone(), target.id.clone()))
+                    .or_insert(summary);
+            }
+        }
+    }
+    edges
+        .into_iter()
+        .map(|((source, target), summary)| {
+            GraphRecord::edge(
+                EdgeLabel::Implements,
+                source,
+                target,
+                Some("1.0".to_owned()),
+                summary,
+            )
+        })
+        .collect()
+}
+
+/// Repo-wide index of IMPLEMENTS-eligible trait/type definitions, keyed by
+/// crate-root-relative qualified name (issue #344).
+struct ImplTargetIndex<'facts> {
+    by_qualified: BTreeMap<&'facts str, Vec<&'facts ImplTargetFact>>,
+}
+
+impl<'facts> ImplTargetIndex<'facts> {
+    fn build(facts_by_file: &'facts BTreeMap<String, FileFacts>) -> Self {
+        let mut by_qualified: BTreeMap<&str, Vec<&ImplTargetFact>> = BTreeMap::new();
+        for facts in facts_by_file.values() {
+            for target in &facts.impl_targets {
+                by_qualified
+                    .entry(target.qualified_name.as_str())
+                    .or_default()
+                    .push(target);
+            }
+        }
+        for candidates in by_qualified.values_mut() {
+            candidates.sort_by(|a, b| a.id.cmp(&b.id));
+            candidates.dedup_by(|a, b| a.id == b.id);
+        }
+        Self { by_qualified }
+    }
+
+    /// Resolves a pending impl's trait path to a UNIQUE target, or `None` when
+    /// nothing matches or the match is ambiguous (2+ same-qualified-name
+    /// definitions) — ambiguity never silently picks one, mirroring the CALLS
+    /// pass.
+    fn resolve(&self, pending: &PendingImplFact) -> Option<&'facts ImplTargetFact> {
+        match self
+            .candidates(&pending.trait_path, &pending.module_names)
+            .as_slice()
+        {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    /// The candidate targets for a trait path, applying the same resolution
+    /// ladder as the local resolver: an absolute `crate::`/`self::`/`super::`
+    /// path resolves to its exact crate-root-relative qualified name; every
+    /// other path (relative-qualified or unqualified) walks the impl's module
+    /// scope outward to the crate root.
+    fn candidates(&self, trait_path: &str, module_names: &[String]) -> Vec<&'facts ImplTargetFact> {
+        if trait_path.contains("::")
+            && let Some(normalized) = normalize_absolute_trait_path(trait_path, module_names)
+        {
+            return self.lookup(&normalized);
+        }
+        self.scope_walk(trait_path, module_names)
+    }
+
+    /// Walks the module scope from the impl's own module outward to the crate
+    /// root, returning the candidates at the first level that matches.
+    fn scope_walk(&self, target: &str, module_names: &[String]) -> Vec<&'facts ImplTargetFact> {
+        for depth in (0..=module_names.len()).rev() {
+            let candidate = if depth == 0 {
+                target.to_owned()
+            } else {
+                format!("{}::{target}", module_names[..depth].join("::"))
+            };
+            let hits = self.lookup(&candidate);
+            if !hits.is_empty() {
+                return hits;
+            }
+        }
+        Vec::new()
+    }
+
+    fn lookup(&self, qualified: &str) -> Vec<&'facts ImplTargetFact> {
+        self.by_qualified
+            .get(qualified)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Normalizes an absolute `crate::`/`self::`/`super::` trait path to the
+/// crate-root-relative qualified name the index keys on (issue #344), mirroring
+/// the local resolver's `normalize_local_trait_path`.
+///
+/// `crate::` is taken from the crate root; `self::`/`super::` resolve against
+/// the impl's enclosing module path. Returns `None` for a relative-qualified
+/// path (`sibling::T`, handled by the scope walk instead) and for a `super::`
+/// chain that walks above the file's module scope.
+fn normalize_absolute_trait_path(target: &str, module_names: &[String]) -> Option<String> {
+    if let Some(rest) = target.strip_prefix("crate::") {
+        return Some(rest.to_owned());
+    }
+    if let Some(rest) = target.strip_prefix("self::") {
+        return Some(if module_names.is_empty() {
+            rest.to_owned()
+        } else {
+            format!("{}::{rest}", module_names.join("::"))
+        });
+    }
+    if !target.starts_with("super::") {
+        return None;
+    }
+    let mut remaining = target;
+    let mut modules: &[String] = module_names;
+    while let Some(rest) = remaining.strip_prefix("super::") {
+        let (_, init) = modules.split_last()?;
+        modules = init;
+        remaining = rest;
+    }
+    Some(if modules.is_empty() {
+        remaining.to_owned()
+    } else {
+        format!("{}::{remaining}", modules.join("::"))
+    })
 }
 
 /// Attaches a [`CallResolution`] status to same-file `CALLS` edges emitted by
@@ -820,7 +1042,7 @@ mod tests {
                     FileFacts {
                         definitions: definitions.clone(),
                         call_sites: call_sites.clone(),
-                        out_of_line_mods: Vec::new(),
+                        ..FileFacts::default()
                     },
                 )
             })
@@ -1055,5 +1277,182 @@ mod tests {
             "two call sites for one pair must collapse to a single edge"
         );
         assert_eq!(records.len(), 1);
+    }
+
+    // --- Cross-file IMPLEMENTS resolution (issue #344) ---------------------
+
+    fn impl_target(id: &str, qualified: &str, module: &[&str], kind: &str) -> ImplTargetFact {
+        ImplTargetFact {
+            id: id.to_owned(),
+            qualified_name: qualified.to_owned(),
+            module_path: module.iter().map(|s| (*s).to_owned()).collect(),
+            symbol_kind: kind.to_owned(),
+        }
+    }
+
+    fn pending_impl(source_id: &str, trait_path: &str, module: &[&str]) -> PendingImplFact {
+        PendingImplFact {
+            source_id: source_id.to_owned(),
+            trait_path: trait_path.to_owned(),
+            module_names: module.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    fn impl_facts(
+        entries: &[(&str, Vec<ImplTargetFact>, Vec<PendingImplFact>)],
+    ) -> BTreeMap<String, FileFacts> {
+        entries
+            .iter()
+            .map(|(path, impl_targets, pending_impls)| {
+                (
+                    (*path).to_owned(),
+                    FileFacts {
+                        impl_targets: impl_targets.clone(),
+                        pending_impls: pending_impls.clone(),
+                        ..FileFacts::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn implements_pairs(records: &[GraphRecord]) -> Vec<(String, String)> {
+        records
+            .iter()
+            .filter_map(|record| match record {
+                GraphRecord::Edge {
+                    label: EdgeLabel::Implements,
+                    source,
+                    target,
+                    ..
+                } => Some((source.clone(), target.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cross_file_absolute_crate_path_edge_backs() {
+        // `impl crate::T for Foo` in src/m.rs; trait T defined at the crate
+        // root in src/lib.rs.
+        let facts = impl_facts(&[
+            (
+                "src/lib.rs",
+                vec![impl_target("trait-T", "T", &[], "trait")],
+                vec![],
+            ),
+            (
+                "src/m.rs",
+                vec![impl_target("struct-Foo", "m::Foo", &["m"], "struct")],
+                vec![pending_impl("impl-Foo", "crate::T", &["m"])],
+            ),
+        ]);
+        let records = cross_file_implements_records("repo", &facts);
+        assert_eq!(
+            implements_pairs(&records),
+            vec![("impl-Foo".to_owned(), "trait-T".to_owned())],
+            "the out-of-line impl edge-backs to the crate-root trait: {records:?}"
+        );
+    }
+
+    #[test]
+    fn cross_file_unqualified_trait_walks_outward() {
+        // `impl Draw for Button` in src/widgets.rs resolves outward through
+        // the module scope to the crate-root trait `Draw`.
+        let facts = impl_facts(&[
+            (
+                "src/lib.rs",
+                vec![impl_target("trait-Draw", "Draw", &[], "trait")],
+                vec![],
+            ),
+            (
+                "src/widgets.rs",
+                vec![impl_target(
+                    "struct-Button",
+                    "widgets::Button",
+                    &["widgets"],
+                    "struct",
+                )],
+                vec![pending_impl("impl-Button", "Draw", &["widgets"])],
+            ),
+        ]);
+        let records = cross_file_implements_records("repo", &facts);
+        assert_eq!(
+            implements_pairs(&records),
+            vec![("impl-Button".to_owned(), "trait-Draw".to_owned())]
+        );
+    }
+
+    #[test]
+    fn cross_file_ambiguous_trait_mints_no_edge() {
+        // Two distinct definitions share the crate-root qualified name `T`:
+        // the impl's trait path is ambiguous, so no edge is minted (ambiguity
+        // never silently picks one).
+        let facts = impl_facts(&[
+            (
+                "src/a.rs",
+                vec![impl_target("trait-T-a", "T", &[], "trait")],
+                vec![],
+            ),
+            (
+                "src/b.rs",
+                vec![impl_target("trait-T-b", "T", &[], "trait")],
+                vec![],
+            ),
+            (
+                "src/m.rs",
+                vec![impl_target("struct-Foo", "m::Foo", &["m"], "struct")],
+                vec![pending_impl("impl-Foo", "crate::T", &["m"])],
+            ),
+        ]);
+        let records = cross_file_implements_records("repo", &facts);
+        assert!(
+            implements_pairs(&records).is_empty(),
+            "an ambiguous trait path mints no edge: {records:?}"
+        );
+    }
+
+    #[test]
+    fn cross_file_external_trait_is_not_diagnosed() {
+        // `impl std::fmt::Debug for Foo` resolves to nothing in-repo: no edge,
+        // and — unlike the CALLS pass — no diagnostic (external traits are
+        // external by construction, matching the implementors completeness
+        // contract).
+        let facts = impl_facts(&[(
+            "src/m.rs",
+            vec![impl_target("struct-Foo", "m::Foo", &["m"], "struct")],
+            vec![pending_impl("impl-Foo", "std::fmt::Debug", &["m"])],
+        )]);
+        let records = cross_file_implements_records("repo", &facts);
+        assert!(
+            records.is_empty(),
+            "an external trait impl mints no edge and no diagnostic: {records:?}"
+        );
+    }
+
+    #[test]
+    fn cross_file_implements_output_is_deterministic() {
+        let facts = impl_facts(&[
+            (
+                "src/lib.rs",
+                vec![
+                    impl_target("trait-T", "T", &[], "trait"),
+                    impl_target("trait-U", "U", &[], "trait"),
+                ],
+                vec![],
+            ),
+            (
+                "src/m.rs",
+                vec![impl_target("struct-Foo", "m::Foo", &["m"], "struct")],
+                vec![
+                    pending_impl("impl-Foo-T", "crate::T", &["m"]),
+                    pending_impl("impl-Foo-U", "crate::U", &["m"]),
+                ],
+            ),
+        ]);
+        let first = cross_file_implements_records("repo", &facts);
+        let second = cross_file_implements_records("repo", &facts);
+        assert_eq!(first, second, "output must be byte-identical across runs");
+        assert_eq!(implements_pairs(&first).len(), 2);
     }
 }

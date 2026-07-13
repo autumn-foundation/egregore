@@ -1154,25 +1154,35 @@ to `parsed_only` instead.
 
 ### Completeness contract (`local_traits_only`)
 
-The extractor records an `IMPLEMENTS` edge only when the trait definition was
-resolvable in the extraction scope — that is, for **locally-defined traits**,
-where "locally" means **the same source file as the impl**. `impl Display
-for Foo` (an external/std trait) produces **no** edge in this slice, and
-neither does an impl whose trait lives in another file of the same repo
-(the out-of-line module layout: `lib.rs` defines the trait, `m.rs` holds
-`impl crate::T for Foo`) — cross-file trait resolution needs a repo-wide
-type-symbol index, which is extraction-deepening reserved for issue #344.
-Generic trait impl headers **are** trait-edge-backed as of issue #343 when the
-trait is same-file: a generic-binder impl (`impl<T> Trait for Type<T>`) and a
-generic-trait instantiation whose trait segment carries generic args
-(`impl Trait<Args> for Type`) both resolve to the local trait and appear as
-edge-backed implementor rows. Two forms stay deliberately bounded out: an
-**inherent** generic impl (`impl<T> Type<T>`, no `for` clause) keeps its
-self-referential record edge and is never a trait implementor, and a **blanket**
-impl (`impl<T> Trait for T`, whose `for` target is a bare binder type parameter)
-mints no edge at all — it covers every type and has no single implementing-type
-record. Cross-file generic trait impls remain bounded out until issue #344.
-The query surfaces this bound instead of hiding it:
+The extractor records an `IMPLEMENTS` edge for a trait whose definition is
+resolvable **anywhere in the scanned repository**. As of issue #344 this
+includes **cross-file out-of-line trait impls**: the common module layout where
+`src/lib.rs` defines `trait T` and a separate `mod m;` file (`src/m.rs`) holds
+`impl crate::T for Foo` now edge-backs. A repo-wide index of every trait/type
+definition is built after per-file extraction, and each impl the per-file pass
+could not resolve locally is retried against it with the same
+`crate::`/`self::`/`super::` and module-scope-walk semantics as same-file
+resolution (an unqualified `impl Draw for Button` in `m.rs` walks outward to a
+crate-root `Draw`; an absolute `impl crate::T for Foo` resolves from the crate
+root). Local resolution still wins, so an edge is never emitted twice, and the
+pass recomputes from cached per-file facts each scan, so editing either side
+re-derives (or retires) the edge.
+
+`impl Display for Foo` (an external/std trait) still produces **no** edge: an
+unresolved or ambiguous trait path is left edge-free rather than diagnosed,
+because a cross-crate trait is external by construction — this is exactly what
+`local_traits_only` means. Generic trait impl headers **are** trait-edge-backed
+as of issue #343 (a generic-binder impl `impl<T> Trait for Type<T>` and a
+generic-trait instantiation `impl Trait<Args> for Type` both resolve their
+trait), and this now applies cross-file too. Two forms stay deliberately
+bounded out: an **inherent** generic impl (`impl<T> Type<T>`, no `for` clause)
+keeps its self-referential record edge and is never a trait implementor, and a
+**blanket** impl (`impl<T> Trait for T`, whose `for` target is a bare binder
+type parameter) mints no edge at all — it covers every type and has no single
+implementing-type record. The remaining honest bounds: **cross-crate** traits
+(std/deps), **non-Rust** languages, blanket impls, and a `use`-alias of a
+trait in a **non-root** module that the scope walk cannot see stay
+unresolved. The query surfaces these bounds instead of hiding them:
 
 - Every implementor row and every zero-implementors signal carries
   `completeness: "local_traits_only"`.
@@ -1305,7 +1315,8 @@ eg query implementors Renderable --graph g.jsonl
 `Circle (impl Renderable for Circle) implements Renderable @ src/shapes.rs:7 (completeness: local_traits_only)`);
 the text format is not stable and must not be parsed.
 
-Out of scope for this verb: emitting edges for external/std traits, resolving
-cross-file trait impls (issue #344) and blanket impls (`impl<T> Trait for T`),
-method-level breakage analysis, and the outbound direction ("what does this
-type implement"). Same-file generic trait impls are in scope as of issue #343.
+Out of scope for this verb: emitting edges for external/std (cross-crate)
+traits, blanket impls (`impl<T> Trait for T`), method-level breakage analysis,
+and the outbound direction ("what does this type implement"). Same-file generic
+trait impls are in scope as of issue #343; cross-file out-of-line trait impls
+are in scope as of issue #344.

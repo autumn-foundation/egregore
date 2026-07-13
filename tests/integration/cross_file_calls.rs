@@ -363,6 +363,87 @@ fn incremental_scan_emits_and_retires_cross_file_call_edges() {
     );
 }
 
+fn implements_edge<'a>(records: &'a [Value], source: &str, target: &str) -> Option<&'a Value> {
+    records.iter().find(|record| {
+        record["record_type"] == "edge"
+            && record["label"] == "IMPLEMENTS"
+            && record["source"] == source
+            && record["target"] == target
+    })
+}
+
+// Cross-file out-of-line trait impls (issue #344): an `impl crate::T for Foo`
+// in a separate `mod m;` file must edge-back to the crate-root trait, and the
+// incremental cache must recompute (and retire) the edge from `FileFacts` on a
+// re-scan exactly like cross-file CALLS.
+#[test]
+fn incremental_scan_emits_and_retires_cross_file_implements_edges() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    write_fixture(
+        &repo,
+        &[
+            (
+                "src/lib.rs",
+                "pub trait T {\n    fn go(&self);\n}\n\npub mod m;\n",
+            ),
+            (
+                "src/m.rs",
+                "pub struct Foo;\n\nimpl crate::T for Foo {\n    fn go(&self) {}\n}\n",
+            ),
+        ],
+    );
+    let cache_path = temp.path().join("codegraph-cache.json");
+
+    let first = aletheia_egregore::incremental::scan_repository_incremental_at(
+        &repo,
+        &cache_path,
+        FIXED_TIME,
+    )
+    .expect("first incremental scan should work");
+    let first_records = parse_jsonl(
+        &first
+            .graph
+            .to_jsonl()
+            .expect("first incremental graph should serialize"),
+    );
+    let trait_t = symbol_id(&first_records, "trait", "T", "src/lib.rs");
+    let impl_foo = symbol_id(
+        &first_records,
+        "impl",
+        "m::impl crate::T for Foo",
+        "src/m.rs",
+    );
+    let edge = implements_edge(&first_records, &impl_foo, &trait_t)
+        .expect("cross-file IMPLEMENTS edge should exist");
+    let edge_id = edge["id"].as_str().expect("edge should have ID").to_owned();
+
+    // Removing the impl retires the edge with a tombstone on the next scan.
+    fs::write(repo.join("src/m.rs"), "pub struct Foo;\n").expect("fixture should update");
+    let second = aletheia_egregore::incremental::scan_repository_incremental_at(
+        &repo,
+        &cache_path,
+        "2026-06-08T00:00:00Z",
+    )
+    .expect("second incremental scan should work");
+    let second_records = parse_jsonl(
+        &second
+            .graph
+            .to_jsonl()
+            .expect("second incremental graph should serialize"),
+    );
+    assert!(
+        implements_edge(&second_records, &impl_foo, &trait_t).is_none(),
+        "removed impl must not re-emit the cross-file IMPLEMENTS edge"
+    );
+    assert!(
+        second_records.iter().any(|record| {
+            record["record_type"] == "tombstone" && record["deleted_id"] == edge_id.as_str()
+        }),
+        "stale cross-file IMPLEMENTS edge must be tombstoned so persisted stores can retire it"
+    );
+}
+
 #[test]
 fn history_replay_emits_cross_file_call_edges_per_commit() {
     let temp = tempfile::tempdir().expect("temp dir should be created");

@@ -13,7 +13,10 @@ use crate::{
             SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, node_name,
             path_segments, reference_text, span,
         },
-        cross_file::{CallKind, CallSiteFact, DefinitionFact, FileFacts, OutOfLineModFact},
+        cross_file::{
+            CallKind, CallSiteFact, DefinitionFact, FileFacts, ImplTargetFact, OutOfLineModFact,
+            PendingImplFact,
+        },
     },
     redaction::REDACTION_POLICY_VERSION,
 };
@@ -407,6 +410,15 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         // key spaces: value-namespace items (`const`, `static`, functions)
         // must never shadow a trait or type in impl trait resolution.
         if is_impl_target_kind(symbol_kind) {
+            // Export this trait/type for the repo-wide cross-file IMPLEMENTS
+            // pass (issue #344), keyed on the crate-root-relative qualified
+            // name so an out-of-line impl in another file can resolve to it.
+            self.facts.impl_targets.push(ImplTargetFact {
+                id: id.clone(),
+                qualified_name: qualified_name.clone(),
+                module_path: self.module_names.clone(),
+                symbol_kind: symbol_kind.to_owned(),
+            });
             self.qualified_definitions
                 .insert(qualified_name, id.clone());
             self.type_definitions.insert(local_name, id);
@@ -1106,37 +1118,93 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     fn resolve_pending_impl_edges(&mut self) {
         let pending = std::mem::take(&mut self.pending_impl_edges);
         for entry in pending {
-            if let Some(target) = self.impl_target_id(&entry.display, &entry.module_names) {
-                self.add_edge(
-                    EdgeLabel::Implements,
-                    entry.source_id,
-                    target,
-                    format!("{} implementation relationship", entry.display),
-                );
+            // Normalize the impl header into a resolution decision. This
+            // handles `unsafe impl ...`, non-generic headers, and generic
+            // headers (`impl<T> Trait for Type<T>`, `impl GenP<u32> for Plain`)
+            // uniformly (issue #343).
+            match impl_trait_target(&entry.display) {
+                ImplTargetDecision::Resolve(trait_name) => {
+                    if let Some(target) =
+                        self.resolve_impl_trait_locally(&trait_name, &entry.module_names)
+                    {
+                        self.add_edge(
+                            EdgeLabel::Implements,
+                            entry.source_id,
+                            target,
+                            format!("{} implementation relationship", entry.display),
+                        );
+                    } else {
+                        // The trait/type is not defined in THIS file. Defer to
+                        // the repo-wide cross-file IMPLEMENTS pass (issue #344),
+                        // which retries the same trait path against every
+                        // file's exported trait/type definitions. Local
+                        // resolution always wins, so a resolved edge here is
+                        // never re-emitted cross-file.
+                        self.facts.pending_impls.push(PendingImplFact {
+                            source_id: entry.source_id,
+                            trait_path: trait_name,
+                            module_names: entry.module_names,
+                        });
+                    }
+                }
+                ImplTargetDecision::Verbatim => {
+                    // A generic inherent impl (`impl<T> Type<T>`, no `for`
+                    // clause) names no trait to reach. Keep the recorded
+                    // self-referential edge via the verbatim display key:
+                    // space-containing display keys never collide with
+                    // identifier names. No cross-file lookup (no trait named).
+                    if let Some(target) = self.definitions.get(entry.display.trim()).cloned() {
+                        self.add_edge(
+                            EdgeLabel::Implements,
+                            entry.source_id,
+                            target,
+                            format!("{} implementation relationship", entry.display),
+                        );
+                    }
+                }
+                // A blanket impl (`impl<T> Trait for T`) whose `for` target is
+                // a bare binder type parameter covers every type and has no
+                // single implementing-type record; it mints no IMPLEMENTS edge.
+                ImplTargetDecision::NoEdge => {}
             }
         }
     }
 
-    fn impl_target_id(&self, display: &str, module_names: &[String]) -> Option<String> {
-        // Normalize the impl header into a resolution decision. This handles
-        // `unsafe impl ...`, non-generic headers, and generic headers
-        // (`impl<T> Trait for Type<T>`, `impl GenP<u32> for Plain`) uniformly
-        // (issue #343).
-        let target = match impl_trait_target(display) {
-            ImplTargetDecision::Resolve(name) => name,
-            ImplTargetDecision::Verbatim => {
-                // A generic inherent impl (`impl<T> Type<T>`, no `for` clause)
-                // names no trait to reach. Keep the recorded self-referential
-                // edge via the verbatim display key: space-containing display
-                // keys never collide with identifier names.
-                return self.definitions.get(display.trim()).cloned();
+    /// Resolves a normalized impl trait path against THIS file's indexed
+    /// trait/type definitions only, returning the target record ID when the
+    /// trait is defined locally. A miss means the trait is defined in another
+    /// file (or is external) and the impl is deferred to the repo-wide
+    /// cross-file pass (issue #344).
+    fn resolve_impl_trait_locally(&self, target: &str, module_names: &[String]) -> Option<String> {
+        if target.contains("::") {
+            // An absolute `crate::`/`self::`/`super::` path resolves against
+            // the module-qualified key space only: a nested symbol's
+            // bare-name alias in `definitions` must never shadow the root
+            // item the path denotes.
+            if let Some(normalized) = Self::normalize_local_trait_path(target, module_names) {
+                return self.qualified_definitions.get(&normalized).cloned();
             }
-            // A blanket impl (`impl<T> Trait for T`) whose `for` target is a
-            // bare binder type parameter covers every type and has no single
-            // implementing-type record; it mints no IMPLEMENTS edge.
-            ImplTargetDecision::NoEdge => return None,
-        };
-        let target = target.as_str();
+            // A relative qualified path (`sibling::T`) resolves in the
+            // impl's module scope first, walking outward to the crate root
+            // (`m::sibling::T`, then `sibling::T`) — mirroring the
+            // unqualified scope walk. Cross-crate paths (`std::fmt::Debug`)
+            // match nothing and stay unresolved.
+            for depth in (0..=module_names.len()).rev() {
+                let candidate = if depth == 0 {
+                    target.to_owned()
+                } else {
+                    format!("{}::{target}", module_names[..depth].join("::"))
+                };
+                if let Some(id) = self.qualified_definitions.get(&candidate) {
+                    return Some(id.clone());
+                }
+            }
+            // No general `definitions` fallback here: beyond the qualified
+            // impl-target keys the scope walk already checked, that map
+            // holds only value-namespace and callable names, which must
+            // never capture an IMPLEMENTS edge.
+            return None;
+        }
         if target.contains("::") {
             // An absolute `crate::`/`self::`/`super::` path resolves against
             // the module-qualified key space only: a nested symbol's

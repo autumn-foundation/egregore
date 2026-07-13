@@ -11,16 +11,19 @@ use crate::ir::{EdgeLabel, GraphRecord, NodeKind, TemporalMetadata};
 
 /// Completeness marker attached to every implementors answer.
 ///
-/// `IMPLEMENTS` edges exist only for traits whose definition was resolvable at
-/// extraction time (locally-defined traits); impls of external/std traits are
-/// not edge-backed. Absence of a row is therefore never proof that no
+/// `IMPLEMENTS` edges exist for traits whose definition is resolvable anywhere
+/// in the scanned repository — same-file (issues #133/#343) and, as of issue
+/// #344, cross-file out-of-line impls (`impl crate::T for Foo` in a separate
+/// `mod m;` file). Impls of external/std (cross-crate) traits are still not
+/// edge-backed. Absence of a row is therefore never proof that no
 /// implementation exists.
 pub const IMPLEMENTORS_COMPLETENESS: &str = "local_traits_only";
 
 /// Human-readable expansion of [`IMPLEMENTORS_COMPLETENESS`], carried on the
 /// zero-implementors signal so an empty answer is never mistaken for an
 /// authoritative one.
-pub const IMPLEMENTORS_COMPLETENESS_NOTE: &str = "implementors are recorded only for locally-defined traits; impls of \
+pub const IMPLEMENTORS_COMPLETENESS_NOTE: &str = "implementors are recorded only for traits defined in the scanned \
+     repository (same-file or cross-file out-of-line impls); impls of \
      external/std traits are not edge-backed in this graph, so absence of a \
      row is not proof that no implementation exists";
 
