@@ -517,16 +517,8 @@ fn classify_code_handle(
 /// is the citation of the template-hash requirement (issue #328; the disclosed
 /// schema shape of the #361–#364 known-limitation cluster). Not a schema change.
 fn is_well_formed_log_id(id: &str) -> bool {
-    let Some(rest) = id.strip_prefix("log:v") else {
-        return false;
-    };
-    let Some((version, hex)) = rest.split_once(':') else {
-        return false;
-    };
-    !version.is_empty()
-        && version.bytes().all(|b| b.is_ascii_digit())
-        && hex.len() >= 16
-        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    crate::ir::strip_log_id_prefix(id)
+        .is_some_and(|hex| hex.len() >= 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Resolves a `runtime_observation` record's `LogSource` provenance over the

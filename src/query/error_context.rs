@@ -42,7 +42,7 @@ use super::{
 };
 use crate::ir::{
     CorrelationBasis, EdgeLabel, ErrorSignaturePayload, GraphRecord, LogPayload, NodeKind,
-    SourceSpan,
+    SourceSpan, strip_log_id_prefix,
 };
 use crate::log_resolve;
 use crate::protected::{PROTECTED_HANDLE_PREFIX, ProtectedStore};
@@ -64,20 +64,6 @@ pub const ERROR_CONTEXT_DISCLAIMER: &str = "Rows are CORRELATION LEADS, never pr
 pub const REPO_SCOPE_CAVEAT: &str = "--repo scopes only the code-side first_seen_range \
      symbol-delta join; log records carry no retrievable repository attribution, so the signature, \
      frame, bucket, and EMITTED_DURING observation sections are NOT repository-filtered.";
-
-/// Strips a version-agnostic `log:v<N>:` stable-ID prefix (see
-/// [`log_stable_id`](crate::ir::log_stable_id)), returning the hex tail (which
-/// may be a partial prefix). Accepts ANY positive integer version so opaque
-/// `log:v1:` fixtures and real `log:v2:` handles (issue #361 schema bump) both
-/// resolve; the exact-record-ID resolution semantics are otherwise unchanged.
-fn strip_log_prefix(id: &str) -> Option<&str> {
-    let rest = id.strip_prefix("log:v")?;
-    let (version, hex) = rest.split_once(':')?;
-    if version.is_empty() || !version.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some(hex)
-}
 
 /// A universal, redaction-safe projection of one `&GraphRecord` for a
 /// trust-separated context section.
@@ -485,7 +471,7 @@ fn resolve_handle(
         .collect();
 
     // ── 1a: exact record-ID match ────────────────────────────────────────────
-    if let Some(needle) = strip_log_prefix(handle) {
+    if let Some(needle) = strip_log_id_prefix(handle) {
         if sig_ids.contains(handle) {
             return HandleResolution::Signatures(vec![handle.to_owned()]);
         }
@@ -549,7 +535,7 @@ fn prefix_resolution(sig_ids: &BTreeSet<&str>, needle: &str) -> HandleResolution
     }
     let candidates: Vec<String> = sig_ids
         .iter()
-        .filter(|id| strip_log_prefix(id).is_some_and(|hex| hex.starts_with(needle)))
+        .filter(|id| strip_log_id_prefix(id).is_some_and(|hex| hex.starts_with(needle)))
         .map(|id| (*id).to_owned())
         .collect();
     match candidates.len() {
@@ -1351,30 +1337,4 @@ fn build_first_seen_range(
         window_end: head.as_ref().map(|(_, _, vt)| vt.clone()),
         overlapping_symbol_deltas,
     })
-}
-
-#[cfg(test)]
-mod prefix_tests {
-    use super::strip_log_prefix;
-
-    #[test]
-    fn strip_log_prefix_is_version_agnostic() {
-        // Both the superseded v1 and current v2 (issue #361) prefixes resolve,
-        // returning the hex tail unchanged so exact-ID and prefix resolution work.
-        assert_eq!(strip_log_prefix("log:v1:deadbeef"), Some("deadbeef"));
-        assert_eq!(strip_log_prefix("log:v2:deadbeef"), Some("deadbeef"));
-        // Multi-digit versions are accepted (future-proof).
-        assert_eq!(strip_log_prefix("log:v10:abc"), Some("abc"));
-        // A partial hex tail (prefix-resolution needle) round-trips.
-        assert_eq!(strip_log_prefix("log:v2:dead"), Some("dead"));
-    }
-
-    #[test]
-    fn strip_log_prefix_rejects_non_log_and_malformed() {
-        assert_eq!(strip_log_prefix("codegraph:v5:abc"), None);
-        assert_eq!(strip_log_prefix("log:abc"), None);
-        assert_eq!(strip_log_prefix("log:v:abc"), None);
-        assert_eq!(strip_log_prefix("log:vx:abc"), None);
-        assert_eq!(strip_log_prefix("some_symbol"), None);
-    }
 }
