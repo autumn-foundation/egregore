@@ -965,6 +965,127 @@ fn runtime_observation_via_memory_requires_provenance_classwide() {
     );
 }
 
+// ── #372: the shared external classifier applies runtime provenance ─────────
+//
+// `eg audit citations` (via `WorkflowBuilder::push_record`) and the evidence-pack
+// / bundle citation gates (via `classify_record_external_with_provenance`) MUST
+// agree on every `runtime_observation` row: both route through the SAME
+// `classify_record_provenanced` derivation against a `LogProvenanceIndex`. A
+// provenance-less `ErrorSignature` therefore classifies `MissingRequiredHandle`
+// on BOTH surfaces — never `Cited`-by-its-own-ID via the context-free catch-all
+// (the loophole #372 closes). Mirrors the #338/#339 single-implementation
+// invariant.
+#[test]
+fn external_provenance_classifier_matches_audit_per_log_row() {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "hash1"]);
+    let cited_sig = crate::ir::log_stable_id(&["error_signature", "repo", "cited", "error"]);
+    let bare_sig = crate::ir::log_stable_id(&["error_signature", "repo", "bare", "error"]);
+
+    // Two Observations surface the two signatures through the `memory` workflow
+    // (the class-wide requirement holds regardless of surfacing workflow).
+    let obs_cited = observation(
+        "agent_memory:v1:obs_cited",
+        Some("traj/run.traj"),
+        vec![EvidenceLink {
+            target_record_id: Some(cited_sig.clone()),
+            target_domain: "log".to_owned(),
+            relation: "OBSERVES".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }],
+    );
+    let obs_bare = observation(
+        "agent_memory:v1:obs_bare",
+        Some("traj/run.traj"),
+        vec![EvidenceLink {
+            target_record_id: Some(bare_sig.clone()),
+            target_domain: "log".to_owned(),
+            relation: "OBSERVES".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }],
+    );
+
+    let records = vec![
+        // (ii) properly-cited: LogSource + CAPTURED_FROM resolves provenance.
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&cited_sig),
+        captured_from(&cited_sig, &src_id),
+        // (i) provenance-less: no LogSource, no CAPTURED_FROM.
+        error_signature_node(&bare_sig),
+        obs_cited,
+        obs_bare,
+    ];
+
+    let report = run_citation_audit(&records, &AuditConfig::default());
+    let provenance = CitationProvenance::build(&records);
+
+    // Gather the audit's status for every runtime_observation row, per record ID.
+    let mut audit_status: std::collections::BTreeMap<String, CitationStatus> =
+        std::collections::BTreeMap::new();
+    for workflow in &report.workflows {
+        for row in &workflow.rows {
+            if row.trust_class == "runtime_observation" {
+                if let Some(prev) = audit_status.get(&row.record_id) {
+                    assert_eq!(
+                        *prev, row.status,
+                        "the audit must classify {} consistently across workflows",
+                        row.record_id
+                    );
+                }
+                audit_status.insert(row.record_id.clone(), row.status.clone());
+            }
+        }
+    }
+
+    // Both signatures surfaced (via memory), and each one's audit status equals
+    // the shared external sibling's status — the single-derivation invariant.
+    for (id, expected) in [
+        (&cited_sig, CitationStatus::Cited),
+        (&bare_sig, CitationStatus::MissingRequiredHandle),
+    ] {
+        let sig = records
+            .iter()
+            .find(|r| r.id() == id.as_str())
+            .expect("signature record present");
+        let sibling = classify_record_external_with_provenance(sig, &provenance);
+        assert_eq!(
+            sibling.trust_class, "runtime_observation",
+            "the sibling classifies {id} as a runtime observation"
+        );
+        assert_eq!(
+            sibling.status, expected,
+            "the sibling status for {id} must match the intended provenance verdict"
+        );
+        let audited = audit_status
+            .get(id.as_str())
+            .expect("the audit surfaced this runtime observation as a row");
+        assert_eq!(
+            *audited, sibling.status,
+            "audit and sibling must agree on {id} — same shared derivation (#372)"
+        );
+    }
+
+    // Document the gap #372 closes: the context-free `classify_record_external`
+    // would (wrongly) count the provenance-less signature as Cited by its own ID.
+    let bare = records
+        .iter()
+        .find(|r| r.id() == bare_sig.as_str())
+        .expect("bare signature present");
+    assert_eq!(
+        classify_record_external(bare).status,
+        CitationStatus::Cited,
+        "the context-free classifier cites a provenance-less log row by its own ID \
+         (the #372 loophole) — the provenance-aware sibling must NOT"
+    );
+}
+
 // ── #376: the two remaining log query workflows are citation-gated ─────────
 //
 // `eg audit citations` now drives three log query workflows (`log-deltas`,
