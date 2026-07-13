@@ -3910,10 +3910,29 @@ pub fn assemble_pack(
     // Coverage on a validly-assembled pack. Co-locate that signature's
     // `CAPTURED_FROM` + `LogSource` into `occurrence_buckets` for exactly those
     // cases, de-duped, so every in-window bucket's provenance is carried by the pack
-    // without double-carrying an already-co-located in-window signature. (soc2-v1
-    // always co-maps `error_signatures` with `occurrence_buckets`, so an in-window
-    // signature's provenance is always present in the combined index.)
+    // without double-carrying an already-co-located in-window signature.
+    //
+    // The exclusion must key off whether the signature's provenance is ACTUALLY
+    // carried by a PRESENT `error_signatures` section — NOT merely off "the
+    // signature is in-window" (issue #372, Codex P2). soc2-v1 always co-maps
+    // `error_signatures` with `occurrence_buckets`, so the default path carries an
+    // in-window signature's provenance there. But a custom catalog can map
+    // `occurrence_buckets` WITHOUT `error_signatures`: then NO section carries the
+    // in-window signature, so excluding it here would strand the bucket's
+    // provenance — `assemble_pack` still passes citation (full-graph index) while
+    // `verify_pack` (which rebuilds its index from the pack's OWN section rows)
+    // fails Coverage on a validly-assembled pack (assemble<->verify divergence). So
+    // exclude a bucket's aggregated signature from bucket-side co-location ONLY when
+    // `error_signatures` is a mapped section (its provenance is co-located there);
+    // otherwise co-locate regardless of window. LogSource nodes / CAPTURED_FROM
+    // edges are BTreeSet-de-duped so nothing double-carries when both sections carry
+    // a shared source.
     {
+        // `error_signatures` is a PRESENT section IFF this control maps that class.
+        let error_signatures_mapped = control
+            .evidence_classes
+            .iter()
+            .any(|cr| cr.class == EvidenceClass::ErrorSignatures);
         let in_window_sig_ids: BTreeSet<String> = in_window_by_class
             .get(EvidenceClass::ErrorSignatures.as_wire())
             .into_iter()
@@ -3930,7 +3949,11 @@ pub fn assemble_pack(
             in_window_by_class.get_mut(EvidenceClass::OccurrenceBuckets.as_wire())
         {
             // Signatures the co-located AGGREGATES edges attribute in-window buckets
-            // to, EXCLUDING those already carrying provenance in error_signatures.
+            // to, EXCLUDING only those whose provenance is already carried by a
+            // PRESENT `error_signatures` section (mapped class AND in-window). When
+            // `error_signatures` is not mapped, no section carries any signature's
+            // provenance, so none are excluded — every aggregated signature's
+            // `CAPTURED_FROM` + `LogSource` is co-located here regardless of window.
             let aggregated_sig_ids: BTreeSet<String> = buckets
                 .iter()
                 .filter_map(|r| match r {
@@ -3939,7 +3962,7 @@ pub fn assemble_pack(
                     }
                     _ => None,
                 })
-                .filter(|sig| !in_window_sig_ids.contains(sig))
+                .filter(|sig| !(error_signatures_mapped && in_window_sig_ids.contains(sig)))
                 .collect();
             let mut captured_edges: Vec<GraphRecord> = Vec::new();
             let mut wanted_sources: BTreeSet<String> = BTreeSet::new();
@@ -12044,6 +12067,101 @@ mod pack340_tests {
         // sig2: 16 * 2 = 32; sig3: 16 * 5 = 80.
         assert_eq!(by_sig[wf("log:v1:sig2").as_str()].in_window_occurrences, 32);
         assert_eq!(by_sig[wf("log:v1:sig3").as_str()].in_window_occurrences, 80);
+    }
+
+    // ── #372 Codex P2: occurrence-only catalog must carry bucket provenance ───────
+    //
+    // A custom catalog can map `occurrence_buckets` WITHOUT `error_signatures`. The
+    // in-window bucket provenance co-location (issue #372) excluded a bucket's
+    // aggregated signature from bucket-side co-location whenever that signature was
+    // an in-window `error_signatures` row — ASSUMING its `CAPTURED_FROM`/`LogSource`
+    // is carried by the error_signatures section. But with no error_signatures
+    // section mapped, the provenance is co-located NOWHERE: `assemble_pack` still
+    // passes citation (full-graph index) while `verify_pack` — which rebuilds the
+    // provenance index from the pack's OWN section rows — re-derives the bucket as
+    // `MissingRequiredHandle` and fails Coverage. A freshly-assembled pack must
+    // survive its own verify. The fix co-locates the signature's provenance into
+    // `occurrence_buckets` when `error_signatures` is absent from the pack.
+    #[test]
+    fn assemble_and_verify_occurrence_only_catalog_carries_bucket_provenance() {
+        // Catalog mapping ONE control to `occurrence_buckets` ONLY (no
+        // `error_signatures`). soc2-v1 always co-maps both CC7.x classes, so this
+        // scenario is only reachable through a custom catalog.
+        let catalog = ControlCatalog {
+            catalog_id: "occ-only-v1".to_owned(),
+            schema_version: CatalogSchemaVersion {
+                domain: "control_catalog".to_owned(),
+                kind: "ControlCatalog".to_owned(),
+                version: 1,
+            },
+            controls: vec![Control {
+                control_id: "OCC1".to_owned(),
+                title: "occurrence buckets only".to_owned(),
+                evidence_classes: vec![ClassRequirement {
+                    class: EvidenceClass::OccurrenceBuckets,
+                    requirement: Requirement::Optional,
+                }],
+            }],
+        };
+
+        // An in-window `ErrorSignature` with resolvable `LogSource`/`CAPTURED_FROM`
+        // provenance (via `with_log_provenance`) and one in-window
+        // `LogOccurrenceBucket` aggregating it.
+        let sig_id = crate::ir::log_stable_id(&["error_signature", "occ", "tpl", "error"]);
+        let mut records = vec![error_signature(
+            &sig_id,
+            "error",
+            "connection refused to HOST",
+            "2026-03-02T09:00:00Z",
+            "2026-03-02T10:00:00Z",
+            5,
+            None,
+        )];
+        let bucket_id = crate::ir::log_stable_id(&["bucket", "occ", "0900"]);
+        records.push(super::fixture::occurrence_bucket(
+            &bucket_id,
+            "2026-03-02T09:00:00Z",
+            5,
+        ));
+        records.push(super::fixture::aggregates(&bucket_id, &sig_id));
+        let records = with_log_provenance(records);
+
+        let pack = assemble_pack(&records, &catalog, "OCC1", &win(), 1.0, "test-0.0.0", None)
+            .expect("assembles");
+
+        // No error_signatures section at all (catalog does not map it).
+        assert!(
+            pack.sections
+                .iter()
+                .all(|s| s.class != EvidenceClass::ErrorSignatures.as_wire()),
+            "occurrence-only catalog emits no error_signatures section",
+        );
+        let occ = section(&pack, EvidenceClass::OccurrenceBuckets);
+        assert_eq!(occ.status, "present");
+        assert!(
+            occ.record_count > 0,
+            "occurrence_buckets section carries the in-window bucket rows",
+        );
+
+        // assemble-time citation passes (it uses the FULL input-graph index).
+        assert!(
+            pack.verdicts.citation.passed,
+            "assemble citation passes on the full-graph index",
+        );
+
+        // The bug: verify rebuilds provenance from the pack's OWN rows. Before the
+        // fix the bucket's in-window signature provenance is co-located nowhere, so
+        // the bucket re-derives MissingRequiredHandle and Coverage fails.
+        let report = verify_pack(&pack);
+        assert!(
+            report.coverage.passed,
+            "verify Coverage must pass on a freshly-assembled occurrence-only pack: {}",
+            report.coverage.detail,
+        );
+        assert!(
+            report.ok,
+            "verify_pack ok on a freshly-assembled occurrence-only pack: {report:?}",
+        );
     }
 
     #[test]
