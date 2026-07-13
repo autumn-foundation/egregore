@@ -150,13 +150,19 @@ rows are gated as code rows):
   across a commit range.
 - `error-context` (`eg query error-context`, #324) — one signature's full
   cross-domain context bundle, driven once per `ErrorSignature` in the set. The
-  lane classifies the **entire** returned envelope, not just the signature and
-  frame rows: every `source_facts`, `observations`, `project_state`, `artifacts`,
-  and `verification_evidence` row is gated by its trust class exactly as the
-  `context` lane gates that bundle (a returned row whose target record is
-  absent/tombstoned is a `MissingRequiredHandle` failure, never silently
-  dropped), `unresolved` targets emit `unresolved_evidence_link` diagnostics, and
-  superseded/contradicted rows are reported excluded.
+  lane classifies **every row the envelope returns**, each from its OWN identity
+  (`record_id` plus `git_commit`), not just the signature and frame rows: the
+  signature's occurrence `buckets` (`LogOccurrenceBucket` runtime observations,
+  gated through the same class-wide `LogSource` provenance rule), its resolved
+  `frames`, and each of the five cross-domain sections — `source_facts`,
+  `observations`, `project_state`, `artifacts`, and `verification_evidence` — is
+  gated by its trust class exactly as the `context` lane gates that bundle. A
+  `source_facts` record returned in multiple temporal versions (distinct
+  `git_commit`s from a scan-history graph) is classified once **per version**, so
+  an uncited version can never hide behind a cited one. A returned row whose
+  target record is absent/tombstoned is a `MissingRequiredHandle` failure, never
+  silently dropped; `unresolved` targets emit `unresolved_evidence_link`
+  diagnostics; and superseded/contradicted rows are reported excluded.
 - `log_signatures` (the subsystem `log_signatures` section, `eg query
   subsystem`, #325) — signatures whose frames resolve under a subsystem prefix.
 

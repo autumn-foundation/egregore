@@ -2001,6 +2001,7 @@ fn error_signature_ids(records: &[GraphRecord]) -> Vec<String> {
 ///
 /// A record set carrying no `ErrorSignature` nodes reports the lane disabled with
 /// a stable reason rather than skipping it.
+#[allow(clippy::too_many_lines)]
 fn drive_error_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
     let sig_ids = error_signature_ids(records);
     if sig_ids.is_empty() {
@@ -2014,6 +2015,30 @@ fn drive_error_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
 
     let mut builder = WorkflowBuilder::new("error-context", "runtime_observation", records);
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    // A `(record_id, git_commit)`-keyed node index so EVERY temporal version of a
+    // stable ID resolves to its OWN record, never collapsing to whichever single
+    // version an ID-only lookup kept. `error_context` preserves each frame-target
+    // source-fact version keyed by `(record_id, git_commit)` (a scan-history
+    // response can return several versions of one symbol), so an ID-only lookup
+    // here would classify one version and let the others' rows — possibly uncited —
+    // escape the code gate (Codex P2, #376). A `Row.git_commit` is exactly
+    // `temporal.git_commit` (or `None` for a non-temporal record), matching this
+    // key. Last-write-wins on a duplicate `(id, git_commit)` mirrors the query's
+    // own `source_facts` map, so the version the audit classifies is the version
+    // the query returned.
+    let by_id_commit: BTreeMap<(&str, Option<&str>), &GraphRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node { id, temporal, .. } => Some((
+                (
+                    id.as_str(),
+                    temporal.as_ref().map(|t| t.git_commit.as_str()),
+                ),
+                r,
+            )),
+            _ => None,
+        })
+        .collect();
     let tombstoned = tombstoned_ids(records);
     for sig_id in &sig_ids {
         // Resolve each signature by its exact `log:v1:` ID (the default view: no
@@ -2061,6 +2086,27 @@ fn drive_error_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
                     _ => builder.push_classified(missing(target_id, "source_fact"), String::new()),
                 }
             }
+            // Occurrence buckets are `LogOccurrenceBucket` runtime-observation
+            // rows the public response serializes as `buckets[].record_id`. Each
+            // must go through `push_record` so the class-wide log-provenance rule
+            // fires (a bucket resolves its `LogSource` via
+            // `AGGREGATES` → signature → `CAPTURED_FROM`), so a cited signature
+            // carrying a provenance-less bucket still fails the log gate (Codex P2,
+            // #376) — a returned bucket is never dropped. Buckets are non-temporal
+            // log nodes (one version per stable ID), so the ID-only `by_id` lookup
+            // is exact here.
+            for bucket in &block.buckets {
+                let bucket_id = bucket.record_id.as_str();
+                match by_id.get(bucket_id) {
+                    Some(record)
+                        if node_visible(bucket_id, has_temporal_anchor(record), &tombstoned) =>
+                    {
+                        builder.push_record(record);
+                    }
+                    _ => builder
+                        .push_classified(missing(bucket_id, "runtime_observation"), String::new()),
+                }
+            }
         }
 
         // Cross-domain sections: `eg query error-context`'s code/agent/project/
@@ -2068,13 +2114,19 @@ fn drive_error_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
         // public response returns every one of these rows — so, exactly as
         // `drive_context` gates that bundle, each returned row is a public row the
         // audit must classify or the gate can pass while a returned row is uncited
-        // (Codex P2, #376). Resolve every row's underlying record by its ID:
-        // present-and-visible → its normal handle rule via `push_record` (a
-        // runtime row still re-fires the class-wide provenance rule; code/non-code
-        // rows get their handle rule); absent or tombstoned-and-unsuperseded →
-        // a `missing` failure in the section's trust lane, never silently dropped
-        // (mirroring the signature/frame handling above). Sections are already
-        // deterministically ordered by the query, so iteration stays byte-stable.
+        // (Codex P2, #376). Resolve every row by its OWN `(record_id, git_commit)`
+        // identity, never an ID-only lookup: `error_context` preserves each
+        // frame-target `source_fact` version separately (a scan-history response
+        // can return several versions of one stable ID), and an ID-only lookup here
+        // would collapse them onto a single record and let an uncited version
+        // escape the code gate. Present-and-visible → its normal handle rule via
+        // `push_record` (a runtime row re-fires the class-wide provenance rule;
+        // code/non-code rows get their handle rule); absent or
+        // tombstoned-and-unsuperseded → a `missing` failure in the section's trust
+        // lane keyed on the row's own `git_commit` so distinct versions stay
+        // distinct, never silently dropped (mirroring the signature/frame handling
+        // above). Sections are already deterministically ordered by the query, so
+        // iteration stays byte-stable.
         for (section, trust) in [
             (&ctx.source_facts, "source_fact"),
             (&ctx.observations, "agent_authored"),
@@ -2084,12 +2136,15 @@ fn drive_error_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
         ] {
             for row in section {
                 let id = row.record_id.as_str();
-                match by_id.get(id) {
+                match by_id_commit.get(&(id, row.git_commit.as_deref())) {
                     Some(record) if node_visible(id, has_temporal_anchor(record), &tombstoned) => {
                         builder.push_record(record);
                         builder.note_redaction(record);
                     }
-                    _ => builder.push_classified(missing(id, trust), String::new()),
+                    _ => builder.push_classified(
+                        missing(id, trust),
+                        row.git_commit.clone().unwrap_or_default(),
+                    ),
                 }
             }
         }
