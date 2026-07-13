@@ -12580,6 +12580,70 @@ mod pack340_tests {
         );
     }
 
+    #[test]
+    fn verify_rejects_unrelated_log_source_injected_into_section() {
+        // #372 membership-breadth guard (Codex P2, thread PRRT_kwDOSfiCJs6Qg8F3):
+        // `verify_pack` re-derives runtime provenance OFFLINE from the co-located
+        // `CAPTURED_FROM` edges + `LogSource` nodes carried in the error_signatures
+        // section. That co-location is a BOUNDED membership exemption — a `LogSource`
+        // node is admitted IFF it is the target of a co-located `CAPTURED_FROM` edge
+        // whose SOURCE is a present in-section signature. This proves the exemption is
+        // NOT too broad: an UNRELATED `LogSource` (named by no co-located
+        // `CAPTURED_FROM`) smuggled into the section is rejected by the membership
+        // check itself, not by an incidental count/hash check.
+        let records = build_log_incident_records();
+        let mut pack = assemble_cc73(&records);
+        // Baseline: the citation-complete #340 fixture verifies clean before tampering.
+        assert!(
+            verify_pack(&pack).ok,
+            "the citation-complete #340 fixture verifies clean before tampering"
+        );
+
+        // A well-formed, non-empty `LogSource` that is NOT the target of any
+        // co-located `CAPTURED_FROM` edge in the section.
+        let stray_id =
+            crate::ir::log_stable_id(&["log_source", "unrelated", "stray.log", "hstray"]);
+        let stray = log_source(&stray_id, "stray.log", "deadbeefdeadbeef");
+        let scrubbed = crate::bundle::scrub_record(stray);
+        let hash = blake3::hash(serde_json::to_string(&scrubbed).unwrap().as_bytes()).to_string();
+        let sec = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == EvidenceClass::ErrorSignatures.as_wire())
+            .expect("error_signatures section");
+        sec.records.push(BundleRecord {
+            record: scrubbed,
+            hash,
+        });
+        sec.record_count = sec.records.len();
+
+        // Recompute the manifest aggregates so the injected row is self-consistent
+        // there: the manifest-count recheck can NOT catch it, isolating the
+        // section-membership exemption as the SOLE check able to reject the row.
+        let (rec_counts, tup_counts) = {
+            let all_rows: Vec<&BundleRecord> = pack
+                .sections
+                .iter()
+                .flat_map(|s| s.records.iter())
+                .collect();
+            compute_manifest_counts(all_rows.iter().copied())
+        };
+        pack.manifest.included_record_counts = rec_counts;
+        pack.manifest.tuple_counts = tup_counts;
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "an unrelated LogSource (named by no co-located CAPTURED_FROM) violates the \
+             bounded section-membership exemption and must fail Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(
+            !report.ok,
+            "a pack with an unrelated LogSource smuggled into error_signatures must not verify ok"
+        );
+    }
+
     // ── AC7: verify BINDS the derived log summaries (tamper-evidence, issue #340)
     // The `log_summary` values are the derived evidence consumers read, but they
     // ride OUTSIDE the hashed `records`. Without an Integrity bind an attacker can
