@@ -2411,6 +2411,85 @@ fn real_scan_cross_file_bare_imported_trait_is_not_misresolved() {
 }
 
 // ---------------------------------------------------------------------------
+// A bare (unqualified) INHERENT impl whose type is defined in another file must
+// not mis-resolve to an unrelated same-named type (Codex round-7 finding). A
+// non-generic inherent impl (`impl Foo {}`) carries the TYPE name `Foo` as its
+// pending trait path; when the module imports `use crate::a::Foo` and the crate
+// root ALSO defines a same-named `struct Foo`, the module-scope outward walk
+// reaches the root `Foo` at depth 0 and would emit a WRONG IMPLEMENTS edge
+// (root `Foo` gaining `m::Foo` as an implementor). The ambiguity guard must
+// count ALL impl-target kinds (traits AND type-defining targets), not only
+// traits, so this bare type reference — ambiguous by simple name across the
+// repo impl-target index (root `Foo` and `a::Foo`) — mints NO edge.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_cross_file_bare_inherent_impl_is_not_misresolved() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!("pub struct Foo;\n\n", "pub mod a;\n", "pub mod m;\n",),
+    )
+    .expect("write lib.rs");
+    fs::write(src.join("a.rs"), "pub struct Foo;\n").expect("write a.rs");
+    fs::write(
+        src.join("m.rs"),
+        concat!(
+            "use crate::a::Foo;\n\n",
+            "impl Foo {\n",
+            "    pub fn x(&self) {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write m.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let graph = fs::read_to_string(&graph_path).expect("read graph");
+    let records: Vec<serde_json::Value> = graph
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+
+    // The root `struct Foo` node — the bare inherent impl in m.rs must NOT bind
+    // to it.
+    let root_foo_id = records
+        .iter()
+        .find(|r| r["record_type"] == "node" && r["symbol_kind"] == "struct" && r["name"] == "Foo")
+        .and_then(|r| r["id"].as_str().map(str::to_owned))
+        .expect("root struct Foo node present");
+
+    // The bare inherent impl `impl Foo {}` in m.rs is a `use crate::a::Foo`
+    // alias whose simple name is ambiguous across the repo impl-target index
+    // (root `Foo` and `a::Foo`), so it stays UNRESOLVED: no IMPLEMENTS edge may
+    // target the root `Foo`.
+    let implements_targets: Vec<&str> = records
+        .iter()
+        .filter(|r| r["record_type"] == "edge" && r["label"] == "IMPLEMENTS")
+        .filter_map(|r| r["target"].as_str())
+        .collect();
+    assert!(
+        !implements_targets.contains(&root_foo_id.as_str()),
+        "bare inherent impl must not mis-bind to the root struct Foo: {implements_targets:?}"
+    );
+    // Stronger bound: the ambiguous bare inherent impl resolves to no
+    // impl-target at all, so no cross-file IMPLEMENTS edge exists to either Foo.
+    assert!(
+        implements_targets.is_empty(),
+        "ambiguous bare inherent impl mints no IMPLEMENTS edge: {implements_targets:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Record-ID handles must stay valid under temporal selectors (PR #296 review):
 // `--at` / `--as-of` resolution must accept the trait's canonical record ID,
 // not only its name.

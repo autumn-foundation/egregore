@@ -42,6 +42,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ir::{CallResolution, EdgeLabel, GraphRecord, NodeKind, SourceSpan, stable_id};
+use crate::languages::rust::is_impl_target_kind;
 
 /// A callable definition exported by a per-file extractor for repo-wide
 /// resolution.
@@ -636,28 +637,46 @@ impl<'facts> ImplTargetIndex<'facts> {
             // A relative-qualified path (`sibling::T`): scope-walk as before.
             return self.scope_walk(trait_path, module_names);
         }
-        // A BARE (unqualified) trait name whose simple name is ambiguous across
-        // the whole repo trait index (e.g. root `T` and `a::T`) may be a
-        // `use`-alias of a NON-root trait the scope walk cannot see. Rather than
-        // let the outward walk mis-bind it to a root same-named trait (a
-        // WRONG-target edge, worse than a missing one), leave it unresolved —
+        // A BARE (unqualified) impl-target name whose simple name is ambiguous
+        // across the whole repo impl-target index (e.g. root `Foo` and `a::Foo`)
+        // may be a `use`-alias of a NON-root definition the scope walk cannot
+        // see. This covers BOTH pending-impl target kinds: a trait path from a
+        // trait impl AND the TYPE name from a non-generic inherent impl
+        // (`impl Foo {}`, whose pending `trait_path` is the type `Foo`). Rather
+        // than let the outward walk mis-bind it to a root same-named definition
+        // (a WRONG-target edge, worse than a missing one), leave it unresolved —
         // matching the documented `local_traits_only` use-alias bound. Only an
-        // unambiguous single same-simple-name trait resolves outward.
+        // unambiguous single same-simple-name impl-target resolves outward.
         if self.bare_simple_name_is_ambiguous(trait_path) {
             return Vec::new();
         }
         self.scope_walk(trait_path, module_names)
     }
 
-    /// Reports whether more than one distinct `trait` definition in the repo
-    /// index shares the given bare simple name. Such a bare reference cannot be
-    /// disambiguated without import-aware (`use`-decl) resolution, which is
-    /// outside this pass's documented bound, so it is left unresolved.
+    /// Reports whether more than one distinct impl-target definition in the repo
+    /// index shares the given bare simple name, counting ALL impl-target kinds
+    /// ([`is_impl_target_kind`]: `trait` / `struct` / `enum` / `type_alias`),
+    /// not only traits. The scope walk resolves a bare name against every one of
+    /// those kinds, so a bare inherent-impl type name (`impl Foo {}`) collides
+    /// with an unrelated same-named type exactly as a bare trait name collides
+    /// with an unrelated same-named trait — the guard must count them all.
+    ///
+    /// Such a bare reference cannot be disambiguated without import-aware
+    /// (`use`-decl) resolution, which is outside this pass's documented bound,
+    /// so it is left unresolved. Trade-off accepted (the honest-bound
+    /// direction): when a trait `T` and an unrelated type `T` coexist across
+    /// files, a bare `impl T for X` that once resolved is now left UNRESOLVED —
+    /// a rare potential WRONG-edge converted into a rare MISSED-edge, consistent
+    /// with `local_traits_only`.
     fn bare_simple_name_is_ambiguous(&self, simple: &str) -> bool {
         let mut matches = 0usize;
         for (qualified, facts) in &self.by_qualified {
             let last = qualified.rsplit("::").next().unwrap_or(qualified);
-            if last == simple && facts.iter().any(|fact| fact.symbol_kind == "trait") {
+            if last == simple
+                && facts
+                    .iter()
+                    .any(|fact| is_impl_target_kind(&fact.symbol_kind))
+            {
                 matches += 1;
                 if matches > 1 {
                     return true;
@@ -1474,6 +1493,71 @@ mod tests {
         assert!(
             implements_pairs(&records).is_empty(),
             "an ambiguous bare trait name mints no edge: {records:?}"
+        );
+    }
+
+    #[test]
+    fn cross_file_bare_inherent_impl_with_ambiguous_type_name_is_unresolved() {
+        // `impl Foo {}` in src/m.rs is a non-generic inherent impl whose pending
+        // trait path is the TYPE name `Foo` (via `use crate::a::Foo`). The
+        // module-scope outward walk cannot see the import and would reach the
+        // root `Foo` struct at depth 0. Because the simple name `Foo` is
+        // ambiguous across the repo impl-target index (root `Foo` and `a::Foo` —
+        // both STRUCTS, no trait involved), the reference is left UNRESOLVED
+        // rather than mis-bound to the root struct (a wrong-target edge). The
+        // guard must count type-defining impl targets, not only traits.
+        let facts = impl_facts(&[
+            (
+                "src/lib.rs",
+                vec![impl_target("struct-Foo-root", "Foo", &[], "struct")],
+                vec![],
+            ),
+            (
+                "src/a.rs",
+                vec![impl_target("struct-Foo-a", "a::Foo", &["a"], "struct")],
+                vec![],
+            ),
+            (
+                "src/m.rs",
+                vec![],
+                vec![pending_impl("impl-Foo", "Foo", &["m"])],
+            ),
+        ]);
+        let records = cross_file_implements_records("repo", &facts);
+        assert!(
+            implements_pairs(&records).is_empty(),
+            "an ambiguous bare inherent-impl type name mints no edge: {records:?}"
+        );
+    }
+
+    #[test]
+    fn cross_file_bare_name_ambiguity_counts_enum_and_type_alias() {
+        // The ambiguity guard spans EVERY impl-target kind. An enum `Bar` and a
+        // type alias `Bar` sharing the simple name across files is ambiguous, so
+        // a bare inherent impl `impl Bar {}` mints no edge — the same guard that
+        // covers traits and structs, proven for the remaining two kinds in one
+        // sweep so the defect cannot return a target-kind at a time.
+        let facts = impl_facts(&[
+            (
+                "src/lib.rs",
+                vec![impl_target("enum-Bar-root", "Bar", &[], "enum")],
+                vec![],
+            ),
+            (
+                "src/a.rs",
+                vec![impl_target("alias-Bar-a", "a::Bar", &["a"], "type_alias")],
+                vec![],
+            ),
+            (
+                "src/m.rs",
+                vec![],
+                vec![pending_impl("impl-Bar", "Bar", &["m"])],
+            ),
+        ]);
+        let records = cross_file_implements_records("repo", &facts);
+        assert!(
+            implements_pairs(&records).is_empty(),
+            "an enum + type-alias same-name collision is ambiguous, no edge: {records:?}"
         );
     }
 

@@ -1185,11 +1185,22 @@ explicitly does *not* implement the trait, so it never edge-backs and never
 surfaces `Foo` as an implementor of `Trait`. The remaining honest bounds:
 **cross-crate** traits (std/deps), **non-Rust** languages, blanket impls, and a
 `use`-alias of a trait in a **non-root** module that the scope walk cannot see
-stay unresolved. A bare (unqualified) trait name whose **simple name is
-ambiguous** across the repo trait index (e.g. a root `T` and a non-root `a::T`)
-is left unresolved too: it may be a `use`-alias of the non-root trait, and this
-pass does not read `use` declarations, so it never guesses a root binding — a
-missing edge is preferred over a wrong-target one.
+stay unresolved. A bare (unqualified) name whose **simple name is
+ambiguous** across the repo impl-target index is left unresolved too: it may be
+a `use`-alias of a non-root definition, and this pass does not read `use`
+declarations, so it never guesses a root binding — a missing edge is preferred
+over a wrong-target one. The ambiguity bound covers **all impl-target kinds**
+(traits **and** type-defining targets: `struct` / `enum` / `type_alias`), not
+just traits, because a non-generic inherent impl (`impl Foo {}`) carries the
+**type** name `Foo` as its bare reference and the scope walk resolves bare names
+against every one of those kinds. So a bare name shared across crate/module
+scopes by any impl-target kind — a root `T` and a non-root `a::T` (traits), or a
+root `struct Foo` and a `use`-aliased `a::Foo` behind `impl Foo {}` (types) — is
+left unresolved rather than mis-targeted. The accepted trade-off: when a trait
+`T` and an unrelated type `T` coexist across files, a bare `impl T for X` that
+once resolved is now left unresolved — a rare potential wrong-edge converted into
+a rare missed-edge, the honest-bound direction consistent with
+`local_traits_only`.
 
 **Multi-crate-root packages are not partitioned by crate root in this slice.**
 The repo-wide index keys on the crate-root-relative **qualified name**, so when

@@ -1666,7 +1666,10 @@ fn import_name(text: &str) -> String {
 /// Returns `true` when a symbol of this kind can be the target of an
 /// `IMPLEMENTS` edge: traits and type-defining items. Value-namespace items
 /// (`const`, `static`) and callables never qualify.
-fn is_impl_target_kind(symbol_kind: &str) -> bool {
+///
+/// Shared with the cross-file IMPLEMENTS resolver so its ambiguity guard and
+/// this extractor's target-kind gate never diverge a target-kind at a time.
+pub(crate) fn is_impl_target_kind(symbol_kind: &str) -> bool {
     matches!(symbol_kind, "trait" | "struct" | "enum" | "type_alias")
 }
 
