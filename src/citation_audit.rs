@@ -2062,6 +2062,55 @@ fn drive_error_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
                 }
             }
         }
+
+        // Cross-domain sections: `eg query error-context`'s code/agent/project/
+        // artifact/verification half IS the `query context` (#38) bundle, and the
+        // public response returns every one of these rows — so, exactly as
+        // `drive_context` gates that bundle, each returned row is a public row the
+        // audit must classify or the gate can pass while a returned row is uncited
+        // (Codex P2, #376). Resolve every row's underlying record by its ID:
+        // present-and-visible → its normal handle rule via `push_record` (a
+        // runtime row still re-fires the class-wide provenance rule; code/non-code
+        // rows get their handle rule); absent or tombstoned-and-unsuperseded →
+        // a `missing` failure in the section's trust lane, never silently dropped
+        // (mirroring the signature/frame handling above). Sections are already
+        // deterministically ordered by the query, so iteration stays byte-stable.
+        for (section, trust) in [
+            (&ctx.source_facts, "source_fact"),
+            (&ctx.observations, "agent_authored"),
+            (&ctx.project_state, "project_state"),
+            (&ctx.artifacts, "artifact"),
+            (&ctx.verification_evidence, "verification_evidence"),
+        ] {
+            for row in section {
+                let id = row.record_id.as_str();
+                match by_id.get(id) {
+                    Some(record) if node_visible(id, has_temporal_anchor(record), &tombstoned) => {
+                        builder.push_record(record);
+                        builder.note_redaction(record);
+                    }
+                    _ => builder.push_classified(missing(id, trust), String::new()),
+                }
+            }
+        }
+        // Unresolved evidence-link targets: a diagnostic per dangling link, never a
+        // silent drop — exactly as `drive_context` reports them.
+        for unresolved in &ctx.unresolved {
+            builder.add_diagnostic(
+                "unresolved_evidence_link".to_owned(),
+                Some(unresolved.source_record_id.clone()),
+                Some(unresolved.target_handle.clone()),
+                Some(unresolved.relation.clone()),
+            );
+        }
+        // Rows the supersession policy removed are reported as excluded (never
+        // counted toward the citation ratio), mirroring `drive_memory`'s excluded
+        // handling and `push_record`'s ExcludedUnverified skip.
+        for excluded in &ctx.excluded {
+            if let Some(record) = by_id.get(excluded.record_id.as_str()) {
+                builder.push_excluded(record, CitationStatus::ExcludedUnverified);
+            }
+        }
     }
     builder
 }

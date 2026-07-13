@@ -1072,6 +1072,179 @@ fn error_context_cited_signature_passes() {
     );
 }
 
+// ── #376 (Codex P2): the error-context CROSS-DOMAIN sections are gated ──────
+//
+// `eg query error-context` returns not only the signature + frame rows but the
+// full `query context` cross-domain bundle (`source_facts`, `observations`,
+// `project_state`, `artifacts`, `verification_evidence`). An EMITTED_DURING
+// `CommandRun` lands in `verification_evidence`; when its target record is
+// absent/tombstoned the public query still exposes the row, so the audit must
+// classify it a citation failure — otherwise the gate can pass while a returned
+// row is uncited.
+
+/// An `EMITTED_DURING` edge from a signature to an agent/command run.
+fn emitted_during(signature_id: &str, run_id: &str) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::EmittedDuring,
+        signature_id.to_owned(),
+        run_id.to_owned(),
+        None,
+        "emitted during".to_owned(),
+    )
+}
+
+/// The `error-context` workflow's classified row for `id`, or a panic naming the
+/// gap (the row must never be silently dropped from the lane).
+fn error_context_row<'a>(report: &'a CitationAuditReport, id: &str) -> &'a RowClassification {
+    let workflow = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == "error-context")
+        .expect("error-context is a registered audit workflow");
+    assert!(workflow.enabled, "error-context lane must be enabled");
+    workflow
+        .rows
+        .iter()
+        .find(|r| r.record_id == id)
+        .unwrap_or_else(|| {
+            panic!(
+                "cross-domain row {id} must surface as an error-context row, never be dropped; \
+                 rows: {:?}",
+                workflow.rows
+            )
+        })
+}
+
+// #376 RED (error-context cross-domain): a signature cited via CAPTURED_FROM
+// carries an EMITTED_DURING edge to a TOMBSTONED CommandRun. `eg query
+// error-context` returns that run in `verification_evidence`, so the audit must
+// count it a `MissingRequiredHandle` non-code failure — never silently skip it.
+// This test fails against the pre-fix lane (which iterated only signatures +
+// frames), proving the gap.
+#[test]
+fn error_context_cross_domain_tombstoned_command_run_fails_gate() {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let run_id = "codegraph:v1:tombstoned_command_run";
+    let records = vec![
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_id),
+        node(run_id, NodeKind::CommandRun),
+        emitted_during(&sig_id, run_id),
+        GraphRecord::Tombstone {
+            id: "codegraph:v1:tomb_run".to_owned(),
+            schema_version: 1,
+            deleted_id: run_id.to_owned(),
+            summary: "command run retracted".to_owned(),
+            producer: None,
+        },
+    ];
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    // The signature itself stays cited — only the cross-domain row is the defect.
+    assert_eq!(
+        error_context_row(&report, &sig_id).status,
+        CitationStatus::Cited,
+        "the CAPTURED_FROM-cited signature is not the failing row"
+    );
+    let row = error_context_row(&report, run_id);
+    assert_eq!(
+        row.status,
+        CitationStatus::MissingRequiredHandle,
+        "a tombstoned EMITTED_DURING CommandRun is never a valid citation"
+    );
+    assert_eq!(
+        row.trust_class, "verification_evidence",
+        "an EMITTED_DURING CommandRun is a verification-evidence row"
+    );
+    // The miss carries a classifying diagnostic (never an unclassified miss)…
+    assert_eq!(report.gate.unclassified_missing_rows, 0);
+    // …and the error-context lane names itself as the source of the miss.
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "missing_required_handle"
+                && d.workflow == "error-context"
+                && d.source_record_id.as_deref() == Some(run_id)),
+        "the error-context lane must name itself for the missing cross-domain row: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        !report.gate.non_code_handle_gate_pass,
+        "an uncited cross-domain verification row fails the non-code handle gate"
+    );
+    assert!(!report.ok);
+}
+
+// #376 GREEN (error-context cross-domain): the same scenario with the CommandRun
+// PRESENT (not tombstoned) → the verification row is cited by its own evidence
+// handle, no gate fails, and the error-context lane contributes no
+// missing-handle diagnostic.
+#[test]
+fn error_context_cross_domain_present_command_run_is_cited() {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let run_id = "codegraph:v1:live_command_run";
+    let records = vec![
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_id),
+        node(run_id, NodeKind::CommandRun),
+        emitted_during(&sig_id, run_id),
+    ];
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let row = error_context_row(&report, run_id);
+    assert_eq!(
+        row.status,
+        CitationStatus::Cited,
+        "a present CommandRun is cited by its own stable evidence handle"
+    );
+    assert_eq!(row.trust_class, "verification_evidence");
+    assert!(report.gate.non_code_handle_gate_pass);
+    assert!(report.ok);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "missing_required_handle" && d.workflow == "error-context"),
+        "a fully cited error-context cross-domain bundle emits no missing-handle diagnostic: {:?}",
+        report.diagnostics
+    );
+}
+
+// #376: the report over a corpus that exercises the error-context cross-domain
+// sections is byte-identical across runs (deterministic serialized output).
+#[test]
+fn error_context_cross_domain_report_is_byte_identical() {
+    let src_id = crate::ir::log_stable_id(&["log_source", "repo", "app.log", "h"]);
+    let sig_id = crate::ir::log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+    let run_id = "codegraph:v1:tombstoned_command_run";
+    let records = vec![
+        log_source_node(&src_id, "app.log", "abc123"),
+        error_signature_node(&sig_id),
+        captured_from(&sig_id, &src_id),
+        node(run_id, NodeKind::CommandRun),
+        emitted_during(&sig_id, run_id),
+        GraphRecord::Tombstone {
+            id: "codegraph:v1:tomb_run".to_owned(),
+            schema_version: 1,
+            deleted_id: run_id.to_owned(),
+            summary: "command run retracted".to_owned(),
+            producer: None,
+        },
+    ];
+    let first =
+        serde_json::to_string(&run_citation_audit(&records, &AuditConfig::default())).unwrap();
+    for _ in 0..2 {
+        let again =
+            serde_json::to_string(&run_citation_audit(&records, &AuditConfig::default())).unwrap();
+        assert_eq!(first, again, "audit output must be deterministic");
+    }
+}
+
 // #376 RED (log_signatures): a signature whose FRAME_RESOLVES_TO edge resolves
 // under a driven subsystem prefix (so it enters the `log_signatures` section)
 // but carries NO CAPTURED_FROM provenance is a `MissingRequiredHandle` runtime

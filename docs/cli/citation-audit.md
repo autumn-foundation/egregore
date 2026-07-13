@@ -149,7 +149,14 @@ rows are gated as code rows):
 - `log-deltas` (`eg query log-deltas`, #326) — runtime error-signature deltas
   across a commit range.
 - `error-context` (`eg query error-context`, #324) — one signature's full
-  cross-domain context bundle, driven once per `ErrorSignature` in the set.
+  cross-domain context bundle, driven once per `ErrorSignature` in the set. The
+  lane classifies the **entire** returned envelope, not just the signature and
+  frame rows: every `source_facts`, `observations`, `project_state`, `artifacts`,
+  and `verification_evidence` row is gated by its trust class exactly as the
+  `context` lane gates that bundle (a returned row whose target record is
+  absent/tombstoned is a `MissingRequiredHandle` failure, never silently
+  dropped), `unresolved` targets emit `unresolved_evidence_link` diagnostics, and
+  superseded/contradicted rows are reported excluded.
 - `log_signatures` (the subsystem `log_signatures` section, `eg query
   subsystem`, #325) — signatures whose frames resolve under a subsystem prefix.
 
