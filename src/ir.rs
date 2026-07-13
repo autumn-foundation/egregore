@@ -34,7 +34,14 @@ pub const USER_CONTEXT_SCHEMA_VERSION: u32 = 1;
 /// Schema version for the log-signature domain (`LogSource`, `ErrorSignature`,
 /// `LogEvent`, `LogOccurrenceBucket`). Documented in `docs/schema/log-graph.md`
 /// (issues #319 / #320).
-pub const LOG_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (issue #361): source-aware `LogOccurrenceBucket` identity — the owning
+/// `LogSource` is folded into the bucket's stable ID and carried as a citable
+/// `source_id` payload field, so two distinct sources observing the same
+/// signature/hour mint DISTINCT bucket IDs (summed downstream) while a genuine
+/// rescan of identical bytes mints the SAME bucket ID (collapsed). A breaking
+/// bump: re-scan to regenerate buckets under the new identity.
+pub const LOG_SCHEMA_VERSION: u32 = 2;
 
 /// Minimum replay tolerance for semantic drift scores.
 /// Documented in `docs/schema/semantic-drift.md`.
@@ -534,7 +541,11 @@ pub struct LogEventPayload {
 /// Payload for a `LogOccurrenceBucket` node: an hourly occurrence count.
 ///
 /// Identity inputs: `repository_id`, `signature_id`, `bucket_start`,
-/// `bucket_width`. `occurrence_count` and producer are non-identity.
+/// `bucket_width`, and `source_id` (issue #361, schema v2). `occurrence_count`
+/// and producer are non-identity. Folding the owning `LogSource` into identity
+/// makes two distinct sources observing the same signature/hour mint DISTINCT
+/// bucket IDs (summed downstream), while a genuine rescan of identical bytes
+/// mints the SAME bucket ID (collapsed as a duplicate).
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LogOccurrenceBucketPayload {
     /// RFC 3339 UTC start of the bucket, floored to the hour.
@@ -543,6 +554,10 @@ pub struct LogOccurrenceBucketPayload {
     pub bucket_width: String,
     /// Occurrences of the signature within this bucket. Non-identity.
     pub occurrence_count: u64,
+    /// Stable `log:v<N>:` handle to the owning `LogSource`. Identity input
+    /// (issue #361): distinguishes buckets from distinct sources sharing a
+    /// signature/hour from a genuine rescan of the same source.
+    pub source_id: String,
 }
 
 /// A typed citation from an agent-memory node to another graph record.
