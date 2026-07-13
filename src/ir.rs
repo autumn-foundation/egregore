@@ -1462,6 +1462,46 @@ impl GraphRecord {
         }
     }
 
+    /// Returns this record's importer `source_kind` attribution: a node's
+    /// `source_kind` (e.g. `github_pr`, `github_issue`), or `None` for a node
+    /// with no attribution and for every non-node record.
+    ///
+    /// This is the single classification arm shared by the daemon's in-batch
+    /// `source_kind` resolution and the offline `eg validate` reviewer-identity
+    /// parity check (issue #369), so the two can never drift on how one record's
+    /// attribution is read.
+    #[must_use]
+    pub fn source_kind_ref(&self) -> Option<&str> {
+        match self {
+            Self::Node { source_kind, .. } => source_kind.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Resolves a record ID's importer `source_kind` within one record batch by
+    /// last-write-wins over forward order — equivalently, the first match in
+    /// reverse order — the EXACT semantics of the daemon's in-batch
+    /// `lookup_node_source_kind` reverse scan (`src/daemon.rs`).
+    ///
+    /// The outer `Option` distinguishes "a record with this id exists in the
+    /// batch" (`Some`) from "no record with this id" (`None`, which the daemon
+    /// resolves through its store `read_back` fallback). The inner `Option` is
+    /// the matched record's [`source_kind_ref`](Self::source_kind_ref): a
+    /// trailing record whose attribution is absent (a node with no `source_kind`,
+    /// or any non-node record sharing the id) resolves to `Some(None)` and thus
+    /// SHADOWS an earlier attribution — matching the daemon exactly (issue #369).
+    #[must_use]
+    pub fn resolve_source_kind_in_batch<'a>(
+        id: &str,
+        records: &'a [Self],
+    ) -> Option<Option<&'a str>> {
+        records
+            .iter()
+            .rev()
+            .find(|record| record.id() == id)
+            .map(Self::source_kind_ref)
+    }
+
     /// Creates a graph node record.
     #[must_use]
     #[allow(clippy::too_many_lines)]

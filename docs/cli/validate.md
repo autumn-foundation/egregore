@@ -89,6 +89,28 @@ same input is byte-identical.
    edge — whose target is a legitimate `LogSource` — is invalid source
    attribution the gate rejects rather than accepting as clean.
 
+2b. **Reviewer-identity source-kind attribution** (issue #369) — the two
+   reviewer-identity edges (issue #335) additionally require the SOURCE node's
+   importer `source_kind` string to match the daemon's
+   `require_project_edge_source_kind` gate, not merely the source node kind
+   (`edge_source_kind_attribution_violation`):
+
+   | Relation | Required source node kind | Required source `source_kind` |
+   |----------|---------------------------|-------------------------------|
+   | `REVIEWED_BY` | `Review` | `github_review` |
+   | `REQUESTED_REVIEW_FROM` | `Task` | `github_pr` |
+
+   Without this, a node-kind-correct but mis-attributed source — a hand-authored
+   `Review` carrying no `source_kind`, or a `github_issue` `Task` — would pass
+   the offline gate while the daemon's `validate_project_edge` rejects it, so
+   direct embedded ingest could persist a reviewer binding `eg validate` called
+   clean. The check runs only when the source node kind is already valid for the
+   relation, so a wrong-kind source is reported once (as
+   `edge_source_kind_violation`), never doubly. The diagnostic carries the
+   observed `source_kind` (absent when the node has none) and the
+   `required_source_kind`. The GitHub importer always stamps the correct
+   `source_kind`, so this hardens hand-authored and third-party graphs.
+
 3. **Edges to tombstoned records** — no edge references a
    tombstoned-and-unsuperseded record: an ID named by a tombstone with no
    surviving node record of the same ID (`edge_to_tombstoned_record`). A

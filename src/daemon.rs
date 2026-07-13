@@ -6307,13 +6307,12 @@ fn lookup_node_source_kind(
     batch: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<Option<String>> {
-    for r in batch.iter().rev() {
-        if r.id() == id {
-            return Ok(match r {
-                GraphRecord::Node { source_kind, .. } => source_kind.clone(),
-                _ => None,
-            });
-        }
+    // In-batch resolution is delegated to the shared last-write-wins helper so
+    // this daemon path and the offline `eg validate` reviewer-identity parity
+    // check (issue #369) can never drift; the store `read_back` fallback below
+    // is unchanged.
+    if let Some(in_batch) = GraphRecord::resolve_source_kind_in_batch(id, batch) {
+        return Ok(in_batch.map(str::to_owned));
     }
     match sink.read_back(id) {
         Ok(Some(GraphRecord::Node { source_kind, .. })) => Ok(source_kind),
@@ -11412,6 +11411,99 @@ fn unix_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a same-id (`n:task`) Task record batch from a forward sequence of
+    /// per-record importer attributions: `Some(kind)` mints a Task carrying that
+    /// `source_kind`, `None` mints a same-id Task with none (issue #369).
+    fn source_kind_batch(sequence: &[Option<&str>]) -> Vec<GraphRecord> {
+        sequence
+            .iter()
+            .map(|attribution| {
+                let mut record = GraphRecord::node(
+                    "n:task".to_owned(),
+                    NodeKind::Task,
+                    None,
+                    None,
+                    Some("task".to_owned()),
+                    "task node".to_owned(),
+                );
+                if let GraphRecord::Node {
+                    ref mut source_kind,
+                    ..
+                } = record
+                {
+                    *source_kind = attribution.map(str::to_owned);
+                }
+                record
+            })
+            .collect()
+    }
+
+    /// One same-node-ID batch shape for the daemon `source_kind` resolution
+    /// parity test (issue #369): a name, the forward sequence of per-record
+    /// attributions for `n:task`, and the value the daemon must resolve.
+    type DaemonSourceKindPermutation = (
+        &'static str,
+        Vec<Option<&'static str>>,
+        Option<&'static str>,
+    );
+
+    #[test]
+    fn lookup_node_source_kind_matches_shared_batch_helper() -> Result<()> {
+        // Issue #369 differential parity: the daemon's real in-batch resolution
+        // (`lookup_node_source_kind`, driven over a real EmbeddedAletheiaSink)
+        // must resolve a node ID to the SAME value as the shared
+        // `GraphRecord::resolve_source_kind_in_batch` helper — the same helper
+        // the offline `eg validate` reviewer-identity parity check consults. The
+        // empty store makes the `read_back` fallback irrelevant (every batch
+        // carries the id), so this pins the in-batch scan exactly. A trailing
+        // record with no attribution must SHADOW an earlier one to `None`.
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let sink =
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?;
+
+        let permutations: &[DaemonSourceKindPermutation] = &[
+            ("single_present", vec![Some("github_pr")], Some("github_pr")),
+            ("single_absent", vec![None], None),
+            ("present_then_absent", vec![Some("github_pr"), None], None),
+            (
+                "absent_then_present",
+                vec![None, Some("github_pr")],
+                Some("github_pr"),
+            ),
+            (
+                "conflicting_values",
+                vec![Some("github_pr"), Some("github_issue")],
+                Some("github_issue"),
+            ),
+            (
+                "same_value_repeats",
+                vec![Some("github_pr"), Some("github_pr")],
+                Some("github_pr"),
+            ),
+        ];
+
+        for (name, sequence, expected) in permutations {
+            let records = source_kind_batch(sequence);
+
+            let daemon_resolved = lookup_node_source_kind("n:task", &records, &sink)
+                .expect("in-batch source_kind resolution never errors");
+            let helper_resolved =
+                GraphRecord::resolve_source_kind_in_batch("n:task", &records).flatten();
+
+            assert_eq!(
+                daemon_resolved.as_deref(),
+                helper_resolved,
+                "daemon lookup and shared helper must agree on permutation `{name}`"
+            );
+            assert_eq!(
+                daemon_resolved.as_deref(),
+                *expected,
+                "daemon lookup must resolve permutation `{name}` to the documented value"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn request_read_uses_total_deadline_for_slow_headers() -> Result<()> {
