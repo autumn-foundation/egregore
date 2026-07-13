@@ -11391,6 +11391,92 @@ mod pack340_tests {
         );
     }
 
+    // ── #372 verify-side floor + integrity bind (Codex P2) ────────────────────
+    //
+    // The hole: `verify_pack`'s Coverage recompute used the CONTEXT-FREE classifier,
+    // which counts an unprovenanced `runtime_observation` row cited by its own ID —
+    // so a pack whose assemble-time `citation.passed` is FALSE still verified `ok`,
+    // masking the recorded failure. The fix floors Coverage against the recorded
+    // (integrity-bound) citation verdict: verify may confirm or downgrade it, never
+    // upgrade it.
+
+    #[test]
+    fn verify_rejects_provenance_less_pack() {
+        // A well-formed-ID but PROVENANCE-LESS ErrorSignature: assemble records a
+        // FAILED citation verdict, and verify must HONOR it (the floor) rather than
+        // masking it with the cited-by-own-ID recompute.
+        let pack = assemble_cc73(&well_formed_signature(false));
+        assert!(
+            !pack.verdicts.citation.passed,
+            "provenance-less runtime rows fail the assemble citation gate (#372)"
+        );
+        let report = verify_pack(&pack);
+        assert!(
+            !report.coverage.passed,
+            "verify Coverage is floored by the recorded citation verdict: {}",
+            report.coverage.detail
+        );
+        assert!(
+            !report.ok,
+            "an invalid, provenance-less pack must not verify ok"
+        );
+    }
+
+    #[test]
+    fn verify_accepts_citation_complete_pack() {
+        // The upgraded, citation-complete #340 fixture: well-formed IDs + resolvable
+        // provenance -> assemble records citation.passed = true -> verify stays clean.
+        let pack = assemble_cc73(&build_log_incident_records());
+        assert!(
+            pack.verdicts.citation.passed,
+            "the citation-complete fixture passes the assemble citation gate"
+        );
+        assert!(
+            verify_pack(&pack).ok,
+            "a legit citation-complete pack still verifies clean under the floor"
+        );
+    }
+
+    #[test]
+    fn verify_marks_runtime_rows_not_recomputable() {
+        // A citation-complete pack containing runtime rows: verify cannot re-derive
+        // log provenance, so it marks those rows `log_citation_not_recomputable`
+        // (counted, excluded from the gate — never counted cited by their own ID).
+        let pack = assemble_cc73(&build_log_incident_records());
+        let report = verify_pack(&pack);
+        assert!(
+            report.coverage.passed,
+            "citation-complete pack passes Coverage: {}",
+            report.coverage.detail
+        );
+        assert!(
+            report
+                .coverage
+                .detail
+                .contains("log_citation_not_recomputable"),
+            "Coverage detail surfaces the not-recomputable marker: {}",
+            report.coverage.detail
+        );
+    }
+
+    #[test]
+    fn verify_catches_flipped_citation_verdict() {
+        // Assemble a provenance-less pack (recorded citation.passed = false), then
+        // flip it to true WITHOUT recomputing `citation_binding_hash`. The Part 4
+        // integrity bind must catch the stale hash, so the floor cannot be defeated
+        // by hand-editing the recorded verdict.
+        let mut pack = assemble_cc73(&well_formed_signature(false));
+        assert!(!pack.verdicts.citation.passed);
+        pack.verdicts.citation.passed = true; // lie; binding hash NOT recomputed
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a flipped citation.passed with a stale binding hash fails Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
     // ── AC1: error_signatures ─────────────────────────────────────────────────
     #[test]
     fn error_signatures_populate_with_clipped_span_and_frame_joins() {
