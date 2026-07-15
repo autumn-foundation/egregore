@@ -1453,20 +1453,19 @@ fn real_scan_cross_file_turbofish_trait_is_edge_backed() {
 }
 
 // ---------------------------------------------------------------------------
-// Multi-crate-root conservative bound (issue #344 review): when a package has
-// two crate roots (`src/lib.rs` + `src/bin/tool.rs`), a root `trait T` in each
-// gets the SAME crate-root-relative qualified name `T`. The repo-wide impl
-// index keys only on that qualified name, so `crate::T` matches BOTH root
-// definitions. The resolver must leave that multi-candidate match UNRESOLVED
-// (mint no edge) rather than silently pick one and mis-target a cross-root
-// edge — a lib `impl crate::T for Foo` must never resolve to the binary's `T`.
-// This is a GREEN regression guard: the resolver already resolves only unique
-// matches (`[only]`), so no behavior change was needed. Full crate-root
-// partitioning of the index is a deferred follow-up, not this slice.
+// Multi-crate-root partitioning (issue #394): when a package has two crate
+// roots (`src/lib.rs` + `src/bin/tool.rs`), a root `trait T` in each gets the
+// SAME crate-root-relative qualified name `T`. Keying the repo-wide impl index
+// on `(crate_root, qualified_name)` keeps the two from pooling, so a lib
+// `impl crate::T for Foo` resolves to the LIBRARY `T` and a bin
+// `impl crate::T for Bar` resolves to the BINARY `T` — and the two never cross.
+// (Before #394 the shared qualified name `T` matched BOTH definitions, so the
+// unique-match resolver left the lib impl UNRESOLVED; this is the recall
+// recovery.)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn real_scan_multi_crate_root_same_name_trait_is_unresolved() {
+fn real_scan_multi_crate_root_same_name_trait_resolves_within_own_root() {
     let temp = tempfile::tempdir().expect("temp dir");
     let src = temp.path().join("src");
     let bin = src.join("bin");
@@ -1483,10 +1482,16 @@ fn real_scan_multi_crate_root_same_name_trait_is_unresolved() {
         concat!("pub struct Foo;\n", "impl crate::T for Foo {}\n"),
     )
     .expect("write m.rs");
-    // Binary crate root ALSO defines a root `trait T` -> same qualified name.
+    // Binary crate root ALSO defines a root `trait T` (same qualified name) and
+    // implements it for its own `Bar`.
     fs::write(
         bin.join("tool.rs"),
-        concat!("pub trait T {}\n", "fn main() {}\n"),
+        concat!(
+            "pub trait T {}\n",
+            "pub struct Bar;\n",
+            "impl crate::T for Bar {}\n",
+            "fn main() {}\n",
+        ),
     )
     .expect("write bin/tool.rs");
 
@@ -1499,19 +1504,46 @@ fn real_scan_multi_crate_root_same_name_trait_is_unresolved() {
         .assert()
         .success();
 
-    // No IMPLEMENTS edge whatsoever names `Foo`: the graph must carry zero
-    // cross-root edges. (A raw text scan of the graph is the tightest guard.)
+    // Identify the two distinct `T` trait nodes by their declaring file.
     let graph_text = fs::read_to_string(&graph_path).expect("read graph");
-    for line in graph_text.lines() {
-        let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
-        assert!(
-            v["label"] != "IMPLEMENTS",
-            "no IMPLEMENTS edge may be minted for the ambiguous cross-root `crate::T`: {line}"
-        );
-    }
+    let records: Vec<serde_json::Value> = graph_text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    let trait_id_in = |path: &str| -> String {
+        records
+            .iter()
+            .find(|r| {
+                r["record_type"] == "node"
+                    && r["symbol_kind"] == "trait"
+                    && r["name"] == "T"
+                    && r["repo_relative_path"] == path
+            })
+            .and_then(|r| r["id"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| panic!("trait T node in {path} present"))
+    };
+    let lib_t = trait_id_in("src/lib.rs");
+    let bin_t = trait_id_in("src/bin/tool.rs");
+    assert_ne!(lib_t, bin_t, "the two crate roots' `T` are distinct nodes");
 
-    // The query answers the zero-implementors signal for the trait(s) named
-    // `T`; `Foo` must never appear as an implementor of either crate root's `T`.
+    // Both roots' impls edge-back — the lib `Foo` to the LIBRARY `T`, the bin
+    // `Bar` to the BINARY `T`.
+    let implements_targets: Vec<&str> = records
+        .iter()
+        .filter(|r| r["record_type"] == "edge" && r["label"] == "IMPLEMENTS")
+        .filter_map(|r| r["target"].as_str())
+        .collect();
+    assert!(
+        implements_targets.contains(&lib_t.as_str()),
+        "the lib `impl crate::T for Foo` must edge-back to the LIBRARY `T`: {records:?}"
+    );
+    assert!(
+        implements_targets.contains(&bin_t.as_str()),
+        "the bin `impl crate::T for Bar` must edge-back to the BINARY `T`: {records:?}"
+    );
+
+    // Per-trait implementor rows confirm no cross-pooling: the library `T` lists
+    // `m::Foo` and never `Bar`; the binary `T` lists `Bar` and never `m::Foo`.
     let stdout = egregore()
         .args(["query", "implementors", "T", "--graph"])
         .arg(&graph_path)
@@ -1520,19 +1552,27 @@ fn real_scan_multi_crate_root_same_name_trait_is_unresolved() {
         .get_output()
         .stdout
         .clone();
-    let out = String::from_utf8(stdout).expect("utf8");
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    let implementors_of = |trait_id: &str| -> Vec<String> {
+        rows.iter()
+            .filter(|r| r["trait_record_id"] == trait_id)
+            .filter_map(|r| r["implementing_type"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let lib_impls = implementors_of(&lib_t);
+    let bin_impls = implementors_of(&bin_t);
     assert!(
-        !out.contains("Foo"),
-        "a multi-crate-root same-name trait must not mis-target `Foo`: {out}"
+        lib_impls.contains(&"m::Foo".to_owned()) && !lib_impls.contains(&"Bar".to_owned()),
+        "library `T` implementors must be exactly {{m::Foo}}, never cross-pooling `Bar`: {lib_impls:?}"
     );
-    for line in out.lines() {
-        let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
-        assert_eq!(
-            v["code"], "zero_implementors_recorded",
-            "each crate root's `T` reports zero implementors, never a mis-targeted row: {line}"
-        );
-        assert_eq!(v["implementors_recorded"], 0, "{line}");
-    }
+    assert!(
+        bin_impls.contains(&"Bar".to_owned()) && !bin_impls.contains(&"m::Foo".to_owned()),
+        "binary `T` implementors must be exactly {{Bar}}, never cross-pooling `m::Foo`: {bin_impls:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1902,18 +1942,17 @@ fn real_scan_unqualified_trait_resolves_in_impl_module_scope() {
         "module impl -> module trait"
     );
 
-    // Round-9 reconciliation: `mod k { use super::Out; impl Out for Kid }`
-    // shadows the bare `Out` with a `use` in scope `k`, so the AST-derived
-    // import-shadow veto (issues #343/#344) now leaves the impl UNRESOLVED
-    // rather than walking outward to the root `Out`. This is the documented
-    // recall trade-off — a `use` of the resolved name (even when the import
-    // target IS the local trait) is left unresolved; correct import-aware
-    // resolution is follow-up #393. The root `Out` therefore gains no
-    // implementor.
+    // Import-aware resolution (issue #393): `mod k { use super::Out; impl Out
+    // for Kid }` binds the bare `Out` through the `use super::Out` import, which
+    // resolves against the impl's module scope to the root `Out` — so `k::Kid`
+    // now edge-backs to the root `Out`. (PR #389 left this unresolved via the
+    // import-shadow veto; #393 recovers the recall by resolving the aliased
+    // import PATH rather than vetoing.)
     let outward = types_for("Out");
-    assert!(
-        outward.is_empty(),
-        "import-shadowed bare `impl Out for Kid` is left unresolved (#393): {outward:?}"
+    assert_eq!(
+        outward,
+        vec!["k::Kid".to_owned()],
+        "import-aware `impl Out for Kid` edge-backs to the root `Out` (#393): {outward:?}"
     );
 }
 
@@ -2119,14 +2158,12 @@ fn real_scan_relative_qualified_trait_path_resolves_in_module_scope() {
 // reference-definition map. The resolver must never bind an IMPLEMENTS edge to
 // that value-namespace `fn T` — the standing invariant this test guards.
 //
-// Round-9 reconciliation: the bare `impl T for Foo` is shadowed by `use m::T;`
-// in its module scope, so the AST-derived import-shadow veto (issues
-// #343/#344) now leaves it UNRESOLVED rather than resolving it to `m::T` — the
-// documented recall trade-off (a `use` of the resolved name, even when the
-// import target IS the local trait, is left unresolved; correct import-aware
-// resolution is follow-up #393). `m::T` therefore gains no implementor. The
-// value-namespace guard below is unaffected and remains the load-bearing
-// assertion.
+// Import-aware resolution (issue #393): the bare `impl T for Foo` is bound by
+// `use m::T;` in its module scope, and #393 resolves that import PATH to the
+// inline-module trait `m::T` — so `m::T` gains `Foo` as an implementor. (PR
+// #389 left it unresolved via the import-shadow veto.) The load-bearing
+// value-namespace guard is unaffected: the resolver still never binds the
+// same-named `fn T` value-namespace item.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -2162,10 +2199,8 @@ fn real_scan_use_imported_trait_beats_value_namespace_shadow() {
         .assert()
         .success();
 
-    // The bare `impl T for Foo` is shadowed by `use m::T;` in scope, so the
-    // import-shadow veto leaves it unresolved (recall trade-off, #393): `m::T`
-    // gains no implementor rather than mint an edge for a name that syntactically
-    // refers to the import.
+    // The bare `impl T for Foo` is bound by `use m::T;` in scope, so import-aware
+    // resolution (#393) edge-backs `Foo` to the inline-module trait `m::T`.
     let stdout = egregore()
         .args(["query", "implementors", "m::T", "--graph"])
         .arg(&graph_path)
@@ -2180,9 +2215,8 @@ fn real_scan_use_imported_trait_beats_value_namespace_shadow() {
         .map(|l| serde_json::from_str(l).expect("valid JSON"))
         .collect();
     assert!(
-        rows.iter()
-            .all(|r| r["implementing_type"] != "Foo" && r["implementing_type"] != "m::Foo"),
-        "the import-shadowed bare impl is left unresolved (recall trade-off, #393): {rows:?}"
+        rows.iter().any(|r| r["implementing_type"] == "Foo"),
+        "the imported bare impl edge-backs `Foo` to `m::T` (#393): {rows:?}"
     );
 
     // The value-namespace fn named T never receives an IMPLEMENTS edge — the
@@ -2351,20 +2385,18 @@ fn real_scan_cross_file_unqualified_trait_resolves_outward() {
 }
 
 // ---------------------------------------------------------------------------
-// Ambiguous bare (unqualified) trait names are left UNRESOLVED, never
-// mis-bound to a root same-named trait (Codex review finding on #344). When an
-// out-of-line module imports a NON-ROOT trait and implements it by bare name
+// Import-aware bare (unqualified) trait resolution (issue #393): an out-of-line
+// module that imports a NON-ROOT trait and implements it by bare name
 // (`use crate::a::T; impl T for Foo`) while the crate root ALSO defines a
-// same-named trait, the module-scope outward walk reaches the root `T` at
-// depth 0 and would emit a WRONG IMPLEMENTS edge (root `T` gaining `Foo`, and
-// `a::T` losing its implementor). The documented `local_traits_only` bound says
-// use-alias / non-root bare trait paths stay unresolved, and a wrong-target
-// edge is worse than a missing one, so this bare-name reference — ambiguous by
-// simple name across the repo trait index — mints NO edge to the root `T`.
+// same-named trait now resolves the bare `T` to the IMPORTED `a::T` — not the
+// root `T`. PR #389 conservatively left this UNRESOLVED via the
+// `shadowed_by_use` veto; #393 recovers the recall by resolving the captured
+// `use`-import PATH against the crate-root-partitioned index. The no-WRONG-edge
+// property is preserved: `Foo` binds `a::T` and NEVER the root `T`.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn real_scan_cross_file_bare_imported_trait_is_not_misresolved() {
+fn real_scan_cross_file_bare_imported_trait_resolves_to_aliased_trait() {
     let temp = tempfile::tempdir().expect("temp dir");
     let src = temp.path().join("src");
     fs::create_dir_all(&src).expect("mkdir src");
@@ -2405,8 +2437,48 @@ fn real_scan_cross_file_bare_imported_trait_is_not_misresolved() {
         .assert()
         .success();
 
+    // Identify the two distinct `T` trait nodes by their declaring file.
+    let graph_text = fs::read_to_string(&graph_path).expect("read graph");
+    let records: Vec<serde_json::Value> = graph_text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    let trait_id_in = |path: &str| -> String {
+        records
+            .iter()
+            .find(|r| {
+                r["record_type"] == "node"
+                    && r["symbol_kind"] == "trait"
+                    && (r["name"] == "T" || r["name"] == "a::T")
+                    && r["repo_relative_path"] == path
+            })
+            .and_then(|r| r["id"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| panic!("trait T node in {path} present"))
+    };
+    let root_t = trait_id_in("src/lib.rs");
+    let a_t = trait_id_in("src/a.rs");
+
+    // The bare `T` in m.rs names `use crate::a::T`, so `Foo` implements `a::T`.
+    let implements_targets: Vec<&str> = records
+        .iter()
+        .filter(|r| r["record_type"] == "edge" && r["label"] == "IMPLEMENTS")
+        .filter_map(|r| r["target"].as_str())
+        .collect();
+    assert!(
+        implements_targets.contains(&a_t.as_str()),
+        "the bare imported trait must edge-back to the aliased `a::T`: {records:?}"
+    );
+    // ...and the no-WRONG-edge property holds: NO IMPLEMENTS edge targets the
+    // root `T`.
+    assert!(
+        !implements_targets.contains(&root_t.as_str()),
+        "the recovered edge must never target the root `T`: {records:?}"
+    );
+
+    // Query view: `a::T` lists `m::Foo` as an implementor. (The no-edge-to-root
+    // property is already proven at the edge level above.)
     let stdout = egregore()
-        .args(["query", "implementors", "T", "--graph"])
+        .args(["query", "implementors", "a::T", "--graph"])
         .arg(&graph_path)
         .assert()
         .success()
@@ -2418,13 +2490,91 @@ fn real_scan_cross_file_bare_imported_trait_is_not_misresolved() {
         .lines()
         .map(|l| serde_json::from_str(l).expect("valid JSON"))
         .collect();
-    // The bare `T` in m.rs is a `use crate::a::T` alias whose simple name is
-    // ambiguous across the repo (root `T` and `a::T`), so it stays unresolved:
-    // `Foo` must NOT appear as an implementor of any `T`.
     assert!(
-        rows.iter()
-            .all(|r| r["implementing_type"] != "m::Foo" && r["implementing_type"] != "Foo"),
-        "bare imported trait must not mis-bind `Foo` to a same-named trait: {rows:?}"
+        rows.iter().any(|r| r["implementing_type"] == "m::Foo"),
+        "`a::T` must report `m::Foo` as an implementor: {rows:?}"
+    );
+}
+
+/// Shared scaffold for the import-aware bare-name variants (issue #393):
+/// `src/lib.rs` (root `trait T` + `mod a` + `mod m`), `src/a.rs` (`pub trait
+/// T`), and a caller-provided `src/m.rs`. Returns the implementors of `a::T`.
+fn scan_import_variant(m_rs: &str) -> Vec<serde_json::Value> {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!("pub trait T {}\n\n", "pub mod a;\n", "pub mod m;\n"),
+    )
+    .expect("write lib.rs");
+    fs::write(src.join("a.rs"), "pub trait T {}\n").expect("write a.rs");
+    fs::write(src.join("m.rs"), m_rs).expect("write m.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+    let stdout = egregore()
+        .args(["query", "implementors", "a::T", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect()
+}
+
+#[test]
+fn real_scan_use_alias_rename_resolves_to_aliased_trait() {
+    // `use crate::a::T as U; impl U for Bar` binds `a::T` through the rename.
+    let rows = scan_import_variant(concat!(
+        "use crate::a::T as U;\n\n",
+        "pub struct Bar;\n\n",
+        "impl U for Bar {}\n",
+    ));
+    assert!(
+        rows.iter().any(|r| r["implementing_type"] == "m::Bar"),
+        "the renamed import `U` must edge-back to `a::T`: {rows:?}"
+    );
+}
+
+#[test]
+fn real_scan_grouped_import_resolves_to_aliased_trait() {
+    // A grouped `use crate::a::{T};` binds `a::T` for the bare `impl T`.
+    let rows = scan_import_variant(concat!(
+        "use crate::a::{T};\n\n",
+        "pub struct Foo;\n\n",
+        "impl T for Foo {}\n",
+    ));
+    assert!(
+        rows.iter().any(|r| r["implementing_type"] == "m::Foo"),
+        "the grouped import must edge-back `m::Foo` to `a::T`: {rows:?}"
+    );
+}
+
+#[test]
+fn real_scan_glob_import_stays_bounded_out() {
+    // A glob `use crate::a::*;` binds no simple name, so the bare `impl T` is
+    // ambiguous (root `T` and `a::T`) and stays UNRESOLVED — the documented
+    // remaining bound. `m::Foo` implements neither `T`.
+    let rows = scan_import_variant(concat!(
+        "use crate::a::*;\n\n",
+        "pub struct Foo;\n\n",
+        "impl T for Foo {}\n",
+    ));
+    assert!(
+        rows.iter().all(|r| r["implementing_type"] != "m::Foo"),
+        "a glob import leaves the bare `impl T` unresolved (no `a::T` edge): {rows:?}"
     );
 }
 
@@ -2486,10 +2636,19 @@ fn real_scan_cross_file_bare_inherent_impl_is_not_misresolved() {
         .and_then(|r| r["id"].as_str().map(str::to_owned))
         .expect("root struct Foo node present");
 
-    // The bare inherent impl `impl Foo {}` in m.rs is a `use crate::a::Foo`
-    // alias whose simple name is ambiguous across the repo impl-target index
-    // (root `Foo` and `a::Foo`), so it stays UNRESOLVED: no IMPLEMENTS edge may
-    // target the root `Foo`.
+    // The bare inherent impl `impl Foo {}` in m.rs names `use crate::a::Foo`, so
+    // import-aware resolution (#393) binds it to the IMPORTED `a::Foo`; the
+    // no-wrong-edge property holds — no IMPLEMENTS edge targets the root `Foo`.
+    let a_foo_id = records
+        .iter()
+        .find(|r| {
+            r["record_type"] == "node"
+                && r["symbol_kind"] == "struct"
+                && r["name"] == "a::Foo"
+                && r["repo_relative_path"] == "src/a.rs"
+        })
+        .and_then(|r| r["id"].as_str().map(str::to_owned))
+        .expect("a::Foo struct node present");
     let implements_targets: Vec<&str> = records
         .iter()
         .filter(|r| r["record_type"] == "edge" && r["label"] == "IMPLEMENTS")
@@ -2499,11 +2658,10 @@ fn real_scan_cross_file_bare_inherent_impl_is_not_misresolved() {
         !implements_targets.contains(&root_foo_id.as_str()),
         "bare inherent impl must not mis-bind to the root struct Foo: {implements_targets:?}"
     );
-    // Stronger bound: the ambiguous bare inherent impl resolves to no
-    // impl-target at all, so no cross-file IMPLEMENTS edge exists to either Foo.
+    // Recall recovery: the inherent impl edge-backs to the imported `a::Foo`.
     assert!(
-        implements_targets.is_empty(),
-        "ambiguous bare inherent impl mints no IMPLEMENTS edge: {implements_targets:?}"
+        implements_targets.contains(&a_foo_id.as_str()),
+        "the imported bare inherent impl edge-backs to `a::Foo` (#393): {implements_targets:?}"
     );
 }
 

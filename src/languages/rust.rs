@@ -18,7 +18,7 @@ use crate::{
         },
         cross_file::{
             CallKind, CallSiteFact, DefinitionFact, FileFacts, ImplTargetFact, OutOfLineModFact,
-            PendingImplFact,
+            PendingImplFact, UseImportFact, crate_root_id,
         },
     },
     redaction::REDACTION_POLICY_VERSION,
@@ -76,6 +76,7 @@ pub fn extract_file_source(
     let mut extractor = RustExtractor::new(file, file_id, repository_id, graph, source);
     extractor.walk(tree.root_node());
     extractor.resolve_pending_impl_edges();
+    extractor.finalize_use_imports();
     extractor.emit_reference_edges();
     Ok(extractor.facts)
 }
@@ -159,6 +160,18 @@ struct RustExtractor<'graph, 'source> {
     /// import, not any local same-name definition, so the impl is left
     /// unresolved (correct import-aware resolution is follow-up #393).
     imports_by_scope: BTreeMap<Vec<String>, BTreeSet<String>>,
+    /// Import PATHS each module-item `use` binds into scope (issue #393):
+    /// module scope -> (bound simple name -> import path as written). Populated
+    /// from the SAME module-item `use` declarations as `imports_by_scope`, so
+    /// the import-aware cross-file `IMPLEMENTS` resolver respects the identical
+    /// Rust-visibility scoping the veto uses. Serialized into
+    /// `FileFacts::use_trait_imports`; the deferred cross-file pass resolves the
+    /// path so `use crate::a::T; impl T for Foo` binds `a::T`, not a root `T`.
+    import_paths_by_scope: BTreeMap<Vec<String>, BTreeMap<String, String>>,
+    /// The crate root this file belongs to (issue #394), stamped onto every
+    /// exported trait/type and pending-impl fact so the repo-wide index can
+    /// partition same-named root definitions across crate roots.
+    crate_root: String,
     /// Impl trait lookups deferred to after the walk (source order).
     pending_impl_edges: Vec<PendingImplEdge>,
     symbol_bodies: Vec<SymbolBody>,
@@ -203,6 +216,8 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             qualified_definitions: BTreeMap::new(),
             type_definitions: BTreeMap::new(),
             imports_by_scope: BTreeMap::new(),
+            import_paths_by_scope: BTreeMap::new(),
+            crate_root: crate_root_id(&file.repo_relative_path),
             pending_impl_edges: Vec::new(),
             symbol_bodies: Vec::new(),
             symbol_ordinals: BTreeMap::new(),
@@ -405,6 +420,17 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                     .or_default()
                     .extend(bound);
             }
+            // Capture the resolved import PATH for each bound simple name
+            // (issue #393), keyed by the same module scope, so the cross-file
+            // resolver can bind a bare imported trait/type name to its true
+            // aliased target instead of vetoing it. Glob imports bind no simple
+            // name and contribute nothing here (they stay bounded out).
+            for (simple, path) in use_bound_import_paths(node, self.source) {
+                self.import_paths_by_scope
+                    .entry(self.module_names.clone())
+                    .or_default()
+                    .insert(simple, path);
+            }
         }
         let name = import_name(self.node_text(node));
         let id = stable_id(&[
@@ -477,6 +503,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             self.facts.impl_targets.push(ImplTargetFact {
                 id: id.clone(),
                 qualified_name: qualified_name.clone(),
+                crate_root: self.crate_root.clone(),
                 module_path: self.module_names.clone(),
                 symbol_kind: symbol_kind.to_owned(),
             });
@@ -1219,6 +1246,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                         self.facts.pending_impls.push(PendingImplFact {
                             source_id: entry.source_id,
                             trait_path: trait_name,
+                            crate_root: self.crate_root.clone(),
                             module_names: entry.module_names,
                             shadowed_by_use,
                         });
@@ -1245,6 +1273,42 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 ImplTargetDecision::NoEdge => {}
             }
         }
+    }
+
+    /// Serializes the captured module-item `use`-import PATHS relevant to this
+    /// file's bare pending impls into [`FileFacts::use_trait_imports`] (issue
+    /// #393), so the deferred cross-file resolver can bind a bare imported
+    /// trait/type name to its true aliased target. Only imports that a bare
+    /// pending impl in the SAME module scope actually names are emitted, keeping
+    /// the fact vector (and cache) minimal. Output is deterministically ordered.
+    fn finalize_use_imports(&mut self) {
+        let mut seen: BTreeSet<(Vec<String>, String)> = BTreeSet::new();
+        let mut imports: Vec<UseImportFact> = Vec::new();
+        for pending in &self.facts.pending_impls {
+            if pending.trait_path.contains("::") {
+                continue;
+            }
+            let key = (pending.module_names.clone(), pending.trait_path.clone());
+            if seen.contains(&key) {
+                continue;
+            }
+            if let Some(path) = self
+                .import_paths_by_scope
+                .get(&pending.module_names)
+                .and_then(|scope| scope.get(&pending.trait_path))
+            {
+                seen.insert(key);
+                imports.push(UseImportFact {
+                    module_names: pending.module_names.clone(),
+                    simple_name: pending.trait_path.clone(),
+                    resolved_path: path.clone(),
+                });
+            }
+        }
+        imports.sort_by(|a, b| {
+            (&a.module_names, &a.simple_name).cmp(&(&b.module_names, &b.simple_name))
+        });
+        self.facts.use_trait_imports = imports;
     }
 
     /// Resolves a normalized impl trait path against THIS file's indexed
@@ -1888,6 +1952,94 @@ fn collect_use_tree_names(node: Node<'_>, source: &str, out: &mut Vec<String>) {
         }
         // `use_wildcard` (glob) names no specific simple name; separator tokens
         // (`{`, `,`, `}`) carry none either.
+        _ => {}
+    }
+}
+
+/// Collects the `(bound simple name, import path as written)` pairs a `use`
+/// declaration introduces into its enclosing scope, walking the Tree-sitter
+/// parse tree (issue #393). The import PATH is what the cross-file resolver
+/// resolves so a bare imported trait/type name binds its true target
+/// (`use crate::a::T;` → `("T", "crate::a::T")`). Handles the plain, alias
+/// (`use a::b::T as U;` → `("U", "a::b::T")`), grouped (`use a::{B, C::D};` →
+/// `("B", "a::B")`, `("D", "a::C::D")`, including nested groups), and glob
+/// (`use a::*;` binds no simple name, contributes nothing) forms — the same
+/// surface [`use_bound_names`] covers, kept in lock-step so the veto's bound
+/// names and the resolver's import paths never disagree.
+fn use_bound_import_paths(node: Node<'_>, source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(argument) = node.child_by_field_name("argument") {
+        collect_use_tree_paths(argument, source, "", &mut out);
+    }
+    out
+}
+
+/// Joins a use-tree prefix with a trailing segment path (`::`-separated),
+/// dropping an empty prefix.
+fn join_use_path(prefix: &str, tail: &str) -> String {
+    if prefix.is_empty() {
+        tail.to_owned()
+    } else {
+        format!("{prefix}::{tail}")
+    }
+}
+
+/// Recursive worker for [`use_bound_import_paths`], accumulating the path prefix
+/// as it descends group nodes. Mirrors [`collect_use_tree_names`] node-for-node
+/// so the bound-name set stays identical.
+fn collect_use_tree_paths(
+    node: Node<'_>,
+    source: &str,
+    prefix: &str,
+    out: &mut Vec<(String, String)>,
+) {
+    match node.kind() {
+        "identifier" | "type_identifier" => {
+            let name = node_source(node, source).trim().to_owned();
+            let full = join_use_path(prefix, &name);
+            out.push((name, full));
+        }
+        "scoped_identifier" => {
+            // `path::name`: the whole scoped identifier is the import path; its
+            // final `name` segment is the bound simple name.
+            if let Some(name) = node.child_by_field_name("name")
+                && matches!(name.kind(), "identifier" | "type_identifier")
+            {
+                let simple = node_source(name, source).trim().to_owned();
+                let written = node_source(node, source).trim().to_owned();
+                let full = join_use_path(prefix, &written);
+                out.push((simple, full));
+            }
+        }
+        "use_as_clause" => {
+            // `path as alias` binds the alias to the path (not its final
+            // segment): `use a::b::T as U;` → `("U", "a::b::T")`.
+            if let Some(alias) = node.child_by_field_name("alias")
+                && matches!(alias.kind(), "identifier" | "type_identifier")
+                && let Some(path) = node.child_by_field_name("path")
+            {
+                let simple = node_source(alias, source).trim().to_owned();
+                let written = node_source(path, source).trim().to_owned();
+                let full = join_use_path(prefix, &written);
+                out.push((simple, full));
+            }
+        }
+        "scoped_use_list" => {
+            let new_prefix = node.child_by_field_name("path").map_or_else(
+                || prefix.to_owned(),
+                |path| join_use_path(prefix, node_source(path, source).trim()),
+            );
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_use_tree_paths(list, source, &new_prefix, out);
+            }
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_use_tree_paths(child, source, prefix, out);
+            }
+        }
+        // `use_wildcard` (glob) and separator tokens name nothing.
         _ => {}
     }
 }
@@ -3300,6 +3452,60 @@ mod tests {
         assert_eq!(
             parse_use_bound_names("use a::{B, c::*};"),
             vec!["B".to_owned()]
+        );
+    }
+
+    /// Parses one `use` declaration and returns the `(simple name, import path)`
+    /// pairs it binds, driving [`use_bound_import_paths`] as the extractor does.
+    fn parse_use_import_paths(source: &str) -> Vec<(String, String)> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load rust grammar");
+        let tree = parser.parse(source, None).expect("parse source");
+        let use_node = find_use_declaration(tree.root_node()).expect("use_declaration present");
+        use_bound_import_paths(use_node, source)
+    }
+
+    #[test]
+    fn use_bound_import_paths_capture_resolved_paths(/* issue #393 */) {
+        // Plain `use crate::a::T;` binds `T` to the full import path.
+        assert_eq!(
+            parse_use_import_paths("use crate::a::T;"),
+            vec![("T".to_owned(), "crate::a::T".to_owned())]
+        );
+        // A bare `use T;` binds `T` to `T`.
+        assert_eq!(
+            parse_use_import_paths("use T;"),
+            vec![("T".to_owned(), "T".to_owned())]
+        );
+        // `use crate::a::T as U;` binds the alias `U` to the aliased PATH, never
+        // the alias text.
+        assert_eq!(
+            parse_use_import_paths("use crate::a::T as U;"),
+            vec![("U".to_owned(), "crate::a::T".to_owned())]
+        );
+        // Grouped `use crate::a::{T};` distributes the group prefix.
+        assert_eq!(
+            parse_use_import_paths("use crate::a::{T};"),
+            vec![("T".to_owned(), "crate::a::T".to_owned())]
+        );
+        // Grouped with nested path + inner alias.
+        assert_eq!(
+            parse_use_import_paths("use crate::a::{B, C::D as E};"),
+            vec![
+                ("B".to_owned(), "crate::a::B".to_owned()),
+                ("E".to_owned(), "crate::a::C::D".to_owned()),
+            ]
+        );
+        // A glob binds no simple name, so it contributes no path — it stays
+        // bounded out of import-aware resolution.
+        assert!(parse_use_import_paths("use crate::a::*;").is_empty());
+        // `super::`/`self::` prefixes are preserved verbatim for the resolver to
+        // normalize against the impl's module scope.
+        assert_eq!(
+            parse_use_import_paths("use super::a::T;"),
+            vec![("T".to_owned(), "super::a::T".to_owned())]
         );
     }
 
