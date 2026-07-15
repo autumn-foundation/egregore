@@ -574,86 +574,137 @@ fn check_edges<'a>(
             }
         }
 
-        // Typed relation target-kind check (present targets only; missing or
-        // tombstoned targets are already reported above). Resolves the target's
-        // LAST-write node kind (issue #391) to match the daemon's
-        // `lookup_node_kind` reverse scan, so an earlier valid kind never masks a
-        // trailing wrong-or-non-node one; a present id whose last record is a
-        // non-node resolves to `None`, matching the daemon's "target not found"
-        // rejection.
-        if let Some(allowed) = allowed_target_kinds(*label)
-            && let Some(&resolved) = index.node_last_kind.get(target.as_str())
-            && !resolved.is_some_and(|kind| allowed.contains(&kind))
-        {
-            let mut diagnostic = ValidationDiagnostic::new(EDGE_TARGET_KIND_VIOLATION);
-            diagnostic.edge_id = Some(edge_id.clone());
-            diagnostic.relation = Some(label.as_str().to_owned());
-            diagnostic.target_id = Some(target.clone());
-            diagnostic.target_kind = resolved.map(NodeKind::as_str);
-            diagnostic.allowed_kinds = Some(allowed.iter().map(|kind| kind.as_str()).collect());
-            index.cite_node(&mut diagnostic, target);
-            diagnostics.insert(diagnostic);
-        }
-
-        // Typed relation source-kind check (present sources only; a missing or
-        // tombstoned source is already reported above). Mirrors the target-kind
-        // check for the source endpoint: log structural edges are directional
-        // (issue #327), so a schema-correct target with a wrong-kind source is
-        // invalid attribution. Resolves the source's LAST-write node kind (issue
-        // #391) via the same last-write accessor, so an earlier valid kind never
-        // masks a trailing wrong-or-non-node one, matching the daemon.
-        if let Some(allowed) = allowed_source_kinds(*label)
-            && let Some(&resolved) = index.node_last_kind.get(source.as_str())
-            && !resolved.is_some_and(|kind| allowed.contains(&kind))
-        {
-            let mut diagnostic = ValidationDiagnostic::new(EDGE_SOURCE_KIND_VIOLATION);
-            diagnostic.edge_id = Some(edge_id.clone());
-            diagnostic.relation = Some(label.as_str().to_owned());
-            diagnostic.endpoint = Some("source");
-            diagnostic.record_id = Some(source.clone());
-            diagnostic.kind = resolved.map(NodeKind::as_str);
-            diagnostic.allowed_kinds = Some(allowed.iter().map(|kind| kind.as_str()).collect());
-            index.cite_node(&mut diagnostic, source);
-            diagnostics.insert(diagnostic);
-        }
-
-        // Reviewer-identity source-kind attribution check (issue #369). The
-        // daemon's `require_project_edge_source_kind` gates REVIEWED_BY on a
-        // `github_review` Review source and REQUESTED_REVIEW_FROM on a
-        // `github_pr` Task source; the offline validator previously checked only
-        // the coarse source node kind, so it green-lit bindings the daemon
-        // rejects. Runs only when the source's LAST-write node kind is already
-        // valid for the relation (issue #391, resolved via the same last-write
-        // accessor as gate (b), so a wrong-kind source is reported once, as
-        // `edge_source_kind_violation`, never doubly), and requires the source
-        // node's importer `source_kind` to equal the relation's required value —
-        // a wrong or absent attribution is a defect.
-        if let Some(required) = required_source_kind(*label)
-            && let Some(&resolved) = index.node_last_kind.get(source.as_str())
-            && allowed_source_kinds(*label)
-                .is_some_and(|allowed| resolved.is_some_and(|kind| allowed.contains(&kind)))
-        {
-            let observed = index
-                .node_source_kinds
-                .get(source.as_str())
-                .copied()
-                .flatten();
-            let satisfied = observed == Some(required);
-            if !satisfied {
-                let mut diagnostic =
-                    ValidationDiagnostic::new(EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION);
-                diagnostic.edge_id = Some(edge_id.clone());
-                diagnostic.relation = Some(label.as_str().to_owned());
-                diagnostic.endpoint = Some("source");
-                diagnostic.record_id = Some(source.clone());
-                diagnostic.source_kind = observed.map(str::to_owned);
-                diagnostic.required_source_kind = Some(required);
-                index.cite_node(&mut diagnostic, source);
-                diagnostics.insert(diagnostic);
-            }
-        }
+        // Typed relation kind gates (a) target, (b) source, and (c)
+        // reviewer-identity source attribution. Each is guarded on ACTUAL NODE
+        // PRESENCE and resolves a present node's kind by LAST-write (issue #391);
+        // see each helper's doc comment. Present targets/sources only — missing or
+        // tombstoned endpoints are already reported by the endpoint-existence loop
+        // above, so a non-node endpoint is reported ONCE as `dangling_edge_endpoint`,
+        // never doubly as a kind violation.
+        check_edge_target_kind(index, edge_id, *label, target, diagnostics);
+        check_edge_source_kind(index, edge_id, *label, source, diagnostics);
+        check_edge_source_kind_attribution(index, edge_id, *label, source, diagnostics);
     }
     (incident, stranded_by_deleted)
+}
+
+/// Gate (a): typed relation target-kind check for a present target node. Guarded
+/// on ACTUAL NODE PRESENCE (`node_kinds`) so a target that resolves to no node
+/// record — its id appears only as a non-node record (an edge's own id, a
+/// tombstone) — is reported ONCE as `dangling_edge_endpoint` by the caller, never
+/// doubly as a kind violation (issue #391). For a present node the kind is
+/// resolved by LAST-write to match the daemon's `lookup_node_kind` reverse scan:
+/// an earlier valid kind never masks a trailing wrong-or-non-node one, and a node
+/// shadowed by a trailing non-node record resolves to `None` — still firing the
+/// gate, matching the daemon's "target not found" rejection.
+fn check_edge_target_kind(
+    index: &GraphIndex<'_>,
+    edge_id: &str,
+    label: EdgeLabel,
+    target: &str,
+    diagnostics: &mut BTreeSet<ValidationDiagnostic>,
+) {
+    let Some(allowed) = allowed_target_kinds(label) else {
+        return;
+    };
+    if !index.node_kinds.contains_key(target) {
+        return;
+    }
+    let resolved = index.node_last_kind.get(target).copied().flatten();
+    if !resolved.is_some_and(|kind| allowed.contains(&kind)) {
+        let mut diagnostic = ValidationDiagnostic::new(EDGE_TARGET_KIND_VIOLATION);
+        diagnostic.edge_id = Some(edge_id.to_owned());
+        diagnostic.relation = Some(label.as_str().to_owned());
+        diagnostic.target_id = Some(target.to_owned());
+        diagnostic.target_kind = resolved.map(NodeKind::as_str);
+        diagnostic.allowed_kinds = Some(allowed.iter().map(|kind| kind.as_str()).collect());
+        index.cite_node(&mut diagnostic, target);
+        diagnostics.insert(diagnostic);
+    }
+}
+
+/// Gate (b): typed relation source-kind check for a present source node. Mirrors
+/// gate (a) for the source endpoint: log structural edges are directional (issue
+/// #327), so a schema-correct target with a wrong-kind source is invalid
+/// attribution. Guarded on ACTUAL NODE PRESENCE (`node_kinds`) so a non-node
+/// source falls through to the single `dangling_edge_endpoint` report (issue
+/// #391); a present node's kind is resolved by LAST-write, so an earlier valid
+/// kind never masks a trailing wrong-or-non-node one and a node shadowed by a
+/// trailing non-node record resolves to `None` — still firing the gate.
+fn check_edge_source_kind(
+    index: &GraphIndex<'_>,
+    edge_id: &str,
+    label: EdgeLabel,
+    source: &str,
+    diagnostics: &mut BTreeSet<ValidationDiagnostic>,
+) {
+    let Some(allowed) = allowed_source_kinds(label) else {
+        return;
+    };
+    if !index.node_kinds.contains_key(source) {
+        return;
+    }
+    let resolved = index.node_last_kind.get(source).copied().flatten();
+    if !resolved.is_some_and(|kind| allowed.contains(&kind)) {
+        let mut diagnostic = ValidationDiagnostic::new(EDGE_SOURCE_KIND_VIOLATION);
+        diagnostic.edge_id = Some(edge_id.to_owned());
+        diagnostic.relation = Some(label.as_str().to_owned());
+        diagnostic.endpoint = Some("source");
+        diagnostic.record_id = Some(source.to_owned());
+        diagnostic.kind = resolved.map(NodeKind::as_str);
+        diagnostic.allowed_kinds = Some(allowed.iter().map(|kind| kind.as_str()).collect());
+        index.cite_node(&mut diagnostic, source);
+        diagnostics.insert(diagnostic);
+    }
+}
+
+/// Gate (c): reviewer-identity source-kind attribution check (issue #369). The
+/// daemon's `require_project_edge_source_kind` gates `REVIEWED_BY` on a
+/// `github_review` Review source and `REQUESTED_REVIEW_FROM` on a `github_pr` Task
+/// source; the offline validator previously checked only the coarse source node
+/// kind, green-lighting bindings the daemon rejects. Guarded on ACTUAL NODE
+/// PRESENCE (`node_kinds`) like gates (a)/(b) (issue #391). Runs only when the
+/// present source's LAST-write node kind is already valid for the relation (issue
+/// #391, resolved via the same last-write accessor as gate (b), so a wrong-kind
+/// source is reported once, as `edge_source_kind_violation`, never doubly), and
+/// requires the source node's importer `source_kind` to equal the relation's
+/// required value — a wrong or absent attribution is a defect.
+fn check_edge_source_kind_attribution(
+    index: &GraphIndex<'_>,
+    edge_id: &str,
+    label: EdgeLabel,
+    source: &str,
+    diagnostics: &mut BTreeSet<ValidationDiagnostic>,
+) {
+    let Some(required) = required_source_kind(label) else {
+        return;
+    };
+    if !index.node_kinds.contains_key(source) {
+        return;
+    }
+    let source_kind_valid = allowed_source_kinds(label).is_some_and(|allowed| {
+        index
+            .node_last_kind
+            .get(source)
+            .copied()
+            .flatten()
+            .is_some_and(|kind| allowed.contains(&kind))
+    });
+    if !source_kind_valid {
+        return;
+    }
+    let observed = index.node_source_kinds.get(source).copied().flatten();
+    if observed != Some(required) {
+        let mut diagnostic = ValidationDiagnostic::new(EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION);
+        diagnostic.edge_id = Some(edge_id.to_owned());
+        diagnostic.relation = Some(label.as_str().to_owned());
+        diagnostic.endpoint = Some("source");
+        diagnostic.record_id = Some(source.to_owned());
+        diagnostic.source_kind = observed.map(str::to_owned);
+        diagnostic.required_source_kind = Some(required);
+        index.cite_node(&mut diagnostic, source);
+        diagnostics.insert(diagnostic);
+    }
 }
 
 /// Reports every tombstone whose deleted record is still referenced by a live
@@ -2769,6 +2820,123 @@ mod tests {
                 && !codes.contains(&EDGE_TARGET_KIND_VIOLATION)
                 && !codes.contains(&EDGE_SOURCE_KIND_ATTRIBUTION_VIOLATION),
             "same-kind history re-emit must stay clean across all kind-gated edges, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn target_present_only_as_non_node_reports_dangling_once_not_kind_violation() {
+        // Issue #391 double-report regression: the MERGED_AS target `n:commit`
+        // exists ONLY as another record's own id (an `References` edge whose
+        // `id()` is `n:commit`), never as a node. The endpoint-existence loop
+        // already reports it `dangling_edge_endpoint`; the target-kind gate must
+        // NOT ALSO fire `edge_target_kind_violation` on the trailing non-node's
+        // shadowed `None` kind. Exactly one defect for this endpoint — matching
+        // the daemon, which rejects a not-found target exactly once. The kind
+        // gate is guarded on ACTUAL NODE PRESENCE (`node_kinds`), not on
+        // `node_last_kind`'s unconditional per-record presence.
+        let records = vec![
+            node_with_source_kind("n:pr", NodeKind::Task, "github_pr"),
+            // `n:commit` appears only as this edge's own id, never as a node.
+            edge("n:commit", EdgeLabel::References, "n:pr", "n:pr"),
+            edge("e:merged", EdgeLabel::MergedAs, "n:pr", "n:commit"),
+        ];
+        let report = validate_records(&records);
+        let about_commit: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                d.target_id.as_deref() == Some("n:commit")
+                    || d.missing_id.as_deref() == Some("n:commit")
+            })
+            .collect();
+        assert_eq!(
+            about_commit.len(),
+            1,
+            "exactly one defect for the non-node target endpoint, got {about_commit:?}"
+        );
+        assert_eq!(about_commit[0].code, DANGLING_EDGE_ENDPOINT);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&EDGE_TARGET_KIND_VIOLATION),
+            "no kind violation on a target that is not a present node, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn source_present_only_as_non_node_reports_dangling_once_not_kind_violation() {
+        // Issue #391 double-report regression, source-kind mirror: the
+        // FRAME_RESOLVES_TO source `n:sig` exists ONLY as another record's own id
+        // (an `References` edge whose `id()` is `n:sig`), never as a node. The
+        // endpoint-existence loop already reports it `dangling_edge_endpoint`; the
+        // source-kind gate must NOT ALSO fire `edge_source_kind_violation` on the
+        // trailing non-node's shadowed `None` kind. Exactly one defect for this
+        // endpoint — matching the daemon's single not-found rejection.
+        let records = vec![
+            node("n:target", NodeKind::Symbol),
+            // `n:sig` appears only as this edge's own id, never as a node.
+            edge("n:sig", EdgeLabel::References, "n:target", "n:target"),
+            edge("e:frt", EdgeLabel::FrameResolvesTo, "n:sig", "n:target"),
+        ];
+        let report = validate_records(&records);
+        let about_sig: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                d.record_id.as_deref() == Some("n:sig") || d.missing_id.as_deref() == Some("n:sig")
+            })
+            .collect();
+        assert_eq!(
+            about_sig.len(),
+            1,
+            "exactly one defect for the non-node source endpoint, got {about_sig:?}"
+        );
+        assert_eq!(about_sig[0].code, DANGLING_EDGE_ENDPOINT);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "no kind violation on a source that is not a present node, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn target_node_then_shadowed_by_non_node_fires_kind_violation_no_dangling() {
+        // Issue #391 last-write shadow case: the MERGED_AS target `n:commit` is a
+        // present Commit node, then re-emitted as a non-node record (an edge whose
+        // own id is `n:commit`). Last-write resolves the kind to `None`, so the
+        // daemon's `lookup_node_kind` returns `None` and rejects (target not
+        // found). Offline `validate` must likewise FIRE the target-kind gate
+        // (`resolved == None` is not an allowed kind) and, because a node record
+        // IS present, must NOT emit `dangling_edge_endpoint` for it. Exactly one
+        // defect for the endpoint, a kind violation citing the shadowed `None`.
+        let records = vec![
+            node_with_source_kind("n:pr", NodeKind::Task, "github_pr"),
+            node("n:commit", NodeKind::Commit),
+            // `n:commit` re-emitted as a non-node record shadows the Commit kind.
+            edge("n:commit", EdgeLabel::References, "n:pr", "n:pr"),
+            edge("e:merged", EdgeLabel::MergedAs, "n:pr", "n:commit"),
+        ];
+        let report = validate_records(&records);
+        let about_commit: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                d.target_id.as_deref() == Some("n:commit")
+                    || d.missing_id.as_deref() == Some("n:commit")
+            })
+            .collect();
+        assert_eq!(
+            about_commit.len(),
+            1,
+            "exactly one defect for the shadowed target endpoint, got {about_commit:?}"
+        );
+        assert_eq!(about_commit[0].code, EDGE_TARGET_KIND_VIOLATION);
+        // The cited kind is the resolved last-write kind: `None` in the shadow
+        // case, matching the daemon's `lookup_node_kind` returning `None`.
+        assert_eq!(about_commit[0].target_kind, None);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&DANGLING_EDGE_ENDPOINT),
+            "a present node must never dangle, got {codes:?}"
         );
     }
 

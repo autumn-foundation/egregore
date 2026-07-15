@@ -11725,6 +11725,39 @@ mod tests {
                 ],
                 expect_reject: false,
             },
+            Case {
+                // Issue #391 last-write shadow: the target `n:commit` is a present
+                // Commit, then re-emitted as a non-node record (an edge whose own
+                // id is `n:commit`) that shadows the kind to `None` under
+                // last-write. The daemon's `lookup_node_kind` returns `None` and
+                // rejects; offline `validate` fires the target-kind gate on the
+                // same resolved `None`. Both reject — and neither double-reports
+                // (the node is present, so no dangling).
+                name: "merged_as_target_node_then_edge_shadow",
+                label: EdgeLabel::MergedAs,
+                source: "n:pr",
+                target: "n:commit",
+                batch: vec![
+                    kinded("n:pr", NodeKind::Task, Some("github_pr")),
+                    kinded("n:commit", NodeKind::Commit, None),
+                    GraphRecord::Edge {
+                        id: "n:commit".to_owned(),
+                        schema_version: crate::ir::SCHEMA_VERSION,
+                        label: EdgeLabel::References,
+                        source: "n:pr".to_owned(),
+                        target: "n:pr".to_owned(),
+                        confidence: None,
+                        resolution: None,
+                        frame_resolution: None,
+                        frame_index: None,
+                        basis: None,
+                        temporal: None,
+                        summary: "shadow".to_owned(),
+                        producer: None,
+                    },
+                ],
+                expect_reject: true,
+            },
         ];
 
         for case in &cases {
