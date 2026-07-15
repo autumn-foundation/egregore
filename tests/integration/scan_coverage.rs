@@ -303,6 +303,66 @@ fn validate_accepts_coverage_node_and_still_catches_defects() {
         .failure();
 }
 
+#[test]
+fn validate_rejects_scan_coverage_contained_by_a_file() {
+    // Issue #135 (PR #400 review): a `ScanCoverage` summary must be contained by
+    // its `Repository`. Reparent the real `Repository —CONTAINS→ ScanCoverage`
+    // edge onto a `File` source: this passes the CONTAINS target-kind check and
+    // keeps the coverage node incident (so it is not an orphan), yet is malformed
+    // attribution the validator must reject with a source-kind defect (exit 1).
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = git_repo_from_fixture(&temp);
+    let graph_path = repo.join("graph.jsonl");
+    assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .args(["scan"])
+        .arg(&repo)
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let jsonl = fs::read_to_string(&graph_path).expect("read graph");
+    let records = parse_jsonl(&jsonl);
+    let coverage_id = coverage_node(&records)["id"].as_str().unwrap().to_owned();
+    // Any indexed source File makes an illegitimate (non-Repository) container.
+    let file_id = records
+        .iter()
+        .find(|r| r["record_type"] == "node" && r["kind"] == "File")
+        .and_then(|r| r["id"].as_str())
+        .expect("a File node in the graph")
+        .to_owned();
+
+    let mut rewritten = String::new();
+    for line in jsonl.lines() {
+        let mut v: Value = serde_json::from_str(line).unwrap();
+        if v["record_type"] == "edge" && v["label"] == "CONTAINS" && v["target"] == coverage_id {
+            v["source"] = Value::from(file_id.clone());
+        }
+        rewritten.push_str(&serde_json::to_string(&v).unwrap());
+        rewritten.push('\n');
+    }
+    let rewritten_path = repo.join("file_contains_coverage.jsonl");
+    fs::write(&rewritten_path, rewritten).expect("write rewritten graph");
+
+    let output = assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .arg("validate")
+        .arg(&rewritten_path)
+        .output()
+        .expect("run validate");
+    assert!(!output.status.success(), "validate must fail (exit 1)");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(
+        stdout.contains("edge_source_kind_violation"),
+        "expected source-kind defect, got: {stdout}"
+    );
+    assert!(
+        stdout.contains(&coverage_id),
+        "defect must name the ScanCoverage target: {stdout}"
+    );
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn inspect_data_dir_surfaces_coverage_block() {
