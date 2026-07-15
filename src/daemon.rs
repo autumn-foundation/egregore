@@ -4272,6 +4272,18 @@ pub fn validate_agent_memory_record_for_cli(
                 "agent-memory node '{id}' has schema_version {schema_version} but only version {AGENT_MEMORY_SCHEMA_VERSION} is accepted"
             );
         }
+        // A Retraction carries its own required-field set and is exempt from the
+        // generic provenance block below (issue #331); validate it against the
+        // shared contract — identical to the daemon HTTP write path — and skip
+        // the generic checks (it never carries evidence links).
+        if *kind == NodeKind::Retraction {
+            let persisted = sink
+                .read_all_records()
+                .map_err(|error| anyhow!(error.to_string()))?;
+            validate_retraction_node(record, records, &persisted)
+                .map_err(|message| anyhow!(message))?;
+            return Ok(());
+        }
         let links = evidence_links.as_deref().unwrap_or(&[]);
         if *kind == NodeKind::Observation && links.is_empty() {
             anyhow::bail!("evidence_links (Observation requires at least one evidence link)");
@@ -6571,7 +6583,139 @@ const AGENT_MEMORY_NODE_KINDS: &[NodeKind] = &[
     NodeKind::Failure,
     NodeKind::Decision,
     NodeKind::CostUsage,
+    // Operator retraction event written by `eg forget` (issue #231). Validated
+    // against its own required-field set and the ingest-time pairing invariant
+    // by `validate_retraction_node` (issue #331).
+    NodeKind::Retraction,
 ];
+
+/// Validates a `Retraction` node against the daemon-specific agent-memory
+/// contract (docs/schema/agent-memory.md §4a). This is the single shared
+/// enforcement point called by BOTH the daemon HTTP write path and the CLI
+/// ingest validator, so the two agree by construction (issue #331).
+///
+/// A `Retraction` carries its OWN required-field set — the redacted reason
+/// (`text`), the `summary`, the operator `agent_id`, `transaction_time`,
+/// `source_handle`, `valid_time`, and the literal
+/// `valid_time_source == "inferred_from_transaction_time"` — and is exempt from
+/// the generic Agent/Observation provenance fields, so callers must branch to
+/// this validator BEFORE their generic required-field block.
+///
+/// Beyond the field set this enforces two ingest-time invariants:
+/// * the deterministic-ID contract — the node `id` must equal
+///   `forget::retraction_event_id(source_handle)`; and
+/// * the pairing invariant — a tombstone deleting the retracted handle must be
+///   present in the same batch or already persisted. The daemon NEVER
+///   synthesizes the tombstone; a lone retraction is rejected.
+///
+/// Returns a stable, machine-readable diagnostic string on any violation;
+/// callers map it to their transport's error type. Non-Node records (a
+/// caller can pass any record) validate vacuously.
+fn validate_retraction_node(
+    record: &GraphRecord,
+    batch: &[GraphRecord],
+    persisted: &[GraphRecord],
+) -> std::result::Result<(), String> {
+    let GraphRecord::Node {
+        id,
+        text,
+        summary,
+        agent_id,
+        transaction_time,
+        source_handle,
+        valid_time,
+        valid_time_source,
+        redaction_policy_version,
+        ..
+    } = record
+    else {
+        return Ok(());
+    };
+
+    if text.as_ref().is_none_or(String::is_empty) {
+        return Err("text (required for Retraction nodes)".to_owned());
+    }
+    if summary.is_empty() {
+        return Err("summary (required for Retraction nodes)".to_owned());
+    }
+    if agent_id.as_ref().is_none_or(String::is_empty) {
+        return Err("agent_id (required for Retraction nodes)".to_owned());
+    }
+
+    let transaction_time = transaction_time
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "transaction_time (required for Retraction nodes)".to_owned())?;
+    if DateTime::parse_from_rfc3339(transaction_time).is_err() {
+        return Err(format!(
+            "transaction_time '{transaction_time}' is not a valid RFC 3339 timestamp"
+        ));
+    }
+
+    let valid_time = valid_time
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "valid_time (required for Retraction nodes)".to_owned())?;
+    if DateTime::parse_from_rfc3339(valid_time).is_err() {
+        return Err(format!(
+            "valid_time '{valid_time}' is not a valid RFC 3339 timestamp"
+        ));
+    }
+
+    if valid_time_source.as_deref() != Some("inferred_from_transaction_time") {
+        return Err("valid_time_source (required for Retraction nodes, must be \
+             'inferred_from_transaction_time')"
+            .to_owned());
+    }
+
+    let handle = source_handle
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "source_handle (required for Retraction nodes)".to_owned())?;
+
+    let expected_id = crate::forget::retraction_event_id(handle);
+    if *id != expected_id {
+        return Err(format!(
+            "Retraction node '{id}' does not match the deterministic ID for its \
+             source_handle '{handle}' (expected '{expected_id}')"
+        ));
+    }
+
+    // `redaction_policy_version` is required only when the recorded reason or
+    // actor carries a redaction marker (docs/schema/agent-memory.md §3).
+    let reason_or_actor_redacted = text.as_deref().is_some_and(crate::redaction::is_redacted)
+        || agent_id
+            .as_deref()
+            .is_some_and(crate::redaction::is_redacted);
+    if reason_or_actor_redacted
+        && redaction_policy_version
+            .as_ref()
+            .is_none_or(String::is_empty)
+    {
+        return Err(
+            "redaction_policy_version (required for Retraction nodes when the reason or actor \
+             is redacted)"
+                .to_owned(),
+        );
+    }
+
+    // Pairing invariant: the tombstone must already exist in this batch or the
+    // store. The daemon prevents a lone retraction at ingest; the operator
+    // command repairs a missing tombstone — validation never synthesizes it.
+    let tombstone_present = batch.iter().chain(persisted.iter()).any(|candidate| {
+        matches!(candidate, GraphRecord::Tombstone { deleted_id, .. } if deleted_id == handle)
+    });
+    if !tombstone_present {
+        let (expected_tombstone, _) = crate::forget::retraction_tombstone_id(handle);
+        return Err(format!(
+            "Retraction node '{id}' has no paired tombstone deleting its source_handle \
+             '{handle}'; a tombstone '{expected_tombstone}' must be present in the same batch \
+             or already persisted"
+        ));
+    }
+
+    Ok(())
+}
 
 // Validates that the source and target IDs of a directly submitted agent-memory edge
 // are in the domains required by the cross-domain registry (docs/schema/agent-memory.md §6).
@@ -6924,6 +7068,18 @@ fn validate_and_synthesize_evidence_edges(
                         return Err(ApiError::bad_request(format!(
                             "agent-memory node '{id}' has schema_version {schema_version} but only version {AGENT_MEMORY_SCHEMA_VERSION} is accepted"
                         )));
+                    }
+                    // A Retraction carries its own required-field set and is
+                    // exempt from the generic provenance block below (issue
+                    // #331); validate it against the shared contract and skip
+                    // the generic checks (it never carries evidence links).
+                    if *kind == NodeKind::Retraction {
+                        let persisted = sink_guard
+                            .read_all_records()
+                            .map_err(|error| ApiError::internal(error.to_string()))?;
+                        validate_retraction_node(record, records, &persisted)
+                            .map_err(ApiError::bad_request)?;
+                        continue;
                     }
                     if *kind == NodeKind::Observation && links.is_empty() {
                         return Err(ApiError::missing_field(
@@ -12851,6 +13007,502 @@ mod tests {
                 .any(|event| event.transition == "exited_saturation"),
             "recovery must emit an exit diagnostic event"
         );
+        Ok(())
+    }
+
+    // ---- Issue #331: daemon-side Retraction ingest validation ----
+
+    /// Builds the exact `[observation, retraction event, tombstone]` records
+    /// `eg forget` produces for a freshly-ingested observation, driving the real
+    /// producer (`crate::forget`) so the fixtures match the embedded write path
+    /// byte-for-byte. Returns the observation, the retraction event node, the
+    /// paired tombstone, the retracted observation ID, and the retraction ID.
+    fn forget_retraction_fixture(
+        reason: &str,
+        tx: &str,
+    ) -> Result<(GraphRecord, GraphRecord, GraphRecord, String, String)> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let obs_id = agent_memory_stable_id(&["node", "observation", "sess-331", "0"]);
+        let mut observation = GraphRecord::node(
+            obs_id.clone(),
+            NodeKind::Observation,
+            None,
+            None,
+            Some("observation".to_owned()),
+            "agent observation".to_owned(),
+        );
+        if let GraphRecord::Node {
+            ref mut schema_version,
+            ref mut text,
+            ref mut agent_id,
+            ref mut session_id,
+            ref mut observed_at,
+            ..
+        } = observation
+        {
+            *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+            *text = Some("the parser silently skips empty input".to_owned());
+            *agent_id = Some("agent-1".to_owned());
+            *session_id = Some("sess-331".to_owned());
+            *observed_at = Some("2026-06-01T00:00:00Z".to_owned());
+        }
+        let mut raw_sink =
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?;
+        let report = ingest_records(std::slice::from_ref(&observation), &mut raw_sink);
+        assert!(report.is_success(), "{report:?}");
+        let current = raw_sink
+            .read_all_records()
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let request = crate::forget::ForgetRequest {
+            handle: obs_id.clone(),
+            reason: reason.to_owned(),
+            retracted_by: "op-1".to_owned(),
+            transaction_time: Some(tx.to_owned()),
+        };
+        let crate::forget::ForgetOutcome::Retracted {
+            event,
+            records: generated,
+        } = crate::forget::retract_from_records(&current, &request)
+            .map_err(|error| anyhow!(format!("{error:?}")))?
+        else {
+            anyhow::bail!("expected Retracted outcome");
+        };
+        let event_node = generated
+            .iter()
+            .find(|record| {
+                matches!(
+                    record,
+                    GraphRecord::Node {
+                        kind: NodeKind::Retraction,
+                        ..
+                    }
+                )
+            })
+            .context("generated retraction event node")?
+            .clone();
+        let tombstone = generated
+            .iter()
+            .find(|record| matches!(record, GraphRecord::Tombstone { .. }))
+            .context("generated retraction tombstone")?
+            .clone();
+        Ok((
+            observation,
+            event_node,
+            tombstone,
+            obs_id,
+            event.retraction_id,
+        ))
+    }
+
+    fn empty_daemon_sink() -> Result<(tempfile::TempDir, Arc<RwLock<EmbeddedAletheiaSink>>)> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let sink = Arc::new(RwLock::new(
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?,
+        ));
+        Ok((temp, sink))
+    }
+
+    fn retraction_write_command(key: &str, records: &[GraphRecord]) -> Result<WriteCommand> {
+        let payload_hash = records_hash(records)?;
+        let (response_tx, _response_rx) = mpsc::channel();
+        Ok(WriteCommand {
+            idempotency_key: key.to_owned(),
+            payload_hash,
+            records: records.to_vec(),
+            response_tx,
+        })
+    }
+
+    fn mutate_event(event: &GraphRecord, apply: impl FnOnce(&mut GraphRecord)) -> GraphRecord {
+        let mut cloned = event.clone();
+        apply(&mut cloned);
+        cloned
+    }
+
+    /// AC4/AC7a: a Retraction paired with its tombstone in the same batch
+    /// validates cleanly through the daemon write path.
+    #[test]
+    fn daemon_accepts_retraction_paired_with_tombstone_in_batch() -> Result<()> {
+        let (_obs, event, tombstone, _obs_id, _rid) =
+            forget_retraction_fixture("leaked customer detail", "2026-07-01T00:00:00Z")?;
+        let (_temp, sink) = empty_daemon_sink()?;
+        let batch = vec![event, tombstone];
+        validate_and_synthesize_evidence_edges(&batch, &sink)
+            .map_err(|error| anyhow!(error.message))?;
+        Ok(())
+    }
+
+    /// AC4: a lone Retraction whose tombstone is already persisted validates.
+    #[test]
+    fn daemon_accepts_retraction_with_persisted_tombstone() -> Result<()> {
+        let (_obs, event, tombstone, _obs_id, _rid) =
+            forget_retraction_fixture("leaked customer detail", "2026-07-01T00:00:00Z")?;
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let mut raw_sink =
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?;
+        let report = ingest_records(std::slice::from_ref(&tombstone), &mut raw_sink);
+        assert!(report.is_success(), "{report:?}");
+        let sink = Arc::new(RwLock::new(raw_sink));
+        validate_and_synthesize_evidence_edges(std::slice::from_ref(&event), &sink)
+            .map_err(|error| anyhow!(error.message))?;
+        Ok(())
+    }
+
+    /// AC4/AC7b: a lone Retraction with no tombstone (batch or store) is rejected
+    /// with a byte-stable diagnostic naming the missing tombstone handle. The
+    /// daemon never synthesizes the tombstone.
+    #[test]
+    fn daemon_rejects_lone_retraction_without_tombstone() -> Result<()> {
+        let (_obs, event, _tombstone, obs_id, _rid) =
+            forget_retraction_fixture("leaked customer detail", "2026-07-01T00:00:00Z")?;
+        let (_temp, sink) = empty_daemon_sink()?;
+        let error = validate_and_synthesize_evidence_edges(std::slice::from_ref(&event), &sink)
+            .expect_err("lone retraction must be rejected");
+        let (expected_tombstone, _) = crate::forget::retraction_tombstone_id(&obs_id);
+        assert!(
+            error.message.contains("no paired tombstone"),
+            "diagnostic must name the missing tombstone: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains(&obs_id),
+            "diagnostic must name the retracted handle: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains(&expected_tombstone),
+            "diagnostic must name the expected tombstone id: {}",
+            error.message
+        );
+        Ok(())
+    }
+
+    /// `AC7a`: a full `eg forget` export (observation, retraction event,
+    /// tombstone)
+    /// replays through the daemon write pipeline with zero validation errors, and
+    /// the retracted record is excluded from transaction-time-current reads while
+    /// the audit trail stays served.
+    #[test]
+    fn daemon_ingest_replays_forget_export_and_excludes_retracted_record() -> Result<()> {
+        let (observation, event, tombstone, obs_id, retraction_id) =
+            forget_retraction_fixture("leaked customer detail", "2026-07-01T00:00:00Z")?;
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let mut raw_sink =
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?;
+        // The retracted observation already lives in the embedded store (the
+        // `eg forget` source store); daemon ingest replays only the export pair.
+        let report = ingest_records(std::slice::from_ref(&observation), &mut raw_sink);
+        assert!(report.is_success(), "{report:?}");
+        let sink = Arc::new(RwLock::new(raw_sink));
+        let idempotency = Arc::new(Mutex::new(IdempotencyStore {
+            path: temp.path().join("idempotency.json"),
+            entries: BTreeMap::new(),
+        }));
+
+        let forget_command = retraction_write_command("forget-331", &[event, tombstone])?;
+        let response = apply_write(&forget_command, &sink, &idempotency)
+            .map_err(|error| anyhow!(error.message))?;
+        assert_eq!(
+            response.failed, 0,
+            "forget export must replay with zero validation errors"
+        );
+
+        let (write_tx, _write_rx) = mpsc::sync_channel(1);
+        let state = ServerState {
+            token: "test-token".to_owned(),
+            store_identity: store_identity_text(temp.path()),
+            sink,
+            write_tx,
+            jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            agents: Arc::new(Mutex::new(BTreeMap::new())),
+            idempotency,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            pressure: Arc::new(PressureTracker::new(1)),
+        };
+
+        let response = handle_get_record(&obs_id, &state);
+        assert_eq!(
+            response.body["result"]["record"],
+            serde_json::Value::Null,
+            "retracted record must be excluded from reads: {}",
+            response.body
+        );
+        let response = handle_get_record(&retraction_id, &state);
+        assert_eq!(
+            response.body["result"]["record"]["id"], retraction_id,
+            "retraction event must stay served: {}",
+            response.body
+        );
+        Ok(())
+    }
+
+    /// AC3: a Retraction carrying none of the generic Agent/Observation
+    /// provenance fields (`agent_kind`, `session_id`, `observed_at`,
+    /// `ingested_at`, `confidence`, `evidence_links`) is accepted — the generic
+    /// required-field block must not apply to it.
+    #[test]
+    fn daemon_accepts_retraction_without_generic_provenance_fields() -> Result<()> {
+        let (_obs, event, tombstone, _obs_id, _rid) =
+            forget_retraction_fixture("leaked customer detail", "2026-07-01T00:00:00Z")?;
+        let GraphRecord::Node {
+            agent_kind,
+            session_id,
+            observed_at,
+            ingested_at,
+            confidence,
+            evidence_links,
+            ..
+        } = &event
+        else {
+            anyhow::bail!("retraction event must be a node");
+        };
+        assert!(
+            agent_kind.is_none()
+                && session_id.is_none()
+                && observed_at.is_none()
+                && ingested_at.is_none()
+                && confidence.is_none()
+                && evidence_links.is_none(),
+            "fixture must omit every generic provenance field"
+        );
+        let (_temp, sink) = empty_daemon_sink()?;
+        validate_and_synthesize_evidence_edges(&[event, tombstone], &sink)
+            .map_err(|error| anyhow!(error.message))?;
+        Ok(())
+    }
+
+    /// AC6: a re-ingest of the same forget export dedups by deterministic ID —
+    /// exactly one retraction event survives, never a duplicate.
+    #[test]
+    fn daemon_reingest_of_forget_export_is_idempotent() -> Result<()> {
+        let (observation, event, tombstone, _obs_id, retraction_id) =
+            forget_retraction_fixture("leaked customer detail", "2026-07-01T00:00:00Z")?;
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let mut raw_sink =
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?;
+        let report = ingest_records(std::slice::from_ref(&observation), &mut raw_sink);
+        assert!(report.is_success(), "{report:?}");
+        let sink = Arc::new(RwLock::new(raw_sink));
+        let idempotency = Arc::new(Mutex::new(IdempotencyStore {
+            path: temp.path().join("idempotency.json"),
+            entries: BTreeMap::new(),
+        }));
+        let pair = [event, tombstone];
+        apply_write(
+            &retraction_write_command("forget-331-a", &pair)?,
+            &sink,
+            &idempotency,
+        )
+        .map_err(|error| anyhow!(error.message))?;
+        // A distinct idempotency key forces re-validation and re-ingest of the
+        // same records; storage dedups by stable ID.
+        apply_write(
+            &retraction_write_command("forget-331-b", &pair)?,
+            &sink,
+            &idempotency,
+        )
+        .map_err(|error| anyhow!(error.message))?;
+        let records = {
+            let guard = sink.read().map_err(|_| anyhow!("sink lock poisoned"))?;
+            guard
+                .read_all_records()
+                .map_err(|error| anyhow!(error.to_string()))?
+        };
+        let event_count = records
+            .iter()
+            .filter(|record| record.id() == retraction_id)
+            .count();
+        assert_eq!(
+            event_count, 1,
+            "re-ingest must not duplicate the retraction event"
+        );
+        Ok(())
+    }
+
+    /// AC6: a Retraction whose ID does not equal
+    /// `forget::retraction_event_id(source_handle)` is rejected.
+    #[test]
+    fn daemon_rejects_retraction_with_forged_id() -> Result<()> {
+        let (_obs, event, tombstone, _obs_id, _rid) =
+            forget_retraction_fixture("leaked customer detail", "2026-07-01T00:00:00Z")?;
+        let forged = mutate_event(&event, |node| {
+            if let GraphRecord::Node { id, .. } = node {
+                *id = "agent_memory:v1:0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+            }
+        });
+        let (_temp, sink) = empty_daemon_sink()?;
+        let error = validate_and_synthesize_evidence_edges(&[forged, tombstone], &sink)
+            .expect_err("forged retraction id must be rejected");
+        assert!(
+            error.message.contains("deterministic ID"),
+            "diagnostic must flag the deterministic-ID mismatch: {}",
+            error.message
+        );
+        Ok(())
+    }
+
+    /// `AC7d`: a Retraction submitted with a non-v1 agent-memory schema version
+    /// is rejected.
+    #[test]
+    fn daemon_rejects_retraction_with_wrong_schema_version() -> Result<()> {
+        let (_obs, event, tombstone, _obs_id, _rid) =
+            forget_retraction_fixture("leaked customer detail", "2026-07-01T00:00:00Z")?;
+        let bumped = mutate_event(&event, |node| {
+            if let GraphRecord::Node { schema_version, .. } = node {
+                *schema_version = AGENT_MEMORY_SCHEMA_VERSION + 1;
+            }
+        });
+        let (_temp, sink) = empty_daemon_sink()?;
+        let error = validate_and_synthesize_evidence_edges(&[bumped, tombstone], &sink)
+            .expect_err("wrong schema version must be rejected");
+        assert!(
+            error.message.contains("schema_version"),
+            "diagnostic must flag the schema version: {}",
+            error.message
+        );
+        Ok(())
+    }
+
+    /// `AC7d`: the allowlist stays precise — a non-Retraction code-graph kind
+    /// under the `agent_memory:v1:` namespace is still rejected.
+    #[test]
+    fn daemon_rejects_non_retraction_kind_under_agent_memory_namespace() -> Result<()> {
+        let node = GraphRecord::node(
+            "agent_memory:v1:deadbeef".to_owned(),
+            NodeKind::Symbol,
+            None,
+            None,
+            Some("sym".to_owned()),
+            "symbol under agent-memory namespace".to_owned(),
+        );
+        let (_temp, sink) = empty_daemon_sink()?;
+        let error = validate_and_synthesize_evidence_edges(std::slice::from_ref(&node), &sink)
+            .expect_err("code-graph kind under agent-memory namespace must be rejected");
+        assert!(
+            error
+                .message
+                .contains("not permitted under the agent_memory:v1: namespace"),
+            "diagnostic must flag the namespace violation: {}",
+            error.message
+        );
+        Ok(())
+    }
+
+    /// AC7c/AC1: every malformed/missing required Retraction field is rejected by
+    /// BOTH the daemon write path and the CLI validator with an IDENTICAL,
+    /// field-naming diagnostic; the well-formed pair is accepted by both.
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    fn daemon_and_cli_retraction_validators_agree() -> Result<()> {
+        let (_obs, event, tombstone, _obs_id, _rid) =
+            forget_retraction_fixture("leaked customer detail", "2026-07-01T00:00:00Z")?;
+
+        // Runs a batch through both validators; asserts either both accept or
+        // both reject with the same message containing `needle`.
+        let expect_reject = |batch: &[GraphRecord], needle: &str| -> Result<()> {
+            let (_wt, write_sink) = empty_daemon_sink()?;
+            let write_error = validate_and_synthesize_evidence_edges(batch, &write_sink)
+                .err()
+                .with_context(|| format!("write path must reject case '{needle}'"))?;
+            assert!(
+                write_error.message.contains(needle),
+                "write path message '{}' must contain '{needle}'",
+                write_error.message
+            );
+
+            let cli_temp = tempfile::tempdir().context("temp dir should be created")?;
+            let cli_sink = EmbeddedAletheiaSink::open(cli_temp.path())
+                .map_err(|error| anyhow!(error.to_string()))?;
+            let cli_error = validate_agent_memory_record_for_cli(&batch[0], batch, &cli_sink)
+                .err()
+                .with_context(|| format!("cli path must reject case '{needle}'"))?;
+            let cli_message = format!("{cli_error}");
+            assert!(
+                cli_message.contains(needle),
+                "cli path message '{cli_message}' must contain '{needle}'"
+            );
+            assert_eq!(
+                write_error.message, cli_message,
+                "AC1: write and cli diagnostics must be identical for case '{needle}'"
+            );
+            Ok(())
+        };
+
+        // Well-formed pair accepted by both.
+        {
+            let batch = [event.clone(), tombstone.clone()];
+            let (_wt, write_sink) = empty_daemon_sink()?;
+            validate_and_synthesize_evidence_edges(&batch, &write_sink)
+                .map_err(|error| anyhow!(error.message))?;
+            let cli_temp = tempfile::tempdir().context("temp dir should be created")?;
+            let cli_sink = EmbeddedAletheiaSink::open(cli_temp.path())
+                .map_err(|error| anyhow!(error.to_string()))?;
+            validate_agent_memory_record_for_cli(&batch[0], &batch, &cli_sink)
+                .context("cli path must accept the well-formed pair")?;
+        }
+
+        let cases: &[(&str, fn(&mut GraphRecord))] = &[
+            ("text", |node| {
+                if let GraphRecord::Node { text, .. } = node {
+                    *text = None;
+                }
+            }),
+            ("summary", |node| {
+                if let GraphRecord::Node { summary, .. } = node {
+                    *summary = String::new();
+                }
+            }),
+            ("agent_id", |node| {
+                if let GraphRecord::Node { agent_id, .. } = node {
+                    *agent_id = Some(String::new());
+                }
+            }),
+            ("transaction_time", |node| {
+                if let GraphRecord::Node {
+                    transaction_time, ..
+                } = node
+                {
+                    *transaction_time = None;
+                }
+            }),
+            ("transaction_time", |node| {
+                if let GraphRecord::Node {
+                    transaction_time, ..
+                } = node
+                {
+                    *transaction_time = Some("not-a-timestamp".to_owned());
+                }
+            }),
+            ("valid_time", |node| {
+                if let GraphRecord::Node { valid_time, .. } = node {
+                    *valid_time = None;
+                }
+            }),
+            ("valid_time", |node| {
+                if let GraphRecord::Node { valid_time, .. } = node {
+                    *valid_time = Some("not-a-timestamp".to_owned());
+                }
+            }),
+            ("valid_time_source", |node| {
+                if let GraphRecord::Node {
+                    valid_time_source, ..
+                } = node
+                {
+                    *valid_time_source = Some("guessed".to_owned());
+                }
+            }),
+            ("source_handle", |node| {
+                if let GraphRecord::Node { source_handle, .. } = node {
+                    *source_handle = None;
+                }
+            }),
+        ];
+
+        for &(needle, apply) in cases {
+            let malformed = mutate_event(&event, apply);
+            let batch = vec![malformed, tombstone.clone()];
+            expect_reject(&batch, needle)?;
+        }
         Ok(())
     }
 }

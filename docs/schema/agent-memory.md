@@ -184,6 +184,25 @@ is never tombstoned, so the act of forgetting stays citable. See
 | `valid_time_source` | `"inferred_from_transaction_time"` | yes | |
 | `redaction_policy_version` | string | when redacted | See §3. |
 
+Daemon ingest constraints (issue #331): the daemon HTTP write path and the CLI
+ingest validator enforce one identical `Retraction` contract. Both accept a
+`Retraction` under the `agent_memory:v1:` namespace against the required-field
+set above (it is exempt from the generic `agent_kind`/`session_id`/`observed_at`/
+`ingested_at` provenance fields and from the Observation-only
+`confidence`/`evidence_links`). Two ingest-time invariants apply beyond the field
+set:
+
+* **Deterministic ID.** The node `id` must equal
+  `["node", "retraction", source_handle]` hashed under `agent_memory:v1:` (the
+  same value `eg forget` mints). A mismatch is rejected.
+* **Tombstone pairing.** A `Retraction` is accepted only when a tombstone whose
+  `deleted_id` equals its `source_handle` is present in the same ingest batch or
+  already persisted in the store. A lone `Retraction` is rejected with a
+  machine-readable diagnostic naming the missing tombstone handle; the daemon
+  never synthesizes the tombstone (prevention at ingest, repair via `eg forget`).
+
+The record shape itself is unchanged.
+
 #### `AgentRun` record shape
 
 | Field | Type | Required | Notes |
