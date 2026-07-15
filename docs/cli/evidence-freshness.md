@@ -144,7 +144,19 @@ duplicate rows are classified once.
   additionally carry an additive `content_signature` — a compact BLAKE3 handle
   over the normalized body — folded into the content-hash trigger, so an inline
   `mod foo { .. }` or `use …;` body change with an unchanged name/path is now
-  reported `drifted`. Residual: an out-of-line `mod foo;` declaration hashes only
+  reported `drifted`. This holds end-to-end through **`scan-history`**: history
+  replay stamps every Module/Import record with the commit's temporal provenance
+  and pushes it into the graph at each commit (the `CHANGED_IN`-edge gate is
+  independent of temporal-history membership), so a module body edit across two
+  commits surfaces as `drifted` from the real extraction pipeline — not only from
+  hand-built fixtures (end-to-end regression:
+  `scan_history_detects_inline_module_body_drift_end_to_end`). A store **upgraded
+  across #206** may hold a legacy version with `content_signature = None` (hashed
+  summary-only) beside a post-upgrade rescan of the same body carrying
+  `Some(sig)`; this one-sided-missing signature is treated as **unknown** and
+  compared summary-only, so a byte-identical body is not reported as a false
+  `drifted`. Both-present and both-absent comparisons are byte-identical to the
+  pre-fix decision. Residual: an out-of-line `mod foo;` declaration hashes only
   `mod foo;`, so a body change in the *target* file surfaces via that file's own
   symbol records (not the `mod` node); and semantic-drift records still skip
   Module/Import (a separate embeddings mechanism). Removal/rename remains
@@ -273,7 +285,12 @@ tombstoned or superseded citation edge is skipped.
   body change. These nodes now carry an additive `content_signature` (a compact
   BLAKE3 handle over the normalized body) that is folded into the content-hash
   trigger, so a change *inside* an inline module or a `use …;` declaration that
-  leaves the name intact is detected as `drifted`. Residual gaps: an out-of-line
+  leaves the name intact is detected as `drifted` — including end-to-end through
+  `scan-history`, whose replay pushes each Module/Import version with temporal
+  provenance. A mixed pre-/post-upgrade store (a legacy `content_signature = None`
+  version vs a post-upgrade `Some(sig)` version of the same body) treats the
+  one-sided-missing signature as unknown and compares summary-only, so no false
+  drift is reported from the schema upgrade alone. Residual gaps: an out-of-line
   `mod foo;` only signs `mod foo;` (the external file's own symbol records carry
   its body), and semantic-drift records still skip these kinds. Removed handles
   remain correctly `unresolved`.

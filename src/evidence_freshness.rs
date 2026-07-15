@@ -1322,7 +1322,6 @@ fn content_change_trigger(
         .and_then(|commit| versions.iter().find(|r| version_commit(r) == Some(commit)))
         .copied()
         .or_else(|| at_or_before(versions, anchor_vt))?;
-    let anchor_hash = content_hash(anchor_version);
 
     let commit_anchored = anchor_commit.is_some() && has_ancestry;
     let mut later: Vec<&GraphRecord> = versions
@@ -1357,7 +1356,7 @@ fn content_change_trigger(
     });
 
     later.into_iter().find_map(|record| {
-        (content_hash(record) != anchor_hash).then(|| {
+        content_differs(anchor_version, record).then(|| {
             // Populate the timestamp from `version_valid`, which falls back to the
             // node-level `valid_time` for current-tree records — otherwise a
             // non-temporal content change would emit an empty `after_valid_time`
@@ -1445,6 +1444,42 @@ fn content_hash(record: &GraphRecord) -> String {
         hasher.update(signature.as_bytes());
     }
     format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+/// The name-only `summary` and optional `content_signature` (issue #206) of a
+/// code-graph node version; `("", None)` for any non-node record.
+fn summary_and_signature(record: &GraphRecord) -> (&str, Option<&str>) {
+    match record {
+        GraphRecord::Node {
+            summary,
+            content_signature,
+            ..
+        } => (summary.as_str(), content_signature.as_deref()),
+        _ => ("", None),
+    }
+}
+
+/// Whether `record`'s content differs from `anchor` for drift purposes, treating
+/// a ONE-SIDED-MISSING `content_signature` as UNKNOWN rather than a change
+/// (issue #206 back-compat / Codex finding B). A store upgraded across #206 holds
+/// a legacy Module/Import version with `content_signature = None` (hashed
+/// summary-only) alongside a post-upgrade rescan of the SAME body carrying
+/// `Some(sig)`; folding the signature into the hash on only one side would flip a
+/// byte-identical body to a false `drifted`. So:
+/// - both versions carry a signature → the full content hash decides (summary +
+///   signature), byte-identical to the pre-fix decision;
+/// - neither carries one → compare the summary only, byte-identical to the
+///   pre-#206 (summary-only) decision;
+/// - exactly one carries one (a pre-/post-upgrade pair) → compare the summary
+///   only, so the field's mere presence never manufactures drift.
+fn content_differs(anchor: &GraphRecord, record: &GraphRecord) -> bool {
+    let (anchor_summary, anchor_sig) = summary_and_signature(anchor);
+    let (record_summary, record_sig) = summary_and_signature(record);
+    if anchor_sig.is_some() && record_sig.is_some() {
+        content_hash(anchor) != content_hash(record)
+    } else {
+        anchor_summary != record_summary
+    }
 }
 
 /// Compares two RFC 3339 instants, returning true when `later` is strictly after

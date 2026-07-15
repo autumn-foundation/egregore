@@ -16,6 +16,7 @@ use aletheia_egregore::{
         AGENT_MEMORY_SCHEMA_VERSION, Graph, SEMANTIC_SCHEMA_VERSION, agent_memory_stable_id,
         semantic_stable_id, stable_id,
     },
+    scan_repository_history,
 };
 use assert_cmd::Command;
 
@@ -4272,4 +4273,305 @@ fn triple_inline_and_materialized_edge_classified_once() {
         count, 1,
         "a triple inline link and its materialized edge are one citation"
     );
+}
+
+// ── End-to-end scan-history Module/Import drift (issue #206 / Codex finding A) ─
+
+/// Initializes a deterministic, isolated Git repo (no remote, GPG signing off,
+/// autocrlf off) so history replay yields byte-stable IDs.
+fn init_git_repo(repo: &std::path::Path) {
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.email", "codegraph@example.invalid"]);
+    run_git(repo, &["config", "user.name", "Codegraph Test"]);
+    run_git(repo, &["config", "core.autocrlf", "false"]);
+    run_git(repo, &["config", "commit.gpgsign", "false"]);
+}
+
+fn write_repo_file(repo: &std::path::Path, relative: &str, contents: &str) {
+    let path = repo.join(relative);
+    fs::create_dir_all(path.parent().expect("relative path should have parent"))
+        .expect("fixture directory should be created");
+    fs::write(path, contents).expect("fixture file should be written");
+}
+
+/// Commits everything staged at a pinned author/committer date and returns the
+/// new HEAD SHA.
+fn commit_repo(repo: &std::path::Path, message: &str, date: &str) -> String {
+    run_git(repo, &["add", "."]);
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "-m", message])
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("git commit should execute");
+    assert!(
+        status.status.success(),
+        "git commit failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    git_stdout(repo, &["rev-parse", "HEAD"])
+}
+
+fn run_git(repo: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("git should execute");
+    assert!(
+        output.status.success(),
+        "git command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_stdout(repo: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("git should execute");
+    assert!(output.status.success(), "git command failed");
+    String::from_utf8(output.stdout)
+        .expect("git output should be utf-8")
+        .trim()
+        .to_owned()
+}
+
+/// Finds the stable record ID of the first node of `kind` whose recorded name is
+/// `name`, from a scanned graph's records.
+fn find_node_id(records: &[GraphRecord], kind: NodeKind, name: &str) -> Option<String> {
+    records.iter().find_map(|record| match record {
+        GraphRecord::Node {
+            id,
+            kind: node_kind,
+            name: Some(node_name),
+            ..
+        } if *node_kind == kind && node_name == name => Some(id.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn scan_history_detects_inline_module_body_drift_end_to_end() {
+    // End-to-end proof (Codex finding A) that #206 content_signature drift
+    // detection is NOT inert in scan-history. The reviewer read
+    // `is_temporal_change_target` as gating temporal-history membership; it only
+    // gates the `CHANGED_IN` edges. Real `scan_repository_history` extraction
+    // pushes Module (and Import) records with temporal provenance at every commit,
+    // so an inline `mod foo { .. }` whose BODY changed between two commits — while
+    // its name/path stayed fixed — must surface as `drifted`, and an UNCHANGED
+    // `use` import must stay `current` (proving the Import record reaches the
+    // freshness comparison rather than being discarded).
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path();
+    init_git_repo(repo);
+
+    write_repo_file(
+        repo,
+        "src/lib.rs",
+        "use std::fmt::Debug;\npub mod foo {\n    pub fn a() -> u32 { 1 }\n}\n",
+    );
+    let first = commit_repo(repo, "initial module and import", "2026-01-01T00:00:00Z");
+
+    // Change only the inline module body; the module NAME/path and the import are
+    // untouched, so the module's stable ID is unchanged while its body signature
+    // flips.
+    write_repo_file(
+        repo,
+        "src/lib.rs",
+        "use std::fmt::Debug;\npub mod foo {\n    pub fn a() -> u32 { 999 }\n}\n",
+    );
+    let _second = commit_repo(repo, "change module body only", "2026-01-02T00:00:00Z");
+
+    let graph = scan_repository_history(repo).expect("history scan should succeed");
+    let module_id =
+        find_node_id(graph.records(), NodeKind::Module, "foo").expect("module foo node present");
+    let import_id = find_node_id(graph.records(), NodeKind::Import, "std::fmt::Debug")
+        .expect("import node present");
+
+    let obs_mod = agent_memory_stable_id(&["obs", "e2e_module_drift"]);
+    let obs_import = agent_memory_stable_id(&["obs", "e2e_import_current"]);
+    let mut records = graph.into_records();
+    records.push(observation(
+        &obs_mod,
+        "foo gates the parser body",
+        "0.9",
+        Some(&module_id),
+        Some("src/lib.rs"),
+        None,
+        "OBSERVES",
+        Some(&first),
+        None,
+    ));
+    records.push(observation(
+        &obs_import,
+        "imports std::fmt::Debug",
+        "0.9",
+        Some(&import_id),
+        Some("src/lib.rs"),
+        None,
+        "OBSERVES",
+        Some(&first),
+        None,
+    ));
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+
+    let module_entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs_mod)
+        .expect("verdict for module observation");
+    assert_eq!(
+        module_entry.verdict,
+        FreshnessVerdict::Drifted,
+        "inline module body drift must be detected end-to-end via scan-history"
+    );
+    assert!(matches!(
+        module_entry.triggering_handle,
+        Some(freshness::TriggeringHandle::ContentChange { .. })
+    ));
+
+    let import_entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs_import)
+        .expect("verdict for import observation");
+    assert_eq!(
+        import_entry.verdict,
+        FreshnessVerdict::Current,
+        "an unchanged import must resolve to a live version — proving the Import \
+         record is pushed into temporal history, not discarded"
+    );
+    assert!(import_entry.triggering_handle.is_none());
+}
+
+// ── One-sided-missing content_signature back-compat (Codex finding B) ─────────
+
+/// Builds a temporal Module/Import version carrying NO `content_signature`,
+/// simulating a legacy record hashed before the #206 field existed.
+#[allow(clippy::too_many_arguments)]
+fn signatureless_version(
+    id: &str,
+    kind: NodeKind,
+    path: &str,
+    name: &str,
+    node_span: SourceSpan,
+    summary: &str,
+    commit: &str,
+    valid_time: &str,
+) -> GraphRecord {
+    GraphRecord::node(
+        id.to_owned(),
+        kind,
+        Some(path.to_owned()),
+        Some(node_span),
+        Some(name.to_owned()),
+        summary.to_owned(),
+    )
+    .with_temporal(temporal(commit, valid_time))
+}
+
+#[test]
+fn one_sided_missing_content_signature_is_not_drift() {
+    // Back-compat regression (Codex finding B): a store upgraded ACROSS #206 holds
+    // a legacy Module/Import version with `content_signature = None` (hashed
+    // summary-only) alongside a post-upgrade rescan of the SAME body carrying
+    // `Some(sig)`. The bodies are byte-identical, so freshness must report
+    // `current`. Before the fix, folding the signature into the hash on only the
+    // upgraded side flipped a byte-identical body to a false `drifted`.
+    let mpath = "src/legacy_mod.rs";
+    let module = stable_id(&["node", "module", "repo-a", mpath, "legacy_mod"]);
+    let ipath = "src/legacy_import.rs";
+    let import = stable_id(&["node", "import", "repo-a", ipath, "BTreeSet"]);
+
+    let obs_mod = agent_memory_stable_id(&["obs", "module_one_sided"]);
+    let obs_import = agent_memory_stable_id(&["obs", "import_one_sided"]);
+    let records = vec![
+        // Legacy anchors: no content_signature (pre-#206 records).
+        signatureless_version(
+            &module,
+            NodeKind::Module,
+            mpath,
+            "legacy_mod",
+            span(1, 20),
+            "Rust module legacy_mod",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        signatureless_version(
+            &import,
+            NodeKind::Import,
+            ipath,
+            "BTreeSet",
+            span(1, 1),
+            "Rust import BTreeSet",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        // Post-upgrade frontiers: Some(sig) over the SAME (unchanged) body.
+        module_version(
+            &module,
+            mpath,
+            "legacy_mod",
+            span(1, 20),
+            "blake3:legacy-mod-body",
+            "commit_b",
+            "2026-03-01T00:00:00Z",
+        ),
+        import_version(
+            &import,
+            ipath,
+            "BTreeSet",
+            span(1, 1),
+            "blake3:legacy-import-body",
+            "commit_b",
+            "2026-03-01T00:00:00Z",
+        ),
+        observation(
+            &obs_mod,
+            "legacy_mod groups the adapters",
+            "0.9",
+            Some(&module),
+            Some(mpath),
+            Some(span(1, 20)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+        observation(
+            &obs_import,
+            "imports BTreeSet",
+            "0.9",
+            Some(&import),
+            Some(ipath),
+            Some(span(1, 1)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    for obs in [&obs_mod, &obs_import] {
+        let entry = verdicts
+            .iter()
+            .find(|e| &e.observation_id == obs)
+            .expect("verdict for one-sided observation");
+        assert_eq!(
+            entry.verdict,
+            FreshnessVerdict::Current,
+            "a one-sided-missing content_signature (upgrade across #206) with an \
+             unchanged body must not be reported as drift"
+        );
+        assert!(entry.triggering_handle.is_none());
+    }
 }

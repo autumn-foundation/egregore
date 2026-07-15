@@ -2452,9 +2452,10 @@ fn _path_for_error(path: &std::path::Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Compact BLAKE3 content signature over the normalized source body (issue
-/// #206). Used to stamp `Module` / `Import` nodes whose display `summary` is
-/// name-only so a body change with an unchanged name stays content-detectable by
+/// Compact BLAKE3 content signature over the normalized source body (issue #206).
+///
+/// Used to stamp `Module` / `Import` nodes whose display `summary` is name-only
+/// so a body change with an unchanged name stays content-detectable by
 /// evidence-freshness drift. Deterministic: [`normalize_code`] is byte-stable,
 /// so CRLF and LF checkouts yield the same handle.
 #[must_use]
