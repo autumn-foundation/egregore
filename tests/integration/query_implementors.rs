@@ -6117,3 +6117,204 @@ fn pin_validation_precedes_all_output() {
         "the anchored candidate's row must not leak: {out}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Auxiliary-target (test / example / bench) HELPER modules are reassigned to
+// the entry crate that `mod`-includes them (issue #394 recall gap; Codex round
+// 2/3, PR #399: "test / example helper modules are stamped their own root").
+//
+// A shared helper like `tests/common/mod.rs` is path-classified into its own
+// synthetic crate root `test:common` by `crate_root_id`, but it actually
+// compiles as a module of the entry crate `tests/it.rs` (`test:it`). Because
+// issue #394 restricts a pending impl's candidate traits to its own crate root,
+// an `impl crate::T for Foo` in the helper could not resolve a trait `T` defined
+// in the entry file — a MISSING IMPLEMENTS edge. The cross-file pass now consults
+// the `mod` inclusion graph and reassigns a SINGLE-includer helper's crate root
+// to the including entry. A helper included by 2+ entry crates stays
+// conservatively unresolved (no-wrong-edge invariant).
+// ---------------------------------------------------------------------------
+
+/// Scans `tree` and returns its graph records plus the IMPLEMENTS edge targets.
+fn scan_records(tree: &std::path::Path) -> (Vec<serde_json::Value>, Vec<String>) {
+    let graph_path = tree.join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(tree)
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+    let graph_text = fs::read_to_string(&graph_path).expect("read graph");
+    let records: Vec<serde_json::Value> = graph_text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    let targets: Vec<String> = records
+        .iter()
+        .filter(|r| r["record_type"] == "edge" && r["label"] == "IMPLEMENTS")
+        .filter_map(|r| r["target"].as_str().map(str::to_owned))
+        .collect();
+    (records, targets)
+}
+
+fn trait_id_in_file(records: &[serde_json::Value], path: &str) -> String {
+    records
+        .iter()
+        .find(|r| {
+            r["record_type"] == "node"
+                && r["symbol_kind"] == "trait"
+                && r["name"] == "T"
+                && r["repo_relative_path"] == path
+        })
+        .and_then(|r| r["id"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("trait T node in {path} present"))
+}
+
+#[test]
+fn real_scan_test_helper_module_resolves_to_entry_crate_trait() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let tests = temp.path().join("tests");
+    fs::create_dir_all(tests.join("common")).expect("mkdir tests/common");
+    // Entry integration-test crate root defines `trait T` and `mod common;`.
+    fs::write(
+        tests.join("it.rs"),
+        concat!("pub trait T { fn go(&self); }\n", "mod common;\n"),
+    )
+    .expect("write tests/it.rs");
+    // The shared helper module (path-classified `test:common`) implements the
+    // entry crate's `crate::T` for its own `Foo`.
+    fs::write(
+        tests.join("common").join("mod.rs"),
+        concat!(
+            "pub struct Foo;\n",
+            "impl crate::T for Foo { fn go(&self) {} }\n",
+        ),
+    )
+    .expect("write tests/common/mod.rs");
+
+    let (records, targets) = scan_records(temp.path());
+    let it_t = trait_id_in_file(&records, "tests/it.rs");
+    assert!(
+        targets.contains(&it_t),
+        "the `tests/common/mod.rs` helper impl must edge-back to the `tests/it.rs` `T`: {records:?}"
+    );
+
+    // The `implementors` query lists `Foo` under the entry crate's `T`.
+    let stdout = egregore()
+        .args(["query", "implementors", "T", "--graph"])
+        .arg(temp.path().join("graph.jsonl"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let implementors: Vec<String> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON"))
+        .filter(|r| r["trait_record_id"] == it_t)
+        .filter_map(|r| r["implementing_type"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        implementors.iter().any(|t| t.ends_with("Foo")),
+        "entry crate `T` must list the helper's `Foo` implementor: {implementors:?}"
+    );
+}
+
+#[test]
+fn real_scan_example_helper_module_resolves_to_entry_crate_trait() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let examples = temp.path().join("examples");
+    fs::create_dir_all(examples.join("common")).expect("mkdir examples/common");
+    // Entry example crate root defines `trait T`, `mod common;`, and `main`.
+    fs::write(
+        examples.join("demo.rs"),
+        concat!(
+            "pub trait T { fn go(&self); }\n",
+            "mod common;\n",
+            "fn main() {}\n",
+        ),
+    )
+    .expect("write examples/demo.rs");
+    fs::write(
+        examples.join("common").join("mod.rs"),
+        concat!(
+            "pub struct Foo;\n",
+            "impl crate::T for Foo { fn go(&self) {} }\n",
+        ),
+    )
+    .expect("write examples/common/mod.rs");
+
+    let (records, targets) = scan_records(temp.path());
+    let demo_t = trait_id_in_file(&records, "examples/demo.rs");
+    assert!(
+        targets.contains(&demo_t),
+        "the `examples/common/mod.rs` helper impl must edge-back to the `examples/demo.rs` `T`: {records:?}"
+    );
+}
+
+#[test]
+fn real_scan_bench_helper_module_resolves_to_entry_crate_trait() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let benches = temp.path().join("benches");
+    fs::create_dir_all(benches.join("common")).expect("mkdir benches/common");
+    fs::write(
+        benches.join("perf.rs"),
+        concat!(
+            "pub trait T { fn go(&self); }\n",
+            "mod common;\n",
+            "fn main() {}\n",
+        ),
+    )
+    .expect("write benches/perf.rs");
+    fs::write(
+        benches.join("common").join("mod.rs"),
+        concat!(
+            "pub struct Foo;\n",
+            "impl crate::T for Foo { fn go(&self) {} }\n",
+        ),
+    )
+    .expect("write benches/common/mod.rs");
+
+    let (records, targets) = scan_records(temp.path());
+    let perf_t = trait_id_in_file(&records, "benches/perf.rs");
+    assert!(
+        targets.contains(&perf_t),
+        "the `benches/common/mod.rs` helper impl must edge-back to the `benches/perf.rs` `T`: {records:?}"
+    );
+}
+
+#[test]
+fn real_scan_shared_test_helper_module_stays_conservatively_unresolved() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let tests = temp.path().join("tests");
+    fs::create_dir_all(tests.join("common")).expect("mkdir tests/common");
+    // TWO entry test crates each `mod common;` and each define their own root
+    // `trait T`. The shared helper is reachable from 2+ distinct entry crates.
+    fs::write(
+        tests.join("a.rs"),
+        concat!("pub trait T { fn go(&self); }\n", "mod common;\n"),
+    )
+    .expect("write tests/a.rs");
+    fs::write(
+        tests.join("b.rs"),
+        concat!("pub trait T { fn go(&self); }\n", "mod common;\n"),
+    )
+    .expect("write tests/b.rs");
+    fs::write(
+        tests.join("common").join("mod.rs"),
+        concat!(
+            "pub struct Foo;\n",
+            "impl crate::T for Foo { fn go(&self) {} }\n",
+        ),
+    )
+    .expect("write tests/common/mod.rs");
+
+    let (records, targets) = scan_records(temp.path());
+    // The helper belongs to neither crate unambiguously (2 includers), so the
+    // conservative bound mints NO edge — a missing edge, never a wrong one.
+    assert!(
+        targets.is_empty(),
+        "a helper shared by 2+ entry crates must stay unresolved: {records:?}"
+    );
+}

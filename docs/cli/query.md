@@ -1286,7 +1286,32 @@ cross-pool. One documented residual bound: a package carrying **both** `src/lib.
 and `src/main.rs`, each defining a same-named **root** trait, still pools those two
 in the shared primary root (a single file's path cannot distinguish the library
 crate from the default binary crate); the common auxiliary-target case is fully
-partitioned. The query surfaces these bounds instead of hiding them:
+partitioned.
+
+**Test / example / bench HELPER modules are assigned to the entry crate that
+`mod`-includes them.** Path classification alone would stamp a shared helper like
+`tests/common/mod.rs` into its own synthetic crate root `test:common`, even though
+it actually compiles as a module of the entry crate `tests/it.rs` (`test:it`) that
+declares `mod common;`. Because a pending impl's candidates are restricted to its
+own crate root, an `impl crate::T for Foo` in that helper would otherwise miss a
+trait `T` defined in the entry file. The cross-file pass therefore consults the
+`mod` inclusion graph: each entry crate root (`tests/<name>.rs`,
+`examples/<name>.rs`, `benches/<name>.rs`, and their `<name>/main.rs` directory
+forms) is walked down its transitive plain `mod <name>;` declarations, and a
+helper reachable from **exactly one** entry crate is reassigned to that entry's
+crate root — so the helper's impls resolve against the entry's traits.
+Conservatively, a helper reachable from **two or more** distinct entry crates (a
+genuinely shared `mod common;` included by several test binaries), or a file cargo
+also compiles as its **own** aux target (`tests/common.rs`), keeps its path-based
+crate root and stays **unresolved** — a missing edge, never a wrong one. Only
+test/example/bench helper files are subject to this reassignment; `lib`/`bin`/
+`build` assignment is unchanged. Residual bound: only the crate-root partition key
+is remapped (not a helper symbol's qualified name), so a deeply nested helper
+defining a root-level symbol that collides by simple name with the entry crate's
+own root symbol can become same-name-ambiguous and stay conservatively
+unresolved.
+
+The query surfaces these bounds instead of hiding them:
 
 - Every implementor row and every zero-implementors signal carries
   `completeness: "local_traits_only"`.

@@ -497,6 +497,188 @@ pub fn crate_root_id(repo_relative_path: &str) -> String {
     }
 }
 
+/// The auxiliary-target ENTRY crate root a repo-relative path denotes when the
+/// file is one cargo compiles as its OWN crate: a top-level integration test
+/// (`tests/<name>.rs` or the directory form `tests/<name>/main.rs`), example
+/// (`examples/<name>.rs` / `examples/<name>/main.rs`), or benchmark
+/// (`benches/<name>.rs` / `benches/<name>/main.rs`). Returns `None` for any
+/// other file, including a nested helper module such as `tests/common/mod.rs`.
+///
+/// A crate-root file owns its CONTAINING directory for `mod` resolution (unlike
+/// an ordinary `foo.rs` module file, which owns the sibling `foo/` directory),
+/// which is why these files anchor the [`reassign_aux_helper_crate_roots`]
+/// inclusion walk.
+fn aux_entry_crate_root(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.split('/').collect();
+    let is_rs = |name: &str| {
+        std::path::Path::new(name)
+            .extension()
+            .is_some_and(|e| e == "rs")
+    };
+    let kind = match segments.first().copied() {
+        Some("tests") => "test",
+        Some("examples") => "example",
+        Some("benches") => "bench",
+        _ => return None,
+    };
+    match segments.as_slice() {
+        [_, file] if is_rs(file) => Some(format!("{kind}:{}", file.trim_end_matches(".rs"))),
+        [_, name, "main.rs"] => Some(format!("{kind}:{name}")),
+        _ => None,
+    }
+}
+
+/// Resolves a plain top-level `mod <name>;` declaration in `declaring_file` to a
+/// scanned repo-relative file, using entry-crate-root-aware base selection: an
+/// aux ENTRY crate root (`is_entry_root`) owns its CONTAINING directory, while a
+/// nested helper module file (`foo.rs`) owns the sibling `foo/` directory (a
+/// `mod.rs` / `main.rs` file already resolves to its containing directory via
+/// [`module_dir_segments`], so the flag only matters for a single-file entry
+/// like `tests/it.rs`).
+///
+/// Conservative by construction (preserving the no-wrong-edge invariant): only a
+/// plain top-level declaration participates. A `#[path]` override, a declaration
+/// nested in an inline module, or an enclosing `#[path]` rebase yields `None` —
+/// the helper keeps its path-based crate root (a MISSING edge, never a wrong
+/// one).
+fn resolve_aux_helper_mod(
+    declaring_file: &str,
+    is_entry_root: bool,
+    fact: &OutOfLineModFact,
+    known_paths: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    if fact.under_inline_path_override
+        || fact.path_override.is_some()
+        || !fact.inline_module_path.is_empty()
+    {
+        return None;
+    }
+    let base = if is_entry_root {
+        parent_dir_segments(declaring_file)
+    } else {
+        module_dir_segments(declaring_file)
+    };
+    let file_candidate = join_segments(&base, &format!("{}.rs", fact.name))?;
+    if known_paths.contains(&file_candidate) {
+        return Some(file_candidate);
+    }
+    let dir_candidate = join_segments(&base, &format!("{}/mod.rs", fact.name))?;
+    known_paths
+        .contains(&dir_candidate)
+        .then_some(dir_candidate)
+}
+
+/// Computes a crate-root REASSIGNMENT map for auxiliary-target (test / example /
+/// bench) HELPER module files, closing the recall gap where a shared helper like
+/// `tests/common/mod.rs` — path-classified into its OWN synthetic crate root
+/// `test:common` by [`crate_root_id`] — actually belongs to the entry crate that
+/// `mod`-includes it (`test:it` for `tests/it.rs`). Issue #394 restricts a
+/// pending impl's candidate traits to its own crate root, so without this remap
+/// an `impl crate::T for Foo` in the helper cannot resolve a trait `T` defined in
+/// the entry file — a MISSING `IMPLEMENTS` edge (Codex round-2/3, PR #399: "test
+/// / example helper modules are stamped their own root").
+///
+/// Path alone cannot decide the owning crate; the `mod` inclusion graph must be
+/// consulted. Each aux ENTRY crate root ([`aux_entry_crate_root`]) seeds a walk
+/// down its transitive plain `mod <name>;` declarations (nested helpers
+/// included). A helper reachable from EXACTLY ONE entry crate is remapped to that
+/// entry's crate root; a helper reachable from ZERO or from 2+ distinct entry
+/// crates keeps its path-based crate root (conservative — a shared or standalone
+/// helper stays unresolved rather than binding one interpretation, preserving the
+/// no-wrong-edge invariant). A helper that is ITSELF an aux entry crate root
+/// (`tests/common.rs`, which cargo also compiles as its own test target) counts
+/// as belonging to its own crate and is never remapped.
+///
+/// Only test/example/bench helper files are reassigned; `lib`/`bin`/`build`
+/// assignment is untouched. The returned map is helper repo-relative path ->
+/// reassigned crate root, applied by [`cross_file_implements_records`] as an
+/// in-pass fact remap — no serialized fact shape changes, so
+/// `CACHE_SCHEMA_VERSION` is unaffected.
+///
+/// Documented residual bound: only the `crate_root` partition key is remapped,
+/// not a helper symbol's crate-root-relative `qualified_name`. A DEEPLY nested
+/// helper that defines a root-level symbol colliding by simple name with the
+/// entry crate's own root symbol can therefore become same-name-ambiguous and
+/// stay unresolved (a conservative MISSING edge), never a wrong edge. The
+/// direct, canonical single-`mod` helper case (the reported gap) resolves.
+fn reassign_aux_helper_crate_roots(
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> BTreeMap<String, String> {
+    let known_paths: std::collections::BTreeSet<String> = facts_by_file.keys().cloned().collect();
+    // helper repo-relative path -> the distinct entry crate roots that
+    // transitively include it via plain `mod` declarations.
+    let mut reached: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+    for entry_path in facts_by_file.keys() {
+        let Some(entry_root) = aux_entry_crate_root(entry_path) else {
+            continue;
+        };
+        // Walk this entry's mod-inclusion subtree. The seed is the crate root
+        // (owns its containing directory); every reached helper is an ordinary
+        // module file. `visited` is per-entry, so cycles terminate.
+        let mut visited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        visited.insert(entry_path.clone());
+        let mut stack: Vec<(String, bool)> = vec![(entry_path.clone(), true)];
+        while let Some((file, is_entry)) = stack.pop() {
+            let Some(facts) = facts_by_file.get(&file) else {
+                continue;
+            };
+            for m in &facts.out_of_line_mods {
+                let Some(child) = resolve_aux_helper_mod(&file, is_entry, m, &known_paths) else {
+                    continue;
+                };
+                reached
+                    .entry(child.clone())
+                    .or_default()
+                    .insert(entry_root.clone());
+                if visited.insert(child.clone()) {
+                    stack.push((child, false));
+                }
+            }
+        }
+    }
+    let mut remap: BTreeMap<String, String> = BTreeMap::new();
+    for (helper, roots) in reached {
+        // Conservative multi/zero-includer bound: only a single-includer helper
+        // is remapped.
+        if roots.len() != 1 {
+            continue;
+        }
+        // A file cargo compiles as its OWN aux target belongs to its own crate;
+        // never steal it into the including entry (it lives in 2+ crates).
+        if aux_entry_crate_root(&helper).is_some() {
+            continue;
+        }
+        let new_root = roots.into_iter().next().expect("exactly one includer");
+        if crate_root_id(&helper) != new_root {
+            remap.insert(helper, new_root);
+        }
+    }
+    remap
+}
+
+/// Applies a [`reassign_aux_helper_crate_roots`] remap to a CLONE of the facts,
+/// rewriting the `crate_root` on every `ImplTargetFact` and `PendingImplFact` of
+/// each remapped helper file. Only the `crate_root` partition key changes;
+/// qualified names, module paths, and imports are untouched, so this is a pure
+/// re-partition, deterministic and byte-identical across runs.
+fn apply_crate_root_remap(
+    facts_by_file: &BTreeMap<String, FileFacts>,
+    remap: &BTreeMap<String, String>,
+) -> BTreeMap<String, FileFacts> {
+    let mut out = facts_by_file.clone();
+    for (path, new_root) in remap {
+        if let Some(facts) = out.get_mut(path) {
+            for target in &mut facts.impl_targets {
+                target.crate_root.clone_from(new_root);
+            }
+            for pending in &mut facts.pending_impls {
+                pending.crate_root.clone_from(new_root);
+            }
+        }
+    }
+    out
+}
+
 /// The directory whose files are the declaring file's child modules:
 /// `src/lib.rs` / `src/main.rs` / `x/mod.rs` own their containing directory;
 /// `src/foo.rs` owns `src/foo/`.
@@ -679,6 +861,20 @@ pub fn cross_file_implements_records(
     _repository_id: &str,
     facts_by_file: &BTreeMap<String, FileFacts>,
 ) -> Vec<GraphRecord> {
+    // Reassign auxiliary-target helper modules (`tests/common/mod.rs`) to the
+    // entry crate that `mod`-includes them (issue #394 recall gap; Codex round
+    // 2/3, PR #399). Path-based [`crate_root_id`] cannot see the `mod` inclusion
+    // graph, so this in-pass remap runs before the crate-root-partitioned index
+    // is built. When nothing needs remapping the borrowed facts are used
+    // directly, keeping output byte-identical.
+    let remap = reassign_aux_helper_crate_roots(facts_by_file);
+    let remapped;
+    let facts_by_file: &BTreeMap<String, FileFacts> = if remap.is_empty() {
+        facts_by_file
+    } else {
+        remapped = apply_crate_root_remap(facts_by_file, &remap);
+        &remapped
+    };
     let index = ImplTargetIndex::build(facts_by_file);
     // (source impl ID, trait target ID) -> summary, deduplicating so a source
     // never mints two edges to one target.
@@ -1921,6 +2117,154 @@ mod tests {
         assert_eq!(crate_root_id("tests/it.rs"), "test:it");
         assert_eq!(crate_root_id("benches/perf.rs"), "bench:perf");
         assert_eq!(crate_root_id("build.rs"), "build");
+    }
+
+    // --- aux-target helper-module crate-root reassignment (issue #394; Codex
+    // round 2/3, PR #399) ----------------------------------------------------
+
+    #[test]
+    fn aux_entry_crate_root_identifies_only_own_crate_entry_files() {
+        // Single-file and directory-form aux ENTRY crate roots.
+        assert_eq!(
+            aux_entry_crate_root("tests/it.rs").as_deref(),
+            Some("test:it")
+        );
+        assert_eq!(
+            aux_entry_crate_root("tests/it/main.rs").as_deref(),
+            Some("test:it")
+        );
+        assert_eq!(
+            aux_entry_crate_root("examples/demo.rs").as_deref(),
+            Some("example:demo")
+        );
+        assert_eq!(
+            aux_entry_crate_root("benches/perf.rs").as_deref(),
+            Some("bench:perf")
+        );
+        // A nested helper module is NOT an entry crate root.
+        assert_eq!(aux_entry_crate_root("tests/common/mod.rs"), None);
+        assert_eq!(aux_entry_crate_root("tests/it/helper.rs"), None);
+        // Non-aux paths are never entry roots.
+        assert_eq!(aux_entry_crate_root("src/lib.rs"), None);
+        assert_eq!(aux_entry_crate_root("src/bin/tool.rs"), None);
+    }
+
+    /// Builds one file's facts with an out-of-line `mod <name>;` declaration.
+    fn mod_only_facts(names: &[&str]) -> FileFacts {
+        FileFacts {
+            out_of_line_mods: names
+                .iter()
+                .map(|name| OutOfLineModFact {
+                    name: (*name).to_owned(),
+                    inline_module_path: Vec::new(),
+                    test_gated: false,
+                    path_override: None,
+                    under_inline_path_override: false,
+                })
+                .collect(),
+            ..FileFacts::default()
+        }
+    }
+
+    #[test]
+    fn single_includer_test_helper_is_reassigned_to_entry_crate_root() {
+        // `tests/it.rs` (crate root `test:it`) includes `mod common;`, resolving
+        // to `tests/common/mod.rs` (a crate root owns its CONTAINING directory).
+        let facts: BTreeMap<String, FileFacts> = [
+            ("tests/it.rs".to_owned(), mod_only_facts(&["common"])),
+            (
+                "tests/common/mod.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in(
+                        "helper-Foo",
+                        "Foo",
+                        &[],
+                        "struct",
+                        "test:common",
+                    )],
+                    pending_impls: vec![pending_impl_in(
+                        "impl-helper-Foo",
+                        "crate::T",
+                        &[],
+                        "test:common",
+                    )],
+                    ..FileFacts::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let remap = reassign_aux_helper_crate_roots(&facts);
+        assert_eq!(
+            remap.get("tests/common/mod.rs").map(String::as_str),
+            Some("test:it"),
+            "a single-includer helper is reassigned to the including entry crate"
+        );
+        // The remap rewrites crate_root on both fact kinds.
+        let remapped = apply_crate_root_remap(&facts, &remap);
+        let helper = &remapped["tests/common/mod.rs"];
+        assert_eq!(helper.impl_targets[0].crate_root, "test:it");
+        assert_eq!(helper.pending_impls[0].crate_root, "test:it");
+    }
+
+    #[test]
+    fn helper_included_by_two_entry_crates_is_not_reassigned() {
+        // Both `tests/a.rs` and `tests/b.rs` include the same helper; it belongs
+        // to neither unambiguously, so it keeps its path-based crate root.
+        let facts: BTreeMap<String, FileFacts> = [
+            ("tests/a.rs".to_owned(), mod_only_facts(&["common"])),
+            ("tests/b.rs".to_owned(), mod_only_facts(&["common"])),
+            (
+                "tests/common/mod.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in(
+                        "helper-Foo",
+                        "Foo",
+                        &[],
+                        "struct",
+                        "test:common",
+                    )],
+                    ..FileFacts::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let remap = reassign_aux_helper_crate_roots(&facts);
+        assert!(
+            remap.is_empty(),
+            "a helper shared by 2+ entry crates is left unresolved: {remap:?}"
+        );
+    }
+
+    #[test]
+    fn helper_that_is_its_own_aux_target_is_not_reassigned() {
+        // `tests/common.rs` is included by `tests/it.rs` but cargo ALSO compiles
+        // it as its own test target `test:common`, so it belongs to 2+ crates
+        // and is never stolen into the including entry.
+        let facts: BTreeMap<String, FileFacts> = [
+            ("tests/it.rs".to_owned(), mod_only_facts(&["common"])),
+            (
+                "tests/common.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in(
+                        "helper-Foo",
+                        "Foo",
+                        &[],
+                        "struct",
+                        "test:common",
+                    )],
+                    ..FileFacts::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let remap = reassign_aux_helper_crate_roots(&facts);
+        assert!(
+            remap.is_empty(),
+            "a file cargo compiles as its own aux target is not reassigned: {remap:?}"
+        );
     }
 
     #[test]
