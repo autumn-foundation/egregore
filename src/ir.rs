@@ -1061,6 +1061,15 @@ pub enum GraphRecord {
         /// `docs/schema/schema-versioning.md §2`; never an identity input.
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        // ── Body content signature (issue #206) ───────────────────────────────
+        /// Compact BLAKE3 handle over the normalized source body of nodes whose
+        /// display `summary` is name-only, so a body change with an unchanged
+        /// name/path is still content-detectable by evidence-freshness drift
+        /// (issue #206). Present on Rust `Module` and `Import` nodes; absent on
+        /// every other kind, whose `summary` already embeds the body. Additive
+        /// per `docs/schema/schema-versioning.md §2`; never an identity input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_signature: Option<String>,
         /// Git and bitemporal provenance for history-backed records.
         #[serde(skip_serializing_if = "Option::is_none")]
         temporal: Option<TemporalMetadata>,
@@ -1579,6 +1588,7 @@ impl GraphRecord {
             doc: None,
             call_context: None,
             note: None,
+            content_signature: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1703,6 +1713,7 @@ impl GraphRecord {
             doc: None,
             call_context: None,
             note: None,
+            content_signature: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1826,6 +1837,7 @@ impl GraphRecord {
             doc: None,
             call_context: None,
             note: None,
+            content_signature: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1954,6 +1966,7 @@ impl GraphRecord {
             doc: None,
             call_context: None,
             note: None,
+            content_signature: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -2304,6 +2317,37 @@ impl GraphRecord {
     pub fn note(&self) -> Option<&str> {
         match self {
             Self::Node { note, .. } => note.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Stamps the compact body content signature on a node record (issue #206).
+    /// Used for `Module` nodes whose display `summary` is name-only and whose
+    /// stable ID is keyed on the qualified name only, so an unchanged-name body
+    /// edit keeps the ID and is still content-detectable by evidence-freshness
+    /// drift. (`Import` nodes do NOT use this — their stable ID already encodes
+    /// the full `use ...;` declaration, so a body change mints a new ID and
+    /// surfaces as a handle-identity change, never a content drift.) The value
+    /// is additive metadata per `docs/schema/schema-versioning.md §2` and MUST
+    /// NOT contribute to stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub fn with_content_signature(mut self, signature: impl Into<String>) -> Self {
+        if let Self::Node {
+            content_signature, ..
+        } = &mut self
+        {
+            *content_signature = Some(signature.into());
+        }
+        self
+    }
+
+    /// Returns the body content signature when present (issue #206).
+    #[must_use]
+    pub fn content_signature(&self) -> Option<&str> {
+        match self {
+            Self::Node {
+                content_signature, ..
+            } => content_signature.as_deref(),
             Self::Edge { .. } | Self::Tombstone { .. } => None,
         }
     }
