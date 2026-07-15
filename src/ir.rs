@@ -1517,6 +1517,42 @@ impl GraphRecord {
             .map(Self::source_kind_ref)
     }
 
+    /// Returns this record's resolved node kind: a node's [`NodeKind`], or `None`
+    /// for every non-node record (an `Edge` or `Tombstone`).
+    ///
+    /// This is the single classification arm shared by the daemon's in-batch
+    /// node-kind resolution (`lookup_node_kind`, `src/daemon.rs`) and the offline
+    /// `eg validate` kind gates (issue #391), so the two can never drift on how
+    /// one record's kind is read: a non-node record sharing an id resolves to
+    /// `None` and thus shadows an earlier node.
+    #[must_use]
+    pub const fn node_kind_ref(&self) -> Option<NodeKind> {
+        match self {
+            Self::Node { kind, .. } => Some(*kind),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Resolves a record ID's node kind within one record batch by last-write-wins
+    /// over forward order — equivalently, the first match in reverse order — the
+    /// EXACT semantics of the daemon's in-batch `lookup_node_kind` reverse scan
+    /// (`src/daemon.rs`).
+    ///
+    /// The outer `Option` distinguishes "a record with this id exists in the
+    /// batch" (`Some`) from "no record with this id" (`None`, which the daemon
+    /// resolves through its store `read_back` fallback). The inner `Option` is the
+    /// matched record's [`node_kind_ref`](Self::node_kind_ref): a trailing non-node
+    /// record sharing the id resolves to `Some(None)` and thus SHADOWS an earlier
+    /// node kind — matching the daemon exactly (issue #391).
+    #[must_use]
+    pub fn resolve_node_kind_in_batch(id: &str, records: &[Self]) -> Option<Option<NodeKind>> {
+        records
+            .iter()
+            .rev()
+            .find(|record| record.id() == id)
+            .map(Self::node_kind_ref)
+    }
+
     /// Creates a graph node record.
     #[must_use]
     #[allow(clippy::too_many_lines)]
