@@ -1186,10 +1186,11 @@ surfaces `Foo` as an implementor of `Trait`. The remaining honest bounds:
 **cross-crate** traits (std/deps), **non-Rust** languages, blanket impls, and a
 `use`-alias of a trait in a **non-root** module that the scope walk cannot see
 stay unresolved. A bare (unqualified) name whose **simple name is
-ambiguous** across the same-file or repo impl-target definitions is left
-unresolved too: it may be a `use`-alias of a non-root definition, and neither
-resolution path reads `use` declarations, so neither guesses a root binding — a
-missing edge is preferred over a wrong-target one. This same-name ambiguity
+ambiguous** across the same-file or repo impl-target definitions and that carries
+**no** captured `use` import naming it (see import-aware resolution below, issue
+#393) is left unresolved: it may be a `use`-alias of a non-root definition, so
+rather than guess a root binding a missing edge is preferred over a wrong-target
+one. This same-name ambiguity
 bound applies on **both** resolution paths, sharing one counting predicate so
 they cannot diverge: the **local/inline-module** per-file resolver (a bare name
 that a same-file scope walk resolves only by reaching **outward** to a
@@ -1211,50 +1212,53 @@ once resolved is now left unresolved — a rare potential wrong-edge converted i
 a rare missed-edge, the honest-bound direction consistent with
 `local_traits_only`.
 
-**Import-shadow veto (the general bare-name bound).** The same-name ambiguity
+**Import-aware bare-name resolution (issue #393).** The same-name ambiguity
 rule above only sees definitions the impl-target index *already knows*. An
 external or std trait brought in by a `use` — `use std::fmt::Display;` — is not
 in that index, so an ambiguity count of one would let the scope walk mis-bind a
-bare `impl Display for Foo` to a same-named **local** `trait Display`. To close
-the entire shadowing family at once, a bare (unqualified) trait/type name that
-is shadowed by a `use` import in the impl's **own module scope** — a **module-item**
-`use` (a direct `use` item of the impl's own module, *not* one nested inside a
-function body or block) whose final bound segment equals that bare name — is left
-**unresolved** on **both** the local per-file and the repo-wide cross-file
-resolution paths, **unless the bare name resolves to a definition in the impl's
-own module** (an own-module definition wins at depth 0 *before* the veto, because
-a same-module `use` plus a same-name item is a compile error in real Rust, so the
-definition is the only valid reading). The veto matches Rust's non-inherited `use`
-visibility: it consults **only** the impl's own module-scope imports — an
-ancestor/root or sibling-module `use` never shadows a bare name inside `mod m`,
-and a **block-local** `use` inside a function body is invisible to module-level
-impls and never feeds the veto at all. This is a deterministic, AST-derived
-name-shadow boolean (it detects the shadowing `use`, it does **not** resolve the
-import), computed once at extraction time and shared by both paths so they cannot
-diverge. It covers external/std imports, `use crate::a::T` aliases of a non-root
-local definition, and grouped/aliased `use` forms alike (a glob `use a::*;` names
-no specific segment and never vetoes). The
-accepted recall trade-off: a legitimate `use crate::Display; impl Display for
-Foo` whose import target **is** the local trait is now *also* left unresolved —
-an honest missing edge in place of a possible wrong one. Correct import-aware
-resolution (binding the bare name to exactly the trait the `use` names) is
-deferred to follow-up **#393**. The incremental-cache schema version bumps to
-**12** for the serde-default `shadowed_by_use` field this veto records on each
-deferred pending-impl fact; older caches rebuild.
+bare `impl Display for Foo` to a same-named **local** `trait Display`. Rather than
+leave every such bare name unresolved, the extractor captures the resolved import
+**path** each **module-item** `use` binds (a direct `use` item of the impl's own
+module, *not* one nested inside a function body or block), and the cross-file
+resolver binds a bare (unqualified) trait/type name to the target that import
+**names** — `use crate::a::T; impl T for Foo` edge-backs `Foo` to `a::T` (not a
+root `T`), `use crate::a::T as U; impl U for Bar` binds through the rename, and a
+grouped `use crate::a::{T};` distributes the group prefix. The import path is
+resolved against the crate-root-partitioned index with the same
+`crate::`/`self::`/`super::` normalization a qualified impl trait path gets, so an
+**external/std** import (`use std::fmt::Display;`) resolves to **no** in-repo
+definition and therefore still mints **no** edge — the recall recovery never
+reintroduces a wrong-target edge. Import capture respects Rust's non-inherited
+`use` visibility exactly (own module scope only; an ancestor/root, sibling-module,
+or **block-local** `use` is never captured for the impl's scope), so a bare name
+recovered here can only bind what a co-located `use` truly imports. A bare name
+resolvable in the impl's **own** module still wins at depth 0 before any import
+handling. Two bare-name cases stay bounded out: a **glob** import (`use a::*;`)
+binds no specific segment, so the bare `impl T for Foo` beside it is genuinely
+un-imported and — when its simple name is ambiguous across the crate root's
+impl-target definitions — is left **unresolved** (the honest missing-edge
+direction); and a bare name with **no** captured `use` import at all falls through
+to the conservative same-name ambiguity bound above. The incremental-cache schema
+version bumps to **13** for the serde-default `use_trait_imports` per-file facts
+this capture records (alongside the crate-root partitioning below); older caches
+rebuild.
 
-**Multi-crate-root packages are not partitioned by crate root in this slice.**
-The repo-wide index keys on the crate-root-relative **qualified name**, so when
-a package has more than one crate root (`src/lib.rs` plus `src/bin/tool.rs` or
-`src/main.rs`) a root `trait T` in each root shares the qualified name `T`. A
-`crate::`-qualified trait path (or a bare name) that matches **more than one**
-such definition is left **unresolved** (no edge) rather than silently picking
-one and mis-targeting a cross-root edge — the same "resolve only a unique
-match" rule that guards ambiguous bare names. This means a legitimate
-`impl crate::T for Foo` in the library is not edge-backed when a binary crate
-root also defines a root `T`; a missing edge is preferred over a wrong cross-root
-one. Full crate-root partitioning of the index (so each root's `T` is distinct)
-is tracked as a deferred follow-up. The query surfaces these bounds instead of
-hiding them:
+**Multi-crate-root packages are partitioned by crate root (issue #394).**
+The repo-wide index keys on `(crate_root, crate-root-relative qualified name)`, so
+when a package has more than one crate root a root `trait T` in each is a
+**distinct** index entry. Auxiliary buildable targets each form their own crate
+root — `src/bin/<name>.rs` / `src/bin/<name>/**` (`bin:<name>`), `examples/**`
+(`example:<name>`), `tests/**` (`test:<name>`), `benches/**` (`bench:<name>`), and
+`build.rs` — while `src/lib.rs`, `src/main.rs`, and their module files share the
+primary crate root. A pending impl's candidates are restricted to its **own**
+crate root, so a library `impl crate::T for Foo` now correctly edge-backs to the
+**library** `T` even when a binary crate root also defines a root `T`, and the
+binary's `impl crate::T for Bar` binds the **binary** `T` — the two never
+cross-pool. One documented residual bound: a package carrying **both** `src/lib.rs`
+and `src/main.rs`, each defining a same-named **root** trait, still pools those two
+in the shared primary root (a single file's path cannot distinguish the library
+crate from the default binary crate); the common auxiliary-target case is fully
+partitioned. The query surfaces these bounds instead of hiding them:
 
 - Every implementor row and every zero-implementors signal carries
   `completeness: "local_traits_only"`.
