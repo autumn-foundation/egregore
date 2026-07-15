@@ -1269,9 +1269,27 @@ impl EmbeddedAletheiaSink {
                 };
                 report.records.push(record);
             } else {
-                report
-                    .unknown_schema_versions
-                    .push(crate::schema_version::UnknownSchemaVersion::new(version));
+                // Preserve the reconstructed canonical record line so `eg export`
+                // (issue #155) can re-emit an unknown-version record verbatim.
+                // A record physically present via the normal `eg ingest` path
+                // always carries a known kind and every required property, so
+                // reconstruction succeeds; only an artificially raw-injected node
+                // lacking a required property (e.g. `summary`) reconstructs to
+                // `None`, which export surfaces as an enumerated skip diagnostic
+                // rather than a silent drop. Counting behavior is unchanged: the
+                // record is still counted only under `unknown_schema_versions`.
+                let raw_line = if record_type.as_deref() == Some("tombstone") {
+                    self.read_tombstone_record_internal(&record_id, node_id)
+                } else {
+                    self.read_node_record_internal(&record_id, node_id)
+                }
+                .ok()
+                .as_ref()
+                .and_then(|record| serde_json::to_string(record).ok());
+                report.unknown_schema_versions.push(
+                    crate::schema_version::UnknownSchemaVersion::new(version)
+                        .with_raw_line(raw_line),
+                );
             }
         }
 
@@ -1298,9 +1316,17 @@ impl EmbeddedAletheiaSink {
                     let record = self.read_edge_record_internal(&codegraph_id, edge_id)?;
                     report.records.push(record);
                 } else {
-                    report
-                        .unknown_schema_versions
-                        .push(crate::schema_version::UnknownSchemaVersion::new(version));
+                    // Preserve the reconstructed canonical edge line for
+                    // `eg export` (issue #155); see the node branch above.
+                    let raw_line = self
+                        .read_edge_record_internal(&codegraph_id, edge_id)
+                        .ok()
+                        .as_ref()
+                        .and_then(|record| serde_json::to_string(record).ok());
+                    report.unknown_schema_versions.push(
+                        crate::schema_version::UnknownSchemaVersion::new(version)
+                            .with_raw_line(raw_line),
+                    );
                 }
             }
         }
