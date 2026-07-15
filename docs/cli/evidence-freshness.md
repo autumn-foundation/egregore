@@ -169,6 +169,20 @@ duplicate rows are classified once.
   `valid_time`s (a working-tree-only deletion at an unchanged HEAD keeps the
   committer-derived `valid_time` and is not detected); use `scan-history` when
   per-commit precision is required.
+  Residual (mixed history + current-tree handle): when a single store combines
+  `scan-history` output and repeated current-tree `scan` output for the **same**
+  repo so that one stable handle carries **both** a commit-anchored version and a
+  non-temporal current-tree version, that handle is governed by the commit-tip
+  frontier and is **not** pruned by the current-tree scan frontier. If a later
+  current-tree scan deletes such a handle without a tombstone, a citation to it can
+  still report `current`/`drifted` rather than `unresolved`, because the two
+  "latest" axes (commit committer date vs. wall-clock scan `valid_time`) have no
+  reliable ordering and history is treated as authoritative. This shape is not
+  produced by any single command — `scan` emits only current-tree handles and
+  `scan-history` only commit-anchored handles; it arises only from hand-combining
+  both outputs for one repo. Use a single `scan-history` store for the freshness
+  workflow; do not merge current-tree `scan` output into a history store for the
+  same repo. Tracked in #405.
 - **Retractions/deletions via the embedded `--data-dir` read.** Tombstone
   *activity* is decided from record order, which is write order for an append-only
   `--graph` file. The embedded `--data-dir` history-inclusive read re-emits a
