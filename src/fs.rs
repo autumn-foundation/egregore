@@ -24,6 +24,37 @@ pub struct SourceFile {
     pub repo_relative_path: String,
 }
 
+/// File-level scan-coverage accounting captured during discovery (issue #135).
+///
+/// Computed over the same walked set discovery visits, so `eg scan` can report
+/// how much of the repository it indexed without a second traversal. Excluded
+/// directories (`.git`, `target`, nested Git worktrees) are never walked, so
+/// they never appear in `files_walked` or `skipped_by_extension` (AC7).
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct ScanCoverageTally {
+    /// Files the walk visited (never counting excluded-directory files).
+    pub files_walked: usize,
+    /// Files that matched the indexed-source filter.
+    pub files_indexed: usize,
+    /// Per-lowercased-extension count of walked-but-not-indexed files
+    /// (`""` keys a file with no extension); a sorted map for stable output.
+    pub skipped_by_extension: std::collections::BTreeMap<String, usize>,
+    /// Repo-relative path -> lowercased extension for every walked file the
+    /// source-filter skipped, retained so the scan can reclassify any that a
+    /// later File-producing extractor (e.g. manifest dependency extraction,
+    /// issue #180) nonetheless indexes with a `File` node — keeping
+    /// `files_indexed` honest about what actually received a graph node. Only
+    /// populated on the complete (Git-tracked) walk; empty on the fallback,
+    /// which carries no walked/skipped denominator. A sorted map for
+    /// determinism.
+    pub skipped_paths: std::collections::BTreeMap<String, String>,
+    /// `true` only on the Git-tracked-files path, which yields a complete
+    /// walked/skipped denominator. The non-Git filesystem-walk fallback sets
+    /// this `false` (it enumerates only matching files, so it has no
+    /// denominator) and never fabricates one.
+    pub coverage_complete: bool,
+}
+
 /// Discovers supported source files (Rust, Python, TypeScript, Go) under a repository root.
 ///
 /// # Errors
@@ -31,7 +62,24 @@ pub struct SourceFile {
 /// Returns an error when directory traversal cannot read an entry or when a
 /// discovered source file cannot be relativized against the repository root.
 pub fn discover_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
-    discover_files_matching(repo_root, &languages::is_supported_source, true)
+    Ok(discover_source_files_with_coverage(repo_root)?.0)
+}
+
+/// Discovers supported source files together with the file-level scan-coverage
+/// tally (issue #135).
+///
+/// The coverage-returning variant of [`discover_source_files`]: the scan path
+/// uses it to stamp a `ScanCoverage` node, while every other caller keeps the
+/// tally-discarding [`discover_source_files`] signature.
+///
+/// # Errors
+///
+/// Returns an error when directory traversal cannot read an entry or when a
+/// discovered source file cannot be relativized against the repository root.
+pub fn discover_source_files_with_coverage(
+    repo_root: &Path,
+) -> Result<(Vec<SourceFile>, ScanCoverageTally)> {
+    discover_files_matching(repo_root, &languages::is_supported_source)
 }
 
 /// Discovers `Cargo.toml` manifests under a repository root for dependency
@@ -43,7 +91,7 @@ pub fn discover_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
 /// Returns an error when directory traversal cannot read an entry or when a
 /// discovered manifest cannot be relativized against the repository root.
 pub fn discover_cargo_manifests(repo_root: &Path) -> Result<Vec<SourceFile>> {
-    discover_files_matching(repo_root, &is_cargo_manifest, false)
+    Ok(discover_files_matching(repo_root, &is_cargo_manifest)?.0)
 }
 
 fn is_cargo_manifest(path: &Path) -> bool {
@@ -53,41 +101,45 @@ fn is_cargo_manifest(path: &Path) -> bool {
 fn discover_files_matching(
     repo_root: &Path,
     matcher: &dyn Fn(&Path) -> bool,
-    log_skipped: bool,
-) -> Result<Vec<SourceFile>> {
+) -> Result<(Vec<SourceFile>, ScanCoverageTally)> {
     let mut files = Vec::new();
+    let mut tally = ScanCoverageTally::default();
 
     if crate::identity::is_repo_root(repo_root) {
         if let Some(tracked) = git_tracked_files(repo_root) {
             for path in tracked {
                 let is_file = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
-                if !is_file || !matcher(&path) {
+                if !is_file {
                     continue;
                 }
                 let Ok(rel) = repo_relative_path(repo_root, &path) else {
                     continue;
                 };
+                // Excluded directories (issue #135 AC7): files under `.git`,
+                // `target`, or a nested Git worktree are never walked, so they
+                // never dilute the coverage denominator or the skip tally.
                 let has_target_or_git = rel
                     .split('/')
                     .any(|part| part == "target" || part == ".git");
-                if !has_target_or_git {
+                if has_target_or_git {
+                    continue;
+                }
+                // The tracked-files walk visits every non-excluded file, so it
+                // yields a complete indexed-vs-skipped accounting (AC4).
+                tally.files_walked += 1;
+                if matcher(&path) {
                     files.push(path);
+                } else {
+                    let ext = path
+                        .extension()
+                        .and_then(OsStr::to_str)
+                        .map(str::to_ascii_lowercase)
+                        .unwrap_or_default();
+                    *tally.skipped_by_extension.entry(ext.clone()).or_default() += 1;
+                    tally.skipped_paths.insert(rel.clone(), ext);
                 }
             }
-
-            if log_skipped {
-                // Report skipped files
-                let (
-                    skipped_rust_count,
-                    skipped_python_count,
-                    skipped_typescript_count,
-                    skipped_go_count,
-                ) = git_count_skipped_files(repo_root).unwrap_or((0, 0, 0, 0));
-
-                eprintln!(
-                    "Skipped {skipped_rust_count} .rs, {skipped_python_count} .py, {skipped_typescript_count} .ts/.tsx, {skipped_go_count} .go files by ignore rules"
-                );
-            }
+            tally.coverage_complete = true;
         } else {
             // Git command failed, fallback
             let ignored_dirs = git_ignored_dir_prefixes(repo_root);
@@ -98,6 +150,18 @@ fn discover_files_matching(
         // Fallback to pure filesystem walk for non-Git trees
         let ignored_dirs = HashSet::new();
         collect_matching_files(repo_root, matcher, &ignored_dirs, &mut files)?;
+    }
+
+    // `files_indexed` is exactly the count of matched files collected, on both
+    // the tracked-files walk and the fallback branches, so set it once here
+    // rather than track a parallel counter (issue #135).
+    tally.files_indexed = files.len();
+    // The fallback branches (non-Git tree, or a failed `git ls-files`) enumerate
+    // only matching files, so they carry no walked/skipped denominator. Report a
+    // best-effort `files_walked == files_indexed` with `coverage_complete` left
+    // `false` rather than fabricate a skip tally (issue #135).
+    if !tally.coverage_complete {
+        tally.files_walked = files.len();
     }
 
     let mut source_files: Vec<SourceFile> = files
@@ -112,7 +176,7 @@ fn discover_files_matching(
         .collect::<Result<Vec<_>>>()?;
 
     source_files.sort_by(|left, right| left.repo_relative_path.cmp(&right.repo_relative_path));
-    Ok(source_files)
+    Ok((source_files, tally))
 }
 
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
@@ -155,69 +219,6 @@ fn git_tracked_files(repo_root: &Path) -> Option<Vec<PathBuf>> {
         }
     }
     Some(paths)
-}
-
-fn git_count_skipped_files(repo_root: &Path) -> Option<(usize, usize, usize, usize)> {
-    let mut skipped_rust = 0;
-    let mut skipped_python = 0;
-    let mut skipped_typescript = 0;
-    let mut skipped_go = 0;
-
-    let mut process_output = |args: &[&str]| -> Option<()> {
-        let output = Command::new("git")
-            .args(["-c", "core.excludesFile="])
-            .args(["-c", "core.quotePath=false"])
-            .arg("-C")
-            .arg(repo_root)
-            .args(args)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        for chunk in output.stdout.split(|&b| b == 0) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let rel_path = bytes_to_path(chunk);
-            let has_target_or_git = rel_path.components().any(|c| {
-                if let std::path::Component::Normal(part) = c {
-                    part == "target" || part == ".git"
-                } else {
-                    false
-                }
-            });
-            if has_target_or_git {
-                continue;
-            }
-            if let Some(ext) = rel_path.extension().and_then(|e| e.to_str()) {
-                if ext.eq_ignore_ascii_case("rs") {
-                    skipped_rust += 1;
-                } else if ext.eq_ignore_ascii_case("py") {
-                    skipped_python += 1;
-                } else if ext.eq_ignore_ascii_case("ts") || ext.eq_ignore_ascii_case("tsx") {
-                    skipped_typescript += 1;
-                } else if ext.eq_ignore_ascii_case("go") {
-                    skipped_go += 1;
-                }
-            }
-        }
-        Some(())
-    };
-
-    process_output(&["ls-files", "--others", "--exclude-standard", "-z"])?;
-    process_output(&[
-        "ls-files",
-        "--others",
-        "--ignored",
-        "--exclude-standard",
-        "-z",
-    ])?;
-
-    Some((skipped_rust, skipped_python, skipped_typescript, skipped_go))
 }
 
 fn collect_matching_files(

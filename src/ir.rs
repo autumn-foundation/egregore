@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 /// Current schema version for code-graph records.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Schema version for agent-memory records (`Agent`, `AgentSession`, `Observation`, etc.).
 /// Documented in `docs/schema/agent-memory.md`.
@@ -445,6 +445,41 @@ pub struct DependencyDeclarationPayload {
     /// be read or parsed; an ancestor lockfile is never consulted in its
     /// place).
     pub resolution: String,
+}
+
+/// Scan-coverage payload stamped on the single `ScanCoverage` node a full
+/// `eg scan` emits (issue #135).
+///
+/// Makes indexing coverage a stated, deterministic, queryable graph fact: how
+/// many files the walk visited, how many were indexed, and — for every file
+/// that was walked but not indexed — a per-extension skip tally. Excluded
+/// directories (`.git`, `target`, nested Git worktrees) are never walked, so
+/// they never dilute these counts (AC7). All fields are additive per
+/// `docs/schema/schema-versioning.md §2` and carry no paths or PII — only
+/// lowercased extensions, counts, and the named language scope — so the node is
+/// redaction-exempt deterministic code-graph data.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScanCoveragePayload {
+    /// Total files the walk visited (files under excluded directories are never
+    /// counted). Equals `files_indexed + sum(skipped_by_extension.values())`
+    /// whenever `coverage_complete` is true (AC4).
+    pub files_walked: usize,
+    /// Files that matched the indexed-source filter and became code-graph nodes.
+    pub files_indexed: usize,
+    /// Per-extension count of walked-but-not-indexed files, keyed on the
+    /// lowercased final path extension (`""` for a file with no extension).
+    /// A sorted map for byte-stable output (AC5).
+    pub skipped_by_extension: std::collections::BTreeMap<String, usize>,
+    /// The human-facing names of the languages `eg scan` indexes, in a stable
+    /// order (AC6). Derived from [`crate::languages::Language::ALL`], never a
+    /// hard-coded list, so it can never drift from the real extractor scope.
+    pub indexed_languages: Vec<String>,
+    /// `true` when the walk produced a complete file-level accounting (the
+    /// Git-tracked-files path). `false` for the non-Git filesystem-walk
+    /// fallback, which enumerates only matching source files and so has no
+    /// walked/skipped denominator; there `files_walked == files_indexed` and
+    /// `skipped_by_extension` is empty. Never fabricates a denominator.
+    pub coverage_complete: bool,
 }
 
 /// Per-kind payload stamped on the four log-signature node kinds (issues
@@ -1095,6 +1130,11 @@ pub enum GraphRecord {
         /// absent on all other kinds (issues #319 / #320).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         log: Option<Box<LogPayload>>,
+        /// Scan-coverage payload for the single `ScanCoverage` node (issue
+        /// #135); absent on all other kinds and on graphs produced before
+        /// coverage stamping.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scan_coverage: Option<Box<ScanCoveragePayload>>,
         // ── Agent-memory provenance fields (absent for code-graph nodes) ─────
         /// Observation body text (Observation nodes).
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1681,6 +1721,7 @@ impl GraphRecord {
             transition_kind: None,
             dependency: None,
             log: None,
+            scan_coverage: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1806,6 +1847,7 @@ impl GraphRecord {
             transition_kind: None,
             dependency: None,
             log: None,
+            scan_coverage: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1930,6 +1972,7 @@ impl GraphRecord {
             transition_kind: None,
             dependency: None,
             log: None,
+            scan_coverage: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -2059,6 +2102,7 @@ impl GraphRecord {
             transition_kind: None,
             dependency: None,
             log: None,
+            scan_coverage: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -2456,6 +2500,26 @@ impl GraphRecord {
         self
     }
 
+    /// Stamps a [`ScanCoveragePayload`] on the `ScanCoverage` node (issue #135).
+    /// No-op on non-node records.
+    #[must_use]
+    pub fn with_scan_coverage(mut self, payload: ScanCoveragePayload) -> Self {
+        if let Self::Node { scan_coverage, .. } = &mut self {
+            *scan_coverage = Some(Box::new(payload));
+        }
+        self
+    }
+
+    /// Returns the scan-coverage payload when this record is a `ScanCoverage`
+    /// node carrying one; `None` otherwise (issue #135).
+    #[must_use]
+    pub fn scan_coverage(&self) -> Option<&ScanCoveragePayload> {
+        match self {
+            Self::Node { scan_coverage, .. } => scan_coverage.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
     /// Sets the evidence-link citation list on a node record. No-op on non-node
     /// records. An empty list clears the field back to `None`.
     #[must_use]
@@ -2839,6 +2903,11 @@ pub enum NodeKind {
     UnsafeSite,
     /// Directly-declared Cargo manifest dependency (issue #180).
     DependencyDeclaration,
+    /// File-level scan-coverage summary (issue #135): one node per full
+    /// `eg scan`, carrying a [`ScanCoveragePayload`] (files walked/indexed and a
+    /// per-extension skip tally). Attached to its `Repository` by a `CONTAINS`
+    /// edge so coverage is citable and never an orphan.
+    ScanCoverage,
     /// Git commit observed during history replay.
     Commit,
     /// File-level change observed in a commit.
@@ -2981,6 +3050,7 @@ impl NodeKind {
             Self::DebtMarker => "DebtMarker",
             Self::UnsafeSite => "UnsafeSite",
             Self::DependencyDeclaration => "DependencyDeclaration",
+            Self::ScanCoverage => "ScanCoverage",
             Self::Commit => "Commit",
             Self::Change => "Change",
             Self::SemanticDrift => "SemanticDrift",

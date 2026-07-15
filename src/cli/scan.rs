@@ -20,12 +20,57 @@ pub(crate) fn scan(
     crate::redaction::redact_code_graph(&mut records, raw_literals, &repository_id);
     let graph = Graph::from_records(records);
 
+    print_scan_coverage(&graph);
+
     let jsonl = graph
         .to_jsonl()
         .context("failed to serialize graph JSONL")?;
     fs::write(out, jsonl)
         .with_context(|| format!("failed to write graph JSONL to {}", out.display()))?;
     Ok(())
+}
+
+/// Prints the deterministic human-readable scan-coverage summary to stderr
+/// (issue #135), reading it back from the single `ScanCoverage` graph node so
+/// the printed summary and the persisted graph fact share one source of truth.
+///
+/// Only emitted when coverage is complete (the Git-tracked-files walk): the
+/// non-Git filesystem-walk fallback has no walked/skipped denominator, so it
+/// stays silent rather than print a misleading partial tally — preserving the
+/// empty-stderr contract for non-Git fixture scans. The machine-readable form
+/// always rides in the JSONL as the `ScanCoverage` node.
+fn print_scan_coverage(graph: &Graph) {
+    let Some(coverage) = graph
+        .records()
+        .iter()
+        .find_map(crate::ir::GraphRecord::scan_coverage)
+    else {
+        return;
+    };
+    if !coverage.coverage_complete {
+        return;
+    }
+    let skipped_total: usize = coverage.skipped_by_extension.values().sum();
+    eprintln!(
+        "scan coverage: {} files walked, {} indexed, {} skipped",
+        coverage.files_walked, coverage.files_indexed, skipped_total
+    );
+    if !coverage.skipped_by_extension.is_empty() {
+        let skipped = coverage
+            .skipped_by_extension
+            .iter()
+            .map(|(ext, count)| {
+                let label = if ext.is_empty() { "(no-ext)" } else { ext };
+                format!("{label}: {count}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("  skipped by extension: {skipped}");
+    }
+    eprintln!(
+        "indexed languages: {}",
+        coverage.indexed_languages.join(", ")
+    );
 }
 
 pub(crate) fn scan_history(

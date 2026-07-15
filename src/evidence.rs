@@ -468,6 +468,7 @@ fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
         transition_kind: None,
         dependency: None,
         log: None,
+        scan_coverage: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
     }
@@ -596,6 +597,7 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
         transition_kind: None,
         dependency: None,
         log: None,
+        scan_coverage: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
     }
@@ -932,6 +934,7 @@ pub fn build_observation_records(
         transition_kind: None,
         dependency: None,
         log: None,
+        scan_coverage: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };
@@ -1175,6 +1178,7 @@ pub fn build_command_evidence_records(
         transition_kind: None,
         dependency: None,
         log: None,
+        scan_coverage: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };
@@ -1425,6 +1429,7 @@ pub fn build_artifact_records(
         transition_kind: None,
         dependency: None,
         log: None,
+        scan_coverage: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };
@@ -1653,6 +1658,7 @@ pub fn build_verification_records(
         transition_kind: None,
         dependency: None,
         log: None,
+        scan_coverage: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };

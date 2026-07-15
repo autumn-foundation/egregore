@@ -29,6 +29,13 @@ pub enum Language {
 }
 
 impl Language {
+    /// Every source language the scanner can extract, in a stable order.
+    ///
+    /// The single source of truth for "which languages does `eg scan` index?",
+    /// consumed by the scan-coverage summary (issue #135) so the named language
+    /// scope can never drift from the extractor's real capability.
+    pub const ALL: [Self; 4] = [Self::Rust, Self::Python, Self::TypeScript, Self::Go];
+
     /// The stable language tag stored on graph records.
     #[must_use]
     pub const fn tag(self) -> &'static str {

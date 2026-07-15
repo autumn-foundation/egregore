@@ -223,6 +223,8 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::CostUsage
         | NodeKind::Retraction
         | NodeKind::DependencyDeclaration
+        // The scan-coverage summary is counts, not source text (issue #135).
+        | NodeKind::ScanCoverage
         // Log-signature nodes carry no source bytes to embed (issues #319/#320).
         | NodeKind::LogSource
         | NodeKind::ErrorSignature

@@ -212,6 +212,7 @@ fn make_agent_memory_node(
         transition_kind: None,
         dependency: None,
         log: None,
+        scan_coverage: None,
         user_context: aletheia_egregore::UserContextFields::empty(),
         producer: None,
     }

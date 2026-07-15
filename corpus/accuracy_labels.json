@@ -149,10 +149,12 @@
       "name": "decoy_host",
       "symbol_kind": "function",
       "span": { "start_byte": 754, "end_byte": 888, "start_line": 47, "end_line": 51 }
-    }
+    },
+    { "id": "scan-coverage", "kind": "ScanCoverage" }
   ],
   "edges": [
     { "label": "CONTAINS", "source": "repo-node", "target": "file-lib" },
+    { "label": "CONTAINS", "source": "repo-node", "target": "scan-coverage" },
     { "label": "DEFINES", "source": "file-lib", "target": "sym-free-func" },
     { "label": "DEFINES", "source": "file-lib", "target": "sym-mystruct" },
     { "label": "DEFINES", "source": "file-lib", "target": "sym-impl-mystruct" },

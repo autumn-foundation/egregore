@@ -30,7 +30,12 @@ pub const EDGE_TARGET_KIND_VIOLATION: &str = "edge_target_kind_violation";
 /// The source-side companion to `edge_target_kind_violation`. The log schema
 /// frames every log structural edge directionally, so a schema-correct target
 /// with a wrong-kind source — e.g. a `LogOccurrenceBucket —CAPTURED_FROM→
-/// LogSource` — is invalid attribution the pre-ingest gate must reject.
+/// LogSource` — is invalid attribution the pre-ingest gate must reject. Also
+/// carries the target-kind-conditioned containment rule (issue #135): a
+/// `CONTAINS` edge targeting a `ScanCoverage` summary whose source is not the
+/// `Repository` it scopes (e.g. a `File —CONTAINS→ ScanCoverage`) is the same
+/// wrong-kind-source defect, with `target_id`/`target_kind` naming the
+/// constrained coverage node.
 pub const EDGE_SOURCE_KIND_VIOLATION: &str = "edge_source_kind_violation";
 /// Stable defect category: a reviewer-identity edge whose source node is of the
 /// correct kind but carries the wrong (or no) importer `source_kind`
@@ -67,6 +72,22 @@ pub const TOMBSTONE_STRANDS_LIVE_EDGE: &str = "tombstone_strands_live_edge";
 /// is the same missing chain. Zero-edge nodes are `orphan_node`, so this
 /// category covers nodes whose edges never include that containment.
 pub const MISSING_CONTAINMENT_EDGE: &str = "missing_containment_edge";
+/// Stable defect category: a node kind whose schema requires a specific inbound
+/// container edge is missing it (issue #135).
+///
+/// A `ScanCoverage` summary MUST be the target of at least one
+/// `Repository —CONTAINS→ ScanCoverage` edge — the attribution that keeps the
+/// coverage summary repository-scoped and citable. This is the true schema
+/// invariant behind coverage attachment, and it subsumes the partial cases the
+/// orphan and target-conditioned source-kind checks each cover: the orphan
+/// check treats ANY incident edge as sufficient, and the source-kind check
+/// fires only when a `CONTAINS → ScanCoverage` edge is actually present. A
+/// coverage node made incident by some OTHER edge (e.g. `ScanCoverage
+/// —MENTIONS→ Symbol`) with no `Repository —CONTAINS→` container slips past
+/// both — the exact hole this category closes. Redaction-safe: it names the
+/// coverage node id, its kind, the required `CONTAINS` relation, and the
+/// required container kind only.
+pub const MISSING_REQUIRED_CONTAINER: &str = "missing_required_container";
 /// Stable defect category: a log-domain node with incident edges missing a
 /// required outbound structural edge (issue #327).
 ///
@@ -104,6 +125,13 @@ pub const DUPLICATE_LOG_STRUCTURAL_EDGE: &str = "duplicate_log_structural_edge";
 /// issue #319/#327), so an edge-less one is a defect. `LogSource` (a root/sink
 /// that may be legitimately edge-less on an empty-log scan) is intentionally
 /// excluded to avoid false positives.
+/// `ScanCoverage` is intentionally NOT listed here: the generic orphan rule
+/// (any incident edge suffices) is too weak for it, since the schema requires
+/// specifically a `Repository —CONTAINS→ ScanCoverage` container. That stronger
+/// invariant is enforced by `check_required_containment` as a specific
+/// `missing_required_container` defect, so a lone or wrong-attached coverage
+/// node reports that precise category rather than a generic `orphan_node`
+/// (issue #135, PR #400 review).
 const ORPHANABLE_KINDS: [NodeKind; 8] = [
     NodeKind::File,
     NodeKind::Module,
@@ -134,6 +162,10 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
             NodeKind::DependencyDeclaration,
             NodeKind::File,
             NodeKind::Module,
+            // `Repository CONTAINS ScanCoverage` attributes the file-level scan
+            // coverage summary to its repository (issue #135), keeping the
+            // coverage node citable and non-orphan.
+            NodeKind::ScanCoverage,
             // `File CONTAINS PanicRiskSite`: unwrap/expect panic-risk call
             // sites are contained by their owning file (issue #223).
             NodeKind::PanicRiskSite,
@@ -233,6 +265,33 @@ const fn allowed_source_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
         // `Review` target reached from a wrong-kind source is invalid
         // attribution the pre-ingest gate must reject.
         EdgeLabel::TransitionsReview => Some(&[NodeKind::ReviewStateTransition]),
+        _ => None,
+    }
+}
+
+/// Allowed SOURCE node kinds for a typed relation whose source constraint
+/// depends on the relation's TARGET node kind (issue #135).
+///
+/// The label-only `allowed_source_kinds` leaves `CONTAINS` sources
+/// unconstrained (`Repository —CONTAINS→ File`, `Module —CONTAINS→ Symbol`, and
+/// `File —CONTAINS→ {DebtMarker, DependencyDeclaration, UnsafeSite, …}` are all
+/// legitimate), so it cannot express "a `ScanCoverage` summary must be
+/// contained by the `Repository` it scopes". A malformed `File —CONTAINS→
+/// ScanCoverage` otherwise passes the label-only target-kind check (`CONTAINS`
+/// permits `ScanCoverage` as a target) AND dodges the orphan check (the inbound
+/// edge makes the coverage node incident) — the exact hole this rule closes.
+/// Keyed on the (label, target-kind) pair so only `CONTAINS → ScanCoverage`
+/// gains a source constraint; every other pair returns `None` (unconstrained)
+/// via the `_ => None` arm, so no legitimate containment can regress.
+const fn allowed_source_kinds_for_target(
+    label: EdgeLabel,
+    target: NodeKind,
+) -> Option<&'static [NodeKind]> {
+    match (label, target) {
+        // `Repository —CONTAINS→ ScanCoverage`: the file-level scan-coverage
+        // summary must be attributed to the `Repository` it scopes, never a
+        // `File` or any other container (issue #135).
+        (EdgeLabel::Contains, NodeKind::ScanCoverage) => Some(&[NodeKind::Repository]),
         _ => None,
     }
 }
@@ -520,6 +579,55 @@ impl<'a> GraphIndex<'a> {
     }
 }
 
+/// Target-kind-conditioned source-kind check (issue #135). Some `CONTAINS`
+/// targets constrain their source: a `ScanCoverage` summary must be contained
+/// by the `Repository` it scopes. A malformed `File —CONTAINS→ ScanCoverage`
+/// otherwise passes the label-only target-kind check (`CONTAINS` permits
+/// `ScanCoverage` as a target) AND, because the inbound edge makes the coverage
+/// node incident, dodges the orphan check — so without this rule `eg validate`
+/// green-lights a coverage node bound to the wrong container. Present sources
+/// only; a missing or tombstoned source is already reported by `check_edges`.
+/// The emitted `edge_source_kind_violation` names the offending source in
+/// `record_id`/`kind` and the constrained target in `target_id`/`target_kind`.
+fn check_target_conditioned_source_kind(
+    edge_id: &str,
+    label: EdgeLabel,
+    source: &str,
+    target: &str,
+    index: &GraphIndex<'_>,
+    diagnostics: &mut BTreeSet<ValidationDiagnostic>,
+) {
+    if let Some(target_kinds) = index.node_kinds.get(target)
+        && let Some((constrained_kind, allowed)) = target_kinds.iter().find_map(|kind| {
+            allowed_source_kinds_for_target(label, *kind).map(|allowed| (*kind, allowed))
+        })
+        && index.node_kinds.contains_key(source)
+    {
+        // Resolve the source's CURRENT kind by LAST-write (issue #391), matching
+        // the sibling source-kind gate `check_edge_source_kind`, never
+        // any-matching the historical `node_kinds` SET. A source re-emitted as a
+        // wrong kind after a valid one has its earlier valid kind SHADOWED, and a
+        // source shadowed by a trailing non-node record resolves to `None` — both
+        // fire the gate, matching the daemon's `lookup_node_kind` reverse scan. A
+        // node ID recurring across history commits with the SAME kind still
+        // resolves to that kind, so the normal single-kind case is unchanged.
+        let resolved = index.node_last_kind.get(source).copied().flatten();
+        if !resolved.is_some_and(|kind| allowed.contains(&kind)) {
+            let mut diagnostic = ValidationDiagnostic::new(EDGE_SOURCE_KIND_VIOLATION);
+            diagnostic.edge_id = Some(edge_id.to_owned());
+            diagnostic.relation = Some(label.as_str().to_owned());
+            diagnostic.endpoint = Some("source");
+            diagnostic.record_id = Some(source.to_owned());
+            diagnostic.kind = resolved.map(NodeKind::as_str);
+            diagnostic.target_id = Some(target.to_owned());
+            diagnostic.target_kind = Some(constrained_kind.as_str());
+            diagnostic.allowed_kinds = Some(allowed.iter().map(|kind| kind.as_str()).collect());
+            index.cite_node(&mut diagnostic, source);
+            diagnostics.insert(diagnostic);
+        }
+    }
+}
+
 /// Checks every edge for endpoint resolution, tombstoned references, and typed
 /// target kinds. Returns the set of IDs incident to any edge and, per
 /// tombstoned ID, the live edges still referencing it.
@@ -584,6 +692,11 @@ fn check_edges<'a>(
         check_edge_target_kind(index, edge_id, *label, target, diagnostics);
         check_edge_source_kind(index, edge_id, *label, source, diagnostics);
         check_edge_source_kind_attribution(index, edge_id, *label, source, diagnostics);
+
+        // Target-kind-conditioned source-kind check (issue #135): e.g. a
+        // `ScanCoverage` summary must be contained by the `Repository` it
+        // scopes, not a `File` (see `check_target_conditioned_source_kind`).
+        check_target_conditioned_source_kind(edge_id, *label, source, target, index, diagnostics);
     }
     (incident, stranded_by_deleted)
 }
@@ -854,6 +967,78 @@ fn check_dependency_containment(
     }
 }
 
+/// Required-container rule (issue #135, PR #400 review): every `ScanCoverage`
+/// node MUST be the target of at least one `Repository —CONTAINS→ ScanCoverage`
+/// edge — the repository-scoping/citation attribution the schema requires. This
+/// is the true invariant behind coverage attachment and subsumes the partial
+/// cases the other checks each cover:
+///
+/// * the orphan check treats ANY incident edge as sufficient, so a coverage node
+///   made incident by some unrelated edge (e.g. `ScanCoverage —MENTIONS→
+///   Symbol`) escapes it;
+/// * `check_target_conditioned_source_kind` fires only when a `CONTAINS →
+///   ScanCoverage` edge actually exists (rejecting a wrong-kind source such as
+///   `File`), so a coverage node with no `CONTAINS` edge at all escapes it too.
+///
+/// A `ScanCoverage` node with no `Repository —CONTAINS→` container is exactly one
+/// `missing_required_container` defect. Because `ScanCoverage` is not in
+/// `ORPHANABLE_KINDS`, a lone zero-edge coverage node reports this specific
+/// defect rather than a generic `orphan_node`. A malformed `File —CONTAINS→
+/// ScanCoverage`-only graph legitimately reports BOTH this defect (no valid
+/// Repository container exists) and `edge_source_kind_violation` (the edge's
+/// source kind is wrong): the two are distinct, complementary facts, not a
+/// duplicate — one names the missing required container, the other the malformed
+/// edge — and neither is suppressed to reduce count.
+fn check_required_containment(
+    records: &[GraphRecord],
+    index: &GraphIndex<'_>,
+    diagnostics: &mut BTreeSet<ValidationDiagnostic>,
+) {
+    fn has_kind(index: &GraphIndex<'_>, id: &str, kind: NodeKind) -> bool {
+        index
+            .node_kinds
+            .get(id)
+            .is_some_and(|kinds| kinds.contains(&kind))
+    }
+    // Coverage node IDs that have at least one `Repository —CONTAINS→` container.
+    let mut contained: BTreeSet<&str> = BTreeSet::new();
+    for record in records {
+        let GraphRecord::Edge {
+            label: EdgeLabel::Contains,
+            source,
+            target,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        // The container SOURCE's kind must resolve to `Repository` by LAST-write
+        // (issue #391), matching the sibling source-kind gate and
+        // `check_target_conditioned_source_kind`, never any-matching the
+        // historical `node_kinds` SET: a source re-emitted as a non-`Repository`
+        // kind after a `Repository` one no longer satisfies containment (its
+        // historical set still contains `Repository`, but its current kind does
+        // not), so the coverage node correctly reports `missing_required_container`.
+        let source_is_repository = index.node_last_kind.get(source.as_str()).copied().flatten()
+            == Some(NodeKind::Repository);
+        if has_kind(index, target, NodeKind::ScanCoverage) && source_is_repository {
+            contained.insert(target);
+        }
+    }
+    for (id, kinds) in &index.node_kinds {
+        if !kinds.contains(&NodeKind::ScanCoverage) || contained.contains(id) {
+            continue;
+        }
+        let mut diagnostic = ValidationDiagnostic::new(MISSING_REQUIRED_CONTAINER);
+        diagnostic.record_id = Some((*id).to_owned());
+        diagnostic.kind = Some(NodeKind::ScanCoverage.as_str());
+        diagnostic.relation = Some(EdgeLabel::Contains.as_str().to_owned());
+        diagnostic.allowed_kinds = Some(vec![NodeKind::Repository.as_str()]);
+        index.cite_node(&mut diagnostic, id);
+        diagnostics.insert(diagnostic);
+    }
+}
+
 /// Cardinality of a required outbound log structural edge (issue #327).
 ///
 /// Every requirement fires `missing_log_structural_edge` at count 0. The two
@@ -993,7 +1178,10 @@ fn check_log_completeness(
 /// 6. every `DependencyDeclaration` with incident edges is the target of a
 ///    `File —CONTAINS→` attribution edge from its declaring manifest — the
 ///    containing file's path equals the dependency node's manifest handle
-///    (`missing_containment_edge`).
+///    (`missing_containment_edge`);
+/// 7. every `ScanCoverage` node is the target of at least one `Repository
+///    —CONTAINS→ ScanCoverage` container edge (`missing_required_container`,
+///    issue #135).
 ///
 /// The output is deterministic: diagnostics are deduplicated and sorted in
 /// canonical order, so repeated validation of the same input is identical.
@@ -1006,6 +1194,7 @@ pub fn validate_records(records: &[GraphRecord]) -> ValidationReport {
     check_tombstones(&index, &stranded_by_deleted, &mut diagnostics);
     check_orphans(&index, &incident, &mut diagnostics);
     check_dependency_containment(records, &index, &incident, &mut diagnostics);
+    check_required_containment(records, &index, &mut diagnostics);
     check_log_completeness(records, &index, &incident, &mut diagnostics);
 
     ValidationReport {
@@ -1219,6 +1408,186 @@ mod tests {
         let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
         assert_eq!(codes, vec![ORPHAN_NODE]);
         assert_eq!(report.diagnostics[0].kind, Some("DependencyDeclaration"));
+    }
+
+    #[test]
+    fn unattached_scan_coverage_is_missing_required_container() {
+        // Issue #135 (PR #400 review): a lone `ScanCoverage` node with no inbound
+        // `Repository —CONTAINS→ ScanCoverage` edge is not repository-scoped or
+        // citable. It is reported as the SPECIFIC `missing_required_container`
+        // defect (not a generic `orphan_node`) because `ScanCoverage` is no
+        // longer in `ORPHANABLE_KINDS`: the true invariant is a Repository
+        // container, and the zero-edge case is just one instance of its absence.
+        let records = vec![node("n:coverage", NodeKind::ScanCoverage)];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![MISSING_REQUIRED_CONTAINER]);
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.record_id.as_deref(), Some("n:coverage"));
+        assert_eq!(diagnostic.kind, Some("ScanCoverage"));
+        assert_eq!(diagnostic.relation.as_deref(), Some("CONTAINS"));
+        assert_eq!(
+            diagnostic.allowed_kinds.as_deref(),
+            Some(&["Repository"][..])
+        );
+    }
+
+    #[test]
+    fn scan_coverage_incident_without_repository_container_is_flagged() {
+        // The gap case (PR #400 Codex P2): a `ScanCoverage` node made incident by
+        // some edge OTHER than its required `Repository —CONTAINS→` container —
+        // here `ScanCoverage —MENTIONS→ Symbol`. The orphan check treats the
+        // incident edge as sufficient, and the target-conditioned source-kind
+        // check fires only on an actual `CONTAINS → ScanCoverage` edge, so before
+        // the explicit required-container invariant this graph validated CLEAN.
+        // It must instead report `missing_required_container` naming the coverage
+        // node — and exactly that one defect (the Symbol target needs no inbound
+        // rule).
+        let records = vec![
+            node("n:coverage", NodeKind::ScanCoverage),
+            node("n:sym", NodeKind::Symbol),
+            edge("e:mentions", EdgeLabel::Mentions, "n:coverage", "n:sym"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![MISSING_REQUIRED_CONTAINER]);
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.record_id.as_deref(), Some("n:coverage"));
+        assert_eq!(diagnostic.kind, Some("ScanCoverage"));
+    }
+
+    #[test]
+    fn scan_coverage_with_inbound_contains_edge_is_not_an_orphan() {
+        // The happy path the extractor emits: `Repository —CONTAINS→
+        // ScanCoverage`. The inbound edge makes the coverage node incident, so
+        // it validates cleanly.
+        let records = vec![
+            node("n:repo", NodeKind::Repository),
+            node("n:coverage", NodeKind::ScanCoverage),
+            edge("e:contains", EdgeLabel::Contains, "n:repo", "n:coverage"),
+        ];
+        let report = validate_records(&records);
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn file_contains_scan_coverage_is_a_source_kind_defect() {
+        // Issue #135: a `ScanCoverage` summary must be contained by the
+        // `Repository` it scopes. A malformed `File —CONTAINS→ ScanCoverage`
+        // passes the label-only target-kind check (CONTAINS permits ScanCoverage
+        // as target) and the inbound edge makes the coverage node incident
+        // (dodging the orphan check). It legitimately reports TWO distinct,
+        // complementary defects: `edge_source_kind_violation` (the edge's source
+        // kind is `File`, not `Repository`) AND `missing_required_container` (no
+        // valid `Repository —CONTAINS→` container exists for the node). Neither is
+        // suppressed to reduce count; they name the malformed edge and the missing
+        // container respectively. Codes sort by category
+        // (`edge_source_kind_violation` < `missing_required_container`).
+        let records = vec![
+            node("n:file", NodeKind::File),
+            node("n:coverage", NodeKind::ScanCoverage),
+            edge("e:contains", EdgeLabel::Contains, "n:file", "n:coverage"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(
+            codes,
+            vec![EDGE_SOURCE_KIND_VIOLATION, MISSING_REQUIRED_CONTAINER]
+        );
+        let source_kind = &report.diagnostics[0];
+        assert_eq!(source_kind.record_id.as_deref(), Some("n:file"));
+        assert_eq!(source_kind.kind, Some("File"));
+        assert_eq!(source_kind.target_id.as_deref(), Some("n:coverage"));
+        assert_eq!(source_kind.target_kind, Some("ScanCoverage"));
+        assert_eq!(
+            source_kind.allowed_kinds.as_deref(),
+            Some(&["Repository"][..])
+        );
+        let missing_container = &report.diagnostics[1];
+        assert_eq!(missing_container.record_id.as_deref(), Some("n:coverage"));
+        assert_eq!(missing_container.kind, Some("ScanCoverage"));
+    }
+
+    #[test]
+    fn repository_contains_scan_coverage_is_clean() {
+        // The happy path the extractor emits: `Repository —CONTAINS→
+        // ScanCoverage` satisfies the issue #135 source constraint and validates
+        // cleanly.
+        let records = vec![
+            node("n:repo", NodeKind::Repository),
+            node("n:coverage", NodeKind::ScanCoverage),
+            edge("e:contains", EdgeLabel::Contains, "n:repo", "n:coverage"),
+        ];
+        let report = validate_records(&records);
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn scan_coverage_container_source_shadowed_to_file_is_rejected() {
+        // Issue #391 / PR #400 Codex P2: the container source `n:x` is emitted
+        // first as a valid `Repository`, then re-emitted as a `File`. Under
+        // LAST-write-wins the CURRENT kind is `File`, so the daemon-parity
+        // resolution the sibling source-kind gates use must catch it: the
+        // historical `node_kinds` SET still contains `Repository`, but the current
+        // kind is not `Repository`. Two complementary defects follow —
+        // `edge_source_kind_violation` (the `CONTAINS → ScanCoverage` source's
+        // last-write kind is `File`, not `Repository`) AND
+        // `missing_required_container` (no valid `Repository —CONTAINS→` container
+        // survives). Neither may be masked by the stale earlier valid version.
+        let records = vec![
+            node("n:x", NodeKind::Repository),
+            node("n:x", NodeKind::File),
+            node("n:coverage", NodeKind::ScanCoverage),
+            edge("e:contains", EdgeLabel::Contains, "n:x", "n:coverage"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "CONTAINS→ScanCoverage off a Repository shadowed to File must flag the source kind, got {codes:?}"
+        );
+        assert!(
+            codes.contains(&MISSING_REQUIRED_CONTAINER),
+            "the coverage node's only container's last-write kind is File, so it has no valid Repository container, got {codes:?}"
+        );
+        let source_kind = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == EDGE_SOURCE_KIND_VIOLATION)
+            .expect("source-kind defect present");
+        // The cited kind is the RESOLVED last-write kind, never the set's minimum.
+        assert_eq!(source_kind.record_id.as_deref(), Some("n:x"));
+        assert_eq!(source_kind.kind, Some("File"));
+        assert_eq!(source_kind.target_id.as_deref(), Some("n:coverage"));
+        assert_eq!(source_kind.target_kind, Some("ScanCoverage"));
+        let missing_container = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == MISSING_REQUIRED_CONTAINER)
+            .expect("missing-container defect present");
+        assert_eq!(missing_container.record_id.as_deref(), Some("n:coverage"));
+        assert_eq!(missing_container.kind, Some("ScanCoverage"));
+    }
+
+    #[test]
+    fn scan_coverage_container_source_shadowed_to_repository_is_clean() {
+        // Inverse ordering proves the resolution is genuinely LAST-write, not
+        // first-write and not any-match: the container source `n:x` is emitted
+        // first as a `File`, THEN re-emitted as a `Repository`. Its last-write
+        // kind is `Repository`, so the `CONTAINS → ScanCoverage` edge is a valid
+        // container and the graph validates cleanly — even though the historical
+        // `node_kinds` SET also contains the (now-shadowed) `File` kind. A
+        // first-write or any-match resolver would misclassify one of the two
+        // orderings; only last-write accepts this one and rejects its mirror
+        // (`scan_coverage_container_source_shadowed_to_file_is_rejected`).
+        let records = vec![
+            node("n:x", NodeKind::File),
+            node("n:x", NodeKind::Repository),
+            node("n:coverage", NodeKind::ScanCoverage),
+            edge("e:contains", EdgeLabel::Contains, "n:x", "n:coverage"),
+        ];
+        let report = validate_records(&records);
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
     }
 
     #[test]

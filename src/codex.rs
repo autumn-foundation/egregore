@@ -1630,6 +1630,7 @@ fn make_node(
         transition_kind: None,
         dependency: None,
         log: None,
+        scan_coverage: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
     }

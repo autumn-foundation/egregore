@@ -88,6 +88,44 @@ store, an empty directory, or an initialized store holding zero Egregore
 records fails with a diagnostic naming the path — never successful zero
 counts. See `docs/cli/inspect.md` for the JSON contract.
 
+`eg scan` makes file-level indexing coverage a stated, deterministic, queryable
+fact (issue #135): one `ScanCoverage` node rides in the JSONL (attached to its
+`Repository` by a `CONTAINS` edge, so it is citable, non-orphan, and validates
+under `eg validate`) carrying `files_walked`, `files_indexed`,
+`skipped_by_extension` (a sorted per-lowercased-extension tally, `""` for
+no-extension), the named indexed-language scope, and `coverage_complete`.
+`files_indexed` counts every walked file that received a graph `File` node — from
+source-symbol extraction OR from a non-source File producer such as
+manifest/dependency extraction (#180), so a tracked `Cargo.toml` that declares
+dependencies is counted INDEXED (it gets a `File` node + queryable
+`DependencyDeclaration` facts), never mislabeled under `skipped_by_extension`;
+the tally is finalized (`reconcile_scan_coverage`) after all File-producing
+extractors run, so any future non-source File producer is covered too. A
+`Cargo.toml` with no dependencies mints no `File` node and stays honestly
+skipped under `toml`. `indexed_languages` names the parsed SOURCE-language scope
+specifically (manifests are not a "language" and add no entry). On a Git working
+tree `eg scan` also prints a human-readable summary to stderr
+(`scan coverage: N files walked, M indexed, K skipped` + skipped-by-extension +
+`indexed languages: Rust, Python, TypeScript, Go`). The named scope is the REAL
+4-language extractor capability (Rust/Python/TypeScript/Go), derived from
+`languages::Language::ALL` — the issue's "Rust only" text was stale. Excluded
+directories (`.git`, `target`, nested Git worktrees) are never walked, so they
+never dilute the counts (AC7); when `coverage_complete` is true,
+`files_indexed + sum(skipped_by_extension) == files_walked` (AC4). The non-Git
+filesystem-walk fallback has no walked/skipped denominator, so it reports
+best-effort counts with `coverage_complete: false` and suppresses the stderr
+summary rather than fabricate one. `eg inspect` surfaces the same coverage block
+over both `--graph` and `--data-dir`, so an agent can tell "0 results because
+absent" from "0 results because that file was never indexed". Over `--graph`,
+equal-ID `ScanCoverage` versions in an exported JSONL are collapsed to the
+freshest by `valid_time` instant; because the full scan stamps seconds precision
+and the record carries no subsecond/write-order signal, two scans within the
+same UTC second cannot be ordered from the file (tiebreak is arbitrary w.r.t.
+recency) — use `--data-dir` (authoritative, ordered by store write-order) for
+sub-second re-scan scenarios (known limitation, issue #406). The
+`codegraph` `SCHEMA_VERSION` is 6 (bumped 5→6 for the `ScanCoverage` node). See
+`docs/cli/scan.md` and `docs/cli/inspect.md`.
+
 `eg export --data-dir <dir> --out <file.jsonl>` dumps every persisted record of
 an embedded store back to canonical JSONL — the inverse of `eg ingest`, distinct
 from the #68 evidence bundle (no header, manifest, run id, or timestamp). It
