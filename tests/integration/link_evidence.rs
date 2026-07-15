@@ -119,6 +119,7 @@ fn make_agent_memory_node(
         doc: None,
         call_context: None,
         note: None,
+        content_signature: None,
         temporal: None,
         semantic_drift: None,
         evidence_links: None,

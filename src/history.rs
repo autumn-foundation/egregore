@@ -427,6 +427,13 @@ fn change_record(repository_id: &str, commit: &GitCommit, change: &GitChange) ->
     .with_temporal(commit.temporal())
 }
 
+/// Gates ONLY the two `CHANGED_IN` edges (to the commit and to the change) —
+/// which are minted for `File`/`Symbol` nodes in a changed path. It does NOT gate
+/// temporal-history membership: every record (Module, Import, etc.) is stamped
+/// with `commit.temporal()` and `graph.push`-ed at every commit via the `else`
+/// arm of the caller, so Module/Import body drift stays content-comparable in
+/// scan-history (issue #206; end-to-end regression:
+/// `scan_history_detects_inline_module_body_drift_end_to_end`).
 const fn is_temporal_change_target(record: &GraphRecord) -> bool {
     matches!(
         record,

@@ -24,6 +24,7 @@ mod error_context;
 mod eval;
 mod evidence;
 mod evidence_freshness;
+mod export;
 mod failure_history;
 mod file_at_point;
 mod forget;
@@ -89,6 +90,7 @@ pub(crate) use error_context::*;
 pub(crate) use eval::*;
 pub(crate) use evidence::*;
 pub(crate) use evidence_freshness::*;
+pub(crate) use export::*;
 pub(crate) use failure_history::*;
 pub(crate) use file_at_point::*;
 pub(crate) use forget::*;
@@ -504,6 +506,30 @@ pub(crate) enum Commands {
         #[cfg(feature = "embeddings")]
         #[arg(long)]
         embed: bool,
+    },
+    /// Export every persisted record from an embedded store as canonical JSONL.
+    ///
+    /// The inverse of `eg ingest` (distinct from the issue #68 evidence
+    /// bundle): reads an embedded `AletheiaDB` store directly — no daemon, no
+    /// network, no embeddings — and writes every persisted graph record (nodes,
+    /// edges, valid-time tombstones, diagnostics, superseded versions, and
+    /// unknown-version records) across all domains, in the exact record shapes
+    /// `eg scan` / `eg ingest` emit (issue #155).
+    ///
+    /// Uses the same physical read surface as `eg inspect --data-dir`, so
+    /// re-ingesting the output reproduces the inspect totals and
+    /// per-domain/kind/schema-version counts. The one deliberate exception:
+    /// a record hidden by `eg forget` (issue #231) is never re-emitted, so its
+    /// retracted body cannot resurface. Output carries no header, manifest, or
+    /// timestamp and is byte-identical across runs on an unchanged store; the
+    /// read is strictly read-only. See `docs/cli/export.md`.
+    Export {
+        /// Embedded `AletheiaDB` data directory to export.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Output JSONL path (created or overwritten).
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Import a rust-swe-agent .traj trajectory file into agent-memory JSONL.
     ImportTraj {
@@ -3256,6 +3282,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             #[cfg(feature = "embeddings")]
             embed,
         ),
+        Commands::Export { data_dir, out } => export(&data_dir, &out),
         Commands::ImportTraj {
             traj_path,
             out,

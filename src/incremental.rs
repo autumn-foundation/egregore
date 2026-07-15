@@ -70,10 +70,29 @@ use crate::{
 /// serde-default, but a bump forces older caches to rebuild so reused per-file
 /// facts carry the verdict rather than defaulting it to `false`.
 ///
+/// v15 adds the `content_signature` field to Node records: a Rust `Module` node
+/// carries a compact BLAKE3 handle over its normalized body so a body change
+/// with an unchanged name/path is content-detectable by evidence-freshness drift
+/// (issue #206). (`Import` nodes intentionally do NOT carry it — an import's
+/// stable ID already encodes its full `use ...;` declaration, so a body change
+/// mints a new ID and surfaces as a handle-identity change, never a content
+/// drift.) The field is serde-default, but an unchanged file served from an
+/// older cache would lack it and hash inconsistently against freshly-rebuilt
+/// neighbors, so the bump forces older caches to rebuild. (13/14 are reserved
+/// for concurrent lanes; this lane takes 15.)
+/// v13 adds crate-root partitioning of the cross-file `IMPLEMENTS` index
+/// (issue #394: the serde-default `crate_root` on each `impl_targets` /
+/// `pending_impls` fact) and import-aware bare-name resolution (issue #393: the
+/// new `use_trait_imports` per-file vector capturing the resolved path each
+/// module-item `use` binds). The fields are serde-default, but a bump forces
+/// older caches to rebuild so reused per-file facts carry the crate root and
+/// import paths rather than defaulting them, recovering the recall PR #389 left
+/// conservatively unresolved.
+///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 12;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 15;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

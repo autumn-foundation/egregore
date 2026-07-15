@@ -18,7 +18,7 @@ use crate::{
         },
         cross_file::{
             CallKind, CallSiteFact, DefinitionFact, FileFacts, ImplTargetFact, OutOfLineModFact,
-            PendingImplFact,
+            PendingImplFact, UseImportFact, crate_root_id,
         },
     },
     redaction::REDACTION_POLICY_VERSION,
@@ -76,6 +76,7 @@ pub fn extract_file_source(
     let mut extractor = RustExtractor::new(file, file_id, repository_id, graph, source);
     extractor.walk(tree.root_node());
     extractor.resolve_pending_impl_edges();
+    extractor.finalize_use_imports();
     extractor.emit_reference_edges();
     Ok(extractor.facts)
 }
@@ -159,6 +160,28 @@ struct RustExtractor<'graph, 'source> {
     /// import, not any local same-name definition, so the impl is left
     /// unresolved (correct import-aware resolution is follow-up #393).
     imports_by_scope: BTreeMap<Vec<String>, BTreeSet<String>>,
+    /// Import PATHS each module-item `use` binds into scope (issue #393):
+    /// module scope -> (bound simple name -> the SET of distinct import paths as
+    /// written). Populated from the SAME module-item `use` declarations as
+    /// `imports_by_scope`, so the import-aware cross-file `IMPLEMENTS` resolver
+    /// respects the identical Rust-visibility scoping the veto uses. Serialized
+    /// into `FileFacts::use_trait_imports`; the deferred cross-file pass resolves
+    /// the path so `use crate::a::T; impl T for Foo` binds `a::T`, not a root `T`.
+    ///
+    /// The value is a `BTreeSet` — NOT a last-wins single path — so a simple name
+    /// bound to two DISTINCT paths in one scope (`#[cfg(feature = "std")] use
+    /// std::fmt::Display;` alongside `#[cfg(not(feature = "std"))] use
+    /// crate::local::Display;`) preserves BOTH bindings (Codex round-4 finding E,
+    /// PR #399). Collapsing them to one path let the resolver mint a local edge in
+    /// the configuration where the name is external; keeping both surfaces the
+    /// collision as `use_trait_imports` multiplicity the resolver treats as
+    /// ambiguous — no import-aware resolution, no edge (the conservative
+    /// pre-#393 shadow-veto outcome).
+    import_paths_by_scope: BTreeMap<Vec<String>, BTreeMap<String, BTreeSet<String>>>,
+    /// The crate root this file belongs to (issue #394), stamped onto every
+    /// exported trait/type and pending-impl fact so the repo-wide index can
+    /// partition same-named root definitions across crate roots.
+    crate_root: String,
     /// Impl trait lookups deferred to after the walk (source order).
     pending_impl_edges: Vec<PendingImplEdge>,
     symbol_bodies: Vec<SymbolBody>,
@@ -203,6 +226,8 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             qualified_definitions: BTreeMap::new(),
             type_definitions: BTreeMap::new(),
             imports_by_scope: BTreeMap::new(),
+            import_paths_by_scope: BTreeMap::new(),
+            crate_root: crate_root_id(&file.repo_relative_path),
             pending_impl_edges: Vec::new(),
             symbol_bodies: Vec::new(),
             symbol_ordinals: BTreeMap::new(),
@@ -275,11 +300,14 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 "rust",
                 format!("Rust module {qualified_name}"),
             )
-            .with_declaration_surface(
-                Some(self.symbol_visibility(node).to_owned()),
-                None,
-                None,
-            ),
+            .with_declaration_surface(Some(self.symbol_visibility(node).to_owned()), None, None)
+            // The module summary is name-only, so a body change with an
+            // unchanged name would hash identically. Stamp a compact BLAKE3
+            // handle over the normalized body so evidence-freshness drift stays
+            // content-detectable (issue #206). Inline `mod foo { .. }` covers
+            // the whole body; out-of-line `mod foo;` covers just the
+            // declaration (the target file's own records carry its body).
+            .with_content_signature(content_signature(self.node_text(node))),
         );
         self.add_edge(
             EdgeLabel::Contains,
@@ -405,6 +433,21 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                     .or_default()
                     .extend(bound);
             }
+            // Capture the resolved import PATH for each bound simple name
+            // (issue #393), keyed by the same module scope, so the cross-file
+            // resolver can bind a bare imported trait/type name to its true
+            // aliased target instead of vetoing it. Glob imports bind no simple
+            // name and contribute nothing here (they stay bounded out).
+            for (simple, path) in use_bound_import_paths(node, self.source) {
+                // Insert into the per-name SET (not last-wins) so a cfg-gated
+                // same-name collision keeps every distinct binding (finding E).
+                self.import_paths_by_scope
+                    .entry(self.module_names.clone())
+                    .or_default()
+                    .entry(simple)
+                    .or_default()
+                    .insert(path);
+            }
         }
         let name = import_name(self.node_text(node));
         let id = stable_id(&[
@@ -414,6 +457,14 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             &self.file.repo_relative_path,
             &name,
         ]);
+        // Imports carry NO `content_signature`: the import stable ID already
+        // encodes the full `use ...;` declaration (via `import_name`, the whole
+        // trimmed path — not the bound leaf), so any body change (glob
+        // expansion, alias, added path segment) mints a DIFFERENT record ID. A
+        // content signature could therefore never be the drift trigger for an
+        // import — two versions with differing bodies never share an ID for
+        // evidence-freshness to compare within. Such a change surfaces as a
+        // handle-identity change (`unresolved`/removed), not `drifted` (#206).
         let mut record = GraphRecord::syntax_node(
             id.clone(),
             NodeKind::Import,
@@ -477,6 +528,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             self.facts.impl_targets.push(ImplTargetFact {
                 id: id.clone(),
                 qualified_name: qualified_name.clone(),
+                crate_root: self.crate_root.clone(),
                 module_path: self.module_names.clone(),
                 symbol_kind: symbol_kind.to_owned(),
             });
@@ -1219,6 +1271,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                         self.facts.pending_impls.push(PendingImplFact {
                             source_id: entry.source_id,
                             trait_path: trait_name,
+                            crate_root: self.crate_root.clone(),
                             module_names: entry.module_names,
                             shadowed_by_use,
                         });
@@ -1245,6 +1298,56 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 ImplTargetDecision::NoEdge => {}
             }
         }
+    }
+
+    /// Serializes the captured module-item `use`-import PATHS relevant to this
+    /// file's bare pending impls into [`FileFacts::use_trait_imports`] (issue
+    /// #393), so the deferred cross-file resolver can bind a bare imported
+    /// trait/type name to its true aliased target. Only imports that a bare
+    /// pending impl in the SAME module scope actually names are emitted, keeping
+    /// the fact vector (and cache) minimal. Output is deterministically ordered.
+    fn finalize_use_imports(&mut self) {
+        let mut seen: BTreeSet<(Vec<String>, String)> = BTreeSet::new();
+        let mut imports: Vec<UseImportFact> = Vec::new();
+        for pending in &self.facts.pending_impls {
+            if pending.trait_path.contains("::") {
+                continue;
+            }
+            let key = (pending.module_names.clone(), pending.trait_path.clone());
+            if seen.contains(&key) {
+                continue;
+            }
+            if let Some(paths) = self
+                .import_paths_by_scope
+                .get(&pending.module_names)
+                .and_then(|scope| scope.get(&pending.trait_path))
+            {
+                seen.insert(key);
+                // Emit ONE fact per DISTINCT resolved path (finding E): a bare
+                // name bound to 2+ paths by cfg-gated imports surfaces as
+                // multiple `use_trait_imports` entries the resolver treats as
+                // ambiguous (`lookup_use_import` returns `None` on distinct-path
+                // multiplicity), so import-aware resolution never fires and no
+                // edge is minted. A single binding still emits exactly one fact.
+                for path in paths {
+                    imports.push(UseImportFact {
+                        module_names: pending.module_names.clone(),
+                        simple_name: pending.trait_path.clone(),
+                        resolved_path: path.clone(),
+                    });
+                }
+            }
+        }
+        // Sort by resolved_path too so multiple same-name facts are ordered
+        // deterministically (byte-identical output across runs).
+        imports.sort_by(|a, b| {
+            (&a.module_names, &a.simple_name, &a.resolved_path).cmp(&(
+                &b.module_names,
+                &b.simple_name,
+                &b.resolved_path,
+            ))
+        });
+        self.facts.use_trait_imports = imports;
     }
 
     /// Resolves a normalized impl trait path against THIS file's indexed
@@ -1892,6 +1995,94 @@ fn collect_use_tree_names(node: Node<'_>, source: &str, out: &mut Vec<String>) {
     }
 }
 
+/// Collects the `(bound simple name, import path as written)` pairs a `use`
+/// declaration introduces into its enclosing scope, walking the Tree-sitter
+/// parse tree (issue #393). The import PATH is what the cross-file resolver
+/// resolves so a bare imported trait/type name binds its true target
+/// (`use crate::a::T;` → `("T", "crate::a::T")`). Handles the plain, alias
+/// (`use a::b::T as U;` → `("U", "a::b::T")`), grouped (`use a::{B, C::D};` →
+/// `("B", "a::B")`, `("D", "a::C::D")`, including nested groups), and glob
+/// (`use a::*;` binds no simple name, contributes nothing) forms — the same
+/// surface [`use_bound_names`] covers, kept in lock-step so the veto's bound
+/// names and the resolver's import paths never disagree.
+fn use_bound_import_paths(node: Node<'_>, source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(argument) = node.child_by_field_name("argument") {
+        collect_use_tree_paths(argument, source, "", &mut out);
+    }
+    out
+}
+
+/// Joins a use-tree prefix with a trailing segment path (`::`-separated),
+/// dropping an empty prefix.
+fn join_use_path(prefix: &str, tail: &str) -> String {
+    if prefix.is_empty() {
+        tail.to_owned()
+    } else {
+        format!("{prefix}::{tail}")
+    }
+}
+
+/// Recursive worker for [`use_bound_import_paths`], accumulating the path prefix
+/// as it descends group nodes. Mirrors [`collect_use_tree_names`] node-for-node
+/// so the bound-name set stays identical.
+fn collect_use_tree_paths(
+    node: Node<'_>,
+    source: &str,
+    prefix: &str,
+    out: &mut Vec<(String, String)>,
+) {
+    match node.kind() {
+        "identifier" | "type_identifier" => {
+            let name = node_source(node, source).trim().to_owned();
+            let full = join_use_path(prefix, &name);
+            out.push((name, full));
+        }
+        "scoped_identifier" => {
+            // `path::name`: the whole scoped identifier is the import path; its
+            // final `name` segment is the bound simple name.
+            if let Some(name) = node.child_by_field_name("name")
+                && matches!(name.kind(), "identifier" | "type_identifier")
+            {
+                let simple = node_source(name, source).trim().to_owned();
+                let written = node_source(node, source).trim().to_owned();
+                let full = join_use_path(prefix, &written);
+                out.push((simple, full));
+            }
+        }
+        "use_as_clause" => {
+            // `path as alias` binds the alias to the path (not its final
+            // segment): `use a::b::T as U;` → `("U", "a::b::T")`.
+            if let Some(alias) = node.child_by_field_name("alias")
+                && matches!(alias.kind(), "identifier" | "type_identifier")
+                && let Some(path) = node.child_by_field_name("path")
+            {
+                let simple = node_source(alias, source).trim().to_owned();
+                let written = node_source(path, source).trim().to_owned();
+                let full = join_use_path(prefix, &written);
+                out.push((simple, full));
+            }
+        }
+        "scoped_use_list" => {
+            let new_prefix = node.child_by_field_name("path").map_or_else(
+                || prefix.to_owned(),
+                |path| join_use_path(prefix, node_source(path, source).trim()),
+            );
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_use_tree_paths(list, source, &new_prefix, out);
+            }
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_use_tree_paths(child, source, prefix, out);
+            }
+        }
+        // `use_wildcard` (glob) and separator tokens name nothing.
+        _ => {}
+    }
+}
+
 /// Reports whether a `use_declaration` is a MODULE ITEM — a direct child of the
 /// `source_file` root or of a `mod_item`'s `declaration_list` body — as opposed
 /// to a `use` nested inside a function body, `block`, or expression. Only a
@@ -2441,6 +2632,18 @@ fn module_path_from_file_parts(parts: &[&str]) -> Vec<String> {
 #[allow(dead_code)]
 fn _path_for_error(path: &std::path::Path) -> PathBuf {
     path.to_path_buf()
+}
+
+/// Compact BLAKE3 content signature over the normalized source body (issue #206).
+///
+/// Used to stamp `Module` / `Import` nodes whose display `summary` is name-only
+/// so a body change with an unchanged name stays content-detectable by
+/// evidence-freshness drift. Deterministic: [`normalize_code`] is byte-stable,
+/// so CRLF and LF checkouts yield the same handle.
+#[must_use]
+pub fn content_signature(body: &str) -> String {
+    let normalized = normalize_code(body);
+    format!("blake3:{}", blake3::hash(normalized.as_bytes()).to_hex())
 }
 
 /// Normalizes source code by stripping comments and collapsing whitespace.
@@ -3303,6 +3506,60 @@ mod tests {
         );
     }
 
+    /// Parses one `use` declaration and returns the `(simple name, import path)`
+    /// pairs it binds, driving [`use_bound_import_paths`] as the extractor does.
+    fn parse_use_import_paths(source: &str) -> Vec<(String, String)> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load rust grammar");
+        let tree = parser.parse(source, None).expect("parse source");
+        let use_node = find_use_declaration(tree.root_node()).expect("use_declaration present");
+        use_bound_import_paths(use_node, source)
+    }
+
+    #[test]
+    fn use_bound_import_paths_capture_resolved_paths(/* issue #393 */) {
+        // Plain `use crate::a::T;` binds `T` to the full import path.
+        assert_eq!(
+            parse_use_import_paths("use crate::a::T;"),
+            vec![("T".to_owned(), "crate::a::T".to_owned())]
+        );
+        // A bare `use T;` binds `T` to `T`.
+        assert_eq!(
+            parse_use_import_paths("use T;"),
+            vec![("T".to_owned(), "T".to_owned())]
+        );
+        // `use crate::a::T as U;` binds the alias `U` to the aliased PATH, never
+        // the alias text.
+        assert_eq!(
+            parse_use_import_paths("use crate::a::T as U;"),
+            vec![("U".to_owned(), "crate::a::T".to_owned())]
+        );
+        // Grouped `use crate::a::{T};` distributes the group prefix.
+        assert_eq!(
+            parse_use_import_paths("use crate::a::{T};"),
+            vec![("T".to_owned(), "crate::a::T".to_owned())]
+        );
+        // Grouped with nested path + inner alias.
+        assert_eq!(
+            parse_use_import_paths("use crate::a::{B, C::D as E};"),
+            vec![
+                ("B".to_owned(), "crate::a::B".to_owned()),
+                ("E".to_owned(), "crate::a::C::D".to_owned()),
+            ]
+        );
+        // A glob binds no simple name, so it contributes no path — it stays
+        // bounded out of import-aware resolution.
+        assert!(parse_use_import_paths("use crate::a::*;").is_empty());
+        // `super::`/`self::` prefixes are preserved verbatim for the resolver to
+        // normalize against the impl's module scope.
+        assert_eq!(
+            parse_use_import_paths("use super::a::T;"),
+            vec![("T".to_owned(), "super::a::T".to_owned())]
+        );
+    }
+
     #[test]
     fn scope_imports_bare_name_consults_only_the_impls_own_scope() {
         // Rust `use` visibility is NOT inherited by child modules: the veto
@@ -4048,5 +4305,137 @@ mod tests {
             "only the comment marker may match; the string literal never does"
         );
         assert_eq!(markers[0].note(), Some("real marker"));
+    }
+
+    /// Extracts `source` and returns the graph records (issue #206 helpers).
+    fn extract_records(source: &str) -> Graph {
+        let file = SourceFile {
+            path: PathBuf::from("src/lib.rs"),
+            repo_relative_path: "src/lib.rs".to_owned(),
+        };
+        let mut graph = Graph::default();
+        extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        graph
+    }
+
+    fn find_node(graph: &Graph, want: NodeKind) -> &GraphRecord {
+        graph
+            .records()
+            .iter()
+            .find(|r| matches!(r, GraphRecord::Node { kind, .. } if *kind == want))
+            .expect("node of requested kind present")
+    }
+
+    #[test]
+    fn module_carries_deterministic_content_signature() {
+        // A module summary is name-only (issue #206) and its stable ID is keyed
+        // on the qualified NAME alone, so an inline-body edit keeps the same ID.
+        // The extractor stamps a compact BLAKE3 body signature so that
+        // same-ID body drift stays content-detectable. It must be present,
+        // well-formed, and byte-stable across identical extractions. Imports
+        // carry NO signature (their ID already encodes the full declaration).
+        let source = "\
+use std::collections::BTreeMap;
+
+pub mod inner {
+    pub fn helper() -> u32 {
+        1
+    }
+}
+";
+        let graph = extract_records(source);
+        let module = find_node(&graph, NodeKind::Module);
+        let import = find_node(&graph, NodeKind::Import);
+
+        let module_sig = module
+            .content_signature()
+            .expect("module content_signature");
+        assert!(module_sig.starts_with("blake3:"));
+        // Imports no longer carry a content signature.
+        assert_eq!(import.content_signature(), None);
+
+        // Deterministic: re-extracting identical source yields identical handles.
+        let graph2 = extract_records(source);
+        assert_eq!(
+            find_node(&graph2, NodeKind::Module).content_signature(),
+            Some(module_sig)
+        );
+        assert_eq!(
+            find_node(&graph2, NodeKind::Import).content_signature(),
+            None
+        );
+    }
+
+    #[test]
+    fn content_signature_changes_with_module_body() {
+        // A module body edit that leaves the name unchanged keeps the module's
+        // stable ID (keyed on qualified name only) but must produce a different
+        // content signature — exactly what makes the module body drift
+        // detectable as a ContentChange within one ID group (issue #206).
+        let base = "\
+pub mod inner {
+    pub fn helper() -> u32 {
+        1
+    }
+}
+";
+        let changed_mod = "\
+pub mod inner {
+    pub fn helper() -> u32 {
+        2
+    }
+}
+";
+        let base_graph = extract_records(base);
+        let base_mod = find_node(&base_graph, NodeKind::Module)
+            .content_signature()
+            .expect("sig")
+            .to_owned();
+
+        let mod_graph = extract_records(changed_mod);
+        assert_ne!(
+            find_node(&mod_graph, NodeKind::Module).content_signature(),
+            Some(base_mod.as_str()),
+            "changed module body must change the signature"
+        );
+    }
+
+    #[test]
+    fn import_body_change_is_a_record_identity_change() {
+        // An import body change (here adding an `as` alias) mints a DIFFERENT
+        // stable record ID, because `import_name` — a hash component of the ID —
+        // is the whole trimmed `use ...;` declaration, not the bound leaf. So
+        // the two versions never share an ID for evidence-freshness to compare a
+        // signature within; the change surfaces as a handle-identity change
+        // (`unresolved`/removed), never a ContentChange drift (issue #206).
+        let base = "use std::collections::BTreeMap;\n";
+        let changed = "use std::collections::BTreeMap as Map;\n";
+        let base_graph = extract_records(base);
+        let changed_graph = extract_records(changed);
+        let base_import = find_node(&base_graph, NodeKind::Import).id();
+        let changed_import = find_node(&changed_graph, NodeKind::Import).id();
+        assert_ne!(
+            base_import, changed_import,
+            "an import body change must mint a different record ID"
+        );
+    }
+
+    #[test]
+    fn only_module_nodes_carry_content_signature() {
+        // content_signature is scoped to Module (issue #206). Symbols embed the
+        // normalized body in their own summary, imports encode the full
+        // declaration in their ID, and the File node is minted upstream; none of
+        // them carry a signature, so their content hash stays byte-unchanged.
+        let source = "use std::collections::BTreeMap;\n\npub fn f() -> u32 {\n    1\n}\n";
+        let graph = extract_records(source);
+        assert_eq!(
+            find_node(&graph, NodeKind::Symbol).content_signature(),
+            None
+        );
+        assert_eq!(
+            find_node(&graph, NodeKind::Import).content_signature(),
+            None
+        );
     }
 }

@@ -1269,9 +1269,27 @@ impl EmbeddedAletheiaSink {
                 };
                 report.records.push(record);
             } else {
-                report
-                    .unknown_schema_versions
-                    .push(crate::schema_version::UnknownSchemaVersion::new(version));
+                // Preserve the reconstructed canonical record line so `eg export`
+                // (issue #155) can re-emit an unknown-version record verbatim.
+                // A record physically present via the normal `eg ingest` path
+                // always carries a known kind and every required property, so
+                // reconstruction succeeds; only an artificially raw-injected node
+                // lacking a required property (e.g. `summary`) reconstructs to
+                // `None`, which export surfaces as an enumerated skip diagnostic
+                // rather than a silent drop. Counting behavior is unchanged: the
+                // record is still counted only under `unknown_schema_versions`.
+                let raw_line = if record_type.as_deref() == Some("tombstone") {
+                    self.read_tombstone_record_internal(&record_id, node_id)
+                } else {
+                    self.read_node_record_internal(&record_id, node_id)
+                }
+                .ok()
+                .as_ref()
+                .and_then(|record| serde_json::to_string(record).ok());
+                report.unknown_schema_versions.push(
+                    crate::schema_version::UnknownSchemaVersion::new(version)
+                        .with_raw_line(raw_line),
+                );
             }
         }
 
@@ -1298,9 +1316,17 @@ impl EmbeddedAletheiaSink {
                     let record = self.read_edge_record_internal(&codegraph_id, edge_id)?;
                     report.records.push(record);
                 } else {
-                    report
-                        .unknown_schema_versions
-                        .push(crate::schema_version::UnknownSchemaVersion::new(version));
+                    // Preserve the reconstructed canonical edge line for
+                    // `eg export` (issue #155); see the node branch above.
+                    let raw_line = self
+                        .read_edge_record_internal(&codegraph_id, edge_id)
+                        .ok()
+                        .as_ref()
+                        .and_then(|record| serde_json::to_string(record).ok());
+                    report.unknown_schema_versions.push(
+                        crate::schema_version::UnknownSchemaVersion::new(version)
+                            .with_raw_line(raw_line),
+                    );
                 }
             }
         }
@@ -2172,6 +2198,7 @@ impl EmbeddedAletheiaSink {
             doc,
             call_context,
             note,
+            content_signature,
             temporal,
             semantic_drift,
             evidence_links,
@@ -2294,6 +2321,7 @@ impl EmbeddedAletheiaSink {
         builder = insert_optional(builder, "doc", doc.as_deref());
         builder = insert_optional(builder, "call_context", call_context.as_deref());
         builder = insert_optional(builder, "note", note.as_deref());
+        builder = insert_optional(builder, "content_signature", content_signature.as_deref());
         builder = insert_temporal(builder, temporal.as_ref());
         builder = insert_semantic_drift(builder, semantic_drift.as_deref());
         builder = insert_optional(builder, "node_valid_time", valid_time.as_deref());
@@ -3019,6 +3047,11 @@ impl EmbeddedAletheiaSink {
                 node.get_property("call_context"),
             )?,
             note: optional_str_property(record_id, "note", node.get_property("note"))?,
+            content_signature: optional_str_property(
+                record_id,
+                "content_signature",
+                node.get_property("content_signature"),
+            )?,
             temporal: temporal_from_properties(record_id, |key| node.get_property(key))?,
             semantic_drift: semantic_drift_from_properties(record_id, |key| {
                 node.get_property(key)

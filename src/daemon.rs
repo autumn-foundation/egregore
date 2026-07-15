@@ -6282,14 +6282,11 @@ fn lookup_node_kind(
     batch: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<Option<NodeKind>> {
-    for r in batch.iter().rev() {
-        if r.id() == id {
-            return Ok(if let GraphRecord::Node { kind, .. } = r {
-                Some(*kind)
-            } else {
-                None
-            });
-        }
+    // In-batch resolution is delegated to the shared last-write-wins helper so
+    // this daemon path and the offline `eg validate` kind gates (issue #391) can
+    // never drift; the store `read_back` fallback below is unchanged.
+    if let Some(in_batch) = GraphRecord::resolve_node_kind_in_batch(id, batch) {
+        return Ok(in_batch);
     }
     match sink.read_back(id) {
         Ok(Some(GraphRecord::Node { kind, .. })) => Ok(Some(kind)),
@@ -11500,6 +11497,320 @@ mod tests {
                 daemon_resolved.as_deref(),
                 *expected,
                 "daemon lookup must resolve permutation `{name}` to the documented value"
+            );
+        }
+        Ok(())
+    }
+
+    /// One per-record shape for the daemon node-kind resolution parity test
+    /// (issue #391): a node of a given kind, or a non-node record (edge /
+    /// tombstone) sharing record id `n:x` that shadows an earlier node kind.
+    #[derive(Clone, Copy)]
+    enum NodeKindShape {
+        NodeOf(NodeKind),
+        EdgeShadow,
+        TombstoneShadow,
+    }
+
+    /// Builds a same-id (`n:x`) record batch from a forward sequence of per-record
+    /// shapes, mirroring the offline validator's `batch_from_node_kinds` helper
+    /// (issue #391). A non-node record carries record id `n:x` (its own id, not a
+    /// deleted-id) so it shadows an earlier node kind under last-write-wins.
+    fn node_kind_batch(sequence: &[NodeKindShape]) -> Vec<GraphRecord> {
+        sequence
+            .iter()
+            .map(|shape| match shape {
+                NodeKindShape::NodeOf(kind) => GraphRecord::node(
+                    "n:x".to_owned(),
+                    *kind,
+                    None,
+                    None,
+                    Some("x".to_owned()),
+                    "x node".to_owned(),
+                ),
+                NodeKindShape::EdgeShadow => GraphRecord::Edge {
+                    id: "n:x".to_owned(),
+                    schema_version: crate::ir::SCHEMA_VERSION,
+                    label: EdgeLabel::Defines,
+                    source: "n:a".to_owned(),
+                    target: "n:b".to_owned(),
+                    confidence: None,
+                    resolution: None,
+                    frame_resolution: None,
+                    frame_index: None,
+                    basis: None,
+                    temporal: None,
+                    summary: "x edge".to_owned(),
+                    producer: None,
+                },
+                NodeKindShape::TombstoneShadow => GraphRecord::Tombstone {
+                    id: "n:x".to_owned(),
+                    schema_version: crate::ir::SCHEMA_VERSION,
+                    deleted_id: "n:deleted".to_owned(),
+                    summary: "x tombstone".to_owned(),
+                    producer: None,
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lookup_node_kind_matches_shared_batch_helper() -> Result<()> {
+        // Issue #391 differential parity: the daemon's real in-batch resolution
+        // (`lookup_node_kind`, driven over a real EmbeddedAletheiaSink) must
+        // resolve a record id to the SAME value as the shared
+        // `GraphRecord::resolve_node_kind_in_batch` helper — the same helper the
+        // offline `eg validate` kind gates consult. The empty store makes the
+        // `read_back` fallback resolve `None` for the absent case; every other
+        // batch carries the id, pinning the in-batch scan exactly. A trailing
+        // non-node record must SHADOW an earlier node kind to `None`.
+        use NodeKindShape::{EdgeShadow, NodeOf, TombstoneShadow};
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let sink =
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?;
+
+        let permutations: &[(&str, Vec<NodeKindShape>, Option<NodeKind>)] = &[
+            (
+                "single_node",
+                vec![NodeOf(NodeKind::Symbol)],
+                Some(NodeKind::Symbol),
+            ),
+            (
+                "node_then_node_different_kind",
+                vec![NodeOf(NodeKind::Task), NodeOf(NodeKind::Symbol)],
+                Some(NodeKind::Symbol),
+            ),
+            (
+                "node_then_edge_shadow",
+                vec![NodeOf(NodeKind::Symbol), EdgeShadow],
+                None,
+            ),
+            (
+                "node_then_tombstone_shadow",
+                vec![NodeOf(NodeKind::Symbol), TombstoneShadow],
+                None,
+            ),
+            ("absent", vec![], None),
+            (
+                "same_kind_repeats",
+                vec![NodeOf(NodeKind::Task), NodeOf(NodeKind::Task)],
+                Some(NodeKind::Task),
+            ),
+        ];
+
+        for (name, sequence, expected) in permutations {
+            let records = node_kind_batch(sequence);
+
+            let daemon_resolved = lookup_node_kind("n:x", &records, &sink)
+                .expect("in-batch node-kind resolution never errors");
+            let helper_resolved =
+                GraphRecord::resolve_node_kind_in_batch("n:x", &records).flatten();
+
+            assert_eq!(
+                daemon_resolved, helper_resolved,
+                "daemon lookup and shared helper must agree on permutation `{name}`"
+            );
+            assert_eq!(
+                daemon_resolved, *expected,
+                "daemon lookup must resolve permutation `{name}` to the documented value"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn repeated_id_last_write_kind_gates_agree_with_validate() -> Result<()> {
+        // Issue #391 differential parity: for the adversarial repeated-ID batch (a
+        // valid kind first, then a wrong last-write kind), the daemon's
+        // `validate_project_edge` (`lookup_node_kind` + `validate_project_edge_kinds`)
+        // and the offline `eg validate` must AGREE on reject, across every
+        // kind-gated project edge; and the normal same-kind history re-emit must
+        // agree on ACCEPT. The daemon reverse-scans to the last-write kind, so an
+        // earlier valid kind never masks a trailing wrong one — the exact bug the
+        // offline validator's former set-any-match diverged on.
+
+        // A node carrying an importer source_kind, mirroring the batch shapes the
+        // offline validator's behavioral tests use.
+        fn kinded(id: &str, kind: NodeKind, source_kind: Option<&str>) -> GraphRecord {
+            let mut record = GraphRecord::node(
+                id.to_owned(),
+                kind,
+                None,
+                None,
+                Some("n".to_owned()),
+                "node".to_owned(),
+            );
+            if let GraphRecord::Node {
+                source_kind: sk, ..
+            } = &mut record
+            {
+                *sk = source_kind.map(str::to_owned);
+            }
+            record
+        }
+
+        // (name, edge label, source id, target id, batch, expect_reject)
+        struct Case {
+            name: &'static str,
+            label: EdgeLabel,
+            source: &'static str,
+            target: &'static str,
+            batch: Vec<GraphRecord>,
+            expect_reject: bool,
+        }
+
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let sink =
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?;
+
+        let cases = vec![
+            Case {
+                name: "merged_as_source_shadowed_to_symbol",
+                label: EdgeLabel::MergedAs,
+                source: "n:pr",
+                target: "n:commit",
+                batch: vec![
+                    kinded("n:pr", NodeKind::Task, Some("github_pr")),
+                    kinded("n:pr", NodeKind::Symbol, Some("github_pr")),
+                    kinded("n:commit", NodeKind::Commit, None),
+                ],
+                expect_reject: true,
+            },
+            Case {
+                name: "merged_as_target_shadowed_to_symbol",
+                label: EdgeLabel::MergedAs,
+                source: "n:pr",
+                target: "n:commit",
+                batch: vec![
+                    kinded("n:pr", NodeKind::Task, Some("github_pr")),
+                    kinded("n:commit", NodeKind::Commit, None),
+                    kinded("n:commit", NodeKind::Symbol, None),
+                ],
+                expect_reject: true,
+            },
+            Case {
+                name: "reviewed_by_source_shadowed_to_symbol",
+                label: EdgeLabel::ReviewedBy,
+                source: "n:review",
+                target: "n:id",
+                batch: vec![
+                    kinded("n:review", NodeKind::Review, Some("github_review")),
+                    kinded("n:review", NodeKind::Symbol, Some("github_review")),
+                    kinded("n:id", NodeKind::ExternalIdentity, None),
+                ],
+                expect_reject: true,
+            },
+            Case {
+                name: "requested_review_from_source_shadowed_to_symbol",
+                label: EdgeLabel::RequestedReviewFrom,
+                source: "n:task",
+                target: "n:id",
+                batch: vec![
+                    kinded("n:task", NodeKind::Task, Some("github_pr")),
+                    kinded("n:task", NodeKind::Symbol, Some("github_pr")),
+                    kinded("n:id", NodeKind::ExternalIdentity, None),
+                ],
+                expect_reject: true,
+            },
+            Case {
+                name: "same_kind_re_emit_stays_clean",
+                label: EdgeLabel::MergedAs,
+                source: "n:pr",
+                target: "n:commit",
+                batch: vec![
+                    kinded("n:pr", NodeKind::Task, Some("github_pr")),
+                    kinded("n:pr", NodeKind::Task, Some("github_pr")),
+                    kinded("n:commit", NodeKind::Commit, None),
+                ],
+                expect_reject: false,
+            },
+            Case {
+                // Issue #391 last-write shadow: the target `n:commit` is a present
+                // Commit, then re-emitted as a non-node record (an edge whose own
+                // id is `n:commit`) that shadows the kind to `None` under
+                // last-write. The daemon's `lookup_node_kind` returns `None` and
+                // rejects; offline `validate` fires the target-kind gate on the
+                // same resolved `None`. Both reject — and neither double-reports
+                // (the node is present, so no dangling).
+                name: "merged_as_target_node_then_edge_shadow",
+                label: EdgeLabel::MergedAs,
+                source: "n:pr",
+                target: "n:commit",
+                batch: vec![
+                    kinded("n:pr", NodeKind::Task, Some("github_pr")),
+                    kinded("n:commit", NodeKind::Commit, None),
+                    GraphRecord::Edge {
+                        id: "n:commit".to_owned(),
+                        schema_version: crate::ir::SCHEMA_VERSION,
+                        label: EdgeLabel::References,
+                        source: "n:pr".to_owned(),
+                        target: "n:pr".to_owned(),
+                        confidence: None,
+                        resolution: None,
+                        frame_resolution: None,
+                        frame_index: None,
+                        basis: None,
+                        temporal: None,
+                        summary: "shadow".to_owned(),
+                        producer: None,
+                    },
+                ],
+                expect_reject: true,
+            },
+        ];
+
+        for case in &cases {
+            // Daemon path: lookup_node_kind + validate_project_edge_kinds.
+            let daemon = validate_project_edge(
+                "e:test",
+                PROJECT_SCHEMA_VERSION,
+                case.label,
+                case.source,
+                case.target,
+                None,
+                &case.batch,
+                &sink,
+            );
+            assert_eq!(
+                daemon.is_err(),
+                case.expect_reject,
+                "daemon validate_project_edge must {} case `{}`",
+                if case.expect_reject {
+                    "reject"
+                } else {
+                    "accept"
+                },
+                case.name
+            );
+
+            // Offline path: the same batch plus the edge record.
+            let mut offline_batch = case.batch.clone();
+            offline_batch.push(GraphRecord::edge(
+                case.label,
+                case.source.to_owned(),
+                case.target.to_owned(),
+                None,
+                "edge".to_owned(),
+            ));
+            let report = crate::validate::validate_records(&offline_batch);
+            let kind_gated = report.diagnostics.iter().any(|d| {
+                matches!(
+                    d.code,
+                    crate::validate::EDGE_SOURCE_KIND_VIOLATION
+                        | crate::validate::EDGE_TARGET_KIND_VIOLATION
+                )
+            });
+            assert_eq!(
+                kind_gated,
+                case.expect_reject,
+                "offline validate must {} case `{}` at a kind gate",
+                if case.expect_reject {
+                    "reject"
+                } else {
+                    "accept"
+                },
+                case.name
             );
         }
         Ok(())
