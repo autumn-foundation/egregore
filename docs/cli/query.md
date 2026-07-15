@@ -1261,15 +1261,27 @@ out of scope. Import capture respects Rust's non-inherited
 or **block-local** `use` is never captured for the impl's scope), so a bare name
 recovered here can only bind what a co-located `use` truly imports. A bare name
 resolvable in the impl's **own** module still wins at depth 0 before any import
-handling. Two bare-name cases stay bounded out: a **glob** import (`use a::*;`)
+handling. Three bare-name cases stay bounded out. A **glob** import (`use a::*;`)
 binds no specific segment, so the bare `impl T for Foo` beside it is genuinely
 un-imported and — when its simple name is ambiguous across the crate root's
 impl-target definitions — is left **unresolved** (the honest missing-edge
-direction); and a bare name with **no** captured `use` import at all falls through
-to the conservative same-name ambiguity bound above. The incremental-cache schema
-version bumps to **13** for the serde-default `use_trait_imports` per-file facts
-this capture records (alongside the crate-root partitioning below); older caches
-rebuild.
+direction). A bare name with **no** captured `use` import at all falls through
+to the conservative same-name ambiguity bound above. And a **cfg-gated same-name
+collision** — the same simple name bound to two *distinct* paths in one module
+scope, `#[cfg(feature = "std")] use std::fmt::Display;` alongside
+`#[cfg(not(feature = "std"))] use crate::local::Display;` — is treated as
+**ambiguous**: the extractor keeps *both* import facts (it does not last-wins
+collapse them), and because one name resolves to two distinct paths the resolver
+fires **no** import-aware resolution and mints **no** edge (Codex round-4 finding E,
+PR #399). Collapsing the two to the in-repo path would have minted a local edge
+even in the configuration where the name is the external std trait; keeping both is
+the conservative pre-#393 shadow-veto outcome. One name resolving to one distinct
+path (the same path repeated is not ambiguity) still resolves. The
+incremental-cache schema version is **13** for the serde-default
+`use_trait_imports` per-file facts this capture records (alongside the crate-root
+partitioning below); the finding-E fix keeps the same fact *shape* (it changes only
+how many facts a colliding name emits), so no further schema bump is required and
+older caches rebuild.
 
 **Multi-crate-root packages are partitioned by crate root (issue #394).**
 The repo-wide index keys on `(crate_root, crate-root-relative qualified name)`, so

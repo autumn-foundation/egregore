@@ -6318,3 +6318,180 @@ fn real_scan_shared_test_helper_module_stays_conservatively_unresolved() {
         "a helper shared by 2+ entry crates must stay unresolved: {records:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Codex round-4 finding E (PR #399): a cfg-gated same-name import collision must
+// stay UNRESOLVED. `#[cfg(feature = "std")] use std::fmt::Display;` and
+// `#[cfg(not(feature = "std"))] use crate::local::Display;` bind the SAME simple
+// name `Display` to TWO distinct paths in one module scope. Before the fix,
+// extraction did a last-wins insert into the per-scope import map, collapsing the
+// two to the (in-repo) `crate::local::Display` binding, so the import-aware
+// resolver minted a local IMPLEMENTS edge even in the configuration where
+// `Display` is the external std trait. The fix keeps BOTH `use_trait_imports`
+// facts; the resolver sees distinct-path multiplicity for one name and treats it
+// as ambiguous — no import-aware resolution, no edge (the conservative
+// pre-#393 shadow-veto outcome).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_cfg_gated_same_name_import_collision_stays_unresolved() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!("pub mod local;\n", "pub mod m;\n"),
+    )
+    .expect("write lib.rs");
+    // A REAL in-repo trait `crate::local::Display`.
+    fs::write(
+        src.join("local.rs"),
+        concat!("pub trait Display {\n", "    fn go(&self);\n", "}\n"),
+    )
+    .expect("write local.rs");
+    // One module binds `Display` to TWO distinct paths via cfg-gated imports,
+    // then implements the bare name.
+    fs::write(
+        src.join("m.rs"),
+        concat!(
+            "#[cfg(feature = \"std\")]\n",
+            "use std::fmt::Display;\n",
+            "#[cfg(not(feature = \"std\"))]\n",
+            "use crate::local::Display;\n\n",
+            "pub struct Foo;\n\n",
+            "impl Display for Foo {\n",
+            "    fn go(&self) {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write m.rs");
+
+    let (records, targets) = scan_records(temp.path());
+    let local_display = records
+        .iter()
+        .find(|r| {
+            r["record_type"] == "node"
+                && r["symbol_kind"] == "trait"
+                && r["name"] == "local::Display"
+                && r["repo_relative_path"] == "src/local.rs"
+        })
+        .and_then(|r| r["id"].as_str().map(str::to_owned))
+        .expect("in-repo trait `local::Display` node present");
+    // The collision is ambiguous: no import-aware edge may target the local
+    // trait (it would be a WRONG edge in the std configuration), and there is no
+    // other in-repo `Display` to resolve to either — so NO edge at all.
+    assert!(
+        !targets.contains(&local_display),
+        "a cfg-gated same-name import collision must not mint an IMPLEMENTS edge \
+         to `crate::local::Display`: {records:?}"
+    );
+    assert!(
+        targets.is_empty(),
+        "the cfg-gated collision leaves the bare `impl Display for Foo` \
+         unresolved — no IMPLEMENTS edge at all: {records:?}"
+    );
+
+    // The query surface agrees: `local::Display` has zero implementors.
+    let stdout = egregore()
+        .args(["query", "implementors", "local::Display", "--graph"])
+        .arg(temp.path().join("graph.jsonl"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert!(
+        rows.iter().all(|r| r["implementing_type"] != "m::Foo"),
+        "`local::Display` must report no `m::Foo` implementor: {rows:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Codex round-4 finding D (PR #399): import-aware bare-trait resolution must fire
+// only for a PROVABLY in-repo import. A realistic external dependency
+// (`use serde::Serialize; impl Serialize for Foo`, serde declared in Cargo.toml,
+// NO local `mod serde`) names the external crate `serde`, so the resolved path
+// `serde::Serialize` finds NO target in the crate-root-partitioned index — an
+// index miss, no edge — WITHOUT any hard-coded dependency-name list. This
+// confirms the current head is already conservative for the realistic serde case
+// via the positive in-repo/index inclusion check.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_cross_file_declared_dependency_import_is_not_misresolved() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    // A realistic manifest declaring serde as a dependency (scan never builds,
+    // so no registry access occurs).
+    fs::write(
+        temp.path().join("Cargo.toml"),
+        concat!(
+            "[package]\n",
+            "name = \"fixture\"\n",
+            "version = \"0.1.0\"\n",
+            "edition = \"2021\"\n\n",
+            "[dependencies]\n",
+            "serde = \"1\"\n",
+        ),
+    )
+    .expect("write Cargo.toml");
+    fs::write(src.join("lib.rs"), "pub mod m;\n").expect("write lib.rs");
+    fs::write(
+        src.join("m.rs"),
+        concat!(
+            "use serde::Serialize;\n\n",
+            "pub struct Foo;\n\n",
+            "impl Serialize for Foo {}\n",
+        ),
+    )
+    .expect("write m.rs");
+
+    let (records, targets) = scan_records(temp.path());
+    // No in-repo `serde::Serialize` target exists, so the import resolves to
+    // nothing — no IMPLEMENTS edge at all, no dependency list required.
+    assert!(
+        targets.is_empty(),
+        "an external declared-dependency import (`use serde::Serialize;`) with no \
+         local `mod serde` must mint no IMPLEMENTS edge: {records:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rename sweep (Codex round-4, PR #399): the BOUND name of a rename is the alias,
+// but resolution applies to the RESOLVED PATH. `use serde::X as Y; impl Y for
+// Foo` (no local `mod serde`) resolves the aliased path `serde::X`, which misses
+// the in-repo index → no edge. Complements the in-repo rename case
+// (`real_scan_use_alias_rename_resolves_to_aliased_trait`) which DOES resolve.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_cross_file_external_rename_import_is_not_misresolved() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(src.join("lib.rs"), "pub mod m;\n").expect("write lib.rs");
+    fs::write(
+        src.join("m.rs"),
+        concat!(
+            "use serde::X as Y;\n\n",
+            "pub struct Foo;\n\n",
+            "impl Y for Foo {}\n",
+        ),
+    )
+    .expect("write m.rs");
+
+    let (records, targets) = scan_records(temp.path());
+    // The alias `Y` binds the external path `serde::X`; it misses the in-repo
+    // index, so no IMPLEMENTS edge is minted.
+    assert!(
+        targets.is_empty(),
+        "a renamed external import (`use serde::X as Y;`) must mint no \
+         IMPLEMENTS edge: {records:?}"
+    );
+}

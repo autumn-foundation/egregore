@@ -161,13 +161,23 @@ struct RustExtractor<'graph, 'source> {
     /// unresolved (correct import-aware resolution is follow-up #393).
     imports_by_scope: BTreeMap<Vec<String>, BTreeSet<String>>,
     /// Import PATHS each module-item `use` binds into scope (issue #393):
-    /// module scope -> (bound simple name -> import path as written). Populated
-    /// from the SAME module-item `use` declarations as `imports_by_scope`, so
-    /// the import-aware cross-file `IMPLEMENTS` resolver respects the identical
-    /// Rust-visibility scoping the veto uses. Serialized into
-    /// `FileFacts::use_trait_imports`; the deferred cross-file pass resolves the
-    /// path so `use crate::a::T; impl T for Foo` binds `a::T`, not a root `T`.
-    import_paths_by_scope: BTreeMap<Vec<String>, BTreeMap<String, String>>,
+    /// module scope -> (bound simple name -> the SET of distinct import paths as
+    /// written). Populated from the SAME module-item `use` declarations as
+    /// `imports_by_scope`, so the import-aware cross-file `IMPLEMENTS` resolver
+    /// respects the identical Rust-visibility scoping the veto uses. Serialized
+    /// into `FileFacts::use_trait_imports`; the deferred cross-file pass resolves
+    /// the path so `use crate::a::T; impl T for Foo` binds `a::T`, not a root `T`.
+    ///
+    /// The value is a `BTreeSet` — NOT a last-wins single path — so a simple name
+    /// bound to two DISTINCT paths in one scope (`#[cfg(feature = "std")] use
+    /// std::fmt::Display;` alongside `#[cfg(not(feature = "std"))] use
+    /// crate::local::Display;`) preserves BOTH bindings (Codex round-4 finding E,
+    /// PR #399). Collapsing them to one path let the resolver mint a local edge in
+    /// the configuration where the name is external; keeping both surfaces the
+    /// collision as `use_trait_imports` multiplicity the resolver treats as
+    /// ambiguous — no import-aware resolution, no edge (the conservative
+    /// pre-#393 shadow-veto outcome).
+    import_paths_by_scope: BTreeMap<Vec<String>, BTreeMap<String, BTreeSet<String>>>,
     /// The crate root this file belongs to (issue #394), stamped onto every
     /// exported trait/type and pending-impl fact so the repo-wide index can
     /// partition same-named root definitions across crate roots.
@@ -426,10 +436,14 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             // aliased target instead of vetoing it. Glob imports bind no simple
             // name and contribute nothing here (they stay bounded out).
             for (simple, path) in use_bound_import_paths(node, self.source) {
+                // Insert into the per-name SET (not last-wins) so a cfg-gated
+                // same-name collision keeps every distinct binding (finding E).
                 self.import_paths_by_scope
                     .entry(self.module_names.clone())
                     .or_default()
-                    .insert(simple, path);
+                    .entry(simple)
+                    .or_default()
+                    .insert(path);
             }
         }
         let name = import_name(self.node_text(node));
@@ -1292,21 +1306,35 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             if seen.contains(&key) {
                 continue;
             }
-            if let Some(path) = self
+            if let Some(paths) = self
                 .import_paths_by_scope
                 .get(&pending.module_names)
                 .and_then(|scope| scope.get(&pending.trait_path))
             {
                 seen.insert(key);
-                imports.push(UseImportFact {
-                    module_names: pending.module_names.clone(),
-                    simple_name: pending.trait_path.clone(),
-                    resolved_path: path.clone(),
-                });
+                // Emit ONE fact per DISTINCT resolved path (finding E): a bare
+                // name bound to 2+ paths by cfg-gated imports surfaces as
+                // multiple `use_trait_imports` entries the resolver treats as
+                // ambiguous (`lookup_use_import` returns `None` on distinct-path
+                // multiplicity), so import-aware resolution never fires and no
+                // edge is minted. A single binding still emits exactly one fact.
+                for path in paths {
+                    imports.push(UseImportFact {
+                        module_names: pending.module_names.clone(),
+                        simple_name: pending.trait_path.clone(),
+                        resolved_path: path.clone(),
+                    });
+                }
             }
         }
+        // Sort by resolved_path too so multiple same-name facts are ordered
+        // deterministically (byte-identical output across runs).
         imports.sort_by(|a, b| {
-            (&a.module_names, &a.simple_name).cmp(&(&b.module_names, &b.simple_name))
+            (&a.module_names, &a.simple_name, &a.resolved_path).cmp(&(
+                &b.module_names,
+                &b.simple_name,
+                &b.resolved_path,
+            ))
         });
         self.facts.use_trait_imports = imports;
     }
