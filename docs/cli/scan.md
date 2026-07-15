@@ -57,15 +57,25 @@ Field notes:
 
 * `files_walked` — files the walk visited (see the excluded-directory contract
   below; excluded files are never counted).
-* `files_indexed` — files that matched the indexed-source filter and became
-  code-graph nodes.
-* `skipped_by_extension` — per-extension count of walked-but-not-indexed files,
-  keyed on the **lowercased final extension** (`""` for a file with no
-  extension). A sorted map for byte-stable output.
-* `indexed_languages` — the human-facing names of the languages `eg scan`
-  indexes, derived from the extractor's real capability so the named scope can
-  never drift from what is actually parsed (#135 AC6). The issue text said "Rust
-  only"; that was stale — the extractor indexes Rust/Python/TypeScript/Go.
+* `files_indexed` — every walked file that received a graph `File` node, whether
+  from source-symbol extraction (`.rs`/`.py`/`.ts`/`.go`) **or** from a
+  non-source File producer such as manifest/dependency extraction (issue #180): a
+  tracked `Cargo.toml` that declares dependencies gets a `File` node plus
+  queryable `DependencyDeclaration` facts (`eg query manifest-deps`), so it is
+  counted here — never mislabeled as skipped when the graph in fact holds a node
+  for it (issue #135). Finalized after all File-producing extractors run.
+* `skipped_by_extension` — per-extension count of walked files that received
+  **no** graph `File` node, keyed on the **lowercased final extension** (`""` for
+  a file with no extension). A `Cargo.toml` with no declared dependencies mints
+  no `File` node and so is honestly counted here under `toml`. A sorted map for
+  byte-stable output.
+* `indexed_languages` — the human-facing names of the parsed **source** languages
+  `eg scan` indexes, derived from the extractor's real capability so the named
+  scope can never drift from what is actually parsed (#135 AC6). The issue text
+  said "Rust only"; that was stale — the extractor indexes
+  Rust/Python/TypeScript/Go. This names the source-language scope specifically; a
+  manifest counted under `files_indexed` is not a parsed "language" and adds no
+  entry here.
 * `coverage_complete` — `true` on the Git-tracked-files walk, which yields a
   complete walked/skipped accounting. `false` on the non-Git filesystem-walk
   fallback, which enumerates only matching source files and therefore has no

@@ -94,10 +94,13 @@ fn scan_reports_coverage_summary_and_node() {
         .expect("scan should run");
     assert!(output.status.success());
 
-    // AC1: human-readable coverage summary on stderr.
+    // AC1: human-readable coverage summary on stderr. The tracked `Cargo.toml`
+    // declares dependencies, so manifest extraction (issue #180) mints a `File`
+    // node for it: it is honestly counted under `files_indexed` (5), never left
+    // mislabeled under the `toml` skip bucket (issue #135).
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("scan coverage: 8 files walked, 4 indexed, 4 skipped"),
+        stderr.contains("scan coverage: 8 files walked, 5 indexed, 3 skipped"),
         "stderr missing coverage summary: {stderr}"
     );
     // AC6: names the real 4-language indexed scope.
@@ -106,8 +109,13 @@ fn scan_reports_coverage_summary_and_node() {
         "stderr missing language scope: {stderr}"
     );
     assert!(
-        stderr.contains("md: 2") && stderr.contains("toml: 1") && stderr.contains("(no-ext): 1"),
+        stderr.contains("md: 2") && stderr.contains("(no-ext): 1"),
         "stderr missing per-extension skips: {stderr}"
+    );
+    // The indexed `Cargo.toml` no longer appears in the skip tally.
+    assert!(
+        !stderr.contains("toml:"),
+        "indexed manifest must not appear under skipped extensions: {stderr}"
     );
 
     let jsonl = fs::read_to_string(&graph_path).expect("scan should write JSONL");
@@ -122,7 +130,7 @@ fn scan_reports_coverage_summary_and_node() {
         .as_u64()
         .expect("files_indexed");
     assert_eq!(walked, 8);
-    assert_eq!(indexed, 4);
+    assert_eq!(indexed, 5);
     assert!(
         node["scan_coverage"]["coverage_complete"]
             .as_bool()
@@ -133,7 +141,10 @@ fn scan_reports_coverage_summary_and_node() {
         .as_object()
         .expect("skipped_by_extension object");
     assert_eq!(skipped["md"], 2);
-    assert_eq!(skipped["toml"], 1);
+    assert!(
+        !skipped.contains_key("toml"),
+        "the dependency-declaring Cargo.toml is indexed, not skipped: {skipped:?}"
+    );
     assert_eq!(skipped[""], 1, "no-extension file keyed on empty string");
 
     // AC4: complete accounting — indexed + sum(skipped) == walked, nothing lost.
@@ -170,6 +181,25 @@ fn scan_reports_coverage_summary_and_node() {
         r["record_type"] == "edge" && r["label"] == "CONTAINS" && r["target"] == coverage_id
     });
     assert!(has_edge, "Repository -> ScanCoverage CONTAINS edge missing");
+
+    // The coverage claim must match reality: the `Cargo.toml` counted under
+    // `files_indexed` genuinely has a `File` node AND queryable dependency
+    // facts, so an agent reading the coverage summary is never told a file was
+    // "never indexed" when the graph in fact holds a node for it (issue #135).
+    let manifest_has_file_node = records.iter().any(|r| {
+        r["record_type"] == "node" && r["kind"] == "File" && r["repo_relative_path"] == "Cargo.toml"
+    });
+    assert!(
+        manifest_has_file_node,
+        "the indexed Cargo.toml must have a File node in the graph"
+    );
+    let has_dependency_fact = records
+        .iter()
+        .any(|r| r["record_type"] == "node" && r["kind"] == "DependencyDeclaration");
+    assert!(
+        has_dependency_fact,
+        "the indexed Cargo.toml must emit DependencyDeclaration facts"
+    );
 }
 
 #[test]
@@ -221,7 +251,7 @@ fn inspect_graph_surfaces_coverage_block() {
     let coverage = value["coverage"].as_array().expect("coverage array");
     assert_eq!(coverage.len(), 1);
     assert_eq!(coverage[0]["files_walked"], 8);
-    assert_eq!(coverage[0]["files_indexed"], 4);
+    assert_eq!(coverage[0]["files_indexed"], 5);
     assert_eq!(coverage[0]["skipped_by_extension"]["md"], 2);
     assert_eq!(coverage[0]["coverage_complete"], true);
 
@@ -251,7 +281,7 @@ fn inspect_graph_surfaces_coverage_block() {
         .expect("inspect text");
     let text = String::from_utf8_lossy(&text_out.stdout);
     assert!(
-        text.contains("coverage: 8 files walked, 4 indexed, 4 skipped (complete: true)"),
+        text.contains("coverage: 8 files walked, 5 indexed, 3 skipped (complete: true)"),
         "text output missing coverage line: {text}"
     );
     assert!(text.contains("indexed languages: Rust, Python, TypeScript, Go"));
@@ -495,8 +525,12 @@ fn inspect_data_dir_surfaces_coverage_block() {
     let coverage = value["coverage"].as_array().expect("coverage array");
     assert_eq!(coverage.len(), 1, "coverage block: {value}");
     assert_eq!(coverage[0]["files_walked"], 8);
-    assert_eq!(coverage[0]["files_indexed"], 4);
-    assert_eq!(coverage[0]["skipped_by_extension"]["toml"], 1);
+    assert_eq!(coverage[0]["files_indexed"], 5);
+    assert_eq!(coverage[0]["skipped_by_extension"]["md"], 2);
+    assert!(
+        coverage[0]["skipped_by_extension"].get("toml").is_none(),
+        "indexed manifest must not appear under skipped extensions: {value}"
+    );
     assert_eq!(coverage[0]["indexed_languages"][0], "Rust");
 }
 
@@ -566,5 +600,5 @@ fn inspect_data_dir_reports_latest_superseded_coverage() {
     // rather than the stale superseded version (files_walked = 3).
     assert_eq!(coverage.len(), 1, "coverage block: {value}");
     assert_eq!(coverage[0]["files_walked"], 8, "latest coverage: {value}");
-    assert_eq!(coverage[0]["files_indexed"], 4, "latest coverage: {value}");
+    assert_eq!(coverage[0]["files_indexed"], 5, "latest coverage: {value}");
 }

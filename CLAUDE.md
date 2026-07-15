@@ -93,8 +93,18 @@ fact (issue #135): one `ScanCoverage` node rides in the JSONL (attached to its
 `Repository` by a `CONTAINS` edge, so it is citable, non-orphan, and validates
 under `eg validate`) carrying `files_walked`, `files_indexed`,
 `skipped_by_extension` (a sorted per-lowercased-extension tally, `""` for
-no-extension), the named indexed-language scope, and `coverage_complete`. On a
-Git working tree `eg scan` also prints a human-readable summary to stderr
+no-extension), the named indexed-language scope, and `coverage_complete`.
+`files_indexed` counts every walked file that received a graph `File` node — from
+source-symbol extraction OR from a non-source File producer such as
+manifest/dependency extraction (#180), so a tracked `Cargo.toml` that declares
+dependencies is counted INDEXED (it gets a `File` node + queryable
+`DependencyDeclaration` facts), never mislabeled under `skipped_by_extension`;
+the tally is finalized (`reconcile_scan_coverage`) after all File-producing
+extractors run, so any future non-source File producer is covered too. A
+`Cargo.toml` with no dependencies mints no `File` node and stays honestly
+skipped under `toml`. `indexed_languages` names the parsed SOURCE-language scope
+specifically (manifests are not a "language" and add no entry). On a Git working
+tree `eg scan` also prints a human-readable summary to stderr
 (`scan coverage: N files walked, M indexed, K skipped` + skipped-by-extension +
 `indexed languages: Rust, Python, TypeScript, Go`). The named scope is the REAL
 4-language extractor capability (Rust/Python/TypeScript/Go), derived from
@@ -106,7 +116,7 @@ filesystem-walk fallback has no walked/skipped denominator, so it reports
 best-effort counts with `coverage_complete: false` and suppresses the stderr
 summary rather than fabricate one. `eg inspect` surfaces the same coverage block
 over both `--graph` and `--data-dir`, so an agent can tell "0 results because
-absent" from "0 results because that language was never indexed". The
+absent" from "0 results because that file was never indexed". The
 `codegraph` `SCHEMA_VERSION` is 6 (bumped 5→6 for the `ScanCoverage` node). See
 `docs/cli/scan.md` and `docs/cli/inspect.md`.
 

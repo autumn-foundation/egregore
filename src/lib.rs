@@ -254,15 +254,7 @@ fn scan_repository_at_with_override_inner(
             .with_source_snapshot(snapshot),
     );
 
-    let (source_files, coverage_tally) = fs::discover_source_files_with_coverage(repo_root)?;
-    // Scan-coverage summary (issue #135): a single deterministic `ScanCoverage`
-    // node makes file-level indexing coverage a stated, queryable graph fact,
-    // attached to its Repository by a CONTAINS edge so it is citable and never
-    // an orphan. Stamped alongside the Repository snapshot, before per-file
-    // records, so it rides in the JSONL and inspect can read it back.
-    for record in scan_coverage_records(&repository_id, &coverage_tally) {
-        graph.push(record.with_valid_time_inferred(transaction_time));
-    }
+    let (source_files, mut coverage_tally) = fs::discover_source_files_with_coverage(repo_root)?;
 
     let mut facts_by_file = BTreeMap::new();
     for source_file in source_files {
@@ -300,8 +292,25 @@ fn scan_repository_at_with_override_inner(
 
     // Declared Cargo dependencies (issue #180): every manifest's directly-
     // declared dependencies become deterministic, citable graph facts joined
-    // with the nearest lockfile's resolved versions.
+    // with the nearest lockfile's resolved versions. This mints a `File` node
+    // for each manifest that declares dependencies — a walked file the source
+    // filter skipped yet that ends up genuinely indexed.
     for record in manifest_deps::scan_dependency_records(repo_root, &repository_id)? {
+        graph.push(record.with_valid_time_inferred(transaction_time));
+    }
+
+    // Scan-coverage reconciliation (issue #135): finalize the tally against the
+    // COMPLETE set of `File` nodes the graph now carries, not source discovery
+    // alone. A manifest the source filter skipped (`Cargo.toml` -> `toml`) but
+    // that manifest extraction indexed with a `File` node is honestly counted
+    // under `files_indexed`, never left mislabeled under `skipped_by_extension`.
+    // This inherently covers any current or future non-source `File` producer
+    // and preserves the invariant `files_indexed + Σ skipped == files_walked`.
+    reconcile_scan_coverage(&graph, &mut coverage_tally);
+    // A single deterministic `ScanCoverage` node makes file-level indexing
+    // coverage a stated, queryable graph fact, attached to its Repository by a
+    // CONTAINS edge so it is citable and never an orphan.
+    for record in scan_coverage_records(&repository_id, &coverage_tally) {
         graph.push(record.with_valid_time_inferred(transaction_time));
     }
 
@@ -417,6 +426,57 @@ fn stable_display_name(payload: &RepositoryIdentityPayload) -> String {
 /// language scope is derived from [`languages::Language::ALL`], never a
 /// hard-coded list, so it stays in lockstep with the extractor's real
 /// capability (AC6).
+/// Finalizes the scan-coverage tally against the complete set of `File` nodes
+/// the graph carries after every File-producing extractor has run (issue #135).
+///
+/// Source discovery classifies a walked file as skipped purely on its extension,
+/// but a later extractor (manifest dependency extraction, issue #180) may mint a
+/// `File` node for one of those skipped files, genuinely indexing it. This
+/// re-derives `files_indexed` and `skipped_by_extension` from the paths that
+/// actually received a `File` node, so the reported counts never claim a file
+/// was "never indexed" when the graph holds a node for it. The complete
+/// (Git-tracked) walk keeps its `files_walked` denominator and the invariant
+/// `files_indexed + Σ skipped == files_walked`; the fallback walk (no
+/// denominator) reports `files_indexed == files_walked` over the distinct
+/// File-node paths without fabricating a skip tally.
+pub(crate) fn reconcile_scan_coverage(graph: &Graph, tally: &mut fs::ScanCoverageTally) {
+    let indexed_paths: std::collections::BTreeSet<&str> = graph
+        .records()
+        .iter()
+        .filter_map(|record| match record {
+            GraphRecord::Node {
+                kind: NodeKind::File,
+                repo_relative_path: Some(path),
+                ..
+            } => Some(path.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    if tally.coverage_complete {
+        // Re-derive the skip tally from the retained walked-but-skipped paths,
+        // excluding any that a File-producing extractor indexed after the walk.
+        let mut skipped_by_extension = BTreeMap::new();
+        for (path, ext) in &tally.skipped_paths {
+            if !indexed_paths.contains(path.as_str()) {
+                *skipped_by_extension.entry(ext.clone()).or_default() += 1;
+            }
+        }
+        let skipped_total: usize = skipped_by_extension.values().sum();
+        tally.skipped_by_extension = skipped_by_extension;
+        // `files_walked` is the fixed denominator; everything not still skipped
+        // is indexed, preserving `files_indexed + Σ skipped == files_walked`.
+        tally.files_indexed = tally.files_walked - skipped_total;
+    } else {
+        // The fallback walk enumerated only matching files, so it has no
+        // walked/skipped denominator. Count the distinct File-node paths as
+        // indexed (this now includes any manifest File nodes) and mirror the
+        // best-effort `files_walked == files_indexed` without a skip tally.
+        tally.files_indexed = indexed_paths.len();
+        tally.files_walked = indexed_paths.len();
+    }
+}
+
 pub(crate) fn scan_coverage_records(
     repository_id: &str,
     tally: &fs::ScanCoverageTally,

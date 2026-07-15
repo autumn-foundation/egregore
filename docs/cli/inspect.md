@@ -125,9 +125,12 @@ Field notes:
 * `repositories` — stable record ID plus a redaction-safe identity summary, sorted by ID.
 * `coverage` — one entry per `ScanCoverage` node (issue #135), sorted by record
   ID: file-level indexing coverage for the repository the scan visited. Lets an
-  agent tell "0 results because absent" from "0 results because that language was
-  never indexed" (a language `eg scan` never parses). See the field-level shape
-  and the excluded-directory contract in `docs/cli/scan.md`. `coverage_complete`
+  agent tell "0 results because absent" from "0 results because that file was
+  never indexed". `files_indexed` counts every walked file that received a graph
+  `File` node — source symbols **or** manifest/dependency facts (a dependency-
+  declaring `Cargo.toml` is indexed, not skipped); `skipped_by_extension` counts
+  only walked files with no `File` node. See the field-level shape and the
+  excluded-directory contract in `docs/cli/scan.md`. `coverage_complete`
   is `true` only for the Git-tracked-files walk; the non-Git fallback reports
   best-effort counts with `coverage_complete: false`. The text layout prints one
   `coverage: <walked> files walked, <indexed> indexed, <skipped> skipped

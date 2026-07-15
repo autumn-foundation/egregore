@@ -39,6 +39,15 @@ pub struct ScanCoverageTally {
     /// Per-lowercased-extension count of walked-but-not-indexed files
     /// (`""` keys a file with no extension); a sorted map for stable output.
     pub skipped_by_extension: std::collections::BTreeMap<String, usize>,
+    /// Repo-relative path -> lowercased extension for every walked file the
+    /// source-filter skipped, retained so the scan can reclassify any that a
+    /// later File-producing extractor (e.g. manifest dependency extraction,
+    /// issue #180) nonetheless indexes with a `File` node — keeping
+    /// `files_indexed` honest about what actually received a graph node. Only
+    /// populated on the complete (Git-tracked) walk; empty on the fallback,
+    /// which carries no walked/skipped denominator. A sorted map for
+    /// determinism.
+    pub skipped_paths: std::collections::BTreeMap<String, String>,
     /// `true` only on the Git-tracked-files path, which yields a complete
     /// walked/skipped denominator. The non-Git filesystem-walk fallback sets
     /// this `false` (it enumerates only matching files, so it has no
@@ -126,7 +135,8 @@ fn discover_files_matching(
                         .and_then(OsStr::to_str)
                         .map(str::to_ascii_lowercase)
                         .unwrap_or_default();
-                    *tally.skipped_by_extension.entry(ext).or_default() += 1;
+                    *tally.skipped_by_extension.entry(ext.clone()).or_default() += 1;
+                    tally.skipped_paths.insert(rel.clone(), ext);
                 }
             }
             tally.coverage_complete = true;
