@@ -1223,12 +1223,20 @@ module, *not* one nested inside a function body or block), and the cross-file
 resolver binds a bare (unqualified) trait/type name to the target that import
 **names** — `use crate::a::T; impl T for Foo` edge-backs `Foo` to `a::T` (not a
 root `T`), `use crate::a::T as U; impl U for Bar` binds through the rename, and a
-grouped `use crate::a::{T};` distributes the group prefix. The import path is
+grouped `use crate::a::{T};` distributes the group prefix. Import-aware in-repo
+resolution fires **only** for an explicitly **in-repo-rooted** import path — one
+whose first `::`-separated segment is `crate`, `self`, or `super` (Codex P2 on PR
+#399). Per Rust 2018+ path resolution, a `use` path with a **bare first segment**
+(`use std::fmt::Display;`, `use serde::Serialize;`, `use a::T;`) names an
+**external crate** through the extern prelude, never a local module that merely
+shares that name — so such an import resolves to **no** in-repo definition and
+mints **no** edge, even when the repo *coincidentally* defines a same-path local
+module (e.g. `mod std { mod fmt { trait Display {} } }`). Without this gate the
+captured extern path would run through the in-repo scope walk and steal the
+coincident local trait — a wrong-target edge. In-repo-rooted paths are then
 resolved against the crate-root-partitioned index with the same
-`crate::`/`self::`/`super::` normalization a qualified impl trait path gets, so an
-**external/std** import (`use std::fmt::Display;`) resolves to **no** in-repo
-definition and therefore still mints **no** edge — the recall recovery never
-reintroduces a wrong-target edge. Import capture respects Rust's non-inherited
+`crate::`/`self::`/`super::` normalization a qualified impl trait path gets — so
+the recall recovery never reintroduces a wrong-target edge. Import capture respects Rust's non-inherited
 `use` visibility exactly (own module scope only; an ancestor/root, sibling-module,
 or **block-local** `use` is never captured for the impl's scope), so a bare name
 recovered here can only bind what a co-located `use` truly imports. A bare name

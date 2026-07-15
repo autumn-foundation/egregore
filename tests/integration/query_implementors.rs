@@ -2153,17 +2153,20 @@ fn real_scan_relative_qualified_trait_path_resolves_in_module_scope() {
 
 // ---------------------------------------------------------------------------
 // The impl trait resolver never crosses into the value namespace (PR #296
-// review): with `mod m { trait T }`, `use m::T;`, `impl T for Foo`, and a
+// review): with `mod m { trait T }`, `use crate::m::T;`, `impl T for Foo`, and a
 // later `fn T()`, the function overwrites the bare `T` alias in the general
 // reference-definition map. The resolver must never bind an IMPLEMENTS edge to
 // that value-namespace `fn T` — the standing invariant this test guards.
 //
 // Import-aware resolution (issue #393): the bare `impl T for Foo` is bound by
-// `use m::T;` in its module scope, and #393 resolves that import PATH to the
-// inline-module trait `m::T` — so `m::T` gains `Foo` as an implementor. (PR
-// #389 left it unresolved via the import-shadow veto.) The load-bearing
-// value-namespace guard is unaffected: the resolver still never binds the
-// same-named `fn T` value-namespace item.
+// `use crate::m::T;` in its module scope, and #393 resolves that in-repo-rooted
+// import PATH to the inline-module trait `m::T` — so `m::T` gains `Foo` as an
+// implementor. (PR #389 left it unresolved via the import-shadow veto.) The
+// import is written `crate::`-rooted per Rust 2018+ path resolution: a bare
+// first segment (`use m::T;`) would name an EXTERN crate, not the local module
+// `m`, and the resolver correctly leaves such extern imports unresolved (Codex
+// P2 on PR #399). The load-bearing value-namespace guard is unaffected: the
+// resolver still never binds the same-named `fn T` value-namespace item.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -2179,7 +2182,7 @@ fn real_scan_use_imported_trait_beats_value_namespace_shadow() {
             "        fn go(&self);\n",
             "    }\n",
             "}\n\n",
-            "use m::T;\n\n",
+            "use crate::m::T;\n\n",
             "pub struct Foo;\n\n",
             "impl T for Foo {\n",
             "    fn go(&self) {}\n",
@@ -2199,8 +2202,9 @@ fn real_scan_use_imported_trait_beats_value_namespace_shadow() {
         .assert()
         .success();
 
-    // The bare `impl T for Foo` is bound by `use m::T;` in scope, so import-aware
-    // resolution (#393) edge-backs `Foo` to the inline-module trait `m::T`.
+    // The bare `impl T for Foo` is bound by `use crate::m::T;` in scope, so
+    // import-aware resolution (#393) edge-backs `Foo` to the inline-module trait
+    // `m::T`.
     let stdout = egregore()
         .args(["query", "implementors", "m::T", "--graph"])
         .arg(&graph_path)
@@ -2989,6 +2993,82 @@ fn real_scan_cross_file_external_import_is_not_misresolved() {
     assert!(
         !implements_to_root,
         "no cross-file IMPLEMENTS edge may target the root trait Display: {records:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Codex P2 (PR #399): the issue #393 import-aware resolver must respect Rust's
+// 2018+ extern-prelude rule. `use std::fmt::Display;` is a BARE-first-segment
+// import — it names external crate `std`, NEVER a local module. When the repo
+// COINCIDENTALLY defines `mod std { mod fmt { trait Display {} } }`, the resolver
+// must NOT run the captured extern path through the in-repo scope walk and bind
+// the local `std::fmt::Display`; that is a WRONG cross-file IMPLEMENTS edge that
+// breaks PR #389's no-wrong-edge invariant. The extern import must stay
+// unresolved (no edge), regardless of the coincident local module.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_cross_file_extern_import_never_binds_coincident_local_module() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    // A local module tree that COINCIDES with the extern path `std::fmt::Display`.
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub mod std {\n",
+            "    pub mod fmt {\n",
+            "        pub trait Display { fn go(&self); }\n",
+            "    }\n",
+            "}\n\n",
+            "pub mod m;\n",
+        ),
+    )
+    .expect("write lib.rs");
+    fs::write(
+        src.join("m.rs"),
+        concat!(
+            "use std::fmt::Display;\n\n",
+            "pub struct Foo;\n\n",
+            "impl Display for Foo {\n    fn go(&self) {}\n}\n",
+        ),
+    )
+    .expect("write m.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let graph = fs::read_to_string(&graph_path).expect("read graph");
+    let records: Vec<serde_json::Value> = graph
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    // The local `std::fmt::Display` trait node — the only trait in the repo —
+    // which the extern import must NEVER bind an implementor to.
+    let local_display_id = records
+        .iter()
+        .find(|r| {
+            r["record_type"] == "node"
+                && r["symbol_kind"] == "trait"
+                && r["name"] == "std::fmt::Display"
+        })
+        .and_then(|r| r["id"].as_str().map(str::to_owned))
+        .expect("local std::fmt::Display trait node present");
+    let implements_to_local = records
+        .iter()
+        .filter(|r| r["record_type"] == "edge" && r["label"] == "IMPLEMENTS")
+        .filter_map(|r| r["target"].as_str())
+        .any(|target| target == local_display_id);
+    assert!(
+        !implements_to_local,
+        "an extern-prelude `use std::fmt::Display` must never bind Foo to the \
+         coincident local std::fmt::Display: {records:?}"
     );
 }
 
