@@ -166,6 +166,75 @@ fn signature_only_trait_methods_are_symbols() {
 }
 
 // ---------------------------------------------------------------------------
+// CALLS reachability: call sites resolve to trait methods (issue #390)
+// ---------------------------------------------------------------------------
+
+fn calls_edge_resolution<'a>(records: &'a [Value], source: &str, target: &str) -> Option<&'a str> {
+    records
+        .iter()
+        .find(|record| {
+            record["record_type"] == "edge"
+                && record["label"] == "CALLS"
+                && record["source"] == source
+                && record["target"] == target
+        })
+        .and_then(|record| record["resolution"].as_str())
+}
+
+#[test]
+fn trait_method_call_sites_resolve_to_the_trait_method() {
+    // A trait-qualified path call and a receiver call both resolve to trait
+    // methods declared in TRAIT_FIXTURE — the signature-only `read` and the
+    // default-bodied `name`. Reachability is the CALLS half of issue #390.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write(&repo, "src/lib.rs", TRAIT_FIXTURE);
+    write(
+        &repo,
+        "src/caller.rs",
+        "pub fn path_call() -> u32 {\n    crate::Device::read()\n}\n\npub fn receiver_call(d: &crate::Device) -> u32 {\n    d.read() + d.name()\n}\n",
+    );
+    commit(&repo, "seed", FIXED_TIME);
+    let records = parse_jsonl(&scan_jsonl(&repo, "trait-call-fixture"));
+
+    let read = symbol(&records, "function", "read").expect("read symbol")["id"]
+        .as_str()
+        .expect("read id");
+    let name = symbol(&records, "function", "name").expect("name symbol")["id"]
+        .as_str()
+        .expect("name id");
+    let path_call =
+        symbol(&records, "function", "caller::path_call").expect("path_call symbol")["id"]
+            .as_str()
+            .expect("path_call id");
+    let receiver_call = symbol(&records, "function", "caller::receiver_call")
+        .expect("receiver_call symbol")["id"]
+        .as_str()
+        .expect("receiver_call id");
+
+    // Trait-qualified `Device::read()` narrows to the signature-only method.
+    assert_eq!(
+        calls_edge_resolution(&records, path_call, read),
+        Some("resolved"),
+        "crate::Device::read() must resolve to the signature-only trait method"
+    );
+    // Receiver `d.read()` / `d.name()` reach the signature-only and the
+    // default-bodied trait methods.
+    assert_eq!(
+        calls_edge_resolution(&records, receiver_call, read),
+        Some("resolved"),
+        "d.read() must resolve to the signature-only trait method"
+    );
+    assert_eq!(
+        calls_edge_resolution(&records, receiver_call, name),
+        Some("resolved"),
+        "d.name() must resolve to the default-bodied trait method"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Extern boundary: foreign declarations stay symbol-less
 // ---------------------------------------------------------------------------
 

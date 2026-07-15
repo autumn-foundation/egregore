@@ -55,10 +55,20 @@ pub struct DefinitionFact {
     /// Unqualified name (last path segment).
     pub simple_name: String,
     /// Normalized segments used for path narrowing (module path, then the
-    /// normalized impl owner for methods, then the simple name).
+    /// normalized impl owner for methods OR the enclosing trait name for
+    /// trait methods, then the simple name).
     pub match_segments: Vec<String>,
     /// Symbol kind: `function`, `method`, or `test`.
     pub symbol_kind: String,
+    /// True when this callable is a trait method — default-bodied or
+    /// signature-only — declared inside a `trait` body (issue #390). Trait
+    /// methods keep `symbol_kind == "function"` (PR #384's additive record-ID
+    /// identity guarantee), so this marker is what distinguishes them from a
+    /// free function: it admits them to the `Method`/`Path` candidate pools
+    /// while EXCLUDING them from the bare free-function pool (`read()` can
+    /// never invoke a trait method). Defaults to `false`.
+    #[serde(default)]
+    pub is_trait_method: bool,
     /// Repo-relative path of the defining file.
     pub repo_relative_path: String,
 }
@@ -1467,12 +1477,18 @@ impl<'facts> DefinitionIndex<'facts> {
     /// ordered. Pool selection is syntactic:
     ///
     /// - `Direct` calls can only bind free functions (a bare Rust call can
-    ///   never invoke a method).
-    /// - `Method`/`SelfMethod` calls can only bind methods; `self.x()`
-    ///   prefers the surrounding impl's methods when any match.
+    ///   never invoke a method OR a trait method — trait methods are excluded
+    ///   by the `is_trait_method` marker, issue #390).
+    /// - `Method` calls bind inherent methods AND trait methods (`x.read()`
+    ///   can dispatch to either); `SelfMethod` (`self.x()`) prefers the
+    ///   surrounding impl's inherent methods when any match and does not reach
+    ///   trait defaults (proving that requires an IMPLEMENTS join — issue
+    ///   #344 follow-up).
     /// - `Path` calls bind any callable whose match segments end with the
-    ///   normalized call path; a single-segment path degrades to the
-    ///   free-function pool.
+    ///   normalized call path — including a trait method whose segments now
+    ///   carry the enclosing trait name (`Device::read`, issue #390); a
+    ///   single-segment path degrades to the free-function pool (and so, like
+    ///   `Direct`, never reaches a trait method).
     fn candidates(&self, call: &CallSiteFact, simple_name: &str) -> Vec<&'facts DefinitionFact> {
         let Some(pool) = self.by_simple_name.get(simple_name) else {
             return Vec::new();
@@ -1486,7 +1502,14 @@ impl<'facts> DefinitionIndex<'facts> {
             CallKind::Method => pool
                 .iter()
                 .copied()
-                .filter(|definition| definition.symbol_kind == "method")
+                .filter(|definition| {
+                    // A receiver call `x.read()` can dispatch to an inherent
+                    // impl method OR a trait method (issue #390). Trait methods
+                    // keep kind `"function"`, so widen the pool by the marker —
+                    // still a labeled lead: multiple same-name candidates emit
+                    // ambiguous edges to all, never a silent pick.
+                    definition.symbol_kind == "method" || definition.is_trait_method
+                })
                 .collect(),
             CallKind::SelfMethod => {
                 let methods: Vec<&DefinitionFact> = pool
@@ -1529,7 +1552,13 @@ impl<'facts> DefinitionIndex<'facts> {
 }
 
 fn is_free_function(definition: &DefinitionFact) -> bool {
-    definition.symbol_kind == "function" || definition.symbol_kind == "test"
+    // Trait methods keep `symbol_kind == "function"` but are NOT free
+    // functions: a bare `read()` (`Direct`, or a single-segment `Path`) can
+    // never invoke a trait method, so excluding them here closes the
+    // corollary false-bind hole (issue #390) — prefer a missing edge over a
+    // wrong one.
+    (definition.symbol_kind == "function" || definition.symbol_kind == "test")
+        && !definition.is_trait_method
 }
 
 fn segments_end_with(segments: &[String], suffix: &[impl AsRef<str>]) -> bool {
@@ -1566,7 +1595,18 @@ mod tests {
                 .map(String::from)
                 .collect(),
             symbol_kind: kind.to_owned(),
+            is_trait_method: false,
             repo_relative_path: path.to_owned(),
+        }
+    }
+
+    /// A trait method definition (issue #390): kind `"function"` with
+    /// `is_trait_method == true`, and `match_segments` carrying the enclosing
+    /// trait name as the owner segment (e.g. `["a", "Device", "read"]`).
+    fn trait_method_definition(id: &str, path: &str, segments: &[&str]) -> DefinitionFact {
+        DefinitionFact {
+            is_trait_method: true,
+            ..definition(id, "function", path, segments)
         }
     }
 
@@ -1699,6 +1739,201 @@ mod tests {
             records.is_empty(),
             "constructor-style and external method calls stay out of the graph: {records:?}"
         );
+    }
+
+    // --- Trait-method call resolution (issue #390) ------------------------
+
+    #[test]
+    fn path_call_binds_trait_method_by_owner_segment() {
+        // `Device::read()` (`Path`, `["Device","read"]`) name-resolves to a
+        // trait method whose match segments carry the trait name.
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![trait_method_definition(
+                "t-read",
+                "src/a.rs",
+                &["a", "Device", "read"],
+            )],
+            vec![],
+        )]);
+        let index = DefinitionIndex::build(&facts);
+        let call = call(
+            "caller",
+            "Device::read",
+            &["Device", "read"],
+            CallKind::Path,
+            None,
+        );
+        let ids: Vec<&str> = index
+            .candidates(&call, "read")
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["t-read"],
+            "Device::read must bind the trait method"
+        );
+    }
+
+    #[test]
+    fn method_call_pool_includes_trait_methods() {
+        // `x.read()` (`Method`) reaches a trait method even though it keeps
+        // `symbol_kind == "function"`.
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![trait_method_definition(
+                "t-read",
+                "src/a.rs",
+                &["a", "Device", "read"],
+            )],
+            vec![],
+        )]);
+        let index = DefinitionIndex::build(&facts);
+        let call = call("caller", "read", &["read"], CallKind::Method, None);
+        let ids: Vec<&str> = index
+            .candidates(&call, "read")
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["t-read"],
+            "x.read() must include the trait method"
+        );
+    }
+
+    #[test]
+    fn bare_direct_call_never_binds_a_trait_method() {
+        // The corollary closure (issue #390): a bare `read()` (`Direct`) can
+        // never invoke a trait method, so the pool is empty even though the
+        // trait method keeps `symbol_kind == "function"`.
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![trait_method_definition(
+                "t-read",
+                "src/a.rs",
+                &["a", "Device", "read"],
+            )],
+            vec![],
+        )]);
+        let index = DefinitionIndex::build(&facts);
+        let call = call("caller", "read", &["read"], CallKind::Direct, None);
+        assert!(
+            index.candidates(&call, "read").is_empty(),
+            "a bare read() must not bind a trait method"
+        );
+    }
+
+    #[test]
+    fn single_segment_path_call_never_binds_a_trait_method() {
+        // A single-segment `Path` degrades to the free-function pool, which
+        // now excludes trait methods (issue #390).
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![trait_method_definition(
+                "t-read",
+                "src/a.rs",
+                &["a", "Device", "read"],
+            )],
+            vec![],
+        )]);
+        let index = DefinitionIndex::build(&facts);
+        let call = call("caller", "read", &["read"], CallKind::Path, None);
+        assert!(
+            index.candidates(&call, "read").is_empty(),
+            "a single-segment read() path must not bind a trait method"
+        );
+    }
+
+    #[test]
+    fn path_call_binds_only_the_exact_trait_suffix() {
+        // `A::read()` with two traits `A` and `B` each declaring `read` binds
+        // ONLY `A::read` — the exact owner suffix, never a fan-out.
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![
+                trait_method_definition("a-read", "src/a.rs", &["a", "A", "read"]),
+                trait_method_definition("b-read", "src/a.rs", &["a", "B", "read"]),
+            ],
+            vec![],
+        )]);
+        let index = DefinitionIndex::build(&facts);
+        let call = call("caller", "A::read", &["A", "read"], CallKind::Path, None);
+        let ids: Vec<&str> = index
+            .candidates(&call, "read")
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a-read"], "A::read must bind only A::read");
+    }
+
+    #[test]
+    fn path_call_does_not_bind_a_free_function_named_like_the_method() {
+        // `Device::read()` must not fall through to a free function `read`
+        // that shares the simple name but not the trait owner segment.
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![definition(
+                "free-read",
+                "function",
+                "src/a.rs",
+                &["a", "read"],
+            )],
+            vec![],
+        )]);
+        let index = DefinitionIndex::build(&facts);
+        let call = call(
+            "caller",
+            "Device::read",
+            &["Device", "read"],
+            CallKind::Path,
+            None,
+        );
+        assert!(
+            index.candidates(&call, "read").is_empty(),
+            "Device::read must not bind an unrelated free function read"
+        );
+    }
+
+    #[test]
+    fn method_call_fans_out_to_all_trait_method_candidates() {
+        // Two same-named trait methods → the `Method` pool holds both, so the
+        // driver labels ambiguous edges to each, never a silent winner.
+        let facts = facts(&[
+            (
+                "src/a.rs",
+                vec![trait_method_definition(
+                    "a-read",
+                    "src/a.rs",
+                    &["a", "Device", "read"],
+                )],
+                vec![],
+            ),
+            (
+                "src/b.rs",
+                vec![trait_method_definition(
+                    "b-read",
+                    "src/b.rs",
+                    &["b", "Sensor", "read"],
+                )],
+                vec![],
+            ),
+            (
+                "src/c.rs",
+                vec![],
+                vec![call("caller", "read", &["read"], CallKind::Method, None)],
+            ),
+        ]);
+        let records = cross_file_call_records("repo", &facts);
+        let mut ambiguous = edge_targets(&records, CallResolution::Ambiguous);
+        ambiguous.sort();
+        assert_eq!(
+            ambiguous,
+            vec!["a-read".to_owned(), "b-read".to_owned()],
+            "two trait methods named read must both be labeled ambiguous candidates"
+        );
+        assert!(edge_targets(&records, CallResolution::Resolved).is_empty());
     }
 
     fn per_file_calls_edge(source: &str, target: &str) -> GraphRecord {
