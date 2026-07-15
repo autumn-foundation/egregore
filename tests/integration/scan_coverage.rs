@@ -602,3 +602,112 @@ fn inspect_data_dir_reports_latest_superseded_coverage() {
     assert_eq!(coverage[0]["files_walked"], 8, "latest coverage: {value}");
     assert_eq!(coverage[0]["files_indexed"], 5, "latest coverage: {value}");
 }
+
+/// Issue #404: after a tracked directory becomes its own nested Git checkout,
+/// `git ls-files` still lists its files (they remain in the superproject index),
+/// but the superproject cannot verify their spans. The Git-tracked-files walk of
+/// `discover_files_matching` must therefore exclude files under a nested Git root
+/// (any ancestor directory below the scan root carrying a `.git` sentinel) — the
+/// same guard the filesystem-walk fallback's `should_descend` already applies —
+/// and the exclusion must be reflected consistently in scan coverage
+/// (excluded-directory semantics: the nested file is neither walked nor indexed,
+/// exactly like a file under `.git`/`target`).
+#[test]
+fn git_walk_excludes_files_under_nested_git_checkout() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = git_repo_from_fixture(&temp);
+
+    // Track a source file under a subdirectory, then turn that subdirectory into
+    // a nested Git checkout by dropping a `.git` FILE sentinel (submodule /
+    // linked-worktree style). The file stays in the superproject index, so
+    // `git ls-files` keeps returning it.
+    let nested = repo.join("dep/src");
+    fs::create_dir_all(&nested).expect("nested dir");
+    fs::write(nested.join("lib.rs"), "pub fn nested() {}\n").expect("nested source");
+    run_git(&repo, &["add", "-A", "-f"]);
+    run_git(&repo, &["commit", "-m", "add tracked dep source"]);
+    fs::write(repo.join("dep/.git"), "gitdir: /elsewhere/.git\n").expect("nested .git sentinel");
+
+    let graph_path = repo.join("graph.jsonl");
+    let output = assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&graph_path)
+        .output()
+        .expect("scan should run");
+    assert!(output.status.success());
+
+    let jsonl = fs::read_to_string(&graph_path).expect("scan should write JSONL");
+    let records = parse_jsonl(&jsonl);
+
+    // The nested checkout's source must not enter the graph.
+    assert!(
+        !jsonl.contains("dep/src/lib.rs"),
+        "file under a nested Git checkout must be excluded from the graph"
+    );
+
+    // Excluded-directory semantics: the nested file is neither walked nor
+    // indexed, so coverage matches the base fixture exactly (8 walked, 5
+    // indexed) rather than counting the extra nested source.
+    let node = coverage_node(&records);
+    let walked = node["scan_coverage"]["files_walked"].as_u64().unwrap();
+    let indexed = node["scan_coverage"]["files_indexed"].as_u64().unwrap();
+    assert_eq!(walked, 8, "nested-Git file must not dilute files_walked");
+    assert_eq!(indexed, 5, "nested-Git file must not be indexed");
+
+    // The nested-checkout source never appears in the skip tally either.
+    let skipped = node["scan_coverage"]["skipped_by_extension"]
+        .as_object()
+        .expect("skipped_by_extension object");
+    let skipped_total: u64 = skipped.values().map(|v| v.as_u64().unwrap()).sum();
+    assert_eq!(
+        indexed + skipped_total,
+        walked,
+        "coverage must fully account (indexed + skipped == walked)"
+    );
+    assert!(
+        node["scan_coverage"]["coverage_complete"]
+            .as_bool()
+            .unwrap()
+    );
+}
+
+/// Issue #404 (fallback branch): the non-Git filesystem walk must likewise skip
+/// files under a nested Git checkout — here proved with a `.git` DIRECTORY
+/// sentinel. This is the existing `should_descend` precedent; the assertion
+/// guards it against regression alongside the Git-tracked-files fix.
+#[test]
+fn filesystem_walk_excludes_files_under_nested_git_checkout() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    // A non-Git tree (no outer `.git`) so discovery takes the filesystem-walk
+    // fallback rather than the Git-tracked-files branch.
+    let root = temp.path().join("tree");
+    fs::create_dir_all(root.join("dep/src")).expect("dirs");
+    fs::write(root.join("outer.rs"), "pub fn outer() {}\n").expect("outer source");
+    fs::write(root.join("dep/src/lib.rs"), "pub fn nested() {}\n").expect("nested source");
+    // `.git` DIRECTORY sentinel marking `dep/` as its own checkout.
+    fs::create_dir_all(root.join("dep/.git")).expect("nested .git dir");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    let output = assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(&root)
+        .arg("--out")
+        .arg(&graph_path)
+        .output()
+        .expect("scan should run");
+    assert!(output.status.success());
+
+    let jsonl = fs::read_to_string(&graph_path).expect("scan should write JSONL");
+    assert!(
+        jsonl.contains("outer.rs"),
+        "top-level source outside the nested checkout must be indexed"
+    );
+    assert!(
+        !jsonl.contains("dep/src/lib.rs"),
+        "file under a nested Git checkout must be excluded from the filesystem walk"
+    );
+}

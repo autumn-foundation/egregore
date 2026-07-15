@@ -561,9 +561,11 @@ impl<'a> FreshnessIndex<'a> {
         }
         if !per_repo_frontier.is_empty() {
             live_code_by_id.retain(|id, versions| {
-                // A handle with any commit-anchored version is a history handle,
-                // governed by the commit-tip frontier above — never pruned here.
-                if versions.iter().any(|r| version_commit(r).is_some()) {
+                let has_temporal = versions.iter().any(|r| version_commit(r).is_some());
+                let has_non_temporal = versions.iter().any(|r| version_commit(r).is_none());
+                // A PURE-history handle (every version commit-anchored) is governed
+                // by the commit-tip frontier above — never pruned here.
+                if has_temporal && !has_non_temporal {
                     return true;
                 }
                 // Prune against the handle's OWN repository's newest scan. With no
@@ -571,10 +573,45 @@ impl<'a> FreshnessIndex<'a> {
                 let Some(&frontier) = per_repo_frontier.get(&repo_index.owner_of(id)) else {
                     return true;
                 };
-                versions.iter().any(|r| {
-                    version_valid(r)
-                        .is_some_and(|vt| time_cmp(vt, frontier) == std::cmp::Ordering::Equal)
-                })
+                // Liveness on the current-tree scan axis: a NON-temporal version at
+                // the repository's newest scan `valid_time`.
+                let at_scan_frontier = versions.iter().any(|r| {
+                    version_commit(r).is_none()
+                        && version_valid(r)
+                            .is_some_and(|vt| time_cmp(vt, frontier) == std::cmp::Ordering::Equal)
+                });
+                if !has_temporal {
+                    // Pure current-tree handle (issue #204): live only at its
+                    // repository's newest scan.
+                    return at_scan_frontier;
+                }
+                // MIXED handle (issue #405): one identity-derived ID carrying BOTH a
+                // `scan-history` (commit-anchored) version and current-tree `scan`
+                // versions — no single command emits both; only a hand-combined store
+                // (e.g. `cat graph.jsonl history.graph.jsonl`, or ingesting both into
+                // one `--data-dir`) does. It is exempt from neither axis. The two
+                // "latest" axes — a commit's committer date (temporal `valid_time`)
+                // and a current-tree scan's wall-clock `valid_time` — have no reliable
+                // cross-ordering (rebases, clock skew: #203 keys on tips, not
+                // timestamps), so we never order them across axes. Instead the handle
+                // is live iff present in the latest state of EITHER axis: a temporal
+                // version at one of its repository's tip commits, OR a non-temporal
+                // version at the newest scan. A symbol present at a tip commit stays
+                // `current` (never a false `unresolved` — the regression a naive "must
+                // also be at the scan frontier" predicate would cause); a symbol
+                // present at the newest scan stays `current`; a symbol absent from
+                // BOTH latest states is pruned to `unresolved`, closing the gap where
+                // a mixed handle was pruned by neither frontier.
+                if at_scan_frontier {
+                    return true;
+                }
+                let repo_tips = per_repo_tips
+                    .get(&repo_index.owner_of(id))
+                    .filter(|set| !set.is_empty())
+                    .unwrap_or(&tips);
+                versions
+                    .iter()
+                    .any(|r| version_commit(r).is_some_and(|c| repo_tips.contains(c)))
             });
         }
 

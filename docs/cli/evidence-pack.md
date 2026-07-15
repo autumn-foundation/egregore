@@ -579,9 +579,18 @@ Re-verifies an assembled pack offline and read-only:
   recomputed with `assemble`'s exact formula and IEEE-754 arithmetic
   (`approved_pr_count / merged_pr_count`, vacuously `1.0` when none merged) and
   compared bit-for-bit, so no float-epsilon drift is introduced; and (7) `passed`
-  must equal `coverage >= min_required` (`min_required` is self-declared — the
-  pack carries no independent source for the `--min-review-coverage` value — so
-  this catches a lie in `passed` alone against the stored coverage/threshold).
+  must equal `coverage >= min_required`. Since issue #355 the threshold is no
+  longer purely self-declared: the manifest echoes the assemble-time
+  `--min-review-coverage` in the **hash-bound** `min_review_coverage` field, so
+  when it is present the measurement's `min_required` must **exactly equal** it (a
+  bit-for-bit divergence is a forged threshold and fails Integrity) and `passed`
+  is recomputed against the manifest-declared, hash-bound value — closing the
+  downward-forge where a genuinely-failing pack (`coverage < min_required`) is
+  hand-edited to lower `min_required` below the coverage and flip `passed` to
+  `true`. A pre-#355 pack (`min_review_coverage` absent) keeps the legacy
+  self-consistency-only path: `passed` recomputed against the self-declared
+  `min_required` alone (that pack carries no bound threshold, so the downward-forge
+  is undetectable for it — documented back-compat degradation).
   Finally, the `measurement` is **required on every `review_coverage` section**:
   `assemble` always emits it, even for a 0%-coverage window with merged PRs but no
   approving reviews (empty rows), so an absent measurement — with or without rows —
@@ -621,7 +630,22 @@ Re-verifies an assembled pack offline and read-only:
   `remediation_links`↔`remediation_links`): a `log_summary` on a non-log section, or
   a variant relocated onto a mismatched log section, fails Integrity. The derived
   `remediation_links` join has no backing hashed row, so the whole-summary hash plus
-  this class bind are its sole binding surface.
+  this class bind are its sole binding surface. Integrity also enforces three
+  manifest-level binds added in issue #355. First, the **`min_review_coverage`
+  binding hash**: the manifest's hash-bound `min_review_coverage` field (the
+  assemble-time `--min-review-coverage`) is recomputed via
+  `min_review_coverage_binding_hash` and compared, so a hand-edited threshold with a
+  stale hash fails — the backstop the measurement's `min_required` equality (check
+  (7) above) leans on. The field and its hash must be **both present or both
+  absent**: a pre-#355 pack carries neither (legacy self-consistency-only path,
+  passes) and a partially-tampered pack (one present, one absent) fails. Second, the
+  **verbatim disclaimer bind**: `manifest.disclaimer` must equal `PACK_DISCLAIMER`
+  byte-for-byte, so a weakened, blanked, or altered disclaimer fails Integrity (the
+  Safety scan only rejects a disclaimer that leaks a secret, not a softened one).
+  Third, **`excluded_missing_valid_time` is recomputed** from the pack's own
+  diagnostics — `assemble` pushes exactly one `missing_valid_time` diagnostic per
+  record it excludes for an unresolvable valid time, in lockstep with the counter —
+  so understating the manifest's stored exclusion count fails Integrity.
 - **Coverage** — recompute the #65 citation thresholds (>=95% code rows cited;
   100% non-code rows cited).
 - **Safety** — scans the **entire serialized pack artifact** for raw sensitive

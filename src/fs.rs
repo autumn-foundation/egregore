@@ -107,6 +107,10 @@ fn discover_files_matching(
 
     if crate::identity::is_repo_root(repo_root) {
         if let Some(tracked) = git_tracked_files(repo_root) {
+            // Memoizes, per directory, whether it carries a nested `.git`
+            // sentinel, so the ancestor scan below stats each directory at most
+            // once across the whole tracked-file list (issue #404).
+            let mut nested_git_cache = std::collections::HashMap::new();
             for path in tracked {
                 let is_file = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
                 if !is_file {
@@ -122,6 +126,16 @@ fn discover_files_matching(
                     .split('/')
                     .any(|part| part == "target" || part == ".git");
                 if has_target_or_git {
+                    continue;
+                }
+                // Excluded nested Git checkouts (issue #404): after a tracked
+                // directory becomes its own checkout, `git ls-files` still lists
+                // its files, but the superproject cannot verify their spans.
+                // Mirror the filesystem-walk fallback's `should_descend`
+                // ancestor-sentinel guard here so both branches exclude nested
+                // checkouts identically, with the same excluded-directory
+                // accounting (never walked, never indexed).
+                if is_under_nested_git(repo_root, &path, &mut nested_git_cache) {
                     continue;
                 }
                 // The tracked-files walk visits every non-excluded file, so it
@@ -255,6 +269,41 @@ fn collect_matching_files(
     }
 
     Ok(())
+}
+
+/// Returns `true` when `path` lies inside a nested Git working tree — a
+/// directory strictly below `repo_root` that carries its own `.git` sentinel
+/// (dir or file). This is the Git-tracked-files-branch analog of the
+/// filesystem-walk fallback's `should_descend` ancestor guard (issue #404):
+/// `git ls-files` keeps enumerating a directory's files after it becomes its own
+/// checkout, so the superproject would otherwise index spans it cannot verify.
+///
+/// `repo_root`'s own `.git` is never treated as nested (the ancestor scan stops
+/// at, and excludes, `repo_root`). Per-directory results are memoized in `cache`
+/// so each ancestor directory is stat'd at most once across the tracked-file
+/// list, keeping the check deterministic and bounded.
+fn is_under_nested_git(
+    repo_root: &Path,
+    path: &Path,
+    cache: &mut std::collections::HashMap<PathBuf, bool>,
+) -> bool {
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        // Stop at (and never inspect) the scan root: its `.git` is the
+        // superproject's own, not a nested checkout. Also stop defensively if we
+        // somehow walked above the root.
+        if dir == repo_root || !dir.starts_with(repo_root) {
+            break;
+        }
+        let is_nested = *cache
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| dir.join(".git").exists());
+        if is_nested {
+            return true;
+        }
+        current = dir.parent();
+    }
+    false
 }
 
 fn should_descend(path: &Path) -> bool {
