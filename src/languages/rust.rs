@@ -417,6 +417,14 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             &self.file.repo_relative_path,
             &name,
         ]);
+        // Imports carry NO `content_signature`: the import stable ID already
+        // encodes the full `use ...;` declaration (via `import_name`, the whole
+        // trimmed path — not the bound leaf), so any body change (glob
+        // expansion, alias, added path segment) mints a DIFFERENT record ID. A
+        // content signature could therefore never be the drift trigger for an
+        // import — two versions with differing bodies never share an ID for
+        // evidence-freshness to compare within. Such a change surfaces as a
+        // handle-identity change (`unresolved`/removed), not `drifted` (#206).
         let mut record = GraphRecord::syntax_node(
             id.clone(),
             NodeKind::Import,
@@ -425,13 +433,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             name.clone(),
             "rust",
             format!("Rust import {name}"),
-        )
-        // The import summary is the bound name only, so a body change (glob
-        // expansion, alias, added path segment) with an unchanged bound name
-        // would hash identically. Stamp a compact BLAKE3 handle over the
-        // normalized `use ...;` declaration so evidence-freshness drift stays
-        // content-detectable (issue #206).
-        .with_content_signature(content_signature(self.node_text(node)));
+        );
         // Doc comments above a `use` declaration attach to the item rustdoc
         // exposes at the re-export site (issue #257); capture them as the
         // import's doc fact. Additive, never an identity input.
@@ -4092,10 +4094,13 @@ mod tests {
     }
 
     #[test]
-    fn module_and_import_carry_deterministic_content_signature() {
-        // Module and Import summaries are name-only (issue #206), so the
-        // extractor stamps a compact BLAKE3 body signature. It must be present,
-        // well-formed, and byte-stable across identical extractions.
+    fn module_carries_deterministic_content_signature() {
+        // A module summary is name-only (issue #206) and its stable ID is keyed
+        // on the qualified NAME alone, so an inline-body edit keeps the same ID.
+        // The extractor stamps a compact BLAKE3 body signature so that
+        // same-ID body drift stays content-detectable. It must be present,
+        // well-formed, and byte-stable across identical extractions. Imports
+        // carry NO signature (their ID already encodes the full declaration).
         let source = "\
 use std::collections::BTreeMap;
 
@@ -4112,11 +4117,9 @@ pub mod inner {
         let module_sig = module
             .content_signature()
             .expect("module content_signature");
-        let import_sig = import
-            .content_signature()
-            .expect("import content_signature");
         assert!(module_sig.starts_with("blake3:"));
-        assert!(import_sig.starts_with("blake3:"));
+        // Imports no longer carry a content signature.
+        assert_eq!(import.content_signature(), None);
 
         // Deterministic: re-extracting identical source yields identical handles.
         let graph2 = extract_records(source);
@@ -4126,18 +4129,17 @@ pub mod inner {
         );
         assert_eq!(
             find_node(&graph2, NodeKind::Import).content_signature(),
-            Some(import_sig)
+            None
         );
     }
 
     #[test]
-    fn content_signature_changes_with_module_and_import_body() {
-        // A module body edit and an import declaration edit — both leaving the
-        // name/bound-name unchanged — must produce different content signatures,
-        // which is exactly what makes the drift detectable (issue #206).
+    fn content_signature_changes_with_module_body() {
+        // A module body edit that leaves the name unchanged keeps the module's
+        // stable ID (keyed on qualified name only) but must produce a different
+        // content signature — exactly what makes the module body drift
+        // detectable as a ContentChange within one ID group (issue #206).
         let base = "\
-use std::collections::BTreeMap;
-
 pub mod inner {
     pub fn helper() -> u32 {
         1
@@ -4145,29 +4147,14 @@ pub mod inner {
 }
 ";
         let changed_mod = "\
-use std::collections::BTreeMap;
-
 pub mod inner {
     pub fn helper() -> u32 {
         2
     }
 }
 ";
-        let changed_import = "\
-use std::collections::BTreeMap as Map;
-
-pub mod inner {
-    pub fn helper() -> u32 {
-        1
-    }
-}
-";
         let base_graph = extract_records(base);
         let base_mod = find_node(&base_graph, NodeKind::Module)
-            .content_signature()
-            .expect("sig")
-            .to_owned();
-        let base_import = find_node(&base_graph, NodeKind::Import)
             .content_signature()
             .expect("sig")
             .to_owned();
@@ -4178,25 +4165,42 @@ pub mod inner {
             Some(base_mod.as_str()),
             "changed module body must change the signature"
         );
+    }
 
-        let import_graph = extract_records(changed_import);
+    #[test]
+    fn import_body_change_is_a_record_identity_change() {
+        // An import body change (here adding an `as` alias) mints a DIFFERENT
+        // stable record ID, because `import_name` — a hash component of the ID —
+        // is the whole trimmed `use ...;` declaration, not the bound leaf. So
+        // the two versions never share an ID for evidence-freshness to compare a
+        // signature within; the change surfaces as a handle-identity change
+        // (`unresolved`/removed), never a ContentChange drift (issue #206).
+        let base = "use std::collections::BTreeMap;\n";
+        let changed = "use std::collections::BTreeMap as Map;\n";
+        let base_graph = extract_records(base);
+        let changed_graph = extract_records(changed);
+        let base_import = find_node(&base_graph, NodeKind::Import).id();
+        let changed_import = find_node(&changed_graph, NodeKind::Import).id();
         assert_ne!(
-            find_node(&import_graph, NodeKind::Import).content_signature(),
-            Some(base_import.as_str()),
-            "changed import declaration must change the signature"
+            base_import, changed_import,
+            "an import body change must mint a different record ID"
         );
     }
 
     #[test]
-    fn non_module_import_nodes_have_no_content_signature() {
-        // content_signature is scoped to Module/Import; other kinds (Symbols,
-        // whose summary already embeds the normalized body) leave it None so
-        // their content hash stays byte-unchanged (issue #206). The File node is
-        // minted upstream of this extractor and likewise never carries one.
-        let source = "pub fn f() -> u32 {\n    1\n}\n";
+    fn only_module_nodes_carry_content_signature() {
+        // content_signature is scoped to Module (issue #206). Symbols embed the
+        // normalized body in their own summary, imports encode the full
+        // declaration in their ID, and the File node is minted upstream; none of
+        // them carry a signature, so their content hash stays byte-unchanged.
+        let source = "use std::collections::BTreeMap;\n\npub fn f() -> u32 {\n    1\n}\n";
         let graph = extract_records(source);
         assert_eq!(
             find_node(&graph, NodeKind::Symbol).content_signature(),
+            None
+        );
+        assert_eq!(
+            find_node(&graph, NodeKind::Import).content_signature(),
             None
         );
     }

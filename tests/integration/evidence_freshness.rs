@@ -113,15 +113,17 @@ fn module_version(
     .with_temporal(temporal(commit, valid_time))
 }
 
-/// Builds a Rust `Import` version pinned to a commit (issue #206). Like
-/// [`module_version`], the summary is name-only and body drift rides on the
-/// additive `content_signature` handle.
+/// Builds a Rust `Import` version pinned to a commit (issue #206). Unlike
+/// [`module_version`], imports carry NO `content_signature`: the import's stable
+/// ID already encodes the full trimmed `use ...;` declaration (via
+/// `import_name`, the whole path — not the bound leaf), so a body change mints a
+/// DIFFERENT record ID rather than riding a content signature. A content
+/// signature on an import could therefore never be the drift trigger.
 fn import_version(
     import_id: &str,
     path: &str,
     name: &str,
     import_span: SourceSpan,
-    signature: &str,
     commit: &str,
     valid_time: &str,
 ) -> GraphRecord {
@@ -133,7 +135,6 @@ fn import_version(
         Some(name.to_owned()),
         format!("Rust import {name}"),
     )
-    .with_content_signature(signature.to_owned())
     .with_temporal(temporal(commit, valid_time))
 }
 
@@ -1937,65 +1938,87 @@ fn module_body_change_is_detected_as_drift() {
 }
 
 #[test]
-fn import_body_change_is_detected_as_drift() {
-    // A Rust `Import` whose `use ...;` declaration changed (e.g. an added path
-    // segment / alias) while the bound name stayed the same. The name-only
-    // summary hides it; the differing `content_signature` surfaces the drift.
-    let path = "src/i.rs";
-    let import = stable_id(&["node", "import", "repo-a", path, "BTreeMap"]);
-    let anchor = import_version(
-        &import,
-        path,
-        "BTreeMap",
-        span(1, 1),
-        "blake3:import-body-v1",
-        "commit_a",
-        "2026-01-01T00:00:00Z",
+fn import_body_change_is_a_handle_identity_change_end_to_end() {
+    // HONEST end-to-end proof (Codex finding, issue #206): an import body change
+    // is NEVER reported as `drifted`/ContentChange, because the import's stable
+    // ID encodes the whole trimmed `use ...;` declaration (`import_name`). When
+    // the declaration changes (`use std::fmt::Debug;` -> `use std::fmt::Debug as
+    // Dbg;`) the real extractor mints a DIFFERENT record ID, so the two versions
+    // never share an ID for a content signature to be compared within. A
+    // citation to the OLD import handle resolves `unresolved` (the handle is
+    // absent from the frontier), NOT `drifted`. This is why imports carry no
+    // `content_signature` — it could never fire.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path();
+    init_git_repo(repo);
+
+    write_repo_file(
+        repo,
+        "src/lib.rs",
+        "use std::fmt::Debug;\npub fn a() -> u32 { 1 }\n",
     );
-    let frontier = import_version(
-        &import,
-        path,
-        "BTreeMap",
-        span(1, 1),
-        "blake3:import-body-v2",
-        "commit_b",
-        "2026-03-01T00:00:00Z",
+    let first = commit_repo(repo, "initial import", "2026-01-01T00:00:00Z");
+
+    // Change ONLY the import declaration (add an `as` alias). The old import
+    // handle disappears and a new one is minted at the frontier.
+    write_repo_file(
+        repo,
+        "src/lib.rs",
+        "use std::fmt::Debug as Dbg;\npub fn a() -> u32 { 1 }\n",
     );
-    let obs = agent_memory_stable_id(&["obs", "import_body"]);
-    let records = vec![
-        anchor,
-        frontier,
-        observation(
-            &obs,
-            "imports BTreeMap from std::collections",
-            "0.9",
-            Some(&import),
-            Some(path),
-            Some(span(1, 1)),
-            "OBSERVES",
-            Some("commit_a"),
-            None,
-        ),
-    ];
+    let _second = commit_repo(repo, "alias the import", "2026-01-02T00:00:00Z");
+
+    let graph = scan_repository_history(repo).expect("history scan should succeed");
+    // The OLD declaration keyed the id on `std::fmt::Debug`; the NEW one on
+    // `std::fmt::Debug as Dbg` — proving the body change moved the identity.
+    let old_import_id = find_node_id(graph.records(), NodeKind::Import, "std::fmt::Debug")
+        .expect("old import node present at the first commit");
+    assert!(
+        find_node_id(graph.records(), NodeKind::Import, "std::fmt::Debug as Dbg").is_some(),
+        "the changed declaration must mint a distinct import handle"
+    );
+
+    let obs = agent_memory_stable_id(&["obs", "e2e_import_identity_change"]);
+    let mut records = graph.into_records();
+    records.push(observation(
+        &obs,
+        "imports std::fmt::Debug",
+        "0.9",
+        Some(&old_import_id),
+        Some("src/lib.rs"),
+        None,
+        "OBSERVES",
+        Some(&first),
+        None,
+    ));
 
     let verdicts = freshness::evidence_link_freshness(&records);
     let entry = verdicts
         .iter()
         .find(|e| e.observation_id == obs)
         .expect("verdict for obs");
-    assert_eq!(entry.verdict, FreshnessVerdict::Drifted);
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Unresolved,
+        "an import body change mints a new ID, so a citation to the old import \
+         handle must resolve `unresolved`, never `drifted`"
+    );
+    // No tombstone is emitted for a renamed import; the handle is simply absent
+    // from the frontier.
     assert!(matches!(
         entry.triggering_handle,
-        Some(freshness::TriggeringHandle::ContentChange { .. })
+        Some(freshness::TriggeringHandle::HandleAbsent)
     ));
 }
 
 #[test]
 fn unchanged_module_import_bodies_stay_current() {
-    // Regression / no-false-positive guard: a `Module` and an `Import` whose
-    // bodies are UNCHANGED between anchor and frontier (same
-    // `content_signature`) must stay `current`. Folding `content_signature`
-    // into the content hash must not flip an unchanged body to `drifted`.
+    // Regression / no-false-positive guard: a `Module` whose body is UNCHANGED
+    // between anchor and frontier (same `content_signature`) and an `Import`
+    // whose UNCHANGED declaration keeps the same stable ID must both stay
+    // `current`. Folding the module `content_signature` into the content hash
+    // must not flip an unchanged body to `drifted`, and an unchanged import
+    // (which carries no `content_signature`) must not drift either.
     let mpath = "src/mu.rs";
     let module = stable_id(&["node", "module", "repo-a", mpath, "stable_mod"]);
     let ipath = "src/iu.rs";
@@ -2027,7 +2050,6 @@ fn unchanged_module_import_bodies_stay_current() {
             ipath,
             "HashMap",
             span(1, 1),
-            "blake3:same-import-body",
             "commit_a",
             "2026-01-01T00:00:00Z",
         ),
@@ -2036,7 +2058,6 @@ fn unchanged_module_import_bodies_stay_current() {
             ipath,
             "HashMap",
             span(1, 1),
-            "blake3:same-import-body",
             "commit_b",
             "2026-03-01T00:00:00Z",
         ),
@@ -4483,11 +4504,14 @@ fn signatureless_version(
 #[test]
 fn one_sided_missing_content_signature_is_not_drift() {
     // Back-compat regression (Codex finding B): a store upgraded ACROSS #206 holds
-    // a legacy Module/Import version with `content_signature = None` (hashed
+    // a legacy `Module` version with `content_signature = None` (hashed
     // summary-only) alongside a post-upgrade rescan of the SAME body carrying
     // `Some(sig)`. The bodies are byte-identical, so freshness must report
     // `current`. Before the fix, folding the signature into the hash on only the
-    // upgraded side flipped a byte-identical body to a false `drifted`.
+    // upgraded side flipped a byte-identical body to a false `drifted`. The
+    // `Import` here never carries a `content_signature` on either side (imports
+    // encode their declaration in the ID), so its unchanged declaration must
+    // likewise stay `current`.
     let mpath = "src/legacy_mod.rs";
     let module = stable_id(&["node", "module", "repo-a", mpath, "legacy_mod"]);
     let ipath = "src/legacy_import.rs";
@@ -4517,7 +4541,9 @@ fn one_sided_missing_content_signature_is_not_drift() {
             "commit_a",
             "2026-01-01T00:00:00Z",
         ),
-        // Post-upgrade frontiers: Some(sig) over the SAME (unchanged) body.
+        // Post-upgrade frontiers: the module carries Some(sig) over the SAME
+        // (unchanged) body; the import stays signatureless (imports never carry
+        // one) over its unchanged declaration.
         module_version(
             &module,
             mpath,
@@ -4532,7 +4558,6 @@ fn one_sided_missing_content_signature_is_not_drift() {
             ipath,
             "BTreeSet",
             span(1, 1),
-            "blake3:legacy-import-body",
             "commit_b",
             "2026-03-01T00:00:00Z",
         ),

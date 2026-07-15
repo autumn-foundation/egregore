@@ -2286,11 +2286,14 @@ impl GraphRecord {
     }
 
     /// Stamps the compact body content signature on a node record (issue #206).
-    /// Used for `Module` / `Import` nodes whose display `summary` is name-only,
-    /// so an unchanged-name body edit is still content-detectable by
-    /// evidence-freshness drift. The value is additive metadata per
-    /// `docs/schema/schema-versioning.md §2` and MUST NOT contribute to stable
-    /// ID composition. No-op on non-node records.
+    /// Used for `Module` nodes whose display `summary` is name-only and whose
+    /// stable ID is keyed on the qualified name only, so an unchanged-name body
+    /// edit keeps the ID and is still content-detectable by evidence-freshness
+    /// drift. (`Import` nodes do NOT use this — their stable ID already encodes
+    /// the full `use ...;` declaration, so a body change mints a new ID and
+    /// surfaces as a handle-identity change, never a content drift.) The value
+    /// is additive metadata per `docs/schema/schema-versioning.md §2` and MUST
+    /// NOT contribute to stable ID composition. No-op on non-node records.
     #[must_use]
     pub fn with_content_signature(mut self, signature: impl Into<String>) -> Self {
         if let Self::Node {
