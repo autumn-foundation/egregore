@@ -60,6 +60,18 @@ pub(crate) fn print_counts_text(counts: &InspectCounts) {
     for repo in &counts.repositories {
         println!("repository: {} ({})", repo.id, repo.identity_summary);
     }
+    for cov in &counts.coverage {
+        let skipped_total: usize = cov.skipped_by_extension.values().sum();
+        println!(
+            "coverage: {} files walked, {} indexed, {} skipped (complete: {})",
+            cov.files_walked, cov.files_indexed, skipped_total, cov.coverage_complete
+        );
+        for (ext, count) in &cov.skipped_by_extension {
+            let label = if ext.is_empty() { "(no-ext)" } else { ext };
+            println!("  skipped {label}: {count}");
+        }
+        println!("  indexed languages: {}", cov.indexed_languages.join(", "));
+    }
     for (kind, count) in &counts.producer_kinds {
         println!("producer_kind {kind}: {count}");
     }
@@ -212,6 +224,19 @@ pub(crate) struct RepositorySummary {
     identity_summary: String,
 }
 
+/// One `ScanCoverage` node's file-level indexing accounting (issue #135),
+/// surfaced in `eg inspect` so an agent can tell "0 results because absent"
+/// from "0 results because that language was never indexed" (AC3).
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct CoverageSummary {
+    id: String,
+    files_walked: usize,
+    files_indexed: usize,
+    skipped_by_extension: BTreeMap<String, usize>,
+    indexed_languages: Vec<String>,
+    coverage_complete: bool,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct InspectCounts {
     records: usize,
@@ -222,6 +247,9 @@ pub(crate) struct InspectCounts {
     schema_versions: BTreeMap<RecordVersion, usize>,
     unknown_schema_versions: BTreeMap<RecordVersion, usize>,
     repositories: Vec<RepositorySummary>,
+    /// Scan-coverage summaries, one per `ScanCoverage` node (issue #135),
+    /// sorted by record ID for deterministic output.
+    coverage: Vec<CoverageSummary>,
     /// Per-`producer_kind` breakdown; legacy records use key `"legacy_pre_v1"`.
     producer_kinds: BTreeMap<String, usize>,
     /// Per-`egregore_version` breakdown; legacy records use key `"legacy_pre_v1"`.
@@ -259,11 +287,24 @@ impl InspectCounts {
                     id,
                     kind,
                     repository_identity,
+                    scan_coverage,
                     ..
                 } => {
                     counts.nodes += 1;
                     if *kind == NodeKind::Diagnostic {
                         counts.diagnostics += 1;
+                    }
+                    if *kind == NodeKind::ScanCoverage
+                        && let Some(payload) = scan_coverage.as_deref()
+                    {
+                        counts.coverage.push(CoverageSummary {
+                            id: id.clone(),
+                            files_walked: payload.files_walked,
+                            files_indexed: payload.files_indexed,
+                            skipped_by_extension: payload.skipped_by_extension.clone(),
+                            indexed_languages: payload.indexed_languages.clone(),
+                            coverage_complete: payload.coverage_complete,
+                        });
                     }
                     if *kind == NodeKind::Repository {
                         let identity_summary = repository_identity.as_deref().map_or_else(
@@ -307,6 +348,10 @@ impl InspectCounts {
             *counts.producer_kinds.entry(kind_key).or_default() += 1;
             *counts.egregore_versions.entry(version_key).or_default() += 1;
         }
+        // Deterministic coverage ordering regardless of physical iteration
+        // order; dedup a stable ID recurring across superseded versions.
+        counts.coverage.sort_by(|a, b| a.id.cmp(&b.id));
+        counts.coverage.dedup_by(|a, b| a.id == b.id);
         counts
     }
 
@@ -374,6 +419,14 @@ impl InspectCounts {
             "repositories": self.repositories.iter().map(|r| serde_json::json!({
                 "id": r.id,
                 "identity_summary": r.identity_summary
+            })).collect::<Vec<_>>(),
+            "coverage": self.coverage.iter().map(|c| serde_json::json!({
+                "id": c.id,
+                "files_walked": c.files_walked,
+                "files_indexed": c.files_indexed,
+                "skipped_by_extension": c.skipped_by_extension,
+                "indexed_languages": c.indexed_languages,
+                "coverage_complete": c.coverage_complete
             })).collect::<Vec<_>>(),
             "producer_kinds": self.producer_kinds,
             "egregore_versions": self.egregore_versions

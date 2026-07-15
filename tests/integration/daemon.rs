@@ -4322,7 +4322,10 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::UnsafeSite
         // Declared Cargo dependencies (issue #180), documented in
         // docs/cli/manifest-deps.md.
-        | NodeKind::DependencyDeclaration => "code-graph-documented",
+        | NodeKind::DependencyDeclaration
+        // File-level scan-coverage summary (issue #135), documented in
+        // docs/cli/scan.md and docs/cli/inspect.md.
+        | NodeKind::ScanCoverage => "code-graph-documented",
         // Documented in docs/schema/semantic-drift.md
         NodeKind::SemanticDrift | NodeKind::EmbeddingModel | NodeKind::EmbeddingVector => {
             "semantic-domain-documented"

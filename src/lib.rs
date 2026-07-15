@@ -121,11 +121,12 @@ pub use ir::{
     LogEventPayload, LogOccurrenceBucketPayload, LogPayload, LogSourcePayload, MetricKind,
     NodeKind, NodeProvenance, PRODUCER_ENVELOPE_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION,
     PatchHandle, Producer, ProducerKind, RepositoryIdentityPayload, SCHEMA_VERSION,
-    SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, SelectionBasis,
-    SemanticDriftMetadata, SnapshotHead, SourceSnapshotPayload, SourceSpan, TemporalMetadata,
-    USER_CONTEXT_SCHEMA_VERSION, UserContextFields, UserContextScope, VERIFICATION_SCHEMA_VERSION,
-    agent_memory_stable_id, artifact_stable_id, log_stable_id, project_stable_id,
-    semantic_stable_id, stable_id, user_context_stable_id, verification_stable_id,
+    SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, ScanCoveragePayload,
+    SelectionBasis, SemanticDriftMetadata, SnapshotHead, SourceSnapshotPayload, SourceSpan,
+    TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, UserContextFields, UserContextScope,
+    VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id, artifact_stable_id, log_stable_id,
+    project_stable_id, semantic_stable_id, stable_id, user_context_stable_id,
+    verification_stable_id,
 };
 pub use local_project::import_local_tasks;
 pub use query::{
@@ -253,8 +254,18 @@ fn scan_repository_at_with_override_inner(
             .with_source_snapshot(snapshot),
     );
 
+    let (source_files, coverage_tally) = fs::discover_source_files_with_coverage(repo_root)?;
+    // Scan-coverage summary (issue #135): a single deterministic `ScanCoverage`
+    // node makes file-level indexing coverage a stated, queryable graph fact,
+    // attached to its Repository by a CONTAINS edge so it is citable and never
+    // an orphan. Stamped alongside the Repository snapshot, before per-file
+    // records, so it rides in the JSONL and inspect can read it back.
+    for record in scan_coverage_records(&repository_id, &coverage_tally) {
+        graph.push(record.with_valid_time_inferred(transaction_time));
+    }
+
     let mut facts_by_file = BTreeMap::new();
-    for source_file in fs::discover_source_files(repo_root)? {
+    for source_file in source_files {
         let (records, facts) = scan_source_file_records(&source_file, &repository_id)?;
         for record in records {
             graph.push(record.with_valid_time_inferred(transaction_time));
@@ -396,6 +407,51 @@ fn stable_display_name(payload: &RepositoryIdentityPayload) -> String {
         ),
         IdentitySource::OperatorOverride | IdentitySource::LocalPath => payload.basename.clone(),
     }
+}
+
+/// Builds the `ScanCoverage` node and its `Repository —CONTAINS→ ScanCoverage`
+/// attribution edge from a discovery tally (issue #135).
+///
+/// The node ID is keyed solely on the repository so a repository has exactly one
+/// coverage node, re-minted deterministically on every full scan. The named
+/// language scope is derived from [`languages::Language::ALL`], never a
+/// hard-coded list, so it stays in lockstep with the extractor's real
+/// capability (AC6).
+pub(crate) fn scan_coverage_records(
+    repository_id: &str,
+    tally: &fs::ScanCoverageTally,
+) -> Vec<GraphRecord> {
+    let coverage_id = stable_id(&["node", "scan_coverage", repository_id]);
+    let payload = ir::ScanCoveragePayload {
+        files_walked: tally.files_walked,
+        files_indexed: tally.files_indexed,
+        skipped_by_extension: tally.skipped_by_extension.clone(),
+        indexed_languages: languages::Language::ALL
+            .iter()
+            .map(|language| language.display_name().to_owned())
+            .collect(),
+        coverage_complete: tally.coverage_complete,
+    };
+    let node = GraphRecord::node(
+        coverage_id.clone(),
+        NodeKind::ScanCoverage,
+        None,
+        None,
+        None,
+        format!(
+            "Scan coverage: {} files walked, {} indexed",
+            tally.files_walked, tally.files_indexed
+        ),
+    )
+    .with_scan_coverage(payload);
+    let edge = GraphRecord::edge(
+        ir::EdgeLabel::Contains,
+        repository_id.to_owned(),
+        coverage_id,
+        Some("1.0".to_owned()),
+        "Repository contains scan coverage summary".to_owned(),
+    );
+    vec![node, edge]
 }
 
 pub(crate) fn scan_source_file_records(

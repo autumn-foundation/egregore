@@ -99,7 +99,17 @@ unchanged store.
   },
   "schema_versions": { "codegraph:File:5": 401, "codegraph:Repository:5": 1 },
   "unknown_schema_versions": { "codegraph:Repository:6": 1 },
-  "repositories": [ { "id": "codegraph:v5:...", "identity_summary": "remote: ..." } ],
+  "repositories": [ { "id": "codegraph:v6:...", "identity_summary": "remote: ..." } ],
+  "coverage": [
+    {
+      "id": "codegraph:v6:...",
+      "files_walked": 61,
+      "files_indexed": 41,
+      "skipped_by_extension": { "": 2, "md": 12, "toml": 6 },
+      "indexed_languages": ["Rust", "Python", "TypeScript", "Go"],
+      "coverage_complete": true
+    }
+  ],
   "producer_kinds": { "legacy_pre_v1": 1204 },
   "egregore_versions": { "legacy_pre_v1": 1204 }
 }
@@ -113,6 +123,16 @@ Field notes:
 * `domain_counts` — per-trust-class `"<kind> v<version>": count` breakdown.
 * `schema_versions` / `unknown_schema_versions` — `"<domain>:<kind>:<version>": count`.
 * `repositories` — stable record ID plus a redaction-safe identity summary, sorted by ID.
+* `coverage` — one entry per `ScanCoverage` node (issue #135), sorted by record
+  ID: file-level indexing coverage for the repository the scan visited. Lets an
+  agent tell "0 results because absent" from "0 results because that language was
+  never indexed" (a language `eg scan` never parses). See the field-level shape
+  and the excluded-directory contract in `docs/cli/scan.md`. `coverage_complete`
+  is `true` only for the Git-tracked-files walk; the non-Git fallback reports
+  best-effort counts with `coverage_complete: false`. The text layout prints one
+  `coverage: <walked> files walked, <indexed> indexed, <skipped> skipped
+  (complete: <bool>)` line plus one indented line per skipped extension and the
+  indexed-language scope.
 * `producer_kinds` / `egregore_versions` — provenance breakdown; records that
   predate producer stamping count under `legacy_pre_v1`.
 

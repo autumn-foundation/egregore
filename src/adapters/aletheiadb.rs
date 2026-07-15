@@ -2179,6 +2179,7 @@ impl EmbeddedAletheiaSink {
             source_snapshot,
             dependency,
             log,
+            scan_coverage,
             text,
             superseded_by,
             agent_id,
@@ -2377,6 +2378,11 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(payload.as_ref())
         {
             builder = builder.insert("log_json", json.as_str());
+        }
+        if let Some(payload) = scan_coverage
+            && let Ok(json) = serde_json::to_string(payload.as_ref())
+        {
+            builder = builder.insert("scan_coverage_json", json.as_str());
         }
         builder = insert_optional(builder, "text", text.as_deref());
         builder = insert_optional(builder, "superseded_by", superseded_by.as_deref());
@@ -3123,6 +3129,16 @@ impl EmbeddedAletheiaSink {
                 .transpose()
                 .map_err(|e| read_back_error(record_id, format!("log_json invalid: {e}")))?
                 .map(Box::new),
+            scan_coverage: optional_str_property(
+                record_id,
+                "scan_coverage_json",
+                node.get_property("scan_coverage_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::ScanCoveragePayload>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("scan_coverage_json invalid: {e}")))?
+            .map(Box::new),
             valid_time: optional_str_property(
                 record_id,
                 "node_valid_time",
@@ -4193,6 +4209,7 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "CostUsage" => Ok(NodeKind::CostUsage),
         "Retraction" => Ok(NodeKind::Retraction),
         "DependencyDeclaration" => Ok(NodeKind::DependencyDeclaration),
+        "ScanCoverage" => Ok(NodeKind::ScanCoverage),
         // Log-signature node kinds (issues #319 / #320).
         "LogSource" => Ok(NodeKind::LogSource),
         "ErrorSignature" => Ok(NodeKind::ErrorSignature),
@@ -4436,6 +4453,7 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::CostUsage
         | NodeKind::Retraction
         | NodeKind::DependencyDeclaration
+        | NodeKind::ScanCoverage
         | NodeKind::LogSource
         | NodeKind::ErrorSignature
         | NodeKind::LogEvent
@@ -6963,12 +6981,16 @@ mod tests {
         let data_dir = temp.path().join("future-kind-store");
         let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
 
-        let record_id = "codegraph:v6:future-kind-repo";
+        // A future KIND must arrive with a future SCHEMA VERSION to be tolerated;
+        // an unknown kind at a *known* version is store damage (a hard error, see
+        // `inspect_all_records_fails_on_corrupt_record_of_known_version`).
+        let future = crate::ir::SCHEMA_VERSION + 1;
+        let record_id = format!("codegraph:v{future}:future-kind-repo");
         let properties = ::aletheiadb::PropertyMapBuilder::new()
-            .insert("codegraph_id", record_id)
+            .insert("codegraph_id", record_id.as_str())
             .insert("record_type", "node")
             .insert("kind", "NewFutureKind")
-            .insert("schema_version", 6i64)
+            .insert("schema_version", i64::from(future))
             .insert("domain", "codegraph")
             .build();
 
@@ -6984,7 +7006,7 @@ mod tests {
         let unknown = &report.unknown_schema_versions[0];
         assert_eq!(unknown.version.domain, "codegraph");
         assert_eq!(unknown.version.kind, "NewFutureKind");
-        assert_eq!(unknown.version.version, 6);
+        assert_eq!(unknown.version.version, future);
     }
 
     #[test]
@@ -7132,12 +7154,13 @@ mod tests {
         let data_dir = temp.path().join("future-kind-current-view-store");
         let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
 
-        let record_id = "codegraph:v6:future-kind-repo";
+        let future = crate::ir::SCHEMA_VERSION + 1;
+        let record_id = format!("codegraph:v{future}:future-kind-repo");
         let properties = ::aletheiadb::PropertyMapBuilder::new()
-            .insert("codegraph_id", record_id)
+            .insert("codegraph_id", record_id.as_str())
             .insert("record_type", "node")
             .insert("kind", "NewFutureKind")
-            .insert("schema_version", 6i64)
+            .insert("schema_version", i64::from(future))
             .insert("domain", "codegraph")
             .build();
 
@@ -7153,6 +7176,6 @@ mod tests {
         let unknown = &report.unknown_schema_versions[0];
         assert_eq!(unknown.version.domain, "codegraph");
         assert_eq!(unknown.version.kind, "NewFutureKind");
-        assert_eq!(unknown.version.version, 6);
+        assert_eq!(unknown.version.version, future);
     }
 }

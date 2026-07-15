@@ -70,10 +70,19 @@ use crate::{
 /// serde-default, but a bump forces older caches to rebuild so reused per-file
 /// facts carry the verdict rather than defaulting it to `false`.
 ///
+/// v14 tracks the codegraph `SCHEMA_VERSION` 5→6 bump (issue #135, the
+/// `ScanCoverage` node). Cached per-file records embed versioned record IDs
+/// (e.g. a reused `File` and its `Repository —CONTAINS→ File` edge carry
+/// `codegraph:v5:` IDs), so reusing a v5 cache after the bump would mint v6
+/// repository/cross-file records that dangle against the reused v5 endpoints.
+/// Bumping the cache version forces a full rebuild so every emitted record
+/// shares the current `codegraph:v6:` identity. (v13 was reserved by a
+/// concurrent lane; this bump skips to 14.)
+///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 12;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 14;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

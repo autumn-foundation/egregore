@@ -88,6 +88,28 @@ store, an empty directory, or an initialized store holding zero Egregore
 records fails with a diagnostic naming the path — never successful zero
 counts. See `docs/cli/inspect.md` for the JSON contract.
 
+`eg scan` makes file-level indexing coverage a stated, deterministic, queryable
+fact (issue #135): one `ScanCoverage` node rides in the JSONL (attached to its
+`Repository` by a `CONTAINS` edge, so it is citable, non-orphan, and validates
+under `eg validate`) carrying `files_walked`, `files_indexed`,
+`skipped_by_extension` (a sorted per-lowercased-extension tally, `""` for
+no-extension), the named indexed-language scope, and `coverage_complete`. On a
+Git working tree `eg scan` also prints a human-readable summary to stderr
+(`scan coverage: N files walked, M indexed, K skipped` + skipped-by-extension +
+`indexed languages: Rust, Python, TypeScript, Go`). The named scope is the REAL
+4-language extractor capability (Rust/Python/TypeScript/Go), derived from
+`languages::Language::ALL` — the issue's "Rust only" text was stale. Excluded
+directories (`.git`, `target`, nested Git worktrees) are never walked, so they
+never dilute the counts (AC7); when `coverage_complete` is true,
+`files_indexed + sum(skipped_by_extension) == files_walked` (AC4). The non-Git
+filesystem-walk fallback has no walked/skipped denominator, so it reports
+best-effort counts with `coverage_complete: false` and suppresses the stderr
+summary rather than fabricate one. `eg inspect` surfaces the same coverage block
+over both `--graph` and `--data-dir`, so an agent can tell "0 results because
+absent" from "0 results because that language was never indexed". The
+`codegraph` `SCHEMA_VERSION` is 6 (bumped 5→6 for the `ScanCoverage` node). See
+`docs/cli/scan.md` and `docs/cli/inspect.md`.
+
 Query commands (local JSONL graph, no network):
 
 ```powershell

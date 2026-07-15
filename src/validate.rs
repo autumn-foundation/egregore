@@ -134,6 +134,10 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
             NodeKind::DependencyDeclaration,
             NodeKind::File,
             NodeKind::Module,
+            // `Repository CONTAINS ScanCoverage` attributes the file-level scan
+            // coverage summary to its repository (issue #135), keeping the
+            // coverage node citable and non-orphan.
+            NodeKind::ScanCoverage,
             // `File CONTAINS PanicRiskSite`: unwrap/expect panic-risk call
             // sites are contained by their owning file (issue #223).
             NodeKind::PanicRiskSite,

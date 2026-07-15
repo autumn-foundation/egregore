@@ -74,9 +74,18 @@ fn test_git_scope_scan_behavior() {
 
     assert!(output.status.success());
 
-    // Verify stderr output reports skipped count for all languages
+    // Verify the scan-coverage summary (issue #135) reports the tracked walk:
+    // the five tracked files (four src/ source files plus the tracked
+    // `.gitignore`) are walked; only the four source files are indexed and the
+    // extension-less `.gitignore` is the single skip. Untracked and ignored
+    // files were never tracked, so they never enter the walk.
     let stderr_str = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr_str.contains("Skipped 3 .rs, 1 .py, 1 .ts/.tsx, 1 .go files by ignore rules"));
+    assert!(
+        stderr_str.contains("scan coverage: 5 files walked, 4 indexed, 1 skipped"),
+        "stderr missing coverage summary: {stderr_str}"
+    );
+    assert!(stderr_str.contains("(no-ext): 1"), "stderr: {stderr_str}");
+    assert!(stderr_str.contains("indexed languages: Rust, Python, TypeScript, Go"));
 
     // Verify only tracked files are scanned
     let graph_content = fs::read_to_string(repo_path.join("graph.jsonl")).unwrap();
