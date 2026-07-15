@@ -1312,6 +1312,22 @@ pub struct PackManifest {
     pub tuple_counts: BTreeMap<String, usize>,
     /// Count of class-relevant records excluded for missing valid time.
     pub excluded_missing_valid_time: usize,
+    /// The `--min-review-coverage` threshold in effect at assemble, echoed here so
+    /// `verify_pack` can (1) require the `review_coverage` measurement's
+    /// `min_required` to equal it and (2) recompute the measurement `passed` flag
+    /// against a declared threshold instead of the self-declared `min_required`
+    /// alone (issue #355 GAP A). Bound by `min_review_coverage_binding_hash` so it
+    /// cannot be silently co-edited. `#[serde(default)]` keeps a pre-#355 pack
+    /// (absent field → `None`) parseable; such a pack keeps the legacy
+    /// self-consistency-only path (documented in `verify_pack`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_review_coverage: Option<f64>,
+    /// BLAKE3 binding hash over `min_review_coverage` (issue #355 GAP A), a sibling
+    /// of `citation_binding_hash`. Recomputed by `verify_pack`'s Integrity check and
+    /// compared, so a hand-edited `min_review_coverage` with a stale hash fails
+    /// Integrity. Present iff `min_review_coverage` is; absent on a pre-#355 pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_review_coverage_binding_hash: Option<String>,
     /// The verbatim always-present disclaimer.
     pub disclaimer: String,
 }
@@ -2949,6 +2965,20 @@ fn hash_citation_verdict(citation: &VerificationVerdict, tallies: &[ClassCitatio
     blake3::hash(serialized.as_bytes()).to_string()
 }
 
+/// Canonical BLAKE3 binding hash over the assemble-time `--min-review-coverage`
+/// threshold (issue #355 GAP A), a sibling of [`hash_citation_verdict`]. Computed
+/// at assemble into `PackManifest::min_review_coverage_binding_hash` and recomputed
+/// by `verify_pack`'s Integrity so a hand-edited `manifest.min_review_coverage`
+/// (e.g. a downward-forged threshold) with a stale hash is caught. A domain tag
+/// keeps the hash distinct from any other single-value bind. Uses the same
+/// `serde_json::to_string` canonicalization as `hash_citation_verdict`, so
+/// byte-stability holds across runs.
+fn hash_min_review_coverage(min_review_coverage: f64) -> String {
+    let payload = ("min_review_coverage_v1", min_review_coverage);
+    let serialized = serde_json::to_string(&payload).unwrap_or_default();
+    blake3::hash(serialized.as_bytes()).to_string()
+}
+
 /// Binds a section's derived `log_summary` (issue #340) into `verify_pack`'s
 /// Integrity so a tampered summary value fails verification, mirroring the
 /// `review_coverage` `measurement` bind. Returns `Err(detail)` on any mismatch.
@@ -4318,6 +4348,8 @@ pub fn assemble_pack(
         included_record_counts,
         tuple_counts,
         excluded_missing_valid_time,
+        min_review_coverage: Some(min_review_coverage),
+        min_review_coverage_binding_hash: Some(hash_min_review_coverage(min_review_coverage)),
         disclaimer: PACK_DISCLAIMER.to_owned(),
     };
 
@@ -4825,6 +4857,9 @@ fn nonrecord_text_fields(pack: &EvidencePack) -> Vec<(String, &str)> {
     ));
     if let Some(c) = m.captured_at.as_deref() {
         out.push(("manifest.captured_at".to_owned(), c));
+    }
+    if let Some(h) = m.min_review_coverage_binding_hash.as_deref() {
+        out.push(("manifest.min_review_coverage_binding_hash".to_owned(), h));
     }
     out.push(("manifest.disclaimer".to_owned(), m.disclaimer.as_str()));
 
@@ -5436,18 +5471,42 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     );
                     break 'integrity;
                 }
-                // `passed` must equal the coverage-vs-threshold predicate.
-                // `min_required` is self-declared (the pack carries no
-                // independent source for the `--min-review-coverage` value it
-                // was assembled with), so this catches a lie in `passed`
-                // alone against the stored coverage/min_required.
-                let expected_passed = m.coverage >= m.min_required;
+                // `passed` must equal the coverage-vs-threshold predicate. Since
+                // issue #355 (GAP A) the manifest echoes the assemble-time
+                // `--min-review-coverage` in the hash-bound `min_review_coverage`
+                // field, so the threshold is no longer purely self-declared: when
+                // it is present the measurement's `min_required` MUST equal it (a
+                // divergence is a forged threshold) and `passed` is recomputed
+                // against the manifest-declared, hash-bound value — closing the
+                // downward-forge where a failing pack lowers `min_required` and
+                // flips `passed` to true. A pre-#355 pack (`min_review_coverage`
+                // absent) keeps the LEGACY self-consistency-only path: `passed`
+                // recomputed against the self-declared `min_required` alone (that
+                // pack carries no bound threshold to compare against, so the
+                // downward-forge is not detectable for it — documented back-compat
+                // degradation).
+                let effective_min_required = match pack.manifest.min_review_coverage {
+                    Some(bound) => {
+                        if m.min_required.to_bits() != bound.to_bits() {
+                            integrity_passed = false;
+                            integrity_detail = format!(
+                                "review_coverage min_required {} does not equal the \
+                                 hash-bound manifest.min_review_coverage {}",
+                                m.min_required, bound,
+                            );
+                            break 'integrity;
+                        }
+                        bound
+                    }
+                    None => m.min_required,
+                };
+                let expected_passed = m.coverage >= effective_min_required;
                 if m.passed != expected_passed {
                     integrity_passed = false;
                     integrity_detail = format!(
                         "review_coverage passed {} does not equal coverage {} >= \
                              min_required {} ({})",
-                        m.passed, m.coverage, m.min_required, expected_passed,
+                        m.passed, m.coverage, effective_min_required, expected_passed,
                     );
                     break 'integrity;
                 }
@@ -5747,6 +5806,71 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                 .clone_into(&mut integrity_detail);
         }
     }
+    // Integrity-bind the manifest's `min_review_coverage` threshold (issue #355
+    // GAP A): recompute its binding hash and compare. A hand-edited
+    // `manifest.min_review_coverage` (e.g. a downward-forged threshold) with a
+    // stale `min_review_coverage_binding_hash` fails here — the backstop the
+    // review_coverage measurement equality above leans on. A pre-#355 pack carries
+    // NEITHER field (both `None`); that is the legacy self-consistency-only path
+    // and passes. A half-tampered pack — one field present, the other absent —
+    // fails: the bind must be all-or-nothing.
+    if integrity_passed {
+        match (
+            pack.manifest.min_review_coverage,
+            pack.manifest.min_review_coverage_binding_hash.as_deref(),
+        ) {
+            (Some(bound), Some(stored)) => {
+                if hash_min_review_coverage(bound) != stored {
+                    integrity_passed = false;
+                    "min_review_coverage_binding_hash does not bind \
+                     manifest.min_review_coverage (threshold tampered or unbound)"
+                        .clone_into(&mut integrity_detail);
+                }
+            }
+            (None, None) => {} // pre-#355 pack: legacy self-consistency-only path.
+            (Some(_), None) | (None, Some(_)) => {
+                integrity_passed = false;
+                "manifest.min_review_coverage and its binding hash must be both \
+                 present or both absent (partial bind is tampering)"
+                    .clone_into(&mut integrity_detail);
+            }
+        }
+    }
+    // Verbatim disclaimer bind (issue #355 GAP B): the always-present disclaimer
+    // must equal `PACK_DISCLAIMER` byte-for-byte. The per-artifact safety scan only
+    // rejects a disclaimer that leaks a secret, so a weakened or blanked disclaimer
+    // would otherwise verify clean.
+    if integrity_passed && pack.manifest.disclaimer != PACK_DISCLAIMER {
+        integrity_passed = false;
+        "manifest.disclaimer does not match the verbatim PACK_DISCLAIMER \
+         (disclaimer weakened, blanked, or altered)"
+            .clone_into(&mut integrity_detail);
+    }
+    // Recompute `excluded_missing_valid_time` (issue #355 GAP C) from the pack's
+    // OWN diagnostics and fail Integrity on a divergence, so understating the
+    // exclusion count becomes detectable. This is faithfully derivable: assemble
+    // pushes exactly one `missing_valid_time` diagnostic (one record_id) per
+    // record it excludes for an unresolvable valid time, incrementing the counter
+    // in lockstep, so the count equals the number of such diagnostics. (Recompute
+    // from diagnostics rather than binding the count into a hash — the count is
+    // independently reconstructible from what the pack already carries.)
+    if integrity_passed {
+        let recomputed_excluded = pack
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "missing_valid_time")
+            .count();
+        if recomputed_excluded != pack.manifest.excluded_missing_valid_time {
+            integrity_passed = false;
+            integrity_detail = format!(
+                "manifest.excluded_missing_valid_time {} does not equal the {} \
+                 missing_valid_time diagnostic(s) the pack carries",
+                pack.manifest.excluded_missing_valid_time, recomputed_excluded,
+            );
+        }
+    }
+    // TODO(#355): `catalog_pin` re-derivation and `review_coverage.applicable`
+    // recomputation are deliberately out of scope for this hardening pass.
     let integrity = VerificationVerdict {
         passed: integrity_passed,
         detail: integrity_detail,
@@ -10313,6 +10437,146 @@ mod pack338_tests {
         assert!(
             report.integrity.detail.contains("coverage"),
             "detail names the field: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    // ── issue #355: bound `min_review_coverage` + verbatim disclaimer +
+    //    recomputed `excluded_missing_valid_time` tamper-resistance ─────────────
+
+    /// Issue #355 GAP A: a clean pack round-trips through verify with the bound
+    /// `min_review_coverage` present, hash-bound, and consistent with the
+    /// measurement.
+    #[test]
+    fn assemble_then_verify_roundtrips_with_bound_min_required() {
+        let pack = assemble_cc81();
+        assert_eq!(pack.manifest.min_review_coverage, Some(1.0));
+        assert_eq!(
+            pack.manifest.min_review_coverage_binding_hash,
+            Some(hash_min_review_coverage(1.0))
+        );
+        let report = verify_pack(&pack);
+        assert!(
+            report.integrity.passed,
+            "a clean pack with a bound min_review_coverage passes Integrity: {}",
+            report.integrity.detail
+        );
+    }
+
+    /// Issue #355 GAP A (the primary exploit): a genuinely-failing pack
+    /// (0.5 coverage vs the 1.0 gate) hand-edited to LOWER `measurement.min_required`
+    /// below the coverage and flip `passed` to true — WITHOUT touching the
+    /// manifest's bound `min_review_coverage` — must FAIL Integrity. verify
+    /// requires the measurement threshold to equal the manifest-declared,
+    /// hash-bound threshold and recomputes `passed` against it.
+    #[test]
+    fn verify_fails_when_min_required_forged_downward_with_consistent_passed() {
+        let mut pack = assemble_cc81();
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "baseline pack passes Integrity"
+        );
+        let m = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_mut())
+            .expect("review_coverage measurement");
+        assert!(!m.passed, "baseline 3-of-6 coverage did not pass the gate");
+        m.min_required = 0.4; // lie: lower the threshold below the 0.5 coverage
+        m.passed = true; //       and self-consistently claim the gate passed
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a downward-forged min_required with a self-consistent passed must fail \
+             Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the forged pack must not verify ok");
+    }
+
+    /// Issue #355 GAP A: the measurement's `min_required` disagreeing with the
+    /// manifest's bound `min_review_coverage` is an Integrity defect on its own.
+    #[test]
+    fn verify_fails_when_min_required_diverges_from_manifest() {
+        let mut pack = assemble_cc81();
+        let m = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_mut())
+            .expect("review_coverage measurement");
+        m.min_required = 0.9; // diverge from the bound manifest threshold (1.0)
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "measurement.min_required != manifest.min_review_coverage must fail \
+             Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Issue #355 GAP A: a FULLY self-consistent downward forge — lower BOTH the
+    /// manifest bound AND the measurement threshold to 0.4 and flip `passed` to
+    /// true — passes the manifest-vs-measurement equality and the passed-recompute;
+    /// ONLY the stale `min_review_coverage_binding_hash` (not recomputed) catches
+    /// it, proving the binding hash is the backstop.
+    #[test]
+    fn verify_fails_when_manifest_min_review_coverage_tampered() {
+        let mut pack = assemble_cc81();
+        pack.manifest.min_review_coverage = Some(0.4); // binding hash NOT recomputed
+        let m = pack
+            .sections
+            .iter_mut()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_mut())
+            .expect("review_coverage measurement");
+        m.min_required = 0.4;
+        m.passed = true; // 0.5 >= 0.4, self-consistent with the forged threshold
+
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a tampered manifest.min_review_coverage with a stale binding hash must \
+             fail Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "the tampered pack must not verify ok");
+    }
+
+    /// Issue #355 GAP B: weakening (or blanking) the manifest disclaimer — any
+    /// deviation from the verbatim `PACK_DISCLAIMER` — must FAIL Integrity.
+    #[test]
+    fn verify_fails_when_disclaimer_weakened() {
+        let mut pack = assemble_cc81();
+        assert_eq!(pack.manifest.disclaimer, PACK_DISCLAIMER);
+        pack.manifest.disclaimer =
+            "rows are recorded observations of process execution as imported".to_owned();
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "a disclaimer deviating from PACK_DISCLAIMER must fail Integrity: {}",
+            report.integrity.detail
+        );
+        assert!(!report.ok, "overall verdict fails");
+    }
+
+    /// Issue #355 GAP C: understating `manifest.excluded_missing_valid_time` while
+    /// the pack's own `missing_valid_time` diagnostics say otherwise must FAIL
+    /// Integrity (verify recomputes the count from the diagnostics).
+    #[test]
+    fn verify_fails_when_excluded_missing_valid_time_understated() {
+        let mut pack = assemble_cc81();
+        assert_eq!(pack.manifest.excluded_missing_valid_time, 1);
+        pack.manifest.excluded_missing_valid_time = 0; // understate the exclusions
+        let report = verify_pack(&pack);
+        assert!(
+            !report.integrity.passed,
+            "an understated excluded_missing_valid_time must fail Integrity: {}",
             report.integrity.detail
         );
         assert!(!report.ok, "overall verdict fails");
