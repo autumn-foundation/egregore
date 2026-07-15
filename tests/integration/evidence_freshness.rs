@@ -4522,3 +4522,207 @@ fn finding2_empty_latest_scan_prunes_prior_handle_via_snapshot_node() {
         Some(freshness::TriggeringHandle::HandleAbsent)
     ));
 }
+
+// ── Codex PR #398 round 2: per-repository scoping of the triple resolver ──────
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn finding454_triple_only_citation_to_moved_span_at_shared_head_is_unresolved() {
+    // Codex round-2 finding #454: a triple-only (path/span, no `target_record_id`)
+    // citation resolves through `resolve_triple`, which decided frontier membership
+    // from the store-wide tip UNION. Repo A has `sha_shared` as HEAD (a tip); repo B
+    // has `sha_shared -> sha_child`, so `sha_shared` is repo B's INTERIOR commit. A
+    // repo-B symbol survives at `sha_child` but MOVED off the cited span between
+    // `sha_shared` and `sha_child`. The union let the interior `sha_shared` version
+    // (repo A's tip SHA) pass the frontier check, so the old span still resolved and
+    // the citation read `current`/`drifted`. Scoping the frontier check to the
+    // candidate's OWN repository (repo B tip = `sha_child`) drops the interior
+    // version, so the moved-off span no longer resolves -> `unresolved`. Repo A's
+    // still-valid triple citation must stay resolved (no regression).
+    let path = "src/lib.rs";
+    let repo_a = stable_id(&["repository", "remote", "https://example.test/f454a.git"]);
+    let repo_b = stable_id(&["repository", "remote", "https://example.test/f454b.git"]);
+    let sym_a = stable_id(&["node", "symbol", "fn", "f454-repo-a", path, "f", "0"]);
+    let sym_mover = stable_id(&["node", "symbol", "fn", "f454-repo-b", path, "mover", "0"]);
+
+    // Repo A: live HEAD symbol at the shared commit (no parents), span (10,20).
+    let head_symbol = symbol_version(
+        &sym_a,
+        path,
+        "f",
+        span(10, 20),
+        "body_a",
+        "sha_shared",
+        "2026-01-01T00:00:00Z",
+    );
+    // Repo B: `mover` at the shared (interior) commit, cited span (30,40).
+    let mover_old = symbol_version(
+        &sym_mover,
+        path,
+        "mover",
+        span(30, 40),
+        "mover_v1",
+        "sha_shared",
+        "2026-01-02T00:00:00Z",
+    );
+    // Repo B: `mover` survives at the child (tip) commit but MOVED to span (50,60).
+    let mut mover_new = symbol_version(
+        &sym_mover,
+        path,
+        "mover",
+        span(50, 60),
+        "mover_v2",
+        "sha_child",
+        "2026-01-03T00:00:00Z",
+    );
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = &mut mover_new
+    {
+        t.git_parent_commits = vec!["sha_shared".to_owned()];
+    }
+
+    let obs_moved = agent_memory_stable_id(&["obs", "f454_moved"]);
+    let obs_a = agent_memory_stable_id(&["obs", "f454_a"]);
+    let records = vec![
+        repo_node(&repo_a, "f454a", "https://example.test/f454a.git"),
+        repo_node(&repo_b, "f454b", "https://example.test/f454b.git"),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_a.clone(),
+            sym_a,
+            Some("1.0".to_owned()),
+            "Repository A contains f".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_b.clone(),
+            sym_mover,
+            Some("1.0".to_owned()),
+            "Repository B contains mover".to_owned(),
+        ),
+        head_symbol,
+        mover_old,
+        mover_new,
+        // Triple-only citation to repo B's OLD span (no record id, no anchor commit).
+        observation(
+            &obs_moved,
+            "note at moved span",
+            "0.9",
+            None,
+            Some(path),
+            Some(span(30, 40)),
+            "OBSERVES",
+            None,
+            None,
+        ),
+        // Triple-only citation to repo A's still-valid span.
+        observation(
+            &obs_a,
+            "note at f",
+            "0.9",
+            None,
+            Some(path),
+            Some(span(10, 20)),
+            "OBSERVES",
+            None,
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let moved = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs_moved)
+        .expect("verdict for the moved-span triple citation");
+    assert_eq!(
+        moved.verdict,
+        FreshnessVerdict::Unresolved,
+        "a triple-only citation to a span the repo-B symbol moved off of must be \
+         unresolved, not kept resolvable by the store-wide tip union"
+    );
+    let a = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs_a)
+        .expect("verdict for the repo-A triple citation");
+    assert_eq!(
+        a.verdict,
+        FreshnessVerdict::Current,
+        "repo A's still-valid triple citation must stay resolved (current)"
+    );
+}
+
+#[test]
+fn finding559_triple_only_citation_to_prior_scan_span_is_unresolved() {
+    // Codex round-2 finding #559: repeated current-tree scans keep the same stable
+    // symbol ID but move it off a path/span-only-cited location. Both versions are
+    // non-temporal (node-level `valid_time`, no commit). `resolve_triple` treated
+    // EVERY non-temporal candidate as frontier, so the scan-1 span still resolved
+    // and the citation was `drifted`/`current`. Counting a non-temporal candidate as
+    // frontier only when its `valid_time` equals its repository's newest scan drops
+    // the scan-1 span -> `unresolved`.
+    let path = "src/svc.rs";
+    let scan_1 = "2026-01-01T00:00:00Z";
+    let scan_2 = "2026-02-01T00:00:00Z";
+    let repo_b = stable_id(&["repository", "remote", "https://example.test/f559.git"]);
+    let sym_mover = stable_id(&["node", "symbol", "fn", "f559", path, "mover", "0"]);
+
+    let current_tree_symbol = |body: &str, sp: SourceSpan, vt: &str| {
+        let mut n = GraphRecord::node(
+            sym_mover.clone(),
+            NodeKind::Symbol,
+            Some(path.to_owned()),
+            Some(sp),
+            Some("mover".to_owned()),
+            format!("Rust fn mover\nSource:\n{body}"),
+        );
+        if let GraphRecord::Node { valid_time, .. } = &mut n {
+            *valid_time = Some(vt.to_owned());
+        }
+        n
+    };
+
+    let obs = agent_memory_stable_id(&["obs", "f559"]);
+    let mut cite = observation(
+        &obs,
+        "note at scan-1 span",
+        "0.9",
+        None,
+        Some(path),
+        Some(span(30, 40)),
+        "OBSERVES",
+        None,
+        Some(scan_1), // valid-time anchor at the first scan, no commit
+    );
+    if let GraphRecord::Node { observed_at, .. } = &mut cite {
+        *observed_at = None;
+    }
+
+    let records = vec![
+        repo_node(&repo_b, "f559", "https://example.test/f559.git"),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_b.clone(),
+            sym_mover.clone(),
+            Some("1.0".to_owned()),
+            "Repository B contains mover".to_owned(),
+        ),
+        // Scan 1: mover at span (30,40).
+        current_tree_symbol("body_v1", span(30, 40), scan_1),
+        // Scan 2: same stable ID, moved to span (50,60).
+        current_tree_symbol("body_v2", span(50, 60), scan_2),
+        cite,
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs)
+        .expect("verdict for the scan-1-span triple citation");
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Unresolved,
+        "a triple-only citation to a span the symbol occupied only at an older scan \
+         must be unresolved, not treated as frontier"
+    );
+}

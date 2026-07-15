@@ -136,10 +136,14 @@ duplicate rows are classified once.
   that same SHA as its HEAD (a shared HEAD SHA no longer keeps a foreign repo's
   deleted handle live). A single-repository store — or a legacy store with no
   `Repository` node — is one `None` bucket whose tip set equals the previous
-  global computation, so those reads stay byte-identical. Residual: a handle can
-  only be scoped to its repository when it is attributable to a `Repository` node;
-  an unattributable handle in a multi-repo store falls back to the global tip
-  union.
+  global computation, so those reads stay byte-identical. This per-repository tip
+  scoping now also governs **triple-only (path/span) citations** — the resolver
+  that matches a citation carrying no `target_record_id` against the live frontier,
+  and the anchored-lineage liveness check — so a span a symbol moved off of in one
+  repository no longer resolves just because another repository names its interior
+  SHA as a HEAD tip. Residual: a handle can only be scoped to its repository when it
+  is attributable to a `Repository` node; an unattributable handle in a multi-repo
+  store falls back to the global tip union.
 - **Repeated current-tree `scan`s.** Liveness and content drift are derived from a
   transaction-time frontier for repeated current-tree full scans (issue #204),
   computed **per owning repository** and sourced from the repository/source-snapshot
@@ -155,7 +159,11 @@ duplicate rows are classified once.
   repo's frontier and prunes the now-absent prior handle. History
   (`scan-history`) handles carry commit anchors and stay governed by the commit-tip
   frontier, unaffected. A handle whose repository is unattributable shares the
-  `None` bucket, byte-identical to the previous global newest-scan behavior.
+  `None` bucket, byte-identical to the previous global newest-scan behavior. This
+  per-repository current-tree frontier now also governs **triple-only (path/span)
+  citations**: a span the symbol occupied only at an older scan of its repository no
+  longer resolves (it is not treated as frontier just for carrying no commit), so a
+  citation to a since-moved current-tree location is `unresolved`.
   Residual: two scans whose `valid_time` collapses to the same instant cannot be
   ordered, so a deletion is only observable across scans with distinct
   `valid_time`s (a working-tree-only deletion at an unchanged HEAD keeps the

@@ -223,6 +223,21 @@ struct FreshnessIndex<'a> {
     /// Commits that participate in any parent/child edge. A commit-anchored
     /// comparison trusts descendant reachability only when its anchor is here.
     dag_commits: BTreeSet<&'a str>,
+    /// Per owning-repository tip commit sets (issue #203, Codex #454). Keyed by
+    /// owning repository record ID (owned so the map outlives the local
+    /// `RepositoryIndex`); the `None` bucket holds unattributable handles and
+    /// equals the store-wide union for single-repo/legacy stores. Lets the triple
+    /// resolvers scope tip membership to a candidate handle's OWN repository
+    /// instead of the store-wide union.
+    per_repo_tips: BTreeMap<Option<String>, BTreeSet<&'a str>>,
+    /// Per owning-repository current-tree scan frontier `valid_time` (issue #204,
+    /// Codex #559). Keyed by owning repository record ID. A non-temporal triple
+    /// candidate counts as frontier only when its `valid_time` equals its repo's
+    /// entry here, so an older-scan span no longer resolves.
+    per_repo_frontier: BTreeMap<Option<String>, &'a str>,
+    /// Owning repository record ID for each live code-handle record ID, so a
+    /// triple candidate's frontier/tip check is scoped to its own repository.
+    owner_by_handle: BTreeMap<&'a str, Option<String>>,
 }
 
 impl<'a> FreshnessIndex<'a> {
@@ -437,14 +452,17 @@ impl<'a> FreshnessIndex<'a> {
         }
         // Per-repository tip sets. A commit is a tip when it is no other commit's
         // parent **within its own repository** (issue #203). The store-wide union
-        // (`tips`) is kept for the frontier resolvers that carry no repository
-        // identity (`resolve_triple`, the unanchored-triple lineage check), but the
-        // liveness retain below is checked **within each handle's owning
-        // repository** — Codex finding #1: in a shared history two repositories can
-        // share a commit SHA that is one repo's HEAD (a tip) yet the other's
-        // interior commit, so a store-wide `tips.contains(c)` would keep the
-        // interior repo's deleted handle live and report a citation to it `current`
-        // instead of `unresolved`.
+        // (`tips`) is retained only as the fallback bucket for handles with no
+        // attributable repository (legacy no-`Repository` stores) and for
+        // `has_ancestry` checks; every liveness/frontier check — the retains below
+        // AND the runtime triple resolvers (`resolve_triple`, the anchored-lineage
+        // check) via the stored `per_repo_tips`/`per_repo_frontier` (Codex round-2
+        // findings #454/#559) — is scoped **within each handle's owning
+        // repository**. Codex round-1 finding #1: in a shared history two
+        // repositories can share a commit SHA that is one repo's HEAD (a tip) yet
+        // the other's interior commit, so a store-wide `tips.contains(c)` would keep
+        // the interior repo's deleted/moved handle live and report a citation to it
+        // `current`/`drifted` instead of `unresolved`.
         let empty_parents: BTreeSet<&str> = BTreeSet::new();
         let mut per_repo_tips: BTreeMap<Option<&str>, BTreeSet<&str>> = BTreeMap::new();
         let mut tips: BTreeSet<&str> = BTreeSet::new();
@@ -560,6 +578,28 @@ impl<'a> FreshnessIndex<'a> {
             });
         }
 
+        // Stored per-repository views for the runtime frontier resolvers (Codex
+        // round-2 findings #454/#559). Round 1 scoped the build-time liveness
+        // retains above but left `resolve_triple` and the anchored-lineage check on
+        // the store-wide `tips` union; these owned-key copies let those resolvers
+        // scope the tip/frontier check to each candidate handle's OWN repository.
+        // Keys are owned so the maps can outlive the local `repo_index`; the `None`
+        // bucket is byte-identical to the old global computation for single-repo /
+        // legacy stores. `owner_by_handle` records each surviving live handle's
+        // owner so a resolver looks its repository up in O(log n).
+        let per_repo_tips: BTreeMap<Option<String>, BTreeSet<&str>> = per_repo_tips
+            .iter()
+            .map(|(owner, set)| ((*owner).map(str::to_owned), set.clone()))
+            .collect();
+        let per_repo_frontier: BTreeMap<Option<String>, &str> = per_repo_frontier
+            .iter()
+            .map(|(owner, vt)| ((*owner).map(str::to_owned), *vt))
+            .collect();
+        let owner_by_handle: BTreeMap<&str, Option<String>> = live_code_by_id
+            .keys()
+            .map(|id| (*id, repo_index.owner_of(id).map(str::to_owned)))
+            .collect();
+
         // Second pass: index drift triggers from `DRIFTS_PRIOR` edges too. The
         // edge target is the prior (cited-side) symbol, the same neighbor-safe key
         // as `prior_record_id`, so this only adds drifts a stale metadata ID would
@@ -592,7 +632,30 @@ impl<'a> FreshnessIndex<'a> {
             superseded_ids,
             tips,
             dag_commits,
+            per_repo_tips,
+            per_repo_frontier,
+            owner_by_handle,
         }
+    }
+
+    /// Tip-commit set scoped to the handle's owning repository (Codex #454),
+    /// falling back to the store-wide union for an unattributable or empty owner
+    /// bucket — byte-identical for single-repo / legacy stores.
+    fn repo_tips_for(&self, handle_id: &str) -> &BTreeSet<&'a str> {
+        self.owner_by_handle
+            .get(handle_id)
+            .and_then(|owner| self.per_repo_tips.get(owner))
+            .filter(|set| !set.is_empty())
+            .unwrap_or(&self.tips)
+    }
+
+    /// Current-tree scan frontier `valid_time` scoped to the handle's owning
+    /// repository (Codex #559), when one was recorded.
+    fn repo_frontier_for(&self, handle_id: &str) -> Option<&'a str> {
+        self.owner_by_handle
+            .get(handle_id)
+            .and_then(|owner| self.per_repo_frontier.get(owner))
+            .copied()
     }
 
     /// True when `commit` participates in the commit DAG (has a parent or child
@@ -708,10 +771,18 @@ impl<'a> FreshnessIndex<'a> {
     }
 
     /// Resolves an unanchored triple `(path, span)` to a live code node ID against
-    /// the **frontier** only: a version is matched only when it sits at a tip commit
-    /// (or carries no commit, i.e. current-tree). A span that matched only a
-    /// historical (non-frontier) version no longer resolves, so a note recorded
-    /// against a since-moved span is `unresolved` rather than a stale `current`.
+    /// the **frontier** only, scoped **per owning repository** (Codex round-2
+    /// findings #454/#559): a commit-anchored version is matched only when it sits
+    /// at a tip commit of its OWN repository, and a non-temporal (current-tree)
+    /// version only when its `valid_time` equals its OWN repository's newest scan.
+    /// Round 1 checked tip membership against the store-wide union and treated every
+    /// non-temporal version as frontier, so a SHA that is another repo's HEAD kept an
+    /// interior version resolvable (#454), and an older-scan span still resolved
+    /// across repeated current-tree scans (#559). A span that matched only a
+    /// historical / older-scan (non-frontier) version now no longer resolves, so a
+    /// note recorded against a since-moved span is `unresolved` rather than a stale
+    /// `current`/`drifted`. An unattributable handle falls back to the store-wide
+    /// union / global frontier, so single-repo / legacy stores are byte-identical.
     ///
     /// A spanned triple targets a symbol/module/import, never the file: if no live
     /// frontier handle matches the span it returns `None` (→ `unresolved`), and only
@@ -739,11 +810,34 @@ impl<'a> FreshnessIndex<'a> {
                 if rp != path {
                     continue;
                 }
-                // Match against the frontier only: skip historical (non-tip) versions
-                // when the graph carries commit ancestry.
-                if !self.tips.is_empty()
-                    && !version_commit(record).is_none_or(|c| self.tips.contains(c))
-                {
+                // Match against the frontier only, scoped to the candidate handle's
+                // OWN repository (Codex round-2 findings #454/#559). A commit-anchored
+                // version must sit at a tip of its own repository — a SHA that is
+                // another repo's HEAD but this repo's interior commit is not a tip
+                // here, so its since-moved span no longer resolves (#454). A
+                // non-temporal (current-tree) version counts as frontier only when its
+                // valid_time equals its repository's newest scan, so a span the symbol
+                // occupied only at an older scan no longer resolves (#559).
+                let at_frontier = version_commit(record).map_or_else(
+                    || {
+                        // A non-temporal (current-tree) version is frontier only at
+                        // its repo's newest scan (#559); no frontier ⇒ nothing to
+                        // prune against, keep it.
+                        self.repo_frontier_for(id.as_str()).is_none_or(|frontier| {
+                            version_valid(record).is_some_and(|vt| {
+                                time_cmp(vt, frontier) == std::cmp::Ordering::Equal
+                            })
+                        })
+                    },
+                    |commit| {
+                        // A commit-anchored version must sit at a tip of its OWN
+                        // repository (#454); an empty scoped set keeps it (no
+                        // ancestry to prune against).
+                        let repo_tips = self.repo_tips_for(id.as_str());
+                        repo_tips.is_empty() || repo_tips.contains(commit)
+                    },
+                );
+                if !at_frontier {
                     continue;
                 }
                 match kind {
@@ -1295,10 +1389,15 @@ fn classify_link(
     // handle is absent from it, the symbol was removed downstream of the anchor — a
     // sibling branch still holding it does not make the cited note current.
     if has_ancestry && anchor_commit.is_some() {
+        // Tip membership scoped to the cited handle's OWN repository (Codex round-2
+        // consistency with #454): the store-wide union could count a foreign repo's
+        // tip SHA as on this lineage. Falls back to the union for an unattributable
+        // handle, so single-repo / legacy stores are byte-identical.
+        let repo_tips = index.repo_tips_for(cited_id);
         let on_lineage_tip = |c: &str| {
-            index.tips.contains(c) && (Some(c) == anchor_commit || anchor_descendants.contains(c))
+            repo_tips.contains(c) && (Some(c) == anchor_commit || anchor_descendants.contains(c))
         };
-        let lineage_has_frontier = index.tips.iter().any(|t| on_lineage_tip(t));
+        let lineage_has_frontier = repo_tips.iter().any(|t| on_lineage_tip(t));
         let live_on_lineage = versions
             .iter()
             .any(|v| version_commit(v).is_some_and(on_lineage_tip));
