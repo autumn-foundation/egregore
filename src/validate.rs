@@ -104,7 +104,12 @@ pub const DUPLICATE_LOG_STRUCTURAL_EDGE: &str = "duplicate_log_structural_edge";
 /// issue #319/#327), so an edge-less one is a defect. `LogSource` (a root/sink
 /// that may be legitimately edge-less on an empty-log scan) is intentionally
 /// excluded to avoid false positives.
-const ORPHANABLE_KINDS: [NodeKind; 8] = [
+/// `ScanCoverage` is always emitted attached to its repository by a
+/// `Repository —CONTAINS→ ScanCoverage` edge (issue #135), the attribution
+/// that keeps the coverage summary repository-scoped and citable, so an
+/// edge-less one is a defect. The inbound `CONTAINS` edge makes the node
+/// incident, so a correctly produced coverage node is never flagged.
+const ORPHANABLE_KINDS: [NodeKind; 9] = [
     NodeKind::File,
     NodeKind::Module,
     NodeKind::Symbol,
@@ -113,6 +118,7 @@ const ORPHANABLE_KINDS: [NodeKind; 8] = [
     NodeKind::LogEvent,
     NodeKind::LogOccurrenceBucket,
     NodeKind::ErrorSignature,
+    NodeKind::ScanCoverage,
 ];
 
 /// Allowed target node kinds for the typed code-graph relations checked by
@@ -1147,6 +1153,32 @@ mod tests {
         let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
         assert_eq!(codes, vec![ORPHAN_NODE]);
         assert_eq!(report.diagnostics[0].kind, Some("DependencyDeclaration"));
+    }
+
+    #[test]
+    fn unattached_scan_coverage_is_an_orphan() {
+        // Issue #135: a `ScanCoverage` node with no inbound
+        // `Repository —CONTAINS→ ScanCoverage` edge is not repository-scoped or
+        // citable, so the referential-integrity gate flags it as an orphan.
+        let records = vec![node("n:coverage", NodeKind::ScanCoverage)];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![ORPHAN_NODE]);
+        assert_eq!(report.diagnostics[0].kind, Some("ScanCoverage"));
+    }
+
+    #[test]
+    fn scan_coverage_with_inbound_contains_edge_is_not_an_orphan() {
+        // The happy path the extractor emits: `Repository —CONTAINS→
+        // ScanCoverage`. The inbound edge makes the coverage node incident, so
+        // it validates cleanly.
+        let records = vec![
+            node("n:repo", NodeKind::Repository),
+            node("n:coverage", NodeKind::ScanCoverage),
+            edge("e:contains", EdgeLabel::Contains, "n:repo", "n:coverage"),
+        ];
+        let report = validate_records(&records);
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
     }
 
     #[test]

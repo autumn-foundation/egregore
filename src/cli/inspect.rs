@@ -199,6 +199,15 @@ pub(crate) fn inspect_embedded_store(data_dir: &Path, format: OutputFormat) -> R
     // output is deterministic regardless of physical store iteration order.
     counts.repositories.sort_by(|a, b| a.id.cmp(&b.id));
 
+    // The coverage detail block must reflect the transaction-time-current
+    // version of each ScanCoverage stable ID. `inspect_all_records` returns
+    // EVERY physical version (including superseded ones) so the record/node
+    // totals stay accurate, but a store re-ingested after files changed then
+    // holds multiple equal-ID coverage versions; resolving the block through
+    // the current serving view guarantees the latest coverage is reported,
+    // never a stale earlier one (issue #135).
+    counts.coverage = current_coverage_summaries(&sink, data_dir)?;
+
     match format {
         OutputFormat::Json => {
             let json_val = counts.to_json_embedded(&data_dir.display().to_string());
@@ -207,6 +216,37 @@ pub(crate) fn inspect_embedded_store(data_dir: &Path, format: OutputFormat) -> R
         OutputFormat::Text => print_counts_text(&counts),
     }
     Ok(())
+}
+
+/// Resolves the transaction-time-current `ScanCoverage` summary for each stable
+/// coverage ID in an embedded store (issue #135).
+///
+/// `inspect_current_records` collapses each non-temporal stable ID to its
+/// latest physical version (superseded prior versions are dropped), so a store
+/// re-ingested after files changed yields exactly one — the current — coverage
+/// summary per ID. Unlike `inspect_all_records` (which the totals need), it
+/// serves only the current serving view; unlike `read_all_records`, it
+/// tolerates unknown-schema-version physical records rather than erroring, so
+/// it is safe on any store the totals path can inspect. Ordering by record ID
+/// keeps the block byte-identical across runs.
+#[cfg(feature = "embedded-aletheiadb")]
+fn current_coverage_summaries(
+    sink: &EmbeddedAletheiaSink,
+    data_dir: &Path,
+) -> Result<Vec<CoverageSummary>> {
+    let report = sink.inspect_current_records().map_err(|error| {
+        anyhow::anyhow!(
+            "failed to read current records from embedded store {}: {error}",
+            data_dir.display()
+        )
+    })?;
+    let mut latest: BTreeMap<String, CoverageSummary> = BTreeMap::new();
+    for record in &report.records {
+        if let Some(summary) = coverage_summary_from_record(record) {
+            latest.insert(summary.id.clone(), summary);
+        }
+    }
+    Ok(latest.into_values().collect())
 }
 
 /// Feature-off stub: `--data-dir` inspection needs the embedded adapter.
@@ -235,6 +275,28 @@ pub(crate) struct CoverageSummary {
     skipped_by_extension: BTreeMap<String, usize>,
     indexed_languages: Vec<String>,
     coverage_complete: bool,
+}
+
+/// Builds a [`CoverageSummary`] from a `ScanCoverage` node record, returning
+/// `None` for any other record kind or a coverage node missing its payload.
+fn coverage_summary_from_record(record: &GraphRecord) -> Option<CoverageSummary> {
+    if let GraphRecord::Node {
+        id,
+        kind: NodeKind::ScanCoverage,
+        scan_coverage: Some(payload),
+        ..
+    } = record
+    {
+        return Some(CoverageSummary {
+            id: id.clone(),
+            files_walked: payload.files_walked,
+            files_indexed: payload.files_indexed,
+            skipped_by_extension: payload.skipped_by_extension.clone(),
+            indexed_languages: payload.indexed_languages.clone(),
+            coverage_complete: payload.coverage_complete,
+        });
+    }
+    None
 }
 
 #[derive(Debug, Default)]
@@ -287,7 +349,6 @@ impl InspectCounts {
                     id,
                     kind,
                     repository_identity,
-                    scan_coverage,
                     ..
                 } => {
                     counts.nodes += 1;
@@ -295,16 +356,9 @@ impl InspectCounts {
                         counts.diagnostics += 1;
                     }
                     if *kind == NodeKind::ScanCoverage
-                        && let Some(payload) = scan_coverage.as_deref()
+                        && let Some(summary) = coverage_summary_from_record(record)
                     {
-                        counts.coverage.push(CoverageSummary {
-                            id: id.clone(),
-                            files_walked: payload.files_walked,
-                            files_indexed: payload.files_indexed,
-                            skipped_by_extension: payload.skipped_by_extension.clone(),
-                            indexed_languages: payload.indexed_languages.clone(),
-                            coverage_complete: payload.coverage_complete,
-                        });
+                        counts.coverage.push(summary);
                     }
                     if *kind == NodeKind::Repository {
                         let identity_summary = repository_identity.as_deref().map_or_else(
@@ -348,10 +402,18 @@ impl InspectCounts {
             *counts.producer_kinds.entry(kind_key).or_default() += 1;
             *counts.egregore_versions.entry(version_key).or_default() += 1;
         }
-        // Deterministic coverage ordering regardless of physical iteration
-        // order; dedup a stable ID recurring across superseded versions.
-        counts.coverage.sort_by(|a, b| a.id.cmp(&b.id));
-        counts.coverage.dedup_by(|a, b| a.id == b.id);
+        // Collapse a stable ScanCoverage ID recurring across superseded
+        // versions to a single deterministic summary. Records arrive in
+        // scan/append order, so the LAST occurrence is the most recent version
+        // — a re-ingest after files changed must report the current coverage,
+        // never a stale earlier one (issue #135). The BTreeMap also orders the
+        // result by record ID, so the output is byte-identical across runs
+        // regardless of physical iteration order.
+        let mut latest: BTreeMap<String, CoverageSummary> = BTreeMap::new();
+        for summary in counts.coverage.drain(..) {
+            latest.insert(summary.id.clone(), summary);
+        }
+        counts.coverage = latest.into_values().collect();
         counts
     }
 

@@ -346,3 +346,72 @@ fn inspect_data_dir_surfaces_coverage_block() {
     assert_eq!(coverage[0]["skipped_by_extension"]["toml"], 1);
     assert_eq!(coverage[0]["indexed_languages"][0], "Rust");
 }
+
+/// A repository re-ingested after files changed leaves the store holding two
+/// physical versions of the same stable `ScanCoverage` ID. `eg inspect
+/// --data-dir` must report the CURRENT (latest) coverage, never a superseded
+/// earlier version (issue #135).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn inspect_data_dir_reports_latest_superseded_coverage() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = git_repo_from_fixture(&temp);
+    let graph_path = repo.join("graph.jsonl");
+    let data_dir = temp.path().join("store");
+    assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .args(["scan"])
+        .arg(&repo)
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    // The real scan records files_walked = 8. Build a STALE variant that keeps
+    // the same ScanCoverage record ID but reports a different files_walked, so
+    // ingesting it first and the real graph second produces two physical
+    // versions of one stable ID (an older, superseded one and the current one).
+    let real_jsonl = fs::read_to_string(&graph_path).expect("read graph");
+    let mut stale = String::new();
+    for line in real_jsonl.lines() {
+        let mut v: Value = serde_json::from_str(line).unwrap();
+        if v["record_type"] == "node" && v["kind"] == "ScanCoverage" {
+            v["scan_coverage"]["files_walked"] = Value::from(3);
+            v["scan_coverage"]["files_indexed"] = Value::from(1);
+        }
+        stale.push_str(&serde_json::to_string(&v).unwrap());
+        stale.push('\n');
+    }
+    let stale_path = repo.join("stale.graph.jsonl");
+    fs::write(&stale_path, stale).expect("write stale graph");
+
+    // Ingest the STALE coverage first, then supersede it with the real scan.
+    for graph in [&stale_path, &graph_path] {
+        assert_cmd::Command::cargo_bin("egregore")
+            .expect("binary")
+            .arg("ingest")
+            .arg(graph)
+            .args(["--adapter", "embedded", "--data-dir"])
+            .arg(&data_dir)
+            .assert()
+            .success();
+    }
+
+    let out = assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .arg("inspect")
+        .args(["--data-dir"])
+        .arg(&data_dir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("inspect data-dir");
+    assert!(out.status.success());
+    let value: Value = serde_json::from_slice(&out.stdout).expect("inspect JSON should parse");
+    let coverage = value["coverage"].as_array().expect("coverage array");
+    // Exactly one summary per stable ID, and it is the LATEST (files_walked = 8)
+    // rather than the stale superseded version (files_walked = 3).
+    assert_eq!(coverage.len(), 1, "coverage block: {value}");
+    assert_eq!(coverage[0]["files_walked"], 8, "latest coverage: {value}");
+    assert_eq!(coverage[0]["files_indexed"], 4, "latest coverage: {value}");
+}
