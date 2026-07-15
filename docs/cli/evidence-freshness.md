@@ -138,12 +138,39 @@ duplicate rows are classified once.
   deleted non-temporal record after its tombstone, so a retracted observation or a
   deleted current-tree handle can be mis-handled there (classified/live instead of
   omitted/`unresolved`). The `--graph` path is correct. Tracked in #205.
-- **Module/import body drift.** Content comparison hashes a node's summary, which
-  embeds the normalized source body for **symbols** but only the name/path for
-  `Module`/`Import` records (and drift records skip them). A module/import whose
-  body changed while its name/path is unchanged is therefore reported `current`;
-  cite the symbols inside the module for body-level freshness. Removal/rename is
-  still correctly `unresolved`. Tracked in #206.
+- **Module body drift** — *detected since #206.* A node's content comparison
+  hashes its summary, which embeds the normalized source body for **symbols** but
+  is name-only for `Module` records. A module's stable ID is keyed on its
+  qualified **name** only, so an inline `mod foo { .. }` whose body changes keeps
+  the same ID. `Module` nodes therefore carry an additive `content_signature` — a
+  compact BLAKE3 handle over the normalized body — folded into the content-hash
+  trigger, so a module body change with an unchanged name/path is reported
+  `drifted`. This holds end-to-end through **`scan-history`**: history replay
+  stamps every Module record with the commit's temporal provenance and pushes it
+  into the graph at each commit (the `CHANGED_IN`-edge gate is independent of
+  temporal-history membership), so a module body edit across two commits surfaces
+  as `drifted` from the real extraction pipeline — not only from hand-built
+  fixtures (end-to-end regression:
+  `scan_history_detects_inline_module_body_drift_end_to_end`). A store **upgraded
+  across #206** may hold a legacy module version with `content_signature = None`
+  (hashed summary-only) beside a post-upgrade rescan of the same body carrying
+  `Some(sig)`; this one-sided-missing signature is treated as **unknown** and
+  compared summary-only, so a byte-identical body is not reported as a false
+  `drifted`. Both-present and both-absent comparisons are byte-identical to the
+  pre-fix decision. Residual: an out-of-line `mod foo;` declaration hashes only
+  `mod foo;`, so a body change in the *target* file surfaces via that file's own
+  symbol records (not the `mod` node); and semantic-drift records still skip
+  `Module` (a separate embeddings mechanism). Removal/rename remains correctly
+  `unresolved`.
+- **Import body drift** — *surfaces as a handle-identity change, NOT `drifted`.*
+  An `Import` node's stable ID already encodes its full trimmed `use …;`
+  declaration (the whole path, not the bound leaf), so **any** body change (glob
+  expansion, added `as` alias, added path segment) mints a **different** record
+  ID. The two versions never share an ID for a content signature to be compared
+  within, so `Import` nodes intentionally carry **no** `content_signature`. A
+  citation to the old import handle resolves `unresolved` (the handle is absent
+  from the frontier), never `drifted` (end-to-end regression:
+  `import_body_change_is_a_handle_identity_change_end_to_end`).
 
 ### Trigger sources (reused, never re-derived)
 
@@ -263,11 +290,28 @@ tombstoned or superseded citation edge is skipped.
 
 ### Known limitations
 
-- **Module / import content.** `Module` and `Import` nodes summarize to a name,
-  not normalized source, so a content-hash change cannot be observed for them.
-  Citations to a module/import are still flagged when the handle is removed
-  (`unresolved`) or a semantic-drift record names it, but a change *inside* a
-  module that leaves its name intact is not detected by the content-hash trigger.
+- **Module content** — *body drift detected since #206.* `Module` node summaries
+  are name-only, so the summary alone cannot observe a body change, yet the
+  module's stable ID is keyed on its qualified name only (an inline-body edit
+  keeps the ID). `Module` nodes therefore carry an additive `content_signature`
+  (a compact BLAKE3 handle over the normalized body) that is folded into the
+  content-hash trigger, so a change *inside* an inline module that leaves the name
+  intact is detected as `drifted` — including end-to-end through `scan-history`,
+  whose replay pushes each Module version with temporal provenance. A mixed
+  pre-/post-upgrade store (a legacy `content_signature = None` version vs a
+  post-upgrade `Some(sig)` version of the same body) treats the one-sided-missing
+  signature as unknown and compares summary-only, so no false drift is reported
+  from the schema upgrade alone. Residual gaps: an out-of-line `mod foo;` only
+  signs `mod foo;` (the external file's own symbol records carry its body), and
+  semantic-drift records still skip this kind. Removed handles remain correctly
+  `unresolved`.
+- **Import content** — *body change surfaces as `unresolved`, not `drifted`.* An
+  `Import` node's stable ID already encodes its full trimmed `use …;` declaration,
+  so any body change (glob expansion, `as` alias, added path segment) mints a
+  different record ID. `Import` nodes therefore carry **no** `content_signature` —
+  it could never be the drift trigger, since the two versions never share an ID.
+  A citation to the old import handle resolves `unresolved` (handle absent from
+  the frontier), never `drifted`.
 - **Span relocation.** A symbol moved without any content change (e.g. lines
   inserted above it) is **not** treated as drift: the observation about what the
   code does is still accurate, and flagging pure relocations would manufacture
