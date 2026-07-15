@@ -363,6 +363,99 @@ fn validate_rejects_scan_coverage_contained_by_a_file() {
     );
 }
 
+/// A canonical `eg export` JSONL (issue #402) sorts its lines LEXICOGRAPHICALLY,
+/// not in scan/append order, so a store holding two physical `ScanCoverage`
+/// versions of one stable ID can serialize the STALE version's line AFTER the
+/// current one. `eg inspect --graph` must therefore pick the FRESHEST coverage
+/// by the serialized `valid_time` (the scan transaction time), never by physical
+/// line order (issue #135). The stale version here is BOTH physically last and
+/// lexically greatest, yet carries an OLDER instant expressed with a positive
+/// timezone offset — so a lexical timestamp comparison would also pick wrong;
+/// only a parsed-instant comparison reports the fresh version.
+#[test]
+fn inspect_graph_reports_freshest_coverage_independent_of_line_order() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = git_repo_from_fixture(&temp);
+    let graph_path = repo.join("graph.jsonl");
+    assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .args(["scan"])
+        .arg(&repo)
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let real_jsonl = fs::read_to_string(&graph_path).expect("read graph");
+    let records = parse_jsonl(&real_jsonl);
+    let coverage = coverage_node(&records);
+
+    // FRESH: newer instant (12:00Z), fewer files (files removed since the stale
+    // scan). This is the current coverage inspect must report.
+    let mut fresh = coverage.clone();
+    fresh["valid_time"] = Value::from("2026-05-19T12:00:00Z");
+    fresh["scan_coverage"]["files_walked"] = Value::from(4);
+    fresh["scan_coverage"]["files_indexed"] = Value::from(4);
+
+    // STALE: an OLDER instant (00:00Z) written as +13:00 so its RFC 3339 string
+    // is lexically GREATER than fresh's, and MORE files. Every field that differs
+    // from fresh is lexically larger, so the stale line sorts last under export's
+    // `lines.sort_unstable()` regardless of serialized field order.
+    let mut stale = coverage;
+    stale["valid_time"] = Value::from("2026-05-19T13:00:00+13:00");
+    stale["scan_coverage"]["files_walked"] = Value::from(9);
+    stale["scan_coverage"]["files_indexed"] = Value::from(9);
+
+    let fresh_line = serde_json::to_string(&fresh).unwrap();
+    let stale_line = serde_json::to_string(&stale).unwrap();
+
+    // Reproduce a canonical `eg export` file: keep every non-coverage record,
+    // add both coverage versions, then sort lexicographically exactly as export
+    // does.
+    let mut lines: Vec<String> = real_jsonl
+        .lines()
+        .filter(|line| {
+            let v: Value = serde_json::from_str(line).unwrap();
+            !(v["record_type"] == "node" && v["kind"] == "ScanCoverage")
+        })
+        .map(str::to_owned)
+        .collect();
+    lines.push(fresh_line.clone());
+    lines.push(stale_line.clone());
+    lines.sort_unstable();
+
+    // Precondition: the stale line really does sort AFTER the fresh line, so a
+    // "keep-last-by-line-order" rule would report the stale coverage.
+    let fresh_pos = lines.iter().position(|l| *l == fresh_line).unwrap();
+    let stale_pos = lines.iter().position(|l| *l == stale_line).unwrap();
+    assert!(
+        stale_pos > fresh_pos,
+        "stale line must sort after fresh to exercise the regression"
+    );
+
+    let export_like = repo.join("export_like.graph.jsonl");
+    fs::write(&export_like, format!("{}\n", lines.join("\n"))).expect("write export-like graph");
+
+    let out = assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .arg("inspect")
+        .arg(&export_like)
+        .args(["--format", "json"])
+        .output()
+        .expect("inspect graph");
+    assert!(out.status.success());
+    let value: Value = serde_json::from_slice(&out.stdout).expect("inspect JSON should parse");
+    let coverage = value["coverage"].as_array().expect("coverage array");
+    // Exactly one summary per stable ID, and it is the FRESH one (files_walked =
+    // 4) — never the stale, physically-last, lexically-greatest version (9).
+    assert_eq!(coverage.len(), 1, "coverage block: {value}");
+    assert_eq!(coverage[0]["files_walked"], 4, "freshest coverage: {value}");
+    assert_eq!(
+        coverage[0]["files_indexed"], 4,
+        "freshest coverage: {value}"
+    );
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn inspect_data_dir_surfaces_coverage_block() {

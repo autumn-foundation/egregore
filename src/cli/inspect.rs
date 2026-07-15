@@ -277,6 +277,34 @@ pub(crate) struct CoverageSummary {
     coverage_complete: bool,
 }
 
+/// Deterministic freshness ordering for collapsing equal-ID `ScanCoverage`
+/// versions on the `--graph` path (issue #135).
+///
+/// `instant` is the coverage node's `valid_time` (= the scan's transaction
+/// time, stamped by `with_valid_time_inferred`) parsed to a UTC instant — a
+/// serialized, export-preserved signal that is monotonic with scan recency, so
+/// a later re-scan sorts fresher regardless of physical line order. A record
+/// whose `valid_time` is absent or unparseable sorts as `None`, strictly older
+/// than any parseable instant (so a real scan always wins over a signal-less
+/// version). `tiebreak` is the canonical serialization of the summary, a
+/// fully-ordered field that keeps selection byte-identical across runs when two
+/// versions share an instant (a degenerate tie carrying no freshness signal).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CoverageFreshness {
+    instant: Option<chrono::DateTime<chrono::Utc>>,
+    tiebreak: String,
+}
+
+impl CoverageFreshness {
+    fn new(valid_time: Option<&str>, summary: &CoverageSummary) -> Self {
+        let instant = valid_time
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let tiebreak = serde_json::to_string(summary).unwrap_or_default();
+        Self { instant, tiebreak }
+    }
+}
+
 /// Builds a [`CoverageSummary`] from a `ScanCoverage` node record, returning
 /// `None` for any other record kind or a coverage node missing its payload.
 fn coverage_summary_from_record(record: &GraphRecord) -> Option<CoverageSummary> {
@@ -324,6 +352,19 @@ impl InspectCounts {
         unknown_schema_versions: &[crate::schema_version::UnknownSchemaVersion],
     ) -> Self {
         let mut counts = Self::default();
+        // Collapse equal-ID `ScanCoverage` versions to the FRESHEST version on
+        // the `--graph` path (issue #135). The freshness key is each coverage
+        // node's `valid_time` (= the scan's transaction time, stamped by
+        // `with_valid_time_inferred`), parsed to a UTC instant — a serialized,
+        // export-preserved, scan-recency-monotonic signal. Physical input/file
+        // order is NOT a valid freshness signal: `eg export` (issue #402) writes
+        // canonical JSONL after a LEXICOGRAPHIC `lines.sort_unstable()`, so a
+        // stale line can sort after the current one and a "keep-last-by-order"
+        // rule would then report stale coverage. The tie-break (fully-ordered
+        // canonical serialization of the summary) keeps output byte-identical
+        // when two versions share a `valid_time` and carry no freshness signal.
+        let mut coverage_latest: BTreeMap<String, (CoverageFreshness, CoverageSummary)> =
+            BTreeMap::new();
         for unknown in unknown_schema_versions {
             counts.records += 1;
             *counts
@@ -349,6 +390,7 @@ impl InspectCounts {
                     id,
                     kind,
                     repository_identity,
+                    valid_time,
                     ..
                 } => {
                     counts.nodes += 1;
@@ -358,7 +400,17 @@ impl InspectCounts {
                     if *kind == NodeKind::ScanCoverage
                         && let Some(summary) = coverage_summary_from_record(record)
                     {
-                        counts.coverage.push(summary);
+                        let freshness = CoverageFreshness::new(valid_time.as_deref(), &summary);
+                        match coverage_latest.entry(summary.id.clone()) {
+                            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                                if freshness > slot.get().0 {
+                                    slot.insert((freshness, summary));
+                                }
+                            }
+                            std::collections::btree_map::Entry::Vacant(slot) => {
+                                slot.insert((freshness, summary));
+                            }
+                        }
                     }
                     if *kind == NodeKind::Repository {
                         let identity_summary = repository_identity.as_deref().map_or_else(
@@ -402,18 +454,14 @@ impl InspectCounts {
             *counts.producer_kinds.entry(kind_key).or_default() += 1;
             *counts.egregore_versions.entry(version_key).or_default() += 1;
         }
-        // Collapse a stable ScanCoverage ID recurring across superseded
-        // versions to a single deterministic summary. Records arrive in
-        // scan/append order, so the LAST occurrence is the most recent version
-        // — a re-ingest after files changed must report the current coverage,
-        // never a stale earlier one (issue #135). The BTreeMap also orders the
+        // Emit the freshest version per stable ScanCoverage ID (see the
+        // `coverage_latest` freshness contract above). The BTreeMap orders the
         // result by record ID, so the output is byte-identical across runs
         // regardless of physical iteration order.
-        let mut latest: BTreeMap<String, CoverageSummary> = BTreeMap::new();
-        for summary in counts.coverage.drain(..) {
-            latest.insert(summary.id.clone(), summary);
-        }
-        counts.coverage = latest.into_values().collect();
+        counts.coverage = coverage_latest
+            .into_values()
+            .map(|(_, summary)| summary)
+            .collect();
         counts
     }
 
