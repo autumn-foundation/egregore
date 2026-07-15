@@ -119,7 +119,6 @@ fn discover_files_matching(
                 // yields a complete indexed-vs-skipped accounting (AC4).
                 tally.files_walked += 1;
                 if matcher(&path) {
-                    tally.files_indexed += 1;
                     files.push(path);
                 } else {
                     let ext = path
@@ -143,12 +142,15 @@ fn discover_files_matching(
         collect_matching_files(repo_root, matcher, &ignored_dirs, &mut files)?;
     }
 
+    // `files_indexed` is exactly the count of matched files collected, on both
+    // the tracked-files walk and the fallback branches, so set it once here
+    // rather than track a parallel counter (issue #135).
+    tally.files_indexed = files.len();
     // The fallback branches (non-Git tree, or a failed `git ls-files`) enumerate
     // only matching files, so they carry no walked/skipped denominator. Report a
-    // best-effort `files_indexed == files_walked` with `coverage_complete` left
+    // best-effort `files_walked == files_indexed` with `coverage_complete` left
     // `false` rather than fabricate a skip tally (issue #135).
     if !tally.coverage_complete {
-        tally.files_indexed = files.len();
         tally.files_walked = files.len();
     }
 
