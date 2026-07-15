@@ -88,6 +88,31 @@ store, an empty directory, or an initialized store holding zero Egregore
 records fails with a diagnostic naming the path — never successful zero
 counts. See `docs/cli/inspect.md` for the JSON contract.
 
+`eg export --data-dir <dir> --out <file.jsonl>` dumps every persisted record of
+an embedded store back to canonical JSONL — the inverse of `eg ingest`, distinct
+from the #68 evidence bundle (no header, manifest, run id, or timestamp). It
+reads the same physical inventory `eg inspect --data-dir` uses
+(`inspect_all_records` through the throwaway read-only copy → strictly
+read-only) and emits nodes, edges, valid-time tombstones, diagnostics,
+superseded versions, and unknown-version records across all domains in the exact
+shapes `scan`/`ingest` emit, so re-ingesting the export into a fresh `--data-dir`
+reproduces the `eg inspect` totals and per-domain/kind/schema-version counts
+(parity holds for stores without retractions). Lines are sorted and `\n`-joined
+as `Graph::to_jsonl` does, so repeated exports of an unchanged store are
+byte-identical. The one deliberate deviation from "every physical record": a
+record hidden by `eg forget` (#231) is never re-emitted (every physical version
+of the retracted id is dropped, fail-closed on privacy), while its `Retraction`
+event and tombstone audit trail are preserved — so a re-ingested forget-export
+is `eg validate`-clean. Unknown `(domain, kind, schema_version)` records (only
+bumped versions of known kinds, since ingest rejects unknown kinds at the write
+path) re-emit their reconstructed canonical line verbatim; a record that cannot
+be reconstructed (a required prop absent — only reachable via artificial raw
+injection) is surfaced as an enumerated stderr skip diagnostic, the single
+documented lossless exception. Redacted records carry as-is (protected raw
+payloads stay `protected:v1:` handles/hashes, never rehydrated). A missing,
+empty, unreadable, or record-empty `--data-dir` fails with a diagnostic naming
+the path and writes no output file. See `docs/cli/export.md`.
+
 Query commands (local JSONL graph, no network):
 
 ```powershell

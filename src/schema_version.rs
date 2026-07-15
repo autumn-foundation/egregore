@@ -80,6 +80,18 @@ pub struct UnknownSchemaVersion {
     pub code: String,
     /// Unknown tuple that caused the rejection.
     pub version: RecordVersion,
+    /// Canonical serialized JSON of the physical record, when it could be
+    /// reconstructed from stored properties (issue #155 `eg export`).
+    ///
+    /// Populated only by the physical-inventory read
+    /// (`EmbeddedAletheiaSink::inspect_all_records`) so `eg export` can re-emit
+    /// an unknown-version record verbatim. `None` when the record cannot be
+    /// reconstructed (a required property such as `summary` is absent — only
+    /// reachable by artificial raw injection, never by `eg ingest`). Every
+    /// other producer of this diagnostic leaves it `None`, and inspect's
+    /// counting behavior ignores it, so this is a purely additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_line: Option<String>,
 }
 
 impl UnknownSchemaVersion {
@@ -87,7 +99,15 @@ impl UnknownSchemaVersion {
         Self {
             code: UNKNOWN_SCHEMA_VERSION_CODE.to_owned(),
             version,
+            raw_line: None,
         }
+    }
+
+    /// Attaches the reconstructed canonical record line (issue #155).
+    #[must_use]
+    pub(crate) fn with_raw_line(mut self, raw_line: Option<String>) -> Self {
+        self.raw_line = raw_line;
+        self
     }
 }
 
