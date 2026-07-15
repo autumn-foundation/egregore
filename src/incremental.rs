@@ -80,6 +80,14 @@ use crate::{
 /// older cache would lack it and hash inconsistently against freshly-rebuilt
 /// neighbors, so the bump forces older caches to rebuild. (13/14 are reserved
 /// for concurrent lanes; this lane takes 15.)
+/// v13 adds crate-root partitioning of the cross-file `IMPLEMENTS` index
+/// (issue #394: the serde-default `crate_root` on each `impl_targets` /
+/// `pending_impls` fact) and import-aware bare-name resolution (issue #393: the
+/// new `use_trait_imports` per-file vector capturing the resolved path each
+/// module-item `use` binds). The fields are serde-default, but a bump forces
+/// older caches to rebuild so reused per-file facts carry the crate root and
+/// import paths rather than defaulting them, recovering the recall PR #389 left
+/// conservatively unresolved.
 ///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
