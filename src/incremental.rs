@@ -70,10 +70,19 @@ use crate::{
 /// serde-default, but a bump forces older caches to rebuild so reused per-file
 /// facts carry the verdict rather than defaulting it to `false`.
 ///
+/// v13 adds crate-root partitioning of the cross-file `IMPLEMENTS` index
+/// (issue #394: the serde-default `crate_root` on each `impl_targets` /
+/// `pending_impls` fact) and import-aware bare-name resolution (issue #393: the
+/// new `use_trait_imports` per-file vector capturing the resolved path each
+/// module-item `use` binds). The fields are serde-default, but a bump forces
+/// older caches to rebuild so reused per-file facts carry the crate root and
+/// import paths rather than defaulting them, recovering the recall PR #389 left
+/// conservatively unresolved.
+///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 12;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 13;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
