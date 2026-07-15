@@ -96,6 +96,7 @@ mod semantic_drift;
 mod semantic_drift_calibration;
 mod semantic_relevance;
 mod store_contention;
+mod store_export;
 mod symbol_metadata;
 mod task_query;
 mod temporal;
