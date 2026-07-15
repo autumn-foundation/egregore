@@ -169,20 +169,25 @@ duplicate rows are classified once.
   `valid_time`s (a working-tree-only deletion at an unchanged HEAD keeps the
   committer-derived `valid_time` and is not detected); use `scan-history` when
   per-commit precision is required.
-  Residual (mixed history + current-tree handle): when a single store combines
+  Mixed history + current-tree handle (issue #405): when a single store combines
   `scan-history` output and repeated current-tree `scan` output for the **same**
   repo so that one stable handle carries **both** a commit-anchored version and a
-  non-temporal current-tree version, that handle is governed by the commit-tip
-  frontier and is **not** pruned by the current-tree scan frontier. If a later
-  current-tree scan deletes such a handle without a tombstone, a citation to it can
-  still report `current`/`drifted` rather than `unresolved`, because the two
-  "latest" axes (commit committer date vs. wall-clock scan `valid_time`) have no
-  reliable ordering and history is treated as authoritative. This shape is not
-  produced by any single command — `scan` emits only current-tree handles and
-  `scan-history` only commit-anchored handles; it arises only from hand-combining
-  both outputs for one repo. Use a single `scan-history` store for the freshness
-  workflow; do not merge current-tree `scan` output into a history store for the
-  same repo. Tracked in #405.
+  non-temporal current-tree version, that handle is now pruned on **both** axes,
+  not exempted by either. Only PURE-history handles (every version commit-anchored)
+  are governed solely by the commit-tip frontier; a mixed handle is live iff it is
+  present in the latest state of **either** axis — a temporal version at one of its
+  repository's **tip commits**, OR a non-temporal version at the **newest scan**. A
+  symbol present at a tip commit stays `current` and a symbol present at the newest
+  scan stays `current`; a symbol absent from **both** latest states (e.g. deleted
+  by the latest scan without a tombstone while its only commit-anchored version sits
+  at an interior commit) is `unresolved`. The two "latest" axes (a commit's
+  committer date vs. a scan's wall-clock `valid_time`) have no reliable
+  cross-ordering — rebases and clock skew mean #203 keys liveness on tips, not
+  timestamps — so they are never ordered against each other; presence on either
+  axis alone keeps the handle live, so a symbol at a tip commit is never a false
+  `unresolved`. This shape is not produced by any single command — `scan` emits only
+  current-tree handles and `scan-history` only commit-anchored handles; it arises
+  only from hand-combining both outputs for one repo.
 - **Retractions/deletions via the embedded `--data-dir` read.** Tombstone
   *activity* is decided from record order, which is write order for an append-only
   `--graph` file. The embedded `--data-dir` history-inclusive read re-emits a

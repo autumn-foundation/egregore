@@ -5184,6 +5184,373 @@ fn finding2_empty_latest_scan_prunes_prior_handle_via_snapshot_node() {
     ));
 }
 
+// ── Issue #405: mixed scan + scan-history handles (both-frontier pruning) ─────
+//
+// A "mixed" handle carries ONE identity-derived record ID under BOTH a
+// `scan-history` (commit-anchored) version and current-tree `scan` (non-temporal)
+// versions — no single command emits both; only a hand-combined store does
+// (`cat graph.jsonl history.graph.jsonl`, or ingesting both into one
+// `--data-dir`). Before #405 the transaction-time scan retain early-returned for
+// ANY handle with a commit-anchored version, so a mixed handle was exempted from
+// the scan frontier while its non-temporal version rescued it from the commit-tip
+// frontier — pruned by NEITHER axis. A symbol deleted by the latest scan without a
+// tombstone stayed `current`. The fix exempts only PURE-history handles: a mixed
+// handle is live iff present in the latest state of either axis (a temporal
+// version at a repo tip commit OR a non-temporal version at the newest scan).
+
+/// Builds a non-temporal current-tree `Symbol` version stamped with a node-level
+/// `valid_time` (no commit), so it participates in the transaction-time scan
+/// frontier. Collapses to the SAME record ID as a `symbol_version` with the same
+/// `sym_id`, forming a mixed handle.
+fn current_tree_symbol_at(
+    sym_id: &str,
+    path: &str,
+    name: &str,
+    sym_span: SourceSpan,
+    body: &str,
+    valid_time: &str,
+) -> GraphRecord {
+    let mut n = GraphRecord::node(
+        sym_id.to_owned(),
+        NodeKind::Symbol,
+        Some(path.to_owned()),
+        Some(sym_span),
+        Some(name.to_owned()),
+        format!("Rust fn {name}\nSource:\n{body}"),
+    );
+    if let GraphRecord::Node { valid_time: vt, .. } = &mut n {
+        *vt = Some(valid_time.to_owned());
+    }
+    n
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mixed_store_history_deletes_and_scan_drops_handle_is_unresolved() {
+    // Issue #405 (the regression case): one repository R, one handle `alpha` that
+    // is BOTH a `scan-history` temporal version at the INTERIOR commit C1 (deleted
+    // by the tip C2, no tombstone) AND a current-tree `scan` version at the OLDER
+    // scan T1 (dropped from the newest scan T2). `alpha` is absent from the tip
+    // commit C2 AND from the newest scan T2, so it must be `unresolved`. Before the
+    // fix the scan retain exempted `alpha` (it has a commit-anchored version) while
+    // its non-temporal version rescued it from the commit-tip frontier, so it was
+    // pruned by neither axis and stayed `current`.
+    let path = "src/lib.rs";
+    let repo_r = stable_id(&["repository", "remote", "https://example.test/405r.git"]);
+    let alpha = stable_id(&["node", "symbol", "fn", "405-repo-r", path, "alpha", "0"]);
+    let keep = stable_id(&["node", "symbol", "fn", "405-repo-r", path, "keep", "0"]);
+    let scan_1 = "2026-01-01T00:00:00Z";
+    let scan_2 = "2026-02-01T00:00:00Z";
+
+    // Prove the two versions collapse to ONE record ID (the crux of a mixed handle).
+    let alpha_temporal = symbol_version(
+        &alpha,
+        path,
+        "alpha",
+        span(10, 20),
+        "alpha_body",
+        "c1",
+        "2025-12-01T00:00:00Z",
+    );
+    let alpha_current =
+        current_tree_symbol_at(&alpha, path, "alpha", span(10, 20), "alpha_body", scan_1);
+    let node_id = |r: &GraphRecord| match r {
+        GraphRecord::Node { id, .. } => id.clone(),
+        _ => panic!("expected a node record"),
+    };
+    assert_eq!(
+        node_id(&alpha_temporal),
+        node_id(&alpha_current),
+        "the temporal and current-tree versions of alpha MUST share one record ID, \
+         else the test proves nothing"
+    );
+
+    // `keep` anchors the DAG: at C1 (root) and at C2 (child of C1, the tip), so C1
+    // is interior and C2 is R's only tip commit.
+    let keep_c1 = symbol_version(
+        &keep,
+        path,
+        "keep",
+        span(30, 40),
+        "keep_body",
+        "c1",
+        "2025-12-01T00:00:00Z",
+    );
+    let mut keep_c2 = symbol_version(
+        &keep,
+        path,
+        "keep",
+        span(30, 40),
+        "keep_body",
+        "c2",
+        "2025-12-15T00:00:00Z",
+    );
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = &mut keep_c2
+    {
+        t.git_parent_commits = vec!["c1".to_owned()];
+    }
+
+    let obs = agent_memory_stable_id(&["obs", "405_mixed_deleted"]);
+    let mut cite = observation(
+        &obs,
+        "alpha did the thing",
+        "0.9",
+        Some(&alpha),
+        Some(path),
+        Some(span(10, 20)),
+        "OBSERVES",
+        None,
+        Some(scan_1),
+    );
+    if let GraphRecord::Node { observed_at, .. } = &mut cite {
+        *observed_at = None;
+    }
+
+    let records = vec![
+        // Scan 1 snapshot node + newest (T2) snapshot node advancing the frontier.
+        repo_node_at(&repo_r, "405r", "https://example.test/405r.git", scan_1),
+        repo_node_at(&repo_r, "405r", "https://example.test/405r.git", scan_2),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_r.clone(),
+            alpha,
+            Some("1.0".to_owned()),
+            "Repository R contains alpha".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_r.clone(),
+            keep,
+            Some("1.0".to_owned()),
+            "Repository R contains keep".to_owned(),
+        ),
+        alpha_temporal,
+        alpha_current,
+        keep_c1,
+        keep_c2,
+        cite,
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs)
+        .expect("verdict for the mixed-handle citation");
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Unresolved,
+        "a mixed handle absent from BOTH the tip commit C2 and the newest scan T2 \
+         must be unresolved, not kept live by the scan-retain history exemption"
+    );
+    assert!(matches!(
+        entry.triggering_handle,
+        Some(freshness::TriggeringHandle::HandleAbsent)
+    ));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mixed_store_handle_live_at_head_commit_stays_current_despite_scan_drop() {
+    // Issue #405 regression guard: a mixed handle whose temporal version is at the
+    // TIP commit C2 stays `current` even though its non-temporal version was dropped
+    // from the newest scan T2. This is the exact false-`unresolved` a naive "a mixed
+    // handle must ALSO be at the scan frontier" predicate would cause — the two axes
+    // are never cross-ordered, so presence at a tip commit alone keeps it live.
+    let path = "src/lib.rs";
+    let repo_r = stable_id(&["repository", "remote", "https://example.test/405h.git"]);
+    let alpha = stable_id(&["node", "symbol", "fn", "405h-repo-r", path, "alpha", "0"]);
+    let keep = stable_id(&["node", "symbol", "fn", "405h-repo-r", path, "keep", "0"]);
+    let scan_1 = "2026-01-01T00:00:00Z";
+    let scan_2 = "2026-02-01T00:00:00Z";
+
+    // `keep` at C1 (root); `alpha` at C2 (child of C1, the tip) — so alpha's
+    // temporal version sits at the repository's tip commit.
+    let keep_c1 = symbol_version(
+        &keep,
+        path,
+        "keep",
+        span(30, 40),
+        "keep_body",
+        "c1",
+        "2025-12-01T00:00:00Z",
+    );
+    let mut alpha_temporal = symbol_version(
+        &alpha,
+        path,
+        "alpha",
+        span(10, 20),
+        "alpha_body",
+        "c2",
+        "2025-12-15T00:00:00Z",
+    );
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = &mut alpha_temporal
+    {
+        t.git_parent_commits = vec!["c1".to_owned()];
+    }
+    // Non-temporal version at the OLDER scan T1, dropped from the newest scan T2.
+    let alpha_current =
+        current_tree_symbol_at(&alpha, path, "alpha", span(10, 20), "alpha_body", scan_1);
+
+    let obs = agent_memory_stable_id(&["obs", "405_mixed_head"]);
+    let mut cite = observation(
+        &obs,
+        "alpha did the thing",
+        "0.9",
+        Some(&alpha),
+        Some(path),
+        Some(span(10, 20)),
+        "OBSERVES",
+        None,
+        Some(scan_1),
+    );
+    if let GraphRecord::Node { observed_at, .. } = &mut cite {
+        *observed_at = None;
+    }
+
+    let records = vec![
+        repo_node_at(&repo_r, "405h", "https://example.test/405h.git", scan_1),
+        repo_node_at(&repo_r, "405h", "https://example.test/405h.git", scan_2),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_r.clone(),
+            alpha,
+            Some("1.0".to_owned()),
+            "Repository R contains alpha".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_r.clone(),
+            keep,
+            Some("1.0".to_owned()),
+            "Repository R contains keep".to_owned(),
+        ),
+        keep_c1,
+        alpha_temporal,
+        alpha_current,
+        cite,
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs)
+        .expect("verdict for the mixed-handle-at-tip citation");
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Current,
+        "a mixed handle present at a repo tip commit stays current even when its \
+         non-temporal version was dropped from the newest scan"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mixed_store_handle_live_at_latest_scan_stays_current_despite_interior_commit() {
+    // Issue #405 scan-axis liveness: a mixed handle whose temporal version is at an
+    // INTERIOR commit C1 (absent from the tip C2) still stays `current` because its
+    // non-temporal version is present in the LATEST scan T2 (valid_time == the
+    // repository's newest-scan frontier). Presence on either axis keeps it live.
+    let path = "src/lib.rs";
+    let repo_r = stable_id(&["repository", "remote", "https://example.test/405s.git"]);
+    let alpha = stable_id(&["node", "symbol", "fn", "405s-repo-r", path, "alpha", "0"]);
+    let keep = stable_id(&["node", "symbol", "fn", "405s-repo-r", path, "keep", "0"]);
+    let scan_2 = "2026-02-01T00:00:00Z";
+
+    // `alpha` temporal only at the interior commit C1; `keep` establishes C2 as the
+    // tip (C1 is its parent).
+    let alpha_temporal = symbol_version(
+        &alpha,
+        path,
+        "alpha",
+        span(10, 20),
+        "alpha_body",
+        "c1",
+        "2025-12-01T00:00:00Z",
+    );
+    let keep_c1 = symbol_version(
+        &keep,
+        path,
+        "keep",
+        span(30, 40),
+        "keep_body",
+        "c1",
+        "2025-12-01T00:00:00Z",
+    );
+    let mut keep_c2 = symbol_version(
+        &keep,
+        path,
+        "keep",
+        span(30, 40),
+        "keep_body",
+        "c2",
+        "2025-12-15T00:00:00Z",
+    );
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = &mut keep_c2
+    {
+        t.git_parent_commits = vec!["c1".to_owned()];
+    }
+    // Non-temporal version present in the newest scan T2 (== the frontier).
+    let alpha_current =
+        current_tree_symbol_at(&alpha, path, "alpha", span(10, 20), "alpha_body", scan_2);
+
+    let obs = agent_memory_stable_id(&["obs", "405_mixed_scan"]);
+    let mut cite = observation(
+        &obs,
+        "alpha did the thing",
+        "0.9",
+        Some(&alpha),
+        Some(path),
+        Some(span(10, 20)),
+        "OBSERVES",
+        None,
+        Some(scan_2),
+    );
+    if let GraphRecord::Node { observed_at, .. } = &mut cite {
+        *observed_at = None;
+    }
+
+    let records = vec![
+        repo_node_at(&repo_r, "405s", "https://example.test/405s.git", scan_2),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_r.clone(),
+            alpha,
+            Some("1.0".to_owned()),
+            "Repository R contains alpha".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_r.clone(),
+            keep,
+            Some("1.0".to_owned()),
+            "Repository R contains keep".to_owned(),
+        ),
+        alpha_temporal,
+        keep_c1,
+        keep_c2,
+        alpha_current,
+        cite,
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs)
+        .expect("verdict for the mixed-handle-at-scan citation");
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Current,
+        "a mixed handle present in the newest scan stays current even when its \
+         only temporal version is at an interior commit"
+    );
+}
+
 // ── Codex PR #398 round 2: per-repository scoping of the triple resolver ──────
 
 #[test]
