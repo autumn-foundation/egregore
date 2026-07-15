@@ -271,7 +271,9 @@ fn scan_repository_incremental_at_inner(
         }
     }
 
-    for source_file in crate::fs::discover_source_files(repo_root)? {
+    let (source_files, mut coverage_tally) =
+        crate::fs::discover_source_files_with_coverage(repo_root)?;
+    for source_file in source_files {
         let hash = file_hash(&source_file.path)?;
         seen_files.insert(source_file.repo_relative_path.clone());
         let previous_entry = previous_cache.files.get(&source_file.repo_relative_path);
@@ -440,6 +442,31 @@ fn scan_repository_incremental_at_inner(
                 graph.push(tombstone);
             }
         }
+    }
+
+    // Declared Cargo dependencies (issue #180), mirrored from the full-scan path
+    // (issue #403). Manifest records are regenerated every refresh — they are not
+    // per-file cached — so a dependency-declaring `Cargo.toml` mints a `File` node
+    // here exactly as a full scan would. Without this, coverage reconciliation
+    // below would misclassify that manifest as skipped `toml`, diverging from a
+    // full scan of the same tree and re-introducing the stale/flip-flop the
+    // coverage node is meant to eliminate.
+    for record in crate::manifest_deps::scan_dependency_records(repo_root, &repository_id)? {
+        graph.push(record.with_valid_time_inferred(transaction_time));
+    }
+
+    // Scan-coverage reconciliation (issue #135), previously emitted only by the
+    // full-scan path (issue #403). Finalize the tally against the COMPLETE set of
+    // `File` nodes the graph now carries — after every File-producing extractor
+    // (per-file source extraction and manifest extraction above) has run — so a
+    // manifest indexed with a `File` node is counted under `files_indexed`, never
+    // mislabeled under `skipped_by_extension`. The `ScanCoverage` node is repo-keyed
+    // (`stable_id(["node","scan_coverage",repository_id])`), so re-emitting it here
+    // supersedes the prior full-scan version in the store, keeping
+    // `eg inspect --data-dir` coverage current after a refresh.
+    crate::reconcile_scan_coverage(&graph, &mut coverage_tally);
+    for record in crate::scan_coverage_records(&repository_id, &coverage_tally) {
+        graph.push(record.with_valid_time_inferred(transaction_time));
     }
 
     next_cache.repository_id.clone_from(&repository_id);

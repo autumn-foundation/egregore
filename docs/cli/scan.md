@@ -129,6 +129,15 @@ record) and `eg inspect --data-dir` — authoritative, ordered by store write-or
   indexed" (#135 AC3).
 * The node survives an embedded-store round-trip (`parse_node_kind`) and
   validates cleanly under `eg validate`.
+* `eg refresh` (the incremental path) maintains the same `ScanCoverage` node
+  (issue #403): every refresh recomputes coverage against the current tree and
+  re-emits the repo-keyed node, superseding the prior full-scan or refresh
+  version in the store. So after adding or removing files and running
+  `eg refresh`, `eg inspect --data-dir` reports the up-to-date
+  `files_walked`/`files_indexed`, never the stale pre-refresh numbers. Refresh
+  runs manifest dependency extraction before finalizing coverage (mirroring the
+  full-scan path), so a dependency-declaring `Cargo.toml` stays counted under
+  `files_indexed`, never misclassified as skipped `toml`.
 
 ## Out of scope for this slice
 
