@@ -116,7 +116,13 @@ filesystem-walk fallback has no walked/skipped denominator, so it reports
 best-effort counts with `coverage_complete: false` and suppresses the stderr
 summary rather than fabricate one. `eg inspect` surfaces the same coverage block
 over both `--graph` and `--data-dir`, so an agent can tell "0 results because
-absent" from "0 results because that file was never indexed". The
+absent" from "0 results because that file was never indexed". Over `--graph`,
+equal-ID `ScanCoverage` versions in an exported JSONL are collapsed to the
+freshest by `valid_time` instant; because the full scan stamps seconds precision
+and the record carries no subsecond/write-order signal, two scans within the
+same UTC second cannot be ordered from the file (tiebreak is arbitrary w.r.t.
+recency) — use `--data-dir` (authoritative, ordered by store write-order) for
+sub-second re-scan scenarios (known limitation, issue #406). The
 `codegraph` `SCHEMA_VERSION` is 6 (bumped 5→6 for the `ScanCoverage` node). See
 `docs/cli/scan.md` and `docs/cli/inspect.md`.
 

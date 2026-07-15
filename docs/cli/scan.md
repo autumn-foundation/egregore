@@ -113,6 +113,14 @@ The `ScanCoverage` node (with a fixed transaction time) and the stderr summary
 are byte-identical across repeated scans of an unchanged repository. The
 per-extension skip groups use a sorted map, so their order is stable (#135 AC5).
 
+The auto-stamped scan `valid_time`/`transaction_time` is at **seconds**
+precision. When an exported JSONL (`eg export`) holds multiple `ScanCoverage`
+versions for the same repository, `eg inspect --graph` picks the current one by
+`valid_time` instant; two full scans within the **same UTC second** cannot be
+ordered from that file (there is no subsecond or write-order signal on the
+record) and `eg inspect --data-dir` — authoritative, ordered by store write-order
+— should be used for sub-second re-scan scenarios (known limitation, issue #406).
+
 ## Reading coverage back
 
 * `eg inspect <graph.jsonl>` and `eg inspect --data-dir <store>` both surface a

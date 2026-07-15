@@ -363,6 +363,18 @@ impl InspectCounts {
         // rule would then report stale coverage. The tie-break (fully-ordered
         // canonical serialization of the summary) keeps output byte-identical
         // when two versions share a `valid_time` and carry no freshness signal.
+        //
+        // KNOWN LIMITATION (issue #406): the full-scan path stamps `valid_time`
+        // at SECONDS precision (`src/lib.rs`), so two full scans of the same
+        // repo within one UTC second share a `valid_time` and the tie-break is
+        // arbitrary w.r.t. recency — an exported JSONL holding both versions may
+        // then surface stale coverage. `ScanCoverage` carries no subsecond or
+        // write-order signal, so this cannot be resolved from a `--graph` file
+        // alone; a real fix needs subsecond scan timestamps or a serialized
+        // generation key. For sub-second re-scan scenarios use
+        // `eg inspect --data-dir`, which is authoritative — it orders by store
+        // physical write-order (`inspect_current_records`) and is immune to
+        // same-second ties.
         let mut coverage_latest: BTreeMap<String, (CoverageFreshness, CoverageSummary)> =
             BTreeMap::new();
         for unknown in unknown_schema_versions {
