@@ -391,8 +391,23 @@ impl<'a> FreshnessIndex<'a> {
         // so without it the deletion commit would be missing from the graph, the
         // prior commit would look like the tip, and a citation to the now-deleted
         // code would be reported `current` instead of `unresolved`.
-        let mut all_commits: BTreeSet<&str> = BTreeSet::new();
-        let mut parent_commits: BTreeSet<&str> = BTreeSet::new();
+        //
+        // Tips are partitioned **per owning repository** (issue #203). In a shared
+        // multi-repo store two histories can share a commit SHA, so a commit that is
+        // one repository's HEAD (a tip) can be another repository's interior commit.
+        // A store-wide `all − parents` set would drop that HEAD from the tip set and
+        // falsely report its live HEAD code `unresolved`. Each commit is attributed
+        // to its repository through the deterministic containment topology
+        // (`Repository → CONTAINS → Commit`, and code handles via
+        // `Repository → CONTAINS → File → DEFINES → …`) that `RepositoryIndex`
+        // already indexes; tips are then `all − parents` **within** each repository
+        // and unioned. Records with no attributable repository — legacy stores with
+        // no `Repository` node — share one `None` bucket that is byte-identical to
+        // the previous global computation, and a single-repository store is a single
+        // bucket, so the primary `scan-history` workflow is unchanged.
+        let repo_index = crate::query::RepositoryIndex::build(records);
+        let mut per_repo_all: BTreeMap<Option<&str>, BTreeSet<&str>> = BTreeMap::new();
+        let mut per_repo_parents: BTreeMap<Option<&str>, BTreeSet<&str>> = BTreeMap::new();
         let mut commit_children: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         // Commits that participate in any parent/child edge. Ancestry is trusted
         // (descendant-only comparison) for an anchor only when the anchor itself is
@@ -401,9 +416,16 @@ impl<'a> FreshnessIndex<'a> {
         let mut dag_commits: BTreeSet<&str> = BTreeSet::new();
         for record in records {
             if let Some(commit) = version_commit(record) {
-                all_commits.insert(commit);
+                let owner = match record {
+                    GraphRecord::Node { id, .. } => repo_index.owner_of(id.as_str()),
+                    _ => None,
+                };
+                per_repo_all.entry(owner).or_default().insert(commit);
                 for parent in version_parents(record) {
-                    parent_commits.insert(parent.as_str());
+                    per_repo_parents
+                        .entry(owner)
+                        .or_default()
+                        .insert(parent.as_str());
                     dag_commits.insert(parent.as_str());
                     dag_commits.insert(commit);
                     commit_children
@@ -413,12 +435,69 @@ impl<'a> FreshnessIndex<'a> {
                 }
             }
         }
-        let tips: BTreeSet<&str> = all_commits.difference(&parent_commits).copied().collect();
+        // Union the per-repository tip sets. A commit is a tip when it is a tip in
+        // *any* owning repository, so a HEAD shared with another repo's interior
+        // stays live. This union is always a superset of the old global tip set
+        // (a commit that was no parent globally is no parent in its own bucket
+        // either), so the change can only *keep more* live code — never newly drop
+        // a handle a single-repo store kept.
+        let empty_parents: BTreeSet<&str> = BTreeSet::new();
+        let mut tips: BTreeSet<&str> = BTreeSet::new();
+        for (owner, all) in &per_repo_all {
+            let parents = per_repo_parents.get(owner).unwrap_or(&empty_parents);
+            tips.extend(all.difference(parents).copied());
+        }
         if !tips.is_empty() {
             live_code_by_id.retain(|_id, versions| {
                 versions.iter().any(|r| {
                     // A non-temporal (current-tree) version keeps the handle live.
                     version_commit(r).is_none_or(|c| tips.contains(c))
+                })
+            });
+        }
+
+        // Transaction-time frontier for repeated current-tree scans (issue #204).
+        // A full `scan`/`refresh` emits every current handle with a node-level
+        // `valid_time` but no `temporal` commit and no `Tombstone` when a handle is
+        // deleted between two scans. The commit-tip frontier above cannot see such a
+        // deletion (these versions carry no commit), so the ghost handle would stay
+        // live and a citation to it would be reported `current` instead of
+        // `unresolved`. Derive a valid-time frontier from the newest node-level
+        // snapshot: a purely non-temporal handle is live only when it has a version
+        // at the newest scan's `valid_time`; one present solely at older scans was
+        // removed. This mirrors the history path's tip frontier on the
+        // transaction-time axis and leaves the commit-anchored history workflow
+        // untouched (a handle with any temporal version is governed by the commit
+        // tips above and skipped here). Timestamps are compared by parsed instant;
+        // two scans that collapse to the same second are the documented tie — both
+        // count as the frontier, so a deletion is only observable across scans with
+        // distinct `valid_time`s.
+        let mut frontier_valid_time: Option<&str> = None;
+        for versions in live_code_by_id.values() {
+            for record in versions {
+                if version_commit(record).is_none()
+                    && let Some(vt) = version_valid(record)
+                {
+                    let newer = frontier_valid_time
+                        .is_none_or(|cur| time_cmp(vt, cur) == std::cmp::Ordering::Greater);
+                    if newer {
+                        frontier_valid_time = Some(vt);
+                    }
+                }
+            }
+        }
+        if let Some(frontier) = frontier_valid_time {
+            live_code_by_id.retain(|_id, versions| {
+                // A handle with any commit-anchored version is a history handle,
+                // governed by the commit-tip frontier above — never pruned here.
+                if versions.iter().any(|r| version_commit(r).is_some()) {
+                    return true;
+                }
+                // Purely non-temporal handle: live only when it has a version at the
+                // newest scan's valid-time. Present only at older scans ⇒ deleted.
+                versions.iter().any(|r| {
+                    version_valid(r)
+                        .is_some_and(|vt| time_cmp(vt, frontier) == std::cmp::Ordering::Equal)
                 })
             });
         }
@@ -1354,6 +1433,12 @@ fn content_change_trigger(
                 .unwrap_or_default()
                 .cmp(version_commit(b).unwrap_or_default())
         })
+        // Deterministic tie-break for repeated current-tree scans (issue #204):
+        // two non-temporal versions can share a second-resolution `valid_time` and
+        // carry no commit, leaving the two keys above equal. Break the tie on the
+        // content signature so the earliest differing later version is selected
+        // byte-identically across runs.
+        .then_with(|| content_hash(a).cmp(&content_hash(b)))
     });
 
     later.into_iter().find_map(|record| {

@@ -123,15 +123,29 @@ duplicate rows are classified once.
 
 ### Known limitations
 
-- **Multi-repo shared commit history.** Commit tips are computed across the whole
-  store. If two repositories in one store share a commit SHA and one repo's HEAD
-  is another's interior commit, a handle at that HEAD can be conservatively
-  reported `unresolved`. Tracked in #203 (per-repository tip partitioning).
-- **Repeated current-tree `scan`s.** Content-drift and liveness are derived from
-  commit history (`scan-history`); repeated current-tree full scans (node-level
-  `valid_time`, no commits or tombstones) are not compared by content, and a
-  handle deleted between two such scans is not flagged `unresolved`. Use
-  `scan-history` for drift detection. Tracked in #204.
+- **Multi-repo shared commit history.** Commit tips are partitioned **per owning
+  repository** (issue #203): each commit is attributed to its repository through
+  the deterministic containment topology `RepositoryIndex` already indexes
+  (`Repository → CONTAINS → Commit`, code handles via
+  `Repository → CONTAINS → File → DEFINES → …`), and tips are `all − parents`
+  within each history and unioned. A commit that is one repository's HEAD stays a
+  tip even when another repository names the same SHA as an interior commit, so
+  live HEAD code is no longer falsely `unresolved`. A single-repository store — or
+  a legacy store with no `Repository` node — is one bucket, byte-identical to the
+  previous global behavior. Residual: commits can only be partitioned when they
+  are attributable to a `Repository` node; an unattributable multi-repo store
+  still falls back to one global bucket.
+- **Repeated current-tree `scan`s.** Liveness and content drift are derived from a
+  transaction-time frontier for repeated current-tree full scans (issue #204):
+  the newest node-level `valid_time` snapshot is the frontier, so a handle deleted
+  between two scans (present only at an older snapshot, no commit and no tombstone)
+  is flagged `unresolved`, and a handle whose body changed across scans is
+  `drifted`. History (`scan-history`) handles carry commit anchors and stay
+  governed by the commit-tip frontier, unaffected. Residual: two scans whose
+  `valid_time` collapses to the same second cannot be ordered, so a deletion is
+  only observable across scans with distinct `valid_time`s (a working-tree-only
+  deletion at an unchanged HEAD keeps the committer-derived `valid_time` and is not
+  detected); use `scan-history` when per-commit precision is required.
 - **Retractions/deletions via the embedded `--data-dir` read.** Tombstone
   *activity* is decided from record order, which is write order for an append-only
   `--graph` file. The embedded `--data-dir` history-inclusive read re-emits a
