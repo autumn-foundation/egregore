@@ -4222,3 +4222,303 @@ fn repeated_current_tree_scans_detect_deletion_and_content_drift() {
         Some(freshness::TriggeringHandle::ContentChange { .. })
     ));
 }
+
+// ── Codex findings on PR #398: per-repository liveness/frontier scoping ───────
+
+/// Builds a remote-derived `Repository` node stamped with a node-level
+/// `valid_time` so it serves as a per-scan source-snapshot marker (finding #2).
+fn repo_node_at(repo_id: &str, basename: &str, remote: &str, valid_time: &str) -> GraphRecord {
+    let mut n = repo_node(repo_id, basename, remote);
+    if let GraphRecord::Node { valid_time: vt, .. } = &mut n {
+        *vt = Some(valid_time.to_owned());
+    }
+    n
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn finding1_interior_repo_handle_at_shared_head_sha_is_unresolved() {
+    // Codex finding #1: repo A has `sha_shared` as HEAD (a tip); repo B has
+    // `sha_shared -> sha_child`, so `sha_shared` is repo B's interior commit. A
+    // repo-B symbol present only at `sha_shared` (deleted at `sha_child`, no
+    // tombstone) must be `unresolved`. A store-wide tip union keeps it live
+    // because repo A made `sha_shared` a tip and reports the citation `current`;
+    // checking tip membership within the handle's OWN repository prunes it. The
+    // opposite direction — repo A's live HEAD symbol at `sha_shared` — must stay
+    // `current`.
+    let path = "src/lib.rs";
+    let repo_a = stable_id(&["repository", "remote", "https://example.test/fa.git"]);
+    let repo_b = stable_id(&["repository", "remote", "https://example.test/fb.git"]);
+    let sym_a = stable_id(&["node", "symbol", "fn", "f1-repo-a", path, "f", "0"]);
+    let sym_b_gone = stable_id(&["node", "symbol", "fn", "f1-repo-b", path, "gone", "0"]);
+    let sym_b_keep = stable_id(&["node", "symbol", "fn", "f1-repo-b", path, "keep", "0"]);
+
+    // Repo A: live HEAD symbol at the shared commit (no parents).
+    let head_symbol = symbol_version(
+        &sym_a,
+        path,
+        "f",
+        span(10, 20),
+        "body_a",
+        "sha_shared",
+        "2026-01-01T00:00:00Z",
+    );
+    // Repo B: a symbol present only at `sha_shared`, deleted by `sha_child`.
+    let gone_symbol = symbol_version(
+        &sym_b_gone,
+        path,
+        "gone",
+        span(30, 40),
+        "gone_body",
+        "sha_shared",
+        "2026-01-02T00:00:00Z",
+    );
+    // Repo B: a surviving symbol at `sha_child` establishing `sha_shared` as
+    // interior (its parent) so `sha_child` is repo B's tip.
+    let mut keep_symbol = symbol_version(
+        &sym_b_keep,
+        path,
+        "keep",
+        span(50, 60),
+        "keep_body",
+        "sha_child",
+        "2026-01-03T00:00:00Z",
+    );
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = &mut keep_symbol
+    {
+        t.git_parent_commits = vec!["sha_shared".to_owned()];
+    }
+
+    let obs_gone = agent_memory_stable_id(&["obs", "f1_gone"]);
+    let obs_head = agent_memory_stable_id(&["obs", "f1_head"]);
+    let records = vec![
+        repo_node(&repo_a, "fa", "https://example.test/fa.git"),
+        repo_node(&repo_b, "fb", "https://example.test/fb.git"),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_a.clone(),
+            sym_a.clone(),
+            Some("1.0".to_owned()),
+            "Repository A contains f".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_b.clone(),
+            sym_b_gone.clone(),
+            Some("1.0".to_owned()),
+            "Repository B contains gone".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_b.clone(),
+            sym_b_keep,
+            Some("1.0".to_owned()),
+            "Repository B contains keep".to_owned(),
+        ),
+        head_symbol,
+        gone_symbol,
+        keep_symbol,
+        observation(
+            &obs_gone,
+            "gone did the thing",
+            "0.9",
+            Some(&sym_b_gone),
+            Some(path),
+            Some(span(30, 40)),
+            "OBSERVES",
+            Some("sha_shared"),
+            None,
+        ),
+        observation(
+            &obs_head,
+            "f computes the key",
+            "0.9",
+            Some(&sym_a),
+            Some(path),
+            Some(span(10, 20)),
+            "OBSERVES",
+            Some("sha_shared"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let gone = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs_gone)
+        .expect("verdict for the interior repo-B citation");
+    assert_eq!(
+        gone.verdict,
+        FreshnessVerdict::Unresolved,
+        "a repo-B handle present only at its interior commit (another repo's HEAD \
+         SHA) must be unresolved, not kept live by the store-wide tip union"
+    );
+    let head = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs_head)
+        .expect("verdict for the repo-A HEAD citation");
+    assert_eq!(
+        head.verdict,
+        FreshnessVerdict::Current,
+        "repo A's live HEAD symbol at the shared SHA must stay current"
+    );
+}
+
+#[test]
+fn finding3_older_scanned_repo_handle_stays_current_against_own_frontier() {
+    // Codex finding #3: two repositories carry current-tree scans at different
+    // times — repo A newest (`2026-02-01`), repo B older (`2026-01-01`). A live
+    // repo-B non-temporal handle present at repo B's own scan time must stay
+    // `current`; a single global frontier (repo A's newer scan) would prune it and
+    // falsely report `unresolved`.
+    let path = "src/svc.rs";
+    let scan_a = "2026-02-01T00:00:00Z";
+    let scan_b = "2026-01-01T00:00:00Z";
+    let repo_a = stable_id(&["repository", "remote", "https://example.test/f3a.git"]);
+    let repo_b = stable_id(&["repository", "remote", "https://example.test/f3b.git"]);
+    let sym_a = stable_id(&["node", "symbol", "fn", "f3-repo-a", path, "a", "0"]);
+    let sym_b = stable_id(&["node", "symbol", "fn", "f3-repo-b", path, "b", "0"]);
+
+    let current_tree_symbol = |sym_id: &str, name: &str, body: &str, sp: SourceSpan, vt: &str| {
+        let mut n = GraphRecord::node(
+            sym_id.to_owned(),
+            NodeKind::Symbol,
+            Some(path.to_owned()),
+            Some(sp),
+            Some(name.to_owned()),
+            format!("Rust fn {name}\nSource:\n{body}"),
+        );
+        if let GraphRecord::Node { valid_time, .. } = &mut n {
+            *valid_time = Some(vt.to_owned());
+        }
+        n
+    };
+
+    let obs_b = agent_memory_stable_id(&["obs", "f3_b"]);
+    let mut cite = observation(
+        &obs_b,
+        "b note",
+        "0.9",
+        Some(&sym_b),
+        Some(path),
+        Some(span(30, 40)),
+        "OBSERVES",
+        None,
+        Some(scan_b), // valid-time anchor at repo B's scan, no commit
+    );
+    if let GraphRecord::Node { observed_at, .. } = &mut cite {
+        *observed_at = None;
+    }
+
+    let records = vec![
+        repo_node_at(&repo_a, "f3a", "https://example.test/f3a.git", scan_a),
+        repo_node_at(&repo_b, "f3b", "https://example.test/f3b.git", scan_b),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_a.clone(),
+            sym_a.clone(),
+            Some("1.0".to_owned()),
+            "Repository A contains a".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_b.clone(),
+            sym_b.clone(),
+            Some("1.0".to_owned()),
+            "Repository B contains b".to_owned(),
+        ),
+        current_tree_symbol(&sym_a, "a", "a_body", span(10, 20), scan_a),
+        current_tree_symbol(&sym_b, "b", "b_body", span(30, 40), scan_b),
+        cite,
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let b = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs_b)
+        .expect("verdict for the repo-B citation");
+    assert_eq!(
+        b.verdict,
+        FreshnessVerdict::Current,
+        "a live repo-B handle at repo B's own scan time must stay current, not be \
+         pruned against repo A's newer global frontier"
+    );
+}
+
+#[test]
+fn finding2_empty_latest_scan_prunes_prior_handle_via_snapshot_node() {
+    // Codex finding #2: a repeated scan deletes the LAST symbol in repo B. Scan 2
+    // re-emits repo B's `Repository` (source-snapshot) node with the new
+    // `valid_time` but no code-handle version. Sourcing the transaction-time
+    // frontier from the snapshot node (not only code handles) advances repo B's
+    // frontier so the prior handle prunes to `unresolved`; a frontier derived only
+    // from code handles would keep it `current`.
+    let path = "src/only.rs";
+    let scan_1 = "2026-01-01T00:00:00Z";
+    let scan_2 = "2026-02-01T00:00:00Z";
+    let repo_b = stable_id(&["repository", "remote", "https://example.test/f2b.git"]);
+    let sym_only = stable_id(&["node", "symbol", "fn", "f2-repo-b", path, "only", "0"]);
+
+    let mut only_symbol = GraphRecord::node(
+        sym_only.clone(),
+        NodeKind::Symbol,
+        Some(path.to_owned()),
+        Some(span(10, 20)),
+        Some("only".to_owned()),
+        "Rust fn only\nSource:\nonly_body".to_owned(),
+    );
+    if let GraphRecord::Node { valid_time, .. } = &mut only_symbol {
+        *valid_time = Some(scan_1.to_owned());
+    }
+
+    let obs = agent_memory_stable_id(&["obs", "f2_only"]);
+    let mut cite = observation(
+        &obs,
+        "only note",
+        "0.9",
+        Some(&sym_only),
+        Some(path),
+        Some(span(10, 20)),
+        "OBSERVES",
+        None,
+        Some(scan_1),
+    );
+    if let GraphRecord::Node { observed_at, .. } = &mut cite {
+        *observed_at = None;
+    }
+
+    let records = vec![
+        // Scan 1: the single symbol present, snapshot node at scan_1.
+        repo_node_at(&repo_b, "f2b", "https://example.test/f2b.git", scan_1),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_b.clone(),
+            sym_only,
+            Some("1.0".to_owned()),
+            "Repository B contains only".to_owned(),
+        ),
+        only_symbol,
+        // Scan 2: last symbol deleted (not re-emitted); only the snapshot node is
+        // re-emitted with the newer scan time.
+        repo_node_at(&repo_b, "f2b", "https://example.test/f2b.git", scan_2),
+        cite,
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs)
+        .expect("verdict for the deleted-only citation");
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Unresolved,
+        "a handle deleted by a scan that re-emits only the snapshot node must be \
+         unresolved once the frontier is sourced from the snapshot node"
+    );
+    assert!(matches!(
+        entry.triggering_handle,
+        Some(freshness::TriggeringHandle::HandleAbsent)
+    ));
+}

@@ -435,66 +435,124 @@ impl<'a> FreshnessIndex<'a> {
                 }
             }
         }
-        // Union the per-repository tip sets. A commit is a tip when it is a tip in
-        // *any* owning repository, so a HEAD shared with another repo's interior
-        // stays live. This union is always a superset of the old global tip set
-        // (a commit that was no parent globally is no parent in its own bucket
-        // either), so the change can only *keep more* live code — never newly drop
-        // a handle a single-repo store kept.
+        // Per-repository tip sets. A commit is a tip when it is no other commit's
+        // parent **within its own repository** (issue #203). The store-wide union
+        // (`tips`) is kept for the frontier resolvers that carry no repository
+        // identity (`resolve_triple`, the unanchored-triple lineage check), but the
+        // liveness retain below is checked **within each handle's owning
+        // repository** — Codex finding #1: in a shared history two repositories can
+        // share a commit SHA that is one repo's HEAD (a tip) yet the other's
+        // interior commit, so a store-wide `tips.contains(c)` would keep the
+        // interior repo's deleted handle live and report a citation to it `current`
+        // instead of `unresolved`.
         let empty_parents: BTreeSet<&str> = BTreeSet::new();
+        let mut per_repo_tips: BTreeMap<Option<&str>, BTreeSet<&str>> = BTreeMap::new();
         let mut tips: BTreeSet<&str> = BTreeSet::new();
         for (owner, all) in &per_repo_all {
             let parents = per_repo_parents.get(owner).unwrap_or(&empty_parents);
-            tips.extend(all.difference(parents).copied());
+            let repo_tips: BTreeSet<&str> = all.difference(parents).copied().collect();
+            tips.extend(repo_tips.iter().copied());
+            per_repo_tips.insert(*owner, repo_tips);
         }
         if !tips.is_empty() {
-            live_code_by_id.retain(|_id, versions| {
+            live_code_by_id.retain(|id, versions| {
+                // Check tip membership within the handle's OWN owning repository.
+                // A handle whose repository cannot be attributed (a legacy
+                // single-repo store with no `Repository` node) shares the `None`
+                // bucket, whose tip set equals the old global computation, so those
+                // stores stay byte-identical; a missing/empty owner bucket falls
+                // back to the store-wide union.
+                let repo_tips = per_repo_tips
+                    .get(&repo_index.owner_of(id))
+                    .filter(|set| !set.is_empty())
+                    .unwrap_or(&tips);
                 versions.iter().any(|r| {
                     // A non-temporal (current-tree) version keeps the handle live.
-                    version_commit(r).is_none_or(|c| tips.contains(c))
+                    version_commit(r).is_none_or(|c| repo_tips.contains(c))
                 })
             });
         }
 
-        // Transaction-time frontier for repeated current-tree scans (issue #204).
+        // Transaction-time frontier for repeated current-tree scans (issue #204),
+        // computed PER owning repository (Codex finding #3) and sourced from the
+        // repository/source-snapshot node's valid_time as well as code-handle
+        // valid_times (Codex finding #2).
+        //
         // A full `scan`/`refresh` emits every current handle with a node-level
         // `valid_time` but no `temporal` commit and no `Tombstone` when a handle is
         // deleted between two scans. The commit-tip frontier above cannot see such a
-        // deletion (these versions carry no commit), so the ghost handle would stay
-        // live and a citation to it would be reported `current` instead of
-        // `unresolved`. Derive a valid-time frontier from the newest node-level
-        // snapshot: a purely non-temporal handle is live only when it has a version
-        // at the newest scan's `valid_time`; one present solely at older scans was
-        // removed. This mirrors the history path's tip frontier on the
-        // transaction-time axis and leaves the commit-anchored history workflow
-        // untouched (a handle with any temporal version is governed by the commit
-        // tips above and skipped here). Timestamps are compared by parsed instant;
-        // two scans that collapse to the same second are the documented tie — both
-        // count as the frontier, so a deletion is only observable across scans with
-        // distinct `valid_time`s.
-        let mut frontier_valid_time: Option<&str> = None;
-        for versions in live_code_by_id.values() {
+        // deletion (these versions carry no commit), so a purely non-temporal handle
+        // is live only when it has a version at its repository's newest scan
+        // `valid_time`; one present solely at older scans was removed. This mirrors
+        // the history path's tip frontier on the transaction-time axis and leaves
+        // the commit-anchored history workflow untouched (a handle with any temporal
+        // version is governed by the commit tips above and skipped here).
+        //
+        // Finding #3: a shared store can hold current-tree scans for more than one
+        // repository taken at different times. A single global frontier would prune
+        // every handle of the older-scanned repository (it has no version at the
+        // newer repo's scan time), falsely reporting valid citations `unresolved`.
+        // Each handle is pruned against ITS OWN repository's newest scan instead.
+        //
+        // Finding #2: a repeated scan that deletes the LAST source file/symbol in a
+        // repository re-emits that repo's `Repository` (source-snapshot) node with
+        // the new scan's node-level valid_time but no code-handle version. Deriving
+        // the frontier only from code handles would never see the newer scan, so the
+        // deleted handle would stay live. Folding the snapshot node's valid_time in
+        // lets an empty latest scan still advance the frontier and prune the prior
+        // handles.
+        //
+        // A handle whose repository cannot be attributed shares the `None` bucket,
+        // whose frontier equals the old global newest-scan computation, so legacy
+        // single-repo stores stay byte-identical. Timestamps are compared by parsed
+        // instant; two scans that collapse to the same instant are the documented
+        // tie — both count as the frontier, so a deletion is only observable across
+        // scans with distinct `valid_time`s.
+        let mut per_repo_frontier: BTreeMap<Option<&str>, &str> = BTreeMap::new();
+        // Code-handle snapshot times, attributed to each handle's repository.
+        for (id, versions) in &live_code_by_id {
+            let owner = repo_index.owner_of(id);
             for record in versions {
                 if version_commit(record).is_none()
                     && let Some(vt) = version_valid(record)
                 {
-                    let newer = frontier_valid_time
-                        .is_none_or(|cur| time_cmp(vt, cur) == std::cmp::Ordering::Greater);
-                    if newer {
-                        frontier_valid_time = Some(vt);
+                    let cur = per_repo_frontier.entry(owner).or_insert(vt);
+                    if time_cmp(vt, cur) == std::cmp::Ordering::Greater {
+                        *cur = vt;
                     }
                 }
             }
         }
-        if let Some(frontier) = frontier_valid_time {
-            live_code_by_id.retain(|_id, versions| {
+        // Repository/source-snapshot node times (finding #2): a scan that deletes a
+        // repository's last handle still re-emits its `Repository` node with the new
+        // valid_time, so an empty latest scan advances the frontier.
+        for record in records {
+            if let GraphRecord::Node {
+                id,
+                kind: NodeKind::Repository,
+                ..
+            } = record
+                && let Some(vt) = version_valid(record)
+            {
+                let owner = repo_index.owner_of(id);
+                let cur = per_repo_frontier.entry(owner).or_insert(vt);
+                if time_cmp(vt, cur) == std::cmp::Ordering::Greater {
+                    *cur = vt;
+                }
+            }
+        }
+        if !per_repo_frontier.is_empty() {
+            live_code_by_id.retain(|id, versions| {
                 // A handle with any commit-anchored version is a history handle,
                 // governed by the commit-tip frontier above — never pruned here.
                 if versions.iter().any(|r| version_commit(r).is_some()) {
                     return true;
                 }
-                // Purely non-temporal handle: live only when it has a version at the
-                // newest scan's valid-time. Present only at older scans ⇒ deleted.
+                // Prune against the handle's OWN repository's newest scan. With no
+                // frontier for this owner there is nothing to prune against.
+                let Some(&frontier) = per_repo_frontier.get(&repo_index.owner_of(id)) else {
+                    return true;
+                };
                 versions.iter().any(|r| {
                     version_valid(r)
                         .is_some_and(|vt| time_cmp(vt, frontier) == std::cmp::Ordering::Equal)
