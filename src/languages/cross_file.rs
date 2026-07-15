@@ -1480,10 +1480,13 @@ impl<'facts> DefinitionIndex<'facts> {
     ///   never invoke a method OR a trait method — trait methods are excluded
     ///   by the `is_trait_method` marker, issue #390).
     /// - `Method` calls bind inherent methods AND trait methods (`x.read()`
-    ///   can dispatch to either); `SelfMethod` (`self.x()`) prefers the
-    ///   surrounding impl's inherent methods when any match and does not reach
-    ///   trait defaults (proving that requires an IMPLEMENTS join — issue
-    ///   #344 follow-up).
+    ///   can dispatch to either); `SelfMethod` (`self.x()`) carries its
+    ///   enclosing owner (the impl owner, or the trait name inside a trait
+    ///   body — issue #390) and narrows STRICTLY to `[owner, name]`, admitting
+    ///   both inherent and trait methods but only the owner's own. It never
+    ///   falls back to the unnarrowed pool: a `self.other()` naming nothing on
+    ///   the owner stays unresolved rather than fan out to an unrelated type's
+    ///   or trait's same-named method.
     /// - `Path` calls bind any callable whose match segments end with the
     ///   normalized call path — including a trait method whose segments now
     ///   carry the enclosing trait name (`Device::read`, issue #390); a
@@ -1512,25 +1515,48 @@ impl<'facts> DefinitionIndex<'facts> {
                 })
                 .collect(),
             CallKind::SelfMethod => {
+                // A `self.method()` receiver call reaches an inherent impl
+                // method OR a trait method: inside a trait body `self` is the
+                // trait's `Self`, so a default method calling `self.other()`
+                // dispatches to the trait's own method (issue #390). Trait
+                // methods keep kind `"function"`, so widen the pool by the
+                // marker — symmetric with the `Method` pool.
                 let methods: Vec<&DefinitionFact> = pool
                     .iter()
                     .copied()
-                    .filter(|definition| definition.symbol_kind == "method")
+                    .filter(|definition| {
+                        definition.symbol_kind == "method" || definition.is_trait_method
+                    })
                     .collect();
-                if let Some(owner) = &call.receiver_owner {
-                    let narrowing = [owner.clone(), simple_name.to_owned()];
-                    let narrowed: Vec<&DefinitionFact> = methods
-                        .iter()
-                        .copied()
-                        .filter(|definition| {
-                            segments_end_with(&definition.match_segments, &narrowing)
-                        })
-                        .collect();
-                    if !narrowed.is_empty() {
-                        return narrowed;
+                match &call.receiver_owner {
+                    // A `self` call always carries its enclosing owner (the impl
+                    // owner, or the trait name inside a trait body), so narrow
+                    // strictly to `[owner, name]` and return that set even when
+                    // it is EMPTY. Never fall back to the unnarrowed pool: a
+                    // trait `self.other()` naming nothing on the trait must stay
+                    // unresolved, never fan out to an unrelated `U::other`
+                    // (prefer a MISSING edge over a WRONG one). Because the
+                    // trait method `T::read` has `match_segments = [.., "T",
+                    // "read"]`, `self.read()` with owner `T` narrows to `T::read`
+                    // only; an unrelated `U::read` (`[.., "U", "read"]`) fails
+                    // the `[T, read]` suffix. Symmetrically an impl owner `S`
+                    // excludes any trait method `T::g`.
+                    Some(owner) => {
+                        let narrowing = [owner.clone(), simple_name.to_owned()];
+                        methods
+                            .into_iter()
+                            .filter(|definition| {
+                                segments_end_with(&definition.match_segments, &narrowing)
+                            })
+                            .collect()
                     }
+                    // A `self` call with no resolvable owner cannot be narrowed;
+                    // this is unreachable for extractor-produced facts (a `self`
+                    // receiver always sits inside an impl or trait), but if it
+                    // ever arises it degrades to the broad pool like `Method`
+                    // rather than inventing narrowing.
+                    None => methods,
                 }
-                methods
             }
             CallKind::Path => {
                 if call.callee_segments.len() <= 1 {
@@ -1934,6 +1960,88 @@ mod tests {
             "two trait methods named read must both be labeled ambiguous candidates"
         );
         assert!(edge_targets(&records, CallResolution::Resolved).is_empty());
+    }
+
+    #[test]
+    fn self_method_pool_includes_trait_methods_narrowed_by_owner() {
+        // REGRESSION (issue #390): `self.read()` inside `trait T` carries owner
+        // `T`. The SelfMethod pool is widened to admit trait methods, but the
+        // owner-narrowing suffix keeps ONLY `T::read` — an unrelated trait
+        // `U::read` never enters the candidate set.
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![
+                trait_method_definition("t-read", "src/a.rs", &["a", "T", "read"]),
+                trait_method_definition("u-read", "src/a.rs", &["a", "U", "read"]),
+            ],
+            vec![],
+        )]);
+        let index = DefinitionIndex::build(&facts);
+        let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("T"));
+        let ids: Vec<&str> = index
+            .candidates(&call, "read")
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["t-read"],
+            "self.read() in trait T must bind only T::read, never U::read"
+        );
+    }
+
+    #[test]
+    fn self_method_with_no_owner_match_returns_empty_not_the_broad_pool() {
+        // NO-WRONG-EDGE / no fallback (issue #390): `self.read()` with owner
+        // `T` where no `T::read` exists must NOT fall back to the unnarrowed
+        // pool. An inherent `Q::read` shares the simple name but not the owner,
+        // so the candidate set stays empty (prefer a MISSING edge over a WRONG
+        // one). This is the fallback-removal guard: pre-fix the branch returned
+        // `methods` (here `[q-read]`) when the narrowed set was empty.
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![definition(
+                "q-read",
+                "method",
+                "src/a.rs",
+                &["a", "Q", "read"],
+            )],
+            vec![],
+        )]);
+        let index = DefinitionIndex::build(&facts);
+        let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("T"));
+        assert!(
+            index.candidates(&call, "read").is_empty(),
+            "self.read() with owner T and no T::read must stay empty, never fan out to Q::read"
+        );
+    }
+
+    #[test]
+    fn impl_self_method_call_never_admits_a_trait_method() {
+        // SYMMETRY GUARD (issue #390): an impl `self.g()` (owner `S`) still
+        // narrows to its inherent `S::g`; the SelfMethod trait-method widening
+        // cannot leak a same-named trait method `T::g` into an impl self-call,
+        // because `T::g`'s segments end `[T, g]`, failing the `[S, g]` suffix.
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![
+                definition("s-g", "method", "src/a.rs", &["a", "S", "g"]),
+                trait_method_definition("t-g", "src/a.rs", &["a", "T", "g"]),
+            ],
+            vec![],
+        )]);
+        let index = DefinitionIndex::build(&facts);
+        let call = call("caller", "g", &["g"], CallKind::SelfMethod, Some("S"));
+        let ids: Vec<&str> = index
+            .candidates(&call, "g")
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["s-g"],
+            "impl self.g() must bind only the inherent S::g, never the trait method T::g"
+        );
     }
 
     fn per_file_calls_edge(source: &str, target: &str) -> GraphRecord {

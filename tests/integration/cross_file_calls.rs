@@ -821,6 +821,160 @@ fn trait_nested_and_self_call_edges_are_byte_stable_across_repeated_scans() {
     );
 }
 
+// --- In-trait `self.` method calls carry the trait owner (issue #390) --------
+
+#[test]
+fn in_trait_self_method_call_binds_only_the_declaring_trait() {
+    // REGRESSION (issue #390): a `self.read()` call inside a default trait
+    // method names the trait's OWN method `read`. In a trait body there is no
+    // `impl_context`, so before the fix `receiver_owner` was None and the call
+    // was a plain `Method` — which the PR's widened Method pool then fanned out
+    // to EVERY same-named trait method, minting an ambiguous edge to an
+    // unrelated `trait U { fn read }`. Carrying the enclosing trait as
+    // `receiver_owner` makes it a `SelfMethod` narrowed to `T::read` ONLY.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32;\n    fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "pub trait U {\n    fn read(&self) -> u32;\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let u_read = symbol_id(&records, "function", "gamma::read", "src/gamma.rs");
+    let f = symbol_id(&records, "function", "alpha::f", "src/alpha.rs");
+
+    // Recall: self.read() resolves to the declaring trait's own method.
+    assert_calls_edge_with_resolution(&records, &f, &t_read, "resolved");
+    // NO-WRONG-EDGE: the unrelated trait U::read is never bound.
+    assert!(
+        calls_edge(&records, &f, &u_read).is_none(),
+        "self.read() in trait T must not fan out to the unrelated trait U::read"
+    );
+}
+
+#[test]
+fn in_trait_self_method_call_with_no_matching_method_invents_no_edge() {
+    // NO-WRONG-EDGE (issue #390): `self.other()` inside trait T, where T
+    // declares no `other`, must stay unresolved — the narrowed candidate set is
+    // empty and the branch must NOT fall back to the broad method pool. An
+    // unrelated `trait U { fn other }` must never be bound (prefer a MISSING
+    // edge over a WRONG one).
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32;\n    fn g(&self) -> u32 {\n        self.other()\n    }\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "pub trait U {\n    fn other(&self) -> u32;\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let u_other = symbol_id(&records, "function", "gamma::other", "src/gamma.rs");
+    let g = symbol_id(&records, "function", "alpha::g", "src/alpha.rs");
+
+    assert!(
+        calls_edge(&records, &g, &u_other).is_none(),
+        "self.other() naming nothing on trait T must not fan out to U::other"
+    );
+    // A receiver-typed self call with no candidate is external — no Diagnostic.
+    assert!(
+        !records.iter().any(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Diagnostic"
+                && record["name"] == "other"
+        }),
+        "an unresolved self-method call must not emit a Diagnostic node"
+    );
+}
+
+#[test]
+fn impl_self_method_call_unaffected_by_trait_widening() {
+    // SYMMETRY GUARD (issue #390): an impl `self.g()` (owner `S`) still narrows
+    // to its inherent `S::g`. The SelfMethod trait-method widening must not leak
+    // a same-named trait method `T::g` in another file into the impl self-call.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub struct S;\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.g()\n    }\n    pub fn g(&self) -> u32 {\n        3\n    }\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "pub trait T {\n    fn g(&self) -> u32;\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let s_g = symbol_id(&records, "method", "alpha::S::g", "src/alpha.rs");
+    let t_g = symbol_id(&records, "function", "gamma::g", "src/gamma.rs");
+    let f = symbol_id(&records, "method", "alpha::S::f", "src/alpha.rs");
+
+    // The impl self-call binds its own inherent method.
+    assert_calls_edge_with_resolution(&records, &f, &s_g, "resolved");
+    // The same-named trait method is NOT admitted into the impl self-call.
+    assert!(
+        calls_edge(&records, &f, &t_g).is_none(),
+        "impl self.g() must not admit the same-named trait method T::g"
+    );
+}
+
+#[test]
+fn in_trait_self_method_call_edges_are_byte_stable_across_repeated_scans() {
+    // Determinism guard for the in-trait `self.` method-call resolution path.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32;\n    fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "pub trait U {\n    fn read(&self) -> u32;\n}\n",
+            ),
+        ],
+    );
+
+    let first = scan_repository_at_with_override(repo, FIXED_TIME, Some(REPO_ID))
+        .expect("fixture repo should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    for run in 2..=5 {
+        let next = scan_repository_at_with_override(repo, FIXED_TIME, Some(REPO_ID))
+            .expect("fixture repo should rescan")
+            .to_jsonl()
+            .expect("graph should reserialize");
+        assert_eq!(first, next, "scan {run} must be byte-identical to scan 1");
+    }
+    assert!(
+        first.contains(r#""resolution":"resolved""#),
+        "stability check must cover the resolved in-trait self-method path: {first}"
+    );
+}
+
 fn implements_edge<'a>(records: &'a [Value], source: &str, target: &str) -> Option<&'a Value> {
     records.iter().find(|record| {
         record["record_type"] == "edge"

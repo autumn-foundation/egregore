@@ -723,9 +723,24 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                     .is_some_and(|value| value.kind() == "self");
                 let owner = receiver_is_self
                     .then(|| {
-                        self.impl_context.as_ref().and_then(|impl_context| {
-                            normalize_impl_owner(&impl_context.method_owner)
-                        })
+                        // A `self.method()` receiver call carries the owner of
+                        // the enclosing `Self` so the SelfMethod branch can
+                        // narrow to it: the impl owner inside an impl block
+                        // (unchanged), else the enclosing trait name inside a
+                        // trait body (issue #390). Inside a trait there is no
+                        // `impl_context`, so before this the owner was None and
+                        // the call collapsed to a plain `Method` that fanned out
+                        // to every same-named trait method. `impl_context` takes
+                        // precedence when both are set (a nested impl inside a
+                        // trait default body). The trait name is the raw
+                        // `trait_context` string, matching the trait-method
+                        // owner segment in `definition_match_segments`.
+                        self.impl_context
+                            .as_ref()
+                            .and_then(|impl_context| {
+                                normalize_impl_owner(&impl_context.method_owner)
+                            })
+                            .or_else(|| self.trait_context.clone())
                     })
                     .flatten();
                 let call_kind = if owner.is_some() {
