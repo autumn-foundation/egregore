@@ -769,18 +769,32 @@ impl<'facts> ImplTargetIndex<'facts> {
             && let Some(resolved_path) =
                 lookup_use_import(use_imports, &pending.module_names, &pending.trait_path)
         {
-            // Import-aware in-repo resolution fires ONLY for an explicitly
-            // in-repo-rooted import path (`crate::`/`self::`/`super::`). A bare
-            // first-segment import (`use std::fmt::Display;`) is an EXTERN-prelude
-            // import per Rust 2018+ path resolution — it names an external crate,
-            // so it resolves to NO in-repo target even when the repo
-            // coincidentally defines a same-path local module (`mod std::fmt`).
-            // Return `None` directly (no edge) rather than running the extern path
-            // through the scope walk, which would mis-bind that coincident local
-            // module — the wrong edge Codex P2 (PR #399) flagged. Either way the
-            // bare name never falls through to the un-imported scope walk; the
-            // name is the import, full stop.
-            if !use_path_is_in_repo_rooted(resolved_path) {
+            // Import-aware in-repo resolution fires for any import path that
+            // could name a local target: an explicitly in-repo-rooted path
+            // (`crate::`/`self::`/`super::`) OR a bare path whose first segment is
+            // NOT a known extern-prelude crate name. A bare first-segment import
+            // splits two ways per Rust 2018+ path resolution:
+            //   * `use std::fmt::Display;` — first segment `std` is an
+            //     EXTERN-prelude crate, so the path names an external crate and
+            //     resolves to NO in-repo target even when the repo coincidentally
+            //     defines a same-path local module (`mod std::fmt`). Returning
+            //     `None` directly (no edge) — rather than running the extern path
+            //     through the scope walk, which would mis-bind that coincident
+            //     local module — preserves the wrong-edge fix Codex P2 (PR #399)
+            //     asked for.
+            //   * `use a::T;` — first segment `a` is NOT an extern-prelude crate,
+            //     so it names a LOCAL crate-root module (valid Rust 2018). It
+            //     resolves against the crate-root-partitioned index below; an
+            //     actual in-repo target must exist for an edge to mint, so an
+            //     ordinary external dependency (`use serde::Serialize;`) still
+            //     yields no edge without any dependency list. Dropping this case
+            //     was the round-1 recall regression Codex "crate-root local
+            //     imports" (PR #399) flagged.
+            // Either way the bare name never falls through to the un-imported
+            // scope walk; the name is the import, full stop.
+            if !use_path_is_in_repo_rooted(resolved_path)
+                && use_path_first_segment_is_extern_prelude(resolved_path)
+            {
                 return None;
             }
             return match self
@@ -936,19 +950,42 @@ fn lookup_use_import<'a>(
 
 /// Reports whether a captured `use`-import path is EXPLICITLY in-repo-rooted —
 /// its first `::`-separated segment is `crate`, `self`, or `super` (Codex P2 on
-/// PR #399). Per Rust 2018+ path resolution, only these roots denote the local
-/// crate inside a `use` path; a BARE first segment (`std::fmt::Display`,
-/// `serde::Serialize`, `a::T`) is an EXTERN-prelude import that names an external
-/// crate, NEVER a local module that merely shares that name. Import-aware in-repo
-/// resolution (issue #393) must fire only for in-repo-rooted paths — otherwise a
-/// repo that coincidentally defines a same-path local module (`mod std::fmt`)
-/// steals the extern import and mints a WRONG `IMPLEMENTS` edge, breaking PR
-/// #389's no-wrong-edge invariant. (`Self` is never valid as a `use`-path root,
-/// so it need not be listed.)
+/// PR #399). Per Rust 2018+ path resolution these roots unambiguously denote the
+/// local crate inside a `use` path. Such a path always resolves in-repo; it is
+/// the always-true half of the import-aware resolution gate, complementing
+/// [`use_path_first_segment_is_extern_prelude`] (which vetoes bare extern-crate
+/// imports). (`Self` is never valid as a `use`-path root, so it need not be
+/// listed.)
 fn use_path_is_in_repo_rooted(path: &str) -> bool {
     matches!(
         path.split("::").next().unwrap_or(path),
         "crate" | "self" | "super"
+    )
+}
+
+/// Reports whether a captured `use`-import path's first `::`-separated segment is
+/// a KNOWN extern-prelude crate name — `std`, `core`, `alloc`, `proc_macro`, or
+/// `test` (the crates Rust injects into the extern prelude). Such a bare import
+/// (`use std::fmt::Display;`, `use core::fmt::Debug;`) names an external crate per
+/// Rust 2018+ path resolution, NEVER a local module that merely shares the name;
+/// import-aware in-repo resolution (issue #393) must NOT fire for it, otherwise a
+/// repo that coincidentally defines a same-path local module (`mod std::fmt`)
+/// steals the extern import and mints a WRONG `IMPLEMENTS` edge, breaking PR
+/// #389's no-wrong-edge invariant. Every OTHER bare first segment
+/// (`a::T`, `serde::Serialize`) is a potential local crate-root module and is
+/// resolved against the crate-root-partitioned index — a genuine external
+/// dependency yields no edge simply because no local target matches, no
+/// dependency list required. This closed exclusion set is what distinguishes an
+/// extern-prelude crate import from a valid bare crate-root-local import (the
+/// recall Codex "crate-root local imports" (PR #399) asked to recover).
+///
+/// Accepted rare bound: a LOCAL crate-root module whose name collides with one of
+/// these extern-prelude crates (e.g. a hand-rolled `mod core`) is ambiguous /
+/// invalid Rust and is treated as external here — out of scope.
+fn use_path_first_segment_is_extern_prelude(path: &str) -> bool {
+    matches!(
+        path.split("::").next().unwrap_or(path),
+        "std" | "core" | "alloc" | "proc_macro" | "test"
     )
 }
 
@@ -2129,5 +2166,114 @@ mod tests {
             "an extern-prelude import must never bind a coincident local \
              module's same-path trait: {records:?}"
         );
+    }
+
+    #[test]
+    fn cross_file_bare_crate_root_local_import_resolves_to_local_trait() {
+        // Recall-regression guard (issue #393; Codex "crate-root local imports"
+        // on PR #399): `use a::T; impl T for Foo` in src/m.rs where `a` is a
+        // LOCAL crate-root module (`mod a { pub trait T {} }`) is valid Rust
+        // 2018 and resolves to the local `a::T`. The round-1 fix gated
+        // import-aware in-repo resolution to `crate::`/`self::`/`super::`-rooted
+        // paths only, which dropped this bare root-local import and lost the
+        // IMPLEMENTS edge. The first path segment `a` is NOT an extern-prelude
+        // crate name, so the import must resolve to the local `a::T`.
+        let facts: BTreeMap<String, FileFacts> = [
+            (
+                "src/lib.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in("root-T", "T", &[], "trait", "lib")],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/a.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in("a-T", "a::T", &["a"], "trait", "lib")],
+                    ..FileFacts::default()
+                },
+            ),
+            (
+                "src/m.rs".to_owned(),
+                FileFacts {
+                    impl_targets: vec![impl_target_in("m-Foo", "m::Foo", &["m"], "struct", "lib")],
+                    pending_impls: vec![PendingImplFact {
+                        source_id: "impl-Foo".to_owned(),
+                        trait_path: "T".to_owned(),
+                        crate_root: "lib".to_owned(),
+                        module_names: vec!["m".to_owned()],
+                        shadowed_by_use: true,
+                    }],
+                    use_trait_imports: vec![use_import(&["m"], "T", "a::T")],
+                    ..FileFacts::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let records = cross_file_implements_records("repo", &facts);
+        assert_eq!(
+            implements_pairs(&records),
+            vec![("impl-Foo".to_owned(), "a-T".to_owned())],
+            "a bare crate-root-local `use a::T;` binds the local a::T, not the \
+             root T: {records:?}"
+        );
+    }
+
+    #[test]
+    fn cross_file_bare_core_alloc_import_never_binds_coincident_local_module() {
+        // The extern-prelude exclusion is not std-only: `core` and `alloc` are
+        // extern-prelude crate names too. A `use core::fmt::Debug;` /
+        // `use alloc::vec::Vec;` import names the external crate even when the
+        // repo coincidentally defines a same-path local module — no edge.
+        for extern_path in ["core::fmt::Debug", "alloc::vec::Vec"] {
+            let (root_seg, _) = extern_path.split_once("::").unwrap();
+            let qualified = extern_path.to_owned();
+            let module: Vec<&str> = extern_path.split("::").take(2).collect();
+            let facts: BTreeMap<String, FileFacts> = [
+                (
+                    "src/extern_shadow.rs".to_owned(),
+                    FileFacts {
+                        impl_targets: vec![impl_target_in(
+                            "local-extern-target",
+                            &qualified,
+                            &module,
+                            "trait",
+                            "lib",
+                        )],
+                        ..FileFacts::default()
+                    },
+                ),
+                (
+                    "src/m.rs".to_owned(),
+                    FileFacts {
+                        impl_targets: vec![impl_target_in(
+                            "m-Foo",
+                            "m::Foo",
+                            &["m"],
+                            "struct",
+                            "lib",
+                        )],
+                        pending_impls: vec![PendingImplFact {
+                            source_id: "impl-Foo".to_owned(),
+                            trait_path: "Target".to_owned(),
+                            crate_root: "lib".to_owned(),
+                            module_names: vec!["m".to_owned()],
+                            shadowed_by_use: true,
+                        }],
+                        use_trait_imports: vec![use_import(&["m"], "Target", &qualified)],
+                        ..FileFacts::default()
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect();
+            let records = cross_file_implements_records("repo", &facts);
+            assert!(
+                implements_pairs(&records).is_empty(),
+                "an extern-prelude `{root_seg}` import must never bind a \
+                 coincident local module: {records:?}"
+            );
+        }
     }
 }

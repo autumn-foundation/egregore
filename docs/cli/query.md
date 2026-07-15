@@ -1224,19 +1224,39 @@ resolver binds a bare (unqualified) trait/type name to the target that import
 **names** — `use crate::a::T; impl T for Foo` edge-backs `Foo` to `a::T` (not a
 root `T`), `use crate::a::T as U; impl U for Bar` binds through the rename, and a
 grouped `use crate::a::{T};` distributes the group prefix. Import-aware in-repo
-resolution fires **only** for an explicitly **in-repo-rooted** import path — one
-whose first `::`-separated segment is `crate`, `self`, or `super` (Codex P2 on PR
-#399). Per Rust 2018+ path resolution, a `use` path with a **bare first segment**
-(`use std::fmt::Display;`, `use serde::Serialize;`, `use a::T;`) names an
-**external crate** through the extern prelude, never a local module that merely
-shares that name — so such an import resolves to **no** in-repo definition and
-mints **no** edge, even when the repo *coincidentally* defines a same-path local
-module (e.g. `mod std { mod fmt { trait Display {} } }`). Without this gate the
-captured extern path would run through the in-repo scope walk and steal the
-coincident local trait — a wrong-target edge. In-repo-rooted paths are then
-resolved against the crate-root-partitioned index with the same
-`crate::`/`self::`/`super::` normalization a qualified impl trait path gets — so
-the recall recovery never reintroduces a wrong-target edge. Import capture respects Rust's non-inherited
+resolution decides whether an import can name a local target by its **first
+`::`-separated segment**, not by requiring an explicit root prefix (Codex
+"crate-root local imports" on PR #399). An import path is resolved in-repo when it
+is either **in-repo-rooted** — first segment `crate`, `self`, `super`, or `Self` —
+**or** its first segment is **not** a known **extern-prelude crate name**. The
+extern-prelude exclusion set is closed: `std`, `core`, `alloc`, `proc_macro`,
+`test`. This splits bare first-segment imports two ways per Rust 2018+ path
+resolution:
+
+- `use std::fmt::Display;` / `use core::fmt::Debug;` — first segment is an
+  extern-prelude crate, so the path names an **external crate** and resolves to
+  **no** in-repo definition, minting **no** edge even when the repo
+  *coincidentally* defines a same-path local module (e.g. `mod std { mod fmt {
+  trait Display {} } }`). Without this exclusion the captured extern path would run
+  through the in-repo scope walk and steal the coincident local trait — a
+  wrong-target edge (the round-1 behaviour, preserved).
+- `use a::T;` — first segment `a` is **not** an extern-prelude crate, so it names a
+  **local crate-root module** (valid Rust 2018) and edge-backs `impl T for Foo` to
+  the local `a::T`, exactly as `use crate::a::T;` does. Recovering these bare
+  crate-root-local imports fixes the round-1 recall regression that dropped every
+  bare (non-`crate::`-prefixed) root-local import.
+
+Resolution still requires an actual in-repo target to exist, so an ordinary
+external dependency (`use serde::Serialize;`) mints **no** edge simply because no
+local `serde::Serialize` matches — **no dependency list is consulted**. Resolvable
+paths are matched against the crate-root-partitioned index: an in-repo-rooted path
+is normalized (`crate::`/`self::`/`super::` stripping, exactly as a qualified impl
+trait path), and a bare crate-root-local path (`a::T`, no prefix to strip) is
+looked up as a crate-root-relative qualified name in the impl's own crate root — so
+the recall recovery never reintroduces a wrong-target edge. **Accepted rare
+bound:** a local module whose name collides with a declared dependency crate (e.g.
+a hand-rolled `mod core`) is ambiguous/invalid Rust and is treated as external —
+out of scope. Import capture respects Rust's non-inherited
 `use` visibility exactly (own module scope only; an ancestor/root, sibling-module,
 or **block-local** `use` is never captured for the impl's scope), so a bare name
 recovered here can only bind what a co-located `use` truly imports. A bare name

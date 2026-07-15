@@ -2500,6 +2500,109 @@ fn real_scan_cross_file_bare_imported_trait_resolves_to_aliased_trait() {
     );
 }
 
+#[test]
+fn real_scan_cross_file_bare_crate_root_local_import_resolves_to_local_trait() {
+    // Recall-regression guard (issue #393; Codex "crate-root local imports" on
+    // PR #399): a BARE `use a::T;` (no `crate::` prefix) where `a` is a local
+    // crate-root module is valid Rust 2018 and resolves to the local `a::T`.
+    // Round 1 gated import-aware resolution to `crate::`/`self::`/`super::`-rooted
+    // paths only and dropped this valid root-local import, losing the IMPLEMENTS
+    // edge. The first path segment `a` is NOT an extern-prelude crate name, so
+    // the import must resolve to `a::T`.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait T {\n",
+            "    fn go(&self);\n",
+            "}\n\n",
+            "pub mod a;\n",
+            "pub mod m;\n",
+        ),
+    )
+    .expect("write lib.rs");
+    fs::write(
+        src.join("a.rs"),
+        concat!("pub trait T {\n", "    fn go(&self);\n", "}\n"),
+    )
+    .expect("write a.rs");
+    fs::write(
+        src.join("m.rs"),
+        concat!(
+            "use a::T;\n\n",
+            "pub struct Foo;\n\n",
+            "impl T for Foo {\n",
+            "    fn go(&self) {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write m.rs");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    egregore()
+        .arg("scan")
+        .arg(temp.path())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let graph_text = fs::read_to_string(&graph_path).expect("read graph");
+    let records: Vec<serde_json::Value> = graph_text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    let trait_id_in = |path: &str| -> String {
+        records
+            .iter()
+            .find(|r| {
+                r["record_type"] == "node"
+                    && r["symbol_kind"] == "trait"
+                    && (r["name"] == "T" || r["name"] == "a::T")
+                    && r["repo_relative_path"] == path
+            })
+            .and_then(|r| r["id"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| panic!("trait T node in {path} present"))
+    };
+    let root_t = trait_id_in("src/lib.rs");
+    let a_t = trait_id_in("src/a.rs");
+
+    let implements_targets: Vec<&str> = records
+        .iter()
+        .filter(|r| r["record_type"] == "edge" && r["label"] == "IMPLEMENTS")
+        .filter_map(|r| r["target"].as_str())
+        .collect();
+    assert!(
+        implements_targets.contains(&a_t.as_str()),
+        "the bare crate-root-local `use a::T;` must edge-back to the local \
+         `a::T`: {records:?}"
+    );
+    assert!(
+        !implements_targets.contains(&root_t.as_str()),
+        "the recovered edge must never target the root `T`: {records:?}"
+    );
+
+    let stdout = egregore()
+        .args(["query", "implementors", "a::T", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert!(
+        rows.iter().any(|r| r["implementing_type"] == "m::Foo"),
+        "`a::T` must report `m::Foo` as an implementor: {rows:?}"
+    );
+}
+
 /// Shared scaffold for the import-aware bare-name variants (issue #393):
 /// `src/lib.rs` (root `trait T` + `mod a` + `mod m`), `src/a.rs` (`pub trait
 /// T`), and a caller-provided `src/m.rs`. Returns the implementors of `a::T`.
