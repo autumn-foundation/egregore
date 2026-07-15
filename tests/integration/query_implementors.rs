@@ -6412,6 +6412,160 @@ fn real_scan_cfg_gated_same_name_import_collision_stays_unresolved() {
 }
 
 // ---------------------------------------------------------------------------
+// Codex round-5 finding P2 (PR #399): the import shadow-veto must actually VETO.
+// A bare `impl T for X` whose module binds `T` via a `use` import that is
+// EXTERNAL or AMBIGUOUS must mint NO edge AND must NOT fall through to the scope
+// walk. Round-4 made `lookup_use_import` return `None` for an ambiguous binding,
+// but the caller treated `None` identically to "no import" and fell through to
+// the scope walk — so a ROOT-LOCAL same-name trait (whose bare simple name is
+// NOT ambiguous by the counting predicate) still stole an IMPLEMENTS edge in the
+// std configuration. The fix makes the import lookup TRI-STATE
+// (Resolved / Veto / NoImport); these two guards pin the Veto behavior.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_scan_cfg_gated_same_name_import_collision_with_root_local_trait_stays_unresolved() {
+    // The exact Codex round-5 fixture: a ROOT-LOCAL `pub trait Display` (qualified
+    // name `Display`, the ONLY in-repo `Display`, so its bare simple name is NOT
+    // "ambiguous" by the counting predicate), plus a module `m` binding `Display`
+    // to TWO distinct cfg-gated paths (`std::fmt::Display` and `crate::Display`),
+    // then `impl Display for Foo`. The ambiguous import must VETO: no edge, and no
+    // fall-through to the scope walk (which would otherwise mint a WRONG edge to
+    // the root-local `Display` — that name is external in the std configuration).
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    // The ROOT-LOCAL trait `crate::Display` (qualified name `Display`).
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait Display {\n",
+            "    fn go(&self);\n",
+            "}\n\n",
+            "pub mod m;\n",
+        ),
+    )
+    .expect("write lib.rs");
+    // One module binds the bare `Display` to TWO distinct paths via cfg-gated
+    // imports, then implements the bare name. In the std configuration the name
+    // is external; the collision is unresolvable.
+    fs::write(
+        src.join("m.rs"),
+        concat!(
+            "#[cfg(feature = \"std\")]\n",
+            "use std::fmt::Display;\n",
+            "#[cfg(not(feature = \"std\"))]\n",
+            "use crate::Display;\n\n",
+            "pub struct Foo;\n\n",
+            "impl Display for Foo {\n",
+            "    fn go(&self) {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write m.rs");
+
+    let (records, targets) = scan_records(temp.path());
+    let root_display = records
+        .iter()
+        .find(|r| {
+            r["record_type"] == "node"
+                && r["symbol_kind"] == "trait"
+                && r["name"] == "Display"
+                && r["repo_relative_path"] == "src/lib.rs"
+        })
+        .and_then(|r| r["id"].as_str().map(str::to_owned))
+        .expect("root-local trait `Display` node present");
+    // The ambiguous import shadows the bare name: no edge may target the
+    // root-local trait (it would be a WRONG edge in the std configuration), and
+    // the veto must suppress the scope walk entirely — so NO edge at all.
+    assert!(
+        !targets.contains(&root_display),
+        "a cfg-gated same-name import collision must not mint an IMPLEMENTS edge \
+         to the root-local `crate::Display` via the scope-walk fall-through: {records:?}"
+    );
+    assert!(
+        targets.is_empty(),
+        "the cfg-gated collision over a root-local same-name trait leaves the bare \
+         `impl Display for Foo` unresolved — no IMPLEMENTS edge at all: {records:?}"
+    );
+
+    // The query surface agrees: `Display` has zero implementors.
+    let stdout = egregore()
+        .args(["query", "implementors", "Display", "--graph"])
+        .arg(temp.path().join("graph.jsonl"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = String::from_utf8(stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert!(
+        rows.iter().all(|r| r["implementing_type"] != "m::Foo"),
+        "root-local `Display` must report no `m::Foo` implementor: {rows:?}"
+    );
+}
+
+#[test]
+fn real_scan_external_import_vetoes_root_local_same_name_trait() {
+    // A SINGLE external `use std::fmt::Display;` in a module that ALSO has a
+    // root-local `trait Display` (qualified name `Display`), plus
+    // `impl Display for Foo`. The external import shadows the bare name per Rust
+    // 2018+ path resolution, so it must VETO: no edge, and no fall-through to the
+    // scope walk that would otherwise mis-bind the coincidental root-local trait.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    // The ROOT-LOCAL trait `crate::Display` (qualified name `Display`).
+    fs::write(
+        src.join("lib.rs"),
+        concat!(
+            "pub trait Display {\n",
+            "    fn go(&self);\n",
+            "}\n\n",
+            "pub mod m;\n",
+        ),
+    )
+    .expect("write lib.rs");
+    fs::write(
+        src.join("m.rs"),
+        concat!(
+            "use std::fmt::Display;\n\n",
+            "pub struct Foo;\n\n",
+            "impl Display for Foo {\n",
+            "    fn go(&self) {}\n",
+            "}\n",
+        ),
+    )
+    .expect("write m.rs");
+
+    let (records, targets) = scan_records(temp.path());
+    let root_display = records
+        .iter()
+        .find(|r| {
+            r["record_type"] == "node"
+                && r["symbol_kind"] == "trait"
+                && r["name"] == "Display"
+                && r["repo_relative_path"] == "src/lib.rs"
+        })
+        .and_then(|r| r["id"].as_str().map(str::to_owned))
+        .expect("root-local trait `Display` node present");
+    assert!(
+        !targets.contains(&root_display),
+        "a single external `use std::fmt::Display;` shadows the bare name and must \
+         not mint an IMPLEMENTS edge to the coincidental root-local trait: {records:?}"
+    );
+    assert!(
+        targets.is_empty(),
+        "the external import vetoes the bare `impl Display for Foo` — no IMPLEMENTS \
+         edge at all: {records:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Codex round-4 finding D (PR #399): import-aware bare-trait resolution must fire
 // only for a PROVABLY in-repo import. A realistic external dependency
 // (`use serde::Serialize; impl Serialize for Foo`, serde declared in Cargo.toml,

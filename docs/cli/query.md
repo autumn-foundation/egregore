@@ -1265,23 +1265,48 @@ handling. Three bare-name cases stay bounded out. A **glob** import (`use a::*;`
 binds no specific segment, so the bare `impl T for Foo` beside it is genuinely
 un-imported and — when its simple name is ambiguous across the crate root's
 impl-target definitions — is left **unresolved** (the honest missing-edge
-direction). A bare name with **no** captured `use` import at all falls through
-to the conservative same-name ambiguity bound above. And a **cfg-gated same-name
-collision** — the same simple name bound to two *distinct* paths in one module
-scope, `#[cfg(feature = "std")] use std::fmt::Display;` alongside
-`#[cfg(not(feature = "std"))] use crate::local::Display;` — is treated as
-**ambiguous**: the extractor keeps *both* import facts (it does not last-wins
-collapse them), and because one name resolves to two distinct paths the resolver
-fires **no** import-aware resolution and mints **no** edge (Codex round-4 finding E,
-PR #399). Collapsing the two to the in-repo path would have minted a local edge
-even in the configuration where the name is the external std trait; keeping both is
-the conservative pre-#393 shadow-veto outcome. One name resolving to one distinct
-path (the same path repeated is not ambiguity) still resolves. The
+direction).
+
+The import lookup is **tri-state** (Codex round-5 finding P2, PR #399), and the
+three states are what keep a shadowed name from leaking into the scope walk:
+
+- **Resolved** — exactly one `use` import binds the name to a resolvable in-repo
+  path (in-repo-rooted, or a bare non-extern-prelude first segment). The path is
+  matched against the crate-root-partitioned index; a match mints the edge, an
+  index miss mints **no** edge — and in neither case does it fall through to the
+  scope walk.
+- **Veto** — a `use` import binds the name but it resolves **externally** (a single
+  extern-prelude path such as `use std::fmt::Display;`) or **ambiguously** (2+
+  distinct cfg-gated paths). The import *shadows* the bare name, so the resolver
+  mints **no** edge **and suppresses the scope-walk fall-through**. This is the fix
+  for the round-4 regression where a vetoed binding silently fell through and let
+  the scope walk mis-bind a coincidental **root-local same-name trait** (e.g. a
+  root `trait Display` reached at depth 0) — a wrong-target edge in the
+  configuration where the name is actually the external `std::fmt::Display`. A
+  single external import shadows the local name exactly as an ambiguous one does.
+- **NoImport** — no `use` import binds the name at all; the resolver falls through
+  to the scope walk and the conservative same-name ambiguity bound above (normal
+  #389 recall for same/parent-module traits). Only an actual `use`-binding of the
+  name triggers a Veto — a bare `impl T for X` with **no** `use` importing `T`
+  still resolves outward via the scope walk.
+
+A **cfg-gated same-name collision** — the same simple name bound to two *distinct*
+paths in one module scope, `#[cfg(feature = "std")] use std::fmt::Display;`
+alongside `#[cfg(not(feature = "std"))] use crate::local::Display;` (or
+`use crate::Display;` for a root-local trait) — is the ambiguous Veto case: the
+extractor keeps *both* import facts (it does not last-wins collapse them), and
+because one name resolves to two distinct paths the resolver mints **no** edge and
+does **not** scope-walk (Codex round-4 finding E and round-5 finding P2, PR #399).
+Collapsing the two to the in-repo path would have minted a local edge even in the
+configuration where the name is the external std trait; vetoing both is the
+conservative shadow-veto outcome. One name resolving to one distinct path (the same
+path repeated is not ambiguity) still resolves. The
 incremental-cache schema version is **13** for the serde-default
 `use_trait_imports` per-file facts this capture records (alongside the crate-root
 partitioning below); the finding-E fix keeps the same fact *shape* (it changes only
-how many facts a colliding name emits), so no further schema bump is required and
-older caches rebuild.
+how many facts a colliding name emits), and the round-5 tri-state veto is a pure
+in-memory resolution change that records **no** new fact, so the schema version
+stays **13** — no further bump is required and older caches rebuild.
 
 **Multi-crate-root packages are partitioned by crate root (issue #394).**
 The repo-wide index keys on `(crate_root, crate-root-relative qualified name)`, so

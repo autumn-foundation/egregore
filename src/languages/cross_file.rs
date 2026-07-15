@@ -953,53 +953,41 @@ impl<'facts> ImplTargetIndex<'facts> {
         pending: &PendingImplFact,
         use_imports: &'facts [UseImportFact],
     ) -> Option<&'facts ImplTargetFact> {
-        // Import-aware resolution (issue #393): when the impl's trait path is a
-        // BARE name that a module-item `use` in the impl's own module scope
-        // binds, the name refers to that import. Resolve the aliased import PATH
-        // (respecting the same crate-root partition) rather than walking the
-        // module scope to a root same-named definition. If the aliased path is
-        // in-repo it resolves to the true target; if it is external/std it
-        // resolves to nothing (no wrong edge). This intentionally does NOT fall
-        // through to the scope walk — the bare name is the import, full stop.
-        if !pending.trait_path.contains("::")
-            && let Some(resolved_path) =
-                lookup_use_import(use_imports, &pending.module_names, &pending.trait_path)
-        {
-            // Import-aware in-repo resolution fires for any import path that
-            // could name a local target: an explicitly in-repo-rooted path
-            // (`crate::`/`self::`/`super::`) OR a bare path whose first segment is
-            // NOT a known extern-prelude crate name. A bare first-segment import
-            // splits two ways per Rust 2018+ path resolution:
-            //   * `use std::fmt::Display;` — first segment `std` is an
-            //     EXTERN-prelude crate, so the path names an external crate and
-            //     resolves to NO in-repo target even when the repo coincidentally
-            //     defines a same-path local module (`mod std::fmt`). Returning
-            //     `None` directly (no edge) — rather than running the extern path
-            //     through the scope walk, which would mis-bind that coincident
-            //     local module — preserves the wrong-edge fix Codex P2 (PR #399)
-            //     asked for.
-            //   * `use a::T;` — first segment `a` is NOT an extern-prelude crate,
-            //     so it names a LOCAL crate-root module (valid Rust 2018). It
-            //     resolves against the crate-root-partitioned index below; an
-            //     actual in-repo target must exist for an edge to mint, so an
-            //     ordinary external dependency (`use serde::Serialize;`) still
-            //     yields no edge without any dependency list. Dropping this case
-            //     was the round-1 recall regression Codex "crate-root local
-            //     imports" (PR #399) flagged.
-            // Either way the bare name never falls through to the un-imported
-            // scope walk; the name is the import, full stop.
-            if !use_path_is_in_repo_rooted(resolved_path)
-                && use_path_first_segment_is_extern_prelude(resolved_path)
-            {
-                return None;
+        // Import-aware resolution (issue #393; Codex round-5 P2 on PR #399): when
+        // the impl's trait path is a BARE name that a module-item `use` in the
+        // impl's own module scope binds, the name refers to that import, never a
+        // coincidental same-named definition the scope walk would reach. The
+        // tri-state [`ImportBinding`] drives three distinct outcomes:
+        //   * Resolved(path) — exactly one import binds the name and its path
+        //     could name an in-repo target (`crate::`/`self::`/`super::`-rooted,
+        //     or a bare first segment that is NOT an extern-prelude crate). Resolve
+        //     the aliased PATH against the crate-root-partitioned index. An index
+        //     miss (e.g. a genuine external `use serde::Serialize;` with no local
+        //     `serde::Serialize`) mints no edge — and still does NOT fall through
+        //     to the scope walk. Recovering the bare crate-root-local case
+        //     (`use a::T;`) was the round-1 recall fix Codex flagged.
+        //   * Veto — an import binds the name but it is EXTERNAL (a single
+        //     extern-prelude path like `use std::fmt::Display;`) or AMBIGUOUS (2+
+        //     distinct cfg-gated paths). The bare name is shadowed by the import;
+        //     mint NO edge and DO NOT fall through to the scope walk (which would
+        //     otherwise mis-bind a coincidental root-local same-name trait — the
+        //     round-4 wrong-edge bug). This restores PR #389's shadow-veto intent.
+        //   * NoImport — no import binds the name; fall through to the scope walk
+        //     (normal #389 recall for same/parent-module traits).
+        if !pending.trait_path.contains("::") {
+            match lookup_use_import(use_imports, &pending.module_names, &pending.trait_path) {
+                ImportBinding::Resolved(resolved_path) => {
+                    return match self
+                        .candidates(&pending.crate_root, resolved_path, &pending.module_names)
+                        .as_slice()
+                    {
+                        [only] => Some(only),
+                        _ => None,
+                    };
+                }
+                ImportBinding::Veto => return None,
+                ImportBinding::NoImport => {}
             }
-            return match self
-                .candidates(&pending.crate_root, resolved_path, &pending.module_names)
-                .as_slice()
-            {
-                [only] => Some(only),
-                _ => None,
-            };
         }
         match self
             .candidates(
@@ -1119,29 +1107,73 @@ impl<'facts> ImplTargetIndex<'facts> {
     }
 }
 
-/// Resolves the import path a module-item `use` binds for `simple_name` in the
-/// impl's exact module scope (issue #393), or `None` when no such import exists
-/// or the scope binds the name to two DISTINCT paths (defensive — a name
-/// collision in real Rust; never silently pick one). Scoping mirrors the
-/// import-shadow veto exactly (own module scope only; ancestor/block-local
+/// Tri-state outcome of asking whether a module-item `use` in the impl's exact
+/// module scope binds `simple_name` (issue #393; Codex round-5 P2 on PR #399).
+///
+/// The three states are what let the caller distinguish "the name is shadowed by
+/// an import that resolves elsewhere" from "no import binds the name". Collapsing
+/// the first two into `None` (the round-4 bug) let an EXTERNAL/AMBIGUOUS binding
+/// fall through to the scope walk, which then mis-bound a coincidental
+/// same-simple-name definition (a root-local trait whose bare name is NOT
+/// "ambiguous" by the counting predicate) — a WRONG `IMPLEMENTS` edge.
+enum ImportBinding<'a> {
+    /// Exactly one `use` import binds the name to a path that could name an
+    /// in-repo target: an explicitly in-repo-rooted path (`crate`/`self`/`super`)
+    /// or a bare path whose first segment is NOT a known extern-prelude crate.
+    /// The caller resolves this path against the crate-root-partitioned index (an
+    /// index miss still mints no edge — no fall-through to the scope walk).
+    Resolved(&'a str),
+    /// A `use` import binds the name but it is EXTERNAL (a single extern-prelude
+    /// crate path — `std::fmt::Display` and friends) or AMBIGUOUS (2+ distinct
+    /// paths, cfg-gated or otherwise). The bare name is shadowed by the import, so
+    /// the caller mints NO edge and MUST NOT fall through to the scope walk. This
+    /// restores PR #389's shadow-veto intent for external/ambiguous imports.
+    Veto,
+    /// No `use` import binds the name in the impl's module scope. The caller falls
+    /// through to the existing scope walk (normal #389 recall for same/parent-
+    /// module traits).
+    NoImport,
+}
+
+/// Classifies whether a module-item `use` binds `simple_name` in the impl's exact
+/// module scope (issue #393) into the tri-state [`ImportBinding`]. Scoping mirrors
+/// the import-shadow veto exactly (own module scope only; ancestor/block-local
 /// imports are never captured here), so recall recovery cannot reintroduce a
 /// wrong edge.
+///
+/// A single binding whose path names an extern-prelude crate (and is not
+/// in-repo-rooted) is [`ImportBinding::Veto`] — the external name shadows any
+/// coincidental local definition. Two or more DISTINCT bound paths (a real
+/// cfg-gated name collision) are also [`ImportBinding::Veto`] — the collision is
+/// unresolvable and never silently picks one, nor falls through to the scope
+/// walk. Any other single binding is [`ImportBinding::Resolved`].
 fn lookup_use_import<'a>(
     use_imports: &'a [UseImportFact],
     module_names: &[String],
     simple_name: &str,
-) -> Option<&'a str> {
+) -> ImportBinding<'a> {
     let mut found: Option<&str> = None;
+    let mut ambiguous = false;
     for import in use_imports {
         if import.module_names == module_names && import.simple_name == simple_name {
             match found {
                 None => found = Some(import.resolved_path.as_str()),
-                Some(existing) if existing != import.resolved_path => return None,
+                Some(existing) if existing != import.resolved_path => ambiguous = true,
                 Some(_) => {}
             }
         }
     }
-    found
+    match found {
+        None => ImportBinding::NoImport,
+        Some(_) if ambiguous => ImportBinding::Veto,
+        Some(path)
+            if !use_path_is_in_repo_rooted(path)
+                && use_path_first_segment_is_extern_prelude(path) =>
+        {
+            ImportBinding::Veto
+        }
+        Some(path) => ImportBinding::Resolved(path),
+    }
 }
 
 /// Reports whether a captured `use`-import path is EXPLICITLY in-repo-rooted —
