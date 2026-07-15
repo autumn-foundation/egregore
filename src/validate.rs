@@ -601,20 +601,30 @@ fn check_target_conditioned_source_kind(
         && let Some((constrained_kind, allowed)) = target_kinds.iter().find_map(|kind| {
             allowed_source_kinds_for_target(label, *kind).map(|allowed| (*kind, allowed))
         })
-        && let Some(source_kinds) = index.node_kinds.get(source)
-        && !source_kinds.iter().any(|kind| allowed.contains(kind))
+        && index.node_kinds.contains_key(source)
     {
-        let mut diagnostic = ValidationDiagnostic::new(EDGE_SOURCE_KIND_VIOLATION);
-        diagnostic.edge_id = Some(edge_id.to_owned());
-        diagnostic.relation = Some(label.as_str().to_owned());
-        diagnostic.endpoint = Some("source");
-        diagnostic.record_id = Some(source.to_owned());
-        diagnostic.kind = source_kinds.iter().next().map(|kind| kind.as_str());
-        diagnostic.target_id = Some(target.to_owned());
-        diagnostic.target_kind = Some(constrained_kind.as_str());
-        diagnostic.allowed_kinds = Some(allowed.iter().map(|kind| kind.as_str()).collect());
-        index.cite_node(&mut diagnostic, source);
-        diagnostics.insert(diagnostic);
+        // Resolve the source's CURRENT kind by LAST-write (issue #391), matching
+        // the sibling source-kind gate `check_edge_source_kind`, never
+        // any-matching the historical `node_kinds` SET. A source re-emitted as a
+        // wrong kind after a valid one has its earlier valid kind SHADOWED, and a
+        // source shadowed by a trailing non-node record resolves to `None` — both
+        // fire the gate, matching the daemon's `lookup_node_kind` reverse scan. A
+        // node ID recurring across history commits with the SAME kind still
+        // resolves to that kind, so the normal single-kind case is unchanged.
+        let resolved = index.node_last_kind.get(source).copied().flatten();
+        if !resolved.is_some_and(|kind| allowed.contains(&kind)) {
+            let mut diagnostic = ValidationDiagnostic::new(EDGE_SOURCE_KIND_VIOLATION);
+            diagnostic.edge_id = Some(edge_id.to_owned());
+            diagnostic.relation = Some(label.as_str().to_owned());
+            diagnostic.endpoint = Some("source");
+            diagnostic.record_id = Some(source.to_owned());
+            diagnostic.kind = resolved.map(NodeKind::as_str);
+            diagnostic.target_id = Some(target.to_owned());
+            diagnostic.target_kind = Some(constrained_kind.as_str());
+            diagnostic.allowed_kinds = Some(allowed.iter().map(|kind| kind.as_str()).collect());
+            index.cite_node(&mut diagnostic, source);
+            diagnostics.insert(diagnostic);
+        }
     }
 }
 
@@ -1002,9 +1012,16 @@ fn check_required_containment(
         else {
             continue;
         };
-        if has_kind(index, target, NodeKind::ScanCoverage)
-            && has_kind(index, source, NodeKind::Repository)
-        {
+        // The container SOURCE's kind must resolve to `Repository` by LAST-write
+        // (issue #391), matching the sibling source-kind gate and
+        // `check_target_conditioned_source_kind`, never any-matching the
+        // historical `node_kinds` SET: a source re-emitted as a non-`Repository`
+        // kind after a `Repository` one no longer satisfies containment (its
+        // historical set still contains `Repository`, but its current kind does
+        // not), so the coverage node correctly reports `missing_required_container`.
+        let source_is_repository = index.node_last_kind.get(source.as_str()).copied().flatten()
+            == Some(NodeKind::Repository);
+        if has_kind(index, target, NodeKind::ScanCoverage) && source_is_repository {
             contained.insert(target);
         }
     }
@@ -1500,6 +1517,74 @@ mod tests {
             node("n:repo", NodeKind::Repository),
             node("n:coverage", NodeKind::ScanCoverage),
             edge("e:contains", EdgeLabel::Contains, "n:repo", "n:coverage"),
+        ];
+        let report = validate_records(&records);
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn scan_coverage_container_source_shadowed_to_file_is_rejected() {
+        // Issue #391 / PR #400 Codex P2: the container source `n:x` is emitted
+        // first as a valid `Repository`, then re-emitted as a `File`. Under
+        // LAST-write-wins the CURRENT kind is `File`, so the daemon-parity
+        // resolution the sibling source-kind gates use must catch it: the
+        // historical `node_kinds` SET still contains `Repository`, but the current
+        // kind is not `Repository`. Two complementary defects follow —
+        // `edge_source_kind_violation` (the `CONTAINS → ScanCoverage` source's
+        // last-write kind is `File`, not `Repository`) AND
+        // `missing_required_container` (no valid `Repository —CONTAINS→` container
+        // survives). Neither may be masked by the stale earlier valid version.
+        let records = vec![
+            node("n:x", NodeKind::Repository),
+            node("n:x", NodeKind::File),
+            node("n:coverage", NodeKind::ScanCoverage),
+            edge("e:contains", EdgeLabel::Contains, "n:x", "n:coverage"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_SOURCE_KIND_VIOLATION),
+            "CONTAINS→ScanCoverage off a Repository shadowed to File must flag the source kind, got {codes:?}"
+        );
+        assert!(
+            codes.contains(&MISSING_REQUIRED_CONTAINER),
+            "the coverage node's only container's last-write kind is File, so it has no valid Repository container, got {codes:?}"
+        );
+        let source_kind = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == EDGE_SOURCE_KIND_VIOLATION)
+            .expect("source-kind defect present");
+        // The cited kind is the RESOLVED last-write kind, never the set's minimum.
+        assert_eq!(source_kind.record_id.as_deref(), Some("n:x"));
+        assert_eq!(source_kind.kind, Some("File"));
+        assert_eq!(source_kind.target_id.as_deref(), Some("n:coverage"));
+        assert_eq!(source_kind.target_kind, Some("ScanCoverage"));
+        let missing_container = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == MISSING_REQUIRED_CONTAINER)
+            .expect("missing-container defect present");
+        assert_eq!(missing_container.record_id.as_deref(), Some("n:coverage"));
+        assert_eq!(missing_container.kind, Some("ScanCoverage"));
+    }
+
+    #[test]
+    fn scan_coverage_container_source_shadowed_to_repository_is_clean() {
+        // Inverse ordering proves the resolution is genuinely LAST-write, not
+        // first-write and not any-match: the container source `n:x` is emitted
+        // first as a `File`, THEN re-emitted as a `Repository`. Its last-write
+        // kind is `Repository`, so the `CONTAINS → ScanCoverage` edge is a valid
+        // container and the graph validates cleanly — even though the historical
+        // `node_kinds` SET also contains the (now-shadowed) `File` kind. A
+        // first-write or any-match resolver would misclassify one of the two
+        // orderings; only last-write accepts this one and rejects its mirror
+        // (`scan_coverage_container_source_shadowed_to_file_is_rejected`).
+        let records = vec![
+            node("n:x", NodeKind::File),
+            node("n:x", NodeKind::Repository),
+            node("n:coverage", NodeKind::ScanCoverage),
+            edge("e:contains", EdgeLabel::Contains, "n:x", "n:coverage"),
         ];
         let report = validate_records(&records);
         assert!(report.is_clean(), "got {:?}", report.diagnostics);
