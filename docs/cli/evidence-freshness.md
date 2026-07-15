@@ -138,12 +138,17 @@ duplicate rows are classified once.
   deleted non-temporal record after its tombstone, so a retracted observation or a
   deleted current-tree handle can be mis-handled there (classified/live instead of
   omitted/`unresolved`). The `--graph` path is correct. Tracked in #205.
-- **Module/import body drift.** Content comparison hashes a node's summary, which
-  embeds the normalized source body for **symbols** but only the name/path for
-  `Module`/`Import` records (and drift records skip them). A module/import whose
-  body changed while its name/path is unchanged is therefore reported `current`;
-  cite the symbols inside the module for body-level freshness. Removal/rename is
-  still correctly `unresolved`. Tracked in #206.
+- **Module/import body drift** — *detected since #206.* A node's content
+  comparison hashes its summary, which embeds the normalized source body for
+  **symbols** but is name-only for `Module`/`Import` records. Those two kinds now
+  additionally carry an additive `content_signature` — a compact BLAKE3 handle
+  over the normalized body — folded into the content-hash trigger, so an inline
+  `mod foo { .. }` or `use …;` body change with an unchanged name/path is now
+  reported `drifted`. Residual: an out-of-line `mod foo;` declaration hashes only
+  `mod foo;`, so a body change in the *target* file surfaces via that file's own
+  symbol records (not the `mod` node); and semantic-drift records still skip
+  Module/Import (a separate embeddings mechanism). Removal/rename remains
+  correctly `unresolved`.
 
 ### Trigger sources (reused, never re-derived)
 
@@ -263,11 +268,15 @@ tombstoned or superseded citation edge is skipped.
 
 ### Known limitations
 
-- **Module / import content.** `Module` and `Import` nodes summarize to a name,
-  not normalized source, so a content-hash change cannot be observed for them.
-  Citations to a module/import are still flagged when the handle is removed
-  (`unresolved`) or a semantic-drift record names it, but a change *inside* a
-  module that leaves its name intact is not detected by the content-hash trigger.
+- **Module / import content** — *body drift detected since #206.* `Module` and
+  `Import` node summaries are name-only, so the summary alone cannot observe a
+  body change. These nodes now carry an additive `content_signature` (a compact
+  BLAKE3 handle over the normalized body) that is folded into the content-hash
+  trigger, so a change *inside* an inline module or a `use …;` declaration that
+  leaves the name intact is detected as `drifted`. Residual gaps: an out-of-line
+  `mod foo;` only signs `mod foo;` (the external file's own symbol records carry
+  its body), and semantic-drift records still skip these kinds. Removed handles
+  remain correctly `unresolved`.
 - **Span relocation.** A symbol moved without any content change (e.g. lines
   inserted above it) is **not** treated as drift: the observation about what the
   code does is still accurate, and flagging pure relocations would manufacture

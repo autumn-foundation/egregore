@@ -86,6 +86,56 @@ fn file_version(
     .with_temporal(temporal(commit, valid_time))
 }
 
+/// Builds a Rust `Module` version pinned to a commit (issue #206). The display
+/// summary is name-only (`Rust module {name}`), so body drift is carried by the
+/// additive `content_signature` handle rather than the summary: two versions
+/// with the same name but different `signature` values hash differently, while
+/// the same `signature` hashes identically.
+fn module_version(
+    mod_id: &str,
+    path: &str,
+    name: &str,
+    mod_span: SourceSpan,
+    signature: &str,
+    commit: &str,
+    valid_time: &str,
+) -> GraphRecord {
+    GraphRecord::node(
+        mod_id.to_owned(),
+        NodeKind::Module,
+        Some(path.to_owned()),
+        Some(mod_span),
+        Some(name.to_owned()),
+        format!("Rust module {name}"),
+    )
+    .with_content_signature(signature.to_owned())
+    .with_temporal(temporal(commit, valid_time))
+}
+
+/// Builds a Rust `Import` version pinned to a commit (issue #206). Like
+/// [`module_version`], the summary is name-only and body drift rides on the
+/// additive `content_signature` handle.
+fn import_version(
+    import_id: &str,
+    path: &str,
+    name: &str,
+    import_span: SourceSpan,
+    signature: &str,
+    commit: &str,
+    valid_time: &str,
+) -> GraphRecord {
+    GraphRecord::node(
+        import_id.to_owned(),
+        NodeKind::Import,
+        Some(path.to_owned()),
+        Some(import_span),
+        Some(name.to_owned()),
+        format!("Rust import {name}"),
+    )
+    .with_content_signature(signature.to_owned())
+    .with_temporal(temporal(commit, valid_time))
+}
+
 /// Builds an agent `Observation` citing `target_id` at `anchor_commit`.
 #[allow(clippy::too_many_arguments)]
 fn observation(
@@ -1825,6 +1875,290 @@ fn backdated_child_commit_content_change_drifts() {
         entry.triggering_handle,
         Some(freshness::TriggeringHandle::ContentChange { .. })
     ));
+}
+
+// ── Module / Import body drift via content_signature (issue #206) ────────────
+
+#[test]
+fn module_body_change_is_detected_as_drift() {
+    // A Rust `Module` whose inline body changed while its name/path stayed
+    // fixed. The display summary is name-only, so before #206 both versions
+    // hashed identically and freshness falsely reported `current`. The additive
+    // `content_signature` now differs between the versions, so the body edit
+    // must surface as a `drifted` ContentChange.
+    let path = "src/m.rs";
+    let module = stable_id(&["node", "module", "repo-a", path, "my_mod"]);
+    let anchor = module_version(
+        &module,
+        path,
+        "my_mod",
+        span(1, 20),
+        "blake3:module-body-v1",
+        "commit_a",
+        "2026-01-01T00:00:00Z",
+    );
+    let frontier = module_version(
+        &module,
+        path,
+        "my_mod",
+        span(1, 22),
+        "blake3:module-body-v2",
+        "commit_b",
+        "2026-03-01T00:00:00Z",
+    );
+    let obs = agent_memory_stable_id(&["obs", "module_body"]);
+    let records = vec![
+        anchor,
+        frontier,
+        observation(
+            &obs,
+            "my_mod gates the parser behind cfg(test)",
+            "0.9",
+            Some(&module),
+            Some(path),
+            Some(span(1, 20)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs)
+        .expect("verdict for obs");
+    assert_eq!(entry.verdict, FreshnessVerdict::Drifted);
+    assert!(matches!(
+        entry.triggering_handle,
+        Some(freshness::TriggeringHandle::ContentChange { .. })
+    ));
+}
+
+#[test]
+fn import_body_change_is_detected_as_drift() {
+    // A Rust `Import` whose `use ...;` declaration changed (e.g. an added path
+    // segment / alias) while the bound name stayed the same. The name-only
+    // summary hides it; the differing `content_signature` surfaces the drift.
+    let path = "src/i.rs";
+    let import = stable_id(&["node", "import", "repo-a", path, "BTreeMap"]);
+    let anchor = import_version(
+        &import,
+        path,
+        "BTreeMap",
+        span(1, 1),
+        "blake3:import-body-v1",
+        "commit_a",
+        "2026-01-01T00:00:00Z",
+    );
+    let frontier = import_version(
+        &import,
+        path,
+        "BTreeMap",
+        span(1, 1),
+        "blake3:import-body-v2",
+        "commit_b",
+        "2026-03-01T00:00:00Z",
+    );
+    let obs = agent_memory_stable_id(&["obs", "import_body"]);
+    let records = vec![
+        anchor,
+        frontier,
+        observation(
+            &obs,
+            "imports BTreeMap from std::collections",
+            "0.9",
+            Some(&import),
+            Some(path),
+            Some(span(1, 1)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs)
+        .expect("verdict for obs");
+    assert_eq!(entry.verdict, FreshnessVerdict::Drifted);
+    assert!(matches!(
+        entry.triggering_handle,
+        Some(freshness::TriggeringHandle::ContentChange { .. })
+    ));
+}
+
+#[test]
+fn unchanged_module_import_bodies_stay_current() {
+    // Regression / no-false-positive guard: a `Module` and an `Import` whose
+    // bodies are UNCHANGED between anchor and frontier (same
+    // `content_signature`) must stay `current`. Folding `content_signature`
+    // into the content hash must not flip an unchanged body to `drifted`.
+    let mpath = "src/mu.rs";
+    let module = stable_id(&["node", "module", "repo-a", mpath, "stable_mod"]);
+    let ipath = "src/iu.rs";
+    let import = stable_id(&["node", "import", "repo-a", ipath, "HashMap"]);
+
+    let obs_mod = agent_memory_stable_id(&["obs", "module_unchanged"]);
+    let obs_import = agent_memory_stable_id(&["obs", "import_unchanged"]);
+    let records = vec![
+        module_version(
+            &module,
+            mpath,
+            "stable_mod",
+            span(1, 20),
+            "blake3:same-module-body",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        module_version(
+            &module,
+            mpath,
+            "stable_mod",
+            span(1, 20),
+            "blake3:same-module-body",
+            "commit_b",
+            "2026-03-01T00:00:00Z",
+        ),
+        import_version(
+            &import,
+            ipath,
+            "HashMap",
+            span(1, 1),
+            "blake3:same-import-body",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        import_version(
+            &import,
+            ipath,
+            "HashMap",
+            span(1, 1),
+            "blake3:same-import-body",
+            "commit_b",
+            "2026-03-01T00:00:00Z",
+        ),
+        observation(
+            &obs_mod,
+            "stable_mod groups the adapters",
+            "0.9",
+            Some(&module),
+            Some(mpath),
+            Some(span(1, 20)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+        observation(
+            &obs_import,
+            "imports HashMap",
+            "0.9",
+            Some(&import),
+            Some(ipath),
+            Some(span(1, 1)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    for obs in [&obs_mod, &obs_import] {
+        let entry = verdicts
+            .iter()
+            .find(|e| &e.observation_id == obs)
+            .expect("verdict for obs");
+        assert_eq!(entry.verdict, FreshnessVerdict::Current);
+        assert!(entry.triggering_handle.is_none());
+    }
+}
+
+#[test]
+fn symbol_hashing_is_unchanged_by_content_signature() {
+    // Symbols embed their normalized body in the summary and carry no
+    // `content_signature`, so their content hash — and thus their freshness
+    // verdicts — must be exactly what it was before #206: a body edit drifts, an
+    // unchanged body stays current.
+    let dpath = "src/sd.rs";
+    let drifted_sym = stable_id(&["node", "symbol", "fn", "repo-a", dpath, "f", "0"]);
+    let upath = "src/su.rs";
+    let stable_sym = stable_id(&["node", "symbol", "fn", "repo-a", upath, "g", "0"]);
+
+    let obs_drift = agent_memory_stable_id(&["obs", "sym_drift"]);
+    let obs_stable = agent_memory_stable_id(&["obs", "sym_stable"]);
+    let records = vec![
+        symbol_version(
+            &drifted_sym,
+            dpath,
+            "f",
+            span(1, 5),
+            "body_v1",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version(
+            &drifted_sym,
+            dpath,
+            "f",
+            span(1, 5),
+            "body_v2",
+            "commit_b",
+            "2026-03-01T00:00:00Z",
+        ),
+        symbol_version(
+            &stable_sym,
+            upath,
+            "g",
+            span(1, 5),
+            "body_same",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version(
+            &stable_sym,
+            upath,
+            "g",
+            span(1, 5),
+            "body_same",
+            "commit_b",
+            "2026-03-01T00:00:00Z",
+        ),
+        observation(
+            &obs_drift,
+            "f returns body_v1",
+            "0.9",
+            Some(&drifted_sym),
+            Some(dpath),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+        observation(
+            &obs_stable,
+            "g returns body_same",
+            "0.9",
+            Some(&stable_sym),
+            Some(upath),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let drift_entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs_drift)
+        .expect("verdict for drift obs");
+    assert_eq!(drift_entry.verdict, FreshnessVerdict::Drifted);
+    let stable_entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs_stable)
+        .expect("verdict for stable obs");
+    assert_eq!(stable_entry.verdict, FreshnessVerdict::Current);
 }
 
 // ── ingested_at anchors drift for legacy notes lacking observed_at ───────────

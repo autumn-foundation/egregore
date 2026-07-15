@@ -70,10 +70,19 @@ use crate::{
 /// serde-default, but a bump forces older caches to rebuild so reused per-file
 /// facts carry the verdict rather than defaulting it to `false`.
 ///
+/// v15 adds the `content_signature` field to Node records: Rust `Module` and
+/// `Import` nodes now carry a compact BLAKE3 handle over their normalized body
+/// so a body change with an unchanged name/path is content-detectable by
+/// evidence-freshness drift (issue #206). The field is serde-default, but an
+/// unchanged file served from an older cache would lack it and hash
+/// inconsistently against freshly-rebuilt neighbors, so the bump forces older
+/// caches to rebuild. (13/14 are reserved for concurrent lanes; this lane takes
+/// 15.)
+///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 12;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 15;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

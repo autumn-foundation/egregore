@@ -1424,14 +1424,26 @@ fn version_parents(record: &GraphRecord) -> &[String] {
 
 /// Content signature of a code-graph node version. The node summary embeds the
 /// normalized source body for symbols, so it is a stable, in-record content
-/// signal that requires no source re-read (read-only, AC8).
+/// signal that requires no source re-read (read-only, AC8). For nodes whose
+/// summary is name-only (Rust `Module` / `Import`, issue #206) the summary alone
+/// misses a body change; those nodes carry a `content_signature` handle over the
+/// normalized body, folded in here so a body edit flips the hash. The field is
+/// mixed in ONLY when present, so every record without it (every other kind)
+/// hashes byte-identically to before.
 fn content_hash(record: &GraphRecord) -> String {
-    let summary = match record {
-        GraphRecord::Node { summary, .. } => summary.as_str(),
-        _ => "",
+    let (summary, content_signature) = match record {
+        GraphRecord::Node {
+            summary,
+            content_signature,
+            ..
+        } => (summary.as_str(), content_signature.as_deref()),
+        _ => ("", None),
     };
     let mut hasher = blake3::Hasher::new();
     hasher.update(summary.as_bytes());
+    if let Some(signature) = content_signature {
+        hasher.update(signature.as_bytes());
+    }
     format!("blake3:{}", hasher.finalize().to_hex())
 }
 

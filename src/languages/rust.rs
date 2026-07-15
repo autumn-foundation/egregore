@@ -275,11 +275,14 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 "rust",
                 format!("Rust module {qualified_name}"),
             )
-            .with_declaration_surface(
-                Some(self.symbol_visibility(node).to_owned()),
-                None,
-                None,
-            ),
+            .with_declaration_surface(Some(self.symbol_visibility(node).to_owned()), None, None)
+            // The module summary is name-only, so a body change with an
+            // unchanged name would hash identically. Stamp a compact BLAKE3
+            // handle over the normalized body so evidence-freshness drift stays
+            // content-detectable (issue #206). Inline `mod foo { .. }` covers
+            // the whole body; out-of-line `mod foo;` covers just the
+            // declaration (the target file's own records carry its body).
+            .with_content_signature(content_signature(self.node_text(node))),
         );
         self.add_edge(
             EdgeLabel::Contains,
@@ -422,7 +425,13 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             name.clone(),
             "rust",
             format!("Rust import {name}"),
-        );
+        )
+        // The import summary is the bound name only, so a body change (glob
+        // expansion, alias, added path segment) with an unchanged bound name
+        // would hash identically. Stamp a compact BLAKE3 handle over the
+        // normalized `use ...;` declaration so evidence-freshness drift stays
+        // content-detectable (issue #206).
+        .with_content_signature(content_signature(self.node_text(node)));
         // Doc comments above a `use` declaration attach to the item rustdoc
         // exposes at the re-export site (issue #257); capture them as the
         // import's doc fact. Additive, never an identity input.
@@ -2443,6 +2452,17 @@ fn _path_for_error(path: &std::path::Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Compact BLAKE3 content signature over the normalized source body (issue
+/// #206). Used to stamp `Module` / `Import` nodes whose display `summary` is
+/// name-only so a body change with an unchanged name stays content-detectable by
+/// evidence-freshness drift. Deterministic: [`normalize_code`] is byte-stable,
+/// so CRLF and LF checkouts yield the same handle.
+#[must_use]
+pub fn content_signature(body: &str) -> String {
+    let normalized = normalize_code(body);
+    format!("blake3:{}", blake3::hash(normalized.as_bytes()).to_hex())
+}
+
 /// Normalizes source code by stripping comments and collapsing whitespace.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -4048,5 +4068,135 @@ mod tests {
             "only the comment marker may match; the string literal never does"
         );
         assert_eq!(markers[0].note(), Some("real marker"));
+    }
+
+    /// Extracts `source` and returns the graph records (issue #206 helpers).
+    fn extract_records(source: &str) -> Graph {
+        let file = SourceFile {
+            path: PathBuf::from("src/lib.rs"),
+            repo_relative_path: "src/lib.rs".to_owned(),
+        };
+        let mut graph = Graph::default();
+        extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        graph
+    }
+
+    fn find_node(graph: &Graph, want: NodeKind) -> &GraphRecord {
+        graph
+            .records()
+            .iter()
+            .find(|r| matches!(r, GraphRecord::Node { kind, .. } if *kind == want))
+            .expect("node of requested kind present")
+    }
+
+    #[test]
+    fn module_and_import_carry_deterministic_content_signature() {
+        // Module and Import summaries are name-only (issue #206), so the
+        // extractor stamps a compact BLAKE3 body signature. It must be present,
+        // well-formed, and byte-stable across identical extractions.
+        let source = "\
+use std::collections::BTreeMap;
+
+pub mod inner {
+    pub fn helper() -> u32 {
+        1
+    }
+}
+";
+        let graph = extract_records(source);
+        let module = find_node(&graph, NodeKind::Module);
+        let import = find_node(&graph, NodeKind::Import);
+
+        let module_sig = module
+            .content_signature()
+            .expect("module content_signature");
+        let import_sig = import
+            .content_signature()
+            .expect("import content_signature");
+        assert!(module_sig.starts_with("blake3:"));
+        assert!(import_sig.starts_with("blake3:"));
+
+        // Deterministic: re-extracting identical source yields identical handles.
+        let graph2 = extract_records(source);
+        assert_eq!(
+            find_node(&graph2, NodeKind::Module).content_signature(),
+            Some(module_sig)
+        );
+        assert_eq!(
+            find_node(&graph2, NodeKind::Import).content_signature(),
+            Some(import_sig)
+        );
+    }
+
+    #[test]
+    fn content_signature_changes_with_module_and_import_body() {
+        // A module body edit and an import declaration edit — both leaving the
+        // name/bound-name unchanged — must produce different content signatures,
+        // which is exactly what makes the drift detectable (issue #206).
+        let base = "\
+use std::collections::BTreeMap;
+
+pub mod inner {
+    pub fn helper() -> u32 {
+        1
+    }
+}
+";
+        let changed_mod = "\
+use std::collections::BTreeMap;
+
+pub mod inner {
+    pub fn helper() -> u32 {
+        2
+    }
+}
+";
+        let changed_import = "\
+use std::collections::BTreeMap as Map;
+
+pub mod inner {
+    pub fn helper() -> u32 {
+        1
+    }
+}
+";
+        let base_graph = extract_records(base);
+        let base_mod = find_node(&base_graph, NodeKind::Module)
+            .content_signature()
+            .expect("sig")
+            .to_owned();
+        let base_import = find_node(&base_graph, NodeKind::Import)
+            .content_signature()
+            .expect("sig")
+            .to_owned();
+
+        let mod_graph = extract_records(changed_mod);
+        assert_ne!(
+            find_node(&mod_graph, NodeKind::Module).content_signature(),
+            Some(base_mod.as_str()),
+            "changed module body must change the signature"
+        );
+
+        let import_graph = extract_records(changed_import);
+        assert_ne!(
+            find_node(&import_graph, NodeKind::Import).content_signature(),
+            Some(base_import.as_str()),
+            "changed import declaration must change the signature"
+        );
+    }
+
+    #[test]
+    fn non_module_import_nodes_have_no_content_signature() {
+        // content_signature is scoped to Module/Import; other kinds (Symbols,
+        // whose summary already embeds the normalized body) leave it None so
+        // their content hash stays byte-unchanged (issue #206). The File node is
+        // minted upstream of this extractor and likewise never carries one.
+        let source = "pub fn f() -> u32 {\n    1\n}\n";
+        let graph = extract_records(source);
+        assert_eq!(
+            find_node(&graph, NodeKind::Symbol).content_signature(),
+            None
+        );
     }
 }
