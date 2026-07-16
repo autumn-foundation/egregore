@@ -295,6 +295,11 @@ cargo run -- query churn --graph history.graph.jsonl               # exit 0, ran
 cargo run -- query churn --graph history.graph.jsonl --limit 10    # cap output (default 50, max 500)
 cargo run -- query churn --graph graph.jsonl                       # exit 2 (no_history: not a history store)
 
+# Symbol dormancy triage: least-recent last change first (issue #219)
+cargo run -- query recency --graph history.graph.jsonl             # exit 0, most dormant first
+cargo run -- query recency --graph history.graph.jsonl --limit 10  # cap output (default 50, max 500)
+cargo run -- query recency --graph graph.jsonl                     # exit 2 (no_history: current-tree scan)
+
 # Producer-identity drift audit against the current binary (issue #234)
 cargo run -- query producer-drift --graph graph.jsonl                  # exit 0 (even with drift)
 cargo run -- query producer-drift --data-dir .egregore --repo acme/widget  # scope one repo; bad selector exits 1
@@ -721,6 +726,27 @@ record ID, the repo-relative path, the integer commit count, and the inclusive c
 used. Ordering is deterministic (ties break on repo-relative path) and byte-identical across
 runs; untracked or ignored paths never appear. The answer states explicitly whether `--limit`
 truncated it. See `docs/cli/churn.md`.
+
+`eg query recency <symbol-scope>` ranks a repository's indexed symbols by LEAST-recent last
+change — most dormant first — over a `scan-history` graph/store (issue #219), the
+dormancy-triage lane. Each row carries the stable `Symbol` record ID + name (ADR-0004 identity,
+never keyed by name so same-name symbols never collapse), the repo-relative path + span at the
+last-change commit, the last-change commit SHA + valid time, and a dormancy span (seconds and
+whole days) computed as `anchor.valid_time − last_change.valid_time`. A symbol's last change is
+the highest-topological-rank commit at which its body differs from its parent snapshot or at
+which it was introduced (reusing the #96/#215 lifeline change-detection). Dormancy is measured
+against the NEWEST INDEXED COMMIT per repository (highest topological rank, SHA-ascending
+tie-break — the same anchor `eg query churn` uses for `last_commit`), NEVER wall-clock "now", so
+a symbol changed at the anchor commit has dormancy 0 and the ranking is byte-identical across
+replays. Ordering is deterministic: `dormancy_seconds` descending, then last-change commit
+topological rank ascending, then repo-relative path ascending, then record ID ascending. Both
+endpoints parse as UTC instants, never raw string order. Live (non-tombstoned) symbols only — a
+deleted symbol is gone, not dormant. Honesty contract: a current-tree-only `eg scan` graph
+carries no `Commit` nodes, so recency is UNAVAILABLE (`no_history`, exit 2) rather than implying
+every symbol is brand-new; commits present but no attributable symbols is `no_match` (exit 2).
+Works over `--graph` and `--data-dir`, honors `--repo` scoping with per-repository anchors (no
+cross-repo bleed), and rejects `--limit` outside 1..=500 (`invalid_limit`, exit 1). Read-only,
+deterministic, `--format text` view available. See `docs/cli/recency.md`.
 
 `eg query producer-drift` audits stored producer identity against the running binary
 (issue #234): every code-graph record whose recorded `egregore_version` and/or grammar

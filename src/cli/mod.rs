@@ -48,6 +48,7 @@ mod producer_drift;
 mod protected;
 mod public_api;
 mod public_api_deltas;
+mod recency;
 mod records;
 mod repair_cmd;
 mod resolve_frames;
@@ -114,6 +115,7 @@ pub(crate) use producer_drift::*;
 pub(crate) use protected::*;
 pub(crate) use public_api::*;
 pub(crate) use public_api_deltas::*;
+pub(crate) use recency::*;
 pub(crate) use records::*;
 pub(crate) use repair_cmd::*;
 pub(crate) use resolve_frames::*;
@@ -2560,6 +2562,47 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Rank indexed symbols by least-recent last change across commit history (issue #219).
+    ///
+    /// Over a temporal store produced by `eg scan-history`, returns symbols
+    /// ranked by least-recent last change — most dormant first — the
+    /// dormancy-triage signal. Each row carries the stable `Symbol` record ID
+    /// and name, the repo-relative path and span, the last-change commit SHA
+    /// and its valid time, and a dormancy span (seconds and whole days)
+    /// measured against the **newest indexed commit per repository**, never
+    /// wall-clock "now". Only live (non-tombstoned) symbols with an
+    /// attributable last change can rank.
+    ///
+    /// Ordering is deterministic and byte-stable: dormancy descending (most
+    /// dormant first), then last-change commit topological rank ascending, then
+    /// repo-relative path ascending, then record ID ascending. The answer
+    /// states explicitly whether `--limit` truncated it.
+    ///
+    /// Exit codes:
+    ///   0 — ranking returned.
+    ///   1 — load error, invalid --limit, unknown/ambiguous --repo selector.
+    ///   2 — no commit history in scope (`no_history`, the honesty case for a
+    ///       current-tree-only scan) or no attributable symbols (`no_match`).
+    ///
+    /// Documented in `docs/cli/recency.md`.
+    Recency {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the ranking to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum ranked symbols returned (default 50, max 500). Values
+        /// outside 1..=500 are rejected with an `invalid_limit` diagnostic.
+        #[arg(long, default_value_t = query::RECENCY_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -4133,6 +4176,35 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_churn_cmd(&records, selected.as_deref(), limit, format)
+        }
+        QuerySubcommand::Recency {
+            graph,
+            data_dir,
+            repo,
+            limit,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic.
+            if limit == 0 || limit > query::RECENCY_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::RECENCY_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {} (default {})",
+                        query::RECENCY_MAX_LIMIT,
+                        query::RECENCY_DEFAULT_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_recency_cmd(&records, selected.as_deref(), limit, format)
         }
         QuerySubcommand::Symbol {
             name,
