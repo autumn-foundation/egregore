@@ -137,6 +137,13 @@ struct RustExtractor<'graph, 'source> {
     module_names: Vec<String>,
     owner_ids: Vec<String>,
     impl_context: Option<ImplContext>,
+    /// Simple name of the `trait` body currently being walked, if any (issue
+    /// #390). A trait method carries no `impl_context` (trait bodies establish
+    /// none), so this is what threads the enclosing trait name into a trait
+    /// method's `match_segments` (`Device::read`) and flags it as a trait
+    /// method. Set on entering a `trait_item`, restored on exit, mirroring how
+    /// `impl_context` is managed.
+    trait_context: Option<String>,
     definitions: BTreeMap<String, String>,
     /// Module-qualified names only (`m::T`; root items bare), restricted to
     /// symbols that can be IMPLEMENTS targets — never the bare-name aliases
@@ -222,6 +229,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             module_names: file_module_path(&file.repo_relative_path),
             owner_ids: vec![file_id.to_owned()],
             impl_context: None,
+            trait_context: None,
             definitions: BTreeMap::new(),
             qualified_definitions: BTreeMap::new(),
             type_definitions: BTreeMap::new(),
@@ -518,6 +526,10 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let id = self.add_symbol(node, symbol_kind, &qualified_name);
         self.definitions.insert(local_name.clone(), id.clone());
         self.definitions.insert(qualified_name.clone(), id.clone());
+        // A trait body's simple name threads into its methods' match segments
+        // and trait-method marker (issue #390). Capture it before `local_name`
+        // is potentially moved into the impl-target key spaces below.
+        let trait_name = (symbol_kind == "trait").then(|| local_name.clone());
         // Only symbols that can be IMPLEMENTS targets enter the impl-lookup
         // key spaces: value-namespace items (`const`, `static`, functions)
         // must never shadow a trait or type in impl trait resolution.
@@ -536,7 +548,40 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 .insert(qualified_name, id.clone());
             self.type_definitions.insert(local_name, id);
         }
-        self.walk_children(node);
+        // Establish the trait body scope while walking its methods, restoring
+        // the previous context on exit (mirrors `impl_context` management).
+        if let Some(trait_name) = trait_name {
+            let previous = self.trait_context.replace(trait_name);
+            self.walk_children(node);
+            self.trait_context = previous;
+        } else {
+            self.walk_children(node);
+        }
+    }
+
+    /// True when `node` (a `function_item` or `function_signature_item`) is a
+    /// DIRECT structural member of the enclosing `trait` body — its immediate
+    /// declaration list belongs to the `trait_item` — and NOT a function
+    /// nested deeper inside a trait method's body (issue #390).
+    ///
+    /// Trait-method attribution (the `is_trait_method` marker and the
+    /// enclosing-trait owner segment in `match_segments`) rides on this exact
+    /// structural position — a true peer of an impl method being the direct
+    /// member of its `impl_item` — rather than the broad persistent
+    /// `trait_context` flag. The flag stays `Some` while descending into a
+    /// trait method's body, so a block-local `fn helper` inside a default
+    /// method would otherwise be mis-marked a trait method and drop its bare
+    /// call site (prefer a MISSING edge over a WRONG one, so also prefer no
+    /// wrong exclusion). An impl always sets `impl_context`, so an impl method
+    /// (even nested in a trait default body) never satisfies this.
+    fn is_direct_trait_method(&self, node: Node<'_>) -> bool {
+        self.impl_context.is_none()
+            && self.trait_context.is_some()
+            && node
+                .parent()
+                .filter(|parent| parent.kind() == "declaration_list")
+                .and_then(|parent| parent.parent())
+                .is_some_and(|grandparent| grandparent.kind() == "trait_item")
     }
 
     fn extract_function(&mut self, node: Node<'_>) {
@@ -566,12 +611,14 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let id = self.add_symbol(node, symbol_kind, &qualified_name);
         self.definitions.insert(local_name.clone(), id.clone());
         self.definitions.insert(qualified_name.clone(), id.clone());
+        let is_trait_method = self.is_direct_trait_method(node);
         self.facts.definitions.push(DefinitionFact {
             id: id.clone(),
             qualified_name: qualified_name.clone(),
             simple_name: local_name.clone(),
-            match_segments: self.definition_match_segments(&local_name),
+            match_segments: self.definition_match_segments(&local_name, is_trait_method),
             symbol_kind: symbol_kind.to_owned(),
+            is_trait_method,
             repo_relative_path: self.file.repo_relative_path.clone(),
         });
         self.collect_call_sites(node, &id, &qualified_name);
@@ -591,13 +638,28 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     /// Match segments for a callable definition: the module path, plus the
-    /// normalized impl owner for methods, plus the simple name.
-    fn definition_match_segments(&self, local_name: &str) -> Vec<String> {
+    /// normalized impl owner for methods (or the enclosing trait name for a
+    /// DIRECT trait method — issue #390), plus the simple name.
+    ///
+    /// `is_trait_method` is the caller's structural verdict from
+    /// [`is_direct_trait_method`](Self::is_direct_trait_method): the enclosing
+    /// trait name is pushed ONLY for a function that is a direct member of the
+    /// trait body, never a block-local `fn` nested inside a trait method (which
+    /// is a free function whose owner is its module).
+    fn definition_match_segments(&self, local_name: &str, is_trait_method: bool) -> Vec<String> {
         let mut segments = self.module_names.clone();
-        if let Some(impl_context) = &self.impl_context
-            && let Some(owner) = normalize_impl_owner(&impl_context.method_owner)
-        {
-            segments.push(owner);
+        if let Some(impl_context) = &self.impl_context {
+            if let Some(owner) = normalize_impl_owner(&impl_context.method_owner) {
+                segments.push(owner);
+            }
+        } else if let Some(trait_name) = self.trait_context.as_ref().filter(|_| is_trait_method) {
+            // A trait method's owner segment is the enclosing trait, so a
+            // `Device::read` path call name-resolves to it (issue #390). The
+            // last segment stays the bare method name for the `Method` pool.
+            // Gated on DIRECT trait membership (`is_trait_method`), never the
+            // broad persistent `trait_context`, so a block-local `fn` nested
+            // in a trait method stays a free function.
+            segments.push(trait_name.clone());
         }
         segments.push(local_name.to_owned());
         segments
@@ -661,9 +723,24 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                     .is_some_and(|value| value.kind() == "self");
                 let owner = receiver_is_self
                     .then(|| {
-                        self.impl_context.as_ref().and_then(|impl_context| {
-                            normalize_impl_owner(&impl_context.method_owner)
-                        })
+                        // A `self.method()` receiver call carries the owner of
+                        // the enclosing `Self` so the SelfMethod branch can
+                        // narrow to it: the impl owner inside an impl block
+                        // (unchanged), else the enclosing trait name inside a
+                        // trait body (issue #390). Inside a trait there is no
+                        // `impl_context`, so before this the owner was None and
+                        // the call collapsed to a plain `Method` that fanned out
+                        // to every same-named trait method. `impl_context` takes
+                        // precedence when both are set (a nested impl inside a
+                        // trait default body). The trait name is the raw
+                        // `trait_context` string, matching the trait-method
+                        // owner segment in `definition_match_segments`.
+                        self.impl_context
+                            .as_ref()
+                            .and_then(|impl_context| {
+                                normalize_impl_owner(&impl_context.method_owner)
+                            })
+                            .or_else(|| self.trait_context.clone())
                     })
                     .flatten();
                 let call_kind = if owner.is_some() {
@@ -711,6 +788,19 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 .and_then(|impl_context| normalize_impl_owner(&impl_context.method_owner))
             {
                 segments.insert(0, owner);
+            } else if let Some(trait_name) = &self.trait_context {
+                // Inside a trait body there is no `impl_context`, so a
+                // `Self::make()` call in a default method names the trait's OWN
+                // associated item: substitute the enclosing trait as the owner
+                // (issue #390), `["make"]` -> `["T", "make"]`. The existing
+                // multi-segment `Path` suffix match then binds it to the trait
+                // method's `["T", "make"]` segments. `impl_context` still takes
+                // precedence when set. Because the match is an exact suffix,
+                // this only mints an edge when `T::make` actually exists —
+                // `Self::other()` with no `other` on the trait stays
+                // unresolved, and it can never bind a free function `make`
+                // (`["make"]`) nor another trait's `U::make` (`["U", "make"]`).
+                segments.insert(0, trait_name.clone());
             }
         }
         (!segments.is_empty()).then_some(segments)
@@ -1010,12 +1100,14 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let id = self.add_symbol(node, "function", &qualified_name);
         self.definitions.insert(local_name.clone(), id.clone());
         self.definitions.insert(qualified_name.clone(), id.clone());
+        let is_trait_method = self.is_direct_trait_method(node);
         self.facts.definitions.push(DefinitionFact {
             id,
             qualified_name: qualified_name.clone(),
             simple_name: local_name.clone(),
-            match_segments: self.definition_match_segments(&local_name),
+            match_segments: self.definition_match_segments(&local_name, is_trait_method),
             symbol_kind: "function".to_owned(),
+            is_trait_method,
             repo_relative_path: self.file.repo_relative_path.clone(),
         });
         // No `SymbolBody` and no `collect_call_sites`: a signature-only

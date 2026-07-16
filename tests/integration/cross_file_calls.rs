@@ -363,6 +363,618 @@ fn incremental_scan_emits_and_retires_cross_file_call_edges() {
     );
 }
 
+// --- Trait-method call resolution (issue #390) -----------------------------
+
+#[test]
+fn scan_binds_trait_qualified_path_and_receiver_calls_to_trait_methods() {
+    // Both a signature-only (`read`) and a default-bodied (`name`) trait
+    // method must be reachable by a trait-qualified `Device::m()` path call
+    // and by a `x.m()` receiver call, across a file boundary.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait Device {\n    fn read(&self) -> u32;\n    fn name(&self) -> u32 {\n        7\n    }\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub fn path_caller() -> u32 {\n    Device::read() + Device::name()\n}\n\npub fn receiver_caller(d: &crate::alpha::Device) -> u32 {\n    d.read() + d.name()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    // Trait methods keep kind "function" and their trait-free qualified name.
+    let read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let name = symbol_id(&records, "function", "alpha::name", "src/alpha.rs");
+    let path_caller = symbol_id(&records, "function", "beta::path_caller", "src/beta.rs");
+    let receiver_caller = symbol_id(&records, "function", "beta::receiver_caller", "src/beta.rs");
+
+    // `Device::read()` / `Device::name()` path calls narrow to the exact
+    // trait method (unique → resolved).
+    assert_calls_edge_with_resolution(&records, &path_caller, &read, "resolved");
+    assert_calls_edge_with_resolution(&records, &path_caller, &name, "resolved");
+    // `d.read()` / `d.name()` receiver calls reach the trait methods too.
+    assert_calls_edge_with_resolution(&records, &receiver_caller, &read, "resolved");
+    assert_calls_edge_with_resolution(&records, &receiver_caller, &name, "resolved");
+}
+
+#[test]
+fn bare_call_never_binds_a_trait_method() {
+    // NO-WRONG-EDGE: a bare `read()` (`Direct`) can never invoke a trait
+    // method. It must resolve to a Diagnostic (unresolved), never the trait
+    // method Symbol — the corollary false-bind closure.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait Device {\n    fn read(&self) -> u32;\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub fn bare_caller() -> u32 {\n    read()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let bare_caller = symbol_id(&records, "function", "beta::bare_caller", "src/beta.rs");
+
+    assert!(
+        calls_edge(&records, &bare_caller, &read).is_none(),
+        "a bare read() call must not false-bind the trait method"
+    );
+    // It is honestly unresolved against a Diagnostic instead.
+    let diagnostic = records
+        .iter()
+        .find(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Diagnostic"
+                && record["name"] == "read"
+                && record["repo_relative_path"] == "src/beta.rs"
+        })
+        .expect("bare unresolved call should emit a Diagnostic node");
+    let diagnostic_id = diagnostic["id"].as_str().expect("diagnostic id");
+    assert_calls_edge_with_resolution(&records, &bare_caller, diagnostic_id, "unresolved");
+}
+
+#[test]
+fn trait_qualified_path_binds_only_the_named_trait() {
+    // NO-WRONG-EDGE: `Aa::read()` with two traits `Aa` and `Bb` each
+    // declaring `read`, plus an unrelated free function `read`, binds ONLY
+    // `Aa::read` (exact owner suffix) — never `Bb::read`, never the free fn.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait Aa {\n    fn read(&self) -> u32;\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "pub trait Bb {\n    fn read(&self) -> u32;\n}\n",
+            ),
+            ("src/delta.rs", "pub fn read() -> u32 {\n    0\n}\n"),
+            (
+                "src/beta.rs",
+                "pub fn caller() -> u32 {\n    Aa::read()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let aa_read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let bb_read = symbol_id(&records, "function", "gamma::read", "src/gamma.rs");
+    let free_read = symbol_id(&records, "function", "delta::read", "src/delta.rs");
+    let caller = symbol_id(&records, "function", "beta::caller", "src/beta.rs");
+
+    assert_calls_edge_with_resolution(&records, &caller, &aa_read, "resolved");
+    assert!(
+        calls_edge(&records, &caller, &bb_read).is_none(),
+        "Aa::read() must not bind the differently-named trait Bb::read"
+    );
+    assert!(
+        calls_edge(&records, &caller, &free_read).is_none(),
+        "Aa::read() must not bind an unrelated free function read"
+    );
+}
+
+#[test]
+fn receiver_call_to_two_trait_methods_is_ambiguous_to_both() {
+    // NO-WRONG-EDGE: a `x.read()` receiver call where two traits declare
+    // `read` fans out to BOTH as ambiguous labeled edges — never a silent
+    // winner.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait Aa {\n    fn read(&self) -> u32;\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "pub trait Bb {\n    fn read(&self) -> u32;\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub fn caller(x: &u32) -> u32 {\n    x.read()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let aa_read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let bb_read = symbol_id(&records, "function", "gamma::read", "src/gamma.rs");
+    let caller = symbol_id(&records, "function", "beta::caller", "src/beta.rs");
+
+    assert_calls_edge_with_resolution(&records, &caller, &aa_read, "ambiguous");
+    assert_calls_edge_with_resolution(&records, &caller, &bb_read, "ambiguous");
+}
+
+#[test]
+fn receiver_call_with_no_matching_method_invents_no_edge() {
+    // NO-WRONG-EDGE: a `x.write()` receiver call with no in-repo `write`
+    // definition mints no edge and no Diagnostic (external by construction).
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait Device {\n    fn read(&self) -> u32;\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub fn caller(x: &u32) -> u32 {\n    x.write()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let caller = symbol_id(&records, "function", "beta::caller", "src/beta.rs");
+
+    assert!(
+        calls_edge(&records, &caller, &read).is_none(),
+        "x.write() must not bind the unrelated trait method read"
+    );
+    // A receiver call with no candidate is external — no Diagnostic either.
+    assert!(
+        !records.iter().any(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Diagnostic"
+                && record["name"] == "write"
+        }),
+        "an unresolved receiver method call must not emit a Diagnostic node"
+    );
+}
+
+#[test]
+fn trait_method_call_edges_are_byte_stable_across_repeated_scans() {
+    // Determinism guard for the new trait-method recall + ambiguity paths.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait Aa {\n    fn read(&self) -> u32;\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "pub trait Bb {\n    fn read(&self) -> u32;\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub fn path_caller() -> u32 {\n    Aa::read()\n}\npub fn receiver_caller(x: &u32) -> u32 {\n    x.read()\n}\n",
+            ),
+        ],
+    );
+
+    let first = scan_repository_at_with_override(repo, FIXED_TIME, Some(REPO_ID))
+        .expect("fixture repo should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    for run in 2..=5 {
+        let next = scan_repository_at_with_override(repo, FIXED_TIME, Some(REPO_ID))
+            .expect("fixture repo should rescan")
+            .to_jsonl()
+            .expect("graph should reserialize");
+        assert_eq!(first, next, "scan {run} must be byte-identical to scan 1");
+    }
+    assert!(
+        first.contains(r#""resolution":"resolved""#)
+            && first.contains(r#""resolution":"ambiguous""#),
+        "stability check must cover the resolved and ambiguous trait-method paths: {first}"
+    );
+}
+
+// --- Trait-method attribution is DIRECT-membership only (issue #390) --------
+
+#[test]
+fn block_local_fn_in_a_trait_method_body_resolves_its_bare_call() {
+    // REGRESSION (issue #390): a `fn helper` defined block-local inside a
+    // default trait method body is a FREE function, not a trait method. The
+    // walker is still under `trait_context` while descending into the method
+    // body, so gating trait-method attribution on the broad flag would mark
+    // `helper` `is_trait_method` and drop its legal bare `helper()` call as
+    // unresolved. Attribution must ride DIRECT structural trait membership, so
+    // the bare call RESOLVES to the local function.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[(
+            "src/alpha.rs",
+            "pub trait T {\n    fn f(&self) -> u32 {\n        fn helper() -> u32 {\n            3\n        }\n        helper()\n    }\n}\n",
+        )],
+    );
+
+    let records = scan_fixture(repo);
+    // The block-local helper is a plain free function (module-qualified name,
+    // NOT `alpha::T::helper`).
+    let helper = symbol_id(&records, "function", "alpha::helper", "src/alpha.rs");
+    let f = symbol_id(&records, "function", "alpha::f", "src/alpha.rs");
+
+    // The bare `helper()` call binds the local free function — never dropped.
+    assert_calls_edge_with_resolution(&records, &f, &helper, "resolved");
+    // And it is NOT recorded unresolved against a Diagnostic.
+    assert!(
+        !records.iter().any(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Diagnostic"
+                && record["name"] == "helper"
+                && record["repo_relative_path"] == "src/alpha.rs"
+        }),
+        "the block-local helper() call must resolve, not emit an unresolved Diagnostic"
+    );
+}
+
+#[test]
+fn block_local_fn_in_a_trait_method_is_not_a_trait_method_target() {
+    // The block-local `helper` must NOT receive the enclosing trait as an
+    // owner segment: a `T::helper()` trait-qualified path call must therefore
+    // find NO candidate (helper's segments are `[alpha, helper]`, not
+    // `[alpha, T, helper]`), proving it was not mis-attributed as a trait
+    // method. No-wrong-edge in the other direction.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn f(&self) -> u32 {\n        fn helper() -> u32 {\n            3\n        }\n        helper()\n    }\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub fn caller() -> u32 {\n    crate::alpha::T::helper()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let helper = symbol_id(&records, "function", "alpha::helper", "src/alpha.rs");
+    let caller = symbol_id(&records, "function", "beta::caller", "src/beta.rs");
+
+    assert!(
+        calls_edge(&records, &caller, &helper).is_none(),
+        "T::helper() must not bind a block-local free function as a trait method"
+    );
+}
+
+#[test]
+fn block_local_fn_in_an_impl_method_body_is_unchanged_by_the_trait_fix() {
+    // SYMMETRIC-BREAKAGE GUARD: the trait-attribution change is gated on
+    // `impl_context.is_none()`, so an impl method's own attribution is never
+    // touched. A block-local `fn helper` inside an impl method keeps its
+    // pre-existing impl-scoped attribution (`method`, owner `S`) — the trait
+    // fix does not leak into the impl path and does not mark it a trait
+    // method. (The impl path carries its own latent nested-item behavior,
+    // out of scope for this trait regression.)
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[(
+            "src/alpha.rs",
+            "pub struct S;\nimpl S {\n    pub fn m(&self) -> u32 {\n        fn helper() -> u32 {\n            5\n        }\n        helper()\n    }\n}\n",
+        )],
+    );
+
+    let records = scan_fixture(repo);
+    // Unchanged impl-scoped attribution: helper stays a `method` under S.
+    let helper = symbol_id(&records, "method", "alpha::S::helper", "src/alpha.rs");
+    // It is a distinct symbol from the impl method `m`.
+    let m = symbol_id(&records, "method", "alpha::S::m", "src/alpha.rs");
+    assert_ne!(helper, m, "the nested helper is a distinct symbol from m");
+    // The direct impl method `m` is present and correctly a method under S.
+    assert!(
+        !records.iter().any(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Symbol"
+                && record["symbol_kind"] == "function"
+                && record["name"] == "alpha::S::helper"
+        }),
+        "the trait fix must not reclassify the impl-nested helper"
+    );
+}
+
+// --- In-trait `Self::` calls carry the trait owner (issue #390) -------------
+
+#[test]
+fn in_trait_self_call_resolves_to_the_trait_associated_fn() {
+    // REGRESSION (issue #390): a `Self::make()` call inside a default trait
+    // method names the trait's OWN associated fn. In a trait body there is no
+    // `impl_context`, so before the fix `Self` was stripped with no owner
+    // substituted, collapsing the call to `["make"]` — which the tightened
+    // free-function pool (trait methods excluded) no longer binds. Substitute
+    // the enclosing trait as the owner so `Self::make()` -> `["T","make"]`
+    // resolves to the trait method via the multi-segment suffix match.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[(
+            "src/alpha.rs",
+            "pub trait T {\n    fn make() -> u32;\n    fn f(&self) -> u32 {\n        Self::make()\n    }\n}\n",
+        )],
+    );
+
+    let records = scan_fixture(repo);
+    let make = symbol_id(&records, "function", "alpha::make", "src/alpha.rs");
+    let f = symbol_id(&records, "function", "alpha::f", "src/alpha.rs");
+
+    assert_calls_edge_with_resolution(&records, &f, &make, "resolved");
+}
+
+#[test]
+fn in_trait_self_call_mints_no_wrong_edge() {
+    // NO-WRONG-EDGE: `Self::make()` in trait T binds ONLY `T::make`, never a
+    // free function `make`, never another trait's `U::make`; and a
+    // `Self::other()` naming an associated fn the trait does not declare stays
+    // unresolved (no invented edge) — the substitution is an exact suffix
+    // match, so it is provable, never a wildcard.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn make() -> u32;\n    fn f(&self) -> u32 {\n        Self::make()\n    }\n    fn g(&self) -> u32 {\n        Self::other()\n    }\n}\n",
+            ),
+            ("src/gamma.rs", "pub fn make() -> u32 {\n    0\n}\n"),
+            ("src/delta.rs", "pub trait U {\n    fn make() -> u32;\n}\n"),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_make = symbol_id(&records, "function", "alpha::make", "src/alpha.rs");
+    let free_make = symbol_id(&records, "function", "gamma::make", "src/gamma.rs");
+    let u_make = symbol_id(&records, "function", "delta::make", "src/delta.rs");
+    let f = symbol_id(&records, "function", "alpha::f", "src/alpha.rs");
+    let g = symbol_id(&records, "function", "alpha::g", "src/alpha.rs");
+
+    // Self::make() binds only the trait's own associated fn.
+    assert_calls_edge_with_resolution(&records, &f, &t_make, "resolved");
+    assert!(
+        calls_edge(&records, &f, &free_make).is_none(),
+        "Self::make() must not bind an unrelated free function make"
+    );
+    assert!(
+        calls_edge(&records, &f, &u_make).is_none(),
+        "Self::make() must not bind a different trait's U::make"
+    );
+    // Self::other() names nothing the trait declares — no invented edge.
+    assert!(
+        calls_edge(&records, &g, &t_make).is_none(),
+        "Self::other() must not wildcard onto T::make"
+    );
+    assert!(
+        calls_edge(&records, &g, &free_make).is_none()
+            && calls_edge(&records, &g, &u_make).is_none(),
+        "Self::other() must invent no edge"
+    );
+}
+
+#[test]
+fn trait_nested_and_self_call_edges_are_byte_stable_across_repeated_scans() {
+    // Determinism guard for the block-local and in-trait `Self::` paths.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[(
+            "src/alpha.rs",
+            "pub trait T {\n    fn make() -> u32;\n    fn f(&self) -> u32 {\n        fn helper() -> u32 {\n            3\n        }\n        helper() + Self::make()\n    }\n}\n",
+        )],
+    );
+
+    let first = scan_repository_at_with_override(repo, FIXED_TIME, Some(REPO_ID))
+        .expect("fixture repo should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    for run in 2..=5 {
+        let next = scan_repository_at_with_override(repo, FIXED_TIME, Some(REPO_ID))
+            .expect("fixture repo should rescan")
+            .to_jsonl()
+            .expect("graph should reserialize");
+        assert_eq!(first, next, "scan {run} must be byte-identical to scan 1");
+    }
+    assert!(
+        first.contains(r#""resolution":"resolved""#),
+        "stability check must cover the resolved nested + Self:: trait paths: {first}"
+    );
+}
+
+// --- In-trait `self.` method calls carry the trait owner (issue #390) --------
+
+#[test]
+fn in_trait_self_method_call_binds_only_the_declaring_trait() {
+    // REGRESSION (issue #390): a `self.read()` call inside a default trait
+    // method names the trait's OWN method `read`. In a trait body there is no
+    // `impl_context`, so before the fix `receiver_owner` was None and the call
+    // was a plain `Method` — which the PR's widened Method pool then fanned out
+    // to EVERY same-named trait method, minting an ambiguous edge to an
+    // unrelated `trait U { fn read }`. Carrying the enclosing trait as
+    // `receiver_owner` makes it a `SelfMethod` narrowed to `T::read` ONLY.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32;\n    fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "pub trait U {\n    fn read(&self) -> u32;\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let u_read = symbol_id(&records, "function", "gamma::read", "src/gamma.rs");
+    let f = symbol_id(&records, "function", "alpha::f", "src/alpha.rs");
+
+    // Recall: self.read() resolves to the declaring trait's own method.
+    assert_calls_edge_with_resolution(&records, &f, &t_read, "resolved");
+    // NO-WRONG-EDGE: the unrelated trait U::read is never bound.
+    assert!(
+        calls_edge(&records, &f, &u_read).is_none(),
+        "self.read() in trait T must not fan out to the unrelated trait U::read"
+    );
+}
+
+#[test]
+fn in_trait_self_method_call_with_no_matching_method_invents_no_edge() {
+    // NO-WRONG-EDGE (issue #390): `self.other()` inside trait T, where T
+    // declares no `other`, must stay unresolved — the narrowed candidate set is
+    // empty and the branch must NOT fall back to the broad method pool. An
+    // unrelated `trait U { fn other }` must never be bound (prefer a MISSING
+    // edge over a WRONG one).
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32;\n    fn g(&self) -> u32 {\n        self.other()\n    }\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "pub trait U {\n    fn other(&self) -> u32;\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let u_other = symbol_id(&records, "function", "gamma::other", "src/gamma.rs");
+    let g = symbol_id(&records, "function", "alpha::g", "src/alpha.rs");
+
+    assert!(
+        calls_edge(&records, &g, &u_other).is_none(),
+        "self.other() naming nothing on trait T must not fan out to U::other"
+    );
+    // A receiver-typed self call with no candidate is external — no Diagnostic.
+    assert!(
+        !records.iter().any(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Diagnostic"
+                && record["name"] == "other"
+        }),
+        "an unresolved self-method call must not emit a Diagnostic node"
+    );
+}
+
+#[test]
+fn impl_self_method_call_unaffected_by_trait_widening() {
+    // SYMMETRY GUARD (issue #390): an impl `self.g()` (owner `S`) still narrows
+    // to its inherent `S::g`. The SelfMethod trait-method widening must not leak
+    // a same-named trait method `T::g` in another file into the impl self-call.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub struct S;\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.g()\n    }\n    pub fn g(&self) -> u32 {\n        3\n    }\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "pub trait T {\n    fn g(&self) -> u32;\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let s_g = symbol_id(&records, "method", "alpha::S::g", "src/alpha.rs");
+    let t_g = symbol_id(&records, "function", "gamma::g", "src/gamma.rs");
+    let f = symbol_id(&records, "method", "alpha::S::f", "src/alpha.rs");
+
+    // The impl self-call binds its own inherent method.
+    assert_calls_edge_with_resolution(&records, &f, &s_g, "resolved");
+    // The same-named trait method is NOT admitted into the impl self-call.
+    assert!(
+        calls_edge(&records, &f, &t_g).is_none(),
+        "impl self.g() must not admit the same-named trait method T::g"
+    );
+}
+
+#[test]
+fn in_trait_self_method_call_edges_are_byte_stable_across_repeated_scans() {
+    // Determinism guard for the in-trait `self.` method-call resolution path.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32;\n    fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "pub trait U {\n    fn read(&self) -> u32;\n}\n",
+            ),
+        ],
+    );
+
+    let first = scan_repository_at_with_override(repo, FIXED_TIME, Some(REPO_ID))
+        .expect("fixture repo should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    for run in 2..=5 {
+        let next = scan_repository_at_with_override(repo, FIXED_TIME, Some(REPO_ID))
+            .expect("fixture repo should rescan")
+            .to_jsonl()
+            .expect("graph should reserialize");
+        assert_eq!(first, next, "scan {run} must be byte-identical to scan 1");
+    }
+    assert!(
+        first.contains(r#""resolution":"resolved""#),
+        "stability check must cover the resolved in-trait self-method path: {first}"
+    );
+}
+
 fn implements_edge<'a>(records: &'a [Value], source: &str, target: &str) -> Option<&'a Value> {
     records.iter().find(|record| {
         record["record_type"] == "edge"
