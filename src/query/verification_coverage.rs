@@ -457,8 +457,20 @@ pub fn verification_coverage<'a>(
     for item in &in_scope_items {
         let owner = owner_key(item.record_id);
         let mut evidence: Vec<CoverageTuple<'a>> = Vec::new();
-        if let Some(set) = symbol_evidence.get(item.record_id) {
-            evidence.extend(set.iter().copied());
+        // Symbol-direct coverage keys: the item's own record ID, plus — for a
+        // resolved `pub use` re-export — the target declaration's record ID.
+        // `public_api_surface` reports a re-exported-only symbol as a row keyed
+        // on the re-export `Import` site while the declaration lives at
+        // `target_record_id`; a verifier normally links to the DECLARATION, so
+        // crediting the target is required to avoid falsely reporting such
+        // symbols uncovered (issue #109 P2). Mirrors the `undocumented` lane,
+        // which credits a doc comment at either the re-export site OR target.
+        let symbol_keys = std::iter::once(item.record_id)
+            .chain(item.via_reexport.then_some(item.target_record_id).flatten());
+        for key in symbol_keys {
+            if let Some(set) = symbol_evidence.get(key) {
+                evidence.extend(set.iter().copied());
+            }
         }
         if let Some(path) = item.repo_relative_path {
             if let Some(set) = file_evidence.get(&(owner, path)) {

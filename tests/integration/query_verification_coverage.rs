@@ -94,6 +94,22 @@ fn code_symbol(path: &str, name: &str, kind: &str, line: usize) -> (String, Grap
     (id, rec)
 }
 
+/// A `pub use` re-export `Import` node at `path`, carrying the use text in its
+/// name so `public_api_surface` parses it into a re-export surface row.
+fn reexport(path: &str, use_text: &str, line: usize) -> (String, GraphRecord) {
+    let id = stable_id(&["node", "Import", path, use_text]);
+    let rec = GraphRecord::syntax_node(
+        id.clone(),
+        NodeKind::Import,
+        path.to_owned(),
+        span(line, line),
+        use_text.to_owned(),
+        "rust",
+        format!("Import {use_text}"),
+    );
+    (id, rec)
+}
+
 /// A verification-domain node carrying a redaction sentinel in its (never
 /// emitted) summary, to prove no raw payload leaks.
 fn ver_node(slug: &str, kind: NodeKind, vk: Option<&str>) -> (String, GraphRecord) {
@@ -773,4 +789,108 @@ fn at_commit_pins_the_surface_snapshot() {
         .map(|c| c["path"].as_str().unwrap())
         .collect();
     assert!(!all.contains(&"beta"), "commit-A snapshot excludes beta");
+}
+
+#[test]
+fn reexport_is_covered_when_its_target_declaration_is_verified() {
+    // A symbol exposed ONLY through `pub use crate::internal::Widget`: the
+    // public surface reports it as a re-export row keyed on the `Import` site,
+    // while the declaration lives at `target_record_id`. A verifier links to
+    // the DECLARATION, so crediting the target is required (issue #109 P2).
+    let (repo_id, repo) = repo_node("repo-reexport");
+    let (lib, file_lib) = code_file("src/lib.rs");
+    let (internal, file_internal) = code_file("src/internal.rs");
+    // Declaration trapped in module `internal` (no recorded module visibility),
+    // so it is NOT its own surface row — reachable only via the re-export.
+    let (widget, s_widget) = code_symbol("src/internal.rs", "internal::Widget", "struct", 10);
+    let (imp, imp_rec) = reexport("src/lib.rs", "pub use crate::internal::Widget", 3);
+    let (v1, ver1) = ver_node("v1", NodeKind::Verification, Some("test_run"));
+
+    let records = vec![
+        repo,
+        file_lib,
+        file_internal,
+        contains(&repo_id, &lib),
+        contains(&repo_id, &internal),
+        defines(&internal, &widget),
+        s_widget,
+        imp_rec,
+        ver1,
+        // Verification links the DECLARATION (target), not the re-export site.
+        ev_edge(EdgeLabel::MentionsSymbol, &v1, &widget),
+    ];
+    let (_temp, path) = write_graph(records);
+    let report = run(&path, &[]);
+
+    assert_eq!(report["capability"], "verification_links_recorded");
+    let covered = report["covered"].as_array().unwrap();
+    let uncovered = report["uncovered"].as_array().unwrap();
+    // The re-export row must be COVERED via its verified target declaration.
+    assert_eq!(report["counts"]["symbols_in_scope"], 1);
+    assert_eq!(covered.len(), 1, "covered: {covered:#?}");
+    assert_eq!(uncovered.len(), 0, "uncovered: {uncovered:#?}");
+    let row = &covered[0];
+    assert_eq!(row["path"], "Widget");
+    assert_eq!(row["record_id"], Value::String(imp.clone()));
+    let ev = &row["verification"][0];
+    assert_eq!(ev["record_id"], Value::String(v1.clone()));
+    assert_eq!(ev["link_level"], "symbol");
+    assert_eq!(ev["edge_label"], "MENTIONS_SYMBOL");
+}
+
+#[test]
+fn reexport_stays_uncovered_when_neither_site_nor_target_is_verified() {
+    // Same re-export shape, but no verification link on either the `Import`
+    // site or the target declaration: it must stay UNCOVERED. A separate
+    // verified symbol keeps the capability present so the lane partitions
+    // rather than degrading to capability-absent.
+    let (repo_id, repo) = repo_node("repo-reexport-neg");
+    let (lib, file_lib) = code_file("src/lib.rs");
+    let (internal, file_internal) = code_file("src/internal.rs");
+    let (widget, s_widget) = code_symbol("src/internal.rs", "internal::Widget", "struct", 10);
+    let (_imp, imp_rec) = reexport("src/lib.rs", "pub use crate::internal::Widget", 3);
+    // A separately-declared public symbol carrying the only verification link,
+    // keeping capability present without touching the re-export or its target.
+    let (linked, s_linked) = code_symbol("src/lib.rs", "keeper", "function", 20);
+    let (v1, ver1) = ver_node("v1", NodeKind::Verification, Some("test_run"));
+
+    let records = vec![
+        repo,
+        file_lib,
+        file_internal,
+        contains(&repo_id, &lib),
+        contains(&repo_id, &internal),
+        defines(&internal, &widget),
+        defines(&lib, &linked),
+        s_widget,
+        s_linked,
+        imp_rec,
+        ver1,
+        ev_edge(EdgeLabel::MentionsSymbol, &v1, &linked),
+    ];
+    let (_temp, path) = write_graph(records);
+    let report = run(&path, &[]);
+
+    assert_eq!(report["capability"], "verification_links_recorded");
+    let uncovered: Vec<&str> = report["uncovered"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    let covered: Vec<&str> = report["covered"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        uncovered.contains(&"Widget"),
+        "unverified re-export must be uncovered: {uncovered:?}"
+    );
+    assert!(
+        !covered.contains(&"Widget"),
+        "unverified re-export must not be covered: {covered:?}"
+    );
+    assert!(covered.contains(&"keeper"));
 }
