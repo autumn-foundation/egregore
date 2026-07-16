@@ -47,6 +47,7 @@ mod undocumented;
 mod unreferenced;
 mod unsafe_sites;
 mod unwrap_expect;
+mod verification_coverage;
 mod who;
 
 pub use as_of::*;
@@ -86,4 +87,5 @@ pub use undocumented::*;
 pub use unreferenced::*;
 pub use unsafe_sites::*;
 pub use unwrap_expect::*;
+pub use verification_coverage::*;
 pub use who::*;
