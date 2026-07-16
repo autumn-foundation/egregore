@@ -5590,19 +5590,23 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
             };
-            let index = query::RepositoryIndex::build(&records);
-            let selected = resolve_repo_scope(&index, repo.as_deref());
             // Resolve the optional `--at` commit pin to a single-commit
             // snapshot before building the surface (the surface itself is
-            // temporally agnostic, matching `query public-api`).
+            // temporally agnostic, matching `query public-api`). Only the `--at`
+            // path needs an index over the full record set; the common path
+            // builds the index once, over the snapshot.
             let snapshot = match at.as_deref() {
                 None => records,
-                Some(selector) => verification_coverage_snapshot_at_commit(
-                    records,
-                    selector,
-                    &index,
-                    selected.as_deref(),
-                ),
+                Some(selector) => {
+                    let index = query::RepositoryIndex::build(&records);
+                    let selected = resolve_repo_scope(&index, repo.as_deref());
+                    verification_coverage_snapshot_at_commit(
+                        records,
+                        selector,
+                        &index,
+                        selected.as_deref(),
+                    )
+                }
             };
             let index = query::RepositoryIndex::build(&snapshot);
             let selected = resolve_repo_scope(&index, repo.as_deref());

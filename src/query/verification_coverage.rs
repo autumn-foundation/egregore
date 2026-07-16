@@ -164,6 +164,28 @@ pub struct VerificationCoverageReport<'a> {
 /// link_level)`.
 type CoverageTuple<'a> = (&'a str, &'a str, &'static str, &'static str);
 
+/// Truncates one result bucket to `limit`, flagging the truncation and pushing a
+/// `results_truncated` diagnostic carrying the true pre-truncation count.
+fn truncate_bucket<T>(
+    rows: &mut Vec<T>,
+    limit: usize,
+    truncated: &mut bool,
+    noun: &str,
+    diagnostics: &mut Vec<VerificationCoverageDiagnostic>,
+) {
+    if rows.len() > limit {
+        let total = rows.len();
+        rows.truncate(limit);
+        *truncated = true;
+        diagnostics.push(VerificationCoverageDiagnostic {
+            code: "results_truncated",
+            detail: format!(
+                "showing {limit} of {total} {noun} rows; raise --limit to see the rest"
+            ),
+        });
+    }
+}
+
 /// Returns the reported verification kind when `record` is a
 /// verification-domain node, else `None`.
 fn verification_kind_of(record: &GraphRecord) -> Option<&str> {
@@ -402,22 +424,21 @@ pub fn verification_coverage<'a>(
     let mut diagnostics: Vec<VerificationCoverageDiagnostic> = Vec::new();
 
     if !capability_present {
-        let reason = capability_reason.unwrap_or("no_verification_records");
-        let detail = match reason {
-            "no_verification_records" => "the store records no verification-domain nodes; \
+        // In this branch capability is absent, so exactly one reason holds.
+        let detail = if verification_records_in_store == 0 {
+            "the store records no verification-domain nodes; \
                  verification coverage cannot be assessed. Absence of recorded evidence is a \
                  prioritization signal, never proof that code is untested, unverified in \
                  reality, unsafe, or broken"
-                .to_owned(),
-            _ => "the store records verification-domain nodes but none link to a code \
+        } else {
+            "the store records verification-domain nodes but none link to a code \
                  Symbol/File (no linking writer has run); verification coverage cannot be \
                  assessed. Absence of recorded evidence is a prioritization signal, never \
                  proof that code is untested, unverified in reality, unsafe, or broken"
-                .to_owned(),
         };
         diagnostics.push(VerificationCoverageDiagnostic {
             code: "verification_facts_unavailable",
-            detail,
+            detail: detail.to_owned(),
         });
         return VerificationCoverageReport {
             capability_present,
@@ -496,54 +517,32 @@ pub fn verification_coverage<'a>(
         }
     }
 
-    let sort_key = |path: Option<&str>, span: Option<SourceSpan>, id: &str| {
-        (
-            path.unwrap_or("").to_owned(),
-            span.map_or(0, |s| s.start_line),
-            id.to_owned(),
-        )
+    // Sort each bucket by (repo-relative path, start line, record id), comparing
+    // borrowed tuples so no allocation happens per comparison.
+    let sort_key = |path: Option<&'a str>, span: Option<SourceSpan>, id: &'a str| {
+        (path.unwrap_or(""), span.map_or(0, |s| s.start_line), id)
     };
-    covered.sort_by(|a, b| {
-        sort_key(a.repo_relative_path, a.span, a.record_id).cmp(&sort_key(
-            b.repo_relative_path,
-            b.span,
-            b.record_id,
-        ))
-    });
-    uncovered.sort_by(|a, b| {
-        sort_key(a.repo_relative_path, a.span, a.record_id).cmp(&sort_key(
-            b.repo_relative_path,
-            b.span,
-            b.record_id,
-        ))
-    });
+    covered.sort_by_key(|c| sort_key(c.repo_relative_path, c.span, c.record_id));
+    uncovered.sort_by_key(|u| sort_key(u.repo_relative_path, u.span, u.record_id));
 
     counts.covered = covered.len();
     counts.uncovered = uncovered.len();
 
     let limit = limit.unwrap_or(VERIFICATION_COVERAGE_DEFAULT_LIMIT);
-    if covered.len() > limit {
-        let total = covered.len();
-        covered.truncate(limit);
-        counts.covered_truncated = true;
-        diagnostics.push(VerificationCoverageDiagnostic {
-            code: "results_truncated",
-            detail: format!(
-                "showing {limit} of {total} covered rows; raise --limit to see the rest"
-            ),
-        });
-    }
-    if uncovered.len() > limit {
-        let total = uncovered.len();
-        uncovered.truncate(limit);
-        counts.uncovered_truncated = true;
-        diagnostics.push(VerificationCoverageDiagnostic {
-            code: "results_truncated",
-            detail: format!(
-                "showing {limit} of {total} uncovered rows; raise --limit to see the rest"
-            ),
-        });
-    }
+    truncate_bucket(
+        &mut covered,
+        limit,
+        &mut counts.covered_truncated,
+        "covered",
+        &mut diagnostics,
+    );
+    truncate_bucket(
+        &mut uncovered,
+        limit,
+        &mut counts.uncovered_truncated,
+        "uncovered",
+        &mut diagnostics,
+    );
 
     diagnostics.sort_by(|a, b| a.code.cmp(b.code).then_with(|| a.detail.cmp(&b.detail)));
     diagnostics.dedup();

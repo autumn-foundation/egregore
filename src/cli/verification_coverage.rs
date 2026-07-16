@@ -138,7 +138,7 @@ pub(crate) fn verification_coverage_snapshot_at_commit(
             eprintln!("{diag}");
             std::process::exit(1);
         }
-        1 => matching.iter().next().map(|c| (*c).to_owned()).unwrap(),
+        1 => (*matching.iter().next().unwrap()).to_owned(),
         count => {
             let diag = serde_json::json!({
                 "code": "ambiguous_commit",
@@ -295,15 +295,16 @@ pub(crate) fn query_verification_coverage_cmd(
                      signal, not proof code is untested or unsafe)."
                 );
             }
+            let citation = |path: Option<&str>, span: Option<SourceSpan>| match (path, span) {
+                (Some(path), Some(span)) => {
+                    format!(" @ {path}:{}-{}", span.start_line, span.end_line)
+                }
+                (Some(path), None) => format!(" @ {path}"),
+                (None, _) => String::new(),
+            };
             println!("covered:");
             for item in &report.covered {
-                let citation = match (item.repo_relative_path, item.span) {
-                    (Some(path), Some(span)) => {
-                        format!(" @ {path}:{}-{}", span.start_line, span.end_line)
-                    }
-                    (Some(path), None) => format!(" @ {path}"),
-                    (None, _) => String::new(),
-                };
+                let citation = citation(item.repo_relative_path, item.span);
                 for ev in &item.verification {
                     println!(
                         "- {} [{}]{} via {}({}) <- {} [{}]",
@@ -319,13 +320,7 @@ pub(crate) fn query_verification_coverage_cmd(
             }
             println!("uncovered:");
             for item in &report.uncovered {
-                let citation = match (item.repo_relative_path, item.span) {
-                    (Some(path), Some(span)) => {
-                        format!(" @ {path}:{}-{}", span.start_line, span.end_line)
-                    }
-                    (Some(path), None) => format!(" @ {path}"),
-                    (None, _) => String::new(),
-                };
+                let citation = citation(item.repo_relative_path, item.span);
                 println!(
                     "- {} [{}]{} ({})",
                     item.path, item.kind, citation, item.record_id
