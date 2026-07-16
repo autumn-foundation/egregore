@@ -5568,13 +5568,21 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             as_of,
             format,
         } => {
-            // Temporal selectors need the history-inclusive store view; the
-            // current-state read suffices otherwise. A JSONL graph is read
-            // identically either way.
-            let records = if at.is_some() || as_of.is_some() {
-                load_query_records_history(graph.as_deref(), data_dir.as_deref())?
-            } else {
-                load_query_records(graph.as_deref(), data_dir.as_deref())?
+            // Strictly read-only: opening the live embedded engine re-persists
+            // its on-disk index files, so the --data-dir path reads a throwaway
+            // copy of the store instead — the original stays byte-for-byte
+            // untouched. --graph is a plain file read. A temporal pin needs the
+            // history-inclusive store view; the current-state read suffices
+            // otherwise. (Mirrors `query implementors`, issue #133.)
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) if at.is_some() || as_of.is_some() => {
+                    load_records_from_db_history_readonly(dir)?
+                }
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (graph, None) => load_query_records(graph, None)?,
             };
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());

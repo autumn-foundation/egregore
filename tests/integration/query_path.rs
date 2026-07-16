@@ -1074,3 +1074,78 @@ fn data_dir_parity_with_graph() {
         "graph and store views must be byte-identical"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The embedded --data-dir path must be strictly read-only (PR #416 review):
+// opening the live engine re-persists index files, so the query must operate
+// on a throwaway copy and leave the store byte-for-byte untouched — for both
+// the current-state and the --at/--as-of history reads.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn snapshot_tree(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in fs::read_dir(dir).expect("read dir") {
+            let entry = entry.expect("entry");
+            let path = entry.path();
+            if entry.file_type().expect("file type").is_dir() {
+                walk(&path, root, out);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("under root")
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, fs::read(&path).expect("read file")));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn data_dir_query_is_read_only() {
+    let f = seed();
+    let temp_db = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp_db.path().join("store");
+
+    egregore()
+        .arg("ingest")
+        .arg(&f.graph)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let before = snapshot_tree(&data_dir);
+    // Current-state read.
+    egregore()
+        .args(["query", "path", &f.entry_a_id, &f.sink_b_id, "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+    // History read (--at exercises the load_records_from_db_history_readonly
+    // path). A missing commit exits 2; that is irrelevant here — the point is
+    // that opening the store for the temporal read must not mutate it.
+    let _ = egregore()
+        .args([
+            "query",
+            "path",
+            &f.entry_a_id,
+            &f.sink_b_id,
+            "--at",
+            "deadbeefdeadbeef",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .assert();
+    let after = snapshot_tree(&data_dir);
+    assert_eq!(
+        before, after,
+        "querying the embedded store must not create, modify, or delete any store file"
+    );
+}
