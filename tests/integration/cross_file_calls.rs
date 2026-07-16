@@ -605,14 +605,20 @@ fn trait_method_call_edges_are_byte_stable_across_repeated_scans() {
 // --- Trait-method attribution is DIRECT-membership only (issue #390) --------
 
 #[test]
-fn block_local_fn_in_a_trait_method_body_resolves_its_bare_call() {
-    // REGRESSION (issue #390): a `fn helper` defined block-local inside a
-    // default trait method body is a FREE function, not a trait method. The
-    // walker is still under `trait_context` while descending into the method
-    // body, so gating trait-method attribution on the broad flag would mark
-    // `helper` `is_trait_method` and drop its legal bare `helper()` call as
-    // unresolved. Attribution must ride DIRECT structural trait membership, so
-    // the bare call RESOLVES to the local function.
+fn block_local_fn_in_a_trait_method_body_has_corrected_identity_but_is_not_cross_file_callable() {
+    // Issue #413 (round 3, Codex finding A) — flips the earlier #412 recall
+    // assertion, coordinator-authorized. A `fn helper` defined block-local
+    // inside a default trait method body keeps its CORRECTED identity: a plain
+    // free function (kind `function`, module-qualified `alpha::helper`, never a
+    // trait method). But it is lexically unreachable through the flat call
+    // index, so it is NOT exported as a call candidate: its own bare `helper()`
+    // call is now UNRESOLVED.
+    //
+    // WHY UNRESOLVED (do not "fix" this back): a block-local fn is lexically
+    // unreachable through the flat cross-file/same-file call index; keeping it
+    // resolvable would reopen the wrong-edge vector where a bare call elsewhere
+    // binds the buried item (Codex round 3). Scoped block-local recall is
+    // restored by a follow-up issue.
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path();
     write_fixture(
@@ -624,22 +630,24 @@ fn block_local_fn_in_a_trait_method_body_resolves_its_bare_call() {
     );
 
     let records = scan_fixture(repo);
-    // The block-local helper is a plain free function (module-qualified name,
-    // NOT `alpha::T::helper`).
+    // Corrected identity retained: a plain free function, module-qualified name,
+    // NOT `alpha::T::helper`.
     let helper = symbol_id(&records, "function", "alpha::helper", "src/alpha.rs");
     let f = symbol_id(&records, "function", "alpha::f", "src/alpha.rs");
-
-    // The bare `helper()` call binds the local free function — never dropped.
-    assert_calls_edge_with_resolution(&records, &f, &helper, "resolved");
-    // And it is NOT recorded unresolved against a Diagnostic.
     assert!(
         !records.iter().any(|record| {
             record["record_type"] == "node"
-                && record["kind"] == "Diagnostic"
-                && record["name"] == "helper"
-                && record["repo_relative_path"] == "src/alpha.rs"
+                && record["kind"] == "Symbol"
+                && record["name"] == "alpha::T::helper"
         }),
-        "the block-local helper() call must resolve, not emit an unresolved Diagnostic"
+        "the block-local helper must not be a trait-method target (identity stays corrected)"
+    );
+
+    // The bare `helper()` call is UNRESOLVED: the block-local fn is not a call
+    // candidate. Keeping it resolvable would reopen the wrong-edge vector.
+    assert!(
+        calls_edge(&records, &f, &helper).is_none(),
+        "a block-local fn is lexically unreachable through the flat call index; keeping it resolvable would reopen the wrong-edge vector (Codex round 3); scoped block-local recall is restored by a follow-up issue"
     );
 }
 
@@ -677,14 +685,19 @@ fn block_local_fn_in_a_trait_method_is_not_a_trait_method_target() {
 }
 
 #[test]
-fn block_local_fn_in_an_impl_method_body_is_unchanged_by_the_trait_fix() {
-    // SYMMETRIC-BREAKAGE GUARD: the trait-attribution change is gated on
-    // `impl_context.is_none()`, so an impl method's own attribution is never
-    // touched. A block-local `fn helper` inside an impl method keeps its
-    // pre-existing impl-scoped attribution (`method`, owner `S`) — the trait
-    // fix does not leak into the impl path and does not mark it a trait
-    // method. (The impl path carries its own latent nested-item behavior,
-    // out of scope for this trait regression.)
+fn block_local_fn_in_an_impl_method_body_has_corrected_identity_but_is_not_cross_file_callable() {
+    // Issue #413 (round 3, Codex finding A). A `fn helper` defined block-local
+    // inside an impl method body keeps its CORRECTED identity: a plain free
+    // function (kind `function`, module-qualified `alpha::helper`, never a
+    // `method` `alpha::S::helper`, no owner DEFINES). But it is lexically
+    // unreachable through the flat call index, so it is NOT exported as a call
+    // candidate: its own bare `helper()` call is now UNRESOLVED.
+    //
+    // WHY UNRESOLVED (do not "fix" this back): a block-local fn is lexically
+    // unreachable through the flat cross-file/same-file call index; keeping it
+    // resolvable would reopen the wrong-edge vector where a bare call elsewhere
+    // binds the buried item (Codex round 3). Scoped block-local recall is
+    // restored by a follow-up issue.
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path();
     write_fixture(
@@ -696,20 +709,131 @@ fn block_local_fn_in_an_impl_method_body_is_unchanged_by_the_trait_fix() {
     );
 
     let records = scan_fixture(repo);
-    // Unchanged impl-scoped attribution: helper stays a `method` under S.
-    let helper = symbol_id(&records, "method", "alpha::S::helper", "src/alpha.rs");
-    // It is a distinct symbol from the impl method `m`.
+    // Corrected identity retained: a plain free function, module-qualified name,
+    // NOT `alpha::S::helper`.
+    let helper = symbol_id(&records, "function", "alpha::helper", "src/alpha.rs");
     let m = symbol_id(&records, "method", "alpha::S::m", "src/alpha.rs");
     assert_ne!(helper, m, "the nested helper is a distinct symbol from m");
-    // The direct impl method `m` is present and correctly a method under S.
+    // The nested helper must NOT be recorded as a method under S.
     assert!(
         !records.iter().any(|record| {
             record["record_type"] == "node"
                 && record["kind"] == "Symbol"
-                && record["symbol_kind"] == "function"
                 && record["name"] == "alpha::S::helper"
         }),
-        "the trait fix must not reclassify the impl-nested helper"
+        "the impl-nested helper must not be mis-attributed as method S::helper"
+    );
+
+    // The bare `helper()` call is UNRESOLVED: the block-local fn is not a call
+    // candidate. Keeping it resolvable would reopen the wrong-edge vector.
+    assert!(
+        calls_edge(&records, &m, &helper).is_none(),
+        "a block-local fn is lexically unreachable through the flat call index; keeping it resolvable would reopen the wrong-edge vector (Codex round 3); scoped block-local recall is restored by a follow-up issue"
+    );
+}
+
+#[test]
+fn block_local_fn_in_an_impl_method_is_not_an_impl_method_target() {
+    // NO-WRONG-EDGE (issue #413): the block-local `helper` must NOT receive the
+    // impl owner as an owner segment: an `S::helper()` path call must therefore
+    // find NO candidate (helper's segments are `[alpha, helper]`, not
+    // `[alpha, S, helper]`), proving it was not mis-attributed as an impl method.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub struct S;\nimpl S {\n    pub fn m(&self) -> u32 {\n        fn helper() -> u32 {\n            5\n        }\n        helper()\n    }\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub fn caller() -> u32 {\n    crate::alpha::S::helper()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let helper = symbol_id(&records, "function", "alpha::helper", "src/alpha.rs");
+    let caller = symbol_id(&records, "function", "beta::caller", "src/beta.rs");
+
+    assert!(
+        calls_edge(&records, &caller, &helper).is_none(),
+        "S::helper() must not bind a block-local free function as an impl method"
+    );
+}
+
+#[test]
+fn bare_call_does_not_bind_a_block_local_fn_buried_in_an_impl_method() {
+    // NO-WRONG-EDGE (issue #413 round 3, Codex finding A): a `fn helper` buried
+    // in an impl method body is lexically unreachable from a separate module's
+    // `g()`. It must NOT be a cross-file call candidate — `g`'s bare `helper()`
+    // (whose only in-repo same-name def is the buried block-local) stays
+    // UNRESOLVED, never a confident wrong resolved edge to the buried item.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub struct S;\nimpl S {\n    pub fn m(&self) -> u32 {\n        fn helper() -> u32 {\n            5\n        }\n        helper()\n    }\n}\n",
+            ),
+            ("src/beta.rs", "pub fn g() -> u32 {\n    helper()\n}\n"),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let helper = symbol_id(&records, "function", "alpha::helper", "src/alpha.rs");
+    let g = symbol_id(&records, "function", "beta::g", "src/beta.rs");
+
+    assert!(
+        calls_edge(&records, &g, &helper).is_none(),
+        "g()'s bare helper() must not bind the block-local fn buried in impl S::m"
+    );
+}
+
+#[test]
+fn module_fn_call_not_ambiguous_with_same_named_block_local_fn() {
+    // NO-WRONG-EDGE (issue #413 round 3, Codex finding A): a module-level
+    // `fn helper` and a same-named block-local `fn helper` buried in `impl S::m`
+    // must not collide. A separate module's `g()` calling `helper()` resolves to
+    // the MODULE `helper` ONLY (single `resolved`), never an ambiguous fan-out
+    // that includes the lexically-unreachable block-local.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub struct S;\nimpl S {\n    pub fn m(&self) -> u32 {\n        fn helper() -> u32 {\n            5\n        }\n        helper()\n    }\n}\n",
+            ),
+            ("src/gamma.rs", "pub fn helper() -> u32 {\n    7\n}\n"),
+            (
+                "src/beta.rs",
+                "use crate::gamma::helper;\npub fn g() -> u32 {\n    helper()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let module_helper = symbol_id(&records, "function", "gamma::helper", "src/gamma.rs");
+    let g = symbol_id(&records, "function", "beta::g", "src/beta.rs");
+
+    // The bare call binds the single module helper, resolved (not ambiguous with
+    // the lexically-unreachable block-local `alpha::helper`).
+    assert_calls_edge_with_resolution(&records, &g, &module_helper, "resolved");
+    // No ambiguous edge from g to any helper — the block-local is not a candidate.
+    assert!(
+        !records.iter().any(|record| {
+            record["record_type"] == "edge"
+                && record["label"] == "CALLS"
+                && record["source"] == g
+                && record["resolution"] == "ambiguous"
+        }),
+        "g()'s helper() must resolve to the module helper only, never ambiguous with a block-local"
     );
 }
 
@@ -936,6 +1060,415 @@ fn impl_self_method_call_unaffected_by_trait_widening() {
     assert!(
         calls_edge(&records, &f, &t_g).is_none(),
         "impl self.g() must not admit the same-named trait method T::g"
+    );
+}
+
+// --- IMPLEMENTS-gated self-dispatch to trait defaults (issue #414) ----------
+
+#[test]
+fn impl_self_call_binds_an_implemented_trait_default() {
+    // RECALL (issue #414): `impl T for S {}` adopts the trait default `T::read`;
+    // an inherent `impl S { fn f(&self){ self.read(); } }` calls it via `self`.
+    // The call carries owner `S`, but `T::read`'s segments end `[T, read]`, so
+    // the strict `[S, read]` owner-narrowing (issue #390) excludes it and the
+    // call was left unresolved. Bind it to `T::read` because the IMPLEMENTS index
+    // PROVES S implements T.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub struct S;\nimpl crate::alpha::T for S {}\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let f = symbol_id(&records, "method", "beta::S::f", "src/beta.rs");
+
+    assert_calls_edge_with_resolution(&records, &f, &t_read, "resolved");
+}
+
+#[test]
+fn impl_self_call_ignores_an_unimplemented_trait_default() {
+    // NO-WRONG-EDGE (issue #414): a second trait `U` also declares a `read`
+    // default but S does NOT implement it. `self.read()` in `impl S` must bind
+    // ONLY the implemented `T::read`, never the unrelated `U::read`.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/kappa.rs",
+                "pub trait U {\n    fn read(&self) -> u32 {\n        2\n    }\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub struct S;\nimpl crate::alpha::T for S {}\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let u_read = symbol_id(&records, "function", "kappa::read", "src/kappa.rs");
+    let f = symbol_id(&records, "method", "beta::S::f", "src/beta.rs");
+
+    assert_calls_edge_with_resolution(&records, &f, &t_read, "resolved");
+    assert!(
+        calls_edge(&records, &f, &u_read).is_none(),
+        "self.read() must not bind U::read, a trait S does not implement"
+    );
+}
+
+#[test]
+fn impl_self_call_to_a_method_from_two_implemented_traits_stays_unresolved() {
+    // CONSERVATIVE (issue #414, Codex P1 on #420): S implements BOTH T and V,
+    // each declaring a `read` default. Rust dispatch for `self.read()` depends on
+    // which trait is in lexical scope at the call site (its `use` imports), which
+    // this cross-file pass does not resolve. Emitting candidates for both would
+    // mint a false CALLS edge to whichever trait is NOT in scope. Multiple
+    // candidate impls therefore stay UNRESOLVED — no edge to either method.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/kappa.rs",
+                "pub trait V {\n    fn read(&self) -> u32 {\n        2\n    }\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub struct S;\nimpl crate::alpha::T for S {}\nimpl crate::kappa::V for S {}\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let v_read = symbol_id(&records, "function", "kappa::read", "src/kappa.rs");
+    let f = symbol_id(&records, "method", "beta::S::f", "src/beta.rs");
+
+    assert!(
+        calls_edge(&records, &f, &t_read).is_none(),
+        "a 2-implemented-trait self-dispatch must not bind T::read (call-site trait scope unresolved)"
+    );
+    assert!(
+        calls_edge(&records, &f, &v_read).is_none(),
+        "a 2-implemented-trait self-dispatch must not bind V::read (call-site trait scope unresolved)"
+    );
+}
+
+#[test]
+fn impl_self_call_respects_call_site_trait_scope() {
+    // NO-WRONG-EDGE (issue #414, Codex P1 on #420): S implements T and U, both
+    // declaring `read`, but the calling module only `use`s U. Rust dispatches
+    // `self.read()` to `U::read` ONLY — `T::read` is not method-call-visible
+    // (out of lexical scope). This cross-file pass does not thread the call
+    // site's `use` imports, so it cannot tell which trait is in scope; emitting
+    // an edge to `T::read` would be a WRONG edge for valid Rust. The critical
+    // assertion is that NO edge to the out-of-scope `T::read` is minted; per the
+    // conservative-narrowing charge the in-scope `U::read` is left unresolved too
+    // (prefer a MISSING edge over a WRONG one).
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "pub trait U {\n    fn read(&self) -> u32 {\n        2\n    }\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "use crate::gamma::U;\npub struct S;\nimpl crate::alpha::T for S {}\nimpl crate::gamma::U for S {}\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let u_read = symbol_id(&records, "function", "gamma::read", "src/gamma.rs");
+    let f = symbol_id(&records, "method", "beta::S::f", "src/beta.rs");
+
+    // CRITICAL: never bind the out-of-scope trait's method.
+    assert!(
+        calls_edge(&records, &f, &t_read).is_none(),
+        "self.read() must not bind T::read: only `use crate::gamma::U` is in scope at the call site"
+    );
+    // Conservative narrowing: the in-scope U::read is also left unresolved (the
+    // pass cannot prove call-site trait scope).
+    assert!(
+        calls_edge(&records, &f, &u_read).is_none(),
+        "a 2-implemented-trait self-dispatch stays unresolved, never a wrong or guessed edge"
+    );
+}
+
+#[test]
+fn impl_self_call_prefers_an_inherent_method_over_a_trait_default() {
+    // INHERENT PRECEDENCE (issue #414): S has an inherent `read` AND implements
+    // `T` (whose default also declares `read`). Rust dispatch binds the inherent
+    // method, so `self.read()` must bind `S::read`, NOT `T::read`.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub struct S;\nimpl crate::alpha::T for S {}\nimpl S {\n    pub fn read(&self) -> u32 {\n        9\n    }\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let s_read = symbol_id(&records, "method", "beta::S::read", "src/beta.rs");
+    let t_read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let f = symbol_id(&records, "method", "beta::S::f", "src/beta.rs");
+
+    assert_calls_edge_with_resolution(&records, &f, &s_read, "resolved");
+    assert!(
+        calls_edge(&records, &f, &t_read).is_none(),
+        "the inherent S::read must win; T::read must never be bound"
+    );
+}
+
+#[test]
+fn impl_self_call_without_an_implements_proof_stays_unresolved() {
+    // NO PROOF / pre-#414 guard preserved: trait `T` with a `read` default
+    // EXISTS, but there is NO `impl T for S`. `self.read()` in `impl S` must stay
+    // UNRESOLVED — prefer a MISSING edge over a WRONG one.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub struct S;\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let f = symbol_id(&records, "method", "beta::S::f", "src/beta.rs");
+
+    assert!(
+        calls_edge(&records, &f, &t_read).is_none(),
+        "self.read() with no `impl T for S` proof must not bind T::read"
+    );
+}
+
+#[test]
+fn impl_self_call_does_not_bind_across_same_simple_name_types() {
+    // NO-WRONG-EDGE (issue #414, same-simple-name-type collision): two DISTINCT
+    // types both named `S` live in different modules of ONE crate root. `b::S`
+    // implements `x::U` (adopting its `read` default); `a::S` implements
+    // nothing. Because the implemented-traits map is keyed on the BARE type name
+    // `S`, an unguarded join would let `self.read()` in `impl a::S` bind
+    // `x::U::read` — a former guaranteed MISS turned into a confident WRONG edge.
+    // The bare `impl_type` is ambiguous among the crate root's type definitions,
+    // so `a::S`'s self-dispatch must stay UNRESOLVED.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/x.rs",
+                "pub trait U {\n    fn read(&self) -> u32 {\n        2\n    }\n}\n",
+            ),
+            ("src/b.rs", "pub struct S;\nimpl crate::x::U for S {}\n"),
+            (
+                "src/a.rs",
+                "pub struct S;\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let u_read = symbol_id(&records, "function", "x::read", "src/x.rs");
+    let f = symbol_id(&records, "method", "a::S::f", "src/a.rs");
+
+    assert!(
+        calls_edge(&records, &f, &u_read).is_none(),
+        "self.read() in impl a::S must not bind x::U::read via a same-simple-name-type collision"
+    );
+}
+
+#[test]
+fn impl_self_call_does_not_bind_a_trait_impld_for_an_external_leaf_collision() {
+    // NO-WRONG-EDGE (issue #414, external-leaf collision, Codex P2 on #420): a
+    // trait `T` is implemented for the EXTERNAL type `std::string::String`, whose
+    // leaf name `String` collides with a LOCAL `struct String` that implements a
+    // DIFFERENT trait `U`. Under the bare-leaf map key `String`, the external
+    // contributor would pollute the local type's implemented-trait set to
+    // {T, U}, so `self.read()` in `impl String` would fan out an ambiguous edge
+    // to `T::read` even though the local `String` only implements `U`. The
+    // implementing type must resolve to a UNIQUE LOCAL type def, so the external
+    // `std::string::String` relation is dropped: `self.read()` binds ONLY the
+    // local `U::read`.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[(
+            "src/lib.rs",
+            "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\npub trait U {\n    fn read(&self) -> u32 {\n        2\n    }\n}\npub struct String;\nimpl T for std::string::String {}\nimpl U for String {}\nimpl String {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+        )],
+    );
+
+    let records = scan_fixture(repo);
+    let f = symbol_id(&records, "method", "String::f", "src/lib.rs");
+    // Both trait methods qualify to the Symbol name `read` in one crate root, so
+    // they cannot be told apart by node name. Distinguish the bug from the fix by
+    // the shape of the CALLS edges out of `f`: the bug pollutes the local
+    // `String`'s implemented set to {T, U}, minting TWO ambiguous edges (one to
+    // each `read`); the fix drops the external `std::string::String` relation,
+    // leaving {U} — exactly ONE resolved edge to the local `U::read`.
+    let read_ids: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Symbol"
+                && record["symbol_kind"] == "function"
+                && record["name"] == "read"
+                && record["repo_relative_path"] == "src/lib.rs"
+        })
+        .filter_map(|record| record["id"].as_str())
+        .collect();
+    assert_eq!(
+        read_ids.len(),
+        2,
+        "T::read and U::read must both be extracted"
+    );
+
+    let calls_from_f: Vec<(&str, &str)> = records
+        .iter()
+        .filter(|record| {
+            record["record_type"] == "edge" && record["label"] == "CALLS" && record["source"] == f
+        })
+        .filter_map(|record| {
+            Some((
+                record["target"].as_str()?,
+                record["resolution"].as_str().unwrap_or(""),
+            ))
+        })
+        .filter(|(target, _)| read_ids.contains(target))
+        .collect();
+
+    // Exactly one resolved edge to a local `read` (the implemented `U::read`),
+    // and no ambiguous fan-out — the external `impl T for std::string::String`
+    // never contributes.
+    assert_eq!(
+        calls_from_f.len(),
+        1,
+        "self.read() must bind exactly one local read method, got: {calls_from_f:?}"
+    );
+    assert_eq!(
+        calls_from_f[0].1, "resolved",
+        "the single self.read() edge must be resolved, not an ambiguous external-leaf fan-out"
+    );
+}
+
+#[test]
+fn impl_self_call_binds_an_implemented_trait_default_across_three_files() {
+    // CROSS-FILE (issue #414): the trait (alpha), the calling `impl S` + struct
+    // (beta), and the `impl T for S` relation (gamma) live in three DIFFERENT
+    // files, exercising the repo-wide ImplTargetIndex join and the global
+    // implemented-traits map.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub struct S;\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "impl crate::alpha::T for crate::beta::S {}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let f = symbol_id(&records, "method", "beta::S::f", "src/beta.rs");
+
+    assert_calls_edge_with_resolution(&records, &f, &t_read, "resolved");
+}
+
+#[test]
+fn implements_gated_self_dispatch_edges_are_byte_stable_across_repeated_scans() {
+    // Determinism guard for the #414 single-implemented-trait recall path (the
+    // resolved case — multiple implemented traits stay unresolved and mint no
+    // edge, so a single trait exercises a real deterministic resolved edge).
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub struct S;\nimpl crate::alpha::T for S {}\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let first = scan_repository_at_with_override(repo, FIXED_TIME, Some(REPO_ID))
+        .expect("fixture repo should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    for run in 2..=5 {
+        let next = scan_repository_at_with_override(repo, FIXED_TIME, Some(REPO_ID))
+            .expect("fixture repo should rescan")
+            .to_jsonl()
+            .expect("graph should reserialize");
+        assert_eq!(first, next, "scan {run} must be byte-identical to scan 1");
+    }
+    assert!(
+        first.contains(r#""resolution":"resolved""#),
+        "stability check must cover the resolved implements-gated self-dispatch path: {first}"
     );
 }
 
