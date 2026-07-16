@@ -63,6 +63,44 @@ pub(crate) fn scope_and_rank_semantic_matches(
     matches.truncate(limit);
 }
 
+/// Which empty-result outcome `eg query semantic` reports when the final match
+/// set is empty (issue #198).
+///
+/// The command must tell "a valid `--under` (or `--repo`) scope selected nothing
+/// from a store that DOES carry a semantic index" apart from "the store has no
+/// semantic index at all", and the two are worded distinctly
+/// (`docs/cli/query.md`) so an agent can tell "nothing under this prefix" from
+/// "this store has no embeddings".
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmptySemanticOutcome {
+    /// A valid `--under` prefix left no in-scope hit even though the store
+    /// carries a live semantic index — the distinct scoped exit-2 outcome.
+    ScopedNoMatch,
+    /// The vector search returned nothing at all — no semantic index/embeddings.
+    NoSemanticIndex,
+}
+
+/// Classifies the empty-result outcome of a scoped semantic query (issue #198).
+///
+/// The deciding signal for "the index exists" is `index_has_hits` — whether the
+/// raw vector search returned ANY hit BEFORE the code-kind / `--repo` / `--under`
+/// filters. A memory-only store, or a selected repo with no embedded code, still
+/// has a live index even though those filters empty the set; using the
+/// post-filter code-hit count here is the bug this classifier fixes, because it
+/// mislabeled an index-present-but-out-of-scope result as "no embeddings".
+#[cfg(feature = "embeddings")]
+pub(crate) const fn classify_empty_semantic_result(
+    under_prefix: Option<&str>,
+    index_has_hits: bool,
+) -> EmptySemanticOutcome {
+    if under_prefix.is_some() && index_has_hits {
+        EmptySemanticOutcome::ScopedNoMatch
+    } else {
+        EmptySemanticOutcome::NoSemanticIndex
+    }
+}
+
 /// Semantic similarity search against an embedded store.
 ///
 /// `under` optionally scopes results to a repo-relative path prefix (issue #198,
@@ -130,6 +168,16 @@ pub(crate) fn query_semantic(
     let mut matches = sink
         .semantic_search(&query_vector, fetch)
         .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
+
+    // The store carries a live semantic index iff the raw vector search returned
+    // at least one hit — captured BEFORE the code-kind / `--repo` / `--under`
+    // filters. A memory-only store, or a selected repo with no embedded code,
+    // still has an index even though the filters below empty the set; keying the
+    // scoped-vs-no-index distinction on this raw signal (not the post-filter code
+    // hits) is what makes a valid `--under` over such a store report the distinct
+    // "scoped, no matches" outcome instead of the "no embeddings" message (#198).
+    let index_has_hits = !matches.is_empty();
+
     // Code search must never blend agent-authored memory hits into deterministic
     // code results (issue #91): the shared vector index now also embeds
     // observation-class memory nodes, recalled only via `eg query semantic-memory`.
@@ -142,26 +190,26 @@ pub(crate) fn query_semantic(
         matches.retain(|m| index.owner_of(&m.record_id) == Some(repo));
     }
 
-    // Whether the store yielded ANY in-repo code hit before subsystem scoping —
-    // used to tell "scoped, no matches" apart from "no semantic index / no code
-    // hits" (AC5).
-    let had_code_hits = !matches.is_empty();
-
     // Subsystem scoping (issue #198) is applied to the full candidate pool BEFORE
     // the top-N cap (AC4); the same helper also imposes canonical ordering (AC7).
     scope_and_rank_semantic_matches(&mut matches, under_prefix, limit);
 
     if matches.is_empty() {
-        if let Some(prefix) = under_prefix
-            && had_code_hits
-        {
-            eprintln!(
-                "scoped to '{prefix}', no matches — the store has a semantic index but no embedded File/Symbol node falls under this prefix"
-            );
-            std::process::exit(2);
+        match classify_empty_semantic_result(under_prefix, index_has_hits) {
+            EmptySemanticOutcome::ScopedNoMatch => {
+                let prefix = under_prefix.unwrap_or_default();
+                eprintln!(
+                    "scoped to '{prefix}', no matches — the store has a semantic index but no embedded File/Symbol node falls under this prefix"
+                );
+                std::process::exit(2);
+            }
+            EmptySemanticOutcome::NoSemanticIndex => {
+                eprintln!(
+                    "no results — store may not have embeddings (re-run ingest with --embed)"
+                );
+                std::process::exit(2);
+            }
         }
-        eprintln!("no results — store may not have embeddings (re-run ingest with --embed)");
-        std::process::exit(2);
     }
 
     for m in &matches {
@@ -963,6 +1011,44 @@ mod scoped_semantic {
         scope_and_rank_semantic_matches(&mut matches, Some("src/alpha"), 10);
         let ids: Vec<&str> = matches.iter().map(|m| m.record_id.as_str()).collect();
         assert_eq!(ids, vec!["aaa", "mmm", "zzz"]);
+    }
+
+    /// A valid `--under` prefix over a store that has a live semantic index but
+    /// whose retrieved pool yields zero in-scope code hits (memory-only store, or
+    /// a selected repo with no embedded code) must report the DISTINCT scoped
+    /// no-match outcome — never the "no embeddings" message. Regression test for
+    /// the Codex #415 finding: the outcome must be independent of whether any
+    /// post-filter CODE hit survived, keyed only on the raw index having hits.
+    #[test]
+    fn empty_scoped_result_over_indexed_store_is_scoped_no_match() {
+        assert_eq!(
+            classify_empty_semantic_result(Some("src/alpha"), true),
+            EmptySemanticOutcome::ScopedNoMatch
+        );
+    }
+
+    /// A valid `--under` prefix over a store whose raw vector search returned
+    /// nothing at all is a genuine no-index outcome, not a scoped no-match.
+    #[test]
+    fn empty_result_over_unindexed_store_is_no_semantic_index() {
+        assert_eq!(
+            classify_empty_semantic_result(Some("src/alpha"), false),
+            EmptySemanticOutcome::NoSemanticIndex
+        );
+    }
+
+    /// Without `--under` there is no scope, so an empty result is always the
+    /// no-index message regardless of whether the raw index had hits.
+    #[test]
+    fn unscoped_empty_result_is_never_scoped_no_match() {
+        assert_eq!(
+            classify_empty_semantic_result(None, true),
+            EmptySemanticOutcome::NoSemanticIndex
+        );
+        assert_eq!(
+            classify_empty_semantic_result(None, false),
+            EmptySemanticOutcome::NoSemanticIndex
+        );
     }
 
     /// `None` scope leaves the candidate set unscoped (only ranked + capped),
