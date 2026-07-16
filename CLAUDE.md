@@ -215,6 +215,14 @@ cargo run -- query error-context <handle> --graph combined.graph.jsonl --as-of <
 cargo run -- query error-context <handle> --graph g.jsonl --protected-store .egregore/protected  # read-time protected join
 cargo run -- query error-context does_not_exist --graph combined.graph.jsonl      # exit 2 (no_match)
 
+# One cross-domain evidence witness path between two record handles (issue #247)
+cargo run -- query evidence-path <source_id> <target_id> --graph graph.jsonl   # exit 0 on a witness path
+cargo run -- query evidence-path <source_id> <target_id> --data-dir .egregore  # embedded, read-only
+cargo run -- query evidence-path <id> <id> --graph graph.jsonl                 # exit 1 (identical_endpoints)
+cargo run -- query evidence-path <live_a> <live_b> --graph graph.jsonl         # exit 1 (no_path) when disconnected
+cargo run -- query evidence-path <missing> <target> --graph graph.jsonl        # exit 2 (endpoint_not_found)
+cargo run -- query evidence-path <tombstoned> <target> --graph graph.jsonl     # exit 2 (endpoint_tombstoned)
+
 # A file's defined-symbol set at a past commit or instant (issue #158)
 cargo run -- query file src/lib.rs --graph history.graph.jsonl --at <commit_sha>             # exit 0 on match
 cargo run -- query file src/lib.rs --graph history.graph.jsonl --as-of 2026-01-02T00:00:00Z  # exit 0 on match
@@ -497,6 +505,41 @@ CORRELATION LEADS, never proof of cause: a resolved frame proves the backtrace N
 an `EMITTED_DURING` edge is a correlation. Read-only, redaction-safe (only the bounded
 `template_excerpt` escapes as free text), deterministic and byte-identical across runs.
 See `docs/cli/error-context.md`.
+
+`eg query evidence-path <source_id> <target_id>` traces ONE deterministic cross-domain
+evidence witness path between two record handles (issue #247), answering "is record A
+grounded in record B, and by what chain?" without hand-walking the graph. It is a read-time
+traversal that mints no edge and adds no node kind, edge label, or trust class: the walk
+runs over the graph's EVIDENCE/PROVENANCE edge subgraph only. Traversal membership is an
+exhaustive compile-time partition of every `EdgeLabel` variant (a `match` with NO wildcard
+arm, so a new variant fails to compile until classified — the completeness invariant):
+TRAVERSED are the cross-domain grounding edges (`HAS_EVIDENCE`, `OBSERVES`, `VALIDATED_BY`,
+`PRODUCED_EVIDENCE`, `FRAME_RESOLVES_TO`, `EMITTED_DURING`, `REFERENCES_TASK`,
+`CLOSES_ACCEPTANCE_CRITERION`, `OWNED_BY_TASK`, and the rest of the evidence-link/log/project
+registry); EXCLUDED are code-graph topology (`CALLS`, `CONTAINS`, `DEFINES`, `IMPORTS`,
+`REFERENCES`, `IMPLEMENTS`, `MENTIONS`, `CHANGED_IN`, `PARENT_OF`, drift edges) and
+intra-agent-memory scaffolding (`SESSION_OF`, `AUTHORED_BY`) — code-only CALLS/REFERENCES
+call paths are the transitive-callers/callees lanes' job, not this one. Both sorted class
+lists ride in the envelope so a `no_path` verdict is never presented as proof no grounding
+exists. Reachability is UNDIRECTED (a grounding chain legitimately mixes edge directions, so
+each edge is usable either way); each hop reports the edge's native `from`/`to` plus a
+`traversal_direction` (`forward`/`reverse`). The path is the deterministic shortest path:
+fewest hops, then at each step the lexicographically smallest `(neighbor_record_id,
+edge_record_id)` — cycles terminate via a visited set. Deleted records (tombstoned and
+non-temporal) and edges touching a deleted endpoint are excluded — a current-state view, no
+`--at`/`--as-of`. Endpoint/exit taxonomy: a witness path (>=1 hop) exits 0; `source_id ==
+target_id` is `identical_endpoints` (exit 1); two live but disconnected endpoints yield a
+machine-readable `no_path` verdict (exit 1, never a silent empty list); an absent endpoint is
+`endpoint_not_found` and a tombstoned endpoint is `endpoint_tombstoned` (both exit 2,
+DISTINCT labels; the source's problem is reported first when both are bad). An `EMITTED_DURING`
+hop carries its `basis` (`content_hash_join`/`temporal_correlation`) and documented
+`confidence` (`1.0`/`0.5`) — a correlation lead, never causation. The lane is repo-agnostic
+(endpoints are exact IDs; a chain may cross repositories), so there is no `--repo` flag.
+Read-only (the `--data-dir` path reads a throwaway copy), redaction-safe (only IDs, domains,
+kinds, edge labels, paths, spans, counts, and basis strings escape — never raw
+source/transcript/command/patch text), deterministic and byte-identical across runs. A witness
+path proves a live evidence-edge chain connects two records; it is NOT proof the cited code
+still matches current source. See `docs/cli/evidence-path.md`.
 
 `eg query file <path> --at <commit>` / `--as-of <instant>` reconstructs the deterministic
 set of symbols a file defined at a chosen commit or valid-time instant (issue #158) from a

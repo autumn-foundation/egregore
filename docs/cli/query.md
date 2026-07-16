@@ -1486,3 +1486,45 @@ traits, blanket impls (`impl<T> Trait for T`), method-level breakage analysis,
 and the outbound direction ("what does this type implement"). Same-file generic
 trait impls are in scope as of issue #343; cross-file out-of-line trait impls
 are in scope as of issue #344.
+
+## eg query evidence-path
+
+Trace **one deterministic cross-domain evidence witness path between two
+records** (issue #247): given two exact record handles, return the shortest
+connecting chain over the graph's evidence/provenance edge subgraph — or an
+explicit `no_path` verdict. Answers *"is record A grounded in record B, and by
+what chain?"* without hand-walking the graph.
+
+```sh
+eg query evidence-path <SOURCE_ID> <TARGET_ID> --graph graph.jsonl        # exit 0 on a witness path
+eg query evidence-path <SOURCE_ID> <TARGET_ID> --data-dir .egregore       # embedded, read-only
+eg query evidence-path <SOURCE_ID> <TARGET_ID> --graph graph.jsonl --format text
+```
+
+Only **evidence/provenance** edges are traversed (`OBSERVES`, `HAS_EVIDENCE`,
+`VALIDATED_BY`, `PRODUCED_EVIDENCE`, `FRAME_RESOLVES_TO`, `EMITTED_DURING`,
+`REFERENCES_TASK`, `CLOSES_ACCEPTANCE_CRITERION`, `OWNED_BY_TASK`, …); code-graph
+topology (`CALLS`, `CONTAINS`, `DEFINES`, …) and intra-memory scaffolding
+(`SESSION_OF`, `AUTHORED_BY`) are **excluded** by design. The classification is an
+exhaustive compile-time partition of every edge label (the completeness
+invariant), and both class lists ride in the envelope so a `no_path` verdict is
+never presented as proof no grounding exists.
+
+Reachability is **undirected** (a grounding chain mixes edge directions), so each
+hop reports the edge's native `from`/`to` plus a `traversal_direction`
+(`forward`/`reverse`). The path is the deterministic shortest path: fewest hops,
+then the smallest `(neighbor_record_id, edge_record_id)` at each step. Deleted
+(tombstoned, non-temporal) records — and edges touching them — are excluded (a
+current-state view; no `--at`/`--as-of`). An `EMITTED_DURING` hop additionally
+carries its `basis` (`content_hash_join` / `temporal_correlation`) and documented
+`confidence` (`1.0` / `0.5`) — a correlation lead, never causation.
+
+Exit codes: `0` on a witness path (≥ 1 hop); `1` on identical endpoints or a
+`no_path` verdict between two live endpoints; `2` when an endpoint is absent
+(`endpoint_not_found`) or tombstoned (`endpoint_tombstoned`, a distinct label).
+The lane is repo-agnostic (endpoints are exact IDs; a chain may cross repos), so
+there is no `--repo` flag. Read-only, redaction-safe (only IDs, domains, kinds,
+edge labels, paths, spans, counts, and basis strings escape), and byte-identical
+across runs. A witness path proves a live evidence-edge chain connects two
+records; it is not proof the cited code still matches current source. See
+`docs/cli/evidence-path.md`.
