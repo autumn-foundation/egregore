@@ -500,12 +500,17 @@ fn ambiguous_from_endpoint_exit1_lists_candidates() {
     let ids: Vec<&str> = candidates.iter().filter_map(|c| c.as_str()).collect();
     assert!(ids.contains(&f.dup_a_id.as_str()), "candidate A: {ids:?}");
     assert!(ids.contains(&f.dup_b_id.as_str()), "candidate B: {ids:?}");
+    // The diagnostic attributes the failing side.
+    assert_eq!(
+        v["endpoint"], "from",
+        "an ambiguous FROM handle must carry endpoint:\"from\"; got {v}"
+    );
 }
 
 #[test]
 fn ambiguous_to_endpoint_exit1() {
     let f = seed();
-    egregore()
+    let stderr = egregore()
         .args([
             "query",
             "path",
@@ -515,7 +520,47 @@ fn ambiguous_to_endpoint_exit1() {
             f.graph.to_str().unwrap(),
         ])
         .assert()
-        .code(1);
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8(stderr).expect("utf8").trim()).expect("stderr JSON");
+    assert!(v["Ambiguous"]["candidates"].is_array(), "candidates: {v}");
+    assert_eq!(
+        v["endpoint"], "to",
+        "an ambiguous TO handle must carry endpoint:\"to\"; got {v}"
+    );
+}
+
+// The SAME ambiguous handle passed for BOTH endpoints must still be
+// attributable: `from` is resolved first, so its diagnostic names the FROM
+// side — without the `endpoint` field the two failures would be
+// indistinguishable (the exact bug this pins).
+#[test]
+fn same_ambiguous_handle_both_endpoints_attributes_to_from() {
+    let f = seed();
+    let stderr = egregore()
+        .args([
+            "query",
+            "path",
+            "dup_name",
+            "dup_name",
+            "--graph",
+            f.graph.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8(stderr).expect("utf8").trim()).expect("stderr JSON");
+    assert!(v["Ambiguous"]["candidates"].is_array(), "candidates: {v}");
+    assert_eq!(
+        v["endpoint"], "from",
+        "the first-resolved (FROM) endpoint must be named; got {v}"
+    );
 }
 
 #[test]

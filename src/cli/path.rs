@@ -104,6 +104,28 @@ fn endpoint_json(record: &GraphRecord) -> Option<PathEndpointJson<'_>> {
     })
 }
 
+/// Emits one deterministic machine-readable handle-error line to stderr,
+/// folding in the `endpoint` field ("from" / "to") that names which side
+/// failed. The externally-tagged `FailureHandleError` body (`Ambiguous` /
+/// `Unsupported` with its `handle`/`candidates`/`message`) is preserved
+/// verbatim as a sibling key, and `endpoint` is added at the top level so a
+/// failure is attributable even when the same handle is supplied for both
+/// endpoints. Reuses the `endpoint` field name of the `no_match`/no-path
+/// envelope for a consistent contract.
+fn emit_endpoint_handle_error(err: &query::FailureHandleError, endpoint: &str) {
+    let mut value = serde_json::to_value(err).expect("handle error serializes");
+    if let serde_json::Value::Object(map) = &mut value {
+        map.insert(
+            "endpoint".to_owned(),
+            serde_json::Value::String(endpoint.to_owned()),
+        );
+    }
+    eprintln!(
+        "{}",
+        serde_json::to_string(&value).expect("handle error serializes")
+    );
+}
+
 /// Resolves one endpoint handle to a single live symbol record ID, mirroring
 /// `transitive-callers` handle semantics. Exits the process with the documented
 /// machine-readable diagnostics on any failure (`endpoint` names which side —
@@ -121,10 +143,7 @@ fn resolve_path_endpoint(
             err @ (query::FailureHandleError::Ambiguous { .. }
             | query::FailureHandleError::Unsupported { .. }),
         ) => {
-            eprintln!(
-                "{}",
-                serde_json::to_string(&err).expect("handle error serializes")
-            );
+            emit_endpoint_handle_error(&err, endpoint);
             std::process::exit(1);
         }
     };
@@ -140,10 +159,7 @@ fn resolve_path_endpoint(
                 target.kind.as_str()
             ),
         };
-        eprintln!(
-            "{}",
-            serde_json::to_string(&err).expect("handle error serializes")
-        );
+        emit_endpoint_handle_error(&err, endpoint);
         std::process::exit(1);
     }
     if matches!(target.kind, query::FailureTargetKind::File) {
@@ -153,10 +169,7 @@ fn resolve_path_endpoint(
                 "{endpoint} handle resolved to a file; query path accepts only symbol handles"
             ),
         };
-        eprintln!(
-            "{}",
-            serde_json::to_string(&err).expect("handle error serializes")
-        );
+        emit_endpoint_handle_error(&err, endpoint);
         std::process::exit(1);
     }
     if let Some(kind) = query::transitive_callers_non_symbol_anchor_kind(records, &target) {
@@ -166,10 +179,7 @@ fn resolve_path_endpoint(
                 "{endpoint} handle resolved to a {kind:?} node; query path accepts only symbol handles"
             ),
         };
-        eprintln!(
-            "{}",
-            serde_json::to_string(&err).expect("handle error serializes")
-        );
+        emit_endpoint_handle_error(&err, endpoint);
         std::process::exit(1);
     }
 
@@ -198,10 +208,7 @@ fn resolve_path_endpoint(
             handle: handle.to_owned(),
             candidates: target.anchor_ids.iter().cloned().collect(),
         };
-        eprintln!(
-            "{}",
-            serde_json::to_string(&err).expect("handle error serializes")
-        );
+        emit_endpoint_handle_error(&err, endpoint);
         std::process::exit(1);
     }
 
