@@ -1152,6 +1152,15 @@ pub(crate) enum QuerySubcommand {
         /// Restrict results to one repository (see `eg query symbol --help`).
         #[arg(long)]
         repo: Option<String>,
+        /// Scope results to a repo-relative directory prefix (issue #198).
+        ///
+        /// Segment-aware: `--under src/alpha` matches `src/alpha/foo.rs` but
+        /// never `src/alphabet/x.rs`; the trailing-slash and bare forms resolve
+        /// identically. The scope is applied BEFORE `--limit`, so `--limit N`
+        /// returns the N best in-subsystem hits. Not supported with `--daemon`
+        /// (scoped retrieval is a local-CLI surface for this slice).
+        #[arg(long, conflicts_with = "daemon")]
+        under: Option<String>,
         /// Maximum number of results (default 10).
         #[arg(long, default_value_t = 10)]
         limit: usize,
@@ -4561,13 +4570,24 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             data_dir,
             daemon,
             repo,
+            under,
             limit,
             format,
         } => {
             if daemon {
+                // `--under` conflicts with `--daemon` at the CLI layer (scoped
+                // retrieval is a local-CLI surface for this slice, issue #198),
+                // so the daemon path never receives a scope prefix.
                 query_semantic_via_daemon(&query, &data_dir, limit, repo.as_deref(), format)
             } else {
-                query_semantic(&query, &data_dir, limit, repo.as_deref(), format)
+                query_semantic(
+                    &query,
+                    &data_dir,
+                    limit,
+                    repo.as_deref(),
+                    under.as_deref(),
+                    format,
+                )
             }
         }
         #[cfg(feature = "embeddings")]

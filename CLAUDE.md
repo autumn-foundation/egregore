@@ -21,7 +21,23 @@ cargo run -- ingest graph.jsonl --adapter dry-run
 cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
 cargo run -- inspect --data-dir .egregore
 cargo run -- query semantic-memory "parser edge case on empty input" --data-dir .egregore
+cargo run -- query semantic "request timeout handling" --data-dir .egregore --under src/daemon
 ```
+
+`eg query semantic <query> --under <prefix>` scopes semantic code search to a
+repo-relative directory prefix (issue #198), reusing the #83 SEGMENT-AWARE prefix
+matcher so `src/alpha` matches `src/alpha/foo.rs` but never `src/alphabet/x.rs`
+(the trailing-slash and bare forms resolve identically). The scope filters the
+full candidate pool BEFORE the `--limit` top-N cap, so `--limit N` returns the N
+best IN-SUBSYSTEM hits, not N global hits filtered down to fewer; it composes
+with `--repo` and `--limit`, and each row keeps the stable
+`record_id`/`score`/`name`/`repo_relative_path`/`span` contract. Output is
+deterministic (byte-identical across runs on an unchanged store). A
+malformed/empty prefix exits 1 with a machine-readable `malformed_under_prefix`
+diagnostic on stdout; a valid prefix matching zero embedded nodes exits 2 with a
+"scoped, no matches" stderr message worded distinctly from the "no semantic
+index" message. `--under` is a local-CLI surface and cannot be combined with
+`--daemon`. See `docs/cli/query.md`.
 
 `eg scan-logs <log> --repo-path <repo>` extracts runtime log signatures from one
 captured log file (issues #319/#320): a `LogSource`, one `ErrorSignature` per

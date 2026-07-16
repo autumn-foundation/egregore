@@ -30,15 +30,79 @@ pub(crate) fn embed_query_text(query: &str) -> Result<Vec<f32>> {
         .map(|dense| dense.embedding)
 }
 
+/// Applies subsystem-path scoping (issue #198), then deterministic ranking, then
+/// the top-N cap to a raw code-hit match set.
+///
+/// Scoping runs BEFORE truncation so in-subsystem hits are never starved by
+/// higher-ranked out-of-subsystem hits (AC4): an agent asking for the top-N in a
+/// subsystem gets the N best in-subsystem hits, not N global hits filtered down
+/// to fewer. `under` is the already-validated, trailing-slash-normalized prefix;
+/// `None` leaves the set unscoped. Prefix matching reuses the #83 segment-aware
+/// [`crate::query::path_is_under_prefix`] matcher, so `src/alpha` matches
+/// `src/alpha/foo.rs` but never `src/alphabet/x.rs`. Ranking is canonical (score
+/// descending, then record ID ascending) so repeated runs over an unchanged
+/// store emit byte-identical output (AC7).
+#[cfg(feature = "embeddings")]
+pub(crate) fn scope_and_rank_semantic_matches(
+    matches: &mut Vec<SemanticMatch>,
+    under: Option<&str>,
+    limit: usize,
+) {
+    if let Some(prefix) = under {
+        matches.retain(|m| {
+            m.repo_relative_path
+                .as_deref()
+                .is_some_and(|p| crate::query::path_is_under_prefix(p, prefix))
+        });
+    }
+    matches.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.record_id.cmp(&b.record_id))
+    });
+    matches.truncate(limit);
+}
+
 /// Semantic similarity search against an embedded store.
+///
+/// `under` optionally scopes results to a repo-relative path prefix (issue #198,
+/// segment-aware via the #83 matcher). A malformed/empty prefix exits `1` with a
+/// machine-readable diagnostic; a valid prefix matching zero embedded nodes exits
+/// `2` with a "scoped, no matches" outcome distinct from the "no semantic index"
+/// message.
 #[cfg(feature = "embeddings")]
 pub(crate) fn query_semantic(
     query: &str,
     data_dir: &Path,
     limit: usize,
     repo: Option<&str>,
+    under: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
+    // Validate + normalize the scope prefix before any store I/O so a malformed
+    // input fails fast with a machine-readable diagnostic (AC5), mirroring the
+    // `eg query subsystem` prefix contract. `path_is_under_prefix` trims the
+    // trailing slash itself; the empty check is all that remains here.
+    let under_prefix = match under {
+        Some(raw) => {
+            let normalized = raw.trim_end_matches('/');
+            if normalized.is_empty() {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "malformed_under_prefix",
+                        "under": raw,
+                        "message": "--under prefix must be non-empty after stripping trailing slashes"
+                    }
+                });
+                println!("{}", serde_json::to_string(&envelope)?);
+                std::process::exit(1);
+            }
+            Some(normalized)
+        }
+        None => None,
+    };
+
     validate_existing_embedded_store(data_dir)?;
 
     let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
@@ -77,9 +141,25 @@ pub(crate) fn query_semantic(
     if let Some(repo) = selected.as_deref() {
         matches.retain(|m| index.owner_of(&m.record_id) == Some(repo));
     }
-    matches.truncate(limit);
+
+    // Whether the store yielded ANY in-repo code hit before subsystem scoping —
+    // used to tell "scoped, no matches" apart from "no semantic index / no code
+    // hits" (AC5).
+    let had_code_hits = !matches.is_empty();
+
+    // Subsystem scoping (issue #198) is applied to the full candidate pool BEFORE
+    // the top-N cap (AC4); the same helper also imposes canonical ordering (AC7).
+    scope_and_rank_semantic_matches(&mut matches, under_prefix, limit);
 
     if matches.is_empty() {
+        if let Some(prefix) = under_prefix
+            && had_code_hits
+        {
+            eprintln!(
+                "scoped to '{prefix}', no matches — the store has a semantic index but no embedded File/Symbol node falls under this prefix"
+            );
+            std::process::exit(2);
+        }
         eprintln!("no results — store may not have embeddings (re-run ingest with --embed)");
         std::process::exit(2);
     }
@@ -775,6 +855,129 @@ impl PrintText for SemanticResult<'_> {
 // json`. If any field is removed or renamed without updating this test (and the
 // docs in docs/cli/query.md), the test suite will fail during CI.
 // ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------------------------------------
+// Issue #198: subsystem-path-scoped semantic search (`--under <prefix>`).
+//
+// The scope filter must be applied to the raw candidate set BEFORE the top-N
+// truncation so in-subsystem hits are never starved by higher-ranked global
+// hits, and must reuse the #83 segment-aware prefix matcher so `src/alpha`
+// never bleeds into `src/alphabet`. These tests exercise the pure
+// scope+rank+truncate helper with a deterministic fixed match set — no
+// embedding model required.
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "embeddings"))]
+mod scoped_semantic {
+    use super::*;
+
+    fn match_at(record_id: &str, path: &str, score: f32) -> SemanticMatch {
+        SemanticMatch {
+            record_id: record_id.to_owned(),
+            kind: Some("File".to_owned()),
+            name: Some(record_id.to_owned()),
+            repo_relative_path: Some(path.to_owned()),
+            score,
+            span: None,
+        }
+    }
+
+    /// A scoped query returns only hits under the prefix; sibling subsystems
+    /// never leak (AC2).
+    #[test]
+    fn scope_filters_to_prefix_and_excludes_siblings() {
+        let mut matches = vec![
+            match_at("a", "src/alpha/one.rs", 0.9),
+            match_at("b", "src/beta/two.rs", 0.8),
+            match_at("c", "src/alpha/three.rs", 0.7),
+        ];
+        scope_and_rank_semantic_matches(&mut matches, Some("src/alpha"), 10);
+        let paths: Vec<&str> = matches
+            .iter()
+            .map(|m| m.repo_relative_path.as_deref().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["src/alpha/one.rs", "src/alpha/three.rs"]);
+    }
+
+    /// Prefix matching is path-segment aware: `src/alpha` never matches
+    /// `src/alphabet` (AC3, reusing the #83 matcher).
+    #[test]
+    fn scope_is_segment_aware() {
+        let mut matches = vec![
+            match_at("a", "src/alpha/foo.rs", 0.9),
+            match_at("b", "src/alphabet/bar.rs", 0.8),
+        ];
+        scope_and_rank_semantic_matches(&mut matches, Some("src/alpha"), 10);
+        let paths: Vec<&str> = matches
+            .iter()
+            .map(|m| m.repo_relative_path.as_deref().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["src/alpha/foo.rs"]);
+    }
+
+    /// The trailing-slash and bare forms resolve identically (AC3).
+    #[test]
+    fn trailing_slash_and_bare_forms_identical() {
+        let fixture = vec![
+            match_at("a", "src/alpha/foo.rs", 0.9),
+            match_at("b", "src/alphabet/bar.rs", 0.8),
+        ];
+        let mut bare = fixture.clone();
+        let mut slashed = fixture;
+        scope_and_rank_semantic_matches(&mut bare, Some("src/alpha"), 10);
+        scope_and_rank_semantic_matches(&mut slashed, Some("src/alpha/"), 10);
+        let ids = |v: &[SemanticMatch]| v.iter().map(|m| m.record_id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&bare), ids(&slashed));
+        assert_eq!(ids(&bare), vec!["a".to_owned()]);
+    }
+
+    /// Scoping runs BEFORE truncation: an agent asking for the top-3 in a
+    /// subsystem gets the 3 best in-subsystem hits, not 3 global hits filtered
+    /// down to zero (AC4). Here the 5 highest-scored hits are all out of scope;
+    /// without before-truncation ordering the result would be empty.
+    #[test]
+    fn scope_applies_before_truncation() {
+        let mut matches = vec![
+            match_at("beta1", "src/beta/a.rs", 0.99),
+            match_at("beta2", "src/beta/b.rs", 0.98),
+            match_at("beta3", "src/beta/c.rs", 0.97),
+            match_at("beta4", "src/beta/d.rs", 0.96),
+            match_at("beta5", "src/beta/e.rs", 0.95),
+            match_at("alpha1", "src/alpha/a.rs", 0.50),
+            match_at("alpha2", "src/alpha/b.rs", 0.40),
+            match_at("alpha3", "src/alpha/c.rs", 0.30),
+            match_at("alpha4", "src/alpha/d.rs", 0.20),
+        ];
+        scope_and_rank_semantic_matches(&mut matches, Some("src/alpha"), 3);
+        let ids: Vec<&str> = matches.iter().map(|m| m.record_id.as_str()).collect();
+        assert_eq!(ids, vec!["alpha1", "alpha2", "alpha3"]);
+    }
+
+    /// Output ordering is deterministic: equal scores break ties on record ID
+    /// so repeated runs over an unchanged store are byte-identical (AC7).
+    #[test]
+    fn ordering_is_deterministic_on_ties() {
+        let mut matches = vec![
+            match_at("zzz", "src/alpha/z.rs", 0.5),
+            match_at("aaa", "src/alpha/a.rs", 0.5),
+            match_at("mmm", "src/alpha/m.rs", 0.5),
+        ];
+        scope_and_rank_semantic_matches(&mut matches, Some("src/alpha"), 10);
+        let ids: Vec<&str> = matches.iter().map(|m| m.record_id.as_str()).collect();
+        assert_eq!(ids, vec!["aaa", "mmm", "zzz"]);
+    }
+
+    /// `None` scope leaves the candidate set unscoped (only ranked + capped),
+    /// so the unscoped code path is unchanged.
+    #[test]
+    fn unscoped_keeps_all_kinds() {
+        let mut matches = vec![
+            match_at("a", "src/alpha/one.rs", 0.9),
+            match_at("b", "src/beta/two.rs", 0.8),
+        ];
+        scope_and_rank_semantic_matches(&mut matches, None, 10);
+        assert_eq!(matches.len(), 2);
+    }
+}
+
 #[cfg(all(test, feature = "embeddings"))]
 mod semantic_contract {
     use super::*;
