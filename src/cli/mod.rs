@@ -24,6 +24,7 @@ mod error_context;
 mod eval;
 mod evidence;
 mod evidence_freshness;
+mod evidence_path;
 mod export;
 mod failure_history;
 mod file_at_point;
@@ -92,6 +93,7 @@ pub(crate) use error_context::*;
 pub(crate) use eval::*;
 pub(crate) use evidence::*;
 pub(crate) use evidence_freshness::*;
+pub(crate) use evidence_path::*;
 pub(crate) use export::*;
 pub(crate) use failure_history::*;
 pub(crate) use file_at_point::*;
@@ -2147,6 +2149,53 @@ pub(crate) enum QuerySubcommand {
         /// never read.
         #[arg(long)]
         protected_store: Option<PathBuf>,
+    },
+    /// Trace a cross-domain evidence witness path between two records (issue #247).
+    ///
+    /// Answers "is record A grounded in record B, and by what chain?" by tracing
+    /// the deterministic shortest connecting path between two record handles over
+    /// the graph's cross-domain evidence/provenance edge subgraph, returning one
+    /// citable witness path (or an explicit `no_path` verdict — never a silent
+    /// empty list).
+    ///
+    /// Only evidence/provenance edges are traversed (`OBSERVES`, `HAS_EVIDENCE`,
+    /// `VALIDATED_BY`, `PRODUCED_EVIDENCE`, `FRAME_RESOLVES_TO`, `EMITTED_DURING`,
+    /// `REFERENCES_TASK`, …); code-graph topology (`CALLS`, `CONTAINS`, `DEFINES`,
+    /// …) and intra-memory scaffolding (`SESSION_OF`, `AUTHORED_BY`) are EXCLUDED
+    /// by design — the classification is an exhaustive compile-time partition of
+    /// every edge label. Reachability is undirected (a grounding chain mixes edge
+    /// directions), so each hop reports the edge's native `from`/`to` plus a
+    /// `traversal_direction`; the tie-break is fewest hops, then the smallest
+    /// `(neighbor_record_id, edge_record_id)` at each step. Deleted (tombstoned,
+    /// non-temporal) records are excluded — a current-state view.
+    ///
+    /// A witness path proves a live evidence-edge chain connects two records; it
+    /// is not proof the cited code still matches current source, and
+    /// `EMITTED_DURING` hops are correlation leads, never causation. Read-only;
+    /// no raw source/transcript/command/patch text ever enters the response.
+    ///
+    /// Exit codes:
+    ///   0 — a witness path was found (>= 1 hop).
+    ///   1 — identical endpoints, or two live endpoints with no evidence chain
+    ///       (`no_path`).
+    ///   2 — an endpoint is absent (`endpoint_not_found`) or tombstoned
+    ///       (`endpoint_tombstoned`).
+    ///
+    /// Documented in `docs/cli/evidence-path.md`.
+    EvidencePath {
+        /// Source record handle (stable record ID).
+        source: String,
+        /// Target record handle (stable record ID).
+        target: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
     /// Rank the files that historically changed in the same commits as a target file (issue #153).
     ///
@@ -5324,6 +5373,27 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 protected_store.as_deref(),
                 embedded_source,
             )
+        }
+        QuerySubcommand::EvidencePath {
+            source,
+            target,
+            graph,
+            data_dir,
+            format,
+        } => {
+            // Strictly read-only lane (AC7): opening the embedded engine in place
+            // re-persists its on-disk index files, so `--data-dir` reads from a
+            // throwaway copy, never the live store (same contract as the other
+            // read-only lanes).
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            query_evidence_path_cmd(&records, &source, &target, format)
         }
         QuerySubcommand::Coupling {
             path,
