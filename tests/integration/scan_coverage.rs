@@ -711,3 +711,143 @@ fn filesystem_walk_excludes_files_under_nested_git_checkout() {
         "file under a nested Git checkout must be excluded from the filesystem walk"
     );
 }
+
+/// Builds a fresh temp Git repo containing a dependency-declaring `Cargo.toml`,
+/// two Rust source files, and a skipped Markdown file, returning the repo path.
+#[cfg(feature = "embedded-aletheiadb")]
+fn git_repo_with_manifest(temp: &tempfile::TempDir) -> PathBuf {
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"cov403\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("write Cargo.toml");
+    fs::write(repo.join("src/lib.rs"), "pub fn a() -> usize { 1 }\n").expect("write lib.rs");
+    fs::write(repo.join("src/other.rs"), "pub fn b() -> usize { 2 }\n").expect("write other.rs");
+    fs::write(repo.join("README.md"), "# doc\n").expect("write README.md");
+    run_git(&repo, &["init"]);
+    run_git(&repo, &["config", "user.email", "test@example.invalid"]);
+    run_git(&repo, &["config", "user.name", "Test"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    run_git(&repo, &["add", "-A", "-f"]);
+    run_git(&repo, &["commit", "-m", "init"]);
+    repo
+}
+
+/// Reads the current `ScanCoverage` block from `eg inspect --data-dir`.
+#[cfg(feature = "embedded-aletheiadb")]
+fn inspect_coverage(data_dir: &Path) -> Value {
+    let out = assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .arg("inspect")
+        .args(["--data-dir"])
+        .arg(data_dir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("inspect data-dir");
+    assert!(out.status.success());
+    let value: Value = serde_json::from_slice(&out.stdout).expect("inspect JSON should parse");
+    let coverage = value["coverage"]
+        .as_array()
+        .expect("coverage array")
+        .clone();
+    assert_eq!(coverage.len(), 1, "exactly one coverage summary: {value}");
+    coverage[0].clone()
+}
+
+/// `eg refresh` must keep the store's `ScanCoverage` node current after the file
+/// set changes (issue #403). Before the fix, the incremental path emitted no
+/// `ScanCoverage` record, so `eg inspect --data-dir` kept reporting the stale
+/// pre-refresh `files_walked`/`files_indexed`. After the fix, refresh re-emits a
+/// superseding coverage node reflecting the new tree, and a dependency-declaring
+/// `Cargo.toml` stays counted `files_indexed`, never `skipped_by_extension.toml`.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn refresh_updates_stored_scan_coverage() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = git_repo_with_manifest(&temp);
+    let graph_path = temp.path().join("initial.jsonl");
+    let data_dir = temp.path().join("store");
+
+    // Full scan + ingest: 4 walked (Cargo.toml, lib.rs, other.rs, README.md),
+    // 3 indexed (both .rs + the dependency-declaring Cargo.toml), 1 skipped (md).
+    assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .args(["scan"])
+        .arg(&repo)
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+    assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .arg("ingest")
+        .arg(&graph_path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let before = inspect_coverage(&data_dir);
+    assert_eq!(before["files_walked"], 4, "pre-refresh coverage: {before}");
+    assert_eq!(before["files_indexed"], 3, "pre-refresh coverage: {before}");
+
+    // Change the file set: add one Rust source file and remove another.
+    fs::write(repo.join("src/added.rs"), "pub fn c() -> usize { 3 }\n").expect("write added.rs");
+    fs::remove_file(repo.join("src/other.rs")).expect("remove other.rs");
+    run_git(&repo, &["add", "-A", "-f"]);
+    run_git(&repo, &["commit", "-m", "change file set"]);
+
+    // Incremental refresh + ingest into the SAME data dir (the CLI path the
+    // refresh command uses under the hood).
+    assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .arg("refresh")
+        .arg(&repo)
+        .args(["--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    // The stored coverage now reflects the NEW tree: still 4 walked (added one
+    // .rs, removed one .rs, README.md + Cargo.toml unchanged) but the indexed set
+    // is recomputed against the current files. Crucially, the numbers are the
+    // freshly reconciled ones, not the stale pre-refresh snapshot, and the
+    // dependency-declaring Cargo.toml is still indexed rather than skipped.
+    let after = inspect_coverage(&data_dir);
+    assert_eq!(after["files_walked"], 4, "post-refresh coverage: {after}");
+    assert_eq!(after["files_indexed"], 3, "post-refresh coverage: {after}");
+    assert!(
+        after["skipped_by_extension"].get("toml").is_none(),
+        "indexed manifest must not appear under skipped extensions: {after}"
+    );
+    assert_eq!(
+        after["skipped_by_extension"]["md"], 1,
+        "post-refresh coverage: {after}"
+    );
+
+    // Add a SECOND new source file so the walked/indexed counts strictly increase,
+    // proving the stored coverage tracks the live tree rather than any fixed prior
+    // value (the exact stale-node regression issue #403 describes).
+    fs::write(repo.join("src/more.rs"), "pub fn d() -> usize { 4 }\n").expect("write more.rs");
+    run_git(&repo, &["add", "-A", "-f"]);
+    run_git(&repo, &["commit", "-m", "add more"]);
+    assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .arg("refresh")
+        .arg(&repo)
+        .args(["--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let grown = inspect_coverage(&data_dir);
+    assert_eq!(grown["files_walked"], 5, "grown coverage: {grown}");
+    assert_eq!(grown["files_indexed"], 4, "grown coverage: {grown}");
+    assert!(
+        grown["skipped_by_extension"].get("toml").is_none(),
+        "indexed manifest must not appear under skipped extensions: {grown}"
+    );
+}

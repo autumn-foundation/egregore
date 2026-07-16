@@ -123,7 +123,14 @@ and the record carries no subsecond/write-order signal, two scans within the
 same UTC second cannot be ordered from the file (tiebreak is arbitrary w.r.t.
 recency) — use `--data-dir` (authoritative, ordered by store write-order) for
 sub-second re-scan scenarios (known limitation, issue #406). The
-`codegraph` `SCHEMA_VERSION` is 6 (bumped 5→6 for the `ScanCoverage` node). See
+`codegraph` `SCHEMA_VERSION` is 6 (bumped 5→6 for the `ScanCoverage` node). `eg
+refresh` (the incremental path) maintains this same node (issue #403): each
+refresh recomputes coverage against the current tree — running manifest
+dependency extraction first, exactly like a full scan, so a dependency-declaring
+`Cargo.toml` stays `files_indexed` and is never misclassified as skipped `toml`
+— and re-emits the repo-keyed `ScanCoverage`, superseding the prior version in
+the store, so `eg inspect --data-dir` never reports stale
+`files_walked`/`files_indexed` after files are added or removed. See
 `docs/cli/scan.md` and `docs/cli/inspect.md`.
 
 `eg export --data-dir <dir> --out <file.jsonl>` dumps every persisted record of
