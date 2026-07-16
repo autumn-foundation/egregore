@@ -603,6 +603,27 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 .is_some_and(|grandparent| grandparent.kind() == "impl_item")
     }
 
+    /// True when `node` (a `function_item`) is declared inside a function or
+    /// closure BODY rather than as a direct item of a module, `impl`, or `trait`
+    /// (issue #413 round 3, Codex finding A). Walks up the enclosing scopes: the
+    /// nearest scope-defining ancestor being a `block` (a fn/closure body, an
+    /// `if`/`match`/loop arm, or a bare block) means the `fn` is a block-local
+    /// statement, lexically unreachable from other scopes; a `declaration_list`
+    /// (a `mod`/`impl`/`trait` item list) or the `source_file` crate root means a
+    /// directly, cross-scope-reachable item. A module-level or impl/trait-method
+    /// `function_item` never sits under a `block`, so it is never block-local.
+    fn is_block_local_fn(node: Node<'_>) -> bool {
+        let mut current = node.parent();
+        while let Some(parent) = current {
+            match parent.kind() {
+                "block" => return true,
+                "declaration_list" | "source_file" => return false,
+                _ => current = parent.parent(),
+            }
+        }
+        false
+    }
+
     fn extract_function(&mut self, node: Node<'_>) {
         if has_unsafe_modifier(node) {
             self.emit_unsafe_site(node, "fn");
@@ -627,22 +648,39 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         };
 
         let id = self.add_symbol(node, symbol_kind, &qualified_name);
-        self.definitions.insert(local_name.clone(), id.clone());
-        self.definitions.insert(qualified_name.clone(), id.clone());
         let is_trait_method = self.is_direct_trait_method(node);
-        self.facts.definitions.push(DefinitionFact {
-            id: id.clone(),
-            qualified_name: qualified_name.clone(),
-            simple_name: local_name.clone(),
-            match_segments: self.definition_match_segments(
-                &local_name,
+        // A block-local `fn` (declared inside a function/closure BODY) is
+        // lexically unreachable from other scopes (issue #413 round 3, Codex
+        // finding A). Its Symbol node keeps the corrected free-function identity
+        // (kind `function`, module-qualified name, no false `Owner::fn` method,
+        // no owner DEFINES — `add_symbol` above is intentionally NOT gated, so
+        // the node + its DEFINES edge and referential closure are preserved).
+        // But it MUST NOT enter ANY call-candidate set, or a call from another
+        // scope could bind the buried item — a wrong or ambiguous edge (and a
+        // confident WRONG edge when the real target is external, leaving the
+        // block-local the sole in-repo candidate). Two candidate sets feed call
+        // resolution, so both are gated: the per-file name→id map
+        // (`self.definitions`, read by the issue #134 `emit_reference_edges`
+        // same-file pass) AND the repo-wide `FileFacts::definitions`
+        // (cross-file + same-file-labeling). Lexically-scoped recall of
+        // intra-block calls is deferred to a follow-up.
+        if !Self::is_block_local_fn(node) {
+            self.definitions.insert(local_name.clone(), id.clone());
+            self.definitions.insert(qualified_name.clone(), id.clone());
+            self.facts.definitions.push(DefinitionFact {
+                id: id.clone(),
+                qualified_name: qualified_name.clone(),
+                simple_name: local_name.clone(),
+                match_segments: self.definition_match_segments(
+                    &local_name,
+                    is_trait_method,
+                    is_direct_impl_method,
+                ),
+                symbol_kind: symbol_kind.to_owned(),
                 is_trait_method,
-                is_direct_impl_method,
-            ),
-            symbol_kind: symbol_kind.to_owned(),
-            is_trait_method,
-            repo_relative_path: self.file.repo_relative_path.clone(),
-        });
+                repo_relative_path: self.file.repo_relative_path.clone(),
+            });
+        }
         self.collect_call_sites(node, &id, &qualified_name);
         self.symbol_bodies.push(SymbolBody {
             id,

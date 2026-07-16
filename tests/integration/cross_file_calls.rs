@@ -605,14 +605,20 @@ fn trait_method_call_edges_are_byte_stable_across_repeated_scans() {
 // --- Trait-method attribution is DIRECT-membership only (issue #390) --------
 
 #[test]
-fn block_local_fn_in_a_trait_method_body_resolves_its_bare_call() {
-    // REGRESSION (issue #390): a `fn helper` defined block-local inside a
-    // default trait method body is a FREE function, not a trait method. The
-    // walker is still under `trait_context` while descending into the method
-    // body, so gating trait-method attribution on the broad flag would mark
-    // `helper` `is_trait_method` and drop its legal bare `helper()` call as
-    // unresolved. Attribution must ride DIRECT structural trait membership, so
-    // the bare call RESOLVES to the local function.
+fn block_local_fn_in_a_trait_method_body_has_corrected_identity_but_is_not_cross_file_callable() {
+    // Issue #413 (round 3, Codex finding A) — flips the earlier #412 recall
+    // assertion, coordinator-authorized. A `fn helper` defined block-local
+    // inside a default trait method body keeps its CORRECTED identity: a plain
+    // free function (kind `function`, module-qualified `alpha::helper`, never a
+    // trait method). But it is lexically unreachable through the flat call
+    // index, so it is NOT exported as a call candidate: its own bare `helper()`
+    // call is now UNRESOLVED.
+    //
+    // WHY UNRESOLVED (do not "fix" this back): a block-local fn is lexically
+    // unreachable through the flat cross-file/same-file call index; keeping it
+    // resolvable would reopen the wrong-edge vector where a bare call elsewhere
+    // binds the buried item (Codex round 3). Scoped block-local recall is
+    // restored by a follow-up issue.
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path();
     write_fixture(
@@ -624,22 +630,24 @@ fn block_local_fn_in_a_trait_method_body_resolves_its_bare_call() {
     );
 
     let records = scan_fixture(repo);
-    // The block-local helper is a plain free function (module-qualified name,
-    // NOT `alpha::T::helper`).
+    // Corrected identity retained: a plain free function, module-qualified name,
+    // NOT `alpha::T::helper`.
     let helper = symbol_id(&records, "function", "alpha::helper", "src/alpha.rs");
     let f = symbol_id(&records, "function", "alpha::f", "src/alpha.rs");
-
-    // The bare `helper()` call binds the local free function — never dropped.
-    assert_calls_edge_with_resolution(&records, &f, &helper, "resolved");
-    // And it is NOT recorded unresolved against a Diagnostic.
     assert!(
         !records.iter().any(|record| {
             record["record_type"] == "node"
-                && record["kind"] == "Diagnostic"
-                && record["name"] == "helper"
-                && record["repo_relative_path"] == "src/alpha.rs"
+                && record["kind"] == "Symbol"
+                && record["name"] == "alpha::T::helper"
         }),
-        "the block-local helper() call must resolve, not emit an unresolved Diagnostic"
+        "the block-local helper must not be a trait-method target (identity stays corrected)"
+    );
+
+    // The bare `helper()` call is UNRESOLVED: the block-local fn is not a call
+    // candidate. Keeping it resolvable would reopen the wrong-edge vector.
+    assert!(
+        calls_edge(&records, &f, &helper).is_none(),
+        "a block-local fn is lexically unreachable through the flat call index; keeping it resolvable would reopen the wrong-edge vector (Codex round 3); scoped block-local recall is restored by a follow-up issue"
     );
 }
 
@@ -677,15 +685,19 @@ fn block_local_fn_in_a_trait_method_is_not_a_trait_method_target() {
 }
 
 #[test]
-fn block_local_fn_in_an_impl_method_body_resolves_its_bare_call() {
-    // REGRESSION (issue #413, impl-side mirror of #390): a `fn helper` defined
-    // block-local inside an impl method body is a FREE function, not an impl
-    // method. The walker is still under `impl_context` while descending into the
-    // method body, so attributing on the broad flag mis-records `helper` as
-    // `method` `alpha::S::helper` (owner `S`), which drops its legal bare
-    // `helper()` call as unresolved. Attribution must ride DIRECT structural
-    // impl membership, so `helper` is a plain module-qualified free function and
-    // its bare call RESOLVES.
+fn block_local_fn_in_an_impl_method_body_has_corrected_identity_but_is_not_cross_file_callable() {
+    // Issue #413 (round 3, Codex finding A). A `fn helper` defined block-local
+    // inside an impl method body keeps its CORRECTED identity: a plain free
+    // function (kind `function`, module-qualified `alpha::helper`, never a
+    // `method` `alpha::S::helper`, no owner DEFINES). But it is lexically
+    // unreachable through the flat call index, so it is NOT exported as a call
+    // candidate: its own bare `helper()` call is now UNRESOLVED.
+    //
+    // WHY UNRESOLVED (do not "fix" this back): a block-local fn is lexically
+    // unreachable through the flat cross-file/same-file call index; keeping it
+    // resolvable would reopen the wrong-edge vector where a bare call elsewhere
+    // binds the buried item (Codex round 3). Scoped block-local recall is
+    // restored by a follow-up issue.
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path();
     write_fixture(
@@ -697,14 +709,11 @@ fn block_local_fn_in_an_impl_method_body_resolves_its_bare_call() {
     );
 
     let records = scan_fixture(repo);
-    // The block-local helper is a plain free function (module-qualified name,
-    // NOT `alpha::S::helper`).
+    // Corrected identity retained: a plain free function, module-qualified name,
+    // NOT `alpha::S::helper`.
     let helper = symbol_id(&records, "function", "alpha::helper", "src/alpha.rs");
     let m = symbol_id(&records, "method", "alpha::S::m", "src/alpha.rs");
     assert_ne!(helper, m, "the nested helper is a distinct symbol from m");
-
-    // The bare `helper()` call binds the local free function — never dropped.
-    assert_calls_edge_with_resolution(&records, &m, &helper, "resolved");
     // The nested helper must NOT be recorded as a method under S.
     assert!(
         !records.iter().any(|record| {
@@ -714,15 +723,12 @@ fn block_local_fn_in_an_impl_method_body_resolves_its_bare_call() {
         }),
         "the impl-nested helper must not be mis-attributed as method S::helper"
     );
-    // And the bare call is NOT recorded unresolved against a Diagnostic.
+
+    // The bare `helper()` call is UNRESOLVED: the block-local fn is not a call
+    // candidate. Keeping it resolvable would reopen the wrong-edge vector.
     assert!(
-        !records.iter().any(|record| {
-            record["record_type"] == "node"
-                && record["kind"] == "Diagnostic"
-                && record["name"] == "helper"
-                && record["repo_relative_path"] == "src/alpha.rs"
-        }),
-        "the block-local helper() call must resolve, not emit an unresolved Diagnostic"
+        calls_edge(&records, &m, &helper).is_none(),
+        "a block-local fn is lexically unreachable through the flat call index; keeping it resolvable would reopen the wrong-edge vector (Codex round 3); scoped block-local recall is restored by a follow-up issue"
     );
 }
 
@@ -755,6 +761,79 @@ fn block_local_fn_in_an_impl_method_is_not_an_impl_method_target() {
     assert!(
         calls_edge(&records, &caller, &helper).is_none(),
         "S::helper() must not bind a block-local free function as an impl method"
+    );
+}
+
+#[test]
+fn bare_call_does_not_bind_a_block_local_fn_buried_in_an_impl_method() {
+    // NO-WRONG-EDGE (issue #413 round 3, Codex finding A): a `fn helper` buried
+    // in an impl method body is lexically unreachable from a separate module's
+    // `g()`. It must NOT be a cross-file call candidate — `g`'s bare `helper()`
+    // (whose only in-repo same-name def is the buried block-local) stays
+    // UNRESOLVED, never a confident wrong resolved edge to the buried item.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub struct S;\nimpl S {\n    pub fn m(&self) -> u32 {\n        fn helper() -> u32 {\n            5\n        }\n        helper()\n    }\n}\n",
+            ),
+            ("src/beta.rs", "pub fn g() -> u32 {\n    helper()\n}\n"),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let helper = symbol_id(&records, "function", "alpha::helper", "src/alpha.rs");
+    let g = symbol_id(&records, "function", "beta::g", "src/beta.rs");
+
+    assert!(
+        calls_edge(&records, &g, &helper).is_none(),
+        "g()'s bare helper() must not bind the block-local fn buried in impl S::m"
+    );
+}
+
+#[test]
+fn module_fn_call_not_ambiguous_with_same_named_block_local_fn() {
+    // NO-WRONG-EDGE (issue #413 round 3, Codex finding A): a module-level
+    // `fn helper` and a same-named block-local `fn helper` buried in `impl S::m`
+    // must not collide. A separate module's `g()` calling `helper()` resolves to
+    // the MODULE `helper` ONLY (single `resolved`), never an ambiguous fan-out
+    // that includes the lexically-unreachable block-local.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub struct S;\nimpl S {\n    pub fn m(&self) -> u32 {\n        fn helper() -> u32 {\n            5\n        }\n        helper()\n    }\n}\n",
+            ),
+            ("src/gamma.rs", "pub fn helper() -> u32 {\n    7\n}\n"),
+            (
+                "src/beta.rs",
+                "use crate::gamma::helper;\npub fn g() -> u32 {\n    helper()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let module_helper = symbol_id(&records, "function", "gamma::helper", "src/gamma.rs");
+    let g = symbol_id(&records, "function", "beta::g", "src/beta.rs");
+
+    // The bare call binds the single module helper, resolved (not ambiguous with
+    // the lexically-unreachable block-local `alpha::helper`).
+    assert_calls_edge_with_resolution(&records, &g, &module_helper, "resolved");
+    // No ambiguous edge from g to any helper — the block-local is not a candidate.
+    assert!(
+        !records.iter().any(|record| {
+            record["record_type"] == "edge"
+                && record["label"] == "CALLS"
+                && record["source"] == g
+                && record["resolution"] == "ambiguous"
+        }),
+        "g()'s helper() must resolve to the module helper only, never ambiguous with a block-local"
     );
 }
 
