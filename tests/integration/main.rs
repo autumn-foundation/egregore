@@ -80,6 +80,7 @@ mod query_undocumented;
 mod query_unreferenced;
 mod query_unsafe_sites;
 mod query_unwrap_expect;
+mod query_verification_coverage;
 mod query_who;
 mod range_delta_repo_gating;
 mod range_deltas;

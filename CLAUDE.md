@@ -310,6 +310,13 @@ cargo run -- query cycles --graph graph.jsonl                     # exit 0 (even
 cargo run -- query cycles src/lib.rs --graph graph.jsonl          # only cycles through this node
 cargo run -- query cycles does_not_exist --graph graph.jsonl      # exit 2 (no_match)
 cargo run -- query cycles codegraph:v1:zzz --graph graph.jsonl    # exit 1 (Unsupported)
+
+# Verification-coverage of the public API surface — covered/uncovered (issue #109)
+cargo run -- query verification-coverage --graph graph.jsonl              # exit 0 (capability verdict when no links)
+cargo run -- query verification-coverage src/adapters --graph graph.jsonl # scope to a path prefix
+cargo run -- query verification-coverage my_symbol --graph graph.jsonl    # scope to a symbol name
+cargo run -- query verification-coverage --graph graph.jsonl --limit 50   # per-bucket truncation
+cargo run -- query verification-coverage src/nope --graph graph.jsonl     # exit 2 (scope_not_found)
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -775,6 +782,37 @@ stable key) and byte-identical across runs. The optional scope handle (symbol na
 or file path) filters to cycles through that node — the pre-refactor check. An acyclic graph
 is an explicit success (exit 0 with an `acyclic` diagnostic), not an error.
 See `docs/cli/cycles.md`.
+
+`eg query verification-coverage [scope]` partitions the issue #213
+externally-reachable public API surface into verification-covered and uncovered
+symbols by joining the recorded verification-domain nodes (`Verification`,
+`CommandRun`, `TestRun`, `ProofResult`, `CIStatus`, `CommandEvidence`,
+`BenchmarkRun`, `CoverageReport`, or any `domain: verification` node) over the
+evidence-link edge/citation registry — never a `#[test]`/coverage-tool grep and
+never a build or coverage run. A public symbol is COVERED when a verification
+node links to it directly (any evidence-link label, `link_level: symbol`) or to
+its containing file via `TOUCHED_FILE`/`FAILED_ON` (`link_level: file`), over
+both edge directions and both representations (graph edges and `EvidenceLink`s
+carried on a node); an agent-memory node linking to it NEVER confers coverage.
+This is a capability-degradation lane by default (mirroring `undocumented`'s
+`doc_facts_unavailable`): because no trunk writer links a verification node to a
+code Symbol/File, a store with no verification records (`no_verification_records`)
+or with verification records that never link to code (`no_verification_code_links`)
+yields an explicit `verification_facts_unavailable` verdict (exit 0) with EMPTY
+buckets — it NEVER floods every symbol into "uncovered". Absence of recorded
+evidence is a prioritization signal, never proof that code is untested,
+unverified in reality, unsafe, or broken; presence is a recorded link, never
+proof of correctness or that a test/proof passed. Covered rows cite each
+crediting verification record ID + kind + edge label + link level. The optional
+scope handle resolves as record ID, exact symbol name, or segment-aware
+repo-relative path prefix (`src/alpha` never matches `src/alphabet`); a scope
+matching no in-store code item exits 2 (`scope_not_found` for a path, `no_match`
+for a name/id). `--repo` scopes both endpoints (a link counts only within the
+scoped repository), `--at <sha>` pins a single-commit surface snapshot, and
+`--limit` (default 500, max 1000) truncates each bucket independently with a
+`results_truncated` diagnostic. Read-only, allow-list-only output (never raw
+payloads), deterministic and byte-identical across runs. See
+`docs/cli/verification-coverage.md`.
 
 Protected raw-artifact commands (issue #60):
 

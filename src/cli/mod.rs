@@ -66,6 +66,7 @@ mod unreferenced;
 mod unsafe_sites;
 mod unwrap_expect;
 mod validate;
+mod verification_coverage;
 mod watch;
 mod who;
 
@@ -133,6 +134,7 @@ pub(crate) use unreferenced::*;
 pub(crate) use unsafe_sites::*;
 pub(crate) use unwrap_expect::*;
 pub(crate) use validate::*;
+pub(crate) use verification_coverage::*;
 pub(crate) use watch::*;
 
 use std::{
@@ -2562,6 +2564,39 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Partition the public API surface into verification-covered / uncovered (issue #109).
+    ///
+    /// Joins the issue #213 externally-reachable public surface with the
+    /// recorded verification-domain nodes (`Verification` / `CommandRun` /
+    /// `TestRun` / `ProofResult` / `CIStatus` / `CommandEvidence` /
+    /// `BenchmarkRun` / `CoverageReport`) over the evidence-link edge/citation
+    /// registry — never a `#[test]`/coverage-tool grep and never a build or
+    /// coverage run. A public
+    /// symbol is COVERED when a verification node links to it directly (any
+    /// evidence-link label) or to its containing file via `TOUCHED_FILE` /
+    /// `FAILED_ON`; an agent-memory node linking to it never confers coverage.
+    ///
+    /// Capability-degradation contract (mirrors `undocumented`'s
+    /// `doc_facts_unavailable`): when the store records no verification nodes,
+    /// or records them but none link to code, the report is an explicit
+    /// `verification_facts_unavailable` verdict (exit 0) with EMPTY buckets —
+    /// never every symbol flooded into "uncovered". Absence of recorded
+    /// evidence is a prioritization signal, NEVER proof that code is untested,
+    /// unverified in reality, unsafe, or broken; presence is a recorded link,
+    /// never proof of correctness or that a test/proof passed.
+    ///
+    /// The optional `scope` handle filters to one code item, resolved in
+    /// precedence order: exact record ID, exact symbol name, or a segment-aware
+    /// repo-relative path prefix. Exit 2 when a supplied scope matches no code
+    /// item (`scope_not_found` for a path, `no_match` for a name/id). Exit 1 on
+    /// malformed input (unknown/ambiguous `--repo`, out-of-range `--limit`).
+    /// Output is deterministic and byte-stable.
+    ///
+    /// Documented in `docs/cli/verification-coverage.md`.
+    VerificationCoverage {
+        /// Optional scope handle: record ID, exact symbol name, or a
+        /// repo-relative path prefix (segment-aware).
+        scope: Option<String>,
     /// Rank indexed symbols by least-recent last change across commit history (issue #219).
     ///
     /// Over a temporal store produced by `eg scan-history`, returns symbols
@@ -2592,10 +2627,14 @@ pub(crate) enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Restrict the ranking to one repository (see `eg query symbol --help`).
+        /// Restrict the surface and links to one repository in a multi-repo store.
         #[arg(long)]
         repo: Option<String>,
-        /// Maximum ranked symbols returned (default 50, max 500). Values
+        /// Resolve the surface against records as they existed at this commit
+        /// SHA or unique prefix (requires a history-bearing store).
+        #[arg(long)]
+        at: Option<String>,
+         /// Maximum ranked symbols returned (default 50, max 500). Values
         /// outside 1..=500 are rejected with an `invalid_limit` diagnostic.
         #[arg(long, default_value_t = query::RECENCY_DEFAULT_LIMIT)]
         limit: usize,
@@ -5563,6 +5602,75 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &index,
                 selected.as_deref(),
                 supersession,
+                format,
+            )
+        }
+        QuerySubcommand::VerificationCoverage {
+            scope,
+            graph,
+            data_dir,
+            repo,
+            at,
+            limit,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic.
+            if let Some(limit) = limit
+                && (limit == 0 || limit > query::VERIFICATION_COVERAGE_MAX_LIMIT)
+            {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::VERIFICATION_COVERAGE_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {}",
+                        query::VERIFICATION_COVERAGE_MAX_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            // Strictly read-only lane (issue #109): `--data-dir` reads from a
+            // throwaway copy, never the live store. A temporal pin needs the
+            // history-inclusive store view so older commit versions are present
+            // to snapshot.
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) if at.is_some() => load_records_from_db_history_readonly(dir)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            // Resolve the optional `--at` commit pin to a single-commit
+            // snapshot before building the surface (the surface itself is
+            // temporally agnostic, matching `query public-api`). Only the `--at`
+            // path needs an index over the full record set; the common path
+            // builds the index once, over the snapshot.
+            let snapshot = match at.as_deref() {
+                None => records,
+                Some(selector) => {
+                    let index = query::RepositoryIndex::build(&records);
+                    let selected = resolve_repo_scope(&index, repo.as_deref());
+                    verification_coverage_snapshot_at_commit(
+                        records,
+                        selector,
+                        &index,
+                        selected.as_deref(),
+                    )
+                }
+            };
+            let index = query::RepositoryIndex::build(&snapshot);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_verification_coverage_cmd(
+                &snapshot,
+                &index,
+                selected.as_deref(),
+                scope.as_deref(),
+                limit,
                 format,
             )
         }
