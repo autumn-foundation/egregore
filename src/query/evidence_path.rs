@@ -394,9 +394,13 @@ struct Discovery<'a> {
 ///
 /// The traversal is an undirected, level-synchronized BFS over the evidence-edge
 /// subgraph (the labels classified as evidence/provenance by the exhaustive
-/// edge-label partition). Deleted records (tombstoned and not carrying a
-/// bitemporal `temporal` version) and edges touching a deleted endpoint are
-/// excluded — a current-state view. On ties the lexicographically smallest
+/// edge-label partition). Liveness is a current-state (latest-write-wins) view
+/// over the append-ordered record slice: a record is deleted only when its most
+/// recent write is a tombstone (no later Node/Edge write of that id follows it)
+/// and it carries no bitemporal `temporal` version — matching embedded
+/// `read_all_records`, so `--graph` and `--data-dir` agree even when a node was
+/// retracted then re-ingested. Edges touching a deleted endpoint are excluded.
+/// On ties the lexicographically smallest
 /// `(neighbor_record_id, edge_record_id)` discovery is kept, so the reported path
 /// is byte-stable. A `visited` set guarantees termination on cycles.
 ///
@@ -425,31 +429,46 @@ pub fn evidence_path(
         });
     }
 
-    // ── tombstone / temporal liveness gate (mirrors transitive_callers) ───────
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let has_temporal: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Node {
-                id,
-                temporal: Some(_),
-                ..
+    // ── current-state (latest-write-wins) tombstone / temporal liveness gate ──
+    //
+    // A `--graph` JSONL from `scan`/`ingest` is an APPEND-ONLY history: a
+    // non-temporal node/edge re-ingested AFTER its own tombstone revives the id.
+    // Embedded `EmbeddedAletheiaSink::read_all_records` (src/adapters/aletheiadb.rs)
+    // already collapses to this current state — it drops a tombstone once a later
+    // node write (higher `NodeId`) or edge write (higher `egregore_seq`) of the
+    // same id supersedes it, both monotonic in write order. `records_from_jsonl`
+    // preserves file/append order, so "latest write for an id" is the record with
+    // the greatest Vec index. A tombstone is ACTIVE only when no later Node/Edge
+    // write of that id follows it — provably equivalent to embedded's per-tombstone
+    // staleness check — so the two supported transports agree (Codex #247 finding).
+    //
+    // `last_write` = greatest index of a Node/Edge write per id; `last_tomb` =
+    // greatest index of a Tombstone per deleted_id. `has_temporal` still fully
+    // exempts bitemporal/history-bearing records a tombstone can never suppress.
+    let mut last_write: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut last_tomb: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut has_temporal: BTreeSet<&str> = BTreeSet::new();
+    for (index, r) in records.iter().enumerate() {
+        match r {
+            GraphRecord::Node { id, temporal, .. } | GraphRecord::Edge { id, temporal, .. } => {
+                last_write.insert(id.as_str(), index);
+                if temporal.is_some() {
+                    has_temporal.insert(id.as_str());
+                }
             }
-            | GraphRecord::Edge {
-                id,
-                temporal: Some(_),
-                ..
-            } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let deleted = |id: &str| tombstoned.contains(id) && !has_temporal.contains(id);
+            GraphRecord::Tombstone { deleted_id, .. } => {
+                last_tomb.insert(deleted_id.as_str(), index);
+            }
+        }
+    }
+    // Active tombstone: a tombstone exists and no later non-tombstone write of the
+    // same id follows it (or none exists at all). `has_temporal` overrides.
+    let deleted = |id: &str| {
+        !has_temporal.contains(id)
+            && last_tomb
+                .get(id)
+                .is_some_and(|&ti| last_write.get(id).is_none_or(|&wi| ti > wi))
+    };
 
     // Live node index: nodes present and not deleted.
     let by_id: BTreeMap<&str, &GraphRecord> = records
@@ -865,6 +884,72 @@ mod tests {
         );
         // Distinct label from not_found.
         assert!(!matches!(err, EvidencePathError::EndpointNotFound { .. }));
+    }
+
+    #[test]
+    fn reingested_node_after_tombstone_is_live_endpoint() {
+        // `--graph` append order: node X, Tombstone(X), node X again (restoration).
+        // Embedded `read_all_records` drops the stale tombstone and keeps X live
+        // (see `read_all_records_includes_restored_node_when_tombstone_is_stale`
+        // in src/adapters/aletheiadb.rs) because a later node write supersedes the
+        // tombstone; the `--graph` path must AGREE — latest write for an id wins.
+        let obs = memory_node("agent_memory:v1:obs");
+        let sym = code_symbol("codegraph:v5:sym", "src/lib.rs", "foo");
+        let tomb = tombstone("codegraph:v5:sym");
+        let sym_again = code_symbol("codegraph:v5:sym", "src/lib.rs", "foo");
+        let e1 = evidence_edge(
+            EdgeLabel::Observes,
+            "agent_memory:v1:obs",
+            "codegraph:v5:sym",
+        );
+        let records = vec![obs, sym, tomb, sym_again, e1];
+        let path = evidence_path(&records, "agent_memory:v1:obs", "codegraph:v5:sym")
+            .expect("re-ingested node after its own tombstone is live (latest write wins)");
+        assert_eq!(path.hops.len(), 1);
+        assert_eq!(path.hops[0].to.record_id, "codegraph:v5:sym");
+    }
+
+    #[test]
+    fn path_traverses_node_reingested_after_tombstone() {
+        // A retracted-then-re-added node X sits MID-path between two live
+        // endpoints; the BFS must be able to route through it.
+        let a = memory_node("agent_memory:v1:a");
+        let x = code_symbol("codegraph:v5:x", "src/x.rs", "x");
+        let tomb = tombstone("codegraph:v5:x");
+        let x_again = code_symbol("codegraph:v5:x", "src/x.rs", "x");
+        let b = verification_node("verification:v1:b");
+        let e1 = evidence_edge(EdgeLabel::Observes, "agent_memory:v1:a", "codegraph:v5:x");
+        let e2 = evidence_edge(
+            EdgeLabel::HasEvidence,
+            "codegraph:v5:x",
+            "verification:v1:b",
+        );
+        let records = vec![a, x, tomb, x_again, b, e1, e2];
+        let path = evidence_path(&records, "agent_memory:v1:a", "verification:v1:b")
+            .expect("BFS routes through a node re-added after its tombstone");
+        assert_eq!(path.hops.len(), 2);
+        assert_eq!(path.hops[0].to.record_id, "codegraph:v5:x");
+        assert_eq!(path.hops[1].from.record_id, "codegraph:v5:x");
+    }
+
+    #[test]
+    fn tombstone_with_no_later_reingest_still_deletes_endpoint() {
+        // AC5 parity guard: a tombstone with NO later re-ingest of that id stays
+        // ACTIVE (its deleted_id is the last write) — the fix must not weaken this.
+        // Append order: node X, Tombstone(X), no re-add.
+        let obs = memory_node("agent_memory:v1:obs");
+        let dead = code_symbol("codegraph:v5:dead", "src/lib.rs", "dead");
+        let tomb = tombstone("codegraph:v5:dead");
+        let records = vec![obs, dead, tomb];
+        let err = evidence_path(&records, "agent_memory:v1:obs", "codegraph:v5:dead")
+            .expect_err("no re-add ⇒ tombstone active ⇒ endpoint tombstoned");
+        assert_eq!(
+            err,
+            EvidencePathError::EndpointTombstoned {
+                side: EndpointSide::Target,
+                handle: "codegraph:v5:dead".to_owned(),
+            }
+        );
     }
 
     #[test]
