@@ -73,6 +73,7 @@ mod query_locate;
 mod query_orient;
 mod query_ownership;
 mod query_public_api;
+mod query_recency;
 mod query_subsystem;
 mod query_symbols;
 mod query_undocumented;
