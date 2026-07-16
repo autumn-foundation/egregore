@@ -98,12 +98,17 @@ use crate::{
 /// shares the current `codegraph:v6:` identity. (This lane originally took 14;
 /// renumbered to 16 after the v15 `content_signature` bump landed on trunk;
 /// 16 -> 17 for the issue #390 `DefinitionFact.is_trait_method` field and the
-/// trait-name-bearing `match_segments` shape, so per-file caches rebuild.)
+/// trait-name-bearing `match_segments` shape, so per-file caches rebuild.
+/// 17 -> 18 for the issue #414 `FileFacts.impl_trait_relations` vector AND the
+/// issue #413 impl-side directness fix: a block-local `fn` nested inside an impl
+/// method body is now a free function (`module::helper`), not `method`
+/// (`Owner::helper`), so its cached symbol identity and edge set change and
+/// per-file caches must rebuild rather than replay the mis-attributed records.)
 ///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 17;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 18;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

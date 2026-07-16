@@ -37,7 +37,7 @@
 //! duplicate (caller, target) pairs collapse to one edge preferring the
 //! strongest status.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -239,6 +239,34 @@ pub struct UseImportFact {
     pub resolved_path: String,
 }
 
+/// A `impl Trait for Type` relation captured for the repo-wide
+/// IMPLEMENTS-gated self-dispatch call-resolution join (issue #414).
+///
+/// Unlike [`PendingImplFact`] (recorded ONLY when local trait resolution
+/// fails), this fact is emitted for EVERY trait impl — same-file and
+/// cross-file — so the resolution pass has a comprehensive "type `S`
+/// implements trait `T`" fact set. A `self.read()` call inside `impl S` binds
+/// the default `T::read` ONLY when this index proves `S` implements a trait
+/// whose crate-root-relative qualified name matches `T::read`'s owner segments
+/// (`match_segments[..len-1]`). Inherent impls (`impl S {}`) and blanket/
+/// negative impls mint no relation.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImplTraitRelationFact {
+    /// Normalized simple name of the implementing Self type (`S` in
+    /// `impl T for S`).
+    pub impl_type: String,
+    /// Normalized trait path as written on the impl header (same normalization
+    /// `pending_impls` uses).
+    pub trait_path: String,
+    /// Crate root the impl belongs to (issue #394 partitioning), derived from
+    /// the impl file's repo-relative path by [`crate_root_id`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub crate_root: String,
+    /// The impl's enclosing module path (crate-root-relative).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub module_names: Vec<String>,
+}
+
 /// Cross-file resolution facts exported by one file's extraction.
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileFacts {
@@ -262,6 +290,10 @@ pub struct FileFacts {
     /// `IMPLEMENTS` resolution (issue #393).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub use_trait_imports: Vec<UseImportFact>,
+    /// Comprehensive `impl Trait for Type` relations, for the IMPLEMENTS-gated
+    /// self-dispatch call-resolution join (issue #414).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub impl_trait_relations: Vec<ImplTraitRelationFact>,
 }
 
 impl FileFacts {
@@ -275,6 +307,7 @@ impl FileFacts {
             && self.impl_targets.is_empty()
             && self.pending_impls.is_empty()
             && self.use_trait_imports.is_empty()
+            && self.impl_trait_relations.is_empty()
     }
 }
 
@@ -758,11 +791,12 @@ pub fn cross_file_call_records(
     let mut diagnostic_edges: BTreeMap<(String, String, String), String> = BTreeMap::new();
 
     for (path, facts) in facts_by_file {
+        let caller_crate_root = crate_root_id(path);
         for call in &facts.call_sites {
             let Some(simple_name) = call.callee_segments.last() else {
                 continue;
             };
-            let candidates = index.candidates(call, simple_name);
+            let candidates = index.candidates(call, simple_name, &caller_crate_root);
             match candidates.len() {
                 0 => {
                     record_unresolved(
@@ -1325,11 +1359,12 @@ fn same_file_call_resolutions(
     let index = DefinitionIndex::build(facts_by_file);
     let mut resolutions = BTreeMap::new();
     for (path, facts) in facts_by_file {
+        let caller_crate_root = crate_root_id(path);
         for call in &facts.call_sites {
             let Some(simple_name) = call.callee_segments.last() else {
                 continue;
             };
-            let candidates = index.candidates(call, simple_name);
+            let candidates = index.candidates(call, simple_name, &caller_crate_root);
             let status = match candidates.len() {
                 0 => continue,
                 1 => CallResolution::Resolved,
@@ -1447,6 +1482,13 @@ fn unresolved_call_diagnostic(
 
 struct DefinitionIndex<'facts> {
     by_simple_name: BTreeMap<&'facts str, Vec<&'facts DefinitionFact>>,
+    /// `(crate_root, implementing_type) -> {trait qualified name}`: the set of
+    /// trait qualified names each type provably implements, for IMPLEMENTS-gated
+    /// self-dispatch (issue #414). Built by resolving every
+    /// [`ImplTraitRelationFact`]'s trait path through the repo-wide
+    /// [`ImplTargetIndex`] so the recorded trait name matches a trait method's
+    /// `match_segments` prefix exactly.
+    implemented: BTreeMap<(String, String), BTreeSet<String>>,
 }
 
 impl<'facts> DefinitionIndex<'facts> {
@@ -1470,7 +1512,60 @@ impl<'facts> DefinitionIndex<'facts> {
             });
             candidates.dedup_by(|a, b| a.id == b.id);
         }
-        Self { by_simple_name }
+
+        // Resolve every recorded `impl Trait for Type` relation to the trait's
+        // crate-root-relative qualified name via the repo-wide impl-target
+        // index (issue #414). A plain `build` (no aux-helper crate-root remap)
+        // is used deliberately — this join is conservative and stays within one
+        // crate root, so it never needs the #399 out-of-line remap. An
+        // unresolvable trait path (external/std, ambiguous) contributes nothing,
+        // so the gate degrades to unresolved (a MISS, never a WRONG edge).
+        let impl_index = ImplTargetIndex::build(facts_by_file);
+        let mut implemented: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        for facts in facts_by_file.values() {
+            for relation in &facts.impl_trait_relations {
+                // Same-simple-name-type guard (issue #414): `impl_type` is a BARE
+                // simple name (`normalize_impl_owner`). Two DISTINCT types both
+                // named `S` in different modules of one crate root would collapse
+                // their implemented-trait sets under this bare key, so a
+                // `self.read()` in an `impl a::S` that implements nothing could
+                // bind a trait `b::S` implements — a WRONG edge. When the bare
+                // `impl_type` is ambiguous among the crate root's impl-target
+                // TYPE definitions, the type identity is unprovable by bare name,
+                // so skip the relation and stay unresolved (a MISS, never a WRONG
+                // edge — the same counting predicate `ImplTargetIndex` uses).
+                if impl_index
+                    .bare_simple_name_is_ambiguous(&relation.crate_root, &relation.impl_type)
+                {
+                    continue;
+                }
+                let pending = PendingImplFact {
+                    source_id: String::new(),
+                    trait_path: relation.trait_path.clone(),
+                    crate_root: relation.crate_root.clone(),
+                    module_names: relation.module_names.clone(),
+                    shadowed_by_use: false,
+                };
+                if let Some(target) = impl_index.resolve(&pending, &facts.use_trait_imports) {
+                    implemented
+                        .entry((relation.crate_root.clone(), relation.impl_type.clone()))
+                        .or_default()
+                        .insert(target.qualified_name.clone());
+                }
+            }
+        }
+
+        Self {
+            by_simple_name,
+            implemented,
+        }
+    }
+
+    /// The set of trait qualified names the type `impl_type` provably implements
+    /// within `crate_root` (issue #414), or `None` when no proof exists.
+    fn implemented_traits(&self, crate_root: &str, impl_type: &str) -> Option<&BTreeSet<String>> {
+        self.implemented
+            .get(&(crate_root.to_owned(), impl_type.to_owned()))
     }
 
     /// Returns the in-repo candidates for a call site, deterministically
@@ -1492,7 +1587,12 @@ impl<'facts> DefinitionIndex<'facts> {
     ///   carry the enclosing trait name (`Device::read`, issue #390); a
     ///   single-segment path degrades to the free-function pool (and so, like
     ///   `Direct`, never reaches a trait method).
-    fn candidates(&self, call: &CallSiteFact, simple_name: &str) -> Vec<&'facts DefinitionFact> {
+    fn candidates(
+        &self,
+        call: &CallSiteFact,
+        simple_name: &str,
+        caller_crate_root: &str,
+    ) -> Vec<&'facts DefinitionFact> {
         let Some(pool) = self.by_simple_name.get(simple_name) else {
             return Vec::new();
         };
@@ -1543,10 +1643,58 @@ impl<'facts> DefinitionIndex<'facts> {
                     // excludes any trait method `T::g`.
                     Some(owner) => {
                         let narrowing = [owner.clone(), simple_name.to_owned()];
+                        let inherent: Vec<&DefinitionFact> = methods
+                            .iter()
+                            .copied()
+                            .filter(|definition| {
+                                segments_end_with(&definition.match_segments, &narrowing)
+                            })
+                            .collect();
+                        // Inherent methods (and a trait's own `self.other()`
+                        // inside its body, whose owner IS the trait name) take
+                        // precedence over trait defaults (Rust dispatch). If the
+                        // owner segment matches directly, bind it and never reach
+                        // for a trait default.
+                        if !inherent.is_empty() {
+                            return inherent;
+                        }
+                        // IMPLEMENTS-gated self-dispatch (issue #414): the owner
+                        // `S` has no directly-named method `S::read`. Bind to a
+                        // trait default ONLY for a trait S PROVABLY implements
+                        // (IMPLEMENTS index join), matched by crate-root-relative
+                        // trait qualified name (`match_segments[..len-1]`). An
+                        // unrelated `U::read` (S does not implement U) is
+                        // excluded; multiple implemented traits declaring the
+                        // method emit ambiguous edges to all, never a silent
+                        // pick; no proof => empty (unresolved, no wrong edge).
+                        // Conservatism (the #412 invariant extended): supertrait
+                        // defaults, blanket impls, and cross-crate-root traits
+                        // are NOT resolved — the direct IMPLEMENTS index never
+                        // places their trait qualified name in S's set
+                        // (supertrait: only the directly-named trait is recorded;
+                        // blanket impl: `impl_type` is a generic param, never a
+                        // concrete S; cross-root: the crate_root guard) — so they
+                        // degrade to unresolved (a MISS, never a WRONG edge). Two
+                        // distinct same-simple-name types in different modules of
+                        // one crate root are likewise treated as ambiguous and
+                        // stay unresolved (the bare-simple-name receiver-owner
+                        // limitation), guarded when the implemented map is built.
+                        let Some(implemented) = self.implemented_traits(caller_crate_root, owner)
+                        else {
+                            return Vec::new();
+                        };
                         methods
                             .into_iter()
                             .filter(|definition| {
-                                segments_end_with(&definition.match_segments, &narrowing)
+                                definition.is_trait_method
+                                    && crate_root_id(&definition.repo_relative_path)
+                                        == caller_crate_root
+                                    && definition.match_segments.len() >= 2
+                                    && implemented.contains(
+                                        &definition.match_segments
+                                            [..definition.match_segments.len() - 1]
+                                            .join("::"),
+                                    )
                             })
                             .collect()
                     }
@@ -1791,7 +1939,7 @@ mod tests {
             None,
         );
         let ids: Vec<&str> = index
-            .candidates(&call, "read")
+            .candidates(&call, "read", "lib")
             .iter()
             .map(|definition| definition.id.as_str())
             .collect();
@@ -1818,7 +1966,7 @@ mod tests {
         let index = DefinitionIndex::build(&facts);
         let call = call("caller", "read", &["read"], CallKind::Method, None);
         let ids: Vec<&str> = index
-            .candidates(&call, "read")
+            .candidates(&call, "read", "lib")
             .iter()
             .map(|definition| definition.id.as_str())
             .collect();
@@ -1846,7 +1994,7 @@ mod tests {
         let index = DefinitionIndex::build(&facts);
         let call = call("caller", "read", &["read"], CallKind::Direct, None);
         assert!(
-            index.candidates(&call, "read").is_empty(),
+            index.candidates(&call, "read", "lib").is_empty(),
             "a bare read() must not bind a trait method"
         );
     }
@@ -1867,7 +2015,7 @@ mod tests {
         let index = DefinitionIndex::build(&facts);
         let call = call("caller", "read", &["read"], CallKind::Path, None);
         assert!(
-            index.candidates(&call, "read").is_empty(),
+            index.candidates(&call, "read", "lib").is_empty(),
             "a single-segment read() path must not bind a trait method"
         );
     }
@@ -1887,7 +2035,7 @@ mod tests {
         let index = DefinitionIndex::build(&facts);
         let call = call("caller", "A::read", &["A", "read"], CallKind::Path, None);
         let ids: Vec<&str> = index
-            .candidates(&call, "read")
+            .candidates(&call, "read", "lib")
             .iter()
             .map(|definition| definition.id.as_str())
             .collect();
@@ -1917,7 +2065,7 @@ mod tests {
             None,
         );
         assert!(
-            index.candidates(&call, "read").is_empty(),
+            index.candidates(&call, "read", "lib").is_empty(),
             "Device::read must not bind an unrelated free function read"
         );
     }
@@ -1979,7 +2127,7 @@ mod tests {
         let index = DefinitionIndex::build(&facts);
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("T"));
         let ids: Vec<&str> = index
-            .candidates(&call, "read")
+            .candidates(&call, "read", "lib")
             .iter()
             .map(|definition| definition.id.as_str())
             .collect();
@@ -2011,7 +2159,7 @@ mod tests {
         let index = DefinitionIndex::build(&facts);
         let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("T"));
         assert!(
-            index.candidates(&call, "read").is_empty(),
+            index.candidates(&call, "read", "lib").is_empty(),
             "self.read() with owner T and no T::read must stay empty, never fan out to Q::read"
         );
     }
@@ -2033,7 +2181,7 @@ mod tests {
         let index = DefinitionIndex::build(&facts);
         let call = call("caller", "g", &["g"], CallKind::SelfMethod, Some("S"));
         let ids: Vec<&str> = index
-            .candidates(&call, "g")
+            .candidates(&call, "g", "lib")
             .iter()
             .map(|definition| definition.id.as_str())
             .collect();
@@ -2041,6 +2189,88 @@ mod tests {
             ids,
             vec!["s-g"],
             "impl self.g() must bind only the inherent S::g, never the trait method T::g"
+        );
+    }
+
+    /// Facts for the IMPLEMENTS-gated self-dispatch join (issue #414): a root
+    /// trait `T` and `U` each declaring a `read` default, plus (optionally) an
+    /// `impl T for S` relation proving `S` implements `T`.
+    fn self_dispatch_facts(with_impl_t_for_s: bool) -> BTreeMap<String, FileFacts> {
+        let mut map = BTreeMap::new();
+        map.insert(
+            "src/lib.rs".to_owned(),
+            FileFacts {
+                definitions: vec![
+                    trait_method_definition("t-read", "src/lib.rs", &["T", "read"]),
+                    trait_method_definition("u-read", "src/lib.rs", &["U", "read"]),
+                ],
+                impl_targets: vec![
+                    impl_target_in("T", "T", &[], "trait", "lib"),
+                    impl_target_in("U", "U", &[], "trait", "lib"),
+                ],
+                impl_trait_relations: if with_impl_t_for_s {
+                    vec![ImplTraitRelationFact {
+                        impl_type: "S".to_owned(),
+                        trait_path: "T".to_owned(),
+                        crate_root: "lib".to_owned(),
+                        module_names: vec![],
+                    }]
+                } else {
+                    vec![]
+                },
+                ..FileFacts::default()
+            },
+        );
+        map
+    }
+
+    #[test]
+    fn self_dispatch_admits_only_an_implemented_trait_method() {
+        // PRECISION (issue #414): `self.read()` with owner `S`, where `S` has no
+        // inherent `read` but PROVABLY implements `T` (whose default declares
+        // `read`), binds ONLY `T::read`. The unrelated `U::read` (S does not
+        // implement `U`) is excluded even though it shares the simple name.
+        let facts = self_dispatch_facts(true);
+        let index = DefinitionIndex::build(&facts);
+        let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("S"));
+        let ids: Vec<&str> = index
+            .candidates(&call, "read", "lib")
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["t-read"],
+            "self.read() in impl S must bind only the implemented T::read, never U::read"
+        );
+    }
+
+    #[test]
+    fn self_dispatch_without_an_implements_proof_admits_nothing() {
+        // NO-WRONG-EDGE (issue #414): the same fixture WITHOUT the `impl T for S`
+        // relation leaves `S`'s implemented-trait set empty, so `self.read()`
+        // binds nothing — a MISS, never a WRONG edge to `T::read` or `U::read`.
+        let facts = self_dispatch_facts(false);
+        let index = DefinitionIndex::build(&facts);
+        let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("S"));
+        assert!(
+            index.candidates(&call, "read", "lib").is_empty(),
+            "self.read() with no `impl T for S` proof must admit no trait-default candidate"
+        );
+    }
+
+    #[test]
+    fn self_dispatch_gate_respects_the_caller_crate_root() {
+        // CONSERVATISM (issue #414): the implemented-trait set is keyed on the
+        // caller's crate root. A caller in a DIFFERENT crate root (`bin:tool`)
+        // finds no proof for `S`, so the trait default is not bound — a
+        // cross-crate-root trait degrades to unresolved, never a wrong edge.
+        let facts = self_dispatch_facts(true);
+        let index = DefinitionIndex::build(&facts);
+        let call = call("caller", "read", &["read"], CallKind::SelfMethod, Some("S"));
+        assert!(
+            index.candidates(&call, "read", "bin:tool").is_empty(),
+            "the IMPLEMENTS gate must not cross crate roots"
         );
     }
 

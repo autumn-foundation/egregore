@@ -17,8 +17,8 @@ use crate::{
             path_segments, reference_text, span,
         },
         cross_file::{
-            CallKind, CallSiteFact, DefinitionFact, FileFacts, ImplTargetFact, OutOfLineModFact,
-            PendingImplFact, UseImportFact, crate_root_id,
+            CallKind, CallSiteFact, DefinitionFact, FileFacts, ImplTargetFact,
+            ImplTraitRelationFact, OutOfLineModFact, PendingImplFact, UseImportFact, crate_root_id,
         },
     },
     redaction::REDACTION_POLICY_VERSION,
@@ -584,6 +584,25 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 .is_some_and(|grandparent| grandparent.kind() == "trait_item")
     }
 
+    /// True when `node` is a DIRECT member of an `impl` block's declaration
+    /// list — its immediate parent is the impl's `declaration_list` and the
+    /// grandparent is the `impl_item`. A block-local `fn` nested inside an impl
+    /// method body fails this check, so it is attributed as a free function,
+    /// not `Owner::fn` (issue #413 — the impl-side mirror of
+    /// `is_direct_trait_method`). The persistent `impl_context` flag stays
+    /// `Some` while descending into an impl method's body, so without this
+    /// structural gate a block-local `fn helper` would be mis-recorded as
+    /// `method` `Owner::helper` and drop its bare `helper()` call (prefer a
+    /// MISSING edge over a WRONG one).
+    fn is_direct_impl_method(&self, node: Node<'_>) -> bool {
+        self.impl_context.is_some()
+            && node
+                .parent()
+                .filter(|parent| parent.kind() == "declaration_list")
+                .and_then(|parent| parent.parent())
+                .is_some_and(|grandparent| grandparent.kind() == "impl_item")
+    }
+
     fn extract_function(&mut self, node: Node<'_>) {
         if has_unsafe_modifier(node) {
             self.emit_unsafe_site(node, "fn");
@@ -592,21 +611,20 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             self.walk_children(node);
             return;
         };
-        let (symbol_kind, qualified_name) = self.impl_context.as_ref().map_or_else(
-            || {
-                if self.is_test_function(node) {
-                    ("test", self.qualify(&local_name))
-                } else {
-                    ("function", self.qualify(&local_name))
-                }
-            },
-            |impl_context| {
-                (
-                    "method",
-                    self.qualify(&format!("{}::{local_name}", impl_context.method_owner)),
-                )
-            },
-        );
+        // Method attribution rides DIRECT structural impl membership (issue
+        // #413): a block-local `fn` nested inside an impl method body keeps
+        // `impl_context` `Some` but is NOT a direct impl member, so it falls
+        // through to the free-function/test branches rather than being
+        // mis-recorded as `Owner::fn`.
+        let is_direct_impl_method = self.is_direct_impl_method(node);
+        let (symbol_kind, qualified_name) = match self.impl_context.as_ref() {
+            Some(impl_context) if is_direct_impl_method => (
+                "method",
+                self.qualify(&format!("{}::{local_name}", impl_context.method_owner)),
+            ),
+            _ if self.is_test_function(node) => ("test", self.qualify(&local_name)),
+            _ => ("function", self.qualify(&local_name)),
+        };
 
         let id = self.add_symbol(node, symbol_kind, &qualified_name);
         self.definitions.insert(local_name.clone(), id.clone());
@@ -616,7 +634,11 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             id: id.clone(),
             qualified_name: qualified_name.clone(),
             simple_name: local_name.clone(),
-            match_segments: self.definition_match_segments(&local_name, is_trait_method),
+            match_segments: self.definition_match_segments(
+                &local_name,
+                is_trait_method,
+                is_direct_impl_method,
+            ),
             symbol_kind: symbol_kind.to_owned(),
             is_trait_method,
             repo_relative_path: self.file.repo_relative_path.clone(),
@@ -646,9 +668,17 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     /// trait name is pushed ONLY for a function that is a direct member of the
     /// trait body, never a block-local `fn` nested inside a trait method (which
     /// is a free function whose owner is its module).
-    fn definition_match_segments(&self, local_name: &str, is_trait_method: bool) -> Vec<String> {
+    fn definition_match_segments(
+        &self,
+        local_name: &str,
+        is_trait_method: bool,
+        is_direct_impl_method: bool,
+    ) -> Vec<String> {
         let mut segments = self.module_names.clone();
-        if let Some(impl_context) = &self.impl_context {
+        if let Some(impl_context) = self.impl_context.as_ref().filter(|_| is_direct_impl_method) {
+            // The impl-owner segment is pushed ONLY for a DIRECT impl member
+            // (issue #413), never a block-local `fn` nested inside an impl
+            // method body (which is a free function whose owner is its module).
             if let Some(owner) = normalize_impl_owner(&impl_context.method_owner) {
                 segments.push(owner);
             }
@@ -819,6 +849,30 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         // while the parse tree is in hand — never re-parsed from the display
         // string later (issue #343/#344).
         let decision = impl_target_decision(node, self.source, &display);
+
+        // Capture a comprehensive `impl Trait for Type` relation for the
+        // repo-wide IMPLEMENTS-gated self-dispatch join (issue #414). Unlike
+        // `pending_impls` (deferred ONLY when local resolution fails), this
+        // records EVERY trait impl — same-file and cross-file — so the
+        // resolution pass has a complete "S implements T" fact set. Emit only
+        // for a trait impl that names a concrete implementing type: a `trait`
+        // field must be present (excludes inherent `impl S {}`, whose decision
+        // is also `Resolve` but carries the TYPE name), and the decision must be
+        // `Resolve` (excludes blanket/negative/non-nominal impls, whose decision
+        // is `NoEdge`, and generic inherent impls, whose decision is
+        // `Verbatim`). The `trait_path` reuses `impl_target_decision`'s exact
+        // normalization so the join stays consistent with the IMPLEMENTS pass.
+        if node.child_by_field_name("trait").is_some()
+            && let ImplTargetDecision::Resolve(trait_path) = &decision
+            && let Some(impl_type) = normalize_impl_owner(&display)
+        {
+            self.facts.impl_trait_relations.push(ImplTraitRelationFact {
+                impl_type,
+                trait_path: trait_path.clone(),
+                crate_root: self.crate_root.clone(),
+                module_names: self.module_names.clone(),
+            });
+        }
 
         // The trait lookup is deferred until the whole file is indexed
         // (`resolve_pending_impl_edges`): Rust item order is insignificant,
@@ -1101,11 +1155,13 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         self.definitions.insert(local_name.clone(), id.clone());
         self.definitions.insert(qualified_name.clone(), id.clone());
         let is_trait_method = self.is_direct_trait_method(node);
+        // A signature-only item never carries an `impl_context` (impl methods
+        // always have bodies), so it is never a direct impl method (issue #413).
         self.facts.definitions.push(DefinitionFact {
             id,
             qualified_name: qualified_name.clone(),
             simple_name: local_name.clone(),
-            match_segments: self.definition_match_segments(&local_name, is_trait_method),
+            match_segments: self.definition_match_segments(&local_name, is_trait_method, false),
             symbol_kind: "function".to_owned(),
             is_trait_method,
             repo_relative_path: self.file.repo_relative_path.clone(),
