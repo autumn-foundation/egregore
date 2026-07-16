@@ -1055,10 +1055,13 @@ fn impl_self_call_ignores_an_unimplemented_trait_default() {
 }
 
 #[test]
-fn impl_self_call_to_a_method_from_two_implemented_traits_is_ambiguous() {
-    // AMBIGUOUS (issue #414): S implements BOTH T and V, each declaring a `read`
-    // default. `self.read()` must emit ambiguous edges to BOTH `T::read` and
-    // `V::read`, never a silent single pick.
+fn impl_self_call_to_a_method_from_two_implemented_traits_stays_unresolved() {
+    // CONSERVATIVE (issue #414, Codex P1 on #420): S implements BOTH T and V,
+    // each declaring a `read` default. Rust dispatch for `self.read()` depends on
+    // which trait is in lexical scope at the call site (its `use` imports), which
+    // this cross-file pass does not resolve. Emitting candidates for both would
+    // mint a false CALLS edge to whichever trait is NOT in scope. Multiple
+    // candidate impls therefore stay UNRESOLVED — no edge to either method.
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path();
     write_fixture(
@@ -1084,13 +1087,62 @@ fn impl_self_call_to_a_method_from_two_implemented_traits_is_ambiguous() {
     let v_read = symbol_id(&records, "function", "kappa::read", "src/kappa.rs");
     let f = symbol_id(&records, "method", "beta::S::f", "src/beta.rs");
 
-    assert_calls_edge_with_resolution(&records, &f, &t_read, "ambiguous");
-    assert_calls_edge_with_resolution(&records, &f, &v_read, "ambiguous");
-    // Neither candidate is ever labeled `resolved` — a 2-candidate self-dispatch
-    // stays ambiguous, never a silent single pick.
     assert!(
-        calls_edge(&records, &f, &t_read).is_some_and(|edge| edge["resolution"] == "ambiguous"),
-        "an implemented-trait-default self-call with 2 candidates must never be resolved"
+        calls_edge(&records, &f, &t_read).is_none(),
+        "a 2-implemented-trait self-dispatch must not bind T::read (call-site trait scope unresolved)"
+    );
+    assert!(
+        calls_edge(&records, &f, &v_read).is_none(),
+        "a 2-implemented-trait self-dispatch must not bind V::read (call-site trait scope unresolved)"
+    );
+}
+
+#[test]
+fn impl_self_call_respects_call_site_trait_scope() {
+    // NO-WRONG-EDGE (issue #414, Codex P1 on #420): S implements T and U, both
+    // declaring `read`, but the calling module only `use`s U. Rust dispatches
+    // `self.read()` to `U::read` ONLY — `T::read` is not method-call-visible
+    // (out of lexical scope). This cross-file pass does not thread the call
+    // site's `use` imports, so it cannot tell which trait is in scope; emitting
+    // an edge to `T::read` would be a WRONG edge for valid Rust. The critical
+    // assertion is that NO edge to the out-of-scope `T::read` is minted; per the
+    // conservative-narrowing charge the in-scope `U::read` is left unresolved too
+    // (prefer a MISSING edge over a WRONG one).
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/alpha.rs",
+                "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/gamma.rs",
+                "pub trait U {\n    fn read(&self) -> u32 {\n        2\n    }\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                "use crate::gamma::U;\npub struct S;\nimpl crate::alpha::T for S {}\nimpl crate::gamma::U for S {}\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let t_read = symbol_id(&records, "function", "alpha::read", "src/alpha.rs");
+    let u_read = symbol_id(&records, "function", "gamma::read", "src/gamma.rs");
+    let f = symbol_id(&records, "method", "beta::S::f", "src/beta.rs");
+
+    // CRITICAL: never bind the out-of-scope trait's method.
+    assert!(
+        calls_edge(&records, &f, &t_read).is_none(),
+        "self.read() must not bind T::read: only `use crate::gamma::U` is in scope at the call site"
+    );
+    // Conservative narrowing: the in-scope U::read is also left unresolved (the
+    // pass cannot prove call-site trait scope).
+    assert!(
+        calls_edge(&records, &f, &u_read).is_none(),
+        "a 2-implemented-trait self-dispatch stays unresolved, never a wrong or guessed edge"
     );
 }
 
@@ -1305,7 +1357,9 @@ fn impl_self_call_binds_an_implemented_trait_default_across_three_files() {
 
 #[test]
 fn implements_gated_self_dispatch_edges_are_byte_stable_across_repeated_scans() {
-    // Determinism guard for the #414 recall + ambiguity paths.
+    // Determinism guard for the #414 single-implemented-trait recall path (the
+    // resolved case — multiple implemented traits stay unresolved and mint no
+    // edge, so a single trait exercises a real deterministic resolved edge).
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path();
     write_fixture(
@@ -1316,12 +1370,8 @@ fn implements_gated_self_dispatch_edges_are_byte_stable_across_repeated_scans() 
                 "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\n",
             ),
             (
-                "src/kappa.rs",
-                "pub trait V {\n    fn read(&self) -> u32 {\n        2\n    }\n}\n",
-            ),
-            (
                 "src/beta.rs",
-                "pub struct S;\nimpl crate::alpha::T for S {}\nimpl crate::kappa::V for S {}\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+                "pub struct S;\nimpl crate::alpha::T for S {}\nimpl S {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
             ),
         ],
     );
@@ -1338,8 +1388,8 @@ fn implements_gated_self_dispatch_edges_are_byte_stable_across_repeated_scans() 
         assert_eq!(first, next, "scan {run} must be byte-identical to scan 1");
     }
     assert!(
-        first.contains(r#""resolution":"ambiguous""#),
-        "stability check must cover the ambiguous implements-gated self-dispatch path: {first}"
+        first.contains(r#""resolution":"resolved""#),
+        "stability check must cover the resolved implements-gated self-dispatch path: {first}"
     );
 }
 

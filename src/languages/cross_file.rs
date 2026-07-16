@@ -1702,8 +1702,8 @@ impl<'facts> DefinitionIndex<'facts> {
                         // trait qualified name (`match_segments[..len-1]`). An
                         // unrelated `U::read` (S does not implement U) is
                         // excluded; multiple implemented traits declaring the
-                        // method emit ambiguous edges to all, never a silent
-                        // pick; no proof => empty (unresolved, no wrong edge).
+                        // method stay UNRESOLVED (see below); no proof => empty
+                        // (unresolved, no wrong edge).
                         // Conservatism (the #412 invariant extended): supertrait
                         // defaults, blanket impls, and cross-crate-root traits
                         // are NOT resolved — the direct IMPLEMENTS index never
@@ -1720,7 +1720,7 @@ impl<'facts> DefinitionIndex<'facts> {
                         else {
                             return Vec::new();
                         };
-                        methods
+                        let gated: Vec<&DefinitionFact> = methods
                             .into_iter()
                             .filter(|definition| {
                                 definition.is_trait_method
@@ -1733,7 +1733,22 @@ impl<'facts> DefinitionIndex<'facts> {
                                             .join("::"),
                                     )
                             })
-                            .collect()
+                            .collect();
+                        if gated.len() >= 2 {
+                            // Multiple implemented traits declare this method.
+                            // Rust dispatch depends on which trait is in lexical
+                            // scope at the CALL SITE (its `use` imports), which
+                            // this pass does not resolve. Emitting all candidates
+                            // would mint a false CALLS edge to an out-of-scope
+                            // trait's default (Codex P1 on #420). Per the #414
+                            // charge, multiple candidate impls stay conservative:
+                            // UNRESOLVED. A single gated candidate is safe: if the
+                            // call compiles with exactly one trait supplying the
+                            // method, that trait is provably in scope (else E0599),
+                            // so the caller labels it `resolved`.
+                            return Vec::new();
+                        }
+                        gated
                     }
                     // A `self` call with no resolvable owner cannot be narrowed;
                     // this is unreachable for extractor-produced facts (a `self`
