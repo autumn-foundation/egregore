@@ -67,6 +67,8 @@ mod unwrap_expect;
 mod validate;
 mod watch;
 mod who;
+// Appended (issue #225); kept at the end to minimize cross-lane merge conflicts.
+mod path;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
@@ -132,6 +134,8 @@ pub(crate) use unsafe_sites::*;
 pub(crate) use unwrap_expect::*;
 pub(crate) use validate::*;
 pub(crate) use watch::*;
+// Appended (issue #225); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use path::*;
 
 use std::{
     collections::BTreeMap,
@@ -2556,6 +2560,65 @@ pub(crate) enum QuerySubcommand {
         /// 1..=500 are rejected with an `invalid_limit` diagnostic.
         #[arg(long, default_value_t = query::CHURN_DEFAULT_LIMIT)]
         limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Trace a directed shortest call path between two symbols (issue #225).
+    ///
+    /// Answers the reachability question between two *named* endpoints: does
+    /// `FROM` reach `TO` through the call graph, and if so by what concrete
+    /// path? The walk is a directed BFS over **resolved `CALLS` edges only**
+    /// (the outbound call direction), so ambiguous/unresolved `CALLS` edges
+    /// (issues #152/#134) and every other label (`REFERENCES`, `MENTIONS`,
+    /// `IMPORTS`, `IMPLEMENTS`, containment) are excluded. Direction is
+    /// honored: `path A B` and `path B A` are distinct queries.
+    ///
+    /// Both endpoints resolve by the same symbol-name / record-ID semantics as
+    /// the other code-handle verbs. When a directed path exists the answer is a
+    /// single deterministic witness path: a summary envelope line followed by
+    /// one line per hop, each hop citing the from/to `record_id`, `name`,
+    /// `kind`, `repo_relative_path`, and `span`, plus the edge label and
+    /// confidence. `A == B` is a trivial zero-hop path.
+    ///
+    /// Selection is deterministic (documented tie-break: minimum hop count,
+    /// then the lexicographically smallest `(source_record_id,
+    /// edge_record_id)` discovery pointer per node), byte-identical across
+    /// runs. The witness is a reachability LEAD, never proof of runtime control
+    /// flow, and a `no_path` verdict is not proof of non-reachability.
+    ///
+    /// Exit codes:
+    ///   0 — a directed path was found (including the trivial `A == B` path).
+    ///   1 — malformed / ambiguous / unsupported handle or selector for either
+    ///       endpoint (machine-readable JSON on stderr; ambiguous names list
+    ///       all candidate record IDs).
+    ///   2 — an endpoint resolves to no live record (`no_match` / `stale_handle`),
+    ///       both endpoints resolve but no directed path exists (`no_path`), or
+    ///       --at/--as-of names no resolvable commit.
+    ///
+    /// Documented in `docs/cli/path.md` and `docs/cli/query.md`.
+    Path {
+        /// Source symbol record ID (`codegraph:vN:<hex>`) or exact symbol name.
+        from: String,
+        /// Target symbol record ID (`codegraph:vN:<hex>`) or exact symbol name.
+        to: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict symbol resolution to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Trace the path against the graph state at this commit SHA or unique
+        /// prefix (requires a history graph). Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Trace the path against the graph state at the most recent commit at
+        /// or before this RFC 3339 instant. Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -5491,6 +5554,38 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &index,
                 selected.as_deref(),
                 supersession,
+                format,
+            )
+        }
+        // Appended (issue #225); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::Path {
+            from,
+            to,
+            graph,
+            data_dir,
+            repo,
+            at,
+            as_of,
+            format,
+        } => {
+            // Temporal selectors need the history-inclusive store view; the
+            // current-state read suffices otherwise. A JSONL graph is read
+            // identically either way.
+            let records = if at.is_some() || as_of.is_some() {
+                load_query_records_history(graph.as_deref(), data_dir.as_deref())?
+            } else {
+                load_query_records(graph.as_deref(), data_dir.as_deref())?
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_path_cmd(
+                &records,
+                &from,
+                &to,
+                &index,
+                selected.as_deref(),
+                at.as_deref(),
+                as_of.as_deref(),
                 format,
             )
         }

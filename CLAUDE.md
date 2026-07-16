@@ -190,6 +190,14 @@ cargo run -- query transitive-callees does_not_exist --graph graph.jsonl      # 
 cargo run -- query transitive-callees <symbol_name> --graph graph.jsonl --max-depth 3
 cargo run -- query transitive-callees <symbol_name> --graph history.graph.jsonl --at <sha>  # commit view
 
+# Directed shortest call path between two symbols with a citable witness (issue #225)
+cargo run -- query path <from_symbol> <to_symbol> --graph graph.jsonl        # exit 0 (path_found)
+cargo run -- query path <to_symbol> <from_symbol> --graph graph.jsonl        # exit 2 (no_path; direction honored)
+cargo run -- query path <ambiguous_name> <to_symbol> --graph graph.jsonl     # exit 1 (candidates listed)
+cargo run -- query path does_not_exist <to_symbol> --graph graph.jsonl       # exit 2 (no_match)
+cargo run -- query path <symbol> <symbol> --graph graph.jsonl                # exit 0 (trivial zero-hop path)
+cargo run -- query path <from_symbol> <to_symbol> --graph history.graph.jsonl --at <sha>  # commit view
+
 # Direct outbound dependencies of a symbol (issue #123)
 cargo run -- query deps <symbol_name> --graph graph.jsonl          # exit 0 (even when empty)
 cargo run -- query deps <ambiguous_name> --graph graph.jsonl       # exit 1 (candidates listed)
@@ -356,6 +364,27 @@ all candidate record IDs; `--at`/`--as-of` walk a single-commit history view. Ou
 newline-delimited JSON (summary envelope line, then reachable rows, then unresolved rows),
 byte-identical across runs. Rows are reachability leads, never proof of breakage or runtime
 behavior. See `docs/cli/transitive-callees.md`.
+
+`eg query path <from> <to>` traces the directed shortest call path between two symbols
+(record ID or exact name) and returns one concrete, citable witness: a summary envelope
+line followed by one line per hop, each hop citing the from/to `record_id`, `name`, `kind`,
+`repo_relative_path`, and `span` plus the `CALLS` edge handle, `resolution`, and
+`confidence`. The walk is a directed BFS over `resolved` CALLS edges ONLY — the outbound
+call direction — so ambiguous/unresolved CALLS edges (issues #152/#134) and every other
+label (`REFERENCES`/`MENTIONS`/`IMPORTS`/`IMPLEMENTS`/containment) are excluded; the
+always-present disclaimer states this and that the witness is a reachability LEAD, never
+proof of runtime control flow, and a `no_path` verdict is not proof of non-reachability.
+Direction is honored (`path A B` and `path B A` are distinct queries); `A == B` is a
+trivial `path_found` zero-hop path. Selection is deterministic and byte-stable: among
+minimum-hop paths, each node keeps the discovery edge with the lexicographically smallest
+`(source_record_id, edge_record_id)` pair as its parent pointer, and the witness is
+reconstructed by following those pointers. Both endpoints resolve independently; an
+ambiguous name exits 1 listing all candidate record IDs (the `endpoint` field names which
+side failed), an unknown/stale endpoint exits 2 (`no_match`/`stale_handle`), and both
+endpoints resolving with no directed path is an explicit `no_path` verdict at exit 2.
+`--at`/`--as-of` trace a single-commit history view (mutually exclusive). Read-only over
+`--graph`/`--data-dir`, redaction-safe (record IDs, names, paths, spans only), with a
+`--format text` mode. See `docs/cli/path.md`.
 
 `eg query deps <handle>` returns the direct outbound dependencies of a symbol (record ID or
 exact name) — its `CALLS`/`IMPLEMENTS`/`IMPORTS`/`REFERENCES` neighbors — each labeled with

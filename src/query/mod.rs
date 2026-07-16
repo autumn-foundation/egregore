@@ -48,6 +48,8 @@ mod unreferenced;
 mod unsafe_sites;
 mod unwrap_expect;
 mod who;
+// Appended (issue #225); kept at the end to minimize cross-lane merge conflicts.
+mod path;
 
 pub use as_of::*;
 pub use change_impact::*;
@@ -87,3 +89,5 @@ pub use unreferenced::*;
 pub use unsafe_sites::*;
 pub use unwrap_expect::*;
 pub use who::*;
+// Appended (issue #225); kept at the end to minimize cross-lane merge conflicts.
+pub use path::*;
