@@ -865,9 +865,11 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         if node.child_by_field_name("trait").is_some()
             && let ImplTargetDecision::Resolve(trait_path) = &decision
             && let Some(impl_type) = normalize_impl_owner(&display)
+            && let Some(impl_type_path) = normalize_impl_owner_path(&display)
         {
             self.facts.impl_trait_relations.push(ImplTraitRelationFact {
                 impl_type,
+                impl_type_path,
                 trait_path: trait_path.clone(),
                 crate_root: self.crate_root.clone(),
                 module_names: self.module_names.clone(),
@@ -2662,6 +2664,23 @@ fn normalize_impl_owner(owner: &str) -> Option<String> {
     let owner = owner.split('<').next()?.trim();
     let owner = owner.rsplit("::").next()?.trim();
     (is_simple_ident(owner)).then(|| owner.to_owned())
+}
+
+/// Normalizes an impl owner display to the implementing type's PATH AS WRITTEN,
+/// stopping BEFORE [`normalize_impl_owner`]'s final leaf reduction (issue #414,
+/// Codex P2 on #420): `T for std::string::String` → `std::string::String`;
+/// `U for String` → `String`; `Runner for crate::foo::Bar` → `crate::foo::Bar`;
+/// `impl<T> Trait for Wrapper<T>` → `Wrapper`. The retained path lets the
+/// repo-wide `ImplTargetIndex` decide whether the implementing type resolves to
+/// a UNIQUE LOCAL type def — an external `std::string::String` resolves to
+/// nothing and its relation is dropped, so it never pollutes a local `String`'s
+/// implemented-trait set under the bare-leaf map key. Returns `None` for empty
+/// forms.
+fn normalize_impl_owner_path(owner: &str) -> Option<String> {
+    let owner = owner.rsplit(" for ").next()?.trim();
+    let owner = strip_impl_prefix(owner).trim();
+    let owner = owner.split('<').next()?.trim();
+    (!owner.is_empty()).then(|| owner.to_owned())
 }
 
 /// Strips a leading `impl` keyword and its generic parameter list, if any.

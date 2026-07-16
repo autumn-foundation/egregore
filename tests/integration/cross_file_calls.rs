@@ -1196,6 +1196,81 @@ fn impl_self_call_does_not_bind_across_same_simple_name_types() {
 }
 
 #[test]
+fn impl_self_call_does_not_bind_a_trait_impld_for_an_external_leaf_collision() {
+    // NO-WRONG-EDGE (issue #414, external-leaf collision, Codex P2 on #420): a
+    // trait `T` is implemented for the EXTERNAL type `std::string::String`, whose
+    // leaf name `String` collides with a LOCAL `struct String` that implements a
+    // DIFFERENT trait `U`. Under the bare-leaf map key `String`, the external
+    // contributor would pollute the local type's implemented-trait set to
+    // {T, U}, so `self.read()` in `impl String` would fan out an ambiguous edge
+    // to `T::read` even though the local `String` only implements `U`. The
+    // implementing type must resolve to a UNIQUE LOCAL type def, so the external
+    // `std::string::String` relation is dropped: `self.read()` binds ONLY the
+    // local `U::read`.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[(
+            "src/lib.rs",
+            "pub trait T {\n    fn read(&self) -> u32 {\n        1\n    }\n}\npub trait U {\n    fn read(&self) -> u32 {\n        2\n    }\n}\npub struct String;\nimpl T for std::string::String {}\nimpl U for String {}\nimpl String {\n    pub fn f(&self) -> u32 {\n        self.read()\n    }\n}\n",
+        )],
+    );
+
+    let records = scan_fixture(repo);
+    let f = symbol_id(&records, "method", "String::f", "src/lib.rs");
+    // Both trait methods qualify to the Symbol name `read` in one crate root, so
+    // they cannot be told apart by node name. Distinguish the bug from the fix by
+    // the shape of the CALLS edges out of `f`: the bug pollutes the local
+    // `String`'s implemented set to {T, U}, minting TWO ambiguous edges (one to
+    // each `read`); the fix drops the external `std::string::String` relation,
+    // leaving {U} — exactly ONE resolved edge to the local `U::read`.
+    let read_ids: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Symbol"
+                && record["symbol_kind"] == "function"
+                && record["name"] == "read"
+                && record["repo_relative_path"] == "src/lib.rs"
+        })
+        .filter_map(|record| record["id"].as_str())
+        .collect();
+    assert_eq!(
+        read_ids.len(),
+        2,
+        "T::read and U::read must both be extracted"
+    );
+
+    let calls_from_f: Vec<(&str, &str)> = records
+        .iter()
+        .filter(|record| {
+            record["record_type"] == "edge" && record["label"] == "CALLS" && record["source"] == f
+        })
+        .filter_map(|record| {
+            Some((
+                record["target"].as_str()?,
+                record["resolution"].as_str().unwrap_or(""),
+            ))
+        })
+        .filter(|(target, _)| read_ids.contains(target))
+        .collect();
+
+    // Exactly one resolved edge to a local `read` (the implemented `U::read`),
+    // and no ambiguous fan-out — the external `impl T for std::string::String`
+    // never contributes.
+    assert_eq!(
+        calls_from_f.len(),
+        1,
+        "self.read() must bind exactly one local read method, got: {calls_from_f:?}"
+    );
+    assert_eq!(
+        calls_from_f[0].1, "resolved",
+        "the single self.read() edge must be resolved, not an ambiguous external-leaf fan-out"
+    );
+}
+
+#[test]
 fn impl_self_call_binds_an_implemented_trait_default_across_three_files() {
     // CROSS-FILE (issue #414): the trait (alpha), the calling `impl S` + struct
     // (beta), and the `impl T for S` relation (gamma) live in three DIFFERENT

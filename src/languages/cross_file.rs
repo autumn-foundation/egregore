@@ -252,9 +252,18 @@ pub struct UseImportFact {
 /// negative impls mint no relation.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ImplTraitRelationFact {
-    /// Normalized simple name of the implementing Self type (`S` in
-    /// `impl T for S`).
+    /// Normalized simple LEAF name of the implementing Self type (`S` in
+    /// `impl T for S`) — the map key and same-simple-name ambiguity guard.
     pub impl_type: String,
+    /// Normalized implementing-type PATH as written, BEFORE the final leaf
+    /// reduction (`std::string::String`, `String`, `crate::foo::S`), issue #414
+    /// / Codex P2 on #420. Resolved against the repo-wide `ImplTargetIndex` so a
+    /// relation whose Self does not resolve to a UNIQUE LOCAL type def (external
+    /// like `std::string::String`, ambiguous, or unresolved) is dropped and
+    /// never pollutes a same-leaf local type's implemented-trait set. Serde
+    /// default (empty) reads back cleanly from a pre-field cache.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub impl_type_path: String,
     /// Normalized trait path as written on the impl header (same normalization
     /// `pending_impls` uses).
     pub trait_path: String,
@@ -1539,6 +1548,34 @@ impl<'facts> DefinitionIndex<'facts> {
                 {
                     continue;
                 }
+                // External-leaf-collision guard (issue #414, Codex P2 on #420):
+                // `impl_type` is only the bare leaf, so a trait implemented for an
+                // EXTERNAL type whose leaf matches a local type
+                // (`impl T for std::string::String` alongside a local
+                // `struct String`) would pollute the local type's set under the
+                // shared leaf key. Resolve the implementing type's retained PATH
+                // against the same `ImplTargetIndex`: keep the relation ONLY when
+                // Self resolves to a UNIQUE LOCAL type def (a non-trait
+                // impl-target kind). An external / ambiguous / unresolved / trait
+                // Self drops the relation, so only genuinely local implementing
+                // types contribute — the bare-leaf receiver key then matches only
+                // the local `impl S`'s own `receiver_owner`.
+                let type_pending = PendingImplFact {
+                    source_id: String::new(),
+                    trait_path: relation.impl_type_path.clone(),
+                    crate_root: relation.crate_root.clone(),
+                    module_names: relation.module_names.clone(),
+                    shadowed_by_use: false,
+                };
+                let Some(type_def) = impl_index.resolve(&type_pending, &facts.use_trait_imports)
+                else {
+                    continue;
+                };
+                if type_def.symbol_kind == "trait"
+                    || !crate::languages::rust::is_impl_target_kind(&type_def.symbol_kind)
+                {
+                    continue;
+                }
                 let pending = PendingImplFact {
                     source_id: String::new(),
                     trait_path: relation.trait_path.clone(),
@@ -2207,10 +2244,15 @@ mod tests {
                 impl_targets: vec![
                     impl_target_in("T", "T", &[], "trait", "lib"),
                     impl_target_in("U", "U", &[], "trait", "lib"),
+                    // The local implementing type must resolve to a UNIQUE LOCAL
+                    // type def (issue #414 / Codex P2 on #420), so `S` is a
+                    // struct impl-target here.
+                    impl_target_in("S", "S", &[], "struct", "lib"),
                 ],
                 impl_trait_relations: if with_impl_t_for_s {
                     vec![ImplTraitRelationFact {
                         impl_type: "S".to_owned(),
+                        impl_type_path: "S".to_owned(),
                         trait_path: "T".to_owned(),
                         crate_root: "lib".to_owned(),
                         module_names: vec![],
