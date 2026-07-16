@@ -15,7 +15,7 @@ eg query who      <NAME>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] 
 eg query who      <NAME>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query drift            --graph <PATH>    [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query drift            --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
-eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
+eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--under <PREFIX>] [--format json|text]
 eg query semantic-context <QUERY> --data-dir <DIR> [--limit N] [--min-score F] [--repo <SELECTOR>]
 eg query semantic-memory <QUERY> --data-dir <DIR> [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
 eg query implementors <TRAIT> --graph <PATH>   [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
@@ -142,6 +142,44 @@ Most subcommands accept exactly one input source:
 - `--data-dir <DIR>` — read from an embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. Requires the `embedded-aletheiadb` feature (enabled by default). Providing both `--graph` and `--data-dir` is an error.
 
 `eg query semantic`, `eg query semantic-context`, and `eg query semantic-memory` accept **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results. `eg query semantic` returns only deterministic **code** hits; `eg query semantic-memory` returns only **agent-authored** memory hits — the two are never blended (issue #91). `eg query semantic-context` follows the `eg query context` no-match convention: on no semantic hit clearing `--min-score` it prints `{"ok":false,"error":{"code":"no_match",...}}` to **stdout** and exits `2`.
+
+### Subsystem scoping — `eg query semantic --under <PREFIX>` (issue #198)
+
+`eg query semantic` accepts an optional `--under <PREFIX>` flag that scopes the
+result set to a repo-relative directory prefix, so an agent working inside a
+known subsystem retrieves concept-matched code only from that subsystem instead
+of hand-filtering crate-wide hits. It reuses the same **segment-aware** prefix
+matcher as `eg query subsystem` (issue #83):
+
+- **Segment-aware, no prefix bleed** — `--under src/alpha` returns hits whose
+  `repo_relative_path` is under `src/alpha/` but never under `src/alphabet/`.
+  The trailing-slash and bare forms resolve identically (`src/alpha` ==
+  `src/alpha/`).
+- **Filtered before `--limit`** — scoping is applied to the full candidate pool
+  *before* the top-N cap, so `--limit N` returns the N best **in-subsystem** hits
+  rather than N global hits filtered down to fewer. Ordering is deterministic
+  (score descending, then record ID ascending); re-running an identical scoped
+  query against an unchanged store produces byte-identical output.
+- **Composes with `--repo` and `--limit`** — repository scoping and subsystem
+  scoping stack; both apply before truncation.
+- **Per-record shape is unchanged** — scoping changes *which* records appear, not
+  the per-record JSON contract (`record_id`, `score`, `name`,
+  `repo_relative_path`, `span`).
+- **Local only** — `--under` is a local-CLI surface for this slice and cannot be
+  combined with `--daemon` (clap rejects the combination); daemon/MCP exposure of
+  scoped retrieval is owned by other issues.
+
+Outcomes:
+
+- A **malformed/empty** prefix (empty, or nothing left after stripping trailing
+  slashes) prints a stable `{"ok":false,"error":{"code":"malformed_under_prefix",...}}`
+  diagnostic to **stdout** and exits `1` — an empty prefix is never silently
+  reported as success.
+- A **valid** prefix that matches zero embedded nodes prints a distinct
+  `scoped to '<prefix>', no matches …` message to **stderr** and exits `2` — this
+  outcome is worded distinctly from the `no results — store may not have
+  embeddings` message so an agent can tell "nothing under this prefix" apart from
+  "this store has no semantic index".
 
 ## Exit codes
 
