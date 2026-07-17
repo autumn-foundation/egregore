@@ -134,11 +134,15 @@ summary rather than fabricate one. `eg inspect` surfaces the same coverage block
 over both `--graph` and `--data-dir`, so an agent can tell "0 results because
 absent" from "0 results because that file was never indexed". Over `--graph`,
 equal-ID `ScanCoverage` versions in an exported JSONL are collapsed to the
-freshest by `valid_time` instant; because the full scan stamps seconds precision
-and the record carries no subsecond/write-order signal, two scans within the
-same UTC second cannot be ordered from the file (tiebreak is arbitrary w.r.t.
-recency) — use `--data-dir` (authoritative, ordered by store write-order) for
-sub-second re-scan scenarios (known limitation, issue #406). The
+freshest by `valid_time` instant, then — on a same-UTC-second tie — by the
+record's full-precision `coverage_generation` instant (a nanosecond RFC 3339
+timestamp captured at scan time; non-identity, additive, never affects record
+IDs or any other node's `valid_time`), so the newer of two same-second scans
+wins deterministically regardless of physical line order (issue #406). The
+residual tie — two scans within the same NANOSECOND, or a legacy record produced
+before `coverage_generation` existed — falls through to a content tiebreak; use
+`--data-dir` (authoritative, ordered by store write-order) for those and other
+sub-second re-scan scenarios. The
 `codegraph` `SCHEMA_VERSION` is 6 (bumped 5→6 for the `ScanCoverage` node). `eg
 refresh` (the incremental path) maintains this same node (issue #403): each
 refresh recomputes coverage against the current tree — running manifest

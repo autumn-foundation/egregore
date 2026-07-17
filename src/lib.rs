@@ -187,8 +187,19 @@ pub fn scan_repository_with_override(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
 ) -> Result<Graph> {
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    scan_repository_at_with_override(repo_path, &now, repo_id_override)
+    // Capture ONE scan instant: `transaction_time`/`valid_time` stay seconds
+    // precision (unchanged), while `coverage_generation` (issue #406) keeps the
+    // full nanosecond precision so two same-UTC-second scans are orderable.
+    let instant = chrono::Utc::now();
+    let now = instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let generation = instant.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    scan_repository_at_with_override_inner(
+        repo_path,
+        &now,
+        repo_id_override,
+        &[],
+        Some(&generation),
+    )
 }
 
 /// Like [`scan_repository_with_override`] but excludes repo-relative paths from
@@ -206,8 +217,16 @@ pub fn scan_repository_with_exclusions(
     repo_id_override: Option<&str>,
     snapshot_exclusions: &[String],
 ) -> Result<Graph> {
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    scan_repository_at_with_override_inner(repo_path, &now, repo_id_override, snapshot_exclusions)
+    let instant = chrono::Utc::now();
+    let now = instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let generation = instant.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    scan_repository_at_with_override_inner(
+        repo_path,
+        &now,
+        repo_id_override,
+        snapshot_exclusions,
+        Some(&generation),
+    )
 }
 
 /// Scans a repository with an explicit `transaction_time` and optional identity override.
@@ -221,7 +240,10 @@ pub fn scan_repository_at_with_override(
     transaction_time: &str,
     repo_id_override: Option<&str>,
 ) -> Result<Graph> {
-    scan_repository_at_with_override_inner(repo_path, transaction_time, repo_id_override, &[])
+    // Explicit-time entry (fixed-timestamp callers such as tests and audit):
+    // derive `coverage_generation` from `transaction_time` for deterministic,
+    // byte-identical output across re-runs with the same override (issue #406).
+    scan_repository_at_with_override_inner(repo_path, transaction_time, repo_id_override, &[], None)
 }
 
 fn scan_repository_at_with_override_inner(
@@ -229,6 +251,7 @@ fn scan_repository_at_with_override_inner(
     transaction_time: &str,
     repo_id_override: Option<&str>,
     snapshot_exclusions: &[String],
+    coverage_generation: Option<&str>,
 ) -> Result<Graph> {
     LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
@@ -309,8 +332,14 @@ fn scan_repository_at_with_override_inner(
     reconcile_scan_coverage(&graph, &mut coverage_tally);
     // A single deterministic `ScanCoverage` node makes file-level indexing
     // coverage a stated, queryable graph fact, attached to its Repository by a
-    // CONTAINS edge so it is citable and never an orphan.
-    for record in scan_coverage_records(&repository_id, &coverage_tally) {
+    // CONTAINS edge so it is citable and never an orphan. `coverage_generation`
+    // (issue #406) carries a full-precision recency signal so two scans within
+    // one UTC second — which share a seconds-precision `valid_time` — are still
+    // deterministically orderable by `eg inspect --graph`. With no explicit
+    // override it defaults to `transaction_time`, keeping fixed-time scans (the
+    // byte-stability tests) byte-identical.
+    let coverage_generation = coverage_generation.unwrap_or(transaction_time);
+    for record in scan_coverage_records(&repository_id, &coverage_tally, coverage_generation) {
         graph.push(record.with_valid_time_inferred(transaction_time));
     }
 
@@ -480,6 +509,7 @@ pub(crate) fn reconcile_scan_coverage(graph: &Graph, tally: &mut fs::ScanCoverag
 pub(crate) fn scan_coverage_records(
     repository_id: &str,
     tally: &fs::ScanCoverageTally,
+    coverage_generation: &str,
 ) -> Vec<GraphRecord> {
     let coverage_id = stable_id(&["node", "scan_coverage", repository_id]);
     let payload = ir::ScanCoveragePayload {
@@ -491,6 +521,9 @@ pub(crate) fn scan_coverage_records(
             .map(|language| language.display_name().to_owned())
             .collect(),
         coverage_complete: tally.coverage_complete,
+        // Full-precision recency tie-break for same-UTC-second re-scans
+        // (issue #406). Non-identity: never part of `coverage_id`.
+        coverage_generation: Some(coverage_generation.to_owned()),
     };
     let node = GraphRecord::node(
         coverage_id.clone(),
