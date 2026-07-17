@@ -63,14 +63,18 @@ an edge label.
 `--out` receives the enriched **log-domain** records only (updated
 `ErrorSignature` nodes, the original log records, new `Diagnostic` markers, and
 new `FRAME_RESOLVES_TO` edges) — the code graph is never re-emitted. Records are
-canonically ordered and byte-identical across runs.
+canonically ordered and byte-identical across runs. The enriched
+`ErrorSignature` re-emits its log payload unchanged except for the added
+evidence links, so the schema-v3 `repository_id` field (issue #362) is
+**preserved** through enrichment; frame resolution mints no new attribution and
+changes no log record ID.
 
 stdout carries a deterministic summary envelope:
 
 ```json
 {"ok":true,"command":"resolve-frames","at_commit":null,"as_of":null,
  "totals":{"signatures_with_frames":1,"resolved":1,"ambiguous":1,"path_only":1,"unresolved":1,"external":1},
- "signatures":[{"signature_id":"log:v2:…","resolved":1,"ambiguous":1,"path_only":1,"unresolved":1,"external":1}],
+ "signatures":[{"signature_id":"log:v3:…","resolved":1,"ambiguous":1,"path_only":1,"unresolved":1,"external":1}],
  "disclaimer":"A frame binding proves that the backtrace frame NAMES the symbol; …"}
 ```
 

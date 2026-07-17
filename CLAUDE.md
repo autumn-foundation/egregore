@@ -44,8 +44,14 @@ captured log file (issues #319/#320): a `LogSource`, one `ErrorSignature` per
 `template-v1` fingerprint (a 1000×-repeated error collapses to one signature with
 `occurrence_count` == the raw count), capped `LogEvent` exemplars, and hourly
 `LogOccurrenceBucket` counts. Trust class `runtime_observation` — a program's own
-claim, deterministically parsed but never verified. Raw log text never enters the
-graph; excerpts are `template-v1`-normalized, redacted, and bounded. Deterministic
+claim, deterministically parsed but never verified. Records mint under the
+`log:v3:` prefix (`LOG_SCHEMA_VERSION` == 3): every log record now carries a
+retrievable `repository_id` field (issue #362, = the computed repository identity
+a `--repo` selector resolves to), and each `LogOccurrenceBucket` also carries a
+sorted `occurrence_timestamps` list (issue #364, RFC3339 UTC per-occurrence valid
+times, `len == occurrence_count`). Both are `#[serde(default)]` so legacy
+`log:v2:` records still deserialize. Raw log text never enters the graph;
+excerpts are `template-v1`-normalized, redacted, and bounded. Deterministic
 and byte-stable; CRLF and LF checkouts yield identical IDs. Unrecognized
 (binary/non-UTF-8) input exits 1 with a machine-readable diagnostic and no partial
 output. Add `--protected-raw-artifacts --protected-store <dir> --producer <id>`
@@ -461,14 +467,17 @@ out-of-range and excluded from all three classes. Each `new_signatures` row join
 signature's `LogOccurrenceBucket` records via `AGGREGATES` edges (`base_window_occurrences`/
 `head_window_occurrences` = buckets at/before each endpoint's committer date); a signature
 with no linked buckets falls back to its aggregate `occurrence_count` with
-`occurrence_source: aggregate_only` — counts are never fabricated. These per-window counts are
-hour-bucket-granular, not endpoint-exact (the envelope carries
-`occurrence_count_granularity: "hourly_bucket"` and the disclaimer states it): a
-`LogOccurrenceBucket` retains only an hour-aligned `bucket_start` and an aggregate count (no
-per-occurrence timestamps), so a bucket straddling a commit instant cannot be sub-divided and a
-count may include occurrences up to one bucket width (1 hour) past the exact endpoint when it
-falls mid-hour; the "fully-before" predicate is deliberately not used (it would under-count
-instead), and endpoint-exact counts require a #320 schema change tracked in #364. Per-window bucket counts
+`occurrence_source: aggregate_only` — counts are never fabricated. Since schema v3 (issue #364)
+each `LogOccurrenceBucket` carries a sorted `occurrence_timestamps` list, so per-window counts
+are ENDPOINT-EXACT: only timestamps at or before the endpoint (by parsed UTC instant) are
+counted, so a bucket straddling a mid-hour endpoint is sub-divided at the instant instead of
+counted whole. A legacy `log:v2:` bucket has empty `occurrence_timestamps` and falls back
+per-bucket to the hour-bucket rule (counted whole when `bucket_start <= endpoint`, may over-count
+by up to one bucket width; the "fully-before" predicate is deliberately not used — it would
+under-count). The `occurrence_count_granularity` marker is therefore PER-RESPONSE and CONDITIONAL:
+`endpoint_exact` when every contributing bucket had timestamps (or none contributed), else
+`hourly_bucket` when at least one legacy bucket fell back; the disclaimer wording is selected to
+match. Per-window bucket counts
 and the aggregate `occurrence_count` both SUM across all scanned sources: since issue #361 a
 `LogOccurrenceBucket` record ID is source-aware — `(repository/signature/hour/width/source_id)` —
 so distinct sources mint DISTINCT bucket IDs whose per-source counts each sum in, while a genuine
@@ -476,20 +485,18 @@ rescan of identical bytes mints the SAME bucket ID and is deduped (collapsed) be
 concatenating the identical `scan-logs` output therefore no longer double-counts buckets. All timestamp comparisons
 (window derivation, classification, bucket cutoffs) are by parsed UTC instant, never raw RFC
 3339 string order, because commit committer dates carry local offsets (`%cI`) while scan-logs
-times are Z-normalized — a lexical comparison would misclassify across offsets. `--repo`
-scopes only the code side (commit/window resolution and the symbol-delta join): log records
-carry no retrievable repository attribution (the repo ID is only hashed into their stable
-IDs), so all in-window log signatures are always included and per-repository log separation
-requires per-repository stores. Whenever `--repo` is set the response envelope discloses this
-in a machine-readable `repo_scope_caveat` field (log signatures are NOT repository-filtered and
-a scoped run cannot be guaranteed repo-specific for them). The disclosure NEVER asserts log
-isolation from the `Repository`-node count: log records add no `Repository` node, so a store
-reporting a single `Repository` node can still hold another repository's log graph (repo-A
-history plus a repo-B `scan-logs` graph) whose in-window signatures classify here regardless of
-`--repo`. `distinct_repository_count`/`multi_repository_store` are informational raw counts, not
-an isolation verdict; the multi-repository case only ADDS a higher-known-risk note and a single
-count is never downgraded to "safe". The schema-level fix that would let `--repo` filter log
-signatures is tracked in #362. Because `LogSource` is a non-identity input (a signature's
+times are Z-normalized — a lexical comparison would misclassify across offsets. Since schema v3
+(issue #362) every log record persists a retrievable `repository_id`, so `--repo` now FILTERS log
+signatures (not just the code side): `RepositoryIndex::owner_of` resolves each signature's
+attribution and a signature belonging to a different repository is soundly EXCLUDED — closing the
+cross-repository false-regression lead the old disclosure could only warn about. A legacy `log:v2:`
+record has an empty `repository_id` and cannot be proven in-repo, so it is conservatively EXCLUDED
+under `--repo` (possible under-report, never a cross-repo bleed) and tallied. The former "logs are
+never repository-filtered" `repo_scope_caveat` is GONE; a shrunken RESIDUAL `repo_scope_caveat`
+(carrying `repo_scope`, `excluded_unattributed_signature_count`, and a fixed `message`) is emitted
+ONLY when `--repo` is set AND at least one legacy unattributed signature was actually excluded — a
+fully-v3 scoped store carries NO caveat. The old `distinct_repository_count`/`multi_repository_store`
+disclosure fields are removed (attribution makes them unnecessary). Because `LogSource` is a non-identity input (a signature's
 stable ID is `(repository_id, fingerprint_algorithm, template, severity)` only), a graph
 combining multiple `scan-logs` outputs for one repo carries the same signature record ID more
 than once; those records are grouped by stable ID and merged BEFORE classifying — earliest

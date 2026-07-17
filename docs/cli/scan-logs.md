@@ -105,6 +105,21 @@ they never change a signature's record ID — capped at 64 per signature, and
 absent when no backtrace parsed. They are the input `eg resolve-frames` binds to
 code-graph symbols (see [`resolve-frames.md`](resolve-frames.md)).
 
+### Schema-v3 record fields (issues #362 / #364)
+
+Every emitted log record (`LogSource`, `ErrorSignature`, `LogEvent`,
+`LogOccurrenceBucket`) carries a retrievable `repository_id` field (issue #362)
+equal to the computed repository identity — the same value a `--repo` selector
+resolves to — so downstream queries can attribute a log signature to its
+repository in a shared store. Each `LogOccurrenceBucket` additionally carries a
+sorted `occurrence_timestamps` list (issue #364) — the RFC 3339 UTC
+per-occurrence valid times that fell in the bucket's hour (length ==
+`occurrence_count`) — so a consumer can bound a per-window occurrence count
+endpoint-exactly at an arbitrary commit instant. Both fields are timestamps or
+IDs only (redaction-safe, never raw log text) and are captured on every scan;
+the record IDs mint under the `log:v3:` prefix (`LOG_SCHEMA_VERSION` = 3). See
+[`docs/schema/log-graph.md`](../schema/log-graph.md).
+
 ### `template-v1` normalization
 
 Applied before any hash or ID. Variable spans are replaced, most-specific-first,

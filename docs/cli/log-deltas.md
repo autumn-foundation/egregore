@@ -32,46 +32,41 @@ resolution and error taxonomy. `BASE` must be an ancestor of `HEAD`. The query
 is purely read-time: it reads only the supplied store, never Git state, so it
 cannot mutate the working tree.
 
-### `--repo` scope (code side only)
+### `--repo` scope (code side **and** log signatures, schema v3)
 
 `--repo <SELECTOR>` scopes the **code side** of the query — commit/endpoint
 resolution, the valid-time window, and the symbol-delta join — to one repository
-in a shared multi-repo store. It does **not** filter the log signatures
-themselves: `scan-logs` records (`ErrorSignature`, `LogOccurrenceBucket`, and
-their `AGGREGATES` / `FRAME_RESOLVES_TO` edges) carry no retrievable repository
-attribution — the repository identity is only hashed into their stable record
-IDs, never stored as a queryable field — so there is no sound way to attribute a
-signature to a repository at read time. Every in-window log signature in the
-store is therefore classified against the scoped window regardless of `--repo`.
-(An earlier revision applied the `--repo` predicate to signature IDs directly;
-because `owner_of(<signature-id>)` is always `None`, that dropped **every**
-signature and returned empty groups even for the correct repository.) To keep log
-domains cleanly separated, keep each repository's logs in its own store.
+in a shared multi-repo store. Since **schema v3** (issue #362) it **also filters
+the log signatures**: every `scan-logs` record now persists a retrievable
+`repository_id` field (byte-identical to the `Repository` record ID the
+selector resolves to), so `RepositoryIndex::owner_of(<signature-id>)` resolves
+and a signature attributed to a **different** repository is soundly **excluded**
+from a scoped run rather than bled into it. This closes the cross-repository
+false-regression lead that the earlier disclosure could only warn about: an
+`ErrorSignature` belonging to repository B whose `first_seen` lands inside
+repository A's derived window is no longer reported under `--repo A`.
 
-**A single `Repository`-node count does NOT mean the run is repo-isolated for log
-signatures.** Log records add no `Repository` node — their repository identity is
-only hashed into their stable IDs — so a store that reports one distinct
-`Repository` node can still hold a second repository's log graph (for example
-repo-A `scan-history` plus a repo-B `scan-logs` graph), whose in-window signatures
-are classified here regardless of `--repo`. The disclosure therefore **never**
-guarantees repo-specificity for log signatures at any repository count.
+**Legacy `log:v2:` records — conservative exclusion.** A pre-v3 log record
+carries **no** persisted `repository_id` (it deserializes to the empty string
+via `#[serde(default)]`), so it cannot be *proven* to belong to the scoped
+repository. Rather than bleed it in (a possible cross-repository false lead), a
+scoped run **excludes** it — a conservative choice that may **under**-report for
+those legacy records until they are re-scanned, never a cross-repository bleed.
+Re-run `eg scan-logs` to regenerate every record under schema v3 with
+retrievable attribution.
 
-Because a scoped run cannot be guaranteed repo-specific for log signatures, the
-response **envelope discloses this in a machine-readable field** rather than only
-in the docs. Whenever `--repo` is set, the response carries a `repo_scope_caveat`
-object stating that log signatures are **not** repository-filtered and that a
-scoped run cannot be guaranteed repo-specific for them (`repo_scope`,
-`distinct_repository_count`, `multi_repository_store`, and a fixed `message`).
-`distinct_repository_count` and `multi_repository_store` are **informational**
-raw counts of `Repository` nodes, never an isolation verdict. When the store
-holds more than one distinct `Repository` node the message ADDS a
-higher-known-risk note (`multi_repository_store: true`) — multiple repositories
-are demonstrably present — but the base disclosure is identical and a single
-count is **never** downgraded to "safe". The field is omitted entirely for
-unscoped queries and is deterministic (fixed strings, no wall clock). The
-schema-level fix — persisting repository attribution on log records so `--repo`
-can soundly filter log signatures and the caveat can be dropped — is tracked in
-issue #362.
+**Residual caveat (shrunk).** The former "logs are never repository-filtered"
+`repo_scope_caveat` is **gone**. A `repo_scope_caveat` object is now emitted
+**only** when `--repo` is set **and** at least one legacy unattributed signature
+was actually excluded, carrying `repo_scope`, an
+`excluded_unattributed_signature_count` (always `> 0` when present), and a fixed
+`message` disclosing the conservative exclusion and the re-scan remedy. A fully
+schema-v3 scoped store — every log signature attributed — carries **no** caveat,
+because the filtering is sound. The field is omitted for unscoped queries and is
+deterministic (fixed strings + a determined count, no wall clock). The former
+`distinct_repository_count` / `multi_repository_store` disclosure fields are
+removed; they were `Repository`-node counts, never an isolation verdict, and the
+attribution field makes them unnecessary.
 
 Separately, whenever the query runs over the embedded (`--data-dir`) read path
 **and** the store holds at least one `ErrorSignature`, the response carries an
@@ -262,27 +257,40 @@ preserved and the window counts stay consistent with the aggregate
 [Signature coalescing](#signature-coalescing-across-scan-logs-outputs) for the
 identical-rescan caveat and issue #361):
 
-- `base_window_occurrences` = sum of linked bucket counts whose `bucket_start`
-  is `<= commit_valid_time[BASE]`;
-- `head_window_occurrences` = sum of linked bucket counts whose `bucket_start`
-  is `<= commit_valid_time[HEAD]`.
+Since **schema v3** (issue #364) each `LogOccurrenceBucket` carries an
+`occurrence_timestamps` list — the sorted RFC 3339 UTC per-occurrence valid
+times that fell in its hour — so per-window counts are now **endpoint-exact**:
 
-These per-window counts are **hour-bucket-granular, not endpoint-exact**. A
-`LogOccurrenceBucket` carries only an hour-aligned `bucket_start` and an
-aggregate count — **no per-occurrence timestamps** (issue #320) — so a bucket
-that straddles the base/head commit instant **cannot be sub-divided** at that
-instant. Because a bucket is counted whenever `bucket_start <= endpoint`, when
-the endpoint falls **mid-hour** the **whole** hour is counted: a window count
-may include occurrences up to one bucket width (**1 hour**) past the exact
-commit instant. This is disclosed, never silently absorbed — every response
-carries `"occurrence_count_granularity": "hourly_bucket"` and the always-present
-`disclaimer` states it. Endpoint-exact counts would require sub-hour
-per-occurrence timestamps the bucket model does not retain; the alternative
-"fully-before" predicate (`bucket_start + width <= endpoint`) is **not** used
-because it would under-count by dropping pre-endpoint occurrences in the same
-partial bucket — trading over-count for under-count with no honesty gain.
-Endpoint-exact occurrence counts require a #319/#320 log-graph schema change
-(sub-hour per-occurrence timestamps) and are tracked in issue #364.
+- `base_window_occurrences` = for each linked v3 bucket, the count of its
+  `occurrence_timestamps` at or before `commit_valid_time[BASE]` (by parsed UTC
+  instant);
+- `head_window_occurrences` = the same at or before `commit_valid_time[HEAD]`.
+
+A bucket that straddles the base/head commit instant is **sub-divided at the
+instant**: only the occurrences at or before the endpoint are counted, even when
+the endpoint falls **mid-hour**. The over-count the earlier hour-bucket rule
+disclosed is gone for v3 records.
+
+**Legacy `log:v2:` fallback (per-bucket, honest degradation).** A pre-v3 bucket
+has an **empty** `occurrence_timestamps` and cannot be sub-divided, so it falls
+back to the hour-bucket-granular rule for **that** bucket: it is counted whole
+whenever `bucket_start <= endpoint`, and a mid-hour endpoint may include
+occurrences up to one bucket width (**1 hour**) past the exact instant. The
+"fully-before" predicate (`bucket_start + width <= endpoint`) is **not** used —
+it would under-count by dropping pre-endpoint occurrences in the same partial
+bucket. Re-scan to regenerate buckets under v3 for endpoint-exactness.
+
+**The `occurrence_count_granularity` marker is now per-response and
+conditional** (issue #364):
+
+- `"endpoint_exact"` when **every** bucket contributing to a per-window count in
+  the response carried per-occurrence timestamps (or no bucket contributed at
+  all — vacuously exact). The `disclaimer` uses the endpoint-exact wording.
+- `"hourly_bucket"` when **at least one** contributing bucket was a legacy
+  `log:v2:` record with no timestamps, so the response degraded to the whole-hour
+  rule for that bucket. The `disclaimer` retains the legacy hour-bucket-granular
+  wording (a count may include occurrences up to one bucket width past the exact
+  endpoint). This is disclosed, never silently absorbed.
 
 When a signature has at least one linked bucket, `occurrence_source` is
 `occurrence_buckets` and both window fields are present. When a signature
@@ -331,11 +339,11 @@ valid times.
   },
   "range_commit_count": 2,
   "disclaimer": "Rows are runtime error-signature observations ...",
-  "occurrence_count_granularity": "hourly_bucket",
+  "occurrence_count_granularity": "endpoint_exact",
   "new_signatures": [
     {
-      "record_id": "log:v2:...",
-      "schema_version": 1,
+      "record_id": "log:v3:...",
+      "schema_version": 3,
       "change_class": "new_signature",
       "severity": "error",
       "first_seen": "2026-01-02T12:00:00Z",
