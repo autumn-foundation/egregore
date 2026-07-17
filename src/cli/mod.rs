@@ -2655,6 +2655,27 @@ pub(crate) enum QuerySubcommand {
         /// Optional scope handle: record ID, exact symbol name, or a
         /// repo-relative path prefix (segment-aware).
         scope: Option<String>,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the surface and links to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Resolve the surface against records as they existed at this commit
+        /// SHA or unique prefix (requires a history-bearing store).
+        #[arg(long)]
+        at: Option<String>,
+        /// Maximum rows per bucket; excess rows are truncated (deterministic
+        /// sort order preserved) with a `results_truncated` diagnostic.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Rank indexed symbols by least-recent last change across commit history (issue #219).
     ///
     /// Over a temporal store produced by `eg scan-history`, returns symbols
@@ -2685,14 +2706,10 @@ pub(crate) enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Restrict the surface and links to one repository in a multi-repo store.
+        /// Restrict the ranking to one repository (see `eg query symbol --help`).
         #[arg(long)]
         repo: Option<String>,
-        /// Resolve the surface against records as they existed at this commit
-        /// SHA or unique prefix (requires a history-bearing store).
-        #[arg(long)]
-        at: Option<String>,
-         /// Maximum ranked symbols returned (default 50, max 500). Values
+        /// Maximum ranked symbols returned (default 50, max 500). Values
         /// outside 1..=500 are rejected with an `invalid_limit` diagnostic.
         #[arg(long, default_value_t = query::RECENCY_DEFAULT_LIMIT)]
         limit: usize,
