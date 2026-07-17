@@ -552,8 +552,12 @@ lists ride in the envelope so a `no_path` verdict is never presented as proof no
 exists. Reachability is UNDIRECTED (a grounding chain legitimately mixes edge directions, so
 each edge is usable either way); each hop reports the edge's native `from`/`to` plus a
 `traversal_direction` (`forward`/`reverse`). The path is the deterministic shortest path:
-fewest hops, then at each step the lexicographically smallest `(neighbor_record_id,
-edge_record_id)` — cycles terminate via a visited set. Deleted records (tombstoned and
+shortest hop count, then the lexicographically smallest path compared as the full ordered
+sequence of `(neighbor_record_id, edge_record_id)` steps from the source (a difference at the
+first step dominates any later step) — cycles terminate via a visited set. A stable edge ID
+re-ingested with changed metadata over an append-only `--graph` resolves to its latest write
+(mirroring embedded `latest_edge_versions`), so both transports surface identical edge
+basis/confidence. Deleted records (tombstoned and
 non-temporal) and edges touching a deleted endpoint are excluded — a current-state view, no
 `--at`/`--as-of`. Endpoint/exit taxonomy: a witness path (>=1 hop) exits 0; `source_id ==
 target_id` is `identical_endpoints` (exit 1); two live but disconnected endpoints yield a

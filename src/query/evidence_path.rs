@@ -18,8 +18,9 @@
 //! either direction. Every emitted hop reports the edge's NATIVE `from`/`to` as
 //! stored plus a `traversal_direction` (`forward` when the walk moved along the
 //! stored edge, `reverse` when against it). The path is the DETERMINISTIC shortest
-//! path: fewest hops, ties broken by the lexicographically smallest
-//! `(neighbor_record_id, edge_record_id)` at each discovery step.
+//! path: fewest hops, then the lexicographically smallest path compared as the
+//! full ordered sequence of `(neighbor_record_id, edge_record_id)` steps from the
+//! source, so a difference at the first step dominates any later step.
 //!
 //! A witness path proves a live evidence-edge chain connects two records; it is
 //! never proof the cited code still matches current source, and `EMITTED_DURING`
@@ -389,6 +390,11 @@ struct Discovery<'a> {
     adj: Adjacency<'a>,
 }
 
+/// A BFS path key: the ordered sequence of `(neighbor_record_id, edge_record_id)`
+/// steps from the source. Full-sequence lexicographic comparison is the
+/// documented tie-break among equal-length shortest paths.
+type PathKey<'a> = Vec<(&'a str, &'a str)>;
+
 /// Traces the deterministic shortest evidence-edge witness path between two
 /// record handles (issue #247).
 ///
@@ -399,10 +405,14 @@ struct Discovery<'a> {
 /// recent write is a tombstone (no later Node/Edge write of that id follows it)
 /// and it carries no bitemporal `temporal` version — matching embedded
 /// `read_all_records`, so `--graph` and `--data-dir` agree even when a node was
-/// retracted then re-ingested. Edges touching a deleted endpoint are excluded.
-/// On ties the lexicographically smallest
-/// `(neighbor_record_id, edge_record_id)` discovery is kept, so the reported path
-/// is byte-stable. A `visited` set guarantees termination on cycles.
+/// retracted then re-ingested. A stable edge ID re-ingested with changed
+/// metadata resolves to its latest write (mirroring embedded
+/// `latest_edge_versions`), so both transports surface identical edge
+/// basis/confidence. Edges touching a deleted endpoint are excluded. The path is
+/// the shortest hop count, then the lexicographically smallest path compared as
+/// the full ordered sequence of `(neighbor_record_id, edge_record_id)` steps from
+/// the source (a difference at the first step dominates any later step), so the
+/// reported path is byte-stable. A `visited` set guarantees termination on cycles.
 ///
 /// # Errors
 ///
@@ -504,7 +514,7 @@ pub fn evidence_path(
 
     // ── undirected adjacency over live evidence edges ─────────────────────────
     let mut adjacency: BTreeMap<&str, Vec<Adjacency<'_>>> = BTreeMap::new();
-    for r in records {
+    for (index, r) in records.iter().enumerate() {
         if let GraphRecord::Edge {
             id,
             label,
@@ -514,6 +524,14 @@ pub fn evidence_path(
             ..
         } = r
         {
+            // Latest-write-wins: over an append-only --graph a stable edge ID may
+            // be re-ingested with changed metadata (basis/confidence/label). Only
+            // the latest write for the id is live, mirroring embedded
+            // `latest_edge_versions` (highest egregore_seq), so the two transports
+            // surface identical edge metadata (Codex #247 finding).
+            if last_write.get(id.as_str()) != Some(&index) {
+                continue;
+            }
             if deleted(id.as_str()) || !is_evidence_path_edge(*label) {
                 continue;
             }
@@ -552,33 +570,45 @@ pub fn evidence_path(
     }
 
     // ── level-synchronized undirected BFS from the source ─────────────────────
+    //
+    // Tie-break among equal-length (shortest) paths: keep the lexicographically
+    // smallest path compared as the FULL ordered sequence of
+    // `(neighbor_record_id, edge_record_id)` steps from the source, so a
+    // difference at the FIRST step dominates any later step (Codex #247 finding).
+    // Each finalized node stores its lex-smallest shortest path key; a competing
+    // discovery for a node is kept only when its full candidate key
+    // (parent's key ++ this step) is smaller. Because the lex-smallest shortest
+    // path to a node always extends the lex-smallest shortest path to its chosen
+    // parent, comparing (finalized parent key ++ step) is exact.
     let mut parent: BTreeMap<&str, Discovery<'_>> = BTreeMap::new();
+    let mut path_key: BTreeMap<&str, PathKey<'_>> = BTreeMap::new();
     let mut visited: BTreeSet<&str> = BTreeSet::new();
     visited.insert(source_id);
+    path_key.insert(source_id, Vec::new());
     let mut frontier: Vec<&str> = vec![source_id];
 
     while !frontier.is_empty() && !visited.contains(target_id) {
-        // Keep the minimum (neighbor_id, edge_id) discovery per newly reached node.
-        let mut discoveries: BTreeMap<&str, Discovery<'_>> = BTreeMap::new();
+        // Keep the discovery with the smallest FULL path key per newly reached node.
+        let mut discoveries: BTreeMap<&str, (Discovery<'_>, PathKey<'_>)> = BTreeMap::new();
         for &node in &frontier {
             let Some(entries) = adjacency.get(node) else {
                 continue;
             };
+            let node_key = &path_key[node];
             for &adj in entries {
                 if visited.contains(adj.neighbor) {
                     continue;
                 }
+                let mut candidate_key = node_key.clone();
+                candidate_key.push((adj.neighbor, adj.edge_id));
                 let candidate = Discovery { parent: node, adj };
                 match discoveries.entry(adj.neighbor) {
                     std::collections::btree_map::Entry::Vacant(e) => {
-                        e.insert(candidate);
+                        e.insert((candidate, candidate_key));
                     }
                     std::collections::btree_map::Entry::Occupied(mut e) => {
-                        let prev = *e.get();
-                        if (candidate.parent, candidate.adj.edge_id)
-                            < (prev.parent, prev.adj.edge_id)
-                        {
-                            e.insert(candidate);
+                        if candidate_key < e.get().1 {
+                            e.insert((candidate, candidate_key));
                         }
                     }
                 }
@@ -588,9 +618,10 @@ pub fn evidence_path(
             break;
         }
         frontier = discoveries.keys().copied().collect();
-        for (node, discovery) in discoveries {
+        for (node, (discovery, key)) in discoveries {
             visited.insert(node);
             parent.insert(node, discovery);
+            path_key.insert(node, key);
         }
     }
 
@@ -972,6 +1003,82 @@ mod tests {
         let path = evidence_path(&records, "agent_memory:v1:obs", "codegraph:v5:sym")
             .expect("temporal version keeps the node live");
         assert_eq!(path.hops.len(), 1);
+    }
+
+    // ── tie-break: lex-smallest FULL path key, first divergence dominates ──────
+
+    #[test]
+    fn tie_break_prefers_first_step_over_later_step() {
+        // Two equal-length (3-hop) paths that converge only at `target`:
+        //   source -> a -> z -> target   and   source -> b -> c -> target
+        // with `a < b` but `c < z` by record ID. The documented tie-break is the
+        // lexicographically smallest FULL ordered sequence of
+        // (neighbor_record_id, edge_record_id) steps from the source, so the first
+        // divergence (a < b) dominates and the returned witness goes through `a`.
+        // A per-step compare that only looks at the immediate parent at `target`
+        // would wrongly pick the `b -> c` branch because `c < z` (Codex #247).
+        let source = code_symbol("codegraph:v5:source", "src/lib.rs", "source");
+        let a = code_symbol("codegraph:v5:a_node", "src/lib.rs", "a");
+        let b = code_symbol("codegraph:v5:b_node", "src/lib.rs", "b");
+        let z = code_symbol("codegraph:v5:z_node", "src/lib.rs", "z");
+        let c = code_symbol("codegraph:v5:c_node", "src/lib.rs", "c");
+        let target = code_symbol("codegraph:v5:target", "src/lib.rs", "target");
+        assert!(a.id() < b.id(), "fixture requires a < b");
+        assert!(c.id() < z.id(), "fixture requires c < z");
+        let records = vec![
+            evidence_edge(EdgeLabel::HasEvidence, source.id(), a.id()),
+            evidence_edge(EdgeLabel::HasEvidence, a.id(), z.id()),
+            evidence_edge(EdgeLabel::HasEvidence, z.id(), target.id()),
+            evidence_edge(EdgeLabel::HasEvidence, source.id(), b.id()),
+            evidence_edge(EdgeLabel::HasEvidence, b.id(), c.id()),
+            evidence_edge(EdgeLabel::HasEvidence, c.id(), target.id()),
+            source,
+            a,
+            b,
+            z,
+            c,
+            target,
+        ];
+
+        let path = evidence_path(&records, "codegraph:v5:source", "codegraph:v5:target")
+            .expect("reachable");
+        assert_eq!(path.hops.len(), 3, "both branches are 3 hops");
+        assert_eq!(
+            path.hops[0].to.record_id, "codegraph:v5:a_node",
+            "first step must go through `a` (a < b dominates)"
+        );
+        assert_eq!(path.hops[1].to.record_id, "codegraph:v5:z_node");
+        assert_eq!(path.hops[2].to.record_id, "codegraph:v5:target");
+    }
+
+    // ── latest-write-wins edge metadata over an append-only --graph ───────────
+
+    #[test]
+    fn graph_edge_uses_latest_write_metadata() {
+        // An append-only --graph re-ingests the SAME stable edge ID (same
+        // label + source + target) with CHANGED metadata. The emitted hop must
+        // carry the LATEST write's basis/confidence, matching embedded
+        // `latest_edge_versions` (highest egregore_seq) — not the first version
+        // a stable-sort + dedup_by_key would retain (Codex #247).
+        let sig = memory_node("agent_memory:v1:sig");
+        let run = verification_node("verification:v1:run");
+        let e_v1 = evidence_edge(EdgeLabel::EmittedDuring, sig.id(), run.id())
+            .with_basis(CorrelationBasis::ContentHashJoin);
+        let e_v2 = evidence_edge(EdgeLabel::EmittedDuring, sig.id(), run.id())
+            .with_basis(CorrelationBasis::TemporalCorrelation);
+        // Append order: v1 first, v2 (the latest write) second.
+        let records = vec![sig, run, e_v1, e_v2];
+
+        let path = evidence_path(&records, "agent_memory:v1:sig", "verification:v1:run")
+            .expect("reachable");
+        assert_eq!(path.hops.len(), 1);
+        assert_eq!(path.hops[0].edge.label, "EMITTED_DURING");
+        assert_eq!(
+            path.hops[0].edge.basis.as_deref(),
+            Some("temporal_correlation"),
+            "hop must carry the latest write's basis"
+        );
+        assert_eq!(path.hops[0].edge.confidence.as_deref(), Some("0.5"));
     }
 
     // ── 5. identical_endpoints ────────────────────────────────────────────────
