@@ -452,16 +452,37 @@ pub fn evidence_path(
     // write of that id follows it — provably equivalent to embedded's per-tombstone
     // staleness check — so the two supported transports agree (Codex #247 finding).
     //
-    // `last_write` = greatest index of a Node/Edge write per id; `last_tomb` =
-    // greatest index of a Tombstone per deleted_id. `has_temporal` still fully
-    // exempts bitemporal/history-bearing records a tombstone can never suppress.
+    // `last_write` = greatest index of a Node/Edge write per id (CROSS-KIND, for
+    // tombstone liveness); `last_edge_write` = greatest index of an EDGE write per
+    // id (EDGE-ONLY, for edge-version selection); `last_tomb` = greatest index of a
+    // Tombstone per deleted_id. `has_temporal` still fully exempts
+    // bitemporal/history-bearing records a tombstone can never suppress.
+    //
+    // The two write maps are kept SEPARATE because this graph model lets a Node and
+    // an Edge legitimately share one stable record ID: `GraphRecord::node_kind_ref`
+    // (src/ir.rs) resolves a non-node record sharing a node's ID to `None` and thus
+    // SHADOWS the node (issue #391, matched by the daemon and `eg validate`). If
+    // edge-version selection keyed off the cross-kind `last_write`, a later Node
+    // write of an edge's ID would win, suppressing EVERY version of the edge and
+    // turning a reachable path into `no_path`. Embedded `latest_edge_versions`
+    // (src/adapters/aletheiadb.rs) selects among physical EDGES per `codegraph_id`
+    // INDEPENDENT of node records, so keying edge selection off the edge-only map is
+    // what keeps `--graph` and `--data-dir` consistent (Codex #247 finding).
     let mut last_write: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut last_edge_write: BTreeMap<&str, usize> = BTreeMap::new();
     let mut last_tomb: BTreeMap<&str, usize> = BTreeMap::new();
     let mut has_temporal: BTreeSet<&str> = BTreeSet::new();
     for (index, r) in records.iter().enumerate() {
         match r {
-            GraphRecord::Node { id, temporal, .. } | GraphRecord::Edge { id, temporal, .. } => {
+            GraphRecord::Node { id, temporal, .. } => {
                 last_write.insert(id.as_str(), index);
+                if temporal.is_some() {
+                    has_temporal.insert(id.as_str());
+                }
+            }
+            GraphRecord::Edge { id, temporal, .. } => {
+                last_write.insert(id.as_str(), index);
+                last_edge_write.insert(id.as_str(), index);
                 if temporal.is_some() {
                     has_temporal.insert(id.as_str());
                 }
@@ -526,10 +547,13 @@ pub fn evidence_path(
         {
             // Latest-write-wins: over an append-only --graph a stable edge ID may
             // be re-ingested with changed metadata (basis/confidence/label). Only
-            // the latest write for the id is live, mirroring embedded
-            // `latest_edge_versions` (highest egregore_seq), so the two transports
-            // surface identical edge metadata (Codex #247 finding).
-            if last_write.get(id.as_str()) != Some(&index) {
+            // the latest EDGE write for the id is live, mirroring embedded
+            // `latest_edge_versions` (highest egregore_seq) — which selects among
+            // physical edges INDEPENDENT of node records. Keying off the edge-only
+            // `last_edge_write` (never the cross-kind `last_write`) means a later
+            // Node write sharing the edge's ID cannot suppress the edge, so the two
+            // transports surface identical edge metadata (Codex #247 finding).
+            if last_edge_write.get(id.as_str()) != Some(&index) {
                 continue;
             }
             if deleted(id.as_str()) || !is_evidence_path_edge(*label) {
@@ -1079,6 +1103,35 @@ mod tests {
             "hop must carry the latest write's basis"
         );
         assert_eq!(path.hops[0].edge.confidence.as_deref(), Some("0.5"));
+    }
+
+    #[test]
+    fn later_node_sharing_edge_id_does_not_suppress_edge() {
+        // This graph model lets a Node and an Edge legitimately share one stable
+        // record ID (`GraphRecord::node_kind_ref` resolves the shadowing case,
+        // issue #391). A `Node` record written LATER in append order than an
+        // evidence edge with the SAME stable ID must NOT suppress that edge:
+        // embedded `latest_edge_versions` selects among physical EDGES per id
+        // independent of nodes, so `--graph` must key edge-version selection off the
+        // edge-only map, never the cross-kind write map. Keying off the cross-kind
+        // map would turn this reachable one-hop chain into a wrong `no_path`
+        // (Codex #247 round-3).
+        let obs = memory_node("agent_memory:v1:obs");
+        let verif = verification_node("verification:v1:verif");
+        let edge = evidence_edge(EdgeLabel::Observes, obs.id(), verif.id());
+        let shared_id = edge.id().to_owned();
+        // An unrelated live Node that happens to carry the edge's stable ID,
+        // appended AFTER the edge so its Vec index is the greatest for that ID.
+        let shadow = memory_node(&shared_id);
+        let records = vec![obs, verif, edge, shadow];
+
+        let path = evidence_path(&records, "agent_memory:v1:obs", "verification:v1:verif")
+            .expect("edge must survive a later same-ID node write");
+        assert_eq!(path.hops.len(), 1, "one-hop OBSERVES chain");
+        assert_eq!(path.hops[0].edge.label, "OBSERVES");
+        assert_eq!(path.hops[0].edge.edge_record_id, shared_id);
+        assert_eq!(path.hops[0].from.record_id, "agent_memory:v1:obs");
+        assert_eq!(path.hops[0].to.record_id, "verification:v1:verif");
     }
 
     // ── 5. identical_endpoints ────────────────────────────────────────────────
