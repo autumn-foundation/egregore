@@ -292,8 +292,11 @@ fn log_stable_id_preserves_case_of_parts() {
 #[test]
 fn schema_gate_accepts_v3_rejects_unknown() {
     use crate::schema_version::{RecordVersion, is_known_record_version};
-    // Log domain is at schema v3 since issues #362/#364 (repository_id +
-    // occurrence_timestamps); v1 and v2 are superseded and no longer accepted.
+    // Log domain MINTS at schema v3 since issues #362/#364 (repository_id +
+    // occurrence_timestamps), but the READ gate must still accept legacy `log:v2:`
+    // records for back-compat (the `#[serde(default)]` v3 fields degrade honestly).
+    // v1 predates the #361 source-aware bucket identity and is out of the advertised
+    // compat window, so it stays rejected; an unknown future version is rejected too.
     for kind in [
         "LogSource",
         "ErrorSignature",
@@ -301,9 +304,7 @@ fn schema_gate_accepts_v3_rejects_unknown() {
         "LogOccurrenceBucket",
     ] {
         assert!(is_known_record_version(&RecordVersion::new("log", kind, 3)));
-        assert!(!is_known_record_version(&RecordVersion::new(
-            "log", kind, 2
-        )));
+        assert!(is_known_record_version(&RecordVersion::new("log", kind, 2)));
         assert!(!is_known_record_version(&RecordVersion::new(
             "log", kind, 1
         )));
@@ -772,4 +773,132 @@ fn legacy_v2_log_payloads_deserialize_with_serde_defaults() {
     let bucket: LogOccurrenceBucketPayload = serde_json::from_str(legacy_bucket).unwrap();
     assert_eq!(bucket.repository_id, "");
     assert!(bucket.occurrence_timestamps.is_empty());
+}
+
+/// Rewrites a serialized v3 log record line into exactly what trunk's
+/// LOG_SCHEMA-2 `scan-logs` emits: `schema_version` 2, a `log:v2:` id prefix,
+/// and NO v3-only payload fields (`repository_id`/`occurrence_timestamps` absent).
+#[cfg(test)]
+fn downgrade_log_line_to_v2(record: &crate::ir::GraphRecord) -> String {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(record).unwrap()).unwrap();
+    let obj = value.as_object_mut().unwrap();
+    obj.insert("schema_version".to_owned(), serde_json::json!(2));
+    if let Some(serde_json::Value::String(id)) = obj.get_mut("id") {
+        *id = id.replace("log:v3:", "log:v2:");
+    }
+    if let Some(serde_json::Value::Object(log)) = obj.get_mut("log") {
+        log.remove("repository_id");
+        log.remove("occurrence_timestamps");
+        if let Some(serde_json::Value::String(sid)) = log.get_mut("source_id") {
+            *sid = sid.replace("log:v3:", "log:v2:");
+        }
+    }
+    serde_json::to_string(&value).unwrap()
+}
+
+#[test]
+fn legacy_v2_log_records_are_accepted_by_records_from_jsonl() {
+    // Back-compat regression (#362/#364): after the LOG_SCHEMA 2 → 3 bump the
+    // version gate must still ACCEPT genuine legacy `log:v2:` records on read.
+    // `#[serde(default)]` on the new payload fields is only reachable if the
+    // version gate lets the record through; a bare `== LOG_SCHEMA_VERSION` gate
+    // classifies a v2 record UnknownSchemaVersion and `records_from_jsonl` (the
+    // hard `--graph` load path) aborts the whole read. This reader-level test
+    // covers what the struct-level `legacy_v2_..._serde_defaults` test cannot.
+    use crate::adapters::records_from_jsonl;
+    use crate::ir::{
+        GraphRecord, LogOccurrenceBucketPayload, LogPayload, LogSourcePayload, NodeKind,
+    };
+    use crate::schema_version::{RecordVersion, is_known_record_version};
+
+    // A valid ("log", 2) tuple must be a known read version.
+    assert!(
+        is_known_record_version(&RecordVersion::new("log", "LogSource", 2)),
+        "(log, LogSource, 2) must be an accepted read version after the v3 bump"
+    );
+
+    // Build real v3 log records via the production builder.
+    let source_id = log_stable_id(&["log_source", "acme/widget", "app.log", "h"]);
+    let source_node = GraphRecord::node(
+        source_id.clone(),
+        NodeKind::LogSource,
+        Some("app.log".to_owned()),
+        None,
+        Some("app.log".to_owned()),
+        "Log source app.log".to_owned(),
+    )
+    .with_domain("log", crate::ir::LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::LogSource(LogSourcePayload {
+        source_relative_path: "app.log".to_owned(),
+        source_format_version: "plain-v1".to_owned(),
+        source_artifact_hash: "h".to_owned(),
+        line_count: 3,
+        repository_id: "acme/widget".to_owned(),
+    }));
+
+    let bucket_node = GraphRecord::node(
+        log_stable_id(&["log_occurrence_bucket", "acme/widget", "sig", "hour"]),
+        NodeKind::LogOccurrenceBucket,
+        None,
+        None,
+        Some("error bucket".to_owned()),
+        "Occurrence bucket".to_owned(),
+    )
+    .with_domain("log", crate::ir::LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::LogOccurrenceBucket(
+        LogOccurrenceBucketPayload {
+            bucket_start: "2026-01-02T03:00:00Z".to_owned(),
+            bucket_width: BUCKET_WIDTH.to_owned(),
+            occurrence_count: 2,
+            source_id,
+            repository_id: "acme/widget".to_owned(),
+            occurrence_timestamps: vec![
+                "2026-01-02T03:05:00Z".to_owned(),
+                "2026-01-02T03:45:00Z".to_owned(),
+            ],
+        },
+    ));
+
+    let v2_source_line = downgrade_log_line_to_v2(&source_node);
+    let v2_bucket_line = downgrade_log_line_to_v2(&bucket_node);
+    assert!(v2_source_line.contains("log:v2:"), "{v2_source_line}");
+    assert!(
+        !v2_source_line.contains("repository_id"),
+        "downgraded v2 line must not carry the v3 repository_id field"
+    );
+    assert!(
+        !v2_bucket_line.contains("occurrence_timestamps"),
+        "downgraded v2 bucket must not carry the v3 occurrence_timestamps field"
+    );
+
+    let jsonl = format!("{v2_source_line}\n{v2_bucket_line}\n");
+
+    // The hard `--graph` load path must ACCEPT these legacy records.
+    let records = records_from_jsonl(&jsonl)
+        .expect("legacy v2 log records must be accepted, not rejected UnknownSchemaVersion");
+    assert_eq!(records.len(), 2);
+
+    // The serde-default v3 fields must be present and honestly empty.
+    let (mut saw_source, mut saw_bucket) = (false, false);
+    for record in &records {
+        if let GraphRecord::Node { log: Some(log), .. } = record {
+            match log.as_ref() {
+                LogPayload::LogSource(src) => {
+                    assert_eq!(src.repository_id, "");
+                    saw_source = true;
+                }
+                LogPayload::LogOccurrenceBucket(bucket) => {
+                    assert_eq!(bucket.repository_id, "");
+                    assert!(bucket.occurrence_timestamps.is_empty());
+                    saw_bucket = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        saw_source && saw_bucket,
+        "both v2 log payloads must round-trip"
+    );
 }
