@@ -418,7 +418,10 @@ reconstructed by following those pointers. Both endpoints resolve independently;
 ambiguous name exits 1 listing all candidate record IDs (the `endpoint` field names which
 side failed), an unknown/stale endpoint exits 2 (`no_match`/`stale_handle`), and both
 endpoints resolving with no directed path is an explicit `no_path` verdict at exit 2.
-`--at`/`--as-of` trace a single-commit history view (mutually exclusive). Read-only over
+`--at`/`--as-of` trace a single-commit history view (mutually exclusive); with neither, a
+scan-history graph/store is read as the UNION of all commit snapshots (no edge tombstones),
+so an edge removed at a later commit can still yield `path_found` — pass `--at <HEAD>` for
+HEAD-only semantics (matches `deps`/`transitive-callers`/`transitive-callees`). Read-only over
 `--graph`/`--data-dir`, redaction-safe (record IDs, names, paths, spans only), with a
 `--format text` mode. See `docs/cli/path.md`.
 

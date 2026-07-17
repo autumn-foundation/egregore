@@ -1076,6 +1076,103 @@ fn data_dir_parity_with_graph() {
 }
 
 // ---------------------------------------------------------------------------
+// Regression guard (PR #416 review): for a scan-history fixture read with NO
+// temporal selector, the union-of-snapshots current-state view must agree
+// byte-for-byte across --graph and --data-dir — matching deps /
+// transitive-callers / transitive-callees. The `seed_history()` a_h -> b_h
+// fixture has one resolved CALLS edge at aaaa1111 and NO edge tombstone, so an
+// unpinned read is `path_found` on BOTH surfaces; `--at bbbb2222` (the later
+// commit where the call is gone) is `no_path`/exit 2 on BOTH.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn history_current_state_agrees_across_graph_and_data_dir() {
+    let (_t, path, a_id, b_id) = seed_history();
+    let temp_db = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp_db.path().join("store");
+
+    egregore()
+        .arg("ingest")
+        .arg(&path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    // Current state (no --at/--as-of): union of all commit snapshots. Both
+    // surfaces must find the path and produce byte-identical output.
+    let graph_stdout = egregore()
+        .args([
+            "query",
+            "path",
+            &a_id,
+            &b_id,
+            "--graph",
+            path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let (graph_header, _) = parse_ndjson(&graph_stdout);
+    assert_eq!(
+        graph_header["verdict"], "path_found",
+        "unpinned --graph history read is path_found (union of snapshots)"
+    );
+
+    let store_stdout = egregore()
+        .args(["query", "path", &a_id, &b_id, "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let (store_header, _) = parse_ndjson(&store_stdout);
+    assert_eq!(
+        store_header["verdict"], "path_found",
+        "unpinned --data-dir history read is path_found (union of snapshots)"
+    );
+
+    assert_eq!(
+        graph_stdout, store_stdout,
+        "unpinned history current-state view must be byte-identical across --graph and --data-dir"
+    );
+
+    // Pinned to the later commit bbbb2222 (the call is gone): both surfaces
+    // must return no_path / exit 2 — the union default is the only place a
+    // removed-later edge still resolves.
+    egregore()
+        .args([
+            "query",
+            "path",
+            &a_id,
+            &b_id,
+            "--graph",
+            path.to_str().unwrap(),
+            "--at",
+            "bbbb2222",
+        ])
+        .assert()
+        .code(2);
+    egregore()
+        .args([
+            "query",
+            "path",
+            &a_id,
+            &b_id,
+            "--at",
+            "bbbb2222",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .assert()
+        .code(2);
+}
+
+// ---------------------------------------------------------------------------
 // The embedded --data-dir path must be strictly read-only (PR #416 review):
 // opening the live engine re-persists index files, so the query must operate
 // on a throwaway copy and leave the store byte-for-byte untouched — for both

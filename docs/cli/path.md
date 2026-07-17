@@ -139,6 +139,18 @@ recent commit whose valid time is at or before the instant; the envelope's
 `at_commit` reports which commit answered. When `--repo` is set, commit
 resolution happens within the selected repository.
 
+### Temporal scope of an unpinned read
+
+With **neither** `--at` nor `--as-of`, a `scan-history` graph or store is read
+as the **union of all commit snapshots** — `scan-history` emits no edge
+tombstones, so a resolved `CALLS` edge that was removed at a later commit is
+still present in the union. A directed path over such an edge therefore still
+yields `path_found`. This is deliberate and matches `deps`,
+`transitive-callers`, and `transitive-callees`, which read the same union.
+Pass `--at <HEAD_SHA>` for HEAD-only (single-snapshot) semantics — the walk
+then sees only the edges live at that commit, so an edge deleted before `HEAD`
+no longer contributes a path.
+
 ## Example
 
 ```sh
