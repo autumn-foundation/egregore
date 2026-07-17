@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::RepositoryIndex;
-use crate::ir::{EdgeLabel, GraphRecord, NodeKind, SourceSpan};
+use crate::ir::{EdgeLabel, GraphRecord, NodeKind, SnapshotHead, SourceSpan, TemporalMetadata};
 
 /// Symbol kinds that can appear on the externally-reachable public API
 /// surface. Methods, tests, and `impl` blocks are declaration details of
@@ -273,10 +273,17 @@ fn resolve_use_target(target: &str, owner_chain: &[String]) -> String {
 ///
 /// Scope: the Rust library crate rooted at `src/` (excluding `src/bin/**`,
 /// tests, examples, and benches) in the current graph state — tombstoned
-/// records are excluded, and when a stable ID appears more than once (history
-/// graphs) the latest record wins. Deterministic: output ordering depends
-/// only on record content, never on map iteration or wall-clock time. Purely
-/// parse-derived — never a build-verified or semver claim.
+/// records are excluded. History replay re-emits the full graph at every
+/// commit with `temporal` provenance and mints no tombstone for a
+/// between-commit deletion, so the surface is anchored to each repository's
+/// stamped HEAD (`source_snapshot`, issue #82): a temporal record is part of
+/// the current state only when its commit is its repository's HEAD — the same
+/// rule `resolve_head_symbols` uses — so a symbol deleted at HEAD never
+/// resurfaces (issue #428). Snapshot-less stores (plain current-tree `scan`)
+/// keep the conservative fallback: nodes resolve by keep-last dedupe by stable
+/// ID. Deterministic: output ordering depends only on record content, never on
+/// map iteration or wall-clock time. Purely parse-derived — never a
+/// build-verified or semver claim.
 #[must_use]
 pub fn public_api_surface<'a>(
     records: &'a [GraphRecord],
@@ -296,6 +303,40 @@ pub fn public_api_surface<'a>(
     let is_owned =
         |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
 
+    // Stamped HEAD commit per live repository (`source_snapshot`, issue #82).
+    // History replay re-emits the full graph at every commit with `temporal`
+    // provenance and no tombstone for a between-commit removal, so a temporal
+    // record is part of the current state only when its commit is its
+    // repository's stamped HEAD — the same rule `resolve_head_symbols` uses.
+    // Snapshot-less stores (plain current-tree `scan`) keep the conservative
+    // fallback: nodes resolve by keep-last dedupe by stable ID (issue #428).
+    let mut repo_heads: BTreeMap<&str, &str> = BTreeMap::new();
+    for record in records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::Repository,
+            source_snapshot: Some(snapshot),
+            ..
+        } = record
+            && !tombstoned.contains(id.as_str())
+            && let SnapshotHead::Commit { sha } = &snapshot.head
+        {
+            repo_heads.insert(id.as_str(), sha.as_str());
+        }
+    }
+    // A temporal code record is current only when its commit is its owning
+    // repository's stamped HEAD. Fallbacks: no temporal provenance => current;
+    // owner not in `repo_heads` (snapshot-less store) => keep everything.
+    let owned_record_is_current = |id: &str, temporal: Option<&TemporalMetadata>| -> bool {
+        let Some(t) = temporal else {
+            return true;
+        };
+        index
+            .owner_of(id)
+            .and_then(|owner| repo_heads.get(owner))
+            .is_none_or(|head_sha| t.git_commit == *head_sha)
+    };
+
     // Current-state view: keep-last dedupe by stable ID so history graphs
     // resolve to their newest version deterministically.
     let mut nodes: BTreeMap<&str, &'a GraphRecord> = BTreeMap::new();
@@ -306,6 +347,7 @@ pub fn public_api_surface<'a>(
             kind,
             language,
             repo_relative_path,
+            temporal,
             ..
         } = record
         else {
@@ -317,7 +359,10 @@ pub fn public_api_surface<'a>(
         if language.as_deref() != Some("rust") {
             continue;
         }
-        if tombstoned.contains(id.as_str()) || !is_owned(id) {
+        if tombstoned.contains(id.as_str())
+            || !is_owned(id)
+            || !owned_record_is_current(id, temporal.as_ref())
+        {
             continue;
         }
         saw_rust_code = true;
