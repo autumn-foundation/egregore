@@ -69,18 +69,22 @@ proof no grounding exists.
 
 ## Determinism / tie-break
 
-The path is the **deterministic shortest path**: fewest hops, then at each
-discovery step the lexicographically smallest `(neighbor_record_id,
-edge_record_id)`. Cycles terminate via a visited set. Output is byte-identical
-across runs.
+The path is the **deterministic shortest path**: fewest hops, then the
+lexicographically smallest path compared as the **full ordered sequence of
+`(neighbor_record_id, edge_record_id)` steps from the source** — so a difference
+at the first step dominates any later step. Cycles terminate via a visited set.
+Output is byte-identical across runs.
 
 ## Liveness
 
 A record is **deleted** when it is tombstoned (a `Retraction`/tombstone names it)
 and does not carry a bitemporal `temporal` version. Deleted records — and edges
 touching a deleted endpoint — are excluded from the graph. A tombstoned id that
-also carries a temporal version stays live. This is a current-state view; there
-is no temporal selector.
+also carries a temporal version stays live. Over an append-only `--graph`, a
+stable edge ID re-ingested with changed metadata resolves to its **latest write**
+(mirroring embedded `latest_edge_versions`), so both transports surface identical
+edge basis/confidence. This is a current-state view; there is no temporal
+selector.
 
 ## Exit codes
 
