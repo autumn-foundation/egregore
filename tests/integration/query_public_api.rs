@@ -6,7 +6,7 @@
 
 use std::{fs, path::Path, path::PathBuf};
 
-use aletheia_egregore::scan_repository_at_with_override;
+use aletheia_egregore::{scan_repository_at_with_override, scan_repository_history_with_override};
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
@@ -529,4 +529,99 @@ fn rust_module_records_carry_visibility() {
     assert_eq!(module("api")["visibility"], "public");
     assert_eq!(module("internal")["visibility"], "private");
     assert_eq!(module("tools")["visibility"], "crate");
+}
+
+// ---------------------------------------------------------------------------
+// History graphs: symbols deleted at HEAD must not resurface (issue #428)
+// ---------------------------------------------------------------------------
+
+fn run_git<const N: usize>(repo: &Path, args: [&str; N]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("git command should execute");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_commit_all(repo: &Path, message: &str, date: &str) {
+    run_git(repo, ["add", "."]);
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "-m", message])
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("git commit should execute");
+    assert!(
+        output.status.success(),
+        "git commit failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Two-commit history: c1 defines two public functions `alive_fn` and
+/// `doomed_fn` in the library crate; c2 (HEAD) deletes `doomed_fn` and keeps
+/// `alive_fn`. History replay re-emits the pre-deletion `doomed_fn` version
+/// with `temporal` provenance and no tombstone, so the public-API surface must
+/// anchor to the `Repository` `source_snapshot` HEAD commit and report only
+/// `alive_fn` — a symbol absent at HEAD is deleted, not live public API.
+#[test]
+fn history_graph_excludes_head_deleted_public_symbols() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path();
+    run_git(repo, ["init"]);
+    run_git(repo, ["config", "user.email", "pubapi@example.invalid"]);
+    run_git(repo, ["config", "user.name", "PubApi Test"]);
+    run_git(repo, ["config", "core.autocrlf", "false"]);
+    run_git(repo, ["config", "commit.gpgsign", "false"]);
+
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn alive_fn() -> usize {\n    1\n}\n\n\
+         pub fn doomed_fn() -> usize {\n    2\n}\n",
+    )
+    .expect("lib.rs at c1");
+    git_commit_all(
+        repo,
+        "c1: define alive_fn and doomed_fn",
+        "2026-01-01T00:00:00Z",
+    );
+
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn alive_fn() -> usize {\n    1\n}\n",
+    )
+    .expect("lib.rs at c2");
+    git_commit_all(repo, "c2: delete doomed_fn", "2026-01-02T00:00:00Z");
+
+    let jsonl = scan_repository_history_with_override(repo, Some("pubapi-history"))
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let graph_dir = tempfile::tempdir().expect("graph dir");
+    let graph = graph_dir.path().join("history.graph.jsonl");
+    fs::write(&graph, jsonl).expect("write history graph");
+
+    let parsed = run_public_api(&graph);
+    let paths = item_paths(&parsed);
+    assert!(
+        paths.contains(&"alive_fn".to_owned()),
+        "a public symbol alive at HEAD must appear on the surface; got {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"doomed_fn".to_owned()),
+        "a public symbol deleted at HEAD must not resurface as live public API; got {paths:?}"
+    );
 }
