@@ -21,7 +21,23 @@ cargo run -- ingest graph.jsonl --adapter dry-run
 cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
 cargo run -- inspect --data-dir .egregore
 cargo run -- query semantic-memory "parser edge case on empty input" --data-dir .egregore
+cargo run -- query semantic "request timeout handling" --data-dir .egregore --under src/daemon
 ```
+
+`eg query semantic <query> --under <prefix>` scopes semantic code search to a
+repo-relative directory prefix (issue #198), reusing the #83 SEGMENT-AWARE prefix
+matcher so `src/alpha` matches `src/alpha/foo.rs` but never `src/alphabet/x.rs`
+(the trailing-slash and bare forms resolve identically). The scope filters the
+full candidate pool BEFORE the `--limit` top-N cap, so `--limit N` returns the N
+best IN-SUBSYSTEM hits, not N global hits filtered down to fewer; it composes
+with `--repo` and `--limit`, and each row keeps the stable
+`record_id`/`score`/`name`/`repo_relative_path`/`span` contract. Output is
+deterministic (byte-identical across runs on an unchanged store). A
+malformed/empty prefix exits 1 with a machine-readable `malformed_under_prefix`
+diagnostic on stdout; a valid prefix matching zero embedded nodes exits 2 with a
+"scoped, no matches" stderr message worded distinctly from the "no semantic
+index" message. `--under` is a local-CLI surface and cannot be combined with
+`--daemon`. See `docs/cli/query.md`.
 
 `eg scan-logs <log> --repo-path <repo>` extracts runtime log signatures from one
 captured log file (issues #319/#320): a `LogSource`, one `ErrorSignature` per
@@ -223,6 +239,14 @@ cargo run -- query error-context <handle> --graph combined.graph.jsonl --as-of <
 cargo run -- query error-context <handle> --graph g.jsonl --protected-store .egregore/protected  # read-time protected join
 cargo run -- query error-context does_not_exist --graph combined.graph.jsonl      # exit 2 (no_match)
 
+# One cross-domain evidence witness path between two record handles (issue #247)
+cargo run -- query evidence-path <source_id> <target_id> --graph graph.jsonl   # exit 0 on a witness path
+cargo run -- query evidence-path <source_id> <target_id> --data-dir .egregore  # embedded, read-only
+cargo run -- query evidence-path <id> <id> --graph graph.jsonl                 # exit 1 (identical_endpoints)
+cargo run -- query evidence-path <live_a> <live_b> --graph graph.jsonl         # exit 1 (no_path) when disconnected
+cargo run -- query evidence-path <missing> <target> --graph graph.jsonl        # exit 2 (endpoint_not_found)
+cargo run -- query evidence-path <tombstoned> <target> --graph graph.jsonl     # exit 2 (endpoint_tombstoned)
+
 # A file's defined-symbol set at a past commit or instant (issue #158)
 cargo run -- query file src/lib.rs --graph history.graph.jsonl --at <commit_sha>             # exit 0 on match
 cargo run -- query file src/lib.rs --graph history.graph.jsonl --as-of 2026-01-02T00:00:00Z  # exit 0 on match
@@ -303,6 +327,11 @@ cargo run -- query churn --graph history.graph.jsonl               # exit 0, ran
 cargo run -- query churn --graph history.graph.jsonl --limit 10    # cap output (default 50, max 500)
 cargo run -- query churn --graph graph.jsonl                       # exit 2 (no_history: not a history store)
 
+# Symbol dormancy triage: least-recent last change first (issue #219)
+cargo run -- query recency --graph history.graph.jsonl             # exit 0, most dormant first
+cargo run -- query recency --graph history.graph.jsonl --limit 10  # cap output (default 50, max 500)
+cargo run -- query recency --graph graph.jsonl                     # exit 2 (no_history: current-tree scan)
+
 # Producer-identity drift audit against the current binary (issue #234)
 cargo run -- query producer-drift --graph graph.jsonl                  # exit 0 (even with drift)
 cargo run -- query producer-drift --data-dir .egregore --repo acme/widget  # scope one repo; bad selector exits 1
@@ -313,6 +342,13 @@ cargo run -- query cycles --graph graph.jsonl                     # exit 0 (even
 cargo run -- query cycles src/lib.rs --graph graph.jsonl          # only cycles through this node
 cargo run -- query cycles does_not_exist --graph graph.jsonl      # exit 2 (no_match)
 cargo run -- query cycles codegraph:v1:zzz --graph graph.jsonl    # exit 1 (Unsupported)
+
+# Verification-coverage of the public API surface — covered/uncovered (issue #109)
+cargo run -- query verification-coverage --graph graph.jsonl              # exit 0 (capability verdict when no links)
+cargo run -- query verification-coverage src/adapters --graph graph.jsonl # scope to a path prefix
+cargo run -- query verification-coverage my_symbol --graph graph.jsonl    # scope to a symbol name
+cargo run -- query verification-coverage --graph graph.jsonl --limit 50   # per-bucket truncation
+cargo run -- query verification-coverage src/nope --graph graph.jsonl     # exit 2 (scope_not_found)
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -526,6 +562,41 @@ CORRELATION LEADS, never proof of cause: a resolved frame proves the backtrace N
 an `EMITTED_DURING` edge is a correlation. Read-only, redaction-safe (only the bounded
 `template_excerpt` escapes as free text), deterministic and byte-identical across runs.
 See `docs/cli/error-context.md`.
+
+`eg query evidence-path <source_id> <target_id>` traces ONE deterministic cross-domain
+evidence witness path between two record handles (issue #247), answering "is record A
+grounded in record B, and by what chain?" without hand-walking the graph. It is a read-time
+traversal that mints no edge and adds no node kind, edge label, or trust class: the walk
+runs over the graph's EVIDENCE/PROVENANCE edge subgraph only. Traversal membership is an
+exhaustive compile-time partition of every `EdgeLabel` variant (a `match` with NO wildcard
+arm, so a new variant fails to compile until classified — the completeness invariant):
+TRAVERSED are the cross-domain grounding edges (`HAS_EVIDENCE`, `OBSERVES`, `VALIDATED_BY`,
+`PRODUCED_EVIDENCE`, `FRAME_RESOLVES_TO`, `EMITTED_DURING`, `REFERENCES_TASK`,
+`CLOSES_ACCEPTANCE_CRITERION`, `OWNED_BY_TASK`, and the rest of the evidence-link/log/project
+registry); EXCLUDED are code-graph topology (`CALLS`, `CONTAINS`, `DEFINES`, `IMPORTS`,
+`REFERENCES`, `IMPLEMENTS`, `MENTIONS`, `CHANGED_IN`, `PARENT_OF`, drift edges) and
+intra-agent-memory scaffolding (`SESSION_OF`, `AUTHORED_BY`) — code-only CALLS/REFERENCES
+call paths are the transitive-callers/callees lanes' job, not this one. Both sorted class
+lists ride in the envelope so a `no_path` verdict is never presented as proof no grounding
+exists. Reachability is UNDIRECTED (a grounding chain legitimately mixes edge directions, so
+each edge is usable either way); each hop reports the edge's native `from`/`to` plus a
+`traversal_direction` (`forward`/`reverse`). The path is the deterministic shortest path:
+fewest hops, then at each step the lexicographically smallest `(neighbor_record_id,
+edge_record_id)` — cycles terminate via a visited set. Deleted records (tombstoned and
+non-temporal) and edges touching a deleted endpoint are excluded — a current-state view, no
+`--at`/`--as-of`. Endpoint/exit taxonomy: a witness path (>=1 hop) exits 0; `source_id ==
+target_id` is `identical_endpoints` (exit 1); two live but disconnected endpoints yield a
+machine-readable `no_path` verdict (exit 1, never a silent empty list); an absent endpoint is
+`endpoint_not_found` and a tombstoned endpoint is `endpoint_tombstoned` (both exit 2,
+DISTINCT labels; the source's problem is reported first when both are bad). An `EMITTED_DURING`
+hop carries its `basis` (`content_hash_join`/`temporal_correlation`) and documented
+`confidence` (`1.0`/`0.5`) — a correlation lead, never causation. The lane is repo-agnostic
+(endpoints are exact IDs; a chain may cross repositories), so there is no `--repo` flag.
+Read-only (the `--data-dir` path reads a throwaway copy), redaction-safe (only IDs, domains,
+kinds, edge labels, paths, spans, counts, and basis strings escape — never raw
+source/transcript/command/patch text), deterministic and byte-identical across runs. A witness
+path proves a live evidence-edge chain connects two records; it is NOT proof the cited code
+still matches current source. See `docs/cli/evidence-path.md`.
 
 `eg query file <path> --at <commit>` / `--as-of <instant>` reconstructs the deterministic
 set of symbols a file defined at a chosen commit or valid-time instant (issue #158) from a
@@ -751,6 +822,27 @@ used. Ordering is deterministic (ties break on repo-relative path) and byte-iden
 runs; untracked or ignored paths never appear. The answer states explicitly whether `--limit`
 truncated it. See `docs/cli/churn.md`.
 
+`eg query recency <symbol-scope>` ranks a repository's indexed symbols by LEAST-recent last
+change — most dormant first — over a `scan-history` graph/store (issue #219), the
+dormancy-triage lane. Each row carries the stable `Symbol` record ID + name (ADR-0004 identity,
+never keyed by name so same-name symbols never collapse), the repo-relative path + span at the
+last-change commit, the last-change commit SHA + valid time, and a dormancy span (seconds and
+whole days) computed as `anchor.valid_time − last_change.valid_time`. A symbol's last change is
+the highest-topological-rank commit at which its body differs from its parent snapshot or at
+which it was introduced (reusing the #96/#215 lifeline change-detection). Dormancy is measured
+against the NEWEST INDEXED COMMIT per repository (highest topological rank, SHA-ascending
+tie-break — the same anchor `eg query churn` uses for `last_commit`), NEVER wall-clock "now", so
+a symbol changed at the anchor commit has dormancy 0 and the ranking is byte-identical across
+replays. Ordering is deterministic: `dormancy_seconds` descending, then last-change commit
+topological rank ascending, then repo-relative path ascending, then record ID ascending. Both
+endpoints parse as UTC instants, never raw string order. Live (non-tombstoned) symbols only — a
+deleted symbol is gone, not dormant. Honesty contract: a current-tree-only `eg scan` graph
+carries no `Commit` nodes, so recency is UNAVAILABLE (`no_history`, exit 2) rather than implying
+every symbol is brand-new; commits present but no attributable symbols is `no_match` (exit 2).
+Works over `--graph` and `--data-dir`, honors `--repo` scoping with per-repository anchors (no
+cross-repo bleed), and rejects `--limit` outside 1..=500 (`invalid_limit`, exit 1). Read-only,
+deterministic, `--format text` view available. See `docs/cli/recency.md`.
+
 `eg query producer-drift` audits stored producer identity against the running binary
 (issue #234): every code-graph record whose recorded `egregore_version` and/or grammar
 component versions differ from the current extractor is flagged, grouped by the distinct
@@ -778,6 +870,37 @@ stable key) and byte-identical across runs. The optional scope handle (symbol na
 or file path) filters to cycles through that node — the pre-refactor check. An acyclic graph
 is an explicit success (exit 0 with an `acyclic` diagnostic), not an error.
 See `docs/cli/cycles.md`.
+
+`eg query verification-coverage [scope]` partitions the issue #213
+externally-reachable public API surface into verification-covered and uncovered
+symbols by joining the recorded verification-domain nodes (`Verification`,
+`CommandRun`, `TestRun`, `ProofResult`, `CIStatus`, `CommandEvidence`,
+`BenchmarkRun`, `CoverageReport`, or any `domain: verification` node) over the
+evidence-link edge/citation registry — never a `#[test]`/coverage-tool grep and
+never a build or coverage run. A public symbol is COVERED when a verification
+node links to it directly (any evidence-link label, `link_level: symbol`) or to
+its containing file via `TOUCHED_FILE`/`FAILED_ON` (`link_level: file`), over
+both edge directions and both representations (graph edges and `EvidenceLink`s
+carried on a node); an agent-memory node linking to it NEVER confers coverage.
+This is a capability-degradation lane by default (mirroring `undocumented`'s
+`doc_facts_unavailable`): because no trunk writer links a verification node to a
+code Symbol/File, a store with no verification records (`no_verification_records`)
+or with verification records that never link to code (`no_verification_code_links`)
+yields an explicit `verification_facts_unavailable` verdict (exit 0) with EMPTY
+buckets — it NEVER floods every symbol into "uncovered". Absence of recorded
+evidence is a prioritization signal, never proof that code is untested,
+unverified in reality, unsafe, or broken; presence is a recorded link, never
+proof of correctness or that a test/proof passed. Covered rows cite each
+crediting verification record ID + kind + edge label + link level. The optional
+scope handle resolves as record ID, exact symbol name, or segment-aware
+repo-relative path prefix (`src/alpha` never matches `src/alphabet`); a scope
+matching no in-store code item exits 2 (`scope_not_found` for a path, `no_match`
+for a name/id). `--repo` scopes both endpoints (a link counts only within the
+scoped repository), `--at <sha>` pins a single-commit surface snapshot, and
+`--limit` (default 500, max 1000) truncates each bucket independently with a
+`results_truncated` diagnostic. Read-only, allow-list-only output (never raw
+payloads), deterministic and byte-identical across runs. See
+`docs/cli/verification-coverage.md`.
 
 Protected raw-artifact commands (issue #60):
 

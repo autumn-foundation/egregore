@@ -15,7 +15,7 @@ eg query who      <NAME>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] 
 eg query who      <NAME>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query drift            --graph <PATH>    [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query drift            --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
-eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
+eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--under <PREFIX>] [--format json|text]
 eg query semantic-context <QUERY> --data-dir <DIR> [--limit N] [--min-score F] [--repo <SELECTOR>]
 eg query semantic-memory <QUERY> --data-dir <DIR> [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
 eg query implementors <TRAIT> --graph <PATH>   [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
@@ -142,6 +142,44 @@ Most subcommands accept exactly one input source:
 - `--data-dir <DIR>` — read from an embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. Requires the `embedded-aletheiadb` feature (enabled by default). Providing both `--graph` and `--data-dir` is an error.
 
 `eg query semantic`, `eg query semantic-context`, and `eg query semantic-memory` accept **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results. `eg query semantic` returns only deterministic **code** hits; `eg query semantic-memory` returns only **agent-authored** memory hits — the two are never blended (issue #91). `eg query semantic-context` follows the `eg query context` no-match convention: on no semantic hit clearing `--min-score` it prints `{"ok":false,"error":{"code":"no_match",...}}` to **stdout** and exits `2`.
+
+### Subsystem scoping — `eg query semantic --under <PREFIX>` (issue #198)
+
+`eg query semantic` accepts an optional `--under <PREFIX>` flag that scopes the
+result set to a repo-relative directory prefix, so an agent working inside a
+known subsystem retrieves concept-matched code only from that subsystem instead
+of hand-filtering crate-wide hits. It reuses the same **segment-aware** prefix
+matcher as `eg query subsystem` (issue #83):
+
+- **Segment-aware, no prefix bleed** — `--under src/alpha` returns hits whose
+  `repo_relative_path` is under `src/alpha/` but never under `src/alphabet/`.
+  The trailing-slash and bare forms resolve identically (`src/alpha` ==
+  `src/alpha/`).
+- **Filtered before `--limit`** — scoping is applied to the full candidate pool
+  *before* the top-N cap, so `--limit N` returns the N best **in-subsystem** hits
+  rather than N global hits filtered down to fewer. Ordering is deterministic
+  (score descending, then record ID ascending); re-running an identical scoped
+  query against an unchanged store produces byte-identical output.
+- **Composes with `--repo` and `--limit`** — repository scoping and subsystem
+  scoping stack; both apply before truncation.
+- **Per-record shape is unchanged** — scoping changes *which* records appear, not
+  the per-record JSON contract (`record_id`, `score`, `name`,
+  `repo_relative_path`, `span`).
+- **Local only** — `--under` is a local-CLI surface for this slice and cannot be
+  combined with `--daemon` (clap rejects the combination); daemon/MCP exposure of
+  scoped retrieval is owned by other issues.
+
+Outcomes:
+
+- A **malformed/empty** prefix (empty, or nothing left after stripping trailing
+  slashes) prints a stable `{"ok":false,"error":{"code":"malformed_under_prefix",...}}`
+  diagnostic to **stdout** and exits `1` — an empty prefix is never silently
+  reported as success.
+- A **valid** prefix that matches zero embedded nodes prints a distinct
+  `scoped to '<prefix>', no matches …` message to **stderr** and exits `2` — this
+  outcome is worded distinctly from the `no results — store may not have
+  embeddings` message so an agent can tell "nothing under this prefix" apart from
+  "this store has no semantic index".
 
 ## Exit codes
 
@@ -1486,3 +1524,45 @@ traits, blanket impls (`impl<T> Trait for T`), method-level breakage analysis,
 and the outbound direction ("what does this type implement"). Same-file generic
 trait impls are in scope as of issue #343; cross-file out-of-line trait impls
 are in scope as of issue #344.
+
+## eg query evidence-path
+
+Trace **one deterministic cross-domain evidence witness path between two
+records** (issue #247): given two exact record handles, return the shortest
+connecting chain over the graph's evidence/provenance edge subgraph — or an
+explicit `no_path` verdict. Answers *"is record A grounded in record B, and by
+what chain?"* without hand-walking the graph.
+
+```sh
+eg query evidence-path <SOURCE_ID> <TARGET_ID> --graph graph.jsonl        # exit 0 on a witness path
+eg query evidence-path <SOURCE_ID> <TARGET_ID> --data-dir .egregore       # embedded, read-only
+eg query evidence-path <SOURCE_ID> <TARGET_ID> --graph graph.jsonl --format text
+```
+
+Only **evidence/provenance** edges are traversed (`OBSERVES`, `HAS_EVIDENCE`,
+`VALIDATED_BY`, `PRODUCED_EVIDENCE`, `FRAME_RESOLVES_TO`, `EMITTED_DURING`,
+`REFERENCES_TASK`, `CLOSES_ACCEPTANCE_CRITERION`, `OWNED_BY_TASK`, …); code-graph
+topology (`CALLS`, `CONTAINS`, `DEFINES`, …) and intra-memory scaffolding
+(`SESSION_OF`, `AUTHORED_BY`) are **excluded** by design. The classification is an
+exhaustive compile-time partition of every edge label (the completeness
+invariant), and both class lists ride in the envelope so a `no_path` verdict is
+never presented as proof no grounding exists.
+
+Reachability is **undirected** (a grounding chain mixes edge directions), so each
+hop reports the edge's native `from`/`to` plus a `traversal_direction`
+(`forward`/`reverse`). The path is the deterministic shortest path: fewest hops,
+then the smallest `(neighbor_record_id, edge_record_id)` at each step. Deleted
+(tombstoned, non-temporal) records — and edges touching them — are excluded (a
+current-state view; no `--at`/`--as-of`). An `EMITTED_DURING` hop additionally
+carries its `basis` (`content_hash_join` / `temporal_correlation`) and documented
+`confidence` (`1.0` / `0.5`) — a correlation lead, never causation.
+
+Exit codes: `0` on a witness path (≥ 1 hop); `1` on identical endpoints or a
+`no_path` verdict between two live endpoints; `2` when an endpoint is absent
+(`endpoint_not_found`) or tombstoned (`endpoint_tombstoned`, a distinct label).
+The lane is repo-agnostic (endpoints are exact IDs; a chain may cross repos), so
+there is no `--repo` flag. Read-only, redaction-safe (only IDs, domains, kinds,
+edge labels, paths, spans, counts, and basis strings escape), and byte-identical
+across runs. A witness path proves a live evidence-edge chain connects two
+records; it is not proof the cited code still matches current source. See
+`docs/cli/evidence-path.md`.

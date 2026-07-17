@@ -24,6 +24,7 @@ mod error_context;
 mod eval;
 mod evidence;
 mod evidence_freshness;
+mod evidence_path;
 mod export;
 mod failure_history;
 mod file_at_point;
@@ -48,6 +49,7 @@ mod producer_drift;
 mod protected;
 mod public_api;
 mod public_api_deltas;
+mod recency;
 mod records;
 mod repair_cmd;
 mod resolve_frames;
@@ -65,6 +67,7 @@ mod unreferenced;
 mod unsafe_sites;
 mod unwrap_expect;
 mod validate;
+mod verification_coverage;
 mod watch;
 mod who;
 // Appended (issue #225); kept at the end to minimize cross-lane merge conflicts.
@@ -92,6 +95,7 @@ pub(crate) use error_context::*;
 pub(crate) use eval::*;
 pub(crate) use evidence::*;
 pub(crate) use evidence_freshness::*;
+pub(crate) use evidence_path::*;
 pub(crate) use export::*;
 pub(crate) use failure_history::*;
 pub(crate) use file_at_point::*;
@@ -116,6 +120,7 @@ pub(crate) use producer_drift::*;
 pub(crate) use protected::*;
 pub(crate) use public_api::*;
 pub(crate) use public_api_deltas::*;
+pub(crate) use recency::*;
 pub(crate) use records::*;
 pub(crate) use repair_cmd::*;
 pub(crate) use resolve_frames::*;
@@ -133,6 +138,7 @@ pub(crate) use unreferenced::*;
 pub(crate) use unsafe_sites::*;
 pub(crate) use unwrap_expect::*;
 pub(crate) use validate::*;
+pub(crate) use verification_coverage::*;
 pub(crate) use watch::*;
 // Appended (issue #225); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use path::*;
@@ -1156,6 +1162,15 @@ pub(crate) enum QuerySubcommand {
         /// Restrict results to one repository (see `eg query symbol --help`).
         #[arg(long)]
         repo: Option<String>,
+        /// Scope results to a repo-relative directory prefix (issue #198).
+        ///
+        /// Segment-aware: `--under src/alpha` matches `src/alpha/foo.rs` but
+        /// never `src/alphabet/x.rs`; the trailing-slash and bare forms resolve
+        /// identically. The scope is applied BEFORE `--limit`, so `--limit N`
+        /// returns the N best in-subsystem hits. Not supported with `--daemon`
+        /// (scoped retrieval is a local-CLI surface for this slice).
+        #[arg(long, conflicts_with = "daemon")]
+        under: Option<String>,
         /// Maximum number of results (default 10).
         #[arg(long, default_value_t = 10)]
         limit: usize,
@@ -2139,6 +2154,53 @@ pub(crate) enum QuerySubcommand {
         #[arg(long)]
         protected_store: Option<PathBuf>,
     },
+    /// Trace a cross-domain evidence witness path between two records (issue #247).
+    ///
+    /// Answers "is record A grounded in record B, and by what chain?" by tracing
+    /// the deterministic shortest connecting path between two record handles over
+    /// the graph's cross-domain evidence/provenance edge subgraph, returning one
+    /// citable witness path (or an explicit `no_path` verdict — never a silent
+    /// empty list).
+    ///
+    /// Only evidence/provenance edges are traversed (`OBSERVES`, `HAS_EVIDENCE`,
+    /// `VALIDATED_BY`, `PRODUCED_EVIDENCE`, `FRAME_RESOLVES_TO`, `EMITTED_DURING`,
+    /// `REFERENCES_TASK`, …); code-graph topology (`CALLS`, `CONTAINS`, `DEFINES`,
+    /// …) and intra-memory scaffolding (`SESSION_OF`, `AUTHORED_BY`) are EXCLUDED
+    /// by design — the classification is an exhaustive compile-time partition of
+    /// every edge label. Reachability is undirected (a grounding chain mixes edge
+    /// directions), so each hop reports the edge's native `from`/`to` plus a
+    /// `traversal_direction`; the tie-break is fewest hops, then the smallest
+    /// `(neighbor_record_id, edge_record_id)` at each step. Deleted (tombstoned,
+    /// non-temporal) records are excluded — a current-state view.
+    ///
+    /// A witness path proves a live evidence-edge chain connects two records; it
+    /// is not proof the cited code still matches current source, and
+    /// `EMITTED_DURING` hops are correlation leads, never causation. Read-only;
+    /// no raw source/transcript/command/patch text ever enters the response.
+    ///
+    /// Exit codes:
+    ///   0 — a witness path was found (>= 1 hop).
+    ///   1 — identical endpoints, or two live endpoints with no evidence chain
+    ///       (`no_path`).
+    ///   2 — an endpoint is absent (`endpoint_not_found`) or tombstoned
+    ///       (`endpoint_tombstoned`).
+    ///
+    /// Documented in `docs/cli/evidence-path.md`.
+    EvidencePath {
+        /// Source record handle (stable record ID).
+        source: String,
+        /// Target record handle (stable record ID).
+        target: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Rank the files that historically changed in the same commits as a target file (issue #153).
     ///
     /// Over a temporal store produced by `scan-history`, counts the distinct
@@ -2559,6 +2621,101 @@ pub(crate) enum QuerySubcommand {
         /// Maximum ranked files returned (default 50, max 500). Values outside
         /// 1..=500 are rejected with an `invalid_limit` diagnostic.
         #[arg(long, default_value_t = query::CHURN_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Partition the public API surface into verification-covered / uncovered (issue #109).
+    ///
+    /// Joins the issue #213 externally-reachable public surface with the
+    /// recorded verification-domain nodes (`Verification` / `CommandRun` /
+    /// `TestRun` / `ProofResult` / `CIStatus` / `CommandEvidence` /
+    /// `BenchmarkRun` / `CoverageReport`) over the evidence-link edge/citation
+    /// registry — never a `#[test]`/coverage-tool grep and never a build or
+    /// coverage run. A public
+    /// symbol is COVERED when a verification node links to it directly (any
+    /// evidence-link label) or to its containing file via `TOUCHED_FILE` /
+    /// `FAILED_ON`; an agent-memory node linking to it never confers coverage.
+    ///
+    /// Capability-degradation contract (mirrors `undocumented`'s
+    /// `doc_facts_unavailable`): when the store records no verification nodes,
+    /// or records them but none link to code, the report is an explicit
+    /// `verification_facts_unavailable` verdict (exit 0) with EMPTY buckets —
+    /// never every symbol flooded into "uncovered". Absence of recorded
+    /// evidence is a prioritization signal, NEVER proof that code is untested,
+    /// unverified in reality, unsafe, or broken; presence is a recorded link,
+    /// never proof of correctness or that a test/proof passed.
+    ///
+    /// The optional `scope` handle filters to one code item, resolved in
+    /// precedence order: exact record ID, exact symbol name, or a segment-aware
+    /// repo-relative path prefix. Exit 2 when a supplied scope matches no code
+    /// item (`scope_not_found` for a path, `no_match` for a name/id). Exit 1 on
+    /// malformed input (unknown/ambiguous `--repo`, out-of-range `--limit`).
+    /// Output is deterministic and byte-stable.
+    ///
+    /// Documented in `docs/cli/verification-coverage.md`.
+    VerificationCoverage {
+        /// Optional scope handle: record ID, exact symbol name, or a
+        /// repo-relative path prefix (segment-aware).
+        scope: Option<String>,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the surface and links to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Resolve the surface against records as they existed at this commit
+        /// SHA or unique prefix (requires a history-bearing store).
+        #[arg(long)]
+        at: Option<String>,
+        /// Maximum rows per bucket; excess rows are truncated (deterministic
+        /// sort order preserved) with a `results_truncated` diagnostic.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Rank indexed symbols by least-recent last change across commit history (issue #219).
+    ///
+    /// Over a temporal store produced by `eg scan-history`, returns symbols
+    /// ranked by least-recent last change — most dormant first — the
+    /// dormancy-triage signal. Each row carries the stable `Symbol` record ID
+    /// and name, the repo-relative path and span, the last-change commit SHA
+    /// and its valid time, and a dormancy span (seconds and whole days)
+    /// measured against the **newest indexed commit per repository**, never
+    /// wall-clock "now". Only live (non-tombstoned) symbols with an
+    /// attributable last change can rank.
+    ///
+    /// Ordering is deterministic and byte-stable: dormancy descending (most
+    /// dormant first), then last-change commit topological rank ascending, then
+    /// repo-relative path ascending, then record ID ascending. The answer
+    /// states explicitly whether `--limit` truncated it.
+    ///
+    /// Exit codes:
+    ///   0 — ranking returned.
+    ///   1 — load error, invalid --limit, unknown/ambiguous --repo selector.
+    ///   2 — no commit history in scope (`no_history`, the honesty case for a
+    ///       current-tree-only scan) or no attributable symbols (`no_match`).
+    ///
+    /// Documented in `docs/cli/recency.md`.
+    Recency {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the ranking to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum ranked symbols returned (default 50, max 500). Values
+        /// outside 1..=500 are rejected with an `invalid_limit` diagnostic.
+        #[arg(long, default_value_t = query::RECENCY_DEFAULT_LIMIT)]
         limit: usize,
         /// Output format.
         #[arg(long, default_value = "json")]
@@ -4197,6 +4354,35 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_churn_cmd(&records, selected.as_deref(), limit, format)
         }
+        QuerySubcommand::Recency {
+            graph,
+            data_dir,
+            repo,
+            limit,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic.
+            if limit == 0 || limit > query::RECENCY_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::RECENCY_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {} (default {})",
+                        query::RECENCY_MAX_LIMIT,
+                        query::RECENCY_DEFAULT_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_recency_cmd(&records, selected.as_deref(), limit, format)
+        }
         QuerySubcommand::Symbol {
             name,
             graph,
@@ -4624,13 +4810,24 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             data_dir,
             daemon,
             repo,
+            under,
             limit,
             format,
         } => {
             if daemon {
+                // `--under` conflicts with `--daemon` at the CLI layer (scoped
+                // retrieval is a local-CLI surface for this slice, issue #198),
+                // so the daemon path never receives a scope prefix.
                 query_semantic_via_daemon(&query, &data_dir, limit, repo.as_deref(), format)
             } else {
-                query_semantic(&query, &data_dir, limit, repo.as_deref(), format)
+                query_semantic(
+                    &query,
+                    &data_dir,
+                    limit,
+                    repo.as_deref(),
+                    under.as_deref(),
+                    format,
+                )
             }
         }
         #[cfg(feature = "embeddings")]
@@ -5257,6 +5454,27 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 embedded_source,
             )
         }
+        QuerySubcommand::EvidencePath {
+            source,
+            target,
+            graph,
+            data_dir,
+            format,
+        } => {
+            // Strictly read-only lane (AC7): opening the embedded engine in place
+            // re-persists its on-disk index files, so `--data-dir` reads from a
+            // throwaway copy, never the live store (same contract as the other
+            // read-only lanes).
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            query_evidence_path_cmd(&records, &source, &target, format)
+        }
         QuerySubcommand::Coupling {
             path,
             graph,
@@ -5554,6 +5772,75 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &index,
                 selected.as_deref(),
                 supersession,
+                format,
+            )
+        }
+        QuerySubcommand::VerificationCoverage {
+            scope,
+            graph,
+            data_dir,
+            repo,
+            at,
+            limit,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic.
+            if let Some(limit) = limit
+                && (limit == 0 || limit > query::VERIFICATION_COVERAGE_MAX_LIMIT)
+            {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::VERIFICATION_COVERAGE_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {}",
+                        query::VERIFICATION_COVERAGE_MAX_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            // Strictly read-only lane (issue #109): `--data-dir` reads from a
+            // throwaway copy, never the live store. A temporal pin needs the
+            // history-inclusive store view so older commit versions are present
+            // to snapshot.
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) if at.is_some() => load_records_from_db_history_readonly(dir)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            // Resolve the optional `--at` commit pin to a single-commit
+            // snapshot before building the surface (the surface itself is
+            // temporally agnostic, matching `query public-api`). Only the `--at`
+            // path needs an index over the full record set; the common path
+            // builds the index once, over the snapshot.
+            let snapshot = match at.as_deref() {
+                None => records,
+                Some(selector) => {
+                    let index = query::RepositoryIndex::build(&records);
+                    let selected = resolve_repo_scope(&index, repo.as_deref());
+                    verification_coverage_snapshot_at_commit(
+                        records,
+                        selector,
+                        &index,
+                        selected.as_deref(),
+                    )
+                }
+            };
+            let index = query::RepositoryIndex::build(&snapshot);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_verification_coverage_cmd(
+                &snapshot,
+                &index,
+                selected.as_deref(),
+                scope.as_deref(),
+                limit,
                 format,
             )
         }

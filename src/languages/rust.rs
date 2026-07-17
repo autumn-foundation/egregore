@@ -17,8 +17,8 @@ use crate::{
             path_segments, reference_text, span,
         },
         cross_file::{
-            CallKind, CallSiteFact, DefinitionFact, FileFacts, ImplTargetFact, OutOfLineModFact,
-            PendingImplFact, UseImportFact, crate_root_id,
+            CallKind, CallSiteFact, DefinitionFact, FileFacts, ImplTargetFact,
+            ImplTraitRelationFact, OutOfLineModFact, PendingImplFact, UseImportFact, crate_root_id,
         },
     },
     redaction::REDACTION_POLICY_VERSION,
@@ -584,6 +584,46 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 .is_some_and(|grandparent| grandparent.kind() == "trait_item")
     }
 
+    /// True when `node` is a DIRECT member of an `impl` block's declaration
+    /// list — its immediate parent is the impl's `declaration_list` and the
+    /// grandparent is the `impl_item`. A block-local `fn` nested inside an impl
+    /// method body fails this check, so it is attributed as a free function,
+    /// not `Owner::fn` (issue #413 — the impl-side mirror of
+    /// `is_direct_trait_method`). The persistent `impl_context` flag stays
+    /// `Some` while descending into an impl method's body, so without this
+    /// structural gate a block-local `fn helper` would be mis-recorded as
+    /// `method` `Owner::helper` and drop its bare `helper()` call (prefer a
+    /// MISSING edge over a WRONG one).
+    fn is_direct_impl_method(&self, node: Node<'_>) -> bool {
+        self.impl_context.is_some()
+            && node
+                .parent()
+                .filter(|parent| parent.kind() == "declaration_list")
+                .and_then(|parent| parent.parent())
+                .is_some_and(|grandparent| grandparent.kind() == "impl_item")
+    }
+
+    /// True when `node` (a `function_item`) is declared inside a function or
+    /// closure BODY rather than as a direct item of a module, `impl`, or `trait`
+    /// (issue #413 round 3, Codex finding A). Walks up the enclosing scopes: the
+    /// nearest scope-defining ancestor being a `block` (a fn/closure body, an
+    /// `if`/`match`/loop arm, or a bare block) means the `fn` is a block-local
+    /// statement, lexically unreachable from other scopes; a `declaration_list`
+    /// (a `mod`/`impl`/`trait` item list) or the `source_file` crate root means a
+    /// directly, cross-scope-reachable item. A module-level or impl/trait-method
+    /// `function_item` never sits under a `block`, so it is never block-local.
+    fn is_block_local_fn(node: Node<'_>) -> bool {
+        let mut current = node.parent();
+        while let Some(parent) = current {
+            match parent.kind() {
+                "block" => return true,
+                "declaration_list" | "source_file" => return false,
+                _ => current = parent.parent(),
+            }
+        }
+        false
+    }
+
     fn extract_function(&mut self, node: Node<'_>) {
         if has_unsafe_modifier(node) {
             self.emit_unsafe_site(node, "fn");
@@ -592,35 +632,55 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             self.walk_children(node);
             return;
         };
-        let (symbol_kind, qualified_name) = self.impl_context.as_ref().map_or_else(
-            || {
-                if self.is_test_function(node) {
-                    ("test", self.qualify(&local_name))
-                } else {
-                    ("function", self.qualify(&local_name))
-                }
-            },
-            |impl_context| {
-                (
-                    "method",
-                    self.qualify(&format!("{}::{local_name}", impl_context.method_owner)),
-                )
-            },
-        );
+        // Method attribution rides DIRECT structural impl membership (issue
+        // #413): a block-local `fn` nested inside an impl method body keeps
+        // `impl_context` `Some` but is NOT a direct impl member, so it falls
+        // through to the free-function/test branches rather than being
+        // mis-recorded as `Owner::fn`.
+        let is_direct_impl_method = self.is_direct_impl_method(node);
+        let (symbol_kind, qualified_name) = match self.impl_context.as_ref() {
+            Some(impl_context) if is_direct_impl_method => (
+                "method",
+                self.qualify(&format!("{}::{local_name}", impl_context.method_owner)),
+            ),
+            _ if self.is_test_function(node) => ("test", self.qualify(&local_name)),
+            _ => ("function", self.qualify(&local_name)),
+        };
 
         let id = self.add_symbol(node, symbol_kind, &qualified_name);
-        self.definitions.insert(local_name.clone(), id.clone());
-        self.definitions.insert(qualified_name.clone(), id.clone());
         let is_trait_method = self.is_direct_trait_method(node);
-        self.facts.definitions.push(DefinitionFact {
-            id: id.clone(),
-            qualified_name: qualified_name.clone(),
-            simple_name: local_name.clone(),
-            match_segments: self.definition_match_segments(&local_name, is_trait_method),
-            symbol_kind: symbol_kind.to_owned(),
-            is_trait_method,
-            repo_relative_path: self.file.repo_relative_path.clone(),
-        });
+        // A block-local `fn` (declared inside a function/closure BODY) is
+        // lexically unreachable from other scopes (issue #413 round 3, Codex
+        // finding A). Its Symbol node keeps the corrected free-function identity
+        // (kind `function`, module-qualified name, no false `Owner::fn` method,
+        // no owner DEFINES — `add_symbol` above is intentionally NOT gated, so
+        // the node + its DEFINES edge and referential closure are preserved).
+        // But it MUST NOT enter ANY call-candidate set, or a call from another
+        // scope could bind the buried item — a wrong or ambiguous edge (and a
+        // confident WRONG edge when the real target is external, leaving the
+        // block-local the sole in-repo candidate). Two candidate sets feed call
+        // resolution, so both are gated: the per-file name→id map
+        // (`self.definitions`, read by the issue #134 `emit_reference_edges`
+        // same-file pass) AND the repo-wide `FileFacts::definitions`
+        // (cross-file + same-file-labeling). Lexically-scoped recall of
+        // intra-block calls is deferred to a follow-up.
+        if !Self::is_block_local_fn(node) {
+            self.definitions.insert(local_name.clone(), id.clone());
+            self.definitions.insert(qualified_name.clone(), id.clone());
+            self.facts.definitions.push(DefinitionFact {
+                id: id.clone(),
+                qualified_name: qualified_name.clone(),
+                simple_name: local_name.clone(),
+                match_segments: self.definition_match_segments(
+                    &local_name,
+                    is_trait_method,
+                    is_direct_impl_method,
+                ),
+                symbol_kind: symbol_kind.to_owned(),
+                is_trait_method,
+                repo_relative_path: self.file.repo_relative_path.clone(),
+            });
+        }
         self.collect_call_sites(node, &id, &qualified_name);
         self.symbol_bodies.push(SymbolBody {
             id,
@@ -646,9 +706,17 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     /// trait name is pushed ONLY for a function that is a direct member of the
     /// trait body, never a block-local `fn` nested inside a trait method (which
     /// is a free function whose owner is its module).
-    fn definition_match_segments(&self, local_name: &str, is_trait_method: bool) -> Vec<String> {
+    fn definition_match_segments(
+        &self,
+        local_name: &str,
+        is_trait_method: bool,
+        is_direct_impl_method: bool,
+    ) -> Vec<String> {
         let mut segments = self.module_names.clone();
-        if let Some(impl_context) = &self.impl_context {
+        if let Some(impl_context) = self.impl_context.as_ref().filter(|_| is_direct_impl_method) {
+            // The impl-owner segment is pushed ONLY for a DIRECT impl member
+            // (issue #413), never a block-local `fn` nested inside an impl
+            // method body (which is a free function whose owner is its module).
             if let Some(owner) = normalize_impl_owner(&impl_context.method_owner) {
                 segments.push(owner);
             }
@@ -819,6 +887,32 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         // while the parse tree is in hand — never re-parsed from the display
         // string later (issue #343/#344).
         let decision = impl_target_decision(node, self.source, &display);
+
+        // Capture a comprehensive `impl Trait for Type` relation for the
+        // repo-wide IMPLEMENTS-gated self-dispatch join (issue #414). Unlike
+        // `pending_impls` (deferred ONLY when local resolution fails), this
+        // records EVERY trait impl — same-file and cross-file — so the
+        // resolution pass has a complete "S implements T" fact set. Emit only
+        // for a trait impl that names a concrete implementing type: a `trait`
+        // field must be present (excludes inherent `impl S {}`, whose decision
+        // is also `Resolve` but carries the TYPE name), and the decision must be
+        // `Resolve` (excludes blanket/negative/non-nominal impls, whose decision
+        // is `NoEdge`, and generic inherent impls, whose decision is
+        // `Verbatim`). The `trait_path` reuses `impl_target_decision`'s exact
+        // normalization so the join stays consistent with the IMPLEMENTS pass.
+        if node.child_by_field_name("trait").is_some()
+            && let ImplTargetDecision::Resolve(trait_path) = &decision
+            && let Some(impl_type) = normalize_impl_owner(&display)
+            && let Some(impl_type_path) = normalize_impl_owner_path(&display)
+        {
+            self.facts.impl_trait_relations.push(ImplTraitRelationFact {
+                impl_type,
+                impl_type_path,
+                trait_path: trait_path.clone(),
+                crate_root: self.crate_root.clone(),
+                module_names: self.module_names.clone(),
+            });
+        }
 
         // The trait lookup is deferred until the whole file is indexed
         // (`resolve_pending_impl_edges`): Rust item order is insignificant,
@@ -1101,11 +1195,13 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         self.definitions.insert(local_name.clone(), id.clone());
         self.definitions.insert(qualified_name.clone(), id.clone());
         let is_trait_method = self.is_direct_trait_method(node);
+        // A signature-only item never carries an `impl_context` (impl methods
+        // always have bodies), so it is never a direct impl method (issue #413).
         self.facts.definitions.push(DefinitionFact {
             id,
             qualified_name: qualified_name.clone(),
             simple_name: local_name.clone(),
-            match_segments: self.definition_match_segments(&local_name, is_trait_method),
+            match_segments: self.definition_match_segments(&local_name, is_trait_method, false),
             symbol_kind: "function".to_owned(),
             is_trait_method,
             repo_relative_path: self.file.repo_relative_path.clone(),
@@ -2606,6 +2702,23 @@ fn normalize_impl_owner(owner: &str) -> Option<String> {
     let owner = owner.split('<').next()?.trim();
     let owner = owner.rsplit("::").next()?.trim();
     (is_simple_ident(owner)).then(|| owner.to_owned())
+}
+
+/// Normalizes an impl owner display to the implementing type's PATH AS WRITTEN,
+/// stopping BEFORE [`normalize_impl_owner`]'s final leaf reduction (issue #414,
+/// Codex P2 on #420): `T for std::string::String` → `std::string::String`;
+/// `U for String` → `String`; `Runner for crate::foo::Bar` → `crate::foo::Bar`;
+/// `impl<T> Trait for Wrapper<T>` → `Wrapper`. The retained path lets the
+/// repo-wide `ImplTargetIndex` decide whether the implementing type resolves to
+/// a UNIQUE LOCAL type def — an external `std::string::String` resolves to
+/// nothing and its relation is dropped, so it never pollutes a local `String`'s
+/// implemented-trait set under the bare-leaf map key. Returns `None` for empty
+/// forms.
+fn normalize_impl_owner_path(owner: &str) -> Option<String> {
+    let owner = owner.rsplit(" for ").next()?.trim();
+    let owner = strip_impl_prefix(owner).trim();
+    let owner = owner.split('<').next()?.trim();
+    (!owner.is_empty()).then(|| owner.to_owned())
 }
 
 /// Strips a leading `impl` keyword and its generic parameter list, if any.
