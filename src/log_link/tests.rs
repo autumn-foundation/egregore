@@ -33,6 +33,7 @@ fn log_source(anchor: &str, path: &str, hash: &str) -> (String, GraphRecord) {
         source_format_version: "plain-v1".to_owned(),
         source_artifact_hash: hash.to_owned(),
         line_count: 1,
+        repository_id: ANCHOR.to_owned(),
     }));
     (id, node)
 }
@@ -56,6 +57,7 @@ fn error_signature(tag: &str, last_seen: &str) -> (String, GraphRecord) {
         first_seen: last_seen.to_owned(),
         last_seen: last_seen.to_owned(),
         frames: None,
+        repository_id: ANCHOR.to_owned(),
     }))
     .with_valid_time(last_seen, "log_event_timestamp");
     (id, node)

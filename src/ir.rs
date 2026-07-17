@@ -41,7 +41,22 @@ pub const USER_CONTEXT_SCHEMA_VERSION: u32 = 1;
 /// signature/hour mint DISTINCT bucket IDs (summed downstream) while a genuine
 /// rescan of identical bytes mints the SAME bucket ID (collapsed). A breaking
 /// bump: re-scan to regenerate buckets under the new identity.
-pub const LOG_SCHEMA_VERSION: u32 = 2;
+///
+/// v3 (issues #362 / #364): two additive capabilities fold into one breaking
+/// bump. **#362** persists repository attribution as a retrievable
+/// `repository_id` field on ALL four log payloads (`LogSource`,
+/// `ErrorSignature`, `LogEvent`, `LogOccurrenceBucket`) so `--repo` can filter
+/// log signatures in a shared multi-repository store (the value is the same
+/// `Repository` record ID already hashed into every log ID). **#364** adds a
+/// sorted `occurrence_timestamps` list to `LogOccurrenceBucketPayload` so window
+/// counts can be bounded endpoint-exactly at an arbitrary commit instant instead
+/// of hour-bucket-granular. Both new fields are `#[serde(default)]`, so a legacy
+/// `log:v2:` record lacking them still deserializes and degrades honestly (empty
+/// attribution / no per-occurrence data) — a deliberate divergence from #361's
+/// required-field stance. The version prefix still flips (`log:v2:` → `log:v3:`)
+/// so v3 and v2 IDs never collide; re-scan is the remedy to regenerate every
+/// record with attribution + per-occurrence timestamps populated.
+pub const LOG_SCHEMA_VERSION: u32 = 3;
 
 /// Minimum replay tolerance for semantic drift scores.
 /// Documented in `docs/schema/semantic-drift.md`.
@@ -526,6 +541,13 @@ pub struct LogSourcePayload {
     /// Count of every logical line in the source, including info/debug noise
     /// that mints no signature. Non-identity.
     pub line_count: u64,
+    /// Stable `Repository` record ID this log source is attributed to (issue
+    /// #362, schema v3). Already an identity input for every log ID; storing it
+    /// makes attribution retrievable so `--repo` can filter log signatures.
+    /// `#[serde(default)]`: a legacy `log:v2:` record without it deserializes to
+    /// an empty (unattributed) string.
+    #[serde(default)]
+    pub repository_id: String,
 }
 
 /// Payload for an `ErrorSignature` node: a deduplicated error fingerprint.
@@ -554,6 +576,13 @@ pub struct ErrorSignaturePayload {
     /// hash preimage. Absent (`None`) when no backtrace was parsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frames: Option<Vec<StackFrame>>,
+    /// Stable `Repository` record ID this signature is attributed to (issue
+    /// #362, schema v3). Already an identity input for the signature ID; storing
+    /// it makes attribution retrievable so `--repo` can filter log signatures.
+    /// `#[serde(default)]`: a legacy `log:v2:` record without it deserializes to
+    /// an empty (unattributed) string.
+    #[serde(default)]
+    pub repository_id: String,
 }
 
 /// Payload for a `LogEvent` node: one bounded exemplar occurrence.
@@ -571,6 +600,12 @@ pub struct LogEventPayload {
     pub source_line: u64,
     /// Closed severity class: `fatal`, `error`, or `warn`.
     pub severity: String,
+    /// Stable `Repository` record ID this exemplar is attributed to (issue #362,
+    /// schema v3). Already an identity input for the event ID; storing it gives
+    /// every log node uniform, retrievable attribution. `#[serde(default)]`: a
+    /// legacy `log:v2:` record without it deserializes to an empty string.
+    #[serde(default)]
+    pub repository_id: String,
 }
 
 /// Payload for a `LogOccurrenceBucket` node: an hourly occurrence count.
@@ -593,6 +628,22 @@ pub struct LogOccurrenceBucketPayload {
     /// (issue #361): distinguishes buckets from distinct sources sharing a
     /// signature/hour from a genuine rescan of the same source.
     pub source_id: String,
+    /// Stable `Repository` record ID this bucket is attributed to (issue #362,
+    /// schema v3). Already an identity input for the bucket ID; storing it makes
+    /// attribution retrievable so `--repo` can filter log signatures.
+    /// `#[serde(default)]`: a legacy `log:v2:` record without it deserializes to
+    /// an empty (unattributed) string.
+    #[serde(default)]
+    pub repository_id: String,
+    /// Sorted (ascending), Z-normalized RFC 3339 UTC valid times of every
+    /// occurrence that fell in this hour (issue #364, schema v3). Non-identity.
+    /// Its `len()` equals `occurrence_count`. Lets a consumer bound window counts
+    /// endpoint-exactly at an arbitrary commit instant instead of counting the
+    /// whole hour-aligned bucket. `#[serde(default)]`: a legacy `log:v2:` bucket
+    /// without it deserializes to an empty vector (no per-occurrence data, so
+    /// consumers fall back to the hour-bucket-granular predicate for it).
+    #[serde(default)]
+    pub occurrence_timestamps: Vec<String>,
 }
 
 /// A typed citation from an agent-memory node to another graph record.
@@ -3603,14 +3654,16 @@ mod strip_prefix_tests {
 
     #[test]
     fn strip_log_id_prefix_is_version_agnostic() {
-        // Both the superseded v1 and current v2 (issue #361) prefixes resolve,
-        // returning the hex tail unchanged so exact-ID and prefix resolution work.
+        // Superseded v1/v2 and current v3 (issues #362/#364) prefixes all
+        // resolve, returning the hex tail unchanged so exact-ID and prefix
+        // resolution work across schema bumps.
         assert_eq!(strip_log_id_prefix("log:v1:deadbeef"), Some("deadbeef"));
         assert_eq!(strip_log_id_prefix("log:v2:deadbeef"), Some("deadbeef"));
+        assert_eq!(strip_log_id_prefix("log:v3:deadbeef"), Some("deadbeef"));
         // Multi-digit versions are accepted (future-proof).
         assert_eq!(strip_log_id_prefix("log:v10:abc"), Some("abc"));
         // A partial hex tail (prefix-resolution needle) round-trips.
-        assert_eq!(strip_log_id_prefix("log:v2:dead"), Some("dead"));
+        assert_eq!(strip_log_id_prefix("log:v3:dead"), Some("dead"));
     }
 
     #[test]

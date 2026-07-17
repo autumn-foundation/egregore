@@ -185,10 +185,10 @@ fn frame_resolves_to_schema_tuple_is_known() {
     let version = record_version(&edge);
     assert_eq!(version.domain, "log");
     assert_eq!(version.kind, "FRAME_RESOLVES_TO");
-    assert_eq!(version.version, 2);
+    assert_eq!(version.version, 3);
     assert!(
         is_known_record_version(&version),
-        "(log, FRAME_RESOLVES_TO, 2) must be an accepted schema tuple"
+        "(log, FRAME_RESOLVES_TO, 3) must be an accepted schema tuple"
     );
 }
 
@@ -276,7 +276,7 @@ fn log_stable_id_is_deterministic_and_prefixed() {
         "error",
     ]);
     assert_eq!(a, b);
-    assert!(a.starts_with("log:v2:"), "got {a}");
+    assert!(a.starts_with("log:v3:"), "got {a}");
 }
 
 #[test]
@@ -290,17 +290,20 @@ fn log_stable_id_preserves_case_of_parts() {
 // ── schema-version gate ──────────────────────────────────────────────────────
 
 #[test]
-fn schema_gate_accepts_v2_rejects_unknown() {
+fn schema_gate_accepts_v3_rejects_unknown() {
     use crate::schema_version::{RecordVersion, is_known_record_version};
-    // Log domain is at schema v2 since issue #361 (source-aware bucket identity);
-    // v1 is a superseded version and is no longer accepted.
+    // Log domain is at schema v3 since issues #362/#364 (repository_id +
+    // occurrence_timestamps); v1 and v2 are superseded and no longer accepted.
     for kind in [
         "LogSource",
         "ErrorSignature",
         "LogEvent",
         "LogOccurrenceBucket",
     ] {
-        assert!(is_known_record_version(&RecordVersion::new("log", kind, 2)));
+        assert!(is_known_record_version(&RecordVersion::new("log", kind, 3)));
+        assert!(!is_known_record_version(&RecordVersion::new(
+            "log", kind, 2
+        )));
         assert!(!is_known_record_version(&RecordVersion::new(
             "log", kind, 1
         )));
@@ -310,7 +313,7 @@ fn schema_gate_accepts_v2_rejects_unknown() {
     }
     for label in ["FINGERPRINTED_AS", "CAPTURED_FROM", "AGGREGATES"] {
         assert!(is_known_record_version(&RecordVersion::new(
-            "log", label, 2
+            "log", label, 3
         )));
     }
 }
@@ -524,4 +527,140 @@ fn bucket_payload_carries_its_log_source_id() {
         bucket_source, source_id,
         "a bucket's source_id is a handle to its LogSource"
     );
+}
+
+// ── issues #362 / #364: LOG_SCHEMA v3 — repository_id + occurrence_timestamps ──
+
+#[test]
+fn log_schema_version_is_three() {
+    // Breaking bump 2 → 3 folding in #362 (repository_id) + #364
+    // (occurrence_timestamps).
+    assert_eq!(crate::ir::LOG_SCHEMA_VERSION, 3);
+}
+
+#[test]
+fn log_ids_are_minted_with_v3_prefix() {
+    // The version prefix flips automatically via the const, so every log record
+    // ID is minted under `log:v3:`.
+    let id = log_stable_id(&[
+        "error_signature",
+        "repo",
+        FINGERPRINT_ALGORITHM,
+        "t",
+        "error",
+    ]);
+    assert!(id.starts_with("log:v3:"), "got {id}");
+}
+
+#[test]
+fn repository_id_round_trips_on_all_four_payloads() {
+    // #362: every log payload carries a retrievable `repository_id`.
+    let src = LogSourcePayload {
+        source_relative_path: "app.log".to_owned(),
+        source_format_version: "plain-v1".to_owned(),
+        source_artifact_hash: "hash".to_owned(),
+        line_count: 3,
+        repository_id: "acme/widget".to_owned(),
+    };
+    let back: LogSourcePayload =
+        serde_json::from_str(&serde_json::to_string(&src).unwrap()).unwrap();
+    assert_eq!(src, back);
+    assert_eq!(back.repository_id, "acme/widget");
+
+    let sig = ErrorSignaturePayload {
+        fingerprint_algorithm: FINGERPRINT_ALGORITHM.to_owned(),
+        template_excerpt: "boom".to_owned(),
+        severity: "error".to_owned(),
+        occurrence_count: 1,
+        first_seen: "2026-01-02T03:00:00Z".to_owned(),
+        last_seen: "2026-01-02T03:00:00Z".to_owned(),
+        frames: None,
+        repository_id: "acme/widget".to_owned(),
+    };
+    let back: ErrorSignaturePayload =
+        serde_json::from_str(&serde_json::to_string(&sig).unwrap()).unwrap();
+    assert_eq!(sig, back);
+    assert_eq!(back.repository_id, "acme/widget");
+
+    let ev = LogEventPayload {
+        event_excerpt: "boom".to_owned(),
+        event_content_hash: "ch".to_owned(),
+        source_line: 1,
+        severity: "error".to_owned(),
+        repository_id: "acme/widget".to_owned(),
+    };
+    let back: LogEventPayload = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+    assert_eq!(ev, back);
+    assert_eq!(back.repository_id, "acme/widget");
+
+    let bucket = LogOccurrenceBucketPayload {
+        bucket_start: "2026-01-02T03:00:00Z".to_owned(),
+        bucket_width: "1h".to_owned(),
+        occurrence_count: 2,
+        source_id: "log:v3:abc".to_owned(),
+        repository_id: "acme/widget".to_owned(),
+        occurrence_timestamps: vec![
+            "2026-01-02T03:00:00Z".to_owned(),
+            "2026-01-02T03:45:00Z".to_owned(),
+        ],
+    };
+    let back: LogOccurrenceBucketPayload =
+        serde_json::from_str(&serde_json::to_string(&bucket).unwrap()).unwrap();
+    assert_eq!(bucket, back);
+    assert_eq!(back.repository_id, "acme/widget");
+}
+
+#[test]
+fn occurrence_timestamps_round_trip_on_bucket() {
+    // #364: the sorted per-occurrence timestamps round-trip through serde.
+    let bucket = LogOccurrenceBucketPayload {
+        bucket_start: "2026-01-02T12:00:00Z".to_owned(),
+        bucket_width: "1h".to_owned(),
+        occurrence_count: 3,
+        source_id: "log:v3:src".to_owned(),
+        repository_id: "acme/widget".to_owned(),
+        occurrence_timestamps: vec![
+            "2026-01-02T12:05:00Z".to_owned(),
+            "2026-01-02T12:15:00Z".to_owned(),
+            "2026-01-02T12:45:00Z".to_owned(),
+        ],
+    };
+    let back: LogOccurrenceBucketPayload =
+        serde_json::from_str(&serde_json::to_string(&bucket).unwrap()).unwrap();
+    assert_eq!(
+        back.occurrence_timestamps.len() as u64,
+        back.occurrence_count
+    );
+    assert_eq!(
+        back.occurrence_timestamps,
+        vec![
+            "2026-01-02T12:05:00Z".to_owned(),
+            "2026-01-02T12:15:00Z".to_owned(),
+            "2026-01-02T12:45:00Z".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn legacy_v2_log_payloads_deserialize_with_serde_defaults() {
+    // Back-compat (#362/#364): a legacy `log:v2:` JSON line lacking the new
+    // fields still deserializes and degrades honestly (empty attribution / no
+    // per-occurrence data), rather than a hard read failure.
+    let legacy_src = r#"{"source_relative_path":"app.log","source_format_version":"plain-v1","source_artifact_hash":"h","line_count":3}"#;
+    let src: LogSourcePayload = serde_json::from_str(legacy_src).unwrap();
+    assert_eq!(src.repository_id, "");
+
+    let legacy_sig = r#"{"fingerprint_algorithm":"template-v1","template_excerpt":"boom","severity":"error","occurrence_count":1,"first_seen":"2026-01-02T03:00:00Z","last_seen":"2026-01-02T03:00:00Z"}"#;
+    let sig: ErrorSignaturePayload = serde_json::from_str(legacy_sig).unwrap();
+    assert_eq!(sig.repository_id, "");
+
+    let legacy_ev =
+        r#"{"event_excerpt":"boom","event_content_hash":"ch","source_line":1,"severity":"error"}"#;
+    let ev: LogEventPayload = serde_json::from_str(legacy_ev).unwrap();
+    assert_eq!(ev.repository_id, "");
+
+    let legacy_bucket = r#"{"bucket_start":"2026-01-02T03:00:00Z","bucket_width":"1h","occurrence_count":2,"source_id":"log:v2:abc"}"#;
+    let bucket: LogOccurrenceBucketPayload = serde_json::from_str(legacy_bucket).unwrap();
+    assert_eq!(bucket.repository_id, "");
+    assert!(bucket.occurrence_timestamps.is_empty());
 }

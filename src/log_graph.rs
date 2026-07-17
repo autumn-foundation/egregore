@@ -323,6 +323,8 @@ pub fn scan_log_records(
             source_format_version: source_format_version.to_owned(),
             source_artifact_hash,
             line_count,
+            // Populated in Phase B (issue #362).
+            repository_id: String::new(),
         }))
         .with_valid_time(transaction_time, VALID_TIME_SOURCE_INFERRED),
     );
@@ -392,6 +394,8 @@ pub fn scan_log_records(
             first_seen: first_seen.clone(),
             last_seen,
             frames,
+            // Populated in Phase B (issue #362).
+            repository_id: String::new(),
         }))
         .with_valid_time(first_seen, sig_valid_time_source);
         if redacted {
@@ -466,6 +470,8 @@ pub fn scan_log_records(
                 event_content_hash: content_hash,
                 source_line: occ.source_line,
                 severity: (*severity).to_owned(),
+                // Populated in Phase B (issue #362).
+                repository_id: String::new(),
             }))
             .with_valid_time(event_valid_time, occ.valid_time_source);
             if occ.redacted {
@@ -536,6 +542,9 @@ pub fn scan_log_records(
                     bucket_width: BUCKET_WIDTH.to_owned(),
                     occurrence_count: count,
                     source_id: source_id.clone(),
+                    // Populated in Phase B (issues #362 / #364).
+                    repository_id: String::new(),
+                    occurrence_timestamps: Vec::new(),
                 }))
                 .with_valid_time(bucket_start.clone(), source),
             );

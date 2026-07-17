@@ -6580,6 +6580,7 @@ pub(crate) mod fixture {
                 source_format_version: "plain-v1".to_owned(),
                 source_artifact_hash: hash.to_owned(),
                 line_count: 10,
+                repository_id: String::new(),
             }),
             WINDOW_FROM,
         )
@@ -6635,6 +6636,7 @@ pub(crate) mod fixture {
                 first_seen: first_seen.to_owned(),
                 last_seen: last_seen.to_owned(),
                 frames,
+                repository_id: String::new(),
             }),
             first_seen,
         )
@@ -6660,6 +6662,7 @@ pub(crate) mod fixture {
                 event_content_hash: content_hash.to_owned(),
                 source_line,
                 severity: severity.to_owned(),
+                repository_id: String::new(),
             }),
             valid_time,
         )
@@ -6679,6 +6682,8 @@ pub(crate) mod fixture {
                 // source_id (identity input since #361) is a fixed placeholder;
                 // dedup/coalesce keys on the record ID, not this field.
                 source_id: "log:v2:fixture-source".to_owned(),
+                repository_id: String::new(),
+                occurrence_timestamps: Vec::new(),
             }),
             bucket_start,
         )
