@@ -136,10 +136,11 @@ use super::RepositoryIndex;
 use super::deltas::{RangeDeltasError, resolve_commit_range};
 use crate::ir::{EdgeLabel, ErrorSignaturePayload, GraphRecord, LogPayload, NodeKind};
 
-/// Always-present advisory label for [`log_deltas`] responses whose per-window
-/// occurrence counts fell back to hour-bucket granularity for at least one
-/// contributing bucket (a legacy `log:v2:` bucket carrying no per-occurrence
-/// timestamps). Selected at response build time; see
+/// Advisory disclaimer for [`log_deltas`] responses that fell back to hour-bucket
+/// granularity (issue #364).
+///
+/// Emitted when at least one contributing bucket is a legacy `log:v2:` record
+/// carrying no per-occurrence timestamps. Selected at response build time; see
 /// [`LOG_DELTAS_DISCLAIMER_ENDPOINT_EXACT`] for the fully-attributed case.
 pub const LOG_DELTAS_DISCLAIMER: &str = "Rows are runtime error-signature observations classified \
      against the commit range's valid-time window. A signature first observed in-range is a \
@@ -153,12 +154,13 @@ pub const LOG_DELTAS_DISCLAIMER: &str = "Rows are runtime error-signature observ
      up to one bucket width (1 hour) past the exact commit instant. Re-run `eg scan-logs` to \
      regenerate the buckets under schema v3 (issue #364) for endpoint-exact counts.";
 
-/// Advisory label for [`log_deltas`] responses whose per-window occurrence counts
-/// are endpoint-exact: every contributing `LogOccurrenceBucket` carries
-/// per-occurrence timestamps (schema v3, issue #364), so a count includes only
-/// occurrences at or before the exact commit instant even when the endpoint falls
-/// mid-hour. Selected at response build time; the legacy hour-bucket wording is
-/// [`LOG_DELTAS_DISCLAIMER`].
+/// Advisory disclaimer for [`log_deltas`] responses with endpoint-exact counts
+/// (issue #364).
+///
+/// Emitted when every contributing `LogOccurrenceBucket` carries per-occurrence
+/// timestamps (schema v3), so a count includes only occurrences at or before the
+/// exact commit instant even when the endpoint falls mid-hour. Selected at response
+/// build time; the legacy hour-bucket wording is [`LOG_DELTAS_DISCLAIMER`].
 pub const LOG_DELTAS_DISCLAIMER_ENDPOINT_EXACT: &str = "Rows are runtime error-signature \
      observations classified against the commit range's valid-time window. A signature first \
      observed in-range is a regression LEAD, not proof this range caused it; a ceased signature is \
@@ -169,28 +171,29 @@ pub const LOG_DELTAS_DISCLAIMER_ENDPOINT_EXACT: &str = "Rows are runtime error-s
      so a count includes only occurrences at or before the exact commit instant, even when the \
      endpoint falls mid-hour.";
 
-/// Machine-readable granularity marker for hour-bucket-granular per-window
-/// occurrence counts — emitted when at least one contributing bucket is a legacy
-/// `log:v2:` record with no per-occurrence timestamps, so its whole hourly bucket
-/// is summed and a mid-hour endpoint may over-count by up to one bucket width.
+/// Granularity marker for hour-bucket-granular per-window occurrence counts.
 ///
-/// The granularity marker is PER-RESPONSE and conditional (issue #364): a response
-/// reports [`OCCURRENCE_COUNT_GRANULARITY_ENDPOINT_EXACT`] when every contributing
-/// bucket carried timestamps (or no buckets contributed), and this value otherwise.
+/// Emitted when at least one contributing bucket is a legacy `log:v2:` record with
+/// no per-occurrence timestamps, so its whole hourly bucket is summed and a
+/// mid-hour endpoint may over-count by up to one bucket width. The marker is
+/// PER-RESPONSE and conditional (issue #364): a response reports
+/// [`OCCURRENCE_COUNT_GRANULARITY_ENDPOINT_EXACT`] when every contributing bucket
+/// carried timestamps (or no buckets contributed), and this value otherwise.
 pub const OCCURRENCE_COUNT_GRANULARITY: &str = "hourly_bucket";
 
-/// Machine-readable granularity marker for endpoint-exact per-window occurrence
-/// counts — emitted when every contributing `LogOccurrenceBucket` carries
-/// per-occurrence timestamps (schema v3, issue #364), so each count is bounded
-/// precisely at the commit instant. Also reported (vacuously) when no bucket
-/// contributed a per-window count. See [`OCCURRENCE_COUNT_GRANULARITY`].
+/// Granularity marker for endpoint-exact per-window occurrence counts.
+///
+/// Emitted when every contributing `LogOccurrenceBucket` carries per-occurrence
+/// timestamps (schema v3, issue #364), so each count is bounded precisely at the
+/// commit instant. Also reported (vacuously) when no bucket contributed a
+/// per-window count. See [`OCCURRENCE_COUNT_GRANULARITY`].
 pub const OCCURRENCE_COUNT_GRANULARITY_ENDPOINT_EXACT: &str = "endpoint_exact";
 
-/// Residual repository-scope caveat text emitted with `--repo` when the store
-/// holds at least one legacy `log:v2:` log signature that carries no persisted
-/// repository attribution and was therefore excluded from the scoped run.
+/// Residual repository-scope caveat text emitted with `--repo` (issue #362).
 ///
-/// Since issue #362 (schema v3) persisted `repository_id` on every log payload,
+/// Emitted when the store holds at least one legacy `log:v2:` log signature that
+/// carries no persisted repository attribution and was therefore excluded from the
+/// scoped run. Since issue #362 (schema v3) persisted `repository_id` on every log payload,
 /// `--repo` filters log signatures by their attribution: a signature attributed
 /// to a different repository is soundly excluded. The ONLY residual honesty gap is
 /// a legacy `log:v2:` record whose `repository_id` deserializes empty: it cannot
