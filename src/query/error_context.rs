@@ -36,6 +36,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+use super::liveness::Liveness;
 use super::{
     LOG_EMBEDDED_RETENTION_CAVEAT, LogEmbeddedRetentionCaveat, OverlappingSymbolDelta,
     ResolvedFrameHandle, UnresolvedRef, range_deltas,
@@ -449,13 +450,11 @@ fn resolve_handle(
     frame_records: &[GraphRecord],
     handle: &str,
 ) -> HandleResolution {
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect();
+    // Latest-write-wins tombstone / temporal liveness (issue #421): over an
+    // append-only `--graph`, a signature/symbol node re-ingested AFTER its own
+    // tombstone is live again, so the shared gate matches the embedded
+    // current-state read and `--graph` / `--data-dir` agree. See `super::liveness`.
+    let liveness = Liveness::new(records);
 
     let sig_ids: BTreeSet<&str> = records
         .iter()
@@ -463,9 +462,8 @@ fn resolve_handle(
             GraphRecord::Node {
                 id,
                 kind: NodeKind::ErrorSignature,
-                temporal,
                 ..
-            } if temporal.is_some() || !tombstoned.contains(id.as_str()) => Some(id.as_str()),
+            } if !liveness.deleted(id.as_str()) => Some(id.as_str()),
             _ => None,
         })
         .collect();
@@ -496,11 +494,8 @@ fn resolve_handle(
                 id,
                 kind: NodeKind::Symbol,
                 name: Some(name),
-                temporal,
                 ..
-            } if name == handle && (temporal.is_some() || !tombstoned.contains(id.as_str())) => {
-                Some(id.as_str())
-            }
+            } if name == handle && !liveness.deleted(id.as_str()) => Some(id.as_str()),
             _ => None,
         })
         .collect();
@@ -1337,4 +1332,102 @@ fn build_first_seen_range(
         window_end: head.as_ref().map(|(_, _, vt)| vt.clone()),
         overlapping_symbol_deltas,
     })
+}
+
+#[cfg(test)]
+mod liveness_parity_tests {
+    //! Transport-parity regression (issue #421): over an append-only `--graph`, an
+    //! `ErrorSignature` or a frame-target `Symbol` re-ingested AFTER its own
+    //! tombstone is live again for handle resolution — matching the embedded
+    //! current-state read; a tombstone with no later re-add still deletes its id.
+    use super::*;
+    use crate::ir::{SourceSpan, log_stable_id, stable_id};
+
+    fn signature(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::ErrorSignature,
+            None,
+            None,
+            None,
+            "signature".to_owned(),
+        )
+        .with_domain("log", 2)
+    }
+
+    fn symbol(id: &str, name: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    fn frame_resolves_to(sig: &str, symbol: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::FrameResolvesTo,
+            sig.to_owned(),
+            symbol.to_owned(),
+            None,
+            "frame resolves to".to_owned(),
+        )
+    }
+
+    fn tomb(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v5:tomb_{deleted_id}"),
+            schema_version: 5,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn signature_reingested_after_tombstone_resolves_by_id() {
+        let sig_id = log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+        let records = vec![signature(&sig_id), tomb(&sig_id), signature(&sig_id)];
+        let resolution = resolve_handle(&records, &records, &sig_id);
+        assert!(
+            matches!(&resolution, HandleResolution::Signatures(ids) if ids.len() == 1 && ids[0] == sig_id),
+            "a signature revived after its tombstone must resolve by its record ID"
+        );
+    }
+
+    #[test]
+    fn signature_tombstone_without_reingest_is_no_match() {
+        let sig_id = log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+        let records = vec![signature(&sig_id), tomb(&sig_id)];
+        let resolution = resolve_handle(&records, &records, &sig_id);
+        assert!(
+            matches!(resolution, HandleResolution::NoMatch),
+            "a signature tombstoned with no re-ingest stays deleted"
+        );
+    }
+
+    #[test]
+    fn symbol_name_frame_target_reingested_after_tombstone_resolves() {
+        let sig_id = log_stable_id(&["error_signature", "repo", "tpl", "error"]);
+        let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "foo"]);
+        let records = vec![
+            signature(&sig_id),
+            symbol(&sym_id, "foo"),
+            tomb(&sym_id),
+            symbol(&sym_id, "foo"),
+            frame_resolves_to(&sig_id, &sym_id),
+        ];
+        let resolution = resolve_handle(&records, &records, "foo");
+        assert!(
+            matches!(&resolution, HandleResolution::Signatures(ids) if ids.len() == 1 && ids[0] == sig_id),
+            "a frame-target symbol revived after its tombstone must resolve the signature naming it"
+        );
+    }
 }

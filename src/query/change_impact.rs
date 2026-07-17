@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::liveness::Liveness;
 use super::{
     FailureTargetKind, MemoryAuditDiagnostic, RepositoryIndex, ResolvedFailureTarget,
     containing_file_or_module, imported_symbol_names, last_path_segment, record_node_kind,
@@ -176,31 +177,13 @@ pub fn change_impact_context<'a>(
         leads.into_iter().take(cap).collect()
     }
 
-    // ── tombstone / temporal filtering (mirrors resolve_failure_handle) ────────
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let has_temporal: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Node {
-                id,
-                temporal: Some(_),
-                ..
-            }
-            | GraphRecord::Edge {
-                id,
-                temporal: Some(_),
-                ..
-            } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let deleted = |id: &str| tombstoned.contains(id) && !has_temporal.contains(id);
+    // ── latest-write-wins tombstone / temporal liveness (issue #421) ──────────
+    // Over an append-only `--graph`, a node re-ingested AFTER its own tombstone
+    // is live again; the shared gate reports a tombstone active only when it is
+    // the id's most recent write, matching the embedded current-state read so
+    // `--graph` and `--data-dir` agree. See `super::liveness`.
+    let liveness = Liveness::new(records);
+    let deleted = |id: &str| liveness.deleted(id);
     let by_id: BTreeMap<&str, &GraphRecord> = records
         .iter()
         .filter_map(|r| {
@@ -866,3 +849,98 @@ pub fn change_impact_context<'a>(
 // ---------------------------------------------------------------------------
 // Transitive inbound reachability — `eg query transitive-callers` (issue #139)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod liveness_parity_tests {
+    //! Transport-parity regression (issue #421): a symbol re-ingested AFTER its
+    //! own tombstone is live again over `--graph`, so its callers surface as
+    //! impact leads — matching the embedded current-state read; a tombstone with
+    //! no later re-add still deletes the anchor.
+    use super::*;
+    use crate::ir::SourceSpan;
+    use std::collections::BTreeSet;
+
+    fn sym(id: &str, name: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    fn calls(source: &str, target: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::Calls,
+            source.to_owned(),
+            target.to_owned(),
+            Some("1.0".to_owned()),
+            "calls".to_owned(),
+        )
+    }
+
+    fn tomb(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v5:tomb_{deleted_id}"),
+            schema_version: 5,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    fn target(anchor: &str) -> ResolvedFailureTarget {
+        let mut anchor_ids = BTreeSet::new();
+        anchor_ids.insert(anchor.to_owned());
+        ResolvedFailureTarget {
+            handle: anchor.to_owned(),
+            kind: FailureTargetKind::Symbol,
+            anchor_ids,
+            seed_failures: BTreeSet::new(),
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn caller_of_reingested_symbol_surfaces_as_impact_lead() {
+        // Append order: A, Tombstone(A), A again, caller B, B --CALLS--> A.
+        let records = vec![
+            sym("codegraph:v5:a", "a"),
+            tomb("codegraph:v5:a"),
+            sym("codegraph:v5:a", "a"),
+            sym("codegraph:v5:b", "b"),
+            calls("codegraph:v5:b", "codegraph:v5:a"),
+        ];
+        let repo_index = RepositoryIndex::build(&records);
+        let ctx = change_impact_context(&records, &target("codegraph:v5:a"), 1, &repo_index, None);
+        assert!(
+            ctx.direct_callers
+                .iter()
+                .any(|l| l.record.id() == "codegraph:v5:b"),
+            "the caller of a symbol revived after its tombstone must surface as an impact lead"
+        );
+    }
+
+    #[test]
+    fn anchor_tombstone_without_reingest_yields_no_leads() {
+        let records = vec![
+            sym("codegraph:v5:a", "a"),
+            tomb("codegraph:v5:a"),
+            sym("codegraph:v5:b", "b"),
+            calls("codegraph:v5:b", "codegraph:v5:a"),
+        ];
+        let repo_index = RepositoryIndex::build(&records);
+        let ctx = change_impact_context(&records, &target("codegraph:v5:a"), 1, &repo_index, None);
+        assert!(
+            ctx.direct_callers.is_empty(),
+            "a tombstone with no later re-ingest still deletes the anchor, so it has no leads"
+        );
+    }
+}

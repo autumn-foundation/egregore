@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::liveness::Liveness;
 use super::{
     MemoryAuditDiagnostic, MemoryEvidenceItem, RepositoryIndex, TaskResolveError,
     is_codegraph_kind, is_project_kind, is_verification_kind, record_node_kind, resolve_task_ids,
@@ -298,27 +299,15 @@ pub fn resolve_failure_handle(
             _ => None,
         })
         .collect();
-    // A record/edge that still has a temporal (history) version is not deleted
-    // for history-bearing reads: a current-state tombstone only retires the
-    // current state, so failure history for moved/deleted code stays reachable
-    // (mirrors `symbol_context`).
-    let has_temporal: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Node {
-                id,
-                temporal: Some(_),
-                ..
-            }
-            | GraphRecord::Edge {
-                id,
-                temporal: Some(_),
-                ..
-            } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let deleted = |id: &str| tombstoned.contains(id) && !has_temporal.contains(id);
+    // Latest-write-wins tombstone / temporal liveness (issue #421): over an
+    // append-only `--graph`, a record re-ingested AFTER its own tombstone is live
+    // again, and a record/edge that still has a temporal (history) version is not
+    // deleted for history-bearing reads. The shared gate reports a tombstone
+    // active only when it is the id's most recent write, matching the embedded
+    // current-state read so `--graph` and `--data-dir` agree. See
+    // `super::liveness`.
+    let liveness = Liveness::new(records);
+    let deleted = |id: &str| liveness.deleted(id);
     let in_scope = |id: &str| -> bool {
         repo_scope.is_none_or(|scope| repo_index.owner_of(id) == Some(scope))
     };
@@ -686,26 +675,15 @@ pub fn failure_history_context<'a>(
             _ => None,
         })
         .collect();
-    // History-bearing reads keep records/edges that have a temporal version even
-    // when a current-state tombstone shares their ID, so failure links for
-    // moved/deleted code remain traversable (mirrors `symbol_context`).
-    let has_temporal: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Node {
-                id,
-                temporal: Some(_),
-                ..
-            }
-            | GraphRecord::Edge {
-                id,
-                temporal: Some(_),
-                ..
-            } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let deleted = |id: &str| tombstoned.contains(id) && !has_temporal.contains(id);
+    // Latest-write-wins tombstone / temporal liveness (issue #421): over an
+    // append-only `--graph`, a record re-ingested AFTER its own tombstone is live
+    // again, and history-bearing reads keep records/edges that carry a temporal
+    // version even when a current-state tombstone shares their ID. The shared
+    // gate reports a tombstone active only when it is the id's most recent write,
+    // matching the embedded current-state read so `--graph` and `--data-dir`
+    // agree. See `super::liveness`.
+    let liveness = Liveness::new(records);
+    let deleted = |id: &str| liveness.deleted(id);
     let present = |id: &str| -> Option<&'a GraphRecord> {
         if deleted(id) {
             None
@@ -1393,3 +1371,140 @@ fn collect_provenance<'a>(
 // ============================================================================
 // Change-impact query (issue #76)
 // ============================================================================
+
+#[cfg(test)]
+mod liveness_parity_tests {
+    //! Transport-parity regression (issue #421): over an append-only `--graph`, a
+    //! record re-ingested AFTER its own tombstone is live again — matching the
+    //! embedded current-state read — in BOTH `resolve_failure_handle` and
+    //! `failure_history_context`; a tombstone with no later re-add still deletes
+    //! its id.
+    use super::*;
+    use crate::ir::{SourceSpan, stable_id};
+
+    fn sym(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some("foo".to_owned()),
+            "symbol foo".to_owned(),
+        )
+    }
+
+    fn failed_verification(id: &str) -> GraphRecord {
+        let mut rec = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Verification,
+            None,
+            None,
+            None,
+            "verification".to_owned(),
+        )
+        .with_domain("verification", 1);
+        if let GraphRecord::Node { status, .. } = &mut rec {
+            *status = Some("fail".to_owned());
+        }
+        rec
+    }
+
+    fn failed_on(source: &str, target: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::FailedOn,
+            source.to_owned(),
+            target.to_owned(),
+            None,
+            "failed on".to_owned(),
+        )
+    }
+
+    fn tomb(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v5:tomb_{deleted_id}"),
+            schema_version: 5,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    fn symbol_target(anchor: &str) -> ResolvedFailureTarget {
+        let mut anchor_ids = BTreeSet::new();
+        anchor_ids.insert(anchor.to_owned());
+        ResolvedFailureTarget {
+            handle: anchor.to_owned(),
+            kind: FailureTargetKind::Symbol,
+            anchor_ids,
+            seed_failures: BTreeSet::new(),
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn resolve_handle_reingested_after_tombstone_is_not_stale() {
+        let id = stable_id(&["node", "Symbol", "src/lib.rs", "foo"]);
+        let records = vec![sym(&id), tomb(&id), sym(&id)];
+        let repo_index = RepositoryIndex::build(&records);
+        let target = resolve_failure_handle(&records, &id, &repo_index, None).expect("resolves");
+        assert!(
+            !target.stale,
+            "a code record revived after its tombstone must resolve non-stale"
+        );
+        assert!(target.anchor_ids.contains(&id));
+    }
+
+    #[test]
+    fn resolve_handle_tombstone_without_reingest_is_stale() {
+        let id = stable_id(&["node", "Symbol", "src/lib.rs", "foo"]);
+        let records = vec![sym(&id), tomb(&id)];
+        let repo_index = RepositoryIndex::build(&records);
+        let target = resolve_failure_handle(&records, &id, &repo_index, None).expect("resolves");
+        assert!(
+            target.stale && target.is_empty(),
+            "a tombstone with no later re-ingest keeps the handle stale"
+        );
+    }
+
+    #[test]
+    fn context_surfaces_failure_reingested_after_tombstone() {
+        // Runtime failure V --FAILED_ON--> anchor A; V is re-ingested after its own
+        // tombstone, so it must surface as a runtime failure (latest write wins).
+        let anchor = "codegraph:v5:anchor";
+        let v = "verification:v1:run";
+        let records = vec![
+            sym(anchor),
+            failed_verification(v),
+            tomb(v),
+            failed_verification(v),
+            failed_on(v, anchor),
+        ];
+        let ctx = failure_history_context(&records, &symbol_target(anchor));
+        assert!(
+            ctx.runtime_failures.iter().any(|a| a.item.record.id() == v),
+            "a runtime failure revived after its tombstone must surface in failure history"
+        );
+    }
+
+    #[test]
+    fn context_omits_failure_tombstoned_without_reingest() {
+        let anchor = "codegraph:v5:anchor";
+        let v = "verification:v1:run";
+        let records = vec![
+            sym(anchor),
+            failed_verification(v),
+            tomb(v),
+            failed_on(v, anchor),
+        ];
+        let ctx = failure_history_context(&records, &symbol_target(anchor));
+        assert!(
+            ctx.runtime_failures.is_empty(),
+            "a failure tombstoned with no re-ingest stays deleted and is not surfaced"
+        );
+    }
+}

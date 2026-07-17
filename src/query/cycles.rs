@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::liveness::Liveness;
 use super::{RepositoryIndex, ResolvedFailureTarget, imported_symbol_names, last_path_segment};
 use crate::ir::{CallResolution, EdgeLabel, GraphRecord, NodeKind};
 
@@ -272,31 +273,15 @@ pub fn dependency_cycles<'a>(
 ) -> DependencyCycles<'a> {
     let mut result = DependencyCycles::default();
 
-    // ── tombstone / temporal filtering (mirrors change_impact_context) ────────
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let has_temporal: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Node {
-                id,
-                temporal: Some(_),
-                ..
-            }
-            | GraphRecord::Edge {
-                id,
-                temporal: Some(_),
-                ..
-            } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let deleted = |id: &str| tombstoned.contains(id) && !has_temporal.contains(id);
+    // ── latest-write-wins tombstone / temporal liveness (issue #421) ──────────
+    // Over an append-only `--graph`, a node/edge re-ingested AFTER its own
+    // tombstone is live again; the shared gate reports a tombstone active only
+    // when it is the id's most recent write, matching the embedded current-state
+    // read so `--graph` and `--data-dir` agree. This lane also reads CALLS
+    // resolution labels for adjacency, so it selects only the latest EDGE write
+    // per edge id (`is_latest_edge_version`) below. See `super::liveness`.
+    let liveness = Liveness::new(records);
+    let deleted = |id: &str| liveness.deleted(id);
     let owner = |id: &str| repo_index.owner_of(id).unwrap_or("");
     let in_scope = |id: &str| repo_scope.is_none_or(|scope| owner(id) == scope);
 
@@ -375,7 +360,7 @@ pub fn dependency_cycles<'a>(
     // CALLS edges: resolved edges drive cycle detection; ambiguous,
     // unresolved, and unlabeled cross-file edges are excluded and tallied,
     // never silently dropped.
-    for r in records {
+    for (index, r) in records.iter().enumerate() {
         let GraphRecord::Edge {
             id,
             label: EdgeLabel::Calls,
@@ -387,6 +372,15 @@ pub fn dependency_cycles<'a>(
         else {
             continue;
         };
+        // Latest-write-wins for edge metadata: over an append-only `--graph` a
+        // stable CALLS edge ID may be re-ingested with a changed resolution.
+        // Only the latest EDGE write for the id is live, mirroring embedded
+        // `latest_edge_versions`; keying off the edge-only map means a later Node
+        // write sharing the edge's ID (issue #391) cannot suppress it, and a
+        // superseded earlier resolution never double-counts the tally.
+        if !liveness.is_latest_edge_version(id.as_str(), index) {
+            continue;
+        }
         if deleted(id.as_str()) {
             continue;
         }
@@ -661,4 +655,102 @@ pub fn dependency_cycles<'a>(
     result.diagnostics.dedup();
 
     result
+}
+
+#[cfg(test)]
+mod liveness_parity_tests {
+    //! Transport-parity regression (issue #421): a CALLS edge re-ingested AFTER
+    //! its own tombstone is live adjacency again over `--graph` (latest EDGE
+    //! version wins), so a dependency cycle closing through it is detected —
+    //! matching the embedded current-state read; a tombstone with no later re-add
+    //! still deletes the edge, leaving the graph acyclic.
+    use super::*;
+
+    fn file(id: &str, path: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::File,
+            Some(path.to_owned()),
+            None,
+            None,
+            format!("file {path}"),
+        )
+    }
+
+    fn sym(id: &str, path: &str, name: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some(path.to_owned()),
+            None,
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    fn calls(source: &str, target: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::Calls,
+            source.to_owned(),
+            target.to_owned(),
+            Some("1.0".to_owned()),
+            "calls".to_owned(),
+        )
+        .with_resolution(CallResolution::Resolved)
+    }
+
+    fn tomb(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v5:tomb_{deleted_id}"),
+            schema_version: 5,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    fn base_records() -> Vec<GraphRecord> {
+        vec![
+            file("codegraph:v5:filex", "src/x.rs"),
+            file("codegraph:v5:filey", "src/y.rs"),
+            sym("codegraph:v5:syma", "src/x.rs", "a"),
+            sym("codegraph:v5:symb", "src/y.rs", "b"),
+            // x -> y edge (always live).
+            calls("codegraph:v5:syma", "codegraph:v5:symb"),
+        ]
+    }
+
+    #[test]
+    fn cycle_closes_through_edge_reingested_after_tombstone() {
+        let mut records = base_records();
+        // y -> x edge closing the cycle, re-ingested after its own tombstone.
+        let e_ba = calls("codegraph:v5:symb", "codegraph:v5:syma");
+        let e_ba_id = e_ba.id().to_owned();
+        records.push(e_ba);
+        records.push(tomb(&e_ba_id));
+        records.push(calls("codegraph:v5:symb", "codegraph:v5:syma"));
+
+        let repo_index = RepositoryIndex::build(&records);
+        let result = dependency_cycles(&records, &repo_index, None, None);
+        assert!(
+            !result.cycles.is_empty(),
+            "a cycle closing through an edge revived after its tombstone must be detected"
+        );
+    }
+
+    #[test]
+    fn closing_edge_tombstone_without_reingest_stays_acyclic() {
+        let mut records = base_records();
+        let e_ba = calls("codegraph:v5:symb", "codegraph:v5:syma");
+        let e_ba_id = e_ba.id().to_owned();
+        records.push(e_ba);
+        records.push(tomb(&e_ba_id));
+
+        let repo_index = RepositoryIndex::build(&records);
+        let result = dependency_cycles(&records, &repo_index, None, None);
+        assert!(
+            result.cycles.is_empty(),
+            "a closing edge with no later re-ingest stays deleted, leaving the graph acyclic"
+        );
+    }
 }

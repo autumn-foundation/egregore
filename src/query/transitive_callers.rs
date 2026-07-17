@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::liveness::Liveness;
 use super::{MemoryAuditDiagnostic, ResolvedFailureTarget, record_node_kind};
 use crate::ir::{CallResolution, EdgeLabel, GraphRecord, NodeKind};
 
@@ -136,31 +137,13 @@ pub fn transitive_callers<'a>(
     anchor_id: &str,
     max_depth: usize,
 ) -> Option<TransitiveCallersContext<'a>> {
-    // ── tombstone / temporal filtering (mirrors change_impact_context) ────────
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let has_temporal: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Node {
-                id,
-                temporal: Some(_),
-                ..
-            }
-            | GraphRecord::Edge {
-                id,
-                temporal: Some(_),
-                ..
-            } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let deleted = |id: &str| tombstoned.contains(id) && !has_temporal.contains(id);
+    // ── latest-write-wins tombstone / temporal liveness (issue #421) ──────────
+    // Over an append-only `--graph`, a node re-ingested AFTER its own tombstone
+    // is live again; the shared gate reports a tombstone active only when it is
+    // the id's most recent write, matching the embedded current-state read so
+    // `--graph` and `--data-dir` agree. See `super::liveness`.
+    let liveness = Liveness::new(records);
+    let deleted = |id: &str| liveness.deleted(id);
     let by_id: BTreeMap<&str, &GraphRecord> = records
         .iter()
         .filter_map(|r| {
@@ -365,4 +348,64 @@ pub fn transitive_callers<'a>(
         diagnostics,
         max_depth,
     })
+}
+
+#[cfg(test)]
+mod liveness_parity_tests {
+    //! Transport-parity regression (issue #421): over an append-only `--graph`, a
+    //! node re-ingested AFTER its own tombstone is live again — matching the
+    //! embedded `--data-dir` current-state read — while a tombstone with no later
+    //! re-add still deletes its id.
+    use super::*;
+    use crate::ir::SourceSpan;
+
+    fn sym(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some("foo".to_owned()),
+            "symbol foo".to_owned(),
+        )
+    }
+
+    fn tomb(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v5:tomb_{deleted_id}"),
+            schema_version: 5,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn anchor_reingested_after_tombstone_resolves_live() {
+        // Append order: node, Tombstone(node), node again → latest write wins, so
+        // `--graph` agrees with the coalesced embedded current-state read.
+        let records = vec![
+            sym("codegraph:v5:a"),
+            tomb("codegraph:v5:a"),
+            sym("codegraph:v5:a"),
+        ];
+        assert!(
+            transitive_callers(&records, "codegraph:v5:a", 5).is_some(),
+            "re-ingested anchor after its tombstone must resolve live"
+        );
+    }
+
+    #[test]
+    fn anchor_tombstone_without_reingest_stays_deleted() {
+        let records = vec![sym("codegraph:v5:a"), tomb("codegraph:v5:a")];
+        assert!(
+            transitive_callers(&records, "codegraph:v5:a", 5).is_none(),
+            "a tombstone with no later re-ingest still deletes the anchor"
+        );
+    }
 }

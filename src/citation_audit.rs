@@ -23,6 +23,7 @@ use serde::Serialize;
 
 use crate::evidence_freshness::FreshnessVerdict;
 use crate::ir::{EdgeLabel, GraphRecord, LogPayload, LogSourcePayload, SourceSpan};
+use crate::query::liveness::Liveness;
 use crate::query::{
     self, FailureHandleError, RepositoryIndex, ResolvedFailureTarget, change_impact_context,
     changes_context, error_context, failure_history_context, largest_semantic_drifts, log_deltas,
@@ -588,6 +589,7 @@ impl<'a> LogProvenanceIndex<'a> {
         // not be accepted as a citation, mirroring the node/frame tombstone
         // filtering the code path already applies (issue #328).
         let tombstoned = tombstoned_ids(records);
+        let liveness = Liveness::new(records);
         let mut sources = BTreeMap::new();
         let mut captured_from: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         let mut aggregates: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
@@ -600,7 +602,7 @@ impl<'a> LogProvenanceIndex<'a> {
                     ..
                 } => {
                     if let LogPayload::LogSource(src) = payload.as_ref()
-                        && node_visible(id, temporal.is_some(), &tombstoned)
+                        && node_visible(id, temporal.is_some(), &liveness)
                     {
                         sources.insert(id.as_str(), src);
                     }
@@ -1154,11 +1156,18 @@ fn tombstoned_ids(records: &[GraphRecord]) -> BTreeSet<&str> {
         .collect()
 }
 
-/// A node is current-or-historical when it is not tombstoned, or it carries a
-/// temporal anchor (a scan-history version that `eg query symbol`/`file` still
-/// returns even after the symbol was later deleted).
-fn node_visible(id: &str, temporal_present: bool, tombstoned: &BTreeSet<&str>) -> bool {
-    temporal_present || !tombstoned.contains(id)
+/// A node is current-or-historical when it is not deleted under the shared
+/// latest-write-wins liveness gate (issue #421), or it carries a temporal anchor
+/// (a scan-history version that `eg query symbol`/`file` still returns even after
+/// the symbol was later deleted).
+///
+/// Routing through [`Liveness::deleted`] (rather than raw tombstone membership)
+/// is what keeps this audit's `--graph` verdict in step with the embedded
+/// `--data-dir` current-state read: a node re-ingested AFTER its own tombstone is
+/// live again on both transports. The `temporal_present` flag preserves the
+/// per-record temporal exemption the call sites already applied.
+fn node_visible(id: &str, temporal_present: bool, liveness: &Liveness) -> bool {
+    temporal_present || !liveness.deleted(id)
 }
 
 /// True when a record carries a Git/bitemporal anchor — a scan-history version
@@ -1178,7 +1187,7 @@ const fn has_temporal_anchor(record: &GraphRecord) -> bool {
 }
 
 fn symbol_names(records: &[GraphRecord]) -> BTreeSet<&str> {
-    let tombstoned = tombstoned_ids(records);
+    let liveness = Liveness::new(records);
     records
         .iter()
         .filter_map(|r| match r {
@@ -1188,7 +1197,7 @@ fn symbol_names(records: &[GraphRecord]) -> BTreeSet<&str> {
                 name: Some(name),
                 temporal,
                 ..
-            } if kind.as_str() == "Symbol" && node_visible(id, temporal.is_some(), &tombstoned) => {
+            } if kind.as_str() == "Symbol" && node_visible(id, temporal.is_some(), &liveness) => {
                 Some(name.as_str())
             }
             _ => None,
@@ -1365,7 +1374,7 @@ fn memory_claim_ids(records: &[GraphRecord]) -> BTreeSet<String> {
 
 fn drive_symbol(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
     let mut builder = WorkflowBuilder::new("symbol", "source_fact", records);
-    let tombstoned = tombstoned_ids(records);
+    let liveness = Liveness::new(records);
     for record in records {
         let GraphRecord::Node {
             id, kind, temporal, ..
@@ -1373,7 +1382,7 @@ fn drive_symbol(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
         else {
             continue;
         };
-        if kind.as_str() == "Symbol" && node_visible(id, temporal.is_some(), &tombstoned) {
+        if kind.as_str() == "Symbol" && node_visible(id, temporal.is_some(), &liveness) {
             builder.push_record(record);
             builder.note_redaction(record);
         }
@@ -1383,7 +1392,7 @@ fn drive_symbol(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
 
 fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
     let mut builder = WorkflowBuilder::new("file", "source_fact", records);
-    let tombstoned = tombstoned_ids(records);
+    let liveness = Liveness::new(records);
     let paths = file_paths(records);
     for record in records {
         let GraphRecord::Node {
@@ -1398,7 +1407,7 @@ fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
         };
         if kind.as_str() == "Symbol"
             && paths.contains(path.as_str())
-            && node_visible(id, temporal.is_some(), &tombstoned)
+            && node_visible(id, temporal.is_some(), &liveness)
         {
             builder.push_record(record);
         }
@@ -1412,7 +1421,7 @@ fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
 /// spanless source-fact rule).
 fn drive_manifest_deps(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
     let mut builder = WorkflowBuilder::new("manifest-deps", "source_fact", records);
-    let tombstoned = tombstoned_ids(records);
+    let liveness = Liveness::new(records);
     for record in records {
         let GraphRecord::Node {
             id, kind, temporal, ..
@@ -1421,7 +1430,7 @@ fn drive_manifest_deps(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
             continue;
         };
         if kind.as_str() == "DependencyDeclaration"
-            && node_visible(id, temporal.is_some(), &tombstoned)
+            && node_visible(id, temporal.is_some(), &liveness)
         {
             builder.push_record(record);
         }
@@ -1975,7 +1984,7 @@ fn drive_log_deltas(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
 
     let mut builder = WorkflowBuilder::new("log-deltas", "runtime_observation", records);
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
-    let tombstoned = tombstoned_ids(records);
+    let liveness = Liveness::new(records);
     for signature in deltas
         .new_signatures
         .iter()
@@ -2001,9 +2010,7 @@ fn drive_log_deltas(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
         for frame in &signature.resolved_frames {
             let target_id = frame.target_record_id.as_str();
             match by_id.get(target_id) {
-                Some(record)
-                    if node_visible(target_id, has_temporal_anchor(record), &tombstoned) =>
-                {
+                Some(record) if node_visible(target_id, has_temporal_anchor(record), &liveness) => {
                     builder.push_record(record);
                 }
                 _ => builder.push_classified(missing(target_id, "source_fact"), String::new()),
@@ -2083,7 +2090,7 @@ fn drive_error_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
             _ => None,
         })
         .collect();
-    let tombstoned = tombstoned_ids(records);
+    let liveness = Liveness::new(records);
     for sig_id in &sig_ids {
         // Resolve each signature by its exact `log:v1:` ID (the default view: no
         // repo scope, no commit/instant pin, exclude superseded rows, no protected
@@ -2123,7 +2130,7 @@ fn drive_error_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
                 let target_id = frame.target_record_id.as_str();
                 match by_id.get(target_id) {
                     Some(record)
-                        if node_visible(target_id, has_temporal_anchor(record), &tombstoned) =>
+                        if node_visible(target_id, has_temporal_anchor(record), &liveness) =>
                     {
                         builder.push_record(record);
                     }
@@ -2143,7 +2150,7 @@ fn drive_error_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
                 let bucket_id = bucket.record_id.as_str();
                 match by_id.get(bucket_id) {
                     Some(record)
-                        if node_visible(bucket_id, has_temporal_anchor(record), &tombstoned) =>
+                        if node_visible(bucket_id, has_temporal_anchor(record), &liveness) =>
                     {
                         builder.push_record(record);
                     }
@@ -2181,7 +2188,7 @@ fn drive_error_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
             for row in section {
                 let id = row.record_id.as_str();
                 match by_id_commit.get(&(id, row.git_commit.as_deref())) {
-                    Some(record) if node_visible(id, has_temporal_anchor(record), &tombstoned) => {
+                    Some(record) if node_visible(id, has_temporal_anchor(record), &liveness) => {
                         builder.push_record(record);
                         builder.note_redaction(record);
                     }

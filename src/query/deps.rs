@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
+use super::liveness::Liveness;
 use super::{ResolvedFailureTarget, record_node_kind};
 use crate::ir::{CallResolution, EdgeLabel, GraphRecord, NodeKind};
 
@@ -131,31 +132,15 @@ pub fn symbol_dependencies<'a>(
     records: &'a [GraphRecord],
     anchor_id: &str,
 ) -> Option<SymbolDependenciesContext<'a>> {
-    // ── tombstone / temporal filtering (mirrors change_impact_context) ────────
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let has_temporal: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Node {
-                id,
-                temporal: Some(_),
-                ..
-            }
-            | GraphRecord::Edge {
-                id,
-                temporal: Some(_),
-                ..
-            } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let deleted = |id: &str| tombstoned.contains(id) && !has_temporal.contains(id);
+    // ── latest-write-wins tombstone / temporal liveness (issue #421) ──────────
+    // Over an append-only `--graph`, a node re-ingested AFTER its own tombstone
+    // is live again; the shared gate reports a tombstone active only when it is
+    // the id's most recent write, matching the embedded current-state read so
+    // `--graph` and `--data-dir` agree. This lane also reads edge
+    // labels/resolution for adjacency, so it selects only the latest EDGE write
+    // per edge id (`is_latest_edge_version`) below. See `super::liveness`.
+    let liveness = Liveness::new(records);
+    let deleted = |id: &str| liveness.deleted(id);
     let by_id: BTreeMap<&str, &GraphRecord> = records
         .iter()
         .filter_map(|r| {
@@ -175,7 +160,7 @@ pub fn symbol_dependencies<'a>(
     let mut unresolved: BTreeMap<(&'static str, &str, &str), UnresolvedDependencyRow<'a>> =
         BTreeMap::new();
 
-    for r in records {
+    for (index, r) in records.iter().enumerate() {
         let GraphRecord::Edge {
             id: edge_id,
             label,
@@ -187,6 +172,14 @@ pub fn symbol_dependencies<'a>(
         else {
             continue;
         };
+        // Latest-write-wins for edge metadata: over an append-only `--graph` a
+        // stable edge ID may be re-ingested with changed label/resolution. Only
+        // the latest EDGE write for the id is live, mirroring embedded
+        // `latest_edge_versions`; keying off the edge-only map means a later Node
+        // write sharing the edge's ID (issue #391) cannot suppress it.
+        if !liveness.is_latest_edge_version(edge_id.as_str(), index) {
+            continue;
+        }
         if source != anchor_id
             || deleted(edge_id.as_str())
             || !SYMBOL_DEPENDENCY_LABELS.contains(label)
@@ -253,4 +246,122 @@ pub fn symbol_dependencies<'a>(
         dependencies: dependencies.into_values().collect(),
         unresolved: unresolved.into_values().collect(),
     })
+}
+
+#[cfg(test)]
+mod liveness_parity_tests {
+    //! Transport-parity regression (issue #421): over an append-only `--graph`, a
+    //! node OR edge re-ingested AFTER its own tombstone is live again — matching
+    //! the embedded `--data-dir` current-state read — and only the latest EDGE
+    //! write for a stable edge id supplies the adjacency metadata. A tombstone
+    //! with no later re-add still deletes its id.
+    use super::*;
+    use crate::ir::SourceSpan;
+
+    fn sym(id: &str, name: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    fn calls(source: &str, target: &str, resolution: CallResolution) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::Calls,
+            source.to_owned(),
+            target.to_owned(),
+            Some("1.0".to_owned()),
+            "calls".to_owned(),
+        )
+        .with_resolution(resolution)
+    }
+
+    fn tomb(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v5:tomb_{deleted_id}"),
+            schema_version: 5,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn anchor_reingested_after_tombstone_resolves_live() {
+        let records = vec![
+            sym("codegraph:v5:a", "a"),
+            tomb("codegraph:v5:a"),
+            sym("codegraph:v5:a", "a"),
+        ];
+        assert!(
+            symbol_dependencies(&records, "codegraph:v5:a").is_some(),
+            "re-ingested anchor after its tombstone must resolve live"
+        );
+    }
+
+    #[test]
+    fn anchor_tombstone_without_reingest_stays_deleted() {
+        let records = vec![sym("codegraph:v5:a", "a"), tomb("codegraph:v5:a")];
+        assert!(
+            symbol_dependencies(&records, "codegraph:v5:a").is_none(),
+            "a tombstone with no later re-ingest still deletes the anchor"
+        );
+    }
+
+    #[test]
+    fn edge_reingested_after_tombstone_is_live_adjacency() {
+        // A CALLS edge re-ingested after its own tombstone must resurface the
+        // dependency, matching the embedded latest-edge-version read.
+        let a = sym("codegraph:v5:a", "a");
+        let b = sym("codegraph:v5:b", "b");
+        let e1 = calls("codegraph:v5:a", "codegraph:v5:b", CallResolution::Resolved);
+        let edge_id = e1.id().to_owned();
+        let e2 = calls("codegraph:v5:a", "codegraph:v5:b", CallResolution::Resolved);
+        let records = vec![a, b, e1, tomb(&edge_id), e2];
+        let ctx = symbol_dependencies(&records, "codegraph:v5:a").expect("anchor live");
+        assert!(
+            ctx.dependencies
+                .iter()
+                .any(|d| d.record.id() == "codegraph:v5:b"),
+            "an edge re-ingested after its tombstone must resurface the dependency"
+        );
+    }
+
+    #[test]
+    fn latest_edge_version_supplies_resolution() {
+        // Two versions of one stable CALLS edge id: v1 `unresolved`, v2 `resolved`.
+        // Only the latest EDGE write (v2) supplies the row, so the target is a
+        // resolved dependency, never also double-reported under `unresolved`.
+        let a = sym("codegraph:v5:a", "a");
+        let b = sym("codegraph:v5:b", "b");
+        let e1 = calls(
+            "codegraph:v5:a",
+            "codegraph:v5:b",
+            CallResolution::Unresolved,
+        );
+        let e2 = calls("codegraph:v5:a", "codegraph:v5:b", CallResolution::Resolved);
+        let records = vec![a, b, e1, e2];
+        let ctx = symbol_dependencies(&records, "codegraph:v5:a").expect("anchor live");
+        assert!(
+            ctx.dependencies
+                .iter()
+                .any(|d| d.record.id() == "codegraph:v5:b"),
+            "the latest edge version (resolved) makes the target a dependency"
+        );
+        assert!(
+            ctx.unresolved
+                .iter()
+                .all(|u| u.target_id != "codegraph:v5:b"),
+            "a superseded earlier edge version must not also report the target unresolved"
+        );
+    }
 }
