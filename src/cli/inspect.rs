@@ -286,23 +286,58 @@ pub(crate) struct CoverageSummary {
 /// a later re-scan sorts fresher regardless of physical line order. A record
 /// whose `valid_time` is absent or unparseable sorts as `None`, strictly older
 /// than any parseable instant (so a real scan always wins over a signal-less
-/// version). `tiebreak` is the canonical serialization of the summary, a
-/// fully-ordered field that keeps selection byte-identical across runs when two
-/// versions share an instant (a degenerate tie carrying no freshness signal).
+/// version). `generation` is the payload's full-precision `coverage_generation`
+/// (issue #406) parsed to a UTC instant — the same-UTC-second tie-break: two
+/// full scans within one UTC second share a seconds-precision `valid_time` yet
+/// carry DISTINCT nanosecond generations, so the newer one wins. A missing or
+/// unparseable generation sorts as `None` (older than any real generation), so
+/// a legacy record without the field never beats a generation-bearing one.
+/// `tiebreak` is the canonical serialization of the summary, a fully-ordered
+/// field that keeps selection byte-identical across runs when two versions
+/// share both an instant AND a generation (a degenerate tie carrying no
+/// freshness signal). Field order matters: the derived `Ord` compares
+/// `instant`, then `generation`, then `tiebreak`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CoverageFreshness {
     instant: Option<chrono::DateTime<chrono::Utc>>,
+    generation: Option<chrono::DateTime<chrono::Utc>>,
     tiebreak: String,
 }
 
 impl CoverageFreshness {
-    fn new(valid_time: Option<&str>, summary: &CoverageSummary) -> Self {
-        let instant = valid_time
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
+    fn new(
+        valid_time: Option<&str>,
+        coverage_generation: Option<&str>,
+        summary: &CoverageSummary,
+    ) -> Self {
+        let parse = |s: Option<&str>| {
+            s.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        };
+        let instant = parse(valid_time);
+        let generation = parse(coverage_generation);
         let tiebreak = serde_json::to_string(summary).unwrap_or_default();
-        Self { instant, tiebreak }
+        Self {
+            instant,
+            generation,
+            tiebreak,
+        }
     }
+}
+
+/// Extracts the `coverage_generation` freshness signal (issue #406) from a
+/// `ScanCoverage` node record, returning `None` for any other record kind or a
+/// coverage node produced before the field existed.
+fn coverage_generation_from_record(record: &GraphRecord) -> Option<&str> {
+    if let GraphRecord::Node {
+        kind: NodeKind::ScanCoverage,
+        scan_coverage: Some(payload),
+        ..
+    } = record
+    {
+        return payload.coverage_generation.as_deref();
+    }
+    None
 }
 
 /// Builds a [`CoverageSummary`] from a `ScanCoverage` node record, returning
@@ -364,17 +399,21 @@ impl InspectCounts {
         // canonical serialization of the summary) keeps output byte-identical
         // when two versions share a `valid_time` and carry no freshness signal.
         //
-        // KNOWN LIMITATION (issue #406): the full-scan path stamps `valid_time`
-        // at SECONDS precision (`src/lib.rs`), so two full scans of the same
-        // repo within one UTC second share a `valid_time` and the tie-break is
-        // arbitrary w.r.t. recency — an exported JSONL holding both versions may
-        // then surface stale coverage. `ScanCoverage` carries no subsecond or
-        // write-order signal, so this cannot be resolved from a `--graph` file
-        // alone; a real fix needs subsecond scan timestamps or a serialized
-        // generation key. For sub-second re-scan scenarios use
-        // `eg inspect --data-dir`, which is authoritative — it orders by store
-        // physical write-order (`inspect_current_records`) and is immune to
-        // same-second ties.
+        // SAME-SECOND TIES (issue #406, resolved): the full-scan path stamps
+        // `valid_time` at SECONDS precision (`src/lib.rs`), so two full scans of
+        // the same repo within one UTC second share a `valid_time`. The
+        // serialized full-precision `coverage_generation` key on
+        // `ScanCoveragePayload` breaks that tie — `CoverageFreshness` compares
+        // `valid_time`, THEN `coverage_generation` (both parsed to UTC
+        // instants), so the newer of two same-second versions wins
+        // deterministically regardless of physical line order (immune to
+        // `eg export`'s lexicographic `lines.sort_unstable()`). Residual ties
+        // fall through to the content tie-break: two scans within the SAME
+        // NANOSECOND, or a legacy coverage record produced before this field
+        // (only seconds `valid_time`, `coverage_generation` absent). For those
+        // (and any sub-second re-scan on the store side) `eg inspect --data-dir`
+        // remains authoritative — it orders by store physical write-order
+        // (`inspect_current_records`).
         let mut coverage_latest: BTreeMap<String, (CoverageFreshness, CoverageSummary)> =
             BTreeMap::new();
         for unknown in unknown_schema_versions {
@@ -412,7 +451,11 @@ impl InspectCounts {
                     if *kind == NodeKind::ScanCoverage
                         && let Some(summary) = coverage_summary_from_record(record)
                     {
-                        let freshness = CoverageFreshness::new(valid_time.as_deref(), &summary);
+                        let freshness = CoverageFreshness::new(
+                            valid_time.as_deref(),
+                            coverage_generation_from_record(record),
+                            &summary,
+                        );
                         match coverage_latest.entry(summary.id.clone()) {
                             std::collections::btree_map::Entry::Occupied(mut slot) => {
                                 if freshness > slot.get().0 {

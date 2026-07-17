@@ -480,6 +480,20 @@ pub struct ScanCoveragePayload {
     /// walked/skipped denominator; there `files_walked == files_indexed` and
     /// `skipped_by_extension` is empty. Never fabricates a denominator.
     pub coverage_complete: bool,
+    /// Full-precision (nanoseconds) RFC 3339 UTC instant captured at scan time,
+    /// used ONLY as a recency tie-break signal when two `ScanCoverage` versions
+    /// of the same repository share a seconds-precision `valid_time` — the
+    /// issue #406 same-UTC-second freshness signal. `eg inspect --graph`
+    /// collapses equal-ID versions to the one with the newest `valid_time`
+    /// instant, then (on a tie) the newest `coverage_generation`; two full
+    /// scans within one UTC second get DISTINCT nanosecond values here, so the
+    /// newer one wins deterministically regardless of physical line order.
+    /// Non-identity: never feeds a record's stable ID and never affects any
+    /// other node's `valid_time`. Additive per
+    /// `docs/schema/schema-versioning.md §2`; absent on graphs produced before
+    /// this field, which fall through to the content tie-break.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_generation: Option<String>,
 }
 
 /// Per-kind payload stamped on the four log-signature node kinds (issues

@@ -104,11 +104,14 @@ use crate::{
 /// method body is now a free function (`module::helper`), not `method`
 /// (`Owner::helper`), so its cached symbol identity and edge set change and
 /// per-file caches must rebuild rather than replay the mis-attributed records.)
+/// 18 -> 19 for the issue #406 `ScanCoveragePayload.coverage_generation` field:
+/// cached records embed serialized coverage shapes, so a bump forces older
+/// caches to rebuild and re-emit the generation-bearing coverage node.
 ///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 18;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 19;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -470,7 +473,13 @@ fn scan_repository_incremental_at_inner(
     // supersedes the prior full-scan version in the store, keeping
     // `eg inspect --data-dir` coverage current after a refresh.
     crate::reconcile_scan_coverage(&graph, &mut coverage_tally);
-    for record in crate::scan_coverage_records(&repository_id, &coverage_tally) {
+    // `coverage_generation` (issue #406) is the same-UTC-second recency
+    // tie-break. The refresh entry points stamp `transaction_time` at full
+    // `to_rfc3339()` precision (nanoseconds in production, deterministic under a
+    // fixed override), so it is the correct generation signal here — two
+    // refreshes within one UTC second get distinct nanosecond values while a
+    // fixed-time refresh stays byte-identical.
+    for record in crate::scan_coverage_records(&repository_id, &coverage_tally, transaction_time) {
         graph.push(record.with_valid_time_inferred(transaction_time));
     }
 

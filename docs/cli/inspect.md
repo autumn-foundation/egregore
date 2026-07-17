@@ -142,18 +142,25 @@ Field notes:
 JSONL-file and daemon inspection keep their existing pretty-printed JSON
 envelope, which additionally carries a `snapshot_timestamp`.
 
-### ScanCoverage freshness on exported JSONL (known limitation, issue #406)
+### ScanCoverage freshness on exported JSONL (issue #406)
 
 When reading an **exported** JSONL (`eg export`) that contains multiple physical
 `ScanCoverage` versions for the same repository, `eg inspect --graph` resolves
-the current version by `valid_time` at RFC 3339 **instant** precision. The
+the current version by `valid_time` at RFC 3339 **instant** precision, THEN — on
+a tie — by the record's full-precision `coverage_generation` instant. The
 full-scan path stamps `valid_time` at **seconds** precision, so two full scans of
-the same repository within the **same UTC second** cannot be ordered from
-exported JSONL — `ScanCoverage` carries no subsecond or write-order signal — and
-the tiebreak is arbitrary with respect to recency in that case (it stays
-byte-deterministic, just not guaranteed newest-wins). For sub-second re-scan
-scenarios use `eg inspect --data-dir`, which is **authoritative**: it orders by
-store physical write-order and is immune to same-second ties.
+the same repository within the **same UTC second** share a `valid_time`; the
+`coverage_generation` field (a nanosecond RFC 3339 instant captured at scan time,
+non-identity, additive) breaks that tie so the **newer** version wins
+deterministically, regardless of physical line order (immune to `eg export`'s
+lexicographic `lines.sort_unstable()`).
+
+Residual ties fall through to the byte-deterministic content tiebreak: two scans
+within the **same nanosecond**, or a legacy `ScanCoverage` record produced before
+`coverage_generation` existed (only seconds `valid_time`, field absent). For
+those cases — and any sub-second re-scan on the store side — use
+`eg inspect --data-dir`, which is **authoritative**: it orders by store physical
+write-order and is immune to same-second ties.
 
 Count semantics after a retraction (`eg forget`, issue #231): daemon-free
 `--data-dir` inspection is a physical inventory, so its counts include a

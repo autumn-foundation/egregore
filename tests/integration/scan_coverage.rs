@@ -223,6 +223,52 @@ fn coverage_node_is_byte_stable_across_scans() {
     assert!(first.contains(r#""kind":"ScanCoverage""#));
 }
 
+/// A real production `eg scan` populates `coverage_generation` (issue #406) at
+/// full nanosecond precision, and it round-trips through the typed `GraphRecord`
+/// serde path `eg export`/`ingest` use, so the freshness signal an exported
+/// graph relies on survives.
+#[test]
+fn scan_populates_and_roundtrips_coverage_generation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = git_repo_from_fixture(&temp);
+
+    // Production path (no fixed-time override): `coverage_generation` carries a
+    // full-precision instant so same-UTC-second re-scans stay orderable.
+    let graph = aletheia_egregore::scan_repository(&repo).expect("scan");
+    let jsonl = graph.to_jsonl().expect("serialize");
+
+    let coverage_line = jsonl
+        .lines()
+        .find(|line| {
+            let v: Value = serde_json::from_str(line).unwrap();
+            v["record_type"] == "node" && v["kind"] == "ScanCoverage"
+        })
+        .expect("scan emits a ScanCoverage line");
+
+    let value: Value = serde_json::from_str(coverage_line).unwrap();
+    let generation = value["scan_coverage"]["coverage_generation"]
+        .as_str()
+        .expect("coverage_generation present on a production scan");
+    // Full nanosecond precision: a fractional-seconds component, not a bare
+    // seconds instant, so two same-second scans differ.
+    assert!(
+        generation.contains('.'),
+        "coverage_generation must be full precision: {generation}"
+    );
+    chrono::DateTime::parse_from_rfc3339(generation)
+        .expect("coverage_generation must be a valid RFC 3339 instant");
+
+    // Round-trip through the exact typed path `eg ingest` uses: deserialize the
+    // line into a `GraphRecord`, re-serialize, and confirm the field survives.
+    let record: aletheia_egregore::GraphRecord =
+        serde_json::from_str(coverage_line).expect("coverage line deserializes to GraphRecord");
+    let reserialized = serde_json::to_string(&record).expect("reserialize record");
+    assert!(
+        reserialized.contains(&format!(r#""coverage_generation":"{generation}""#)),
+        "coverage_generation must round-trip: {reserialized}"
+    );
+}
+
 #[test]
 fn inspect_graph_surfaces_coverage_block() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -483,6 +529,113 @@ fn inspect_graph_reports_freshest_coverage_independent_of_line_order() {
     assert_eq!(
         coverage[0]["files_indexed"], 4,
         "freshest coverage: {value}"
+    );
+}
+
+/// Two full scans within one UTC second stamp identical `valid_time`
+/// (seconds precision), so the sub-second `coverage_generation` field
+/// (issue #406) is the tie-break signal that lets `eg inspect --graph`
+/// deterministically report the NEWER version — never the physically-last
+/// or lexically-greatest one that `eg export`'s `lines.sort_unstable()`
+/// might surface.
+#[test]
+fn inspect_graph_reports_newer_of_two_same_second_coverage_versions() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = git_repo_from_fixture(&temp);
+    let graph_path = repo.join("graph.jsonl");
+    assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .args(["scan"])
+        .arg(&repo)
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let real_jsonl = fs::read_to_string(&graph_path).expect("read graph");
+    let records = parse_jsonl(&real_jsonl);
+    let coverage = coverage_node(&records);
+
+    // Both versions share one seconds-precision `valid_time` (the same-UTC-second
+    // scenario). Only `coverage_generation` distinguishes them.
+    let shared_valid_time = "2026-05-19T00:00:00Z";
+
+    // FRESH: later generation instant, fewer files (files removed since the stale
+    // scan). This is the current coverage inspect must report.
+    let mut fresh = coverage.clone();
+    fresh["valid_time"] = Value::from(shared_valid_time);
+    fresh["scan_coverage"]["coverage_generation"] = Value::from("2026-05-19T00:00:00.500000000Z");
+    fresh["scan_coverage"]["files_walked"] = Value::from(4);
+    fresh["scan_coverage"]["files_indexed"] = Value::from(4);
+
+    // STALE: an OLDER generation instant (previous day, via a +13:00 offset) whose
+    // RFC 3339 string is lexically GREATER than fresh's, and MORE files — so the
+    // stale line sorts LAST under export's `lines.sort_unstable()`. Selection by
+    // parsed generation instant (not line order, not lexical string order) must
+    // still pick fresh.
+    let mut stale = coverage;
+    stale["valid_time"] = Value::from(shared_valid_time);
+    stale["scan_coverage"]["coverage_generation"] =
+        Value::from("2026-05-19T00:00:00.900000000+13:00");
+    stale["scan_coverage"]["files_walked"] = Value::from(9);
+    stale["scan_coverage"]["files_indexed"] = Value::from(9);
+
+    let fresh_line = serde_json::to_string(&fresh).unwrap();
+    let stale_line = serde_json::to_string(&stale).unwrap();
+
+    let mut lines: Vec<String> = real_jsonl
+        .lines()
+        .filter(|line| {
+            let v: Value = serde_json::from_str(line).unwrap();
+            !(v["record_type"] == "node" && v["kind"] == "ScanCoverage")
+        })
+        .map(str::to_owned)
+        .collect();
+    lines.push(fresh_line.clone());
+    lines.push(stale_line.clone());
+    lines.sort_unstable();
+
+    // Precondition: the stale line really does sort AFTER the fresh line, so a
+    // "keep-last-by-line-order" rule would report the stale coverage.
+    let fresh_pos = lines.iter().position(|l| *l == fresh_line).unwrap();
+    let stale_pos = lines.iter().position(|l| *l == stale_line).unwrap();
+    assert!(
+        stale_pos > fresh_pos,
+        "stale line must sort after fresh to exercise the regression"
+    );
+
+    let export_like = repo.join("export_like.graph.jsonl");
+    fs::write(&export_like, format!("{}\n", lines.join("\n"))).expect("write export-like graph");
+
+    let run_inspect = || {
+        let out = assert_cmd::Command::cargo_bin("egregore")
+            .expect("binary")
+            .arg("inspect")
+            .arg(&export_like)
+            .args(["--format", "json"])
+            .output()
+            .expect("inspect graph");
+        assert!(out.status.success());
+        out.stdout
+    };
+
+    let first = run_inspect();
+    let value: Value = serde_json::from_slice(&first).expect("inspect JSON should parse");
+    let coverage = value["coverage"].as_array().expect("coverage array");
+    // Exactly one summary per stable ID, and it is the FRESH one (files_walked =
+    // 4) — never the stale, physically-last, lexically-greatest version (9).
+    assert_eq!(coverage.len(), 1, "coverage block: {value}");
+    assert_eq!(coverage[0]["files_walked"], 4, "newer coverage: {value}");
+    assert_eq!(coverage[0]["files_indexed"], 4, "newer coverage: {value}");
+
+    // Selection is deterministic across inspects. The `--graph` envelope carries a
+    // wall-clock `snapshot_timestamp`, so compare the coverage sub-value rather
+    // than the whole output.
+    let second = run_inspect();
+    let value2: Value = serde_json::from_slice(&second).expect("inspect JSON should parse");
+    assert_eq!(
+        value["coverage"], value2["coverage"],
+        "coverage selection must be deterministic across inspects"
     );
 }
 
