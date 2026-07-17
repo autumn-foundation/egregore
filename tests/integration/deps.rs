@@ -1479,3 +1479,88 @@ fn data_dir_store_returns_same_dependency_set() {
         "graph and store views must agree"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #424: the embedded `--data-dir` path must be strictly read-only.
+// Opening the live engine re-persists index files, so the query must operate on
+// a throwaway copy and leave the store byte-for-byte untouched — for both the
+// current-state and the `--at`/`--as-of` history reads (mirrors `query path`).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn snapshot_tree(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in fs::read_dir(dir).expect("read dir") {
+            let entry = entry.expect("entry");
+            let path = entry.path();
+            if entry.file_type().expect("file type").is_dir() {
+                walk(&path, root, out);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("under root")
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, fs::read(&path).expect("read file")));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn data_dir_query_is_read_only() {
+    let f = seed();
+    let temp_db = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp_db.path().join("store");
+
+    // Ingest a copy without the intentionally dangling edge (the embedded sink
+    // rejects it); the read-only property under test is unaffected.
+    let dangling_marker = "d".repeat(64);
+    let content = fs::read_to_string(&f.graph).expect("read fixture");
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|l| !l.contains(&dangling_marker))
+        .collect();
+    let cleaned = format!("{}\n", kept.join("\n"));
+    let cleaned_path = temp_db.path().join("cleaned.jsonl");
+    fs::write(&cleaned_path, cleaned).expect("write cleaned fixture");
+
+    egregore()
+        .arg("ingest")
+        .arg(&cleaned_path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let before = snapshot_tree(&data_dir);
+    // Current-state read.
+    egregore()
+        .args(["query", "deps", &f.anchor_id, "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+    // History read (`--at` exercises the history-inclusive read-only loader). A
+    // missing commit exits 2; irrelevant here — the point is no mutation.
+    let _ = egregore()
+        .args([
+            "query",
+            "deps",
+            &f.anchor_id,
+            "--at",
+            "deadbeefdeadbeef",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .assert();
+    let after = snapshot_tree(&data_dir);
+    assert_eq!(
+        before, after,
+        "querying the embedded store must not create, modify, or delete any store file"
+    );
+}

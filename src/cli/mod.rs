@@ -5057,13 +5057,22 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 eprintln!("{diag}");
                 std::process::exit(1);
             }
-            // Temporal selectors need the history-inclusive store view; the
-            // current-state read suffices otherwise. A JSONL graph is read
-            // identically either way.
-            let records = if at.is_some() || as_of.is_some() {
-                load_query_records_history(graph.as_deref(), data_dir.as_deref())?
-            } else {
-                load_query_records(graph.as_deref(), data_dir.as_deref())?
+            // Strictly read-only lane (issue #424): opening the embedded engine
+            // in place re-persists its on-disk index files, so `--data-dir` reads
+            // from a throwaway copy, never the live store (same contract as
+            // `query path`/`query implementors`). Temporal selectors need the
+            // history-inclusive store view; the current-state read suffices
+            // otherwise. A JSONL graph is read identically either way.
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) if at.is_some() || as_of.is_some() => {
+                    load_records_from_db_history_readonly(dir)?
+                }
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
             };
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
@@ -5099,13 +5108,22 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 eprintln!("{diag}");
                 std::process::exit(1);
             }
-            // Temporal selectors need the history-inclusive store view; the
-            // current-state read suffices otherwise. A JSONL graph is read
-            // identically either way.
-            let records = if at.is_some() || as_of.is_some() {
-                load_query_records_history(graph.as_deref(), data_dir.as_deref())?
-            } else {
-                load_query_records(graph.as_deref(), data_dir.as_deref())?
+            // Strictly read-only lane (issue #424): opening the embedded engine
+            // in place re-persists its on-disk index files, so `--data-dir` reads
+            // from a throwaway copy, never the live store (same contract as
+            // `query path`/`query implementors`). Temporal selectors need the
+            // history-inclusive store view; the current-state read suffices
+            // otherwise. A JSONL graph is read identically either way.
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) if at.is_some() || as_of.is_some() => {
+                    load_records_from_db_history_readonly(dir)?
+                }
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
             };
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
@@ -5129,13 +5147,22 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             as_of,
             format,
         } => {
-            // Temporal selectors need the history-inclusive store view; the
-            // current-state read suffices otherwise. A JSONL graph is read
-            // identically either way.
-            let records = if at.is_some() || as_of.is_some() {
-                load_query_records_history(graph.as_deref(), data_dir.as_deref())?
-            } else {
-                load_query_records(graph.as_deref(), data_dir.as_deref())?
+            // Strictly read-only lane (issue #424): opening the embedded engine
+            // in place re-persists its on-disk index files, so `--data-dir` reads
+            // from a throwaway copy, never the live store (same contract as
+            // `query path`/`query implementors`). Temporal selectors need the
+            // history-inclusive store view; the current-state read suffices
+            // otherwise. A JSONL graph is read identically either way.
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) if at.is_some() || as_of.is_some() => {
+                    load_records_from_db_history_readonly(dir)?
+                }
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
             };
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
