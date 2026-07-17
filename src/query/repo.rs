@@ -210,6 +210,35 @@ impl RepositoryIndex {
                 owner.insert(id.clone(), repo_id);
             }
         }
+        // Log-domain nodes (issue #362, schema v3): `scan-logs` persists a
+        // retrievable `repository_id` on every log payload, byte-equal to the
+        // code `Repository` node ID computed at scan time. Attribute each log
+        // node directly from that field so `owner_of` resolves and `--repo` can
+        // soundly filter log signatures. Log records live off the containment
+        // topology (their edges run signature→source, bucket→signature), so they
+        // are never already in `owner`; a plain insert suffices. A legacy
+        // `log:v2:` record deserializes `repository_id` to an empty string
+        // (serde default) and stays unattributed — `owner_of` returns `None`, and
+        // scoped consumers exclude it rather than guess its repository. Populated
+        // BEFORE the highest-version remap below so a log owner recorded under an
+        // older `Repository` schema version aligns with the highest-version
+        // selector the same way code owners do.
+        for record in records {
+            if let GraphRecord::Node {
+                id,
+                log: Some(payload),
+                ..
+            } = record
+            {
+                let repo_id = payload.repository_id();
+                if !repo_id.is_empty() {
+                    owner
+                        .entry(id.clone())
+                        .or_insert_with(|| repo_id.to_owned());
+                }
+            }
+        }
+
         // Remap owners to their highest-version counterpart to preserve all schema-version owners.
         let mut suffix_to_versions: HashMap<&str, Vec<(u32, &str)>> = HashMap::new();
         for repo_id in repos.keys() {
@@ -327,5 +356,92 @@ impl RepositoryIndex {
             .highest_version
             .get(resolved)
             .map_or(resolved, String::as_str))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{
+        ErrorSignaturePayload, LOG_SCHEMA_VERSION, LogOccurrenceBucketPayload, LogPayload,
+        log_stable_id,
+    };
+
+    /// Builds an `ErrorSignature` log node carrying `repository_id` (schema v3,
+    /// issue #362). An empty `repository_id` models a legacy `log:v2:` record.
+    fn error_signature(seed: &str, repository_id: &str) -> GraphRecord {
+        let id = log_stable_id(&["error_signature", "repo", seed]);
+        GraphRecord::node(
+            id,
+            NodeKind::ErrorSignature,
+            None,
+            None,
+            Some("error signature".to_owned()),
+            "Error signature".to_owned(),
+        )
+        .with_domain("log", LOG_SCHEMA_VERSION)
+        .with_log(LogPayload::ErrorSignature(ErrorSignaturePayload {
+            fingerprint_algorithm: "template-v1".to_owned(),
+            template_excerpt: format!("template {seed}"),
+            severity: "error".to_owned(),
+            occurrence_count: 1,
+            first_seen: "2026-01-01T00:00:00Z".to_owned(),
+            last_seen: "2026-01-01T00:00:00Z".to_owned(),
+            frames: None,
+            repository_id: repository_id.to_owned(),
+        }))
+    }
+
+    /// Builds a `LogOccurrenceBucket` log node carrying `repository_id`.
+    fn occurrence_bucket(seed: &str, repository_id: &str) -> GraphRecord {
+        let id = log_stable_id(&["log_occurrence_bucket", seed]);
+        GraphRecord::node(
+            id,
+            NodeKind::LogOccurrenceBucket,
+            None,
+            None,
+            Some("bucket".to_owned()),
+            "Occurrence bucket".to_owned(),
+        )
+        .with_domain("log", LOG_SCHEMA_VERSION)
+        .with_log(LogPayload::LogOccurrenceBucket(
+            LogOccurrenceBucketPayload {
+                bucket_start: "2026-01-01T00:00:00Z".to_owned(),
+                bucket_width: "1h".to_owned(),
+                occurrence_count: 1,
+                source_id: "log:v3:source".to_owned(),
+                repository_id: repository_id.to_owned(),
+                occurrence_timestamps: Vec::new(),
+            },
+        ))
+    }
+
+    #[test]
+    fn owner_of_resolves_log_record_from_repository_id() {
+        // A v3 scan-logs graph persists `repository_id` on every log payload,
+        // byte-equal to the code `Repository` node ID. `owner_of` must resolve
+        // through it even without any containment edge (issue #362).
+        let repo_id = "codegraph:v1:repo-a";
+        let sig = error_signature("boom", repo_id);
+        let bucket = occurrence_bucket("boom-hour", repo_id);
+        let sig_id = sig.id().to_owned();
+        let bucket_id = bucket.id().to_owned();
+
+        let index = RepositoryIndex::build(&[sig, bucket]);
+
+        assert_eq!(index.owner_of(&sig_id), Some(repo_id));
+        assert_eq!(index.owner_of(&bucket_id), Some(repo_id));
+    }
+
+    #[test]
+    fn owner_of_returns_none_for_legacy_unattributed_log_record() {
+        // A legacy `log:v2:` record deserializes `repository_id` to an empty
+        // string (serde default) and stays unattributed — `owner_of` is `None`.
+        let sig = error_signature("legacy", "");
+        let sig_id = sig.id().to_owned();
+
+        let index = RepositoryIndex::build(&[sig]);
+
+        assert_eq!(index.owner_of(&sig_id), None);
     }
 }

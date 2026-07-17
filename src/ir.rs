@@ -523,6 +523,26 @@ pub enum LogPayload {
     LogOccurrenceBucket(LogOccurrenceBucketPayload),
 }
 
+impl LogPayload {
+    /// Returns the persisted `Repository` record ID this log node is attributed
+    /// to (issue #362, schema v3).
+    ///
+    /// Every log payload variant carries a `repository_id` field equal to the
+    /// code-graph `Repository` node ID computed at scan time (already an identity
+    /// input for the log record's stable ID). An empty string is a legacy
+    /// `log:v2:` record deserialized through `#[serde(default)]`: unattributed,
+    /// so consumers treat it as owner-less.
+    #[must_use]
+    pub fn repository_id(&self) -> &str {
+        match self {
+            Self::LogSource(p) => &p.repository_id,
+            Self::ErrorSignature(p) => &p.repository_id,
+            Self::LogEvent(p) => &p.repository_id,
+            Self::LogOccurrenceBucket(p) => &p.repository_id,
+        }
+    }
+}
+
 /// Payload for a `LogSource` node: the captured log artifact identity.
 ///
 /// Identity inputs (`docs/schema/log-graph.md`): `repository_id`,
