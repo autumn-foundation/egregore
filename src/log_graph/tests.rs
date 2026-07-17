@@ -529,6 +529,115 @@ fn bucket_payload_carries_its_log_source_id() {
     );
 }
 
+// ── issue #362: scan-logs populates repository_id on every log payload ────────
+
+/// Every `repository_id` carried on any log-domain payload the scan emitted.
+fn scanned_repository_ids(records: &[GraphRecord]) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node {
+                log: Some(payload), ..
+            } => Some(match payload.as_ref() {
+                LogPayload::LogSource(p) => p.repository_id.clone(),
+                LogPayload::ErrorSignature(p) => p.repository_id.clone(),
+                LogPayload::LogEvent(p) => p.repository_id.clone(),
+                LogPayload::LogOccurrenceBucket(p) => p.repository_id.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn scan_populates_repository_id_on_every_log_payload() {
+    // #362: the scan's repository identity is retrievable on ALL FOUR payload
+    // kinds (LogSource, ErrorSignature, LogEvent, LogOccurrenceBucket), so a
+    // shared multi-repo store can attribute — and `--repo` can filter — logs.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let records = scan_records(dir.path(), "app.log", ONE_ERROR);
+    let ids = scanned_repository_ids(&records);
+    assert_eq!(ids.len(), 4, "one repository_id per log node kind");
+    for id in &ids {
+        assert_eq!(
+            id, "repo_test",
+            "every log payload carries the scan repo id"
+        );
+    }
+}
+
+// ── issue #364: scan-logs populates sorted per-occurrence bucket timestamps ───
+
+const THREE_ERRORS_ONE_HOUR: &str = "2026-01-02T03:45:00Z [ERROR] widget checkout failed for order\n2026-01-02T03:05:00Z [ERROR] widget checkout failed for order\n2026-01-02T03:15:00Z [ERROR] widget checkout failed for order\n";
+
+/// Returns the single occurrence bucket's `(occurrence_count, occurrence_timestamps)`.
+fn bucket_count_and_timestamps(records: &[GraphRecord]) -> (u64, Vec<String>) {
+    let mut found: Option<(u64, Vec<String>)> = None;
+    for r in records {
+        if let GraphRecord::Node {
+            log: Some(payload), ..
+        } = r
+            && let LogPayload::LogOccurrenceBucket(b) = payload.as_ref()
+        {
+            assert!(found.is_none(), "expected exactly one occurrence bucket");
+            found = Some((b.occurrence_count, b.occurrence_timestamps.clone()));
+        }
+    }
+    found.expect("scan produced one occurrence bucket")
+}
+
+#[test]
+fn scan_populates_bucket_occurrence_timestamps_sorted() {
+    // #364: the bucket retains every per-occurrence valid time, sorted, so a
+    // consumer can bound window counts endpoint-exactly at an arbitrary instant.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let records = scan_records(dir.path(), "app.log", THREE_ERRORS_ONE_HOUR);
+    let (count, timestamps) = bucket_count_and_timestamps(&records);
+    assert_eq!(count, 3);
+    assert_eq!(
+        timestamps,
+        vec![
+            "2026-01-02T03:05:00Z".to_owned(),
+            "2026-01-02T03:15:00Z".to_owned(),
+            "2026-01-02T03:45:00Z".to_owned(),
+        ],
+        "occurrence_timestamps are the sorted per-occurrence valid times"
+    );
+    assert_eq!(
+        timestamps.len() as u64,
+        count,
+        "occurrence_timestamps.len() equals occurrence_count"
+    );
+}
+
+#[test]
+fn scan_bucket_occurrence_timestamps_are_deterministic() {
+    // Byte-stable ordering across identical rescans.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let a = scan_records(dir.path(), "app.log", THREE_ERRORS_ONE_HOUR);
+    let b = scan_records(dir.path(), "app.log", THREE_ERRORS_ONE_HOUR);
+    assert_eq!(
+        bucket_count_and_timestamps(&a).1,
+        bucket_count_and_timestamps(&b).1
+    );
+}
+
+#[test]
+fn scan_timestampless_line_still_populates_occurrence_timestamps() {
+    // A line with no parseable leading timestamp falls back to the scan's
+    // transaction time; the bucket still records that inferred valid time (never
+    // an empty list) so a consumer's endpoint filter has something to compare.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let records = scan_records(
+        dir.path(),
+        "app.log",
+        "[ERROR] widget checkout failed for order\n",
+    );
+    let (count, timestamps) = bucket_count_and_timestamps(&records);
+    assert_eq!(count, 1);
+    assert_eq!(timestamps, vec!["2026-01-02T03:00:00Z".to_owned()]);
+}
+
 // ── issues #362 / #364: LOG_SCHEMA v3 — repository_id + occurrence_timestamps ──
 
 #[test]

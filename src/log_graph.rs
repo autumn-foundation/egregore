@@ -323,8 +323,7 @@ pub fn scan_log_records(
             source_format_version: source_format_version.to_owned(),
             source_artifact_hash,
             line_count,
-            // Populated in Phase B (issue #362).
-            repository_id: String::new(),
+            repository_id: repository_id.to_owned(),
         }))
         .with_valid_time(transaction_time, VALID_TIME_SOURCE_INFERRED),
     );
@@ -394,8 +393,7 @@ pub fn scan_log_records(
             first_seen: first_seen.clone(),
             last_seen,
             frames,
-            // Populated in Phase B (issue #362).
-            repository_id: String::new(),
+            repository_id: repository_id.to_owned(),
         }))
         .with_valid_time(first_seen, sig_valid_time_source);
         if redacted {
@@ -470,8 +468,7 @@ pub fn scan_log_records(
                 event_content_hash: content_hash,
                 source_line: occ.source_line,
                 severity: (*severity).to_owned(),
-                // Populated in Phase B (issue #362).
-                repository_id: String::new(),
+                repository_id: repository_id.to_owned(),
             }))
             .with_valid_time(event_valid_time, occ.valid_time_source);
             if occ.redacted {
@@ -498,15 +495,23 @@ pub fn scan_log_records(
         }
 
         // ── Hourly occurrence buckets ────────────────────────────────────────
-        let mut buckets: BTreeMap<String, (u64, bool)> = BTreeMap::new();
+        // Each bucket carries its per-occurrence valid times (issue #364, schema
+        // v3), sorted, so a consumer can bound window counts endpoint-exactly at
+        // an arbitrary commit instant instead of counting the whole hour-aligned
+        // bucket. Timestamps are already Z-normalized RFC 3339 UTC (seconds
+        // precision), so a lexical sort matches the chronological/`first_seen`
+        // ordering the rest of the extractor uses.
+        let mut buckets: BTreeMap<String, (u64, bool, Vec<String>)> = BTreeMap::new();
         for occ in occs {
             let entry = buckets
                 .entry(occ.bucket_start.clone())
-                .or_insert((0, false));
+                .or_insert_with(|| (0, false, Vec::new()));
             entry.0 += 1;
             entry.1 |= occ.bucket_from_timestamp;
+            entry.2.push(occ.valid_time.clone());
         }
-        for (bucket_start, (count, from_ts)) in buckets {
+        for (bucket_start, (count, from_ts, mut occurrence_timestamps)) in buckets {
+            occurrence_timestamps.sort();
             // Source-aware bucket identity (issue #361, schema v2): fold the
             // owning `LogSource` in (LAST, after BUCKET_WIDTH) so two distinct
             // sources observing the same signature/hour mint DISTINCT bucket IDs
@@ -542,9 +547,8 @@ pub fn scan_log_records(
                     bucket_width: BUCKET_WIDTH.to_owned(),
                     occurrence_count: count,
                     source_id: source_id.clone(),
-                    // Populated in Phase B (issues #362 / #364).
-                    repository_id: String::new(),
-                    occurrence_timestamps: Vec::new(),
+                    repository_id: repository_id.to_owned(),
+                    occurrence_timestamps,
                 }))
                 .with_valid_time(bucket_start.clone(), source),
             );

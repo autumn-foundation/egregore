@@ -148,6 +148,7 @@ fn error_signature(
         first_seen: first_seen.to_owned(),
         last_seen: last_seen.to_owned(),
         frames: None,
+        repository_id: "repo_test".to_owned(),
     }))
     .with_valid_time(first_seen, "log_event_timestamp")
 }
@@ -201,6 +202,8 @@ fn bucket_with_source(
             bucket_width: "1h".to_owned(),
             occurrence_count: count,
             source_id: source_id.to_owned(),
+            repository_id: "repo_test".to_owned(),
+            occurrence_timestamps: Vec::new(),
         },
     ))
     .with_valid_time(bucket_start, "log_event_timestamp");

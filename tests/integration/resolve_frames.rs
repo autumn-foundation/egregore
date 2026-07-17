@@ -479,6 +479,7 @@ fn at_signature(seed: &str, frames: Vec<StackFrame>) -> (String, GraphRecord) {
         first_seen: "2026-01-02T12:00:00Z".to_owned(),
         last_seen: "2026-01-02T13:00:00Z".to_owned(),
         frames: Some(frames),
+        repository_id: AT_REPO.to_owned(),
     }))
     .with_valid_time("2026-01-02T12:00:00Z", "log_event_timestamp");
     (id, node)
@@ -552,6 +553,44 @@ fn module_only_frame_under_at_resolves_against_commit_view() {
         frame_targets(&head.records, &sig_id),
         vec![(id_b, FrameResolution::Resolved)],
         "the HEAD (c2) view must resolve to the HEAD symbol id, not the pre-HEAD one"
+    );
+}
+
+#[test]
+fn enrichment_preserves_signature_repository_id() {
+    // #362: resolve-frames enriches an ErrorSignature with FRAME_RESOLVES_TO
+    // evidence links by cloning the node; the schema-v3 repository_id must ride
+    // through the rewrite unchanged (attribution is never dropped).
+    let (id_b, sym_b) = at_symbol("handler", "src/b.rs", C2, T2_377);
+    let (repo_id, repo) = at_repo_node(C2);
+    let (sig_id, sig) = at_signature("handler-boom", vec![name_only_frame("app::handler")]);
+    let records = vec![
+        repo,
+        at_commit_node(C2, T2_377),
+        contains(&repo_id, &id_b),
+        sym_b,
+        sig,
+    ];
+
+    let resolved = log_resolve::resolve_frames(&records, None);
+    let emitted = resolved
+        .records
+        .iter()
+        .find_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                log: Some(payload),
+                ..
+            } if *id == sig_id => match payload.as_ref() {
+                LogPayload::ErrorSignature(p) => Some(p.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("resolve-frames re-emits the enriched ErrorSignature");
+    assert_eq!(
+        emitted.repository_id, AT_REPO,
+        "repository_id survives FRAME_RESOLVES_TO enrichment"
     );
 }
 

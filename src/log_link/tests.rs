@@ -454,3 +454,41 @@ fn output_is_byte_identical_across_runs() {
         .collect();
     assert_eq!(ja, jb);
 }
+
+#[test]
+fn enrichment_preserves_signature_repository_id() {
+    // #362: link-logs enriches an ErrorSignature with EMITTED_DURING evidence
+    // links by cloning the node; the schema-v3 repository_id must ride through
+    // the rewrite unchanged (attribution is never dropped when links are added).
+    let hash = "deadbeefhash";
+    let (src_id, src) = log_source(ANCHOR, "app.log", hash);
+    let (sig_id, sig) = error_signature("boom", "2026-07-01T12:00:00Z");
+    let records = vec![
+        repository(ANCHOR),
+        src,
+        sig,
+        captured_from(&sig_id, &src_id),
+        agent_run("run_in", "2026-07-01T11:00:00Z", "2026-07-01T13:00:00Z"),
+        command_run("cmd1", hash),
+    ];
+    let result = link_logs(&records, &LinkLogsOptions::default());
+    let emitted = result
+        .records
+        .iter()
+        .find_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                log: Some(payload),
+                ..
+            } if *id == sig_id => match payload.as_ref() {
+                LogPayload::ErrorSignature(p) => Some(p.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("link-logs re-emits the enriched ErrorSignature");
+    assert_eq!(
+        emitted.repository_id, ANCHOR,
+        "repository_id survives EMITTED_DURING enrichment"
+    );
+}
