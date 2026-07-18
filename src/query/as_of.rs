@@ -108,6 +108,7 @@ impl CorpusModeSource {
 ///
 /// Returns a human-readable message when the flags conflict; callers surface it
 /// as a machine-readable `unsupported_combination` diagnostic and exit 1.
+#[allow(clippy::fn_params_excessive_bools)]
 pub fn resolve_corpus_mode(
     has_temporal_pin: bool,
     at_head: bool,
@@ -177,7 +178,7 @@ const fn record_temporal(record: &GraphRecord) -> Option<&TemporalMetadata> {
         GraphRecord::Node { temporal, .. } | GraphRecord::Edge { temporal, .. } => {
             temporal.as_ref()
         }
-        _ => None,
+        GraphRecord::Tombstone { .. } => None,
     }
 }
 
@@ -245,12 +246,14 @@ pub fn non_head_current_record_ids(
             has_current.insert(id); // fallback a
             continue;
         };
-        let version_current = match index.owner_of(id) {
-            Some(owner) => repo_heads
-                .get(owner)
-                .is_none_or(|head| t.git_commit == **head),
-            None => repo_heads.values().any(|head| *head == t.git_commit),
-        };
+        let version_current = index.owner_of(id).map_or_else(
+            || repo_heads.values().any(|head| *head == t.git_commit),
+            |owner| {
+                repo_heads
+                    .get(owner)
+                    .is_none_or(|head| t.git_commit == **head)
+            },
+        );
         if version_current {
             has_current.insert(id);
         } else {

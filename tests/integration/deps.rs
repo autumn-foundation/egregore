@@ -1409,7 +1409,7 @@ fn assert_unsupported_combination(extra: &[&str]) {
     let mut args: Vec<String> = vec![
         "query".into(),
         "deps".into(),
-        anchor_id.clone(),
+        anchor_id,
         "--graph".into(),
         path.to_str().unwrap().to_owned(),
     ];
