@@ -598,11 +598,12 @@ fn scan_populates_bucket_occurrence_timestamps_sorted() {
     assert_eq!(
         timestamps,
         vec![
-            "2026-01-02T03:05:00Z".to_owned(),
-            "2026-01-02T03:15:00Z".to_owned(),
-            "2026-01-02T03:45:00Z".to_owned(),
+            "2026-01-02T03:05:00.000000000Z".to_owned(),
+            "2026-01-02T03:15:00.000000000Z".to_owned(),
+            "2026-01-02T03:45:00.000000000Z".to_owned(),
         ],
-        "occurrence_timestamps are the sorted per-occurrence valid times"
+        "occurrence_timestamps are the sorted per-occurrence instants at \
+         fixed-width nanosecond precision"
     );
     assert_eq!(
         timestamps.len() as u64,
@@ -636,7 +637,38 @@ fn scan_timestampless_line_still_populates_occurrence_timestamps() {
     );
     let (count, timestamps) = bucket_count_and_timestamps(&records);
     assert_eq!(count, 1);
-    assert_eq!(timestamps, vec!["2026-01-02T03:00:00Z".to_owned()]);
+    assert_eq!(
+        timestamps,
+        vec!["2026-01-02T03:00:00.000000000Z".to_owned()]
+    );
+}
+
+#[test]
+fn scan_bucket_occurrence_timestamps_preserve_subsecond_precision() {
+    // #364, Codex P2: an occurrence at a sub-second instant must be retained at
+    // FULL precision (fixed-width RFC 3339 nanoseconds), not truncated to the
+    // whole second, so downstream endpoint-exact window counts are honest. A
+    // truncating scan would store `...12:30:00Z` and silently snap a `.900`
+    // occurrence back onto the second boundary, wrongly including it in a
+    // `<= 12:30:00Z` window count.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let records = scan_records(
+        dir.path(),
+        "app.log",
+        "2026-01-02T12:30:00.900Z [ERROR] widget checkout failed for order\n",
+    );
+    let (count, timestamps) = bucket_count_and_timestamps(&records);
+    assert_eq!(count, 1);
+    assert_eq!(
+        timestamps,
+        vec!["2026-01-02T12:30:00.900000000Z".to_owned()],
+        "sub-second precision is preserved as fixed-width RFC 3339 nanoseconds"
+    );
+    assert_eq!(
+        timestamps.len() as u64,
+        count,
+        "occurrence_timestamps.len() still equals occurrence_count"
+    );
 }
 
 // ── issues #362 / #364: LOG_SCHEMA v3 — repository_id + occurrence_timestamps ──

@@ -113,9 +113,11 @@ equal to the computed repository identity — the same value a `--repo` selector
 resolves to — so downstream queries can attribute a log signature to its
 repository in a shared store. Each `LogOccurrenceBucket` additionally carries a
 sorted `occurrence_timestamps` list (issue #364) — the RFC 3339 UTC
-per-occurrence valid times that fell in the bucket's hour (length ==
-`occurrence_count`) — so a consumer can bound a per-window occurrence count
-endpoint-exactly at an arbitrary commit instant. Both fields are timestamps or
+per-occurrence instants that fell in the bucket's hour (length ==
+`occurrence_count`), preserved at full sub-second precision (fixed-width
+nanoseconds, e.g. `…T12:30:00.900000000Z`) — so a consumer can bound a per-window
+occurrence count endpoint-exactly at an arbitrary commit instant, even one on a
+whole-second boundary. Both fields are timestamps or
 IDs only (redaction-safe, never raw log text) and are captured on every scan;
 the record IDs mint under the `log:v3:` prefix (`LOG_SCHEMA_VERSION` = 3). See
 [`docs/schema/log-graph.md`](../schema/log-graph.md).

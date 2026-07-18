@@ -78,7 +78,8 @@ already hashed into the record's stable ID. It is `#[serde(default)]`: a legacy
   hour-floored), `bucket_width` (`1h`), `occurrence_count`, `source_id`
   (issue #361 — a `log:v<N>:` handle to the owning `LogSource`, a required
   identity input), and (issue #364) `occurrence_timestamps` — the sorted list
-  of RFC 3339 UTC per-occurrence valid times that fell in the bucket's hour.
+  of full-precision (fixed-width nanosecond) RFC 3339 UTC per-occurrence
+  instants that fell in the bucket's hour.
   When populated (schema v3) its length equals `occurrence_count`; it is
   `#[serde(default)]` and empty on a legacy `log:v2:` bucket. It is **not** an
   identity input (the bucket ID preimage is unchanged); it exists so a consumer
@@ -208,13 +209,18 @@ containment edge — is what carries attribution even in a standalone log graph.
 ### Per-occurrence timestamps (schema v3, issue #364)
 
 Each `LogOccurrenceBucket` retains, in addition to its aggregate
-`occurrence_count`, the sorted list of RFC 3339 UTC per-occurrence valid times
+`occurrence_count`, the sorted list of RFC 3339 UTC per-occurrence instants
 that fell in its hour (`occurrence_timestamps`, length == `occurrence_count`
-when populated). The data already exists at scan time — each occurrence carries
-a `valid_time`; v3 simply stops discarding the individual times. This is the
-minimal scheme that answers an **arbitrary** commit instant exactly: a consumer
-counts only the timestamps at or before the endpoint, so a bucket straddling a
-mid-hour endpoint is no longer counted whole. A legacy `log:v2:` bucket has an
+when populated). These preserve the input's **full sub-second precision** in a
+canonical fixed-width nanosecond RFC 3339 UTC form (e.g. `…T12:30:00.900000000Z`;
+an occurrence with no fractional part is `…T12:30:00.000000000Z`), so the
+endpoint-exact claim is honest even against a whole-second commit endpoint — a
+`12:30:00.900` occurrence stays **after** a `12:30:00` endpoint rather than
+snapping onto the second boundary (issue #364, Codex P2). The fixed width keeps
+a lexical sort equal to the chronological instant order. This is the minimal
+scheme that answers an **arbitrary** commit instant exactly: a consumer counts
+only the timestamps at or before the endpoint (compared by parsed UTC instant),
+so a bucket straddling a mid-hour endpoint is no longer counted whole. A legacy `log:v2:` bucket has an
 empty `occurrence_timestamps` and falls back to the hour-bucket-granular rule
 for that bucket (see [`log-deltas.md`](../cli/log-deltas.md) → *Occurrence
 counts*). Timestamps only — redaction-safe, never raw log text.

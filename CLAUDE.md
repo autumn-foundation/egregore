@@ -48,8 +48,10 @@ claim, deterministically parsed but never verified. Records mint under the
 `log:v3:` prefix (`LOG_SCHEMA_VERSION` == 3): every log record now carries a
 retrievable `repository_id` field (issue #362, = the computed repository identity
 a `--repo` selector resolves to), and each `LogOccurrenceBucket` also carries a
-sorted `occurrence_timestamps` list (issue #364, RFC3339 UTC per-occurrence valid
-times, `len == occurrence_count`). Both are `#[serde(default)]` so legacy
+sorted `occurrence_timestamps` list (issue #364, RFC3339 UTC per-occurrence
+instants preserved at full sub-second precision — fixed-width nanoseconds, so a
+whole-second commit endpoint counts a `12:30:00.900` occurrence as after
+`12:30:00`, not on the boundary; `len == occurrence_count`). Both are `#[serde(default)]` so legacy
 `log:v2:` records still deserialize. Raw log text never enters the graph;
 excerpts are `template-v1`-normalized, redacted, and bounded. Deterministic
 and byte-stable; CRLF and LF checkouts yield identical IDs. Unrecognized
