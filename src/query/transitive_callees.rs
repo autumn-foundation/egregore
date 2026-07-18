@@ -231,7 +231,7 @@ pub fn transitive_callees<'a>(
 
     // ── outbound edge index: source -> [(target, edge, label, resolution)] ────
     let mut outbound: BTreeMap<&str, Vec<TransitiveEdgeRef<'a>>> = BTreeMap::new();
-    for r in records {
+    for (index, r) in records.iter().enumerate() {
         if let GraphRecord::Edge {
             id,
             label,
@@ -241,6 +241,17 @@ pub fn transitive_callees<'a>(
             ..
         } = r
         {
+            // Latest-write-wins for edge metadata (issue #421): over an
+            // append-only `--graph` a stable edge ID may be re-ingested with a
+            // changed label/resolution. Only the latest EDGE write for the id is
+            // live, mirroring embedded `latest_edge_versions`; keying off the
+            // edge-only map means a later Node write sharing the edge's ID
+            // (issue #391) cannot suppress it. Without this a stale earlier
+            // version (e.g. `unresolved` before a `resolved` re-ingest) could be
+            // admitted, diverging from the coalesced `--data-dir` read.
+            if !liveness.is_latest_edge_version(id.as_str(), index) {
+                continue;
+            }
             if deleted(id.as_str()) || !TRANSITIVE_CALLEE_LABELS.contains(label) {
                 continue;
             }
@@ -506,6 +517,33 @@ mod liveness_parity_tests {
         )
     }
 
+    fn sym_named(id: &str, name: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    fn calls(source: &str, target: &str, resolution: CallResolution) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::Calls,
+            source.to_owned(),
+            target.to_owned(),
+            Some("1.0".to_owned()),
+            "calls".to_owned(),
+        )
+        .with_resolution(resolution)
+    }
+
     fn tomb(deleted_id: &str) -> GraphRecord {
         GraphRecord::Tombstone {
             id: format!("codegraph:v5:tomb_{deleted_id}"),
@@ -535,6 +573,52 @@ mod liveness_parity_tests {
         assert!(
             transitive_callees(&records, "codegraph:v5:a", 5).is_none(),
             "a tombstone with no later re-ingest still deletes the anchor"
+        );
+    }
+
+    #[test]
+    fn latest_edge_version_supplies_resolution() {
+        // Two versions of one stable outbound CALLS edge id: v1 `unresolved`,
+        // v2 `resolved`. Only the latest EDGE write (v2) supplies the adjacency,
+        // so the callee is reachable — matching the coalesced `--data-dir` read.
+        // With a stale earlier version kept, the callee would be shunted to the
+        // `unresolved` bucket instead (the Codex P2 divergence).
+        let a = sym_named("codegraph:v5:a", "a");
+        let b = sym_named("codegraph:v5:b", "b");
+        let e1 = calls(
+            "codegraph:v5:a",
+            "codegraph:v5:b",
+            CallResolution::Unresolved,
+        );
+        let e2 = calls("codegraph:v5:a", "codegraph:v5:b", CallResolution::Resolved);
+        let records = vec![a, b, e1, e2];
+        let ctx = transitive_callees(&records, "codegraph:v5:a", 5).expect("anchor live");
+        assert!(
+            ctx.rows.iter().any(|r| r.record.id() == "codegraph:v5:b"),
+            "the latest edge version (resolved) makes the target a reachable callee"
+        );
+        assert!(
+            ctx.unresolved
+                .iter()
+                .all(|u| u.target_id != "codegraph:v5:b"),
+            "a superseded earlier edge version must not also report the target unresolved"
+        );
+    }
+
+    #[test]
+    fn edge_reingested_after_tombstone_is_live_adjacency() {
+        // A CALLS edge re-ingested after its own tombstone must resurface the
+        // callee, matching the embedded latest-edge-version read.
+        let a = sym_named("codegraph:v5:a", "a");
+        let b = sym_named("codegraph:v5:b", "b");
+        let e1 = calls("codegraph:v5:a", "codegraph:v5:b", CallResolution::Resolved);
+        let edge_id = e1.id().to_owned();
+        let e2 = calls("codegraph:v5:a", "codegraph:v5:b", CallResolution::Resolved);
+        let records = vec![a, b, e1, tomb(&edge_id), e2];
+        let ctx = transitive_callees(&records, "codegraph:v5:a", 5).expect("anchor live");
+        assert!(
+            ctx.rows.iter().any(|r| r.record.id() == "codegraph:v5:b"),
+            "an edge re-ingested after its tombstone must resurface the callee"
         );
     }
 }
