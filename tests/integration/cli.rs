@@ -44,6 +44,19 @@ fn scan_and_inspect_work_without_aletheiadb() {
 }
 
 #[test]
+fn version_flag_prints_crate_version_on_both_binaries() {
+    let version = env!("CARGO_PKG_VERSION");
+    for bin in ["egregore", "eg"] {
+        Command::cargo_bin(bin)
+            .expect("binary should run")
+            .arg("--version")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(version));
+    }
+}
+
+#[test]
 fn eg_alias_runs_cli() {
     Command::cargo_bin("eg")
         .expect("short alias binary should run")

@@ -107,14 +107,19 @@ use crate::{
 /// 18 -> 19 for the issue #406 `ScanCoveragePayload.coverage_generation` field:
 /// cached records embed serialized coverage shapes, so a bump forces older
 /// caches to rebuild and re-emit the generation-bearing coverage node.
-/// 19 -> 20 for the issue #438 non-UTF-8/unreadable source skip: such a file now
+/// 19 -> 20 for the issue #440 qualified/cross-crate call-resolution fix: the
+/// crate-relative `file_module_path`/`crate_root_id` derivation changes cached
+/// `DefinitionFact.match_segments`/`crate_root` in workspace layouts, and the
+/// new `CallSiteFact.path_root` field changes the cached call-site shape, so
+/// per-file caches must rebuild rather than replay pre-#440 unresolved stubs.
+/// 20 -> 21 for the issue #438 non-UTF-8/unreadable source skip: such a file now
 /// caches a `Diagnostic` (never a `File` node) and shifts the coverage counts,
 /// so older caches must rebuild rather than replay the pre-skip record set.
 ///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 20;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 21;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

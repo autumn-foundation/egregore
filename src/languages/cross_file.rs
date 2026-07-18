@@ -87,6 +87,30 @@ pub enum CallKind {
     SelfMethod,
 }
 
+/// How a path-qualified call names its leading crate scope (issue #440).
+///
+/// Preserved from the call's written form because [`normalize_call_path`] strips
+/// the leading `crate`/`self`/`super` (and rewrites `Self`), which would
+/// otherwise erase whether the path was crate-absolute or named another crate —
+/// the signal the resolution pass needs to confine a qualified call to the right
+/// workspace crate root instead of matching same-named symbols repo-wide.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallPathRoot {
+    /// Not a path-qualified call (a bare/method call), or a legacy fact: the
+    /// pool is matched repo-wide (the pre-#440 behavior). Default so a cache
+    /// written before #440 deserializes to the unchanged matching.
+    #[default]
+    Unqualified,
+    /// The path began with `crate`/`self`/`super`: it names the CALLER'S own
+    /// crate, so resolution is confined to the caller's crate root.
+    CurrentCrate,
+    /// The path began with a bare segment (`dep_crate::…`, `mod_b::…`) that may
+    /// name a workspace crate; the raw first segment is retained so the
+    /// resolution pass can look it up in the workspace crate registry.
+    Leading(String),
+}
+
 /// A syntactic call site found inside a recorded symbol body.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CallSiteFact {
@@ -102,6 +126,11 @@ pub struct CallSiteFact {
     pub callee_segments: Vec<String>,
     /// Syntactic call form.
     pub call_kind: CallKind,
+    /// How the call's leading path segment names its crate scope (issue #440).
+    /// `#[serde(default)]` so a pre-#440 cache deserializes to `Unqualified`
+    /// (repo-wide matching, unchanged).
+    #[serde(default)]
+    pub path_root: CallPathRoot,
     /// Normalized impl owner for `self`-receiver calls; `None` elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_owner: Option<String>,
@@ -523,7 +552,24 @@ fn is_conventional_crate_root(path: &str) -> bool {
 /// root-trait collision is rare and left as a known bound.
 #[must_use]
 pub fn crate_root_id(repo_relative_path: &str) -> String {
-    let segments: Vec<&str> = repo_relative_path.split('/').collect();
+    let (prefix, remainder) = split_crate_prefix(repo_relative_path);
+    let base = base_crate_root_id(&remainder);
+    if prefix.is_empty() {
+        base
+    } else {
+        // Prefix-qualify so distinct workspace crates (`crates/a/src/lib.rs`,
+        // `crates/b/src/lib.rs`) never pool their same-named root definitions
+        // into one `lib` partition (issue #440). A single-crate `src/...`
+        // layout has an empty prefix and is byte-identical to the pre-#440 id.
+        format!("{prefix}::{base}")
+    }
+}
+
+/// The crate-root identifier for a crate-relative remainder (the second element
+/// of [`split_crate_prefix`]). This is the pre-#440 single-crate classification,
+/// operating on the remainder so it composes with any workspace-directory prefix.
+fn base_crate_root_id(remainder: &[String]) -> String {
+    let segments: Vec<&str> = remainder.iter().map(String::as_str).collect();
     let is_rs = |name: &str| {
         std::path::Path::new(name)
             .extension()
@@ -547,6 +593,54 @@ pub fn crate_root_id(repo_relative_path: &str) -> String {
         ["benches", rest @ ..] => aux("bench", rest).unwrap_or_else(|| "lib".to_owned()),
         _ => "lib".to_owned(),
     }
+}
+
+/// Splits a repo-relative Rust file path into its workspace-crate directory
+/// prefix and the crate-relative remainder (issue #440).
+///
+/// A cargo workspace places each member crate in its own directory
+/// (`crates/foo/src/lib.rs`, `foo/src/mod_b.rs`), so the pre-#440 assumption
+/// that every source path begins at `src/`/`tests/`/… held only for a
+/// single-crate repo. This locates the crate's target-root marker — the FIRST
+/// `src`/`tests`/`examples`/`benches` segment, or a `build.rs` — and returns
+/// everything before it as the crate directory prefix and the marker-onward
+/// suffix as the crate-relative remainder. A single-crate `src/lib.rs` yields
+/// (`""`, `["src", "lib.rs"]`) — an empty prefix, so every downstream id and
+/// module path is byte-identical to the pre-#440 behavior. A path with no
+/// marker (a non-`src` stray file) yields an empty prefix and the whole path,
+/// matching the pre-#440 `lib`/empty-module-path fallback.
+///
+/// The FIRST marker is chosen deliberately: it keeps a module literally named
+/// `src` (`crate_a/src/src/foo.rs`) attributed to the real crate `crate_a`
+/// rather than mis-rooting at the inner `src`. The residual bound is a crate
+/// directory literally named after a marker (`benches/src/lib.rs`), which is
+/// not a conventional cargo layout.
+#[must_use]
+pub(crate) fn split_crate_prefix(repo_relative_path: &str) -> (String, Vec<String>) {
+    let segments = crate::languages::common::path_segments(repo_relative_path);
+    let is_marker = |s: &str| matches!(s, "src" | "tests" | "examples" | "benches");
+    let boundary = segments
+        .iter()
+        .position(|s| is_marker(s))
+        .or_else(|| segments.iter().rposition(|s| s == "build.rs"));
+    match boundary {
+        Some(0) | None => (String::new(), segments),
+        Some(i) => (segments[..i].join("/"), segments[i..].to_vec()),
+    }
+}
+
+/// The inferred crate name for a repo-relative path: the last component of its
+/// workspace-crate directory prefix, normalized cargo-style (`-` → `_`), or
+/// `None` for a single-crate (`src/…`-rooted) path with no directory prefix
+/// (issue #440). Used to recognize a cross-crate qualified call's leading
+/// segment (`dep_crate::…`) as naming a workspace member.
+#[must_use]
+pub(crate) fn crate_name_of(repo_relative_path: &str) -> Option<String> {
+    let (prefix, _) = split_crate_prefix(repo_relative_path);
+    if prefix.is_empty() {
+        return None;
+    }
+    prefix.rsplit('/').next().map(|name| name.replace('-', "_"))
 }
 
 /// The auxiliary-target ENTRY crate root a repo-relative path denotes when the
@@ -1498,6 +1592,13 @@ struct DefinitionIndex<'facts> {
     /// [`ImplTargetIndex`] so the recorded trait name matches a trait method's
     /// `match_segments` prefix exactly.
     implemented: BTreeMap<(String, String), BTreeSet<String>>,
+    /// Inferred-crate-name -> that crate's LIBRARY crate-root id, for resolving
+    /// cross-crate qualified calls (`dep_crate::mod::fn()`) to a workspace
+    /// member (issue #440). The name is the crate directory's last component,
+    /// cargo-normalized (`-` → `_`). A name that maps to two distinct crate
+    /// directories is ambiguous and stored as `None`, so it never confers a
+    /// (possibly wrong) cross-crate binding — resolution stays conservative.
+    crate_name_roots: BTreeMap<String, Option<String>>,
 }
 
 impl<'facts> DefinitionIndex<'facts> {
@@ -1520,6 +1621,32 @@ impl<'facts> DefinitionIndex<'facts> {
                 ))
             });
             candidates.dedup_by(|a, b| a.id == b.id);
+        }
+
+        // Build the workspace crate-name registry (issue #440): every crate
+        // directory the scanned file set reveals contributes its inferred name
+        // -> library crate-root binding, so a `dep_crate::…` qualified call can
+        // be confined to that crate's definitions. A name shared by two crate
+        // directories is marked ambiguous (`None`) — never a wrong binding.
+        let mut crate_name_roots: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for path in facts_by_file.keys() {
+            let (prefix, _) = split_crate_prefix(path);
+            if prefix.is_empty() {
+                continue;
+            }
+            let Some(name) = crate_name_of(path) else {
+                continue;
+            };
+            let lib_root = format!("{prefix}::lib");
+            match crate_name_roots.get(&name) {
+                None => {
+                    crate_name_roots.insert(name, Some(lib_root));
+                }
+                Some(Some(existing)) if *existing != lib_root => {
+                    crate_name_roots.insert(name, None);
+                }
+                _ => {}
+            }
         }
 
         // Resolve every recorded `impl Trait for Type` relation to the trait's
@@ -1595,6 +1722,7 @@ impl<'facts> DefinitionIndex<'facts> {
         Self {
             by_simple_name,
             implemented,
+            crate_name_roots,
         }
     }
 
@@ -1766,10 +1894,41 @@ impl<'facts> DefinitionIndex<'facts> {
                         .filter(|definition| is_free_function(definition))
                         .collect();
                 }
+                // Determine WHICH crate's definitions this qualified path may
+                // bind, and the crate-relative segments to suffix-match, from
+                // the call's preserved leading scope (issue #440):
+                //
+                // - `crate`/`self`/`super` head -> the caller's own crate root.
+                // - a bare head naming a WORKSPACE crate -> that crate's library
+                //   root, with the crate name segment dropped (`dep::mod::fn`
+                //   suffix-matches the dep's `mod::fn`).
+                // - any other bare head (an in-crate relative path, or an
+                //   external crate) -> the caller's own crate root, full
+                //   segments; an external crate then has no local module to
+                //   match and stays honestly unresolved (no wrong edge).
+                // - a legacy `Unqualified` Path fact -> repo-wide match
+                //   (unchanged pre-#440 behavior).
+                let (target_root, segments): (Option<&str>, &[String]) = match &call.path_root {
+                    CallPathRoot::CurrentCrate => {
+                        (Some(caller_crate_root), call.callee_segments.as_slice())
+                    }
+                    CallPathRoot::Leading(name) => {
+                        let normalized = name.replace('-', "_");
+                        match self.crate_name_roots.get(&normalized) {
+                            Some(Some(root)) => (Some(root.as_str()), &call.callee_segments[1..]),
+                            _ => (Some(caller_crate_root), call.callee_segments.as_slice()),
+                        }
+                    }
+                    CallPathRoot::Unqualified => (None, call.callee_segments.as_slice()),
+                };
+                // `target_root == None` is the legacy repo-wide match (no crate
+                // confinement); `Some(root)` confines to that crate root.
                 pool.iter()
                     .copied()
                     .filter(|definition| {
-                        segments_end_with(&definition.match_segments, &call.callee_segments)
+                        target_root.is_none_or(|root| {
+                            crate_root_id(&definition.repo_relative_path) == root
+                        }) && segments_end_with(&definition.match_segments, segments)
                     })
                     .collect()
             }
@@ -1849,6 +2008,9 @@ mod tests {
             callee_display: display.to_owned(),
             callee_segments: segments.iter().map(|s| (*s).to_owned()).collect(),
             call_kind: kind,
+            // Explicit-fact tests keep the pre-#440 repo-wide matching; the
+            // real extractor sets a specific `path_root` for scoped-path calls.
+            path_root: CallPathRoot::Unqualified,
             receiver_owner: owner.map(ToOwned::to_owned),
             span: span(),
         }
@@ -3281,5 +3443,179 @@ mod tests {
                  coincident local module: {records:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Qualified-path and cross-crate call resolution over a multi-crate
+    // workspace (issue #440). These drive the REAL per-file extractor
+    // (`extract_file_source`) so the crate-root / module-path derivation from
+    // the repo-relative path is exercised end to end, then resolve the calls
+    // with `cross_file_call_records`.
+    // -----------------------------------------------------------------------
+
+    /// Extracts every `(repo_relative_path, source)` entry through the real
+    /// Rust extractor and collects the per-file facts into the map the
+    /// cross-file resolution pass consumes.
+    fn workspace_facts(entries: &[(&str, &str)]) -> BTreeMap<String, FileFacts> {
+        use crate::fs::SourceFile;
+        use crate::ir::Graph;
+
+        entries
+            .iter()
+            .map(|(path, source)| {
+                let file = SourceFile {
+                    path: std::path::PathBuf::from(path),
+                    repo_relative_path: (*path).to_owned(),
+                };
+                let mut graph = Graph::default();
+                let facts = crate::languages::rust::extract_file_source(
+                    &file,
+                    source,
+                    &format!("file:{path}"),
+                    "repo",
+                    &mut graph,
+                )
+                .expect("source should parse");
+                ((*path).to_owned(), facts)
+            })
+            .collect()
+    }
+
+    /// The repo-relative paths of definitions reached by a `resolved` CALLS
+    /// edge, paired with the callee's simple name, sorted for determinism.
+    fn resolved_definition_hits(
+        records: &[GraphRecord],
+        facts: &BTreeMap<String, FileFacts>,
+    ) -> Vec<(String, String)> {
+        let by_id: BTreeMap<&str, &DefinitionFact> = facts
+            .values()
+            .flat_map(|f| f.definitions.iter())
+            .map(|d| (d.id.as_str(), d))
+            .collect();
+        let mut hits: Vec<(String, String)> = records
+            .iter()
+            .filter(|r| r.resolution() == Some(CallResolution::Resolved))
+            .filter_map(|r| match r {
+                GraphRecord::Edge { target, .. } => by_id
+                    .get(target.as_str())
+                    .map(|d| (d.repo_relative_path.clone(), d.simple_name.clone())),
+                _ => None,
+            })
+            .collect();
+        hits.sort();
+        hits
+    }
+
+    /// True when any `unresolved` CALLS edge (a per-file `Diagnostic` stub) was
+    /// minted for a callee whose display path contains `needle`.
+    fn has_unresolved_stub_for(records: &[GraphRecord], needle: &str) -> bool {
+        records.iter().any(|r| match r {
+            GraphRecord::Node {
+                kind: NodeKind::Diagnostic,
+                name,
+                ..
+            } => name.as_deref().is_some_and(|n| n.contains(needle)),
+            _ => false,
+        })
+    }
+
+    // (a) An intra-crate `crate::mod_b::target()` call binds the definition
+    // Symbol, so `transitive-callers` can see the caller.
+    #[test]
+    fn qualified_crate_path_call_resolves_within_workspace_crate() {
+        let facts = workspace_facts(&[
+            ("crate_a/src/mod_b.rs", "pub fn target() {}\n"),
+            (
+                "crate_a/src/mod_a.rs",
+                "pub fn caller() { crate::mod_b::target(); }\n",
+            ),
+            ("crate_a/src/lib.rs", "pub mod mod_a;\npub mod mod_b;\n"),
+        ]);
+        let records = cross_file_call_records("repo", &facts);
+        let hits = resolved_definition_hits(&records, &facts);
+        assert!(
+            hits.contains(&("crate_a/src/mod_b.rs".to_owned(), "target".to_owned())),
+            "crate::mod_b::target() must resolve to mod_b::target, got {hits:?}"
+        );
+        assert!(
+            !has_unresolved_stub_for(&records, "mod_b::target"),
+            "the qualified call must not become a Diagnostic stub: {records:?}"
+        );
+    }
+
+    // (b) A cross-crate `crate_b::mod_c::target()` call resolves when
+    // `crate_b` is a workspace crate.
+    #[test]
+    fn cross_crate_qualified_call_resolves_to_workspace_definition() {
+        let facts = workspace_facts(&[
+            ("crate_b/src/mod_c.rs", "pub fn target() {}\n"),
+            ("crate_b/src/lib.rs", "pub mod mod_c;\n"),
+            (
+                "crate_a/src/mod_a.rs",
+                "pub fn caller() { crate_b::mod_c::target(); }\n",
+            ),
+            ("crate_a/src/lib.rs", "pub mod mod_a;\n"),
+        ]);
+        let records = cross_file_call_records("repo", &facts);
+        let hits = resolved_definition_hits(&records, &facts);
+        assert!(
+            hits.contains(&("crate_b/src/mod_c.rs".to_owned(), "target".to_owned())),
+            "crate_b::mod_c::target() must resolve across crates, got {hits:?}"
+        );
+    }
+
+    // (c) A qualified call into a crate that is NOT part of the workspace stays
+    // unresolved — no wrong edge (doctrine).
+    #[test]
+    fn external_crate_qualified_call_stays_unresolved() {
+        let facts = workspace_facts(&[
+            // A local `mod_c::target` exists, but the call names `ext_dep::…`,
+            // which is not a workspace crate, so it must NOT bind here.
+            ("crate_a/src/mod_c.rs", "pub fn target() {}\n"),
+            (
+                "crate_a/src/mod_a.rs",
+                "pub fn caller() { ext_dep::mod_c::target(); }\n",
+            ),
+            ("crate_a/src/lib.rs", "pub mod mod_a;\npub mod mod_c;\n"),
+        ]);
+        let records = cross_file_call_records("repo", &facts);
+        let hits = resolved_definition_hits(&records, &facts);
+        assert!(
+            !hits.contains(&("crate_a/src/mod_c.rs".to_owned(), "target".to_owned())),
+            "an external-crate qualified call must not bind a same-named local \
+             definition: {hits:?}"
+        );
+        assert!(
+            has_unresolved_stub_for(&records, "ext_dep"),
+            "the external qualified call must stay an honest Diagnostic stub: {records:?}"
+        );
+    }
+
+    // (d) Two same-named `target` functions in DIFFERENT modules must not
+    // cross-resolve: `crate::mod_b::target()` binds only mod_b's.
+    #[test]
+    fn qualified_call_disambiguates_same_name_across_modules() {
+        let facts = workspace_facts(&[
+            ("crate_a/src/mod_b.rs", "pub fn target() {}\n"),
+            ("crate_a/src/mod_d.rs", "pub fn target() {}\n"),
+            (
+                "crate_a/src/mod_a.rs",
+                "pub fn caller() { crate::mod_b::target(); }\n",
+            ),
+            (
+                "crate_a/src/lib.rs",
+                "pub mod mod_a;\npub mod mod_b;\npub mod mod_d;\n",
+            ),
+        ]);
+        let records = cross_file_call_records("repo", &facts);
+        let hits = resolved_definition_hits(&records, &facts);
+        assert!(
+            hits.contains(&("crate_a/src/mod_b.rs".to_owned(), "target".to_owned())),
+            "crate::mod_b::target() must resolve to mod_b's target, got {hits:?}"
+        );
+        assert!(
+            !hits.contains(&("crate_a/src/mod_d.rs".to_owned(), "target".to_owned())),
+            "crate::mod_b::target() must NOT bind mod_d's same-named target: {hits:?}"
+        );
     }
 }

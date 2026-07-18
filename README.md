@@ -26,7 +26,7 @@ The release binary lands at `target/release/egregore.exe` (and `eg.exe` as a sho
 
 ### 3. Scan your codebase
 
-Point `scan` at any repository. It parses every supported source file — `.rs` (Rust), `.py` (Python), `.ts`/`.tsx` (TypeScript), and `.go` (Go) — with Tree-sitter and emits a deterministic JSONL graph of nodes (files, modules, symbols, imports, diagnostics) and edges (DEFINES, CALLS, IMPORTS, MENTIONS, CONTAINS).
+Point `scan` at any repository. It parses every supported source file — `.rs` (Rust), `.py` (Python), `.ts`/`.tsx` (TypeScript), and `.go` (Go) — with Tree-sitter and emits a deterministic JSONL graph of nodes (files, modules, symbols, imports, diagnostics) and edges (DEFINES, CALLS, IMPORTS, REFERENCES, CONTAINS). (`MENTIONS` is a reserved edge label that no current language extractor emits; resolved usage is recorded as `REFERENCES`. See [PRD schema](docs/prd/0001-codebase-knowledge-graph.md).)
 
 For Rust, `CALLS` edges are resolved **across files inside the scanned repository** by a
 deterministic repo-wide resolution pass (issue #152): a call site whose name matches exactly
@@ -188,7 +188,7 @@ line a text search would make an agent ingest — no false positives from commen
 or string literals, and no bodies to read just to learn what a file defines.
 That claim is test-enforced: reference matching runs over AST-derived text with
 comment and string content removed, decoy calls in the accuracy corpus
-(`corpus/accuracy/`) must yield zero `CALLS`/`MENTIONS` edges for the
+(`corpus/accuracy/`) must yield zero `CALLS`/`REFERENCES` edges for the
 `eg audit accuracy` gate to pass, and name-collision `CALLS` edges carry an
 explicit `resolution` status (`resolved` / `ambiguous`) instead of being
 asserted as uniquely resolved (issue #134).
