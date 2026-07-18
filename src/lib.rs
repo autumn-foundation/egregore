@@ -512,11 +512,31 @@ pub(crate) fn reconcile_scan_coverage(graph: &Graph, tally: &mut fs::ScanCoverag
         tally.files_indexed = tally.files_walked - skipped_total;
     } else {
         // The fallback walk enumerated only matching files, so it has no
-        // walked/skipped denominator. Count the distinct File-node paths as
+        // extension-skip denominator. Count the distinct File-node paths as
         // indexed (this now includes any manifest File nodes) and mirror the
-        // best-effort `files_walked == files_indexed` without a skip tally.
+        // best-effort `files_walked == files_indexed`.
         tally.files_indexed = indexed_paths.len();
         tally.files_walked = indexed_paths.len();
+        // Even without a full denominator, a decode/unreadable skip (issue #438)
+        // is a file the walk DID visit but could not index — recorded in
+        // `skipped_paths` via `record_unindexed_skip` (the fallback never
+        // records extension skips there). Fold each such path that received no
+        // `File` node into `skipped_by_extension` (keyed by its recorded
+        // lowercased extension, `""` for none) and add it to `files_walked`, so
+        // the skip is honestly counted walked + skipped instead of silently
+        // vanishing outside the Git-tracked path. Mirror the complete branch's
+        // "skipped_paths minus indexed File nodes" subtraction so a path that
+        // did receive a `File` node is never double-counted. `coverage_complete`
+        // stays `false`: the fallback still lacks an extension-skip denominator.
+        let mut skipped_by_extension = BTreeMap::new();
+        for (path, ext) in &tally.skipped_paths {
+            if !indexed_paths.contains(path.as_str()) {
+                *skipped_by_extension.entry(ext.clone()).or_default() += 1;
+            }
+        }
+        let skipped_total: usize = skipped_by_extension.values().sum();
+        tally.skipped_by_extension = skipped_by_extension;
+        tally.files_walked += skipped_total;
     }
 }
 

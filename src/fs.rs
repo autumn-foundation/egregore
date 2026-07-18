@@ -43,10 +43,13 @@ pub struct ScanCoverageTally {
     /// source-filter skipped, retained so the scan can reclassify any that a
     /// later File-producing extractor (e.g. manifest dependency extraction,
     /// issue #180) nonetheless indexes with a `File` node — keeping
-    /// `files_indexed` honest about what actually received a graph node. Only
-    /// populated on the complete (Git-tracked) walk; empty on the fallback,
-    /// which carries no walked/skipped denominator. A sorted map for
-    /// determinism.
+    /// `files_indexed` honest about what actually received a graph node. At
+    /// discovery time this is populated with extension skips only on the
+    /// complete (Git-tracked) walk; the fallback records none there. The scan
+    /// loop additionally threads decode/unreadable skips (issue #438) into it
+    /// via `record_unindexed_skip` on BOTH paths, so `reconcile_scan_coverage`
+    /// folds those into `skipped_by_extension` even in the fallback (which still
+    /// lacks a full extension-skip denominator). A sorted map for determinism.
     pub skipped_paths: std::collections::BTreeMap<String, String>,
     /// `true` only on the Git-tracked-files path, which yields a complete
     /// walked/skipped denominator. The non-Git filesystem-walk fallback sets

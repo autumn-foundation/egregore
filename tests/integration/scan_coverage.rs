@@ -354,6 +354,112 @@ fn scan_skips_non_utf8_source_and_records_diagnostic() {
     );
 }
 
+/// Issue #438 (fallback branch): the same non-UTF-8 decode skip must be counted
+/// honestly on the NON-Git filesystem-walk fallback, not only the Git-tracked
+/// complete walk. A PLAIN directory (no `git init`, forcing the fallback) with a
+/// decodable `good.rs` plus a genuine UTF-16LE `bad.rs` still emits the skip
+/// `Diagnostic`, and `reconcile_scan_coverage` now folds the recorded
+/// `skipped_paths` entry into `skipped_by_extension` and `files_walked` — so
+/// `bad.rs` appears as `rs: 1` and is included in the walked count instead of
+/// silently vanishing. `coverage_complete` stays `false`: the fallback still
+/// lacks a full extension-skip denominator.
+#[test]
+fn fallback_walk_counts_non_utf8_skip_in_coverage() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    // A non-Git tree (no `.git`), so discovery takes the filesystem-walk fallback
+    // rather than the Git-tracked-files branch.
+    let root = temp.path().join("tree");
+    fs::create_dir_all(root.join("src")).expect("src dir");
+    fs::write(root.join("src/good.rs"), "pub fn good() -> u32 { 1 }\n").expect("good source");
+    fs::write(
+        root.join("src/bad.rs"),
+        utf16le_with_bom("pub fn hidden() {}"),
+    )
+    .expect("bad source");
+
+    let graph_path = temp.path().join("graph.jsonl");
+    let output = assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(&root)
+        .arg("--out")
+        .arg(&graph_path)
+        .output()
+        .expect("scan should run");
+    assert!(
+        output.status.success(),
+        "scan must exit 0 on a non-UTF-8 source in the fallback path: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let jsonl = fs::read_to_string(&graph_path).expect("scan should write JSONL");
+    let records = parse_jsonl(&jsonl);
+
+    // The decodable file is fully extracted.
+    let good_file = records.iter().any(|r| {
+        r["record_type"] == "node"
+            && r["kind"] == "File"
+            && r["repo_relative_path"] == "src/good.rs"
+    });
+    let good_symbol = records.iter().any(|r| {
+        r["record_type"] == "node"
+            && r["kind"] == "Symbol"
+            && r["repo_relative_path"] == "src/good.rs"
+            && r["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with("good"))
+    });
+    assert!(good_file, "decodable file must have a File node");
+    assert!(good_symbol, "decodable file's symbol must be extracted");
+
+    // A Diagnostic names the undecodable file (non-UTF-8 source).
+    let diagnostic = records.iter().find(|r| {
+        r["record_type"] == "node"
+            && r["kind"] == "Diagnostic"
+            && r["repo_relative_path"] == "src/bad.rs"
+    });
+    let diagnostic = diagnostic.expect("a Diagnostic must name the skipped non-UTF-8 file");
+    assert!(
+        diagnostic["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("UTF-8"),
+        "diagnostic must state the non-UTF-8 decode failure: {diagnostic}"
+    );
+
+    // The fallback is not a complete walk, so it cannot fabricate a full
+    // walked/skipped denominator.
+    let node = coverage_node(&records);
+    assert_eq!(
+        node["scan_coverage"]["coverage_complete"], false,
+        "the non-Git fallback must report coverage_complete: false: {node}"
+    );
+
+    // The decode skip is now honestly counted: bad.rs appears as `rs: 1` under
+    // skipped_by_extension and is included in files_walked (1 indexed good.rs +
+    // 1 skipped bad.rs == 2 walked), instead of silently vanishing.
+    let skipped = node["scan_coverage"]["skipped_by_extension"]
+        .as_object()
+        .expect("skipped_by_extension object");
+    assert_eq!(
+        skipped["rs"], 1,
+        "the undecodable .rs must be counted skipped in the fallback: {node}"
+    );
+    let walked = node["scan_coverage"]["files_walked"].as_u64().unwrap();
+    let indexed = node["scan_coverage"]["files_indexed"].as_u64().unwrap();
+    assert_eq!(indexed, 1, "only the decodable .rs is indexed: {node}");
+    assert_eq!(
+        walked, 2,
+        "the decode-skipped file must be included in files_walked: {node}"
+    );
+    let skipped_total: u64 = skipped.values().map(|v| v.as_u64().unwrap()).sum();
+    assert_eq!(
+        indexed + skipped_total,
+        walked,
+        "indexed + skipped == walked for the counted decode skip"
+    );
+}
+
 #[test]
 fn coverage_node_is_byte_stable_across_scans() {
     let temp = tempfile::tempdir().expect("temp dir");
