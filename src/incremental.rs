@@ -337,7 +337,7 @@ fn scan_repository_incremental_at_inner(
                 // for such files. The coverage skip is threaded below, uniformly
                 // for the rebuild and reuse paths.
                 crate::SourceFileScanOutcome::Skipped { diagnostic, .. } => {
-                    (vec![diagnostic], FileFacts::default())
+                    (vec![*diagnostic], FileFacts::default())
                 }
             };
             let mut records = records

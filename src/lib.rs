@@ -298,7 +298,7 @@ fn scan_repository_at_with_override_inner(
                 repo_relative_path,
                 extension,
             } => {
-                graph.push(diagnostic.with_valid_time_inferred(transaction_time));
+                graph.push((*diagnostic).with_valid_time_inferred(transaction_time));
                 coverage_tally.record_unindexed_skip(repo_relative_path, extension);
             }
         }
@@ -576,8 +576,10 @@ pub(crate) enum SourceFileScanOutcome {
     /// The file was skipped (non-UTF-8 or unreadable). `diagnostic` names the
     /// repo-relative path and the fixed decode/read-failure reason;
     /// `repo_relative_path`/`extension` reconcile the skip into `ScanCoverage`.
+    /// The diagnostic node is boxed so the (common) `Extracted` variant is not
+    /// bloated by the large `GraphRecord` node.
     Skipped {
-        diagnostic: GraphRecord,
+        diagnostic: Box<GraphRecord>,
         repo_relative_path: String,
         extension: String,
     },
@@ -625,35 +627,29 @@ pub(crate) fn scan_source_file_records(
     // (a genuine text file in another encoding) and the adjacent unreadable
     // class (permission/io error) — skip and record rather than abort (issue
     // #438).
-    let bytes = match std::fs::read(&source_file.path) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return Ok(SourceFileScanOutcome::Skipped {
-                diagnostic: skipped_source_diagnostic(
-                    repository_id,
-                    &repo_relative_path,
-                    "unreadable_source",
-                    "skipped source file: unreadable",
-                ),
-                repo_relative_path,
-                extension,
-            });
-        }
+    let Ok(bytes) = std::fs::read(&source_file.path) else {
+        return Ok(SourceFileScanOutcome::Skipped {
+            diagnostic: Box::new(skipped_source_diagnostic(
+                repository_id,
+                &repo_relative_path,
+                "unreadable_source",
+                "skipped source file: unreadable",
+            )),
+            repo_relative_path,
+            extension,
+        });
     };
-    let source = match std::str::from_utf8(&bytes) {
-        Ok(source) => source,
-        Err(_) => {
-            return Ok(SourceFileScanOutcome::Skipped {
-                diagnostic: skipped_source_diagnostic(
-                    repository_id,
-                    &repo_relative_path,
-                    "non_utf8_source",
-                    "skipped source file: not valid UTF-8",
-                ),
-                repo_relative_path,
-                extension,
-            });
-        }
+    let Ok(source) = std::str::from_utf8(&bytes) else {
+        return Ok(SourceFileScanOutcome::Skipped {
+            diagnostic: Box::new(skipped_source_diagnostic(
+                repository_id,
+                &repo_relative_path,
+                "non_utf8_source",
+                "skipped source file: not valid UTF-8",
+            )),
+            repo_relative_path,
+            extension,
+        });
     };
     let (records, facts) = scan_source_text_records(source_file, source, repository_id)?;
     Ok(SourceFileScanOutcome::Extracted { records, facts })
@@ -751,7 +747,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(repo_relative_path, "src");
-                let GraphRecord::Node { kind, summary, .. } = &diagnostic else {
+                let GraphRecord::Node { kind, summary, .. } = diagnostic.as_ref() else {
                     panic!("skip diagnostic must be a node");
                 };
                 assert_eq!(*kind, NodeKind::Diagnostic);

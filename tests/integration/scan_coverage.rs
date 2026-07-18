@@ -220,6 +220,7 @@ fn utf16le_with_bom(text: &str) -> Vec<u8> {
 /// decodable file, and reconciles the skip into `ScanCoverage` so the file is
 /// honestly counted UNINDEXED (AC4 invariant preserved).
 #[test]
+#[allow(clippy::too_many_lines)]
 fn scan_skips_non_utf8_source_and_records_diagnostic() {
     let temp = tempfile::tempdir().expect("temp dir");
     let repo = temp.path().join("repo");

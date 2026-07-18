@@ -153,35 +153,31 @@ fn scan_repository_history_inner(
         for path in list_indexed_source_files(repo_root, &commit.sha)? {
             let change_id = change_ids_by_path.get(&path);
             let bytes = git_blob_bytes(repo_root, &commit.sha, &path)?;
-            let source = match std::str::from_utf8(&bytes) {
-                Ok(source) => source,
-                Err(_) => {
-                    // Issue #438: a non-UTF-8 committed blob is skipped, not
-                    // aborted. Emit a deterministic `Diagnostic` naming the
-                    // commit + path (fixed summary, no raw bytes) and keep
-                    // replaying the tree. `git show` reads objects only, never
-                    // mutating the checkout.
-                    let diag_id = stable_id(&[
-                        "node",
-                        "diagnostic",
-                        "non_utf8_source",
-                        &repository_id,
-                        &commit.sha,
-                        &path,
-                    ]);
-                    graph.push(
-                        GraphRecord::node(
-                            diag_id,
-                            NodeKind::Diagnostic,
-                            Some(path.clone()),
-                            None,
-                            Some("non_utf8_source".to_owned()),
-                            "skipped source file: not valid UTF-8".to_owned(),
-                        )
-                        .with_temporal(commit.temporal()),
-                    );
-                    continue;
-                }
+            let Ok(source) = std::str::from_utf8(&bytes) else {
+                // Issue #438: a non-UTF-8 committed blob is skipped, not aborted.
+                // Emit a deterministic `Diagnostic` naming the commit + path
+                // (fixed summary, no raw bytes) and keep replaying the tree.
+                // `git show` reads objects only, never mutating the checkout.
+                let diag_id = stable_id(&[
+                    "node",
+                    "diagnostic",
+                    "non_utf8_source",
+                    &repository_id,
+                    &commit.sha,
+                    &path,
+                ]);
+                graph.push(
+                    GraphRecord::node(
+                        diag_id,
+                        NodeKind::Diagnostic,
+                        Some(path.clone()),
+                        None,
+                        Some("non_utf8_source".to_owned()),
+                        "skipped source file: not valid UTF-8".to_owned(),
+                    )
+                    .with_temporal(commit.temporal()),
+                );
+                continue;
             };
             let source_file = SourceFile {
                 path: repo_root.join(&path),
