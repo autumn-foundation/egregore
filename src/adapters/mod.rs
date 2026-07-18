@@ -103,7 +103,7 @@ pub enum AdapterError {
     /// limit was exceeded (issue #439).
     ///
     /// The motivating case is `AletheiaDB` 0.1.1's process-global string
-    /// interner, whose non-overridable `MAX_STRING_COUNT` (100_000) is hit at
+    /// interner, whose non-overridable `MAX_STRING_COUNT` (`100_000`) is hit at
     /// index-persist time by the per-record property-value strings a large
     /// graph interns. Unlike [`AdapterError::Rejected`], this is a fatal,
     /// non-retryable class: the store cannot accept the workload as-is, so the
@@ -129,7 +129,7 @@ pub enum AdapterError {
 /// protection)"` and `resource == "string interner"`. This matcher returns
 /// `true` when the message names that exact interner overflow — either by
 /// carrying both `"Capacity exceeded"` and `"string interner"`, or by carrying
-/// the DoS-protection marker the interner (and only the size/capacity DoS
+/// the DoS-protection marker the interner (and only the size/capacity `DoS`
 /// guards) emits. Matching is case-sensitive against the strings upstream
 /// actually emits.
 #[must_use]

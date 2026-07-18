@@ -1,13 +1,13 @@
 //! Ingest capacity preflight (issue #439).
 //!
 //! `AletheiaDB` 0.1.1 caps its process-global string interner at a
-//! non-overridable `MAX_STRING_COUNT` of 100_000 entries
+//! non-overridable `MAX_STRING_COUNT` of `100_000` entries
 //! (`src/storage/index_persistence/mod.rs`). At WRITE time only node/edge
 //! labels and property KEYS are interned (a small bounded set), so tens of
 //! thousands of records write without complaint. At index-PERSIST time the
 //! serializer interns every per-record property VALUE string (record id, path,
 //! name, summary, signature, doc, boxed-payload JSON, ...). A large graph mints
-//! far more than 100_000 distinct value strings and overflows the cap, and the
+//! far more than `100_000` distinct value strings and overflows the cap, and the
 //! store's background persistence thread then hot-loops on the resulting
 //! `CapacityExceeded` error forever — the observed "ingest hangs" symptom.
 //!
@@ -122,6 +122,7 @@ pub struct PreflightRefusal {
 //   these records are rare relative to the 100_000 cap and their commit-shared
 //   substrings dedup heavily, so the effect is negligible.
 #[must_use]
+#[allow(clippy::too_many_lines)] // Exhaustive per-field enumeration by design.
 pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
     let mut values: HashSet<String> = HashSet::new();
     let mut node_count = 0usize;
@@ -326,18 +327,19 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                     review_commit_sha,
                     identity_system,
                     transition_kind,
-                ] {
-                    if let Some(value) = field {
-                        values.insert(value.clone());
-                    }
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    values.insert(field.clone());
                 }
                 // Numeric fields the adapter interns via `.to_string()`.
-                insert_num(&mut values, disambiguator);
-                insert_num(&mut values, ordinal);
-                insert_num(&mut values, hunk_count);
-                insert_num(&mut values, exit_code);
-                insert_num(&mut values, turn_index);
-                insert_num(&mut values, patch_bytes_size);
+                insert_num(&mut values, disambiguator.as_ref());
+                insert_num(&mut values, ordinal.as_ref());
+                insert_num(&mut values, hunk_count.as_ref());
+                insert_num(&mut values, exit_code.as_ref());
+                insert_num(&mut values, turn_index.as_ref());
+                insert_num(&mut values, patch_bytes_size.as_ref());
                 // Boxed / collection payloads: one interned JSON string each.
                 insert_json(&mut values, temporal.as_ref());
                 insert_json(&mut values, semantic_drift.as_deref());
@@ -446,7 +448,7 @@ pub fn check_ingest_capacity(
     }
 }
 
-fn insert_num<T: ToString>(values: &mut HashSet<String>, field: &Option<T>) {
+fn insert_num<T: ToString>(values: &mut HashSet<String>, field: Option<&T>) {
     if let Some(value) = field {
         values.insert(value.to_string());
     }
@@ -533,7 +535,7 @@ mod tests {
 
     /// Builds a cheap in-memory graph whose estimate exceeds the cap: each node
     /// contributes a distinct id + name + summary + the per-write seq term, so
-    /// ~34k nodes clears 100_000. Pure allocation, well under a second, no store.
+    /// ~34k nodes clears `100_000`. Pure allocation, well under a second, no store.
     fn synthesize_above_threshold() -> Vec<GraphRecord> {
         let count = 34_000usize;
         let mut records = Vec::with_capacity(count);

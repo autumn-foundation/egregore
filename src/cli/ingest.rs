@@ -110,6 +110,7 @@ pub(crate) fn embedded_write_open_error(data_dir: &Path, error: AdapterError) ->
     ))
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn ingest(
     graph: &Path,
     adapter: IngestAdapter,

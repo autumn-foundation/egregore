@@ -4730,7 +4730,7 @@ mod tests {
     use super::*;
     use crate::ir::{GraphRecord, SourceSpan, TemporalMetadata, stable_id};
 
-    /// Issue #439: a store error carrying AletheiaDB's real interner-overflow
+    /// Issue #439: a store error carrying `AletheiaDB`'s real interner-overflow
     /// Display maps through `classify_store_error` to the fatal
     /// `CapacityExceeded` variant, while an unrelated error stays `Rejected`.
     /// This exercises the exact mapping the `create_node` / `persist_indexes`
