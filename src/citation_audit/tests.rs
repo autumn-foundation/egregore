@@ -283,6 +283,7 @@ fn log_source_node(id: &str, path: &str, hash: &str) -> GraphRecord {
         source_format_version: "plain-v1".to_owned(),
         source_artifact_hash: hash.to_owned(),
         line_count: 10,
+        repository_id: String::new(),
     }))
 }
 
@@ -305,6 +306,7 @@ fn error_signature_node(id: &str) -> GraphRecord {
             first_seen: "2026-01-02T12:00:00Z".to_owned(),
             last_seen: "2026-01-02T13:00:00Z".to_owned(),
             frames: None,
+            repository_id: String::new(),
         },
     ))
 }
@@ -1445,6 +1447,8 @@ fn occurrence_bucket_node(id: &str, bucket_start: &str) -> GraphRecord {
             bucket_width: "1h".to_owned(),
             occurrence_count: 3,
             source_id: "log:v2:fixture-source".to_owned(),
+            repository_id: String::new(),
+            occurrence_timestamps: Vec::new(),
         },
     ))
 }

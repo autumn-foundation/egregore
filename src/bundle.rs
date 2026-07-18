@@ -923,6 +923,7 @@ mod tests {
             first_seen: "2026-03-02T09:00:00Z".to_owned(),
             last_seen: "2026-03-02T10:00:00Z".to_owned(),
             frames: None,
+            repository_id: String::new(),
         }))
     }
 
@@ -941,6 +942,7 @@ mod tests {
             source_format_version: "plain-v1".to_owned(),
             source_artifact_hash: hash.to_owned(),
             line_count: 10,
+            repository_id: String::new(),
         }))
     }
 

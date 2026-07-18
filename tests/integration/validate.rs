@@ -131,14 +131,14 @@ fn orphan_node_line(id: &str, summary: &str) -> String {
 }
 
 /// A minimal log-domain node line (issue #319 kinds). Log-domain records use
-/// `LOG_SCHEMA_VERSION` (2 since issue #361). The validator inspects only
+/// `LOG_SCHEMA_VERSION` (3 since issues #362/#364). The validator inspects only
 /// `id`/`kind`/`repo_relative_path`/`span`; the `log` payload is optional.
 fn log_node_line(id: &str, kind: &str, summary: &str) -> String {
     serde_json::json!({
         "record_type": "node",
         "id": id,
         "kind": kind,
-        "schema_version": 2,
+        "schema_version": 3,
         "repo_relative_path": "app.log",
         "span": {"start_byte": 0, "end_byte": 10, "start_line": 1, "end_line": 1},
         "name": kind,
@@ -149,12 +149,12 @@ fn log_node_line(id: &str, kind: &str, summary: &str) -> String {
 
 /// A log-domain edge line. Log edge labels (`FINGERPRINTED_AS`, `CAPTURED_FROM`,
 /// `AGGREGATES`, `FRAME_RESOLVES_TO`, `EMITTED_DURING`) resolve to the log
-/// domain, so their records carry `LOG_SCHEMA_VERSION` (2 since issue #361).
+/// domain, so their records carry `LOG_SCHEMA_VERSION` (3 since issues #362/#364).
 fn log_edge_line(id: &str, label: &str, source: &str, target: &str) -> String {
     serde_json::json!({
         "record_type": "edge",
         "id": id,
-        "schema_version": 2,
+        "schema_version": 3,
         "label": label,
         "source": source,
         "target": target,

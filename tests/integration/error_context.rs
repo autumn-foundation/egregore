@@ -140,6 +140,7 @@ fn error_signature(
         first_seen: first_seen.to_owned(),
         last_seen: last_seen.to_owned(),
         frames,
+        repository_id: String::new(),
     }))
     .with_valid_time(first_seen, "log_event_timestamp");
     (id, node)
@@ -161,6 +162,7 @@ fn log_source(anchor: &str, path: &str, hash: &str) -> (String, GraphRecord) {
         source_format_version: "plain-v1".to_owned(),
         source_artifact_hash: hash.to_owned(),
         line_count: 1,
+        repository_id: String::new(),
     }));
     (id, node)
 }
@@ -227,6 +229,8 @@ fn bucket_with_source(
             bucket_width: "1h".to_owned(),
             occurrence_count: count,
             source_id: source_id.to_owned(),
+            repository_id: String::new(),
+            occurrence_timestamps: Vec::new(),
         },
     ))
     .with_valid_time(bucket_start, "log_event_timestamp");
@@ -489,7 +493,7 @@ fn well_formed_absent_signature_id_is_no_match() {
 fn resolves_unique_fingerprint_prefix() {
     let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 3, None);
     let records = vec![sig];
-    let hex = sig_id.strip_prefix("log:v2:").unwrap();
+    let hex = sig_id.strip_prefix("log:v3:").unwrap();
     let prefix = &hex[..12]; // long enough to be unique
     let ctx = error_context(
         &records,
@@ -519,7 +523,7 @@ fn ambiguous_prefix_fixture() -> (Vec<GraphRecord>, String, Vec<String>) {
     }
     let mut by_first: BTreeMap<char, Vec<String>> = BTreeMap::new();
     for id in &ids {
-        let hex = id.strip_prefix("log:v2:").unwrap();
+        let hex = id.strip_prefix("log:v3:").unwrap();
         let first = hex.chars().next().unwrap();
         by_first.entry(first).or_default().push(id.clone());
     }
@@ -529,7 +533,7 @@ fn ambiguous_prefix_fixture() -> (Vec<GraphRecord>, String, Vec<String>) {
         .expect("20 signatures over 16 hex digits must collide on a first digit");
     let mut candidates: Vec<String> = ids
         .iter()
-        .filter(|id| id.strip_prefix("log:v2:").unwrap().starts_with(*first))
+        .filter(|id| id.strip_prefix("log:v3:").unwrap().starts_with(*first))
         .cloned()
         .collect();
     candidates.sort();

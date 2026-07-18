@@ -247,7 +247,7 @@ pub fn is_known_record_version(version: &RecordVersion) -> bool {
         "project" => version.version == PROJECT_SCHEMA_VERSION,
         "semantic" => version.version == SEMANTIC_SCHEMA_VERSION,
         "user_context" => version.version == USER_CONTEXT_SCHEMA_VERSION,
-        "log" => version.version == LOG_SCHEMA_VERSION,
+        "log" => (2..=LOG_SCHEMA_VERSION).contains(&version.version),
         _ => false,
     }
 }

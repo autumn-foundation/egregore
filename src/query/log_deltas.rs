@@ -81,26 +81,30 @@
 //! (bucket → signature) edges (issue #320). For a signature with at least one
 //! linked bucket:
 //!
-//! * `base_window_occurrences` = sum of bucket counts whose `bucket_start`
-//!   is `<= commit_valid_time[base]`;
-//! * `head_window_occurrences` = sum of bucket counts whose `bucket_start`
-//!   is `<= commit_valid_time[head]`.
+//! * `base_window_occurrences` = occurrences at or before `commit_valid_time[base]`;
+//! * `head_window_occurrences` = occurrences at or before `commit_valid_time[head]`.
 //!
-//! These per-window counts are HOUR-BUCKET-GRANULAR, not endpoint-exact (Codex
-//! P2). A `LogOccurrenceBucket` carries only an hour-aligned `bucket_start` and
-//! an aggregate count — no per-occurrence timestamps (issue #320) — so a bucket
-//! straddling the base/head commit instant cannot be sub-divided at that instant.
-//! Including a bucket whenever `bucket_start <= endpoint` therefore counts the
-//! WHOLE hour, which may pull in occurrences up to one bucket width (1 hour) past
-//! the exact commit instant when the endpoint falls mid-hour. This is disclosed,
-//! not silently absorbed: the response carries `occurrence_count_granularity ==
-//! "hourly_bucket"` ([`OCCURRENCE_COUNT_GRANULARITY`]) and the always-present
-//! disclaimer states it. The alternative "fully-before" predicate
-//! (`bucket_start + width <= endpoint`) would UNDER-count by dropping pre-endpoint
-//! occurrences in the same partial bucket — trading over-count for under-count
-//! with no honesty gain — so disclosure is preferred over changing the predicate.
-//! Endpoint-exact counts would require sub-hour per-occurrence timestamps the
-//! bucket model does not retain.
+//! Since issue #364 (schema v3) a `LogOccurrenceBucket` carries the sorted
+//! per-occurrence `occurrence_timestamps` that fell in its hour, so a bucket
+//! straddling the base/head commit instant CAN be sub-divided: the per-window
+//! count is the number of timestamps at or before the endpoint instant — bounded
+//! precisely at the commit instant even when the endpoint falls mid-hour. When
+//! every contributing bucket carries timestamps the response reports
+//! `occurrence_count_granularity == "endpoint_exact"`
+//! ([`OCCURRENCE_COUNT_GRANULARITY_ENDPOINT_EXACT`]) and the endpoint-exact
+//! disclaimer.
+//!
+//! A legacy `log:v2:` bucket carries no timestamps (they deserialize empty), so it
+//! FALLS BACK to the hour-bucket predicate — its whole `occurrence_count` is summed
+//! whenever `bucket_start <= endpoint`, which may pull in occurrences up to one
+//! bucket width (1 hour) past the exact instant. The granularity marker is
+//! PER-RESPONSE: a response degrades to `occurrence_count_granularity ==
+//! "hourly_bucket"` ([`OCCURRENCE_COUNT_GRANULARITY`]) and the legacy
+//! hour-bucket disclaimer the moment ANY contributing bucket falls back, honestly
+//! disclosing the mixed/legacy case rather than fabricating sub-hour precision. The
+//! "fully-before" predicate (`bucket_start + width <= endpoint`) was rejected for
+//! the fallback because it would UNDER-count by dropping pre-endpoint occurrences.
+//! Re-run `eg scan-logs` to regenerate buckets under schema v3 for exact counts.
 //!
 //! These per-window counts SUM every DISTINCT linked bucket across the coalesced
 //! group, deduped by bucket record ID (issue #361, source-aware identity). A
@@ -130,104 +134,109 @@ use chrono::{DateTime, Utc};
 
 use super::RepositoryIndex;
 use super::deltas::{RangeDeltasError, resolve_commit_range};
-use crate::ir::{
-    EdgeLabel, ErrorSignaturePayload, GraphRecord, LogPayload, NodeKind, parse_codegraph_id,
-};
+use crate::ir::{EdgeLabel, ErrorSignaturePayload, GraphRecord, LogPayload, NodeKind};
 
-/// Always-present advisory label for [`log_deltas`] responses.
+/// Advisory disclaimer for [`log_deltas`] responses that fell back to hour-bucket
+/// granularity (issue #364).
+///
+/// Emitted when at least one contributing bucket is a legacy `log:v2:` record
+/// carrying no per-occurrence timestamps. Selected at response build time; see
+/// [`LOG_DELTAS_DISCLAIMER_ENDPOINT_EXACT`] for the fully-attributed case.
 pub const LOG_DELTAS_DISCLAIMER: &str = "Rows are runtime error-signature observations classified \
      against the commit range's valid-time window. A signature first observed in-range is a \
      regression LEAD, not proof this range caused it; a ceased signature is not proof of a fix; \
      occurrence data only reflects the log sources that were scanned (a sampling artifact), never \
      the complete runtime behavior of the system. Per-window occurrence counts \
      (`base_window_occurrences`/`head_window_occurrences`) are hour-bucket-granular, not \
-     endpoint-exact: they sum every hourly `LogOccurrenceBucket` whose start is at or before the \
-     endpoint, so when the endpoint falls mid-hour a count may include occurrences up to one \
-     bucket width (1 hour) past the exact commit instant; endpoint-exact counts would require \
-     per-occurrence timestamps the bucket model does not retain.";
+     endpoint-exact: at least one contributing `LogOccurrenceBucket` is a legacy record carrying \
+     no per-occurrence timestamps, so its whole hourly bucket is summed whenever its start is at \
+     or before the endpoint, and when the endpoint falls mid-hour a count may include occurrences \
+     up to one bucket width (1 hour) past the exact commit instant. Re-run `eg scan-logs` to \
+     regenerate the buckets under schema v3 (issue #364) for endpoint-exact counts.";
 
-/// Machine-readable granularity marker for the per-window occurrence counts.
+/// Advisory disclaimer for [`log_deltas`] responses with endpoint-exact counts
+/// (issue #364).
 ///
-/// `LogOccurrenceBucket` records carry only an hour-aligned `bucket_start` and an
-/// aggregate count — no per-occurrence timestamps (issue #320) — so a bucket
-/// straddling the base/head commit instant cannot be sub-divided. The per-window
-/// sums are therefore hour-bucket-granular: [`window_bucket_sum`] includes every
-/// bucket whose start is at/before the endpoint, which may pull in occurrences up
-/// to one bucket width past the exact instant when the endpoint falls mid-hour.
-/// This constant discloses that semantics without fabricating sub-hour precision.
+/// Emitted when every contributing `LogOccurrenceBucket` carries per-occurrence
+/// timestamps (schema v3), so a count includes only occurrences at or before the
+/// exact commit instant even when the endpoint falls mid-hour. Selected at response
+/// build time; the legacy hour-bucket wording is [`LOG_DELTAS_DISCLAIMER`].
+pub const LOG_DELTAS_DISCLAIMER_ENDPOINT_EXACT: &str = "Rows are runtime error-signature \
+     observations classified against the commit range's valid-time window. A signature first \
+     observed in-range is a regression LEAD, not proof this range caused it; a ceased signature is \
+     not proof of a fix; occurrence data only reflects the log sources that were scanned (a \
+     sampling artifact), never the complete runtime behavior of the system. Per-window occurrence \
+     counts (`base_window_occurrences`/`head_window_occurrences`) are endpoint-exact: every \
+     contributing `LogOccurrenceBucket` carries per-occurrence timestamps (schema v3, issue #364), \
+     so a count includes only occurrences at or before the exact commit instant, even when the \
+     endpoint falls mid-hour.";
+
+/// Granularity marker for hour-bucket-granular per-window occurrence counts.
+///
+/// Emitted when at least one contributing bucket is a legacy `log:v2:` record with
+/// no per-occurrence timestamps, so its whole hourly bucket is summed and a
+/// mid-hour endpoint may over-count by up to one bucket width. The marker is
+/// PER-RESPONSE and conditional (issue #364): a response reports
+/// [`OCCURRENCE_COUNT_GRANULARITY_ENDPOINT_EXACT`] when every contributing bucket
+/// carried timestamps (or no buckets contributed), and this value otherwise.
 pub const OCCURRENCE_COUNT_GRANULARITY: &str = "hourly_bucket";
 
-/// Envelope caveat text emitted with `--repo` when the store holds a single
-/// distinct `Repository` node.
+/// Granularity marker for endpoint-exact per-window occurrence counts.
 ///
-/// This message NEVER asserts log isolation or repo-specificity from that count.
-/// Log records add no `Repository` node (their repository ID is only hashed into
-/// their stable IDs), so a `Repository`-node count of one does NOT mean the store
-/// is repo-isolated for log signatures: the store can still hold a second
-/// repository's log graph — repo-A history plus a repo-B `scan-logs` graph — whose
-/// unattributable in-window signatures are classified here regardless of `--repo`.
-pub const LOG_REPO_SCOPE_SINGLE_CAVEAT: &str = "`--repo` scopes only the code side (commit/window \
-     resolution and the symbol-delta join). Log signatures are NOT repository-filtered: log records \
-     carry no retrievable repository attribution — they add no `Repository` node and the \
-     repository ID is only hashed into their stable IDs — so a `--repo`-scoped run cannot be \
-     guaranteed repo-specific for log signatures. The store may hold log records from other \
-     repositories that carry no retrievable attribution and are still classified here regardless \
-     of `--repo`. Per-repository log isolation requires per-repository stores.";
+/// Emitted when every contributing `LogOccurrenceBucket` carries per-occurrence
+/// timestamps (schema v3, issue #364), so each count is bounded precisely at the
+/// commit instant. Also reported (vacuously) when no bucket contributed a
+/// per-window count. See [`OCCURRENCE_COUNT_GRANULARITY`].
+pub const OCCURRENCE_COUNT_GRANULARITY_ENDPOINT_EXACT: &str = "endpoint_exact";
 
-/// Envelope caveat text emitted with `--repo` when the store holds MORE THAN ONE
-/// distinct `Repository` node.
+/// Residual repository-scope caveat text emitted with `--repo` (issue #362).
 ///
-/// Same honest base disclosure as [`LOG_REPO_SCOPE_SINGLE_CAVEAT`] — a scoped run
-/// is never guaranteed repo-specific for log signatures at any count — with an
-/// added note that the store demonstrably holds multiple `Repository` nodes, a
-/// higher KNOWN cross-repository bleed risk. Neither variant claims isolation.
-pub const LOG_REPO_SCOPE_MULTI_CAVEAT: &str = "`--repo` scopes only the code side (commit/window \
-     resolution and the symbol-delta join). Log signatures are NOT repository-filtered: log records \
-     carry no retrievable repository attribution — they add no `Repository` node and the \
-     repository ID is only hashed into their stable IDs — so a `--repo`-scoped run cannot be \
-     guaranteed repo-specific for log signatures. The store may hold log records from other \
-     repositories that carry no retrievable attribution and are still classified here regardless \
-     of `--repo`. This store additionally holds MULTIPLE distinct `Repository` nodes, so the known \
-     cross-repository bleed risk is higher. Per-repository log isolation requires per-repository \
-     stores.";
+/// Emitted when the store holds at least one legacy `log:v2:` log signature that
+/// carries no persisted repository attribution and was therefore excluded from the
+/// scoped run. Since issue #362 (schema v3) persisted `repository_id` on every log payload,
+/// `--repo` filters log signatures by their attribution: a signature attributed
+/// to a different repository is soundly excluded. The ONLY residual honesty gap is
+/// a legacy `log:v2:` record whose `repository_id` deserializes empty: it cannot
+/// be proven to belong to the scoped repository, so it is EXCLUDED (conservative,
+/// possible under-report) rather than bled in (never a cross-repository false
+/// lead). This message discloses that residual and never claims full isolation or
+/// a guaranteed-complete scoped result. The excluded count rides the caveat's
+/// `excluded_unattributed_signature_count` field.
+pub const LOG_REPO_SCOPE_RESIDUAL_CAVEAT: &str = "`--repo` now filters log signatures by their \
+     persisted repository attribution (schema v3, issue #362): a signature attributed to a \
+     different repository is excluded. This store additionally holds legacy log signatures (schema \
+     v2, see `excluded_unattributed_signature_count`) that carry NO persisted repository \
+     attribution; because they cannot be proven to belong to the scoped repository, they were \
+     EXCLUDED from this scoped run rather than bled in. This is a conservative exclusion — the \
+     scoped result may UNDER-report for those legacy records until they are re-scanned — never a \
+     cross-repository bleed and never a full-isolation guarantee. Re-run `eg scan-logs` to \
+     regenerate them under schema v3 with retrievable attribution, or keep per-repository stores.";
 
-/// Advisory disclosure attached to a [`LogDeltas`] response whenever `--repo`
-/// scopes the query, stating that log signatures are never repository-filtered.
+/// Residual repository-scope disclosure attached to a [`LogDeltas`] response
+/// (issue #362, schema v3).
 ///
-/// `--repo` scopes only the CODE side (commit/window resolution and the
-/// symbol-delta join). Because log records carry no retrievable repository
-/// attribution, every in-window signature is always classified regardless of
-/// `--repo`; the query cannot separate one repository's log signatures from
-/// another's. This field surfaces that limitation in the machine-readable
-/// envelope (not only the docs).
-///
-/// The `message` NEVER derives isolation or repo-specificity from the
-/// `Repository`-node count. Log records add no `Repository` node, so
-/// `distinct_repository_count == 1` does NOT mean the store is repo-isolated for
-/// log signatures — a store can hold repo-A history (one `Repository` node) plus
-/// a repo-B `scan-logs` graph (no `Repository` node) whose in-window signatures
-/// still classify here. `distinct_repository_count` and `multi_repository_store`
-/// remain honest INFORMATIONAL fields (raw counts of `Repository` nodes); the
-/// multi-repository case only ADDS a note about a higher KNOWN bleed risk, never
-/// downgrading the single-count message to "safe". It is present only when
-/// `--repo` is set; both variants carry the same isolation-free base disclosure.
+/// Since `repository_id` is persisted on every log payload, `--repo` now filters
+/// log signatures by their attribution: a signature attributed to a different
+/// repository is soundly excluded, so the former "logs are never
+/// repository-filtered" caveat no longer applies. The ONLY residual honesty gap is
+/// a legacy `log:v2:` signature whose `repository_id` deserializes empty: it
+/// cannot be proven to belong to the scoped repository, so it is EXCLUDED from a
+/// scoped run rather than bled in. This caveat is emitted ONLY when `--repo` is set
+/// AND at least one such legacy signature was actually excluded, disclosing that
+/// conservative exclusion (possible under-report, never a cross-repository bleed)
+/// and pointing to a re-scan remedy. A fully schema-v3 store (every log signature
+/// attributed) carries NO caveat — the scoped filtering is sound.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LogRepoScopeCaveat {
-    /// The repository selector that was applied to the code side.
+    /// The repository selector that was applied.
     pub repo_scope: String,
-    /// Informational count of distinct `Repository` NODES present in the store
-    /// (schema-version duplicates of one repository collapsed). NOT a bleed-risk
-    /// verdict: log records add no `Repository` node, so a count of one never
-    /// implies log isolation. `> 1` only means multiple repositories are
-    /// demonstrably present — a higher KNOWN cross-repository bleed risk.
-    pub distinct_repository_count: usize,
-    /// Informational: true when the store holds more than one distinct
-    /// `Repository` node. Never gates an isolation claim (see the type doc).
-    pub multi_repository_store: bool,
-    /// Fixed advisory text. [`LOG_REPO_SCOPE_SINGLE_CAVEAT`] when a single
-    /// `Repository` node is present, [`LOG_REPO_SCOPE_MULTI_CAVEAT`] (same base
-    /// disclosure plus a higher-known-risk note) for multiple. Neither variant
-    /// asserts log isolation or repo-specificity.
+    /// Count of legacy (schema v2, empty `repository_id`) log signatures that
+    /// could not be attributed and were EXCLUDED from this scoped run. Always
+    /// `> 0` when this caveat is present (the caveat is omitted otherwise).
+    pub excluded_unattributed_signature_count: usize,
+    /// Fixed advisory text ([`LOG_REPO_SCOPE_RESIDUAL_CAVEAT`]). Discloses the
+    /// conservative exclusion of unattributed legacy signatures and the re-scan
+    /// remedy; never claims full isolation or a guaranteed-complete result.
     pub message: &'static str,
 }
 
@@ -379,18 +388,26 @@ pub struct LogDeltas {
     pub window: LogDeltaWindow,
     /// Number of commits in the range (reachable from head, not from base).
     pub range_commit_count: usize,
-    /// Always-present advisory disclaimer ([`LOG_DELTAS_DISCLAIMER`]).
+    /// Always-present advisory disclaimer, selected per-response:
+    /// [`LOG_DELTAS_DISCLAIMER_ENDPOINT_EXACT`] when every contributing bucket
+    /// carried per-occurrence timestamps, [`LOG_DELTAS_DISCLAIMER`] (the legacy
+    /// hour-bucket wording) when at least one fell back (issue #364).
     pub disclaimer: &'static str,
-    /// Always-present granularity marker for the per-window occurrence counts
-    /// ([`OCCURRENCE_COUNT_GRANULARITY`], `"hourly_bucket"`): `base_window_occurrences`
-    /// / `head_window_occurrences` are hour-bucket-granular, not endpoint-exact.
-    /// The bucket model (issue #320) retains no per-occurrence timestamps, so a
-    /// bucket straddling a commit instant cannot be sub-divided; a count may include
-    /// occurrences up to one bucket width (1 hour) past the exact endpoint.
+    /// Always-present granularity marker for the per-window occurrence counts,
+    /// PER-RESPONSE and conditional (issue #364):
+    /// [`OCCURRENCE_COUNT_GRANULARITY_ENDPOINT_EXACT`] (`"endpoint_exact"`) when
+    /// every contributing `LogOccurrenceBucket` carried per-occurrence timestamps
+    /// (schema v3), so `base_window_occurrences`/`head_window_occurrences` are
+    /// bounded precisely at the commit instant; [`OCCURRENCE_COUNT_GRANULARITY`]
+    /// (`"hourly_bucket"`) when at least one contributing bucket was a legacy
+    /// `log:v2:` record with no timestamps, so a count may include occurrences up
+    /// to one bucket width (1 hour) past the exact endpoint.
     pub occurrence_count_granularity: &'static str,
-    /// Repository-scope caveat, present only when `--repo` is set (issue #326
-    /// follow-on): log signatures are never repository-filtered — see
-    /// [`LogRepoScopeCaveat`]. Absent (omitted from JSON) for unscoped queries.
+    /// Residual repository-scope caveat (issue #362, schema v3), present only when
+    /// `--repo` is set AND at least one legacy unattributed (`log:v2:`) signature
+    /// was excluded from the scoped run — see [`LogRepoScopeCaveat`]. A
+    /// fully-schema-v3 store (every log signature attributed) carries NO caveat:
+    /// `--repo` filters log signatures soundly. Absent for unscoped queries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_scope_caveat: Option<LogRepoScopeCaveat>,
     /// Embedded-store retention caveat, present only when the query ran over the
@@ -454,33 +471,23 @@ pub fn log_deltas(
     repo_scope: Option<&str>,
     embedded_source: bool,
 ) -> Result<LogDeltas, RangeDeltasError> {
-    // Repository scoping mirrors `range_deltas` for the CODE side only: in a
-    // shared store two repositories can carry the same commit SHA, so commit
-    // resolution, the valid-time window, and the symbol-delta join are gated by
-    // owning repository when a scope is set.
+    // Repository scoping mirrors `range_deltas` for the CODE side: in a shared
+    // store two repositories can carry the same commit SHA, so commit resolution,
+    // the valid-time window, and the symbol-delta join are gated by owning
+    // repository when a scope is set.
     //
-    // Log-domain records (`ErrorSignature`, `LogOccurrenceBucket`, and the
-    // `AGGREGATES` / `FRAME_RESOLVES_TO` edges keyed on their IDs) carry NO
-    // retrievable repository attribution: `scan-logs` only hashes the repository
-    // ID into the stable record IDs (see `log_stable_id` / `scan_log_records`)
-    // and never stores it on any payload, node, or edge field, so
-    // `RepositoryIndex::owner_of(<signature-id>)` is always `None`. Filtering
-    // signatures by `--repo` would therefore drop EVERY signature and return
-    // empty groups even for the correct repository (Codex P2). Because log nodes
-    // cannot be attributed, `--repo` scopes only the code side (commit/window
-    // resolution and the symbol-delta join); all log signatures are included.
-    //
-    // A scoped run over a SHARED multi-repository store can consequently surface
-    // an unrelated repository's in-window signature as if it were repo-scoped
-    // (Codex P2, `src/query/log_deltas.rs:421`). We DIAGNOSE rather than reject:
-    // rejecting `--repo` when logs are present would break the common
-    // single-repository store, where including every signature is correct.
-    // Instead the response envelope carries `repo_scope_caveat` whenever `--repo`
-    // is set, disclosing that logs are unfiltered and ELEVATING the message when
-    // the store holds more than one distinct `Repository` node (see the caveat
-    // construction near the return). The schema-level fix — persisting repository
-    // attribution on log records — is tracked in issue #362. This limitation is
-    // documented in `docs/cli/log-deltas.md`.
+    // Since issue #362 (schema v3) persisted a retrievable `repository_id` on
+    // every log payload, `RepositoryIndex::owner_of(<signature-id>)` now RESOLVES,
+    // so `--repo` also SOUNDLY filters the log side: a signature attributed to a
+    // different repository is excluded (the cross-repository false-lead that #326
+    // could only disclose). The one residual honesty gap is a legacy `log:v2:`
+    // signature whose `repository_id` deserializes empty (serde default): it
+    // cannot be proven to belong to the scoped repository, so it is EXCLUDED from a
+    // scoped run rather than bled in — a conservative under-report, never a bleed.
+    // When at least one such legacy signature is excluded, the response envelope
+    // carries `repo_scope_caveat` (see the caveat construction near the return)
+    // pointing to a re-scan remedy; a fully-schema-v3 store carries no caveat.
+    // Documented in `docs/cli/log-deltas.md` and issue #362.
     let repo_index = repo_scope.map(|_| RepositoryIndex::build(records));
     let in_scope = |id: &str| -> bool {
         match (repo_scope, repo_index.as_ref()) {
@@ -590,7 +597,12 @@ pub fn log_deltas(
     // of identical bytes mints the SAME bucket ID (byte-identical → collapsed here).
     // Iterating NODES and deduping by record ID therefore counts each real
     // observation exactly once and no longer double-counts a concatenated rescan.
-    let mut buckets_by_sig: BTreeMap<&str, Vec<(&str, u64)>> = BTreeMap::new();
+    // Each linked bucket carries its hour-aligned `bucket_start`, aggregate
+    // `occurrence_count`, and (schema v3, issue #364) the sorted per-occurrence
+    // `occurrence_timestamps` that let [`window_bucket_sum`] bound a per-window
+    // count endpoint-exactly. A legacy `log:v2:` bucket deserializes empty
+    // timestamps and falls back to the hour-bucket predicate.
+    let mut buckets_by_sig: BTreeMap<&str, Vec<BucketWindow>> = BTreeMap::new();
     let mut seen_bucket_ids: BTreeSet<&str> = BTreeSet::new();
     for r in records {
         if let GraphRecord::Node {
@@ -605,10 +617,11 @@ pub fn log_deltas(
                 }
                 if let Some(sigs) = bucket_targets.get(r.id()) {
                     for sig in sigs {
-                        buckets_by_sig
-                            .entry(*sig)
-                            .or_default()
-                            .push((bucket.bucket_start.as_str(), bucket.occurrence_count));
+                        buckets_by_sig.entry(*sig).or_default().push(BucketWindow {
+                            bucket_start: bucket.bucket_start.as_str(),
+                            occurrence_count: bucket.occurrence_count,
+                            occurrence_timestamps: &bucket.occurrence_timestamps,
+                        });
                     }
                 }
             }
@@ -628,6 +641,10 @@ pub fn log_deltas(
     // row per stable signature ID is emitted. `schema_version` and `severity` are
     // identity-derived, hence identical within a group.
     let mut sig_groups: BTreeMap<&str, Vec<(u32, &ErrorSignaturePayload)>> = BTreeMap::new();
+    // Legacy (`log:v2:`) signatures excluded from a scoped run because they carry
+    // no persisted `repository_id` and cannot be proven in-repo (issue #362).
+    // Deduped by stable ID so a coalesced group counts once.
+    let mut excluded_unattributed: BTreeSet<&str> = BTreeSet::new();
     for r in records {
         let GraphRecord::Node {
             id,
@@ -639,12 +656,26 @@ pub fn log_deltas(
         else {
             continue;
         };
-        // No `in_scope` gate on the signature: log records carry no retrievable
-        // repository attribution, so `--repo` scopes only the code side (Codex
-        // P2). See the module-level scoping note above.
         let LogPayload::ErrorSignature(sig) = payload.as_ref() else {
             continue;
         };
+        // #362 repository filtering: `repository_id` (schema v3) makes the log side
+        // attributable, so `--repo` filters signatures soundly. A signature
+        // attributed to a DIFFERENT repository is excluded (the cross-repository
+        // false lead #326 could only disclose). A legacy `log:v2:` signature with
+        // an empty `repository_id` cannot be proven in-repo, so it is EXCLUDED
+        // (conservative under-report, never a bleed) and tallied for the residual
+        // caveat. `owner_of` reads the persisted `repository_id`, remapped to the
+        // highest-version `Repository` id exactly like the `--repo` selector.
+        if let (Some(scope), Some(index)) = (repo_scope, repo_index.as_ref()) {
+            if sig.repository_id.is_empty() {
+                excluded_unattributed.insert(id.as_str());
+                continue;
+            }
+            if index.owner_of(id.as_str()) != Some(scope) {
+                continue;
+            }
+        }
         sig_groups
             .entry(id.as_str())
             .or_default()
@@ -657,6 +688,13 @@ pub fn log_deltas(
     let mut new_signatures: Vec<LogSignatureDelta> = Vec::new();
     let mut ceased_signatures: Vec<LogSignatureDelta> = Vec::new();
     let mut continuing_signatures: Vec<LogSignatureDelta> = Vec::new();
+
+    // Per-response granularity flag (issue #364): stays true while every
+    // contributing bucket carries per-occurrence timestamps (endpoint-exact) and
+    // flips false the first time any window sum falls back to a legacy `log:v2:`
+    // hour-bucket. A response with no contributing buckets stays true (vacuously
+    // endpoint-exact — there are no hour-granular approximations to disclose).
+    let mut all_buckets_endpoint_exact = true;
 
     for (id, group) in &sig_groups {
         // Merged valid-time bounds: earliest first_seen and latest last_seen
@@ -703,11 +741,21 @@ pub fn log_deltas(
         // bucket IDs whose per-source counts each sum in; a genuine rescan of
         // identical bytes mints the SAME bucket ID and was collapsed above, so
         // concatenating an identical scan-logs output no longer double-counts.
+        // Each `window_bucket_sum` reports whether it was fully endpoint-exact
+        // (no legacy hour-bucket fallback); the response-level flag is the AND
+        // across both endpoints of every bucketed signature (issue #364).
         let (occurrence_source, base_window, head_window) = match buckets_by_sig.get(*id) {
             Some(buckets) if !buckets.is_empty() => {
-                let base_sum = base_instant.map(|bt| window_bucket_sum(buckets, bt));
-                let head_sum = head_instant.map(|ht| window_bucket_sum(buckets, ht));
-                ("occurrence_buckets", base_sum, head_sum)
+                let base = base_instant.map(|bt| window_bucket_sum(buckets, bt));
+                let head = head_instant.map(|ht| window_bucket_sum(buckets, ht));
+                if base.is_some_and(|(_, exact)| !exact) || head.is_some_and(|(_, exact)| !exact) {
+                    all_buckets_endpoint_exact = false;
+                }
+                (
+                    "occurrence_buckets",
+                    base.map(|(sum, _)| sum),
+                    head.map(|(sum, _)| sum),
+                )
             }
             _ => ("aggregate_only", None, None),
         };
@@ -766,32 +814,20 @@ pub fn log_deltas(
         });
     }
 
-    // Repository-scope caveat: whenever `--repo` is set, disclose in the
-    // envelope that log signatures are NOT repository-filtered (they carry no
-    // retrievable attribution) and that a scoped run can never be guaranteed
-    // repo-specific for log signatures — regardless of the `Repository`-node
-    // count, because log records add no `Repository` node (a store can hold one
-    // repository's history plus another's log graph and still count one). The
-    // multi-repository message ADDS a higher-known-risk note; it never downgrades
-    // the single-count message to "safe". The count collapses schema-version
-    // duplicates of one repository, mirroring the `RepositoryIndex` version
-    // remap, and is INFORMATIONAL only. Deterministic: fixed strings, no wall
-    // clock. See docs/cli/log-deltas.md and issue #362.
-    let repo_scope_caveat = match (repo_scope, repo_index.as_ref()) {
-        (Some(scope), Some(index)) => {
-            let distinct_repository_count = distinct_repository_count(index);
-            let multi_repository_store = distinct_repository_count > 1;
-            Some(LogRepoScopeCaveat {
-                repo_scope: scope.to_owned(),
-                distinct_repository_count,
-                multi_repository_store,
-                message: if multi_repository_store {
-                    LOG_REPO_SCOPE_MULTI_CAVEAT
-                } else {
-                    LOG_REPO_SCOPE_SINGLE_CAVEAT
-                },
-            })
-        }
+    // Residual repository-scope caveat (issue #362, schema v3): `--repo` now
+    // filters log signatures soundly by their persisted `repository_id`, so the
+    // former "logs are never repository-filtered" disclosure is gone. The ONLY
+    // residual honesty gap is a legacy `log:v2:` signature with an empty
+    // `repository_id` that was EXCLUDED because it could not be proven in-repo
+    // (tallied above). Emit the caveat ONLY when at least one such legacy signature
+    // was excluded; a fully-schema-v3 scoped store carries no caveat. Fixed string
+    // + a determined count — byte-stable, no wall clock. See docs/cli/log-deltas.md.
+    let repo_scope_caveat = match repo_scope {
+        Some(scope) if !excluded_unattributed.is_empty() => Some(LogRepoScopeCaveat {
+            repo_scope: scope.to_owned(),
+            excluded_unattributed_signature_count: excluded_unattributed.len(),
+            message: LOG_REPO_SCOPE_RESIDUAL_CAVEAT,
+        }),
         _ => None,
     };
 
@@ -825,34 +861,22 @@ pub fn log_deltas(
             window_end,
         },
         range_commit_count: range.range_commit_shas.len(),
-        disclaimer: LOG_DELTAS_DISCLAIMER,
-        occurrence_count_granularity: OCCURRENCE_COUNT_GRANULARITY,
+        disclaimer: if all_buckets_endpoint_exact {
+            LOG_DELTAS_DISCLAIMER_ENDPOINT_EXACT
+        } else {
+            LOG_DELTAS_DISCLAIMER
+        },
+        occurrence_count_granularity: if all_buckets_endpoint_exact {
+            OCCURRENCE_COUNT_GRANULARITY_ENDPOINT_EXACT
+        } else {
+            OCCURRENCE_COUNT_GRANULARITY
+        },
         repo_scope_caveat,
         embedded_log_retention_caveat,
         new_signatures,
         ceased_signatures,
         continuing_signatures,
     })
-}
-
-/// Counts the distinct repositories a [`RepositoryIndex`] knows, collapsing the
-/// schema-version duplicates of one repository into a single count.
-///
-/// A repository re-scanned under a newer schema version mints a new
-/// `Repository` record whose stable-ID suffix (identity) is unchanged; grouping
-/// by that suffix mirrors the index's own highest-version remap so a versioned
-/// re-scan is not miscounted as two repositories. An ID that does not parse as a
-/// code-graph handle counts as its own distinct repository (defensive — real
-/// `Repository` IDs are always code-graph handles).
-fn distinct_repository_count(index: &RepositoryIndex) -> usize {
-    let mut identities: BTreeSet<String> = BTreeSet::new();
-    for id in index.repository_ids() {
-        match parse_codegraph_id(id) {
-            Some((_, suffix)) => identities.insert(suffix.to_owned()),
-            None => identities.insert(id.to_owned()),
-        };
-    }
-    identities.len()
 }
 
 /// Parses an RFC 3339 timestamp to a UTC instant for ordering, or `None` when it
@@ -951,18 +975,53 @@ fn classify(
     }
 }
 
-/// Sums the occurrence counts of the linked buckets whose `bucket_start` instant
-/// is at or before `endpoint` (the endpoint's committer date as a UTC instant).
+/// One linked occurrence bucket's window-relevant fields.
+#[derive(Debug, Clone, Copy)]
+struct BucketWindow<'a> {
+    /// Hour-aligned RFC 3339 UTC bucket start.
+    bucket_start: &'a str,
+    /// Aggregate occurrences in the bucket (used only for the legacy fallback).
+    occurrence_count: u64,
+    /// Sorted per-occurrence RFC 3339 UTC valid times (schema v3, issue #364).
+    /// Empty for a legacy `log:v2:` bucket.
+    occurrence_timestamps: &'a [String],
+}
+
+/// Sums the occurrences of the linked buckets that fall at or before `endpoint`
+/// (the endpoint's committer date as a UTC instant), returning the sum and
+/// whether the sum was fully ENDPOINT-EXACT (issue #364).
 ///
-/// The comparison is by parsed instant, not raw string, for the same
-/// cross-offset reason as [`classify`] (Codex P1). A bucket whose `bucket_start`
+/// A schema-v3 bucket carries per-occurrence `occurrence_timestamps`, so its
+/// contribution is the count of timestamps at or before the endpoint — bounded
+/// precisely at the commit instant even when the endpoint falls mid-hour. A legacy
+/// `log:v2:` bucket carries no timestamps, so it FALLS BACK to the hour-bucket
+/// predicate (its whole `occurrence_count` is summed whenever `bucket_start` is at
+/// or before the endpoint) and the returned exact-flag is cleared, degrading the
+/// response granularity to `hourly_bucket`.
+///
+/// Every comparison is by parsed instant, not raw string, for the same
+/// cross-offset reason as [`classify`] (Codex P1). A bucket start or timestamp that
 /// cannot be parsed is excluded from the sum rather than compared incorrectly.
-fn window_bucket_sum(buckets: &[(&str, u64)], endpoint: DateTime<Utc>) -> u64 {
-    buckets
-        .iter()
-        .filter(|(bucket_start, _)| parse_instant(bucket_start).is_some_and(|b| b <= endpoint))
-        .map(|(_, count)| *count)
-        .sum()
+fn window_bucket_sum(buckets: &[BucketWindow], endpoint: DateTime<Utc>) -> (u64, bool) {
+    let mut sum: u64 = 0;
+    let mut endpoint_exact = true;
+    for bucket in buckets {
+        if bucket.occurrence_timestamps.is_empty() && bucket.occurrence_count > 0 {
+            // Legacy v2 bucket: no per-occurrence data. Whole-bucket predicate.
+            if parse_instant(bucket.bucket_start).is_some_and(|b| b <= endpoint) {
+                sum += bucket.occurrence_count;
+            }
+            endpoint_exact = false;
+        } else {
+            // v3 bucket: count only occurrences at or before the endpoint instant.
+            sum += bucket
+                .occurrence_timestamps
+                .iter()
+                .filter(|t| parse_instant(t).is_some_and(|ts| ts <= endpoint))
+                .count() as u64;
+        }
+    }
+    (sum, endpoint_exact)
 }
 
 /// Builds the deterministic overlapping symbol-delta list for a new signature:

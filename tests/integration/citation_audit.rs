@@ -705,6 +705,7 @@ fn seed() -> Fixture {
         source_format_version: "plain-v1".to_owned(),
         source_artifact_hash: "loghash1".to_owned(),
         line_count: 42,
+        repository_id: "audit-repo".to_owned(),
     }))
     .with_valid_time("2026-01-02T12:00:00Z", "inferred_from_transaction_time");
 
@@ -732,6 +733,7 @@ fn seed() -> Fixture {
             first_seen: first.to_owned(),
             last_seen: last.to_owned(),
             frames: None,
+            repository_id: "audit-repo".to_owned(),
         }))
         .with_valid_time(first, "log_event_timestamp")
     };
@@ -789,6 +791,8 @@ fn seed() -> Fixture {
             bucket_width: "1h".to_owned(),
             occurrence_count: 3,
             source_id: log_source_id.clone(),
+            repository_id: "audit-repo".to_owned(),
+            occurrence_timestamps: Vec::new(),
         },
     ))
     .with_valid_time("2026-01-02T12:00:00Z", "log_event_timestamp");
@@ -1236,6 +1240,7 @@ fn seed_uncited_log_graph(path: &std::path::Path) {
             first_seen: "2026-01-02T12:00:00Z".to_owned(),
             last_seen: "2026-01-02T13:00:00Z".to_owned(),
             frames: None,
+            repository_id: "audit-repo".to_owned(),
         }))
         .with_valid_time("2026-01-02T12:00:00Z", "log_event_timestamp"),
     );

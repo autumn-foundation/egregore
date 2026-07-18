@@ -667,6 +667,7 @@ fn error_signature(
         first_seen: first_seen.to_owned(),
         last_seen: last_seen.to_owned(),
         frames: None,
+        repository_id: String::new(),
     }))
     .with_domain("log", LOG_SCHEMA_VERSION)
 }

@@ -130,6 +130,27 @@ fn error_signature(
     last_seen: &str,
     occurrence_count: u64,
 ) -> GraphRecord {
+    error_signature_attributed(
+        seed,
+        severity,
+        first_seen,
+        last_seen,
+        occurrence_count,
+        "repo_test",
+    )
+}
+
+/// Like [`error_signature`] but stamps an explicit `repository_id` on the payload
+/// (issue #362, schema v3). An empty `repository_id` models a legacy `log:v2:`
+/// record that carries no persisted attribution.
+fn error_signature_attributed(
+    seed: &str,
+    severity: &str,
+    first_seen: &str,
+    last_seen: &str,
+    occurrence_count: u64,
+    repository_id: &str,
+) -> GraphRecord {
     let id = log_sig_id(seed);
     GraphRecord::node(
         id,
@@ -148,6 +169,7 @@ fn error_signature(
         first_seen: first_seen.to_owned(),
         last_seen: last_seen.to_owned(),
         frames: None,
+        repository_id: repository_id.to_owned(),
     }))
     .with_valid_time(first_seen, "log_event_timestamp")
 }
@@ -201,6 +223,53 @@ fn bucket_with_source(
             bucket_width: "1h".to_owned(),
             occurrence_count: count,
             source_id: source_id.to_owned(),
+            repository_id: "repo_test".to_owned(),
+            occurrence_timestamps: Vec::new(),
+        },
+    ))
+    .with_valid_time(bucket_start, "log_event_timestamp");
+    let edge = log_edge(
+        EdgeLabel::Aggregates,
+        &bucket_id,
+        signature_id,
+        "LogOccurrenceBucket aggregates ErrorSignature",
+    );
+    (node, edge)
+}
+
+/// A schema-v3 `LogOccurrenceBucket` node (issue #364) carrying per-occurrence
+/// `occurrence_timestamps`, plus its `AGGREGATES` edge to the signature. The
+/// bucket's `occurrence_count` equals the number of timestamps (the payload
+/// invariant), letting consumers bound window counts endpoint-exactly.
+fn bucket_with_timestamps(
+    signature_id: &str,
+    bucket_start: &str,
+    timestamps: &[&str],
+    source_id: &str,
+) -> (GraphRecord, GraphRecord) {
+    let bucket_id = aletheia_egregore::log_stable_id(&[
+        "log_occurrence_bucket",
+        signature_id,
+        bucket_start,
+        source_id,
+    ]);
+    let node = GraphRecord::node(
+        bucket_id.clone(),
+        NodeKind::LogOccurrenceBucket,
+        None,
+        None,
+        Some(format!("bucket {bucket_start}")),
+        format!("Occurrence bucket {bucket_start} x{}", timestamps.len()),
+    )
+    .with_domain("log", LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::LogOccurrenceBucket(
+        LogOccurrenceBucketPayload {
+            bucket_start: bucket_start.to_owned(),
+            bucket_width: "1h".to_owned(),
+            occurrence_count: timestamps.len() as u64,
+            source_id: source_id.to_owned(),
+            repository_id: "repo_test".to_owned(),
+            occurrence_timestamps: timestamps.iter().map(|t| (*t).to_owned()).collect(),
         },
     ))
     .with_valid_time(bucket_start, "log_event_timestamp");
@@ -506,6 +575,112 @@ fn log_deltas_window_occurrences_are_hour_bucket_granular() {
         "disclaimer must clarify counts are not endpoint-exact, got: {}",
         deltas.disclaimer
     );
+}
+
+#[test]
+fn log_deltas_window_occurrences_are_endpoint_exact_with_v3_timestamps() {
+    // Issue #364: HEAD's committer date falls MID-BUCKET (12:30), and the linked
+    // schema-v3 `LogOccurrenceBucket` (hour-aligned at 12:00) now carries
+    // per-occurrence timestamps [12:15, 12:45]. The window count is the number of
+    // timestamps at or before the exact head instant, so only 12:15 counts — the
+    // post-head 12:45 occurrence is excluded, where the legacy hour-bucket rule
+    // would have over-counted it. The marker and disclaimer flip to endpoint-exact.
+    const BASE_T: &str = "2026-01-01T00:00:00Z"; // c1 base
+    const START_T: &str = "2026-01-02T00:00:00Z"; // c2 → window_start
+    const HEAD_T: &str = "2026-01-02T12:30:00Z"; // c3 head → MID 12:00 bucket
+    const SIG_FIRST: &str = "2026-01-02T12:00:00Z"; // inside [00:00, 12:30]
+    const SIG_LAST: &str = "2026-01-02T12:55:00Z";
+    const BUCKET_HOUR: &str = "2026-01-02T12:00:00Z"; // spans 12:00–13:00
+    const OCC_BEFORE_HEAD: &str = "2026-01-02T12:15:00Z"; // <= 12:30 → counted
+    const OCC_AFTER_HEAD: &str = "2026-01-02T12:45:00Z"; // > 12:30 → excluded
+
+    let sig = log_sig_id("exact-head");
+    let (bucket_node, bucket_edge) = bucket_with_timestamps(
+        &sig,
+        BUCKET_HOUR,
+        &[OCC_BEFORE_HEAD, OCC_AFTER_HEAD],
+        DEFAULT_SOURCE,
+    );
+    let records = vec![
+        commit("c1sha0000", &[], BASE_T),
+        commit("c2sha0000", &["c1sha0000"], START_T),
+        commit("c3sha0000", &["c2sha0000"], HEAD_T),
+        error_signature("exact-head", "error", SIG_FIRST, SIG_LAST, 2),
+        bucket_node,
+        bucket_edge,
+    ];
+    let deltas = log_deltas(&records, "c1", "c3", None, false).expect("range should resolve");
+
+    assert_eq!(record_ids(&deltas.new_signatures), vec![sig]);
+    let row = &deltas.new_signatures[0];
+    assert_eq!(row.occurrence_source, "occurrence_buckets");
+    assert_eq!(
+        row.head_window_occurrences,
+        Some(1),
+        "endpoint-exact: only the 12:15 occurrence is at/before the 12:30 head; \
+         the post-head 12:45 occurrence is excluded"
+    );
+    assert_eq!(row.base_window_occurrences, Some(0));
+
+    // The marker and disclaimer flip to endpoint-exact and drop the legacy wording.
+    assert_eq!(deltas.occurrence_count_granularity, "endpoint_exact");
+    assert!(
+        deltas.disclaimer.contains("endpoint-exact"),
+        "endpoint-exact disclaimer must state the counts are endpoint-exact, got: {}",
+        deltas.disclaimer
+    );
+    assert!(
+        !deltas.disclaimer.contains("hour-bucket-granular"),
+        "endpoint-exact disclaimer must not carry the legacy hour-bucket wording, got: {}",
+        deltas.disclaimer
+    );
+}
+
+#[test]
+fn log_deltas_mixed_v3_and_legacy_buckets_degrade_to_hourly() {
+    // A response with even ONE contributing legacy `log:v2:` bucket (no
+    // timestamps) degrades the whole granularity marker to `hourly_bucket`, even
+    // though a sibling signature's bucket is schema-v3 endpoint-exact (issue #364).
+    const BASE_T: &str = "2026-01-01T00:00:00Z";
+    const START_T: &str = "2026-01-02T00:00:00Z";
+    const HEAD_T: &str = "2026-01-02T12:30:00Z";
+    const HOUR: &str = "2026-01-02T12:00:00Z";
+
+    let v3_sig = log_sig_id("v3-exact");
+    let legacy_sig = log_sig_id("v2-legacy");
+    let (v3_node, v3_edge) =
+        bucket_with_timestamps(&v3_sig, HOUR, &["2026-01-02T12:15:00Z"], DEFAULT_SOURCE);
+    // `bucket_with_edge` mints a legacy bucket with empty `occurrence_timestamps`.
+    let (legacy_node, legacy_edge) = bucket_with_edge(&legacy_sig, HOUR, 4);
+    let records = vec![
+        commit("c1sha0000", &[], BASE_T),
+        commit("c2sha0000", &["c1sha0000"], START_T),
+        commit("c3sha0000", &["c2sha0000"], HEAD_T),
+        error_signature(
+            "v3-exact",
+            "error",
+            "2026-01-02T12:00:00Z",
+            "2026-01-02T12:20:00Z",
+            1,
+        ),
+        error_signature(
+            "v2-legacy",
+            "error",
+            "2026-01-02T12:00:00Z",
+            "2026-01-02T12:55:00Z",
+            4,
+        ),
+        v3_node,
+        v3_edge,
+        legacy_node,
+        legacy_edge,
+    ];
+    let deltas = log_deltas(&records, "c1", "c3", None, false).expect("range should resolve");
+    assert_eq!(
+        deltas.occurrence_count_granularity, "hourly_bucket",
+        "one legacy bucket degrades the whole response to hour-bucket granularity"
+    );
+    assert!(deltas.disclaimer.contains("hour-bucket-granular"));
 }
 
 #[test]
@@ -1302,15 +1477,19 @@ fn build_augmented_graph(repo: &Path, graph_path: &Path) -> String {
     tweaked_id
 }
 
-#[test]
-fn log_deltas_repo_scope_keeps_log_signatures() {
-    let temp = tempfile::tempdir().expect("temp dir should be created");
-    let repo = temp.path().join("repo");
-    fs::create_dir_all(&repo).expect("repo dir should be created");
-    let [first, _second, third] = seed_repo(&repo);
-    let (records, tweaked_id) = augmented_records(&repo);
-
-    // The repository record ID that owns the scanned code topology.
+/// Scans the repo's history into records and returns them alongside the real
+/// `Repository` record ID and the `tweaked` symbol record ID, WITHOUT appending
+/// any log signatures — so a test can attach log records with whatever
+/// `repository_id` attribution it wants to exercise (issue #362).
+fn scanned_code_records(repo: &Path) -> (Vec<GraphRecord>, String, String) {
+    let jsonl = scan_repository_history(repo)
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let records: Vec<GraphRecord> = jsonl
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record should parse"))
+        .collect();
     let repo_id = records
         .iter()
         .find_map(|r| match r {
@@ -1322,35 +1501,101 @@ fn log_deltas_repo_scope_keeps_log_signatures() {
             _ => None,
         })
         .expect("scan-history should emit a Repository node");
+    let tweaked_id = records
+        .iter()
+        .find_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::Symbol,
+                name: Some(name),
+                ..
+            } if name == "tweaked" => Some(id.clone()),
+            _ => None,
+        })
+        .expect("tweaked symbol should be scanned");
+    (records, repo_id, tweaked_id)
+}
 
+#[test]
+fn log_deltas_repo_scope_keeps_attributed_and_excludes_foreign() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let [first, _second, third] = seed_repo(&repo);
+    let (mut records, repo_id, tweaked_id) = scanned_code_records(&repo);
     let base_prefix = &first[..12];
 
-    // Unscoped: the three in-window classes are populated.
+    // In-repo signatures attributed to the scanned repository (schema v3, #362).
+    let new_sig = log_sig_id("new-boom");
+    let (bucket_node, bucket_edge) = bucket_with_edge(&new_sig, NEW_BUCKET, 5);
+    records.push(error_signature_attributed(
+        "new-boom", "error", NEW_FIRST, NEW_LAST, 5, &repo_id,
+    ));
+    records.push(error_signature_attributed(
+        "ceased-warn",
+        "warn",
+        CEASED_FIRST,
+        CEASED_LAST,
+        3,
+        &repo_id,
+    ));
+    records.push(error_signature_attributed(
+        "cont-error",
+        "error",
+        CONT_FIRST,
+        CONT_LAST,
+        9,
+        &repo_id,
+    ));
+    records.push(bucket_node);
+    records.push(bucket_edge);
+    records.push(frame_edge(
+        &new_sig,
+        &tweaked_id,
+        0,
+        FrameResolution::Resolved,
+    ));
+
+    // A FOREIGN repository's in-window signature: attributed to a different
+    // repository id that owns no code here. Under #362 it must be EXCLUDED when
+    // the query is scoped to the scanned repository (the cross-repository false
+    // lead #326 could only disclose).
+    let foreign = log_sig_id("foreign-boom");
+    records.push(error_signature_attributed(
+        "foreign-boom",
+        "error",
+        NEW_FIRST,
+        NEW_LAST,
+        7,
+        "codegraph:v1:other-repo",
+    ));
+
+    // Unscoped: every in-window signature is classified, in-repo and foreign.
     let unscoped = log_deltas(&records, base_prefix, &third, None, false)
         .expect("unscoped range should resolve");
-    assert_eq!(
-        record_ids(&unscoped.new_signatures),
-        vec![log_sig_id("new-boom")]
+    assert!(record_ids(&unscoped.new_signatures).contains(&new_sig.as_str()));
+    assert!(
+        record_ids(&unscoped.new_signatures).contains(&foreign.as_str()),
+        "an unscoped run classifies every in-window signature"
     );
-    assert_eq!(unscoped.ceased_signatures.len(), 1);
-    assert_eq!(unscoped.continuing_signatures.len(), 1);
 
-    // Scoped to the repository that owns the code side: the log signatures are
-    // NOT attributable to a repository, so scoping must not drop them. The
-    // regression this guards: `owner_of(<signature-id>)` is `None`, so a naive
-    // `--repo` predicate over signature IDs filtered out every signature and
-    // returned empty groups even for the correct repository.
+    // Scoped to the scanned repository: the attributed in-repo signatures are
+    // KEPT and the foreign signature is EXCLUDED (issue #362).
     let scoped = log_deltas(&records, base_prefix, &third, Some(&repo_id), false)
         .expect("scoped range should resolve");
     assert_eq!(
         record_ids(&scoped.new_signatures),
         vec![log_sig_id("new-boom")],
-        "repo scoping must keep the repo's log signatures, not drop them"
+        "scoping keeps the repo's attributed signature and drops the foreign one"
+    );
+    assert!(
+        !record_ids(&scoped.new_signatures).contains(&foreign.as_str()),
+        "a signature attributed to another repository must be excluded when scoped"
     );
     assert_eq!(scoped.ceased_signatures.len(), 1);
     assert_eq!(scoped.continuing_signatures.len(), 1);
 
-    // The buckets and frame join (also keyed on signature IDs) survive scoping.
+    // Buckets and the frame/overlap join survive scoping for the kept signature.
     assert_eq!(
         scoped.new_signatures[0].occurrence_source,
         "occurrence_buckets"
@@ -1361,217 +1606,86 @@ fn log_deltas_repo_scope_keeps_log_signatures() {
         scoped.new_signatures[0].overlapping_symbol_deltas[0].record_id,
         tweaked_id
     );
-}
 
-/// A synthetic second `Repository` node with a distinct identity, so a shared
-/// store carries more than one repository for the multi-repo caveat elevation.
-fn extra_repository(seed: &str) -> GraphRecord {
-    GraphRecord::node(
-        stable_id(&["node", "Repository", seed]),
-        NodeKind::Repository,
-        None,
-        None,
-        Some(seed.to_owned()),
-        format!("Repository {seed}"),
-    )
+    // Every log signature that reached the scoped result is attributed (schema
+    // v3), so the residual caveat is ABSENT — the filtering is sound.
+    assert!(
+        scoped.repo_scope_caveat.is_none(),
+        "a fully-attributed scoped store carries no residual caveat"
+    );
 }
 
 #[test]
-fn log_deltas_repo_scope_discloses_unfiltered_logs_and_elevates_for_multi_repo() {
+fn log_deltas_repo_scope_excludes_legacy_unattributed_and_discloses() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir should be created");
     let [first, _second, third] = seed_repo(&repo);
-    let (mut records, _tweaked_id) = augmented_records(&repo);
-
-    let repo_id = records
-        .iter()
-        .find_map(|r| match r {
-            GraphRecord::Node {
-                id,
-                kind: NodeKind::Repository,
-                ..
-            } => Some(id.clone()),
-            _ => None,
-        })
-        .expect("scan-history should emit a Repository node");
+    let (mut records, repo_id, _tweaked_id) = scanned_code_records(&repo);
     let base_prefix = &first[..12];
 
-    // Unscoped queries carry NO caveat — the field is absent.
-    let unscoped = log_deltas(&records, base_prefix, &third, None, false)
-        .expect("unscoped range should resolve");
-    assert!(
-        unscoped.repo_scope_caveat.is_none(),
-        "unscoped log-deltas must not carry a repo-scope caveat"
-    );
-
-    // Single-repository store, `--repo` set: caveat present-but-benign.
-    let single = log_deltas(&records, base_prefix, &third, Some(&repo_id), false)
-        .expect("scoped single-repo range should resolve");
-    let caveat = single
-        .repo_scope_caveat
-        .as_ref()
-        .expect("a scoped query must disclose that logs are unfiltered");
-    assert_eq!(caveat.repo_scope, repo_id);
-    assert_eq!(caveat.distinct_repository_count, 1);
-    assert!(!caveat.multi_repository_store);
-    assert!(
-        caveat.message.contains("NOT repository-filtered"),
-        "the caveat must state log signatures are not repository-filtered"
-    );
-    // The message must NEVER claim isolation/safety from a `Repository`-node
-    // count of one: log records add no `Repository` node, so a single-repo NODE
-    // count does not mean the store is repo-isolated for log signatures.
-    assert!(
-        !caveat.message.contains("no other repository"),
-        "single-repo caveat must not claim no other repository's logs can be included"
-    );
-    assert!(
-        caveat
-            .message
-            .contains("cannot be guaranteed repo-specific"),
-        "single-repo caveat must honestly disclose it cannot be guaranteed repo-specific for logs"
-    );
-
-    // Shared multi-repository store: append a distinct second `Repository` node.
-    // The repo-B signature whose `first_seen` lands in repo-A's window is still
-    // classified under `--repo A` (logs are unfiltered) — and the caveat is now
-    // ELEVATED, naming the distinct repository count and the multi-repo bleed.
-    records.push(extra_repository("other-repo"));
-    records.push(error_signature(
-        "repo-b-boom",
-        "error",
-        NEW_FIRST,
-        NEW_LAST,
-        7,
+    // One attributed in-repo signature (kept) plus one LEGACY `log:v2:` signature
+    // whose `repository_id` deserializes empty (unattributed). Both would classify
+    // `new` in-window, but the legacy one cannot be proven in-repo.
+    records.push(error_signature_attributed(
+        "new-boom", "error", NEW_FIRST, NEW_LAST, 5, &repo_id,
     ));
-
-    let multi = log_deltas(&records, base_prefix, &third, Some(&repo_id), false)
-        .expect("scoped multi-repo range should resolve");
-    // The unrelated repo-B signature is included despite `--repo A` (unfiltered).
-    let repo_b_id = log_sig_id("repo-b-boom");
-    assert!(
-        record_ids(&multi.new_signatures).contains(&repo_b_id.as_str()),
-        "an unrelated repository's in-window signature must still be classified \
-         because logs are not repository-filtered"
-    );
-    let elevated = multi
-        .repo_scope_caveat
-        .as_ref()
-        .expect("a scoped query over a multi-repo store must disclose the caveat");
-    assert_eq!(
-        elevated.distinct_repository_count, 2,
-        "the caveat must name the distinct repository count"
-    );
-    assert!(
-        elevated.multi_repository_store,
-        "a store with two repositories must elevate the caveat"
-    );
-    assert!(
-        elevated
-            .message
-            .contains("MULTIPLE distinct `Repository` nodes"),
-        "the elevated caveat must name the multi-repository condition"
-    );
-    assert!(
-        elevated.message.contains("NOT repository-filtered"),
-        "the elevated caveat must still state logs are not repository-filtered"
-    );
-    // Even elevated, the message must not claim isolation from any repo count.
-    assert!(
-        !elevated.message.contains("no other repository"),
-        "the elevated caveat must not claim no other repository's logs can be included"
-    );
-}
-
-/// P2 (Codex, `src/query/log_deltas.rs:121`): a store can hold repo-A history
-/// (one `Repository` node) PLUS a repo-B log graph that adds NO `Repository`
-/// node. `distinct_repository_count` is then 1, but repo-B's unfiltered
-/// signature IS classified under `--repo A`. The single-`Repository`-count
-/// caveat must therefore NEVER assert isolation ("no other repository's log
-/// signatures can be included") — that guarantee is false in this mixed-log
-/// scenario.
-#[test]
-fn log_deltas_single_repo_node_count_never_claims_log_isolation() {
-    let temp = tempfile::tempdir().expect("temp dir should be created");
-    let repo = temp.path().join("repo");
-    fs::create_dir_all(&repo).expect("repo dir should be created");
-    let [first, _second, third] = seed_repo(&repo);
-    let (mut records, _tweaked_id) = augmented_records(&repo);
-
-    let repo_id = records
-        .iter()
-        .find_map(|r| match r {
-            GraphRecord::Node {
-                id,
-                kind: NodeKind::Repository,
-                ..
-            } => Some(id.clone()),
-            _ => None,
-        })
-        .expect("scan-history should emit a Repository node");
-    let base_prefix = &first[..12];
-
-    // A repo-B log signature whose `first_seen` lands in repo-A's window, added
-    // WITHOUT any second `Repository` node — exactly what a repo-B `scan-logs`
-    // graph contributes (log records add no `Repository` node).
-    records.push(error_signature(
-        "repo-b-log-only",
+    records.push(error_signature_attributed(
+        "legacy-boom",
         "error",
         NEW_FIRST,
         NEW_LAST,
         9,
+        "",
     ));
 
     let scoped = log_deltas(&records, base_prefix, &third, Some(&repo_id), false)
         .expect("scoped range should resolve");
 
-    // (a) Behavior unchanged: the repo-B signature is still classified.
-    let repo_b_id = log_sig_id("repo-b-log-only");
+    // The attributed signature is kept; the legacy unattributed one is EXCLUDED.
+    let legacy = log_sig_id("legacy-boom");
+    assert_eq!(
+        record_ids(&scoped.new_signatures),
+        vec![log_sig_id("new-boom")]
+    );
     assert!(
-        record_ids(&scoped.new_signatures).contains(&repo_b_id.as_str()),
-        "a log-only repository's in-window signature must still be classified \
-         because logs are not repository-filtered"
+        !record_ids(&scoped.new_signatures).contains(&legacy.as_str()),
+        "a legacy unattributed signature cannot be proven in-repo and is excluded"
     );
 
+    // The residual caveat fires, naming the excluded count, and NEVER carries the
+    // obsolete "logs are not repository-filtered" story or a full-isolation claim.
     let caveat = scoped
         .repo_scope_caveat
         .as_ref()
-        .expect("a scoped query must disclose that logs are unfiltered");
+        .expect("excluding a legacy unattributed signature must disclose the residual caveat");
+    assert_eq!(caveat.repo_scope, repo_id);
+    assert_eq!(
+        caveat.excluded_unattributed_signature_count, 1,
+        "the caveat must name how many legacy unattributed signatures were excluded"
+    );
+    assert!(
+        caveat.message.contains("EXCLUDED"),
+        "the caveat must disclose the conservative exclusion"
+    );
+    assert!(
+        caveat.message.contains("issue #362") && caveat.message.contains("schema v3"),
+        "the caveat must attribute the v3 filtering to issue #362"
+    );
+    assert!(
+        !caveat.message.contains("NOT repository-filtered"),
+        "the shrunk caveat must not carry the obsolete unfiltered-logs disclosure"
+    );
+}
 
-    // The store still reports exactly one distinct `Repository` node — the
-    // informational count is honest raw data — yet a repo-B signature bled in.
-    assert_eq!(caveat.distinct_repository_count, 1);
-    assert!(!caveat.multi_repository_store);
-
-    // (b) The caveat must NOT assert any isolation/safety guarantee.
+#[test]
+fn log_deltas_unscoped_never_carries_repo_caveat() {
+    let records = synthetic_log_delta_records();
+    let unscoped =
+        log_deltas(&records, "c1", "c3", None, false).expect("unscoped range should resolve");
     assert!(
-        !caveat.message.contains("no other repository"),
-        "single-`Repository`-count caveat must not claim no other repository's logs \
-         can be included — a log-only repo adds no `Repository` node and bleeds in"
-    );
-    assert!(
-        !caveat.message.contains("single repository, so"),
-        "the caveat must not derive a safety guarantee from a single-repository count"
-    );
-    // And it must carry the honest, uniform disclosure.
-    assert!(
-        caveat.message.contains("NOT repository-filtered"),
-        "the caveat must state log signatures are not repository-filtered"
-    );
-    assert!(
-        caveat
-            .message
-            .contains("cannot be guaranteed repo-specific"),
-        "the caveat must disclose a scoped run cannot be guaranteed repo-specific for logs"
-    );
-    assert!(
-        caveat.message.contains("other repositories"),
-        "the caveat must warn the store may hold log records from other repositories"
-    );
-    assert!(
-        caveat.message.contains("per-repository stores"),
-        "the caveat must point to per-repository stores for log isolation"
+        unscoped.repo_scope_caveat.is_none(),
+        "unscoped log-deltas must not carry a repo-scope caveat"
     );
 }
 

@@ -155,15 +155,15 @@ fn every_record_carries_identity_and_producer_envelope() {
     for record in &records {
         let id = record["id"].as_str().expect("record has id");
         assert!(
-            id.starts_with("log:v2:"),
-            "id must be log:v2:-prefixed: {id}"
+            id.starts_with("log:v3:"),
+            "id must be log:v3:-prefixed: {id}"
         );
-        assert_eq!(record["schema_version"], 2, "log schema version is 2");
+        assert_eq!(record["schema_version"], 3, "log schema version is 3");
 
         let producer = &record["producer"];
         assert_eq!(producer["producer_kind"], "log_importer");
         let comps = &producer["producer_components"];
-        assert_eq!(comps["importer_schema_version"], "2");
+        assert_eq!(comps["importer_schema_version"], "3");
         assert_eq!(comps["fingerprint_algorithm"], "template-v1");
         assert!(
             comps["source_format_version"].is_string(),
@@ -188,6 +188,57 @@ fn every_record_carries_identity_and_producer_envelope() {
     );
     assert_eq!(src["log"]["source_relative_path"], "app.log");
     assert_eq!(src["log"]["source_format_version"], "plain-v1");
+}
+
+// ── AC (#362/#364): repository attribution + per-occurrence bucket timestamps ─
+
+#[test]
+fn every_log_node_carries_repository_id_and_buckets_carry_sorted_timestamps() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (plain, _) = write_fixtures(temp.path());
+    let jsonl = scan_to_jsonl(&plain, temp.path());
+    let records = parse_records(&jsonl);
+
+    // #362: every log-domain NODE payload carries the scan's repository id.
+    let mut log_nodes = 0;
+    for record in &records {
+        if record["record_type"] != "node" {
+            continue;
+        }
+        let log = &record["log"];
+        if log.is_null() {
+            continue;
+        }
+        log_nodes += 1;
+        assert_eq!(
+            log["repository_id"], REPO_ID,
+            "every log payload carries the scan repository id"
+        );
+    }
+    assert!(log_nodes > 0, "the fixture produced log nodes");
+
+    // #364: every occurrence bucket carries a sorted, non-empty per-occurrence
+    // timestamp list whose length equals occurrence_count.
+    let buckets = nodes_of_kind(&records, "LogOccurrenceBucket");
+    assert!(
+        !buckets.is_empty(),
+        "the fixture produced occurrence buckets"
+    );
+    for bucket in buckets {
+        let ts = bucket["log"]["occurrence_timestamps"]
+            .as_array()
+            .expect("occurrence_timestamps is an array");
+        assert!(!ts.is_empty(), "a bucket carries at least one timestamp");
+        let strs: Vec<&str> = ts.iter().map(|v| v.as_str().unwrap()).collect();
+        let mut sorted = strs.clone();
+        sorted.sort_unstable();
+        assert_eq!(strs, sorted, "occurrence_timestamps are sorted");
+        assert_eq!(
+            ts.len() as u64,
+            bucket["log"]["occurrence_count"].as_u64().unwrap(),
+            "occurrence_timestamps.len() equals occurrence_count"
+        );
+    }
 }
 
 // ── AC: determinism (5 scans byte-identical) and CRLF/LF identity ────────────

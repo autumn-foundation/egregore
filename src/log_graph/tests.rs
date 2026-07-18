@@ -185,10 +185,10 @@ fn frame_resolves_to_schema_tuple_is_known() {
     let version = record_version(&edge);
     assert_eq!(version.domain, "log");
     assert_eq!(version.kind, "FRAME_RESOLVES_TO");
-    assert_eq!(version.version, 2);
+    assert_eq!(version.version, 3);
     assert!(
         is_known_record_version(&version),
-        "(log, FRAME_RESOLVES_TO, 2) must be an accepted schema tuple"
+        "(log, FRAME_RESOLVES_TO, 3) must be an accepted schema tuple"
     );
 }
 
@@ -276,7 +276,7 @@ fn log_stable_id_is_deterministic_and_prefixed() {
         "error",
     ]);
     assert_eq!(a, b);
-    assert!(a.starts_with("log:v2:"), "got {a}");
+    assert!(a.starts_with("log:v3:"), "got {a}");
 }
 
 #[test]
@@ -290,16 +290,20 @@ fn log_stable_id_preserves_case_of_parts() {
 // ── schema-version gate ──────────────────────────────────────────────────────
 
 #[test]
-fn schema_gate_accepts_v2_rejects_unknown() {
+fn schema_gate_accepts_v3_rejects_unknown() {
     use crate::schema_version::{RecordVersion, is_known_record_version};
-    // Log domain is at schema v2 since issue #361 (source-aware bucket identity);
-    // v1 is a superseded version and is no longer accepted.
+    // Log domain MINTS at schema v3 since issues #362/#364 (repository_id +
+    // occurrence_timestamps), but the READ gate must still accept legacy `log:v2:`
+    // records for back-compat (the `#[serde(default)]` v3 fields degrade honestly).
+    // v1 predates the #361 source-aware bucket identity and is out of the advertised
+    // compat window, so it stays rejected; an unknown future version is rejected too.
     for kind in [
         "LogSource",
         "ErrorSignature",
         "LogEvent",
         "LogOccurrenceBucket",
     ] {
+        assert!(is_known_record_version(&RecordVersion::new("log", kind, 3)));
         assert!(is_known_record_version(&RecordVersion::new("log", kind, 2)));
         assert!(!is_known_record_version(&RecordVersion::new(
             "log", kind, 1
@@ -310,7 +314,7 @@ fn schema_gate_accepts_v2_rejects_unknown() {
     }
     for label in ["FINGERPRINTED_AS", "CAPTURED_FROM", "AGGREGATES"] {
         assert!(is_known_record_version(&RecordVersion::new(
-            "log", label, 2
+            "log", label, 3
         )));
     }
 }
@@ -523,5 +527,378 @@ fn bucket_payload_carries_its_log_source_id() {
     assert_eq!(
         bucket_source, source_id,
         "a bucket's source_id is a handle to its LogSource"
+    );
+}
+
+// ── issue #362: scan-logs populates repository_id on every log payload ────────
+
+/// Every `repository_id` carried on any log-domain payload the scan emitted.
+fn scanned_repository_ids(records: &[GraphRecord]) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node {
+                log: Some(payload), ..
+            } => Some(match payload.as_ref() {
+                LogPayload::LogSource(p) => p.repository_id.clone(),
+                LogPayload::ErrorSignature(p) => p.repository_id.clone(),
+                LogPayload::LogEvent(p) => p.repository_id.clone(),
+                LogPayload::LogOccurrenceBucket(p) => p.repository_id.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn scan_populates_repository_id_on_every_log_payload() {
+    // #362: the scan's repository identity is retrievable on ALL FOUR payload
+    // kinds (LogSource, ErrorSignature, LogEvent, LogOccurrenceBucket), so a
+    // shared multi-repo store can attribute — and `--repo` can filter — logs.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let records = scan_records(dir.path(), "app.log", ONE_ERROR);
+    let ids = scanned_repository_ids(&records);
+    assert_eq!(ids.len(), 4, "one repository_id per log node kind");
+    for id in &ids {
+        assert_eq!(
+            id, "repo_test",
+            "every log payload carries the scan repo id"
+        );
+    }
+}
+
+// ── issue #364: scan-logs populates sorted per-occurrence bucket timestamps ───
+
+const THREE_ERRORS_ONE_HOUR: &str = "2026-01-02T03:45:00Z [ERROR] widget checkout failed for order\n2026-01-02T03:05:00Z [ERROR] widget checkout failed for order\n2026-01-02T03:15:00Z [ERROR] widget checkout failed for order\n";
+
+/// Returns the single occurrence bucket's `(occurrence_count, occurrence_timestamps)`.
+fn bucket_count_and_timestamps(records: &[GraphRecord]) -> (u64, Vec<String>) {
+    let mut found: Option<(u64, Vec<String>)> = None;
+    for r in records {
+        if let GraphRecord::Node {
+            log: Some(payload), ..
+        } = r
+            && let LogPayload::LogOccurrenceBucket(b) = payload.as_ref()
+        {
+            assert!(found.is_none(), "expected exactly one occurrence bucket");
+            found = Some((b.occurrence_count, b.occurrence_timestamps.clone()));
+        }
+    }
+    found.expect("scan produced one occurrence bucket")
+}
+
+#[test]
+fn scan_populates_bucket_occurrence_timestamps_sorted() {
+    // #364: the bucket retains every per-occurrence valid time, sorted, so a
+    // consumer can bound window counts endpoint-exactly at an arbitrary instant.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let records = scan_records(dir.path(), "app.log", THREE_ERRORS_ONE_HOUR);
+    let (count, timestamps) = bucket_count_and_timestamps(&records);
+    assert_eq!(count, 3);
+    assert_eq!(
+        timestamps,
+        vec![
+            "2026-01-02T03:05:00Z".to_owned(),
+            "2026-01-02T03:15:00Z".to_owned(),
+            "2026-01-02T03:45:00Z".to_owned(),
+        ],
+        "occurrence_timestamps are the sorted per-occurrence valid times"
+    );
+    assert_eq!(
+        timestamps.len() as u64,
+        count,
+        "occurrence_timestamps.len() equals occurrence_count"
+    );
+}
+
+#[test]
+fn scan_bucket_occurrence_timestamps_are_deterministic() {
+    // Byte-stable ordering across identical rescans.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let a = scan_records(dir.path(), "app.log", THREE_ERRORS_ONE_HOUR);
+    let b = scan_records(dir.path(), "app.log", THREE_ERRORS_ONE_HOUR);
+    assert_eq!(
+        bucket_count_and_timestamps(&a).1,
+        bucket_count_and_timestamps(&b).1
+    );
+}
+
+#[test]
+fn scan_timestampless_line_still_populates_occurrence_timestamps() {
+    // A line with no parseable leading timestamp falls back to the scan's
+    // transaction time; the bucket still records that inferred valid time (never
+    // an empty list) so a consumer's endpoint filter has something to compare.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let records = scan_records(
+        dir.path(),
+        "app.log",
+        "[ERROR] widget checkout failed for order\n",
+    );
+    let (count, timestamps) = bucket_count_and_timestamps(&records);
+    assert_eq!(count, 1);
+    assert_eq!(timestamps, vec!["2026-01-02T03:00:00Z".to_owned()]);
+}
+
+// ── issues #362 / #364: LOG_SCHEMA v3 — repository_id + occurrence_timestamps ──
+
+#[test]
+fn log_schema_version_is_three() {
+    // Breaking bump 2 → 3 folding in #362 (repository_id) + #364
+    // (occurrence_timestamps).
+    assert_eq!(crate::ir::LOG_SCHEMA_VERSION, 3);
+}
+
+#[test]
+fn log_ids_are_minted_with_v3_prefix() {
+    // The version prefix flips automatically via the const, so every log record
+    // ID is minted under `log:v3:`.
+    let id = log_stable_id(&[
+        "error_signature",
+        "repo",
+        FINGERPRINT_ALGORITHM,
+        "t",
+        "error",
+    ]);
+    assert!(id.starts_with("log:v3:"), "got {id}");
+}
+
+#[test]
+fn repository_id_round_trips_on_all_four_payloads() {
+    // #362: every log payload carries a retrievable `repository_id`.
+    let src = LogSourcePayload {
+        source_relative_path: "app.log".to_owned(),
+        source_format_version: "plain-v1".to_owned(),
+        source_artifact_hash: "hash".to_owned(),
+        line_count: 3,
+        repository_id: "acme/widget".to_owned(),
+    };
+    let back: LogSourcePayload =
+        serde_json::from_str(&serde_json::to_string(&src).unwrap()).unwrap();
+    assert_eq!(src, back);
+    assert_eq!(back.repository_id, "acme/widget");
+
+    let sig = ErrorSignaturePayload {
+        fingerprint_algorithm: FINGERPRINT_ALGORITHM.to_owned(),
+        template_excerpt: "boom".to_owned(),
+        severity: "error".to_owned(),
+        occurrence_count: 1,
+        first_seen: "2026-01-02T03:00:00Z".to_owned(),
+        last_seen: "2026-01-02T03:00:00Z".to_owned(),
+        frames: None,
+        repository_id: "acme/widget".to_owned(),
+    };
+    let back: ErrorSignaturePayload =
+        serde_json::from_str(&serde_json::to_string(&sig).unwrap()).unwrap();
+    assert_eq!(sig, back);
+    assert_eq!(back.repository_id, "acme/widget");
+
+    let ev = LogEventPayload {
+        event_excerpt: "boom".to_owned(),
+        event_content_hash: "ch".to_owned(),
+        source_line: 1,
+        severity: "error".to_owned(),
+        repository_id: "acme/widget".to_owned(),
+    };
+    let back: LogEventPayload = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+    assert_eq!(ev, back);
+    assert_eq!(back.repository_id, "acme/widget");
+
+    let bucket = LogOccurrenceBucketPayload {
+        bucket_start: "2026-01-02T03:00:00Z".to_owned(),
+        bucket_width: "1h".to_owned(),
+        occurrence_count: 2,
+        source_id: "log:v3:abc".to_owned(),
+        repository_id: "acme/widget".to_owned(),
+        occurrence_timestamps: vec![
+            "2026-01-02T03:00:00Z".to_owned(),
+            "2026-01-02T03:45:00Z".to_owned(),
+        ],
+    };
+    let back: LogOccurrenceBucketPayload =
+        serde_json::from_str(&serde_json::to_string(&bucket).unwrap()).unwrap();
+    assert_eq!(bucket, back);
+    assert_eq!(back.repository_id, "acme/widget");
+}
+
+#[test]
+fn occurrence_timestamps_round_trip_on_bucket() {
+    // #364: the sorted per-occurrence timestamps round-trip through serde.
+    let bucket = LogOccurrenceBucketPayload {
+        bucket_start: "2026-01-02T12:00:00Z".to_owned(),
+        bucket_width: "1h".to_owned(),
+        occurrence_count: 3,
+        source_id: "log:v3:src".to_owned(),
+        repository_id: "acme/widget".to_owned(),
+        occurrence_timestamps: vec![
+            "2026-01-02T12:05:00Z".to_owned(),
+            "2026-01-02T12:15:00Z".to_owned(),
+            "2026-01-02T12:45:00Z".to_owned(),
+        ],
+    };
+    let back: LogOccurrenceBucketPayload =
+        serde_json::from_str(&serde_json::to_string(&bucket).unwrap()).unwrap();
+    assert_eq!(
+        back.occurrence_timestamps.len() as u64,
+        back.occurrence_count
+    );
+    assert_eq!(
+        back.occurrence_timestamps,
+        vec![
+            "2026-01-02T12:05:00Z".to_owned(),
+            "2026-01-02T12:15:00Z".to_owned(),
+            "2026-01-02T12:45:00Z".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn legacy_v2_log_payloads_deserialize_with_serde_defaults() {
+    // Back-compat (#362/#364): a legacy `log:v2:` JSON line lacking the new
+    // fields still deserializes and degrades honestly (empty attribution / no
+    // per-occurrence data), rather than a hard read failure.
+    let legacy_src = r#"{"source_relative_path":"app.log","source_format_version":"plain-v1","source_artifact_hash":"h","line_count":3}"#;
+    let src: LogSourcePayload = serde_json::from_str(legacy_src).unwrap();
+    assert_eq!(src.repository_id, "");
+
+    let legacy_sig = r#"{"fingerprint_algorithm":"template-v1","template_excerpt":"boom","severity":"error","occurrence_count":1,"first_seen":"2026-01-02T03:00:00Z","last_seen":"2026-01-02T03:00:00Z"}"#;
+    let sig: ErrorSignaturePayload = serde_json::from_str(legacy_sig).unwrap();
+    assert_eq!(sig.repository_id, "");
+
+    let legacy_ev =
+        r#"{"event_excerpt":"boom","event_content_hash":"ch","source_line":1,"severity":"error"}"#;
+    let ev: LogEventPayload = serde_json::from_str(legacy_ev).unwrap();
+    assert_eq!(ev.repository_id, "");
+
+    let legacy_bucket = r#"{"bucket_start":"2026-01-02T03:00:00Z","bucket_width":"1h","occurrence_count":2,"source_id":"log:v2:abc"}"#;
+    let bucket: LogOccurrenceBucketPayload = serde_json::from_str(legacy_bucket).unwrap();
+    assert_eq!(bucket.repository_id, "");
+    assert!(bucket.occurrence_timestamps.is_empty());
+}
+
+/// Rewrites a serialized v3 log record line into exactly what trunk's
+/// LOG_SCHEMA-2 `scan-logs` emits: `schema_version` 2, a `log:v2:` id prefix,
+/// and NO v3-only payload fields (`repository_id`/`occurrence_timestamps` absent).
+#[cfg(test)]
+fn downgrade_log_line_to_v2(record: &crate::ir::GraphRecord) -> String {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(record).unwrap()).unwrap();
+    let obj = value.as_object_mut().unwrap();
+    obj.insert("schema_version".to_owned(), serde_json::json!(2));
+    if let Some(serde_json::Value::String(id)) = obj.get_mut("id") {
+        *id = id.replace("log:v3:", "log:v2:");
+    }
+    if let Some(serde_json::Value::Object(log)) = obj.get_mut("log") {
+        log.remove("repository_id");
+        log.remove("occurrence_timestamps");
+        if let Some(serde_json::Value::String(sid)) = log.get_mut("source_id") {
+            *sid = sid.replace("log:v3:", "log:v2:");
+        }
+    }
+    serde_json::to_string(&value).unwrap()
+}
+
+#[test]
+fn legacy_v2_log_records_are_accepted_by_records_from_jsonl() {
+    // Back-compat regression (#362/#364): after the LOG_SCHEMA 2 → 3 bump the
+    // version gate must still ACCEPT genuine legacy `log:v2:` records on read.
+    // `#[serde(default)]` on the new payload fields is only reachable if the
+    // version gate lets the record through; a bare `== LOG_SCHEMA_VERSION` gate
+    // classifies a v2 record UnknownSchemaVersion and `records_from_jsonl` (the
+    // hard `--graph` load path) aborts the whole read. This reader-level test
+    // covers what the struct-level `legacy_v2_..._serde_defaults` test cannot.
+    use crate::adapters::records_from_jsonl;
+    use crate::ir::{
+        GraphRecord, LogOccurrenceBucketPayload, LogPayload, LogSourcePayload, NodeKind,
+    };
+    use crate::schema_version::{RecordVersion, is_known_record_version};
+
+    // A valid ("log", 2) tuple must be a known read version.
+    assert!(
+        is_known_record_version(&RecordVersion::new("log", "LogSource", 2)),
+        "(log, LogSource, 2) must be an accepted read version after the v3 bump"
+    );
+
+    // Build real v3 log records via the production builder.
+    let source_id = log_stable_id(&["log_source", "acme/widget", "app.log", "h"]);
+    let source_node = GraphRecord::node(
+        source_id.clone(),
+        NodeKind::LogSource,
+        Some("app.log".to_owned()),
+        None,
+        Some("app.log".to_owned()),
+        "Log source app.log".to_owned(),
+    )
+    .with_domain("log", crate::ir::LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::LogSource(LogSourcePayload {
+        source_relative_path: "app.log".to_owned(),
+        source_format_version: "plain-v1".to_owned(),
+        source_artifact_hash: "h".to_owned(),
+        line_count: 3,
+        repository_id: "acme/widget".to_owned(),
+    }));
+
+    let bucket_node = GraphRecord::node(
+        log_stable_id(&["log_occurrence_bucket", "acme/widget", "sig", "hour"]),
+        NodeKind::LogOccurrenceBucket,
+        None,
+        None,
+        Some("error bucket".to_owned()),
+        "Occurrence bucket".to_owned(),
+    )
+    .with_domain("log", crate::ir::LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::LogOccurrenceBucket(
+        LogOccurrenceBucketPayload {
+            bucket_start: "2026-01-02T03:00:00Z".to_owned(),
+            bucket_width: BUCKET_WIDTH.to_owned(),
+            occurrence_count: 2,
+            source_id,
+            repository_id: "acme/widget".to_owned(),
+            occurrence_timestamps: vec![
+                "2026-01-02T03:05:00Z".to_owned(),
+                "2026-01-02T03:45:00Z".to_owned(),
+            ],
+        },
+    ));
+
+    let v2_source_line = downgrade_log_line_to_v2(&source_node);
+    let v2_bucket_line = downgrade_log_line_to_v2(&bucket_node);
+    assert!(v2_source_line.contains("log:v2:"), "{v2_source_line}");
+    assert!(
+        !v2_source_line.contains("repository_id"),
+        "downgraded v2 line must not carry the v3 repository_id field"
+    );
+    assert!(
+        !v2_bucket_line.contains("occurrence_timestamps"),
+        "downgraded v2 bucket must not carry the v3 occurrence_timestamps field"
+    );
+
+    let jsonl = format!("{v2_source_line}\n{v2_bucket_line}\n");
+
+    // The hard `--graph` load path must ACCEPT these legacy records.
+    let records = records_from_jsonl(&jsonl)
+        .expect("legacy v2 log records must be accepted, not rejected UnknownSchemaVersion");
+    assert_eq!(records.len(), 2);
+
+    // The serde-default v3 fields must be present and honestly empty.
+    let (mut saw_source, mut saw_bucket) = (false, false);
+    for record in &records {
+        if let GraphRecord::Node { log: Some(log), .. } = record {
+            match log.as_ref() {
+                LogPayload::LogSource(src) => {
+                    assert_eq!(src.repository_id, "");
+                    saw_source = true;
+                }
+                LogPayload::LogOccurrenceBucket(bucket) => {
+                    assert_eq!(bucket.repository_id, "");
+                    assert!(bucket.occurrence_timestamps.is_empty());
+                    saw_bucket = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        saw_source && saw_bucket,
+        "both v2 log payloads must round-trip"
     );
 }

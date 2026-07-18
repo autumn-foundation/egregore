@@ -72,10 +72,12 @@ silently chosen.
   **repository anchor** — the sole `Repository` node's stable ID. Each
   signature's repository is *verified* by recomputing its `LogSource` stable ID
   against that anchor
-  (`log:v2:blake3("log_source", anchor, source_relative_path,
+  (`log:v3:blake3("log_source", anchor, source_relative_path,
   source_artifact_hash)`) and checking it equals the stored `LogSource` ID; this
-  reads the repository identity the ID hash already encoded, with **no new
-  stored field**. A signature whose `LogSource` does not recompute to the anchor
+  reads the repository identity the ID hash already encoded. (Schema v3 also
+  persists that identity as a retrievable `repository_id` field per issue #362,
+  but link-logs still verifies by recompute — it needs no field read.) A
+  signature whose `LogSource` does not recompute to the anchor
   is *foreign*: its in-window candidates are suppressed and counted in
   `cross_repo_rejected`.
 - With **zero or multiple** `Repository` anchors the linker cannot attribute
@@ -111,7 +113,10 @@ Enriched log-domain records (each `ErrorSignature` carrying its new evidence
 links, the other log records unchanged) followed by the new `EMITTED_DURING` /
 `REFERENCES_TASK` edges, in canonical order. Non-log records (agent /
 verification / project targets) are referenced by stable ID and never
-re-emitted. A deterministic JSON envelope is printed to stdout:
+re-emitted. The enriched `ErrorSignature` re-emits its log payload unchanged
+except for the added evidence links, so the schema-v3 `repository_id` field
+(issue #362) is **preserved** through enrichment and no log record ID changes. A
+deterministic JSON envelope is printed to stdout:
 
 ```json
 {
@@ -129,7 +134,7 @@ re-emitted. A deterministic JSON envelope is printed to stdout:
     "tolerance_seconds": 0,
     "temporal_correlation_enabled": true
   },
-  "signatures": [ { "signature_id": "log:v2:…", "content_hash_join": 1,
+  "signatures": [ { "signature_id": "log:v3:…", "content_hash_join": 1,
                     "temporal_correlation": 2, "task_links": 1,
                     "uncorrelated": false } ],
   "disclaimer": "An EMITTED_DURING edge is a correlation lead, never causation. …"

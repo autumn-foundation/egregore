@@ -1,10 +1,23 @@
-# Log-Signature Domain Schema - v2
+# Log-Signature Domain Schema - v3
 
-Runtime log observations (issues #319 / #320). `schema_version` = `2` (bumped
-1 → 2 by issue #361: source-aware `LogOccurrenceBucket` identity). Domain prefix
-`log:v2:`. The v1 → v2 change was a `breaking` bump per
-[`schema-versioning.md`](schema-versioning.md); re-scan to regenerate log
-records under the v2 identity.
+Runtime log observations (issues #319 / #320). `schema_version` = `3`. Domain
+prefix `log:v3:`. Version history, each a `breaking` bump per
+[`schema-versioning.md`](schema-versioning.md):
+
+- **v1 → v2** (issue #361): source-aware `LogOccurrenceBucket` identity.
+- **v2 → v3** (issues #362 / #364): two additive capabilities in one bump —
+  **#362** persists repository attribution as a retrievable `repository_id`
+  field on all four log payloads (previously the repository identity was only
+  hashed into the stable IDs, never serialized), and **#364** adds a sorted
+  `occurrence_timestamps` list to `LogOccurrenceBucket` so window counts can be
+  bounded endpoint-exactly at an arbitrary commit instant. Both new fields are
+  `#[serde(default)]`, so a legacy `log:v2:` record that lacks them still
+  deserializes and degrades honestly (empty attribution / no per-occurrence
+  data) — a deliberate divergence from #361's required-field stance.
+
+The version prefix flips (`log:v2:` → `log:v3:`), so v3 and v2 IDs for the same
+logical record never collide; **re-scan is the remedy** to regenerate every log
+record under v3 with attribution and per-occurrence timestamps populated.
 
 The `scan-logs` command ([`docs/cli/scan-logs.md`](../cli/scan-logs.md)) is the
 producer. Records are deterministic, filesystem-local, and redaction-safe. Raw
@@ -35,12 +48,19 @@ correctness.
 Carried in one boxed `log` field on the node (mirrors the `dependency`
 payload), serialized internally-tagged on `log_kind`.
 
-- **`LogSource`**: `source_relative_path`, `source_format_version`
-  (`plain-v1` | `jsonl-v1`), `source_artifact_hash` (BLAKE3 of the
-  **newline-normalized** file bytes — the idempotency anchor), `line_count`
-  (every logical line, including info/debug noise).
-- **`ErrorSignature`**: `fingerprint_algorithm` (`template-v1`),
-  `template_excerpt` (redacted, ≤200 chars), `severity`
+Since **schema v3** (issue #362) **every** log payload variant carries a
+`repository_id` field — the computed repository identity, byte-identical to the
+`Repository` record ID that a `--repo` selector resolves to and to the value
+already hashed into the record's stable ID. It is `#[serde(default)]`: a legacy
+`log:v2:` record deserializes it as the empty string (unattributed). See
+[Repository attribution](#repository-attribution-schema-v3-issue-362).
+
+- **`LogSource`**: `repository_id`, `source_relative_path`,
+  `source_format_version` (`plain-v1` | `jsonl-v1`), `source_artifact_hash`
+  (BLAKE3 of the **newline-normalized** file bytes — the idempotency anchor),
+  `line_count` (every logical line, including info/debug noise).
+- **`ErrorSignature`**: `repository_id`, `fingerprint_algorithm`
+  (`template-v1`), `template_excerpt` (redacted, ≤200 chars), `severity`
   (`fatal` | `error` | `warn`), `occurrence_count`, `first_seen`, `last_seen`,
   and (issue #322) an optional `frames` array of structured, redaction-safe
   backtrace frames captured at scan time. Each frame carries `frame_index`
@@ -52,11 +72,19 @@ payload), serialized internally-tagged on `log_kind`.
   rewrites file paths to `<PATH>` and drops long backtraces past the excerpt
   bound, so the structured frames preserve the resolvable frame data the
   excerpt cannot.
-- **`LogEvent`**: `event_excerpt` (redacted, ≤200 chars), `event_content_hash`,
-  `source_line`, `severity`.
-- **`LogOccurrenceBucket`**: `bucket_start` (RFC 3339 UTC, hour-floored),
-  `bucket_width` (`1h`), `occurrence_count`, and (issue #361) `source_id` — a
-  `log:v2:` handle to the owning `LogSource`, a required identity input.
+- **`LogEvent`**: `repository_id`, `event_excerpt` (redacted, ≤200 chars),
+  `event_content_hash`, `source_line`, `severity`.
+- **`LogOccurrenceBucket`**: `repository_id`, `bucket_start` (RFC 3339 UTC,
+  hour-floored), `bucket_width` (`1h`), `occurrence_count`, `source_id`
+  (issue #361 — a `log:v<N>:` handle to the owning `LogSource`, a required
+  identity input), and (issue #364) `occurrence_timestamps` — the sorted list
+  of RFC 3339 UTC per-occurrence valid times that fell in the bucket's hour.
+  When populated (schema v3) its length equals `occurrence_count`; it is
+  `#[serde(default)]` and empty on a legacy `log:v2:` bucket. It is **not** an
+  identity input (the bucket ID preimage is unchanged); it exists so a consumer
+  can bound a per-window count endpoint-exactly at an arbitrary commit instant
+  instead of counting the whole hour. See
+  [Per-occurrence timestamps](#per-occurrence-timestamps-schema-v3-issue-364).
 
 ## Edge labels
 
@@ -130,7 +158,7 @@ blame.
 
 ## Stable-ID identity
 
-IDs are `log:v2:<blake3>` over the NUL-joined identity parts below (content is
+IDs are `log:v3:<blake3>` over the NUL-joined identity parts below (content is
 hashed verbatim — no lowercasing). The **producer envelope and its version
 fields are never identity inputs**, so two binary versions over identical input
 mint identical IDs. Line endings are normalized (`\r\n`/`\r` → `\n`) before
@@ -154,6 +182,42 @@ bucket IDs whose per-source counts **sum** via per-signature aggregation, while 
 genuine **rescan** of identical bytes mints the **same** bucket ID and **collapses**
 as a duplicate. This is what lets downstream consumers tell "rescan (count once)"
 apart from "distinct sources (sum)" — a bucket ID collision is now always a rescan.
+
+The **schema v3** additions (`repository_id`, `occurrence_timestamps`) are
+**non-identity** — every identity part above is unchanged, so a v3 record's
+`<blake3>` preimage is identical to what a v2 record would produce; only the
+`log:v3:` prefix (from the bumped `LOG_SCHEMA_VERSION`) makes the full ID differ.
+
+### Repository attribution (schema v3, issue #362)
+
+Every log payload carries a `repository_id` field equal to the computed
+repository identity — byte-identical to the `Repository` record ID that a
+`--repo <selector>` resolves to. Because `repository_id` was always an identity
+input for every log ID, storing it changes **no** preimage; it makes the
+attribution **retrievable** at read time rather than only hash-encoded.
+`RepositoryIndex::owner_of(<log-record-id>)` now resolves from this field, so
+[`eg query log-deltas --repo`](../cli/log-deltas.md) filters log signatures by
+repository in a shared multi-repository store: a signature attributed to a
+different repository is soundly excluded rather than bled in. A legacy `log:v2:`
+record deserializes `repository_id` as the empty string (unattributed);
+`owner_of` returns `None` for it, and under a set `--repo` it is **excluded**
+(conservative — it cannot be proven in-repo), disclosed by a shrunken residual
+caveat. `scan-logs` mints **no** `Repository` node, so this field — not a
+containment edge — is what carries attribution even in a standalone log graph.
+
+### Per-occurrence timestamps (schema v3, issue #364)
+
+Each `LogOccurrenceBucket` retains, in addition to its aggregate
+`occurrence_count`, the sorted list of RFC 3339 UTC per-occurrence valid times
+that fell in its hour (`occurrence_timestamps`, length == `occurrence_count`
+when populated). The data already exists at scan time — each occurrence carries
+a `valid_time`; v3 simply stops discarding the individual times. This is the
+minimal scheme that answers an **arbitrary** commit instant exactly: a consumer
+counts only the timestamps at or before the endpoint, so a bucket straddling a
+mid-hour endpoint is no longer counted whole. A legacy `log:v2:` bucket has an
+empty `occurrence_timestamps` and falls back to the hour-bucket-granular rule
+for that bucket (see [`log-deltas.md`](../cli/log-deltas.md) → *Occurrence
+counts*). Timestamps only — redaction-safe, never raw log text.
 
 ## Aggregation storage design
 

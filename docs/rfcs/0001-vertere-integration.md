@@ -263,10 +263,13 @@ concrete work before a multi-tenant cloud deployment. Open tracking issues:
   (the owning `LogSource` is folded into the bucket's stable ID and carried as a
   citable `source_id` field), so distinct sources and rescans are distinguished in
   per-window counts and those counts converge across `--graph` and `--data-dir`
-  (**resolved, issue #361**, schema v2). Remaining: log records carry no persisted
-  repository attribution, so `--repo` cannot filter log signatures (issue #362);
-  endpoint-exact occurrence counts need sub-hour per-occurrence timestamps
-  (issue #364).
+  (**resolved, issue #361**, schema v2). Log records now persist a retrievable
+  `repository_id` field, so `eg query log-deltas --repo` filters log signatures by
+  repository in a shared store (**resolved, issue #362**, schema v3), and each
+  `LogOccurrenceBucket` retains a sorted `occurrence_timestamps` list so
+  `log-deltas` per-window counts are endpoint-exact (**resolved, issue #364**,
+  schema v3, with a per-response `hourly_bucket` fallback for legacy `log:v2:`
+  buckets). Both v3 fields are `#[serde(default)]` for back-compat with v2 records.
 - **Evidence-pack hardening.** Bind `frame_resolution` labels on error-signature
   evidence-pack rows via co-located `FRAME_RESOLVES_TO` edges (issue #371); extend the
   `runtime_observation` provenance requirement to the shared citation classifier used
