@@ -21,6 +21,7 @@ use crate::{
     },
     repository_record_from_identity, scan_source_file_records,
     schema_version::validate_record_version,
+    unreadable_skip_outcome,
 };
 
 /// Incremental cache schema for extractor output stored on disk.
@@ -285,7 +286,28 @@ fn scan_repository_incremental_at_inner(
     let (source_files, mut coverage_tally) =
         crate::fs::discover_source_files_with_coverage(repo_root)?;
     for source_file in source_files {
-        let hash = file_hash(&source_file.path)?;
+        // An unreadable file (io error, e.g. a permission failure) fails the byte
+        // hash BEFORE `scan_source_file_records` could turn it into a
+        // `SourceFileScanOutcome::Skipped` (issue #438). `?`-propagating here
+        // would abort the whole refresh instead of skipping just this file, so
+        // route the io error to the SAME unreadable-skip handling the full scan
+        // uses: emit the deterministic diagnostic, count the file UNINDEXED, and
+        // move on without caching a `File` node. Not inserting into `seen_files`
+        // is intentional — a previously-cached file that has since become
+        // unreadable gets its stale records tombstoned below, matching the
+        // full-scan result (no `File` node for it). A NON-UTF-8 file still hashes
+        // fine here and is skipped downstream by `scan_source_file_records`; only
+        // the io-error class needs this branch.
+        let Ok(hash) = file_hash(&source_file.path) else {
+            record_unreadable_source_skip(
+                &mut graph,
+                &mut coverage_tally,
+                &source_file,
+                &repository_id,
+                transaction_time,
+            );
+            continue;
+        };
         seen_files.insert(source_file.repo_relative_path.clone());
         let previous_entry = previous_cache.files.get(&source_file.repo_relative_path);
         let cached = previous_entry.filter(|_| can_reuse_cache_records);
@@ -734,6 +756,37 @@ fn file_hash(path: &Path) -> Result<String> {
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
+/// Records an unreadable source file (io error) in the incremental refresh loop
+/// as a coverage-reconciled SKIP instead of aborting the refresh (issue #438).
+///
+/// The full-scan path reaches its unreadable-skip arm from inside
+/// `scan_source_file_records`; the refresh path computes [`file_hash`] (itself a
+/// `std::fs::read`) FIRST, so an unreadable file fails there — before extraction
+/// could observe it — and must be routed to the SAME handling here rather than
+/// `?`-propagating and aborting the whole scan. Reuses the shared
+/// [`unreadable_skip_outcome`] builder so the emitted diagnostic is byte-identical
+/// to the full scan's, pushes it into the graph, and counts the file UNINDEXED so
+/// `reconcile_scan_coverage` stays honest. No `File` node and no cache entry are
+/// produced, so the hash simply recomputes on the next refresh.
+fn record_unreadable_source_skip(
+    graph: &mut Graph,
+    coverage_tally: &mut crate::fs::ScanCoverageTally,
+    source_file: &crate::fs::SourceFile,
+    repository_id: &str,
+    transaction_time: &str,
+) {
+    let crate::SourceFileScanOutcome::Skipped {
+        diagnostic,
+        repo_relative_path,
+        extension,
+    } = unreadable_skip_outcome(source_file, repository_id)
+    else {
+        unreachable!("unreadable_skip_outcome always returns a Skipped outcome");
+    };
+    graph.push((*diagnostic).with_valid_time_inferred(transaction_time));
+    coverage_tally.record_unindexed_skip(repo_relative_path, extension);
+}
+
 fn invalidated_record_tombstones(
     repo_relative_path: &str,
     old_records: &[GraphRecord],
@@ -772,5 +825,95 @@ fn invalidated_record_tombstone(
         deleted_id: deleted_id.to_owned(),
         summary: format!("Invalidated stale cached record {deleted_id} from {repo_relative_path}"),
         producer: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{file_hash, record_unreadable_source_skip};
+    use crate::fs::{ScanCoverageTally, SourceFile};
+    use crate::ir::{Graph, GraphRecord, NodeKind};
+
+    /// Issue #438 (refresh path): an unreadable discovered file makes the
+    /// incremental loop's `file_hash` read fail. Before the fix that error
+    /// `?`-aborted the whole refresh, so the unreadable diagnostic and coverage
+    /// skip were never produced; now the io error routes to
+    /// [`record_unreadable_source_skip`], which — reusing the same
+    /// `unreadable_skip_outcome` builder the full scan uses — emits the
+    /// deterministic `unreadable_source` diagnostic and counts the file
+    /// UNINDEXED without aborting and without minting a `File` node. The io error
+    /// is triggered root-safely by a directory-as-source path (EISDIR on Unix),
+    /// mirroring the full-scan unit test, so it needs no permission games.
+    #[test]
+    fn incremental_unreadable_source_is_skipped_not_aborted() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // A directory at the source path makes `std::fs::read` (the read behind
+        // `file_hash`) return an io error on every platform, deterministically
+        // and without chmod games that root would bypass.
+        let dir_as_source = temp.path().join("weird.rs");
+        std::fs::create_dir_all(&dir_as_source).expect("dir");
+        let source_file = SourceFile {
+            path: dir_as_source,
+            repo_relative_path: "weird.rs".to_owned(),
+        };
+
+        // The refresh loop keys the unreadable branch on `file_hash` returning
+        // `Err`; confirm the directory path drives it there deterministically.
+        assert!(
+            file_hash(&source_file.path).is_err(),
+            "reading a directory as a file must be an io error"
+        );
+
+        let mut graph = Graph::new();
+        let mut coverage_tally = ScanCoverageTally::default();
+        record_unreadable_source_skip(
+            &mut graph,
+            &mut coverage_tally,
+            &source_file,
+            "repo:test",
+            "2026-01-01T00:00:00Z",
+        );
+
+        // The deterministic unreadable diagnostic is produced (name + fixed
+        // summary identical to the full-scan skip).
+        let diagnostics: Vec<_> = graph
+            .records()
+            .iter()
+            .filter_map(|record| match record {
+                GraphRecord::Node {
+                    kind: NodeKind::Diagnostic,
+                    name,
+                    summary,
+                    ..
+                } => Some((name.clone(), summary.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(diagnostics.len(), 1, "exactly one skip diagnostic expected");
+        assert_eq!(diagnostics[0].0.as_deref(), Some("unreadable_source"));
+        assert_eq!(diagnostics[0].1, "skipped source file: unreadable");
+
+        // No `File` node is minted for the skipped path.
+        assert!(
+            !graph.records().iter().any(|record| matches!(
+                record,
+                GraphRecord::Node {
+                    kind: NodeKind::File,
+                    ..
+                }
+            )),
+            "an unreadable file must not receive a File node"
+        );
+
+        // Coverage counts the file as an UNINDEXED skip (keyed on its lowercased
+        // extension), so `reconcile_scan_coverage` classifies it correctly.
+        assert_eq!(
+            coverage_tally
+                .skipped_paths
+                .get("weird.rs")
+                .map(String::as_str),
+            Some("rs"),
+            "the skipped path must be reconciled as UNINDEXED"
+        );
     }
 }

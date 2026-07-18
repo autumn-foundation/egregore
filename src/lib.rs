@@ -617,6 +617,34 @@ fn skipped_source_diagnostic(
     )
 }
 
+/// Builds the `Skipped` outcome for a source file that cannot be READ at all —
+/// an io error such as a permission failure (issue #438).
+///
+/// Shared by the full-scan path ([`scan_source_file_records`], where the first
+/// `std::fs::read` fails) and the incremental refresh path (`incremental.rs`,
+/// where the earlier byte-hash read fails before extraction is reached), so both
+/// emit the IDENTICAL deterministic `unreadable_source` diagnostic — id shape
+/// `["node","diagnostic","unreadable_source",repository_id,repo_relative_path]`,
+/// fixed summary — and reconcile scan coverage the same way. Factoring the
+/// construction here keeps the two call sites from duplicating it.
+pub(crate) fn unreadable_skip_outcome(
+    source_file: &fs::SourceFile,
+    repository_id: &str,
+) -> SourceFileScanOutcome {
+    let repo_relative_path = source_file.repo_relative_path.clone();
+    let extension = fs::lowercased_extension(&source_file.path);
+    SourceFileScanOutcome::Skipped {
+        diagnostic: Box::new(skipped_source_diagnostic(
+            repository_id,
+            &repo_relative_path,
+            "unreadable_source",
+            "skipped source file: unreadable",
+        )),
+        repo_relative_path,
+        extension,
+    }
+}
+
 pub(crate) fn scan_source_file_records(
     source_file: &fs::SourceFile,
     repository_id: &str,
@@ -628,16 +656,7 @@ pub(crate) fn scan_source_file_records(
     // class (permission/io error) — skip and record rather than abort (issue
     // #438).
     let Ok(bytes) = std::fs::read(&source_file.path) else {
-        return Ok(SourceFileScanOutcome::Skipped {
-            diagnostic: Box::new(skipped_source_diagnostic(
-                repository_id,
-                &repo_relative_path,
-                "unreadable_source",
-                "skipped source file: unreadable",
-            )),
-            repo_relative_path,
-            extension,
-        });
+        return Ok(unreadable_skip_outcome(source_file, repository_id));
     };
     let Ok(source) = std::str::from_utf8(&bytes) else {
         return Ok(SourceFileScanOutcome::Skipped {
