@@ -82,6 +82,13 @@ pub(crate) struct DepsHeaderJson<'a> {
     as_of: Option<&'a str>,
     total_dependencies: usize,
     total_unresolved: usize,
+    /// Corpus the current-state view read (issue #427):
+    /// `head_anchored`/`union`/`commit_pinned`/`single_snapshot`.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: `default`/`explicit_flag`/`selector`.
+    corpus_mode_source: &'static str,
+    /// One-line human description of what the corpus includes.
+    corpus_disclaimer: &'static str,
     disclaimer: &'static str,
     diagnostics: Vec<AuditDiagnostic<'a>>,
 }
@@ -161,7 +168,11 @@ pub(crate) fn deps_unresolved_row_json<'a>(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools
+)]
 pub(crate) fn query_deps_cmd(
     records: &[GraphRecord],
     handle: &str,
@@ -169,32 +180,72 @@ pub(crate) fn query_deps_cmd(
     repo_scope: Option<&str>,
     at: Option<&str>,
     as_of: Option<&str>,
+    at_head: bool,
+    all_history: bool,
     format: OutputFormat,
 ) -> Result<()> {
+    // ── corpus-mode selection (issue #427) ────────────────────────────────────
+    // Current-state code lanes default to HEAD-anchoring (records current at
+    // each repository's stamped `source_snapshot` HEAD) when a snapshot exists;
+    // `--all-history` opts into the union of all commit snapshots and `--at-head`
+    // makes the default explicit. `--at`/`--as-of` still pin a single commit.
+    let has_snapshot = query::store_has_source_snapshot(records);
+    let (corpus_mode, corpus_mode_source) = match query::resolve_corpus_mode(
+        at.is_some() || as_of.is_some(),
+        at_head,
+        all_history,
+        has_snapshot,
+    ) {
+        Ok(pair) => pair,
+        Err(message) => {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": { "code": "unsupported_combination", "message": message },
+            });
+            println!("{}", serde_json::to_string(&envelope)?);
+            std::process::exit(1);
+        }
+    };
+
     // ── temporal narrowing: one commit's snapshot view (issue #123 AC4) ───────
     // Reuses the transitive-callers commit-view resolver: both verbs answer
     // from the same single-commit history slice.
     let mut at_commit: Option<String> = None;
-    let filtered: Option<Vec<GraphRecord>> = if at.is_some() || as_of.is_some() {
-        let sha = resolve_transitive_commit_view(records, index, repo_scope, at, as_of)?;
-        let view: Vec<GraphRecord> = records
-            .iter()
-            .filter(|r| match r {
-                GraphRecord::Node {
-                    temporal: Some(t), ..
-                }
-                | GraphRecord::Edge {
-                    temporal: Some(t), ..
-                } => t.git_commit == sha,
-                _ => false,
-            })
-            .cloned()
-            .collect();
-        at_commit = Some(sha);
-        Some(view)
-    } else {
-        None
-    };
+    let filtered: Option<Vec<GraphRecord>> =
+        if matches!(corpus_mode, query::CorpusMode::CommitPinned) {
+            let sha = resolve_transitive_commit_view(records, index, repo_scope, at, as_of)?;
+            let view: Vec<GraphRecord> = records
+                .iter()
+                .filter(|r| match r {
+                    GraphRecord::Node {
+                        temporal: Some(t), ..
+                    }
+                    | GraphRecord::Edge {
+                        temporal: Some(t), ..
+                    } => t.git_commit == sha,
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+            at_commit = Some(sha);
+            Some(view)
+        } else if matches!(corpus_mode, query::CorpusMode::HeadAnchored) {
+            // Head-anchor: drop every record not current at its owning repository's
+            // stamped HEAD BEFORE traversal, so a dependency (edge or target) removed
+            // at HEAD does not appear. Snapshot-less stores never reach here (the
+            // default resolves to SingleSnapshot). See `query::non_head_current_record_ids`.
+            let non_current = query::non_head_current_record_ids(records, index);
+            let view: Vec<GraphRecord> = records
+                .iter()
+                .filter(|r| !non_current.contains(r.id()))
+                .cloned()
+                .collect();
+            Some(view)
+        } else {
+            // Union / SingleSnapshot: keep the full record set; `symbol_dependencies`
+            // applies its keep-last-per-id / latest-edge-version liveness itself.
+            None
+        };
     let records: &[GraphRecord] = filtered.as_deref().unwrap_or(records);
 
     // ── handle resolution (symbol record ID or exact symbol name only) ────────
@@ -342,6 +393,9 @@ pub(crate) fn query_deps_cmd(
         as_of,
         total_dependencies: rows_json.len(),
         total_unresolved: unresolved_json.len(),
+        corpus_mode: corpus_mode.as_str(),
+        corpus_mode_source: corpus_mode_source.as_str(),
+        corpus_disclaimer: corpus_mode.disclaimer(),
         disclaimer: DEPS_DISCLAIMER,
         diagnostics,
     };
