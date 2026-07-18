@@ -2014,6 +2014,9 @@ fn shadowed_receiver_binding_falls_back_to_ambiguous_fanout() {
 }
 
 #[test]
+// `bar_configure`/`baz_configure` are intentionally parallel (two types with the
+// same method), which trips the similar-names lint without aiding clarity here.
+#[allow(clippy::similar_names)]
 fn provable_receiver_with_no_matching_method_invents_no_edge() {
     // RED (issue #441): a provable `let f: Foo = …` whose type `Foo` has NO
     // matching method must emit NOTHING NEW — never guess an edge to another
