@@ -140,14 +140,58 @@ pub fn parse_query_path(raw: &str) -> Result<Vec<String>, WhoImportsError> {
     Ok(segments.into_iter().map(str::to_owned).collect())
 }
 
+/// Strips an optional leading Rust visibility + `use` keyword prefix from an
+/// Import node's raw `name`, anchored at the very start.
+///
+/// The Rust extractor's `import_name` only trims a leading BARE `use`, so a
+/// public re-export keeps its visibility on the Import node `name`:
+/// `pub use crate::internal::Widget;` mints the literal name
+/// `pub use crate::internal::Widget` (issue #449 Codex finding). Left as-is, the
+/// first segment split on `::` becomes `pub use crate`, so every `crate::…`
+/// re-export site is missed. This helper drops the keyword prefix before the
+/// split: an optional `pub` visibility token (including a `pub(crate)` /
+/// `pub(super)` / `pub(self)` / `pub(in path)` restriction) followed by the
+/// `use` keyword, or a bare leading `use `. Only the anchored keyword prefix is
+/// consumed — `pub` and `use` are reserved words and can never be module
+/// segments, and a segment that merely starts with the substring `use` (e.g.
+/// `used`) is not stripped — so this never over-strips a real path.
+fn strip_use_prefix(name: &str) -> &str {
+    let trimmed = name.trim_start();
+    // Optionally consume a leading `pub` visibility token, including a
+    // `pub(...)` restriction. A bare `pub` counts only when followed by
+    // whitespace or a `(` — otherwise it is part of a longer token and left be.
+    let after_vis = trimmed
+        .strip_prefix("pub")
+        .map_or(trimmed, |rest| match rest.chars().next() {
+            // Skip the balanced `(...)` restriction (visibility restrictions do
+            // not nest, so the first `)` closes it).
+            Some('(') => rest.find(')').map_or(rest, |idx| &rest[idx + 1..]),
+            Some(c) if c.is_whitespace() => rest,
+            _ => trimmed,
+        })
+        .trim_start();
+    // Strip only when the `use` keyword is actually present (and is a whole
+    // keyword, not the prefix of a longer identifier); otherwise the name is
+    // already a bare path — return it unchanged.
+    match after_vis.strip_prefix("use") {
+        Some(rest) if rest.chars().next().is_none_or(char::is_whitespace) => rest.trim_start(),
+        _ => name,
+    }
+}
+
 /// Reduces an Import node's raw `name` path text to its module-path segment
 /// list.
 ///
 /// A group import `a::b::{C, D}` reduces to the common module prefix `a::b`; a
 /// glob `a::b::*` reduces to `a::b`; a trailing ` as <alias>` rename is
-/// stripped. Empty segments (from a trailing `::`) and `*` are dropped.
+/// stripped. A leading `pub`/visibility + `use` (or bare `use`) keyword prefix
+/// left on a re-export node's `name` by the extractor is stripped first (see
+/// [`strip_use_prefix`]). Empty segments (from a trailing `::`) and `*` are
+/// dropped.
 #[must_use]
 pub fn parse_import_segments(name: &str) -> Vec<String> {
+    // Drop any leading `[pub[(...)]] use` keyword prefix a re-export node kept.
+    let name = strip_use_prefix(name);
     // Group import: everything before the first `{` is the common module
     // prefix; the braced leaves (and any leaf renames inside them) are dropped.
     let head = name.find('{').map_or(name, |idx| &name[..idx]);
@@ -374,6 +418,96 @@ mod tests {
         );
         assert_eq!(parse_import_segments("crate::a::*"), vec!["crate", "a"]);
         assert_eq!(parse_import_segments("crate::{a, b}"), vec!["crate"]);
+    }
+
+    #[test]
+    fn import_segments_strip_pub_use_re_export_prefix() {
+        // The Rust extractor's `import_name` only trims a leading bare `use`, so
+        // a public re-export keeps its visibility on the Import node `name`:
+        // `pub use crate::internal::Widget;` mints the literal name
+        // `pub use crate::internal::Widget`. The segment parser must drop that
+        // keyword prefix or the first segment becomes `pub use crate` (#449).
+        assert_eq!(
+            parse_import_segments("pub use crate::internal::Widget"),
+            vec!["crate", "internal", "Widget"]
+        );
+        assert_eq!(
+            parse_import_segments("pub(crate) use crate::a::T"),
+            vec!["crate", "a", "T"]
+        );
+        assert_eq!(
+            parse_import_segments("pub(super) use super::a::T"),
+            vec!["super", "a", "T"]
+        );
+        assert_eq!(
+            parse_import_segments("pub(in crate::foo) use crate::a::T"),
+            vec!["crate", "a", "T"]
+        );
+        // A bare leading `use ` keyword (robustness) is also stripped.
+        assert_eq!(
+            parse_import_segments("use crate::a::T"),
+            vec!["crate", "a", "T"]
+        );
+        // Plain already-stripped paths are unaffected — `pub`/`use` are reserved
+        // words, so a real segment can never begin with them, and a segment that
+        // merely starts with the substring `use` (e.g. `used`) is not stripped.
+        assert_eq!(
+            parse_import_segments("crate::a::T"),
+            vec!["crate", "a", "T"]
+        );
+        assert_eq!(
+            parse_import_segments("used::helpers::X"),
+            vec!["used", "helpers", "X"]
+        );
+    }
+
+    #[test]
+    fn pub_use_re_export_site_matches_prefix_query() {
+        // A public re-export whose extractor name retains `pub use` must still be
+        // found by a `crate::internal` query (#449, finding 1).
+        let mut g = Graph::new();
+        let id = import(&mut g, "src/lib.rs", "pub use crate::internal::Widget", 1);
+        let recs = g.into_records();
+        let result = run(&recs, "crate::internal");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].record_id, id);
+    }
+
+    #[test]
+    fn crate_flag_unifies_pub_use_re_export() {
+        // The `--crate` unification must also reach a `pub use crate::…`
+        // re-export site once the keyword prefix is stripped (#449, finding 1).
+        let mut g = Graph::new();
+        import(&mut g, "src/lib.rs", "pub use crate::widget::Thing", 1);
+        let recs = g.into_records();
+        let index = RepositoryIndex::build(&recs);
+        let unified = who_imports(&recs, "mycrate::widget", Some("mycrate"), &index, None).unwrap();
+        assert_eq!(unified.rows.len(), 1);
+        assert_eq!(unified.rows[0].import_path, "pub use crate::widget::Thing");
+    }
+
+    // ── scan-history union semantics ─────────────────────────────────────
+    //
+    // A `scan-history` graph is the UNION of every commit snapshot: history
+    // replay stamps per-commit Import records but does NOT tombstone an import
+    // removed in a later commit. This lane has no `--at`/`--as-of` and no
+    // HEAD-only filter, so an import present only in an early commit is STILL
+    // returned by an unpinned query — mirroring `deps`/`path` (#449, finding 2).
+    #[test]
+    fn history_union_returns_import_removed_in_a_later_commit() {
+        let mut g = Graph::new();
+        // Import present in an early commit; a later commit dropped it WITHOUT a
+        // tombstone (history replay never tombstones removed imports). The
+        // un-tombstoned early-commit record persists in the union JSONL.
+        let id = import(&mut g, "src/old.rs", "foo::bar::Legacy", 1);
+        let recs = g.into_records();
+        let result = run(&recs, "foo::bar");
+        assert_eq!(
+            result.rows.len(),
+            1,
+            "unpinned who-imports over a history union still returns a later-removed import"
+        );
+        assert_eq!(result.rows[0].record_id, id);
     }
 
     // ── matching ─────────────────────────────────────────────────────────

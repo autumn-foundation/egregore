@@ -467,9 +467,16 @@ produces NO match (the precision win over grep). The graph carries no per-file o
 name, so by default a `crate::`-relative import and an absolute `<crate>::` import are
 DISTINCT (and a leading `self`/`super` is matched literally); pass `--crate <name>` to
 rewrite a leading `crate::` in BOTH the query and imports to `<name>::` so the two forms
-unify — caller-supplied ground truth, never guessed. Liveness follows the shared
+unify — caller-supplied ground truth, never guessed. A leading `pub`/visibility + `use` (or
+bare `use`) keyword prefix the extractor leaves on a re-export node's `name`
+(`pub use crate::internal::Widget`) is stripped before matching, so `crate::…` re-export sites
+are found (issue #449). Liveness follows the shared
 latest-write-wins `Liveness` gate so `--graph` and `--data-dir` agree on tombstoned/revived
-imports. Output is a deterministic NDJSON envelope (`query_path`, optional `crate_name`,
+imports. This slice has no `--at`/`--as-of` and no HEAD-only filter: over a `scan`
+(current-tree) graph the answer is current state, but over a `scan-history` graph the lane
+reads the UNION of all commit snapshots (history replay never tombstones a later-removed
+import, so an import present only in an early commit is still returned), mirroring
+`deps`/`path`. Output is a deterministic NDJSON envelope (`query_path`, optional `crate_name`,
 `total_importers`, disclaimer) then one `source_fact` row per importer carrying a stable
 `record_id` + repo-relative `repo_relative_path`/`span` + the raw `import_path`; sorted by
 path, start line, then record ID and byte-identical across runs and across `--graph` vs

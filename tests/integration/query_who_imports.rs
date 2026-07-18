@@ -269,6 +269,105 @@ fn tombstoned_then_revived_import_is_live_over_graph() {
 }
 
 #[test]
+fn pub_use_re_export_site_is_found_end_to_end() {
+    // The Rust extractor's `import_name` only trims a leading bare `use`, so a
+    // `pub use crate::internal::Widget;` re-export keeps its visibility on the
+    // Import node `name` (`pub use crate::internal::Widget`). The lane must
+    // strip that keyword prefix before matching (#449, finding 1).
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("reexport.jsonl");
+    let mut graph = Graph::new();
+
+    let repo_id = stable_id(&["node", "Repository", "repo-reexport"]);
+    graph.push(GraphRecord::node(
+        repo_id.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo-reexport".to_owned()),
+        "Repository repo-reexport".to_owned(),
+    ));
+    file(&mut graph, &repo_id, "src/lib.rs");
+    file(&mut graph, &repo_id, "src/vis.rs");
+    // Public re-export whose extractor name retains the `pub use` prefix.
+    import(
+        &mut graph,
+        "src/lib.rs",
+        "pub use crate::internal::Widget",
+        1,
+    );
+    // A `pub(crate) use` re-export keeps its restricted visibility too.
+    import(
+        &mut graph,
+        "src/vis.rs",
+        "pub(crate) use crate::internal::Helper",
+        2,
+    );
+
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+
+    let (header, rows) = run_ok(&[
+        "query",
+        "who-imports",
+        "crate::internal",
+        "--graph",
+        path.to_str().unwrap(),
+    ]);
+    assert_eq!(header["total_importers"].as_u64(), Some(2));
+    let matched: Vec<&str> = rows
+        .iter()
+        .map(|r| r["import_path"].as_str().unwrap())
+        .collect();
+    assert!(matched.contains(&"pub use crate::internal::Widget"));
+    assert!(matched.contains(&"pub(crate) use crate::internal::Helper"));
+}
+
+#[test]
+fn history_union_returns_import_removed_in_a_later_commit() {
+    // A `scan-history` graph is the UNION of all commit snapshots: history
+    // replay stamps per-commit Import records but never tombstones one removed
+    // in a later commit, and this lane has no `--at`/`--as-of` and no HEAD-only
+    // filter. So an import present only in an early commit is STILL returned by
+    // an unpinned query — mirroring `deps`/`path` (#449, finding 2, documented
+    // in docs/cli/who-imports.md).
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("history_union.jsonl");
+    let mut graph = Graph::new();
+
+    let repo_id = stable_id(&["node", "Repository", "repo-history-union"]);
+    graph.push(GraphRecord::node(
+        repo_id.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo-history-union".to_owned()),
+        "Repository repo-history-union".to_owned(),
+    ));
+    file(&mut graph, &repo_id, "src/old.rs");
+    // Import present in an early commit and dropped later WITHOUT a tombstone —
+    // exactly how history replay leaves a removed import in the union JSONL.
+    let legacy_id = import(&mut graph, "src/old.rs", "foo::bar::Legacy", 1);
+
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+
+    let (header, rows) = run_ok(&[
+        "query",
+        "who-imports",
+        "foo::bar",
+        "--graph",
+        path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        header["total_importers"].as_u64(),
+        Some(1),
+        "unpinned who-imports over a history union still returns a later-removed import"
+    );
+    assert_eq!(rows[0]["record_id"].as_str(), Some(legacy_id.as_str()));
+}
+
+#[test]
 fn segment_boundary_never_bleeds_into_sibling() {
     let f = seed();
     // `foo::barbell` is a distinct module — querying it returns only the sibling.
