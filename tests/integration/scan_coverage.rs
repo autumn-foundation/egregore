@@ -202,6 +202,157 @@ fn scan_reports_coverage_summary_and_node() {
     );
 }
 
+/// Encodes `text` as UTF-16LE with a byte-order mark, yielding bytes that are
+/// genuine text yet never valid UTF-8 (a leading `0xFF` byte is impossible in
+/// UTF-8), so writing them to a `.rs` file exercises the non-UTF-8 decode-skip
+/// path (issue #438).
+fn utf16le_with_bom(text: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+/// Issue #438: `eg scan` must not hard-abort on the first non-UTF-8 tracked
+/// source file. It skips the undecodable file, records a deterministic
+/// `Diagnostic` naming its repo-relative path, continues extracting every
+/// decodable file, and reconciles the skip into `ScanCoverage` so the file is
+/// honestly counted UNINDEXED (AC4 invariant preserved).
+#[test]
+fn scan_skips_non_utf8_source_and_records_diagnostic() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(repo.join("src/good.rs"), "pub fn good() -> u32 { 1 }\n").expect("good source");
+    fs::write(
+        repo.join("src/also_good.rs"),
+        "pub fn also() -> u32 { 2 }\n",
+    )
+    .expect("second good source");
+    fs::write(
+        repo.join("src/bad.rs"),
+        utf16le_with_bom("pub fn hidden() {}"),
+    )
+    .expect("bad source");
+    fs::write(repo.join("README.md"), "# doc\n").expect("readme");
+    run_git(&repo, &["init"]);
+    run_git(&repo, &["config", "user.email", "test@example.invalid"]);
+    run_git(&repo, &["config", "user.name", "Test"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    run_git(&repo, &["add", "-A", "-f"]);
+    run_git(&repo, &["commit", "-m", "fixture"]);
+
+    let graph_path = repo.join("graph.jsonl");
+    let output = assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&graph_path)
+        .output()
+        .expect("scan should run");
+    // The scan completes rather than aborting on the undecodable file.
+    assert!(
+        output.status.success(),
+        "scan must exit 0 on a non-UTF-8 source: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let jsonl = fs::read_to_string(&graph_path).expect("scan should write JSONL");
+    let records = parse_jsonl(&jsonl);
+
+    // The decodable files are fully extracted.
+    let good_file = records.iter().any(|r| {
+        r["record_type"] == "node"
+            && r["kind"] == "File"
+            && r["repo_relative_path"] == "src/good.rs"
+    });
+    let good_symbol = records.iter().any(|r| {
+        r["record_type"] == "node"
+            && r["kind"] == "Symbol"
+            && r["repo_relative_path"] == "src/good.rs"
+            && r["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with("good"))
+    });
+    assert!(good_file, "decodable file must have a File node");
+    assert!(good_symbol, "decodable file's symbol must be extracted");
+
+    // The bad file gets no File node.
+    let bad_file = records.iter().any(|r| {
+        r["record_type"] == "node" && r["kind"] == "File" && r["repo_relative_path"] == "src/bad.rs"
+    });
+    assert!(!bad_file, "the non-UTF-8 file must not receive a File node");
+
+    // A Diagnostic names the bad file's repo-relative path with a non-UTF-8
+    // reason.
+    let diagnostic = records.iter().find(|r| {
+        r["record_type"] == "node"
+            && r["kind"] == "Diagnostic"
+            && r["repo_relative_path"] == "src/bad.rs"
+    });
+    let diagnostic = diagnostic.expect("a Diagnostic must name the skipped non-UTF-8 file");
+    let summary = diagnostic["summary"].as_str().unwrap_or_default();
+    assert!(
+        summary.contains("UTF-8"),
+        "diagnostic must state the non-UTF-8 decode failure: {summary}"
+    );
+
+    // Coverage counts the bad file as skipped/unindexed. 4 walked (good, also_good,
+    // bad, README), 2 indexed (the two decodable .rs), skipped rs=1 + md=1.
+    let node = coverage_node(&records);
+    let walked = node["scan_coverage"]["files_walked"].as_u64().unwrap();
+    let indexed = node["scan_coverage"]["files_indexed"].as_u64().unwrap();
+    assert_eq!(walked, 4, "coverage: {node}");
+    assert_eq!(
+        indexed, 2,
+        "the bad .rs must not be counted indexed: {node}"
+    );
+    let skipped = node["scan_coverage"]["skipped_by_extension"]
+        .as_object()
+        .expect("skipped_by_extension object");
+    assert_eq!(skipped["rs"], 1, "the undecodable .rs is skipped: {node}");
+    assert_eq!(skipped["md"], 1, "coverage: {node}");
+    let skipped_total: u64 = skipped.values().map(|v| v.as_u64().unwrap()).sum();
+    assert_eq!(
+        indexed + skipped_total,
+        walked,
+        "AC4: indexed + skipped == walked"
+    );
+
+    // A graph carrying the diagnostic validates cleanly.
+    assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .arg("validate")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    // Determinism: two fixed-time scans of the unchanged repo (including the
+    // skip diagnostic and the reconciled coverage) are byte-identical. A fixed
+    // time + id pins the only wall-clock fields (producer/valid time), so any
+    // residual difference would be genuine non-determinism.
+    let fixed_time = "2026-05-19T00:00:00Z";
+    let id = Some("non-utf8-stable-fixture");
+    let first = scan_repository_at_with_override(&repo, fixed_time, id)
+        .expect("scan")
+        .to_jsonl()
+        .expect("serialize");
+    let second = scan_repository_at_with_override(&repo, fixed_time, id)
+        .expect("scan")
+        .to_jsonl()
+        .expect("serialize");
+    assert_eq!(
+        first, second,
+        "scan over a non-UTF-8 file must be byte-stable"
+    );
+    assert!(
+        first.contains("skipped source file: not valid UTF-8"),
+        "the skip diagnostic must be present in the fixed-time scan"
+    );
+}
+
 #[test]
 fn coverage_node_is_byte_stable_across_scans() {
     let temp = tempfile::tempdir().expect("temp dir");

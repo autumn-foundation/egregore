@@ -107,11 +107,14 @@ use crate::{
 /// 18 -> 19 for the issue #406 `ScanCoveragePayload.coverage_generation` field:
 /// cached records embed serialized coverage shapes, so a bump forces older
 /// caches to rebuild and re-emit the generation-bearing coverage node.
+/// 19 -> 20 for the issue #438 non-UTF-8/unreadable source skip: such a file now
+/// caches a `Diagnostic` (never a `File` node) and shifts the coverage counts,
+/// so older caches must rebuild rather than replay the pre-skip record set.
 ///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 19;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 20;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -326,7 +329,17 @@ fn scan_repository_incremental_at_inner(
             (records, cached.facts.clone())
         } else {
             rebuilt_files.push(source_file.repo_relative_path.clone());
-            let (records, facts) = scan_source_file_records(&source_file, &repository_id)?;
+            let (records, facts) = match scan_source_file_records(&source_file, &repository_id)? {
+                crate::SourceFileScanOutcome::Extracted { records, facts } => (records, facts),
+                // A non-UTF-8 or unreadable file is skipped (issue #438): cache
+                // the diagnostic as this file's sole record so an unchanged file
+                // reuses it next refresh. Byte hashing above already succeeds
+                // for such files. The coverage skip is threaded below, uniformly
+                // for the rebuild and reuse paths.
+                crate::SourceFileScanOutcome::Skipped { diagnostic, .. } => {
+                    (vec![diagnostic], FileFacts::default())
+                }
+            };
             let mut records = records
                 .into_iter()
                 .map(|r| r.with_valid_time_inferred(transaction_time))
@@ -369,6 +382,29 @@ fn scan_repository_incremental_at_inner(
             }
             (records, facts)
         };
+
+        // Thread a decode/read skip (issue #438) into the coverage tally,
+        // uniformly for the rebuild and reuse paths: a skipped file produces its
+        // diagnostic but no `File` node, so an absent `File` node for this path
+        // means it must be counted UNINDEXED. Doing it here (rather than only on
+        // the rebuild arm) keeps `reconcile_scan_coverage` honest even when the
+        // undecodable file is unchanged and its cached diagnostic is reused.
+        let has_file_node = records.iter().any(|record| {
+            matches!(
+                record,
+                GraphRecord::Node {
+                    kind: crate::ir::NodeKind::File,
+                    repo_relative_path: Some(path),
+                    ..
+                } if *path == source_file.repo_relative_path
+            )
+        });
+        if !has_file_node {
+            coverage_tally.record_unindexed_skip(
+                source_file.repo_relative_path.clone(),
+                crate::fs::lowercased_extension(&source_file.path),
+            );
+        }
 
         for record in &records {
             graph.push(record.clone());

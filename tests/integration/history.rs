@@ -123,6 +123,80 @@ fn merge_commits_with_rust_resolutions_keep_commit_changed_in_edges() {
     assert_path_has_changed_source(&records, &changed_sources, "src/lib.rs");
 }
 
+/// Issue #438: history replay must not hard-abort on a non-UTF-8 committed
+/// source blob. It skips the undecodable blob, emits a deterministic
+/// `Diagnostic` naming the commit + path, and keeps replaying every decodable
+/// file across the history. `git show` reads objects only, never mutating the
+/// checkout.
+#[test]
+fn scan_history_skips_non_utf8_blob_and_records_diagnostic() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    git(&repo, ["init"]);
+    git(&repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git(&repo, ["config", "user.name", "Codegraph Test"]);
+    git(&repo, ["config", "core.autocrlf", "false"]);
+    git(&repo, ["config", "commit.gpgsign", "false"]);
+
+    write(&repo, "src/lib.rs", "pub fn good() -> u32 { 1 }\n");
+    // A committed `.rs` blob whose bytes are UTF-16LE (BOM 0xFF 0xFE then LE
+    // code units) — genuine text, never valid UTF-8.
+    let mut bad = vec![0xFF, 0xFE];
+    for unit in "pub fn hidden() {}".encode_utf16() {
+        bad.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(repo.join("src/bad.rs"), &bad).expect("bad blob should be written");
+    let commit_sha = commit(
+        &repo,
+        "add source and non-utf8 blob",
+        "2026-04-01T00:00:00Z",
+    );
+
+    let head_before = git_output(&repo, ["rev-parse", "HEAD"]);
+
+    let jsonl = scan_repository_history(&repo)
+        .expect("history replay must complete over a non-UTF-8 blob")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let records = parse_jsonl(&jsonl);
+
+    // The decodable file is still extracted across the history.
+    assert!(
+        records.iter().any(|r| {
+            r["record_type"] == "node"
+                && r["kind"] == "Symbol"
+                && r["repo_relative_path"] == "src/lib.rs"
+                && r["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with("good"))
+        }),
+        "the decodable blob's symbol must be extracted"
+    );
+    // A Diagnostic names the skipped blob with a non-UTF-8 reason.
+    let diagnostic = records.iter().find(|r| {
+        r["record_type"] == "node"
+            && r["kind"] == "Diagnostic"
+            && r["repo_relative_path"] == "src/bad.rs"
+    });
+    let diagnostic = diagnostic.expect("a Diagnostic must name the skipped non-UTF-8 blob");
+    assert!(
+        diagnostic["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("UTF-8"),
+        "diagnostic must state the non-UTF-8 decode failure: {diagnostic}"
+    );
+    // The blob's own bytes never enter the graph.
+    assert!(
+        !jsonl.contains("hidden"),
+        "raw blob text must never enter the graph"
+    );
+    // The checkout is untouched (git show reads objects only).
+    assert_eq!(git_output(&repo, ["rev-parse", "HEAD"]), head_before);
+    let _ = commit_sha;
+}
+
 fn seed_history_repo(repo: &Path) -> [String; 3] {
     git(repo, ["init"]);
     git(repo, ["config", "user.email", "codegraph@example.invalid"]);
