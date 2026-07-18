@@ -1006,22 +1006,55 @@ fn window_bucket_sum(buckets: &[BucketWindow], endpoint: DateTime<Utc>) -> (u64,
     let mut sum: u64 = 0;
     let mut endpoint_exact = true;
     for bucket in buckets {
-        if bucket.occurrence_timestamps.is_empty() && bucket.occurrence_count > 0 {
-            // Legacy v2 bucket: no per-occurrence data. Whole-bucket predicate.
-            if parse_instant(bucket.bucket_start).is_some_and(|b| b <= endpoint) {
-                sum += bucket.occurrence_count;
-            }
-            endpoint_exact = false;
-        } else {
-            // v3 bucket: count only occurrences at or before the endpoint instant.
-            sum += bucket
-                .occurrence_timestamps
-                .iter()
-                .filter(|t| parse_instant(t).is_some_and(|ts| ts <= endpoint))
-                .count() as u64;
-        }
+        let (count, exact) = bucket_occurrences_at_or_before(
+            bucket.bucket_start,
+            bucket.occurrence_count,
+            bucket.occurrence_timestamps,
+            endpoint,
+        );
+        sum += count;
+        endpoint_exact &= exact;
     }
     (sum, endpoint_exact)
+}
+
+/// Endpoint-exact occurrence count for a SINGLE `LogOccurrenceBucket` at or
+/// before `endpoint`, returning `(count, endpoint_exact)` (issue #364).
+///
+/// A schema-v3 bucket carries per-occurrence `occurrence_timestamps`, so its
+/// contribution is the count of timestamps at or before the endpoint — bounded
+/// precisely at the commit instant even when the endpoint falls mid-hour, and
+/// `endpoint_exact` is `true`. A legacy `log:v2:` bucket carries no timestamps
+/// (they deserialize empty), so it FALLS BACK to the hour-bucket predicate (its
+/// whole `occurrence_count` counts iff `bucket_start` is at or before the
+/// endpoint) and `endpoint_exact` is `false`, degrading the caller's response
+/// granularity to `hourly_bucket`. Every comparison is by parsed UTC instant,
+/// never raw RFC 3339 string order (Codex P1); an unparseable bucket start or
+/// timestamp is excluded rather than compared incorrectly. Shared by
+/// [`window_bucket_sum`] (log-deltas) and `error_context`'s `--as-of` bucket
+/// view so the two lanes count identically.
+pub(crate) fn bucket_occurrences_at_or_before(
+    bucket_start: &str,
+    occurrence_count: u64,
+    occurrence_timestamps: &[String],
+    endpoint: DateTime<Utc>,
+) -> (u64, bool) {
+    if occurrence_timestamps.is_empty() && occurrence_count > 0 {
+        // Legacy v2 bucket: no per-occurrence data. Whole-bucket predicate.
+        let count = if parse_instant(bucket_start).is_some_and(|b| b <= endpoint) {
+            occurrence_count
+        } else {
+            0
+        };
+        (count, false)
+    } else {
+        // v3 bucket: count only occurrences at or before the endpoint instant.
+        let count = occurrence_timestamps
+            .iter()
+            .filter(|t| parse_instant(t).is_some_and(|ts| ts <= endpoint))
+            .count() as u64;
+        (count, true)
+    }
 }
 
 /// Builds the deterministic overlapping symbol-delta list for a new signature:

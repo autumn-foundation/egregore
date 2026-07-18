@@ -37,9 +37,11 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::liveness::Liveness;
+use super::log_deltas::bucket_occurrences_at_or_before;
 use super::{
-    LOG_EMBEDDED_RETENTION_CAVEAT, LogEmbeddedRetentionCaveat, OverlappingSymbolDelta,
-    ResolvedFrameHandle, UnresolvedRef, range_deltas,
+    LOG_EMBEDDED_RETENTION_CAVEAT, LOG_REPO_SCOPE_RESIDUAL_CAVEAT, LogEmbeddedRetentionCaveat,
+    LogRepoScopeCaveat, OCCURRENCE_COUNT_GRANULARITY, OCCURRENCE_COUNT_GRANULARITY_ENDPOINT_EXACT,
+    OverlappingSymbolDelta, RepositoryIndex, ResolvedFrameHandle, UnresolvedRef, range_deltas,
 };
 use crate::ir::{
     CorrelationBasis, EdgeLabel, ErrorSignaturePayload, GraphRecord, LogPayload, NodeKind,
@@ -54,17 +56,6 @@ pub const ERROR_CONTEXT_DISCLAIMER: &str = "Rows are CORRELATION LEADS, never pr
      resolved frame proves the backtrace NAMES a symbol, not that it is at fault; an EMITTED_DURING \
      edge is a content-hash or temporal correlation, never causation; and the absence of a lead is \
      not proof of unrelatedness. Occurrence data reflects only the log sources that were scanned.";
-
-/// Fixed advisory emitted in `repo_scope_caveat` whenever `--repo` is set.
-///
-/// `--repo` scopes only the code-side `first_seen_range` symbol-delta join. Log
-/// records carry no retrievable repository attribution (their repository ID is
-/// only hashed into their stable IDs), so the runtime sections
-/// (`signatures`/frames/buckets and their `EMITTED_DURING` observations) are
-/// NEVER repository-filtered — mirroring `eg query log-deltas`.
-pub const REPO_SCOPE_CAVEAT: &str = "--repo scopes only the code-side first_seen_range \
-     symbol-delta join; log records carry no retrievable repository attribution, so the signature, \
-     frame, bucket, and EMITTED_DURING observation sections are NOT repository-filtered.";
 
 /// A universal, redaction-safe projection of one `&GraphRecord` for a
 /// trust-separated context section.
@@ -259,11 +250,27 @@ pub struct ErrorContext {
     /// Protected payload handles (present only under `--protected-store`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protected_payloads: Option<Vec<ProtectedPayloadRef>>,
-    /// Repository-scope caveat, present only when `--repo` is set: discloses
-    /// that the scope filters only the code-side `first_seen_range` join, never
-    /// the log/runtime sections ([`REPO_SCOPE_CAVEAT`]). Omitted when unscoped.
+    /// Residual repository-scope caveat (issue #362, schema v3). Since
+    /// `repository_id` is persisted on every log payload, `--repo` now SOUNDLY
+    /// filters the log/runtime sections (signatures, frames, buckets, and their
+    /// `EMITTED_DURING` observations) by attribution — a signature attributed to a
+    /// different repository is excluded, not merely disclosed. The ONLY residual
+    /// gap is a legacy `log:v2:` signature whose `repository_id` deserializes empty:
+    /// it cannot be proven in-repo, so it is conservatively EXCLUDED. This caveat
+    /// is present ONLY when `--repo` is set AND at least one such legacy signature
+    /// was excluded; a fully schema-v3 scoped store carries none. Reuses the
+    /// `log-deltas` (#362) [`LogRepoScopeCaveat`] shape verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub repo_scope_caveat: Option<&'static str>,
+    pub repo_scope_caveat: Option<LogRepoScopeCaveat>,
+    /// Occurrence-count granularity marker for the `--as-of` bucket view (issue
+    /// #364), present ONLY when `--as-of` is set. `endpoint_exact` when every
+    /// listed occurrence bucket carried per-occurrence `occurrence_timestamps`, so
+    /// its count is bounded precisely at the cutoff instant; `hourly_bucket` when
+    /// at least one listed bucket was a legacy `log:v2:` record (empty timestamps)
+    /// whose whole hour-aligned count could not be sub-divided at the cutoff.
+    /// Omitted when `--as-of` is not set (no endpoint bounds the buckets).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurrence_count_granularity: Option<&'static str>,
     /// Embedded-store retention caveat, present only when the query ran over the
     /// embedded (`--data-dir`) read path AND the store holds at least one
     /// `ErrorSignature` record (issue #363): the embedded lane now loads through
@@ -616,7 +623,7 @@ pub fn error_context(
     };
 
     // §1: resolve the handle to anchor signature IDs.
-    let signature_ids: Vec<String> = match resolve_handle(records, frame_records, handle) {
+    let mut signature_ids: Vec<String> = match resolve_handle(records, frame_records, handle) {
         HandleResolution::Signatures(ids) => ids,
         HandleResolution::Ambiguous(candidates) => {
             return Err(ErrorContextError::Ambiguous { candidates });
@@ -627,6 +634,46 @@ pub fn error_context(
             });
         }
     };
+
+    // §1b (issue #362, schema v3): when `--repo` is set, scope the runtime/log
+    // sections by the persisted `repository_id`, mirroring `eg query log-deltas`.
+    // A signature attributed to a DIFFERENT repository is soundly excluded (the
+    // cross-repository false lead #326 could only disclose); a legacy `log:v2:`
+    // signature whose `repository_id` deserializes empty cannot be proven in-repo
+    // and is conservatively EXCLUDED and tallied for the residual caveat. Filtering
+    // `signature_ids` here scopes every downstream runtime section (signatures,
+    // frames, buckets, sources, `EMITTED_DURING` observations) uniformly, since
+    // they all derive from `sig_set` below. `owner_of` reads the persisted
+    // attribution, so it needs no containment topology (log records live off it).
+    let mut excluded_unattributed: BTreeSet<String> = BTreeSet::new();
+    if let Some(scope) = repo_scope {
+        let index = RepositoryIndex::build(records);
+        let sig_repo_id: BTreeMap<&str, &str> = records
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Node {
+                    kind: NodeKind::ErrorSignature,
+                    id,
+                    log: Some(payload),
+                    ..
+                } => match payload.as_ref() {
+                    LogPayload::ErrorSignature(sig) => {
+                        Some((id.as_str(), sig.repository_id.as_str()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        signature_ids.retain(|id| match sig_repo_id.get(id.as_str()) {
+            Some(repo_id) if repo_id.is_empty() => {
+                excluded_unattributed.insert(id.clone());
+                false
+            }
+            _ => index.owner_of(id.as_str()) == Some(scope),
+        });
+    }
+
     let sig_set: BTreeSet<&str> = signature_ids.iter().map(String::as_str).collect();
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
 
@@ -713,9 +760,23 @@ pub fn error_context(
     // bucket ID is now (repository/signature/hour/width/SOURCE), so distinct
     // sources mint distinct bucket IDs (each listed once) while a genuine rescan
     // of identical bytes mints the SAME bucket ID (collapsed as a duplicate).
+    //
+    // Under `--as-of` the bucket count is ENDPOINT-EXACT (issue #364): rather than
+    // dropping or keeping a whole hour-aligned bucket, each bucket contributes only
+    // its occurrences at or before the cutoff instant, via the shared
+    // `bucket_occurrences_at_or_before` counter (identical to `log-deltas`). A
+    // schema-v3 bucket carries per-occurrence `occurrence_timestamps`, so a bucket
+    // straddling the cutoff is sub-divided precisely; a legacy `log:v2:` bucket
+    // (empty timestamps) falls back to the whole-hour predicate and degrades the
+    // response `occurrence_count_granularity` marker to `hourly_bucket`. A bucket
+    // contributing zero (every occurrence after the cutoff) is not listed.
     let as_of_instant = as_of.and_then(parse_instant);
     let mut buckets_by_sig: BTreeMap<&str, Vec<BucketRow>> = BTreeMap::new();
     let mut seen_bucket_ids: BTreeSet<&str> = BTreeSet::new();
+    // Response-level exactness flag: flips false the first time a LISTED bucket
+    // falls back to the legacy hour-bucket predicate. Only meaningful under
+    // `--as-of` (surfaced as `occurrence_count_granularity` below).
+    let mut all_as_of_buckets_exact = true;
     for r in records {
         let GraphRecord::Node {
             id,
@@ -734,10 +795,23 @@ pub fn error_context(
         let Some(sigs) = bucket_targets.get(id.as_str()) else {
             continue;
         };
-        if let (Some(cutoff), Some(start)) = (as_of_instant, parse_instant(&bucket.bucket_start))
-            && start > cutoff
-        {
+        // Endpoint-exact count and exactness for this bucket at the cutoff, or the
+        // whole aggregate count when no `--as-of` bounds the view.
+        let (bucket_count, bucket_exact) = match as_of_instant {
+            Some(cutoff) => bucket_occurrences_at_or_before(
+                &bucket.bucket_start,
+                bucket.occurrence_count,
+                &bucket.occurrence_timestamps,
+                cutoff,
+            ),
+            None => (bucket.occurrence_count, true),
+        };
+        // A bucket contributing nothing at or before the cutoff is not listed.
+        if as_of_instant.is_some() && bucket_count == 0 {
             continue;
+        }
+        if as_of_instant.is_some() && !bucket_exact {
+            all_as_of_buckets_exact = false;
         }
         for sig in sigs {
             if sig_set.contains(sig) {
@@ -745,11 +819,19 @@ pub fn error_context(
                     record_id: id.clone(),
                     bucket_start: bucket.bucket_start.clone(),
                     bucket_width: bucket.bucket_width.clone(),
-                    occurrence_count: bucket.occurrence_count,
+                    occurrence_count: bucket_count,
                 });
             }
         }
     }
+    // Granularity marker, present only under `--as-of` (issue #364).
+    let occurrence_count_granularity = as_of.map(|_| {
+        if all_as_of_buckets_exact {
+            OCCURRENCE_COUNT_GRANULARITY_ENDPOINT_EXACT
+        } else {
+            OCCURRENCE_COUNT_GRANULARITY
+        }
+    });
 
     // Coalesce ErrorSignature records by stable ID (LogSource is non-identity).
     let mut sig_payloads: BTreeMap<&str, Vec<(u32, &ErrorSignaturePayload)>> = BTreeMap::new();
@@ -1155,7 +1237,20 @@ pub fn error_context(
         unresolved,
         excluded,
         protected_payloads,
-        repo_scope_caveat: repo_scope.map(|_| REPO_SCOPE_CAVEAT),
+        // Residual repository-scope caveat (issue #362, schema v3): `--repo` now
+        // filters the runtime sections by persisted `repository_id`, so the caveat
+        // fires ONLY when at least one legacy unattributed signature was actually
+        // excluded — a fully schema-v3 scoped store carries none. Reuses the
+        // `log-deltas` disclosure verbatim.
+        repo_scope_caveat: match repo_scope {
+            Some(scope) if !excluded_unattributed.is_empty() => Some(LogRepoScopeCaveat {
+                repo_scope: scope.to_owned(),
+                excluded_unattributed_signature_count: excluded_unattributed.len(),
+                message: LOG_REPO_SCOPE_RESIDUAL_CAVEAT,
+            }),
+            _ => None,
+        },
+        occurrence_count_granularity,
         embedded_log_retention_caveat,
         disclaimer: ERROR_CONTEXT_DISCLAIMER,
     })
