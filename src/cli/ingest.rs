@@ -1,5 +1,84 @@
 use super::*;
 
+/// Fatal-refusal exit code for an ingest that would (or did) overflow
+/// `AletheiaDB`'s non-overridable 100k string-interner cap (issue #439).
+///
+/// `eg ingest` otherwise uses only 0 (every record ingested) and 1 (a generic
+/// per-record failure, surfaced via `anyhow` through `main`). 2 has no prior
+/// ingest meaning, so it is reserved here for the distinct "capacity exceeded"
+/// fatal class — both the preflight refusal and a real write/persist overflow.
+/// Documented in `docs/cli/ingest.md`.
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) const INGEST_CAPACITY_EXIT_CODE: i32 = 2;
+
+/// Stable machine code carried by every ingest capacity-overflow refusal.
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) const INGEST_CAPACITY_EXCEEDED_CODE: &str = "ingest_capacity_exceeded";
+
+/// Human-readable + machine-readable text shared by the preflight and runtime
+/// capacity refusals: names the upstream cap and the workarounds.
+#[cfg(feature = "embedded-aletheiadb")]
+const INGEST_CAPACITY_MESSAGE: &str = "ingest would overflow AletheiaDB's process-global string-interner cap of \
+     100000 entries (non-overridable in the published crate); the embedded \
+     store's background persistence would otherwise hot-loop on the capacity \
+     error and hang";
+
+#[cfg(feature = "embedded-aletheiadb")]
+const INGEST_CAPACITY_WORKAROUND: &str = "split the graph into smaller per-crate / per-subsystem ingests, or query \
+     the JSONL directly with the `--graph` query path (which needs no embedded \
+     store)";
+
+/// Prints the machine-readable capacity envelope on stdout, a one-line human
+/// summary on stderr, and exits with [`INGEST_CAPACITY_EXIT_CODE`].
+///
+/// The preflight case (before the store is opened) carries
+/// `estimated_distinct_strings`; the runtime case (a real write/persist
+/// overflow) carries `records_written`. Both share the stable `code`, `limit`,
+/// `record_count`, `message`, and `workaround` fields.
+#[cfg(feature = "embedded-aletheiadb")]
+fn refuse_ingest_capacity(
+    data_dir: &Path,
+    record_count: usize,
+    estimated_distinct_strings: Option<u64>,
+    records_written: Option<usize>,
+    detail: Option<&str>,
+) -> ! {
+    let mut error = serde_json::json!({
+        "code": INGEST_CAPACITY_EXCEEDED_CODE,
+        "limit": MAX_INTERNED_STRINGS,
+        "record_count": record_count,
+        "message": INGEST_CAPACITY_MESSAGE,
+        "workaround": INGEST_CAPACITY_WORKAROUND,
+        "data_dir": data_dir.display().to_string(),
+    });
+    let map = error
+        .as_object_mut()
+        .expect("capacity error envelope is a JSON object");
+    if let Some(estimate) = estimated_distinct_strings {
+        map.insert("estimated_distinct_strings".to_owned(), estimate.into());
+    }
+    if let Some(written) = records_written {
+        map.insert("records_written".to_owned(), written.into());
+    }
+    if let Some(detail) = detail {
+        map.insert("detail".to_owned(), detail.into());
+    }
+    let envelope = serde_json::json!({ "ok": false, "error": error });
+    println!("{envelope}");
+    match estimated_distinct_strings {
+        Some(estimate) => eprintln!(
+            "ingest refused: estimated {estimate} distinct interned strings \
+             meets AletheiaDB's {MAX_INTERNED_STRINGS} cap; {INGEST_CAPACITY_WORKAROUND} \
+             (or re-run with --force to bypass the estimate)"
+        ),
+        None => eprintln!(
+            "ingest aborted: AletheiaDB reached its {MAX_INTERNED_STRINGS} \
+             string-interner cap during write/persist; {INGEST_CAPACITY_WORKAROUND}"
+        ),
+    }
+    std::process::exit(INGEST_CAPACITY_EXIT_CODE);
+}
+
 /// Maps an embedded open failure on the ingest write path into a CLI error.
 ///
 /// A write-lease contention refusal (issue #200) additionally prints the
@@ -39,6 +118,7 @@ pub(crate) fn ingest(
     session_id: &str,
     idempotency_key: Option<&str>,
     #[cfg(feature = "embeddings")] embed: bool,
+    #[cfg(feature = "embedded-aletheiadb")] force: bool,
 ) -> Result<()> {
     #[cfg(not(feature = "embedded-aletheiadb"))]
     let _ = (data_dir, agent_id, session_id, idempotency_key);
@@ -60,6 +140,20 @@ pub(crate) fn ingest(
         #[cfg(feature = "embedded-aletheiadb")]
         IngestAdapter::Embedded => {
             let data_dir = data_dir.map_or_else(|| PathBuf::from(".egregore"), Path::to_path_buf);
+            // Capacity preflight (issue #439), the primary defense: refuse fast
+            // BEFORE opening the store, so a graph estimated to overflow
+            // AletheiaDB's 100k string-interner cap never spawns the background
+            // persistence thread that would otherwise hot-loop and hang. Skipped
+            // under `--force`; a real overflow during write/persist is still
+            // fatal below.
+            if let Err(refusal) = check_ingest_capacity(&records, force) {
+                let PreflightRefusal {
+                    estimate,
+                    record_count,
+                    ..
+                } = refusal;
+                refuse_ingest_capacity(&data_dir, record_count, Some(estimate), None, None);
+            }
             #[cfg(feature = "embeddings")]
             let mut sink = if embed {
                 let (vectors, dimensions) = generate_embeddings(&records)?;
@@ -73,10 +167,39 @@ pub(crate) fn ingest(
             let mut sink = EmbeddedAletheiaSink::open(&data_dir)
                 .map_err(|error| embedded_write_open_error(&data_dir, error))?;
             let report = ingest_records(&records, &mut sink);
+            // A capacity overflow surfaced as a per-record write failure is
+            // fatal (never a generic exit-1 failure): a partial store whose
+            // interner is at the cap cannot be persisted.
+            if let Some(failure) = report.failures.iter().find(|failure| {
+                crate::adapters::is_string_interner_capacity_error(&failure.message)
+            }) {
+                refuse_ingest_capacity(
+                    &data_dir,
+                    records.len(),
+                    None,
+                    Some(report.succeeded),
+                    Some(&failure.message),
+                );
+            }
             if report.is_success() {
-                sink.persist_indexes().with_context(|| {
-                    format!("failed to persist embedded store {}", data_dir.display())
-                })?;
+                match sink.persist_indexes() {
+                    Ok(()) => {}
+                    Err(AdapterError::CapacityExceeded { detail, .. }) => {
+                        refuse_ingest_capacity(
+                            &data_dir,
+                            records.len(),
+                            None,
+                            Some(report.succeeded),
+                            Some(&detail),
+                        );
+                    }
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error).context(format!(
+                            "failed to persist embedded store {}",
+                            data_dir.display()
+                        )));
+                    }
+                }
             }
             report
         }

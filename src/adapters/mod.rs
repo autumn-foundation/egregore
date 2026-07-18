@@ -13,6 +13,8 @@ use crate::{
 #[cfg(feature = "embedded-aletheiadb")]
 mod aletheiadb;
 
+pub mod preflight;
+
 #[cfg(feature = "embedded-aletheiadb")]
 pub use aletheiadb::EmbeddedAletheiaSink;
 #[cfg(feature = "embeddings")]
@@ -96,6 +98,44 @@ pub enum AdapterError {
         /// Unknown schema-version tuple.
         version: RecordVersion,
     },
+
+    /// A backing store refused a write or a persist because a hard capacity
+    /// limit was exceeded (issue #439).
+    ///
+    /// The motivating case is `AletheiaDB` 0.1.1's process-global string
+    /// interner, whose non-overridable `MAX_STRING_COUNT` (100_000) is hit at
+    /// index-persist time by the per-record property-value strings a large
+    /// graph interns. Unlike [`AdapterError::Rejected`], this is a fatal,
+    /// non-retryable class: the store cannot accept the workload as-is, so the
+    /// CLI refuses fast rather than letting the store's background persistence
+    /// thread hot-loop on the same error forever.
+    #[error("capacity exceeded for {resource} (limit {limit:?}): {detail}")]
+    CapacityExceeded {
+        /// Human-readable name of the exhausted resource (e.g. `string interner`).
+        resource: String,
+        /// The exceeded limit when known, `None` when the store did not report it.
+        limit: Option<u64>,
+        /// The upstream error text, preserved verbatim for diagnostics.
+        detail: String,
+    },
+}
+
+/// Classifies a backing-store error message as an `AletheiaDB` string-interner
+/// capacity overflow (issue #439).
+///
+/// `AletheiaDB` 0.1.1 raises `StorageError::CapacityExceeded` from its
+/// process-global interner (`core/interning.rs`) with the fixed Display
+/// `"Capacity exceeded for {resource}: current={current}, limit={limit} (DoS
+/// protection)"` and `resource == "string interner"`. This matcher returns
+/// `true` when the message names that exact interner overflow — either by
+/// carrying both `"Capacity exceeded"` and `"string interner"`, or by carrying
+/// the DoS-protection marker the interner (and only the size/capacity DoS
+/// guards) emits. Matching is case-sensitive against the strings upstream
+/// actually emits.
+#[must_use]
+pub fn is_string_interner_capacity_error(message: &str) -> bool {
+    (message.contains("Capacity exceeded") && message.contains("string interner"))
+        || message.contains("DoS protection")
 }
 
 /// Destination for graph records.
@@ -335,4 +375,61 @@ fn ordered_records(records: &[GraphRecord]) -> Vec<&GraphRecord> {
         GraphRecord::Tombstone { .. } => (2_u8, record.id()),
     });
     ordered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_real_upstream_interner_overflow_string() {
+        // The exact Display AletheiaDB 0.1.1 emits for a string-interner
+        // overflow (core/interning.rs -> core/error.rs CapacityExceeded).
+        let upstream =
+            "Capacity exceeded for string interner: current=100000, limit=100000 (DoS protection)";
+        assert!(is_string_interner_capacity_error(upstream));
+    }
+
+    #[test]
+    fn classifies_on_dos_protection_marker_alone() {
+        assert!(is_string_interner_capacity_error(
+            "some wrapper: current=100000, limit=100000 (DoS protection)"
+        ));
+    }
+
+    #[test]
+    fn classifies_on_capacity_plus_interner_without_dos_marker() {
+        assert!(is_string_interner_capacity_error(
+            "Capacity exceeded for string interner (limit reached)"
+        ));
+    }
+
+    #[test]
+    fn rejects_unrelated_error_messages() {
+        assert!(!is_string_interner_capacity_error(
+            "sink rejected record codegraph:v1:abc: node label mismatch"
+        ));
+        assert!(!is_string_interner_capacity_error(
+            "failed to parse graph JSONL line 3: expected value"
+        ));
+        // A different capacity error (not the interner, no DoS marker) is not
+        // classified as the interner overflow.
+        assert!(!is_string_interner_capacity_error(
+            "Capacity exceeded for transaction operations: current=5, limit=5"
+        ));
+    }
+
+    #[test]
+    fn capacity_exceeded_display_names_resource_and_limit() {
+        let error = AdapterError::CapacityExceeded {
+            resource: "string interner".to_owned(),
+            limit: Some(100_000),
+            detail: "Capacity exceeded for string interner: current=100000, limit=100000 \
+                     (DoS protection)"
+                .to_owned(),
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("capacity exceeded for string interner"));
+        assert!(rendered.contains("100000"));
+    }
 }

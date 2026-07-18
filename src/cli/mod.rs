@@ -178,6 +178,8 @@ use crate::adapters::EmbeddedAletheiaSink;
 #[cfg(feature = "embeddings")]
 use crate::adapters::SemanticMatch;
 #[cfg(feature = "embedded-aletheiadb")]
+use crate::adapters::preflight::{MAX_INTERNED_STRINGS, PreflightRefusal, check_ingest_capacity};
+#[cfg(feature = "embedded-aletheiadb")]
 use crate::adapters::{AdapterError, STORE_CONTENDED_CODE};
 #[cfg(feature = "embedded-aletheiadb")]
 use crate::daemon::{DaemonClient, DaemonConfig};
@@ -516,6 +518,14 @@ pub(crate) enum Commands {
         #[cfg(feature = "embeddings")]
         #[arg(long)]
         embed: bool,
+        /// Bypass the ingest capacity preflight (issue #439). The preflight
+        /// refuses fast when a graph is estimated to overflow AletheiaDB's
+        /// non-overridable 100k string-interner cap; `--force` skips that
+        /// estimate. A real capacity overflow during the write/persist remains
+        /// fatal even with `--force`.
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long)]
+        force: bool,
     },
     /// Export every persisted record from an embedded store as canonical JSONL.
     ///
@@ -3492,6 +3502,8 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             idempotency_key,
             #[cfg(feature = "embeddings")]
             embed,
+            #[cfg(feature = "embedded-aletheiadb")]
+            force,
         } => ingest(
             &graph,
             adapter,
@@ -3501,6 +3513,8 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             idempotency_key.as_deref(),
             #[cfg(feature = "embeddings")]
             embed,
+            #[cfg(feature = "embedded-aletheiadb")]
+            force,
         ),
         Commands::Export { data_dir, out } => export(&data_dir, &out),
         Commands::ImportTraj {
