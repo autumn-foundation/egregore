@@ -225,8 +225,17 @@ struct Occurrence {
     redacted: bool,
     /// One-based source line the occurrence began on.
     source_line: u64,
-    /// RFC 3339 UTC valid time.
+    /// RFC 3339 UTC valid time, SECONDS precision. Drives `first_seen`/
+    /// `last_seen`, the signature/`LogEvent` valid time, and the `LogEvent`
+    /// record ID — all kept seconds-precise for stable identity.
     valid_time: String,
+    /// RFC 3339 UTC occurrence instant at FULL (fixed-width nanosecond)
+    /// precision (issue #364, Codex P2). Distinct from `valid_time` so the
+    /// bucket's `occurrence_timestamps` list can bound window counts
+    /// endpoint-exactly at a sub-second boundary without perturbing any record
+    /// ID. Fixed-width, so a lexical sort matches the chronological instant
+    /// order.
+    precise_time: String,
     /// Source of `valid_time`.
     valid_time_source: &'static str,
     /// RFC 3339 UTC bucket start (floored to the hour).
@@ -495,12 +504,14 @@ pub fn scan_log_records(
         }
 
         // ── Hourly occurrence buckets ────────────────────────────────────────
-        // Each bucket carries its per-occurrence valid times (issue #364, schema
-        // v3), sorted, so a consumer can bound window counts endpoint-exactly at
-        // an arbitrary commit instant instead of counting the whole hour-aligned
-        // bucket. Timestamps are already Z-normalized RFC 3339 UTC (seconds
-        // precision), so a lexical sort matches the chronological/`first_seen`
-        // ordering the rest of the extractor uses.
+        // Each bucket carries its per-occurrence instants (issue #364, schema v3),
+        // sorted, so a consumer can bound window counts endpoint-exactly at an
+        // arbitrary commit instant instead of counting the whole hour-aligned
+        // bucket. These are the FULL-precision `precise_time`s (Z-normalized
+        // RFC 3339 UTC, fixed-width nanoseconds — Codex P2), NOT the seconds-precise
+        // `valid_time`: a `12:30:00.900` occurrence must stay after a `12:30:00`
+        // endpoint, not snap onto the second boundary. Fixed-width means a lexical
+        // sort still matches the chronological instant order.
         let mut buckets: BTreeMap<String, (u64, bool, Vec<String>)> = BTreeMap::new();
         for occ in occs {
             let entry = buckets
@@ -508,7 +519,7 @@ pub fn scan_log_records(
                 .or_insert_with(|| (0, false, Vec::new()));
             entry.0 += 1;
             entry.1 |= occ.bucket_from_timestamp;
-            entry.2.push(occ.valid_time.clone());
+            entry.2.push(occ.precise_time.clone());
         }
         for (bucket_start, (count, from_ts, mut occurrence_timestamps)) in buckets {
             occurrence_timestamps.sort();
@@ -774,7 +785,7 @@ fn parse_plain(
         let Some(severity) = severity_from_text(&header) else {
             continue;
         };
-        let (valid_time, valid_time_source, bucket_start, bucket_from_timestamp) =
+        let (valid_time, precise_time, valid_time_source, bucket_start, bucket_from_timestamp) =
             resolve_time(parse_timestamp(&header), transaction_time, tx_bucket);
         let (template, redacted) = fingerprint(&full_text);
         let frames = parse_frames(&full_text, repo_root);
@@ -784,6 +795,7 @@ fn parse_plain(
             redacted,
             source_line: start_line,
             valid_time,
+            precise_time,
             valid_time_source,
             bucket_start,
             bucket_from_timestamp,
@@ -980,11 +992,12 @@ fn parse_jsonl(text: &str, transaction_time: &str, tx_bucket: &str) -> Vec<Occur
             continue;
         }
         let timestamp = first_str(&obj, &["timestamp", "ts", "time"]);
-        let (valid_time, valid_time_source, bucket_start, bucket_from_timestamp) = resolve_time(
-            timestamp.as_deref().and_then(parse_timestamp),
-            transaction_time,
-            tx_bucket,
-        );
+        let (valid_time, precise_time, valid_time_source, bucket_start, bucket_from_timestamp) =
+            resolve_time(
+                timestamp.as_deref().and_then(parse_timestamp),
+                transaction_time,
+                tx_bucket,
+            );
         let (template, redacted) = fingerprint(&message);
         occurrences.push(Occurrence {
             severity,
@@ -992,6 +1005,7 @@ fn parse_jsonl(text: &str, transaction_time: &str, tx_bucket: &str) -> Vec<Occur
             redacted,
             source_line: (idx + 1) as u64,
             valid_time,
+            precise_time,
             valid_time_source,
             bucket_start,
             bucket_from_timestamp,
@@ -1037,16 +1051,34 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-/// Resolves an optional parsed timestamp into the four temporal fields.
+/// Resolves an occurrence's timestamps, returning
+/// `(valid_time, precise_time, valid_time_source, bucket_start, from_ts)`.
+///
+/// `valid_time` is SECONDS precision (it drives `first_seen`/`last_seen`, the
+/// signature/`LogEvent` valid time, and the `LogEvent` record ID, all kept
+/// stable). `precise_time` is the SAME instant at FULL fixed-width nanosecond
+/// precision (issue #364, Codex P2), stored only in the bucket's
+/// `occurrence_timestamps` list so a mid-second window endpoint can bound the
+/// count exactly. The inferred fallback normalizes `transaction_time` to the
+/// same nanosecond width so the list stays uniform-width (lexical order ==
+/// instant order).
 fn resolve_time(
     parsed: Option<DateTime<Utc>>,
     transaction_time: &str,
     tx_bucket: &str,
-) -> (String, &'static str, String, bool) {
+) -> (String, String, &'static str, String, bool) {
     parsed.map_or_else(
         || {
+            let precise_time = DateTime::parse_from_rfc3339(transaction_time).map_or_else(
+                |_| transaction_time.to_owned(),
+                |dt| {
+                    dt.with_timezone(&Utc)
+                        .to_rfc3339_opts(SecondsFormat::Nanos, true)
+                },
+            );
             (
                 transaction_time.to_owned(),
+                precise_time,
                 VALID_TIME_SOURCE_INFERRED,
                 tx_bucket.to_owned(),
                 false,
@@ -1054,8 +1086,15 @@ fn resolve_time(
         },
         |dt| {
             let valid_time = dt.to_rfc3339_opts(SecondsFormat::Secs, true);
+            let precise_time = dt.to_rfc3339_opts(SecondsFormat::Nanos, true);
             let bucket_start = floor_datetime(dt).to_rfc3339_opts(SecondsFormat::Secs, true);
-            (valid_time, VALID_TIME_SOURCE_EVENT, bucket_start, true)
+            (
+                valid_time,
+                precise_time,
+                VALID_TIME_SOURCE_EVENT,
+                bucket_start,
+                true,
+            )
         },
     )
 }

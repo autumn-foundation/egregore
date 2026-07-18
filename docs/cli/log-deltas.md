@@ -258,8 +258,11 @@ preserved and the window counts stay consistent with the aggregate
 identical-rescan caveat and issue #361):
 
 Since **schema v3** (issue #364) each `LogOccurrenceBucket` carries an
-`occurrence_timestamps` list — the sorted RFC 3339 UTC per-occurrence valid
-times that fell in its hour — so per-window counts are now **endpoint-exact**:
+`occurrence_timestamps` list — the sorted RFC 3339 UTC per-occurrence instants
+that fell in its hour, preserved at **full sub-second precision** (fixed-width
+nanoseconds, e.g. `…T12:30:00.900000000Z`) so the endpoint-exact claim holds even
+against a whole-second commit endpoint (issue #364, Codex P2) — so per-window
+counts are now **endpoint-exact**:
 
 - `base_window_occurrences` = for each linked v3 bucket, the count of its
   `occurrence_timestamps` at or before `commit_valid_time[BASE]` (by parsed UTC

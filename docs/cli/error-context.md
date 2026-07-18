@@ -34,7 +34,7 @@ eg query error-context <HANDLE> --data-dir <DIR>  [--repo <SELECTOR>] [--as-of <
 
 `<HANDLE>` resolves an `ErrorSignature` three ways, in precedence order:
 
-1. **Exact record ID** — a `log:v2:<hex>` `ErrorSignature` stable ID.
+1. **Exact record ID** — a `log:v3:<hex>` `ErrorSignature` stable ID.
 2. **Fingerprint / template-hash prefix** — a hex prefix of the signature's
    stable-ID hex tail. A unique prefix resolves; a prefix matching two or more
    signatures is **ambiguous** (exit 1, all candidate IDs listed). A bare hex
@@ -43,7 +43,7 @@ eg query error-context <HANDLE> --data-dir <DIR>  [--repo <SELECTOR>] [--as-of <
    it (`FRAME_RESOLVES_TO`). A symbol named by *many* signatures returns **all**
    of them (exit 0) — this is not ambiguity.
 
-A well-formed `log:v2:` handle that is not an `ErrorSignature` (absent, or a
+A well-formed `log:v3:` handle that is not an `ErrorSignature` (absent, or a
 `LogSource` / `LogOccurrenceBucket` ID) is `no_match` (exit 2), never silently
 prefix-matched.
 
@@ -52,27 +52,51 @@ state, so it cannot mutate the working tree. Raw log/transcript/command/patch
 text never enters the response beyond the signature's bounded, post-redaction
 `template_excerpt`.
 
-### `--repo` scope (code side only)
+### `--repo` scope (code side + log side, issue #362)
 
-`--repo <SELECTOR>` scopes the **code side** of the `first_seen_range` to one
-repository in a shared multi-repo store: both the commit timeline that brackets
-the signature's `first_seen` (base/head/window commits) and the reused
-symbol-delta join are restricted to commits and code owned by that repository
-(via the `CONTAINS` topology, like [`eg query log-deltas`](./log-deltas.md)).
-Without this scoping a foreign repository's commits could bracket a foreign
-window. Log records carry no retrievable repository attribution (their
-repository ID is only hashed into their stable IDs), so signatures, frames,
-buckets, and runs are never repository-filtered.
+`--repo <SELECTOR>` scopes **both** the code side and the runtime/log side in a
+shared multi-repo store. On the code side it restricts the `first_seen_range`:
+both the commit timeline that brackets the signature's `first_seen`
+(base/head/window commits) and the reused symbol-delta join are limited to
+commits and code owned by that repository (via the `CONTAINS` topology, like
+[`eg query log-deltas`](./log-deltas.md)); without this a foreign repository's
+commits could bracket a foreign window.
+
+Since **schema v3** (issue #362) every log payload persists a retrievable
+`repository_id` (byte-equal to the code `Repository` node ID), so `--repo` now
+**soundly filters the runtime/log sections too**: an `ErrorSignature` (and its
+frames, buckets, and `EMITTED_DURING` observations) attributed to a **different**
+repository is **excluded** via `RepositoryIndex::owner_of`, closing the
+cross-repository false lead the old disclosure could only warn about. A legacy
+`log:v2:` signature whose `repository_id` deserializes empty **cannot be proven
+in-repo**, so it is conservatively **excluded** (a possible under-report, never a
+cross-repository bleed) and tallied. When at least one such legacy signature is
+excluded, the envelope carries a shrunken residual `repo_scope_caveat` (the same
+`LogRepoScopeCaveat` shape as `eg query log-deltas`, carrying `repo_scope`,
+`excluded_unattributed_signature_count`, and a fixed re-scan-remedy `message`); a
+fully schema-v3 scoped store carries **no** caveat. Re-run `eg scan-logs` to
+regenerate legacy records under schema v3 with retrievable attribution.
 
 ### Temporal selectors
 
 - `--at <COMMIT>` re-resolves the backtrace frames against that commit view
   (spans as they existed at that commit), reusing the
   [`eg resolve-frames`](./resolve-frames.md) resolver.
-- `--as-of <RFC3339>` bounds the occurrence-bucket view on the valid axis:
-  buckets whose `bucket_start` is after the instant are dropped. A malformed
-  `--as-of` (not a full RFC 3339 instant) exits 1 with a machine-readable
-  `invalid_as_of_timestamp` envelope — never silently ignored.
+- `--as-of <RFC3339>` bounds the occurrence-bucket view on the valid axis
+  **endpoint-exactly** (issue #364). Each bucket contributes only its
+  per-occurrence `occurrence_timestamps` at or before the instant: a schema-v3
+  bucket straddling the cutoff is **sub-divided precisely** (its reported
+  `occurrence_count` is the count at or before the cutoff, not the whole hour),
+  and a bucket whose every occurrence falls after the cutoff drops out. A legacy
+  `log:v2:` bucket carries no timestamps, so it **falls back** to the whole-hour
+  predicate (its full count survives whenever `bucket_start` is at or before the
+  cutoff). The envelope reports a per-response `occurrence_count_granularity`
+  marker — `endpoint_exact` when every listed bucket carried timestamps, else
+  `hourly_bucket` when at least one legacy bucket fell back — present **only**
+  under `--as-of`. This reuses the same `bucket_occurrences_at_or_before` counter
+  as [`eg query log-deltas`](./log-deltas.md), so the two lanes count identically.
+  A malformed `--as-of` (not a full RFC 3339 instant) exits 1 with a
+  machine-readable `invalid_as_of_timestamp` envelope — never silently ignored.
 
 `--at` and `--as-of` are mutually exclusive; combining them exits 1 with a
 machine-readable `unsupported_combination` envelope (mirroring
@@ -153,7 +177,7 @@ eg link-logs --graph resolved.graph.jsonl --graph agent.graph.jsonl --out linked
 Get-Content graph.jsonl, history.graph.jsonl, linked.graph.jsonl | Set-Content combined.graph.jsonl
 
 # Assemble the cross-domain error-context bundle
-eg query error-context log:v2:<hex> --graph combined.graph.jsonl
+eg query error-context log:v3:<hex> --graph combined.graph.jsonl
 ```
 
 ## Response shape
@@ -161,11 +185,11 @@ eg query error-context log:v2:<hex> --graph combined.graph.jsonl
 ```json
 {
   "ok": true,
-  "handle": "log:v2:<hex>",
-  "signature_ids": ["log:v2:<hex>"],
+  "handle": "log:v3:<hex>",
+  "signature_ids": ["log:v3:<hex>"],
   "signatures": [
     {
-      "record_id": "log:v2:<hex>",
+      "record_id": "log:v3:<hex>",
       "schema_version": 1,
       "trust_class": "runtime_observation",
       "severity": "error",
@@ -174,14 +198,14 @@ eg query error-context log:v2:<hex> --graph combined.graph.jsonl
       "first_seen": "2026-01-02T12:00:00Z",
       "last_seen": "2026-01-02T13:00:00Z",
       "occurrence_count": 5,
-      "source_handles": [{ "record_id": "log:v2:<hex>", "source_relative_path": "app.log", "source_artifact_hash": "<blake3-hex>" }],
-      "buckets": [{ "record_id": "log:v2:<hex>", "bucket_start": "2026-01-02T12:00:00Z", "bucket_width": "1h", "occurrence_count": 5 }],
+      "source_handles": [{ "record_id": "log:v3:<hex>", "source_relative_path": "app.log", "source_artifact_hash": "<blake3-hex>" }],
+      "buckets": [{ "record_id": "log:v3:<hex>", "bucket_start": "2026-01-02T12:00:00Z", "bucket_width": "1h", "occurrence_count": 5 }],
       "frames": [{ "frame_index": 0, "frame_resolution": "resolved", "target_record_id": "codegraph:v5:<hex>" }]
     }
   ],
   "first_seen_range": {
     "status": "history",
-    "anchor_signature_id": "log:v2:<hex>",
+    "anchor_signature_id": "log:v3:<hex>",
     "first_seen": "2026-01-02T12:00:00Z",
     "base_commit": "<sha>",
     "head_commit": "<sha>",

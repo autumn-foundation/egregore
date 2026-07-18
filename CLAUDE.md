@@ -48,8 +48,10 @@ claim, deterministically parsed but never verified. Records mint under the
 `log:v3:` prefix (`LOG_SCHEMA_VERSION` == 3): every log record now carries a
 retrievable `repository_id` field (issue #362, = the computed repository identity
 a `--repo` selector resolves to), and each `LogOccurrenceBucket` also carries a
-sorted `occurrence_timestamps` list (issue #364, RFC3339 UTC per-occurrence valid
-times, `len == occurrence_count`). Both are `#[serde(default)]` so legacy
+sorted `occurrence_timestamps` list (issue #364, RFC3339 UTC per-occurrence
+instants preserved at full sub-second precision — fixed-width nanoseconds, so a
+whole-second commit endpoint counts a `12:30:00.900` occurrence as after
+`12:30:00`, not on the boundary; `len == occurrence_count`). Both are `#[serde(default)]` so legacy
 `log:v2:` records still deserialize. Raw log text never enters the graph;
 excerpts are `template-v1`-normalized, redacted, and bounded. Deterministic
 and byte-stable; CRLF and LF checkouts yield identical IDs. Unrecognized
@@ -241,7 +243,7 @@ cargo run -- query log-deltas <sha> <sha> --graph combined.graph.jsonl          
 cargo run -- query log-deltas ffffffffffff <head_sha> --graph combined.graph.jsonl # exit 2 (missing_commit)
 
 # One error signature's full cross-domain context bundle (issue #324)
-cargo run -- query error-context log:v2:<hex> --graph combined.graph.jsonl        # exit 0 (record ID)
+cargo run -- query error-context log:v3:<hex> --graph combined.graph.jsonl        # exit 0 (record ID)
 cargo run -- query error-context <hex_prefix> --graph combined.graph.jsonl        # exit 0 unique / exit 1 ambiguous
 cargo run -- query error-context <symbol_name> --graph combined.graph.jsonl       # exit 0 (frames resolved to it)
 cargo run -- query error-context <handle> --graph combined.graph.jsonl --at <sha> # re-resolve frames at a commit view
@@ -537,11 +539,11 @@ half (seeded from each resolved frame target via `record_context`), the #322
 `FRAME_RESOLVES_TO` / #323 `EMITTED_DURING`+`REFERENCES_TASK` / #320 `AGGREGATES`+`CAPTURED_FROM`
 log-edge topology for the runtime half, and the #118 `range_deltas` mechanics for the history
 `first_seen_range`. Handle resolution has three precedence-ordered modes (the `log:v<N>:` prefix
-is matched version-agnostically, so both v1 fixtures and real v2 handles resolve): exact
-`log:v2:<hex>` record ID; a fingerprint/template-hash hex prefix (unique → resolve; ≥2 → `ambiguous` exit 1
+is matched version-agnostically, so both legacy and current-schema handles resolve): exact
+`log:v3:<hex>` record ID; a fingerprint/template-hash hex prefix (unique → resolve; ≥2 → `ambiguous` exit 1
 with all candidate IDs; a bare hex prefix matching none falls through to symbol-name mode); and
 an exact `Symbol` name whose frames resolved to it (a symbol named by MANY signatures returns
-ALL of them, exit 0 — not ambiguity). A well-formed `log:v2:` handle that is not an
+ALL of them, exit 0 — not ambiguity). A well-formed `log:v3:` handle that is not an
 `ErrorSignature` (absent, or a `LogSource`/bucket ID) is `no_match` (exit 2), never silently
 prefix-matched. Sections are trust-separated with a `trust_class` on every row: `signatures`
 (`runtime_observation` — identity + `template_excerpt` + occurrence buckets + resolved frames),
@@ -555,10 +557,23 @@ narrowest commit window (base = newest commit at/before it, head = oldest at/aft
 ascending SHA) and joins the reused `range_deltas` symbol groups against the frame targets into
 `overlapping_symbol_deltas`; a plain `scan` graph reports `history_unavailable`, never a
 fabricated window. `--at <commit>` re-resolves frames against that commit view; `--as-of
-<instant>` bounds the occurrence-bucket view (both are mutually exclusive → exit 1
-`unsupported_combination`). `--supersession exclude` (default) drops superseded/contradicted
-agent rows into `excluded`; `include-but-flag` keeps and flags them. `--repo` scopes only the
-code side of the history join (log records carry no retrievable repository attribution).
+<instant>` bounds the occurrence-bucket view ENDPOINT-EXACTLY (issue #364): each bucket
+contributes only its per-occurrence `occurrence_timestamps` at or before the cutoff (a
+straddling schema-v3 bucket is sub-divided precisely, a zero-contribution bucket is dropped),
+and a per-response `occurrence_count_granularity` marker reports `endpoint_exact` when every
+listed bucket carried timestamps, else `hourly_bucket` when a legacy `log:v3:`-store bucket
+(empty timestamps) fell back to the whole-hour predicate; the marker is emitted only under
+`--as-of`. `--at`/`--as-of` are mutually exclusive → exit 1 `unsupported_combination`.
+`--supersession exclude` (default) drops superseded/contradicted
+agent rows into `excluded`; `include-but-flag` keeps and flags them. Since issue #362 (schema
+v3) persisted `repository_id` on every log payload, `--repo` now SOUNDLY filters BOTH the code
+side of the history join AND the runtime/log sections (signatures, frames, buckets, and their
+`EMITTED_DURING` observations): a signature attributed to a different repository is excluded
+via `RepositoryIndex::owner_of`, not merely disclosed. A legacy log record whose
+`repository_id` deserializes empty cannot be proven in-repo and is conservatively EXCLUDED and
+tallied under a shrunken residual `repo_scope_caveat` (reusing the `log-deltas`
+`LogRepoScopeCaveat` shape), emitted ONLY when such a legacy signature was actually excluded —
+a fully schema-v3 scoped store carries none.
 `--protected-store <dir>` matches each signature's `LogSource` `source_artifact_hash` to a
 `protected:v1:` handle at READ time (class + byte length only; raw bytes never read); the graph
 must carry zero protected handles or the run exits 1 (`protected_handle_in_graph`). Over
@@ -960,10 +975,11 @@ or when any non-code trust-class row lacks a source/evidence/policy handle. Log-
 (issues #328, #376): the audit drives all three log query workflows that return
 `runtime_observation` rows — `log-deltas` (#326), `error-context` (#324), and the subsystem
 `log_signatures` section (#325) — gating every returned runtime-observation signature
-row on a well-formed `log:v2:` record ID PLUS its `LogSource` provenance (source path +
-`source_artifact_hash`, resolved through an at-least-one present `CAPTURED_FROM`/`AGGREGATES`
-`LogSource`; the `log:v2:` ID satisfies the template-hash requirement, a disclosed schema
-shape). The requirement is class-wide, so ANY other lane that surfaces a log row (e.g. `memory`)
+row on a well-formed `log:v<N>:` record ID (version-agnostic via `strip_log_id_prefix`, so
+current `log:v3:` and any legacy handle both satisfy it) PLUS its `LogSource` provenance
+(source path + `source_artifact_hash`, resolved through an at-least-one present
+`CAPTURED_FROM`/`AGGREGATES` `LogSource`; the `log:v<N>:` ID satisfies the template-hash
+requirement, a disclosed schema shape). The requirement is class-wide, so ANY other lane that surfaces a log row (e.g. `memory`)
 applies it too. `runtime_observation` is its own rate-gated lane at the strictest default
 `--min-log-citation 1.0` (validated to [0,1]; out-of-range exits 2), separate from the binary
 non-code gate; a below-threshold lane emits `below_log_citation_threshold` naming the SPECIFIC
@@ -1065,7 +1081,7 @@ Issue #340 folds runtime log-graph incident evidence (foundation: umbrella #319,
 #320 `ErrorSignature`/fingerprint scan, #322 `FRAME_RESOLVES_TO`, #326
 log-deltas) into the CC7.2/CC7.3 sections — pure pack-side population, no new
 graph domain/kind/edge/trust class. `error_signatures` rows carry each signature's
-`log:v2:` ID, severity, `template_hash`, `frame_chain_hash`, first/last-seen
+`log:v3:` ID, severity, `template_hash`, `frame_chain_hash`, first/last-seen
 **clipped to the window**, content-addressed `protected:v1:` exemplar handles
 (handle + hash only, never log text, #60 discipline), and each `FRAME_RESOLVES_TO`
 join with its `frame_resolution` label propagated verbatim (#152/#134).

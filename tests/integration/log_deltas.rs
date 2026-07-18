@@ -637,6 +637,65 @@ fn log_deltas_window_occurrences_are_endpoint_exact_with_v3_timestamps() {
 }
 
 #[test]
+fn log_deltas_subsecond_occurrence_after_endpoint_is_excluded_and_still_exact() {
+    // Issue #364, Codex P2: scan-time occurrence timestamps must preserve their
+    // FULL sub-second precision so the endpoint-exact window count is honest.
+    // Two identical-template ERROR lines land in the SAME whole second as the
+    // head committer date (12:30:00Z): one exactly AT 12:30:00.000 (boundary
+    // inclusive → counted) and one at 12:30:00.900 whose real instant is AFTER
+    // the endpoint (→ excluded). A scan that truncated to whole seconds would
+    // store both as `12:30:00Z` and wrongly count 2 while still claiming
+    // `endpoint_exact` — a false claim this end-to-end test pins closed by
+    // driving the REAL scanner, not a hand-built bucket.
+    const BASE_T: &str = "2026-01-01T00:00:00Z"; // c1 base
+    const START_T: &str = "2026-01-02T00:00:00Z"; // c2 → window_start
+    const HEAD_T: &str = "2026-01-02T12:30:00Z"; // c3 head → whole-second endpoint
+
+    let log_body = "2026-01-02T12:30:00.000Z [ERROR] widget checkout failed for order\n\
+                    2026-01-02T12:30:00.900Z [ERROR] widget checkout failed for order\n";
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let log_path = temp.path().join("app.log");
+    fs::write(&log_path, log_body).expect("write log fixture");
+    let scanned = aletheia_egregore::log_graph::scan_log_records(
+        &log_path,
+        temp.path(),
+        "repo_test",
+        START_T,
+        false,
+    )
+    .expect("scan should succeed")
+    .records;
+
+    let mut records = vec![
+        commit("c1sha0000", &[], BASE_T),
+        commit("c2sha0000", &["c1sha0000"], START_T),
+        commit("c3sha0000", &["c2sha0000"], HEAD_T),
+    ];
+    records.extend(scanned);
+
+    let deltas = log_deltas(&records, "c1", "c3", None, false).expect("range should resolve");
+
+    assert_eq!(
+        deltas.new_signatures.len(),
+        1,
+        "the scanned signature is first seen inside the window → new"
+    );
+    let row = &deltas.new_signatures[0];
+    assert_eq!(row.occurrence_source, "occurrence_buckets");
+    assert_eq!(
+        row.head_window_occurrences,
+        Some(1),
+        "only the 12:30:00.000 occurrence is at/before the 12:30:00 head endpoint; \
+         the 12:30:00.900 occurrence's real instant is AFTER it and must be excluded"
+    );
+    assert_eq!(row.base_window_occurrences, Some(0));
+    assert_eq!(
+        deltas.occurrence_count_granularity, "endpoint_exact",
+        "the bucket carries per-occurrence timestamps → the count is legitimately endpoint-exact"
+    );
+}
+
+#[test]
 fn log_deltas_mixed_v3_and_legacy_buckets_degrade_to_hourly() {
     // A response with even ONE contributing legacy `log:v2:` bucket (no
     // timestamps) degrades the whole granularity marker to `hourly_bucket`, even

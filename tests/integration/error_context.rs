@@ -238,6 +238,74 @@ fn bucket_with_source(
     (node, edge)
 }
 
+/// Like [`error_signature`] but stamps an explicit `repository_id` on the
+/// payload (issue #362, schema v3). An empty `repository_id` models a legacy
+/// `log:v2:` record that carries no retrievable attribution.
+fn error_signature_attributed(
+    seed: &str,
+    severity: &str,
+    first_seen: &str,
+    last_seen: &str,
+    occurrence_count: u64,
+    repository_id: &str,
+) -> (String, GraphRecord) {
+    let id = log_stable_id(&["error_signature", ANCHOR, FINGERPRINT, seed, severity]);
+    let node = GraphRecord::node(
+        id.clone(),
+        NodeKind::ErrorSignature,
+        None,
+        None,
+        Some(format!("{severity} signature")),
+        format!("error signature {seed}"),
+    )
+    .with_domain("log", LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::ErrorSignature(ErrorSignaturePayload {
+        fingerprint_algorithm: FINGERPRINT.to_owned(),
+        template_excerpt: format!("template {seed}"),
+        severity: severity.to_owned(),
+        occurrence_count,
+        first_seen: first_seen.to_owned(),
+        last_seen: last_seen.to_owned(),
+        frames: None,
+        repository_id: repository_id.to_owned(),
+    }))
+    .with_valid_time(first_seen, "log_event_timestamp");
+    (id, node)
+}
+
+/// A v3 `LogOccurrenceBucket` carrying explicit per-occurrence
+/// `occurrence_timestamps` (issue #364), plus its `AGGREGATES` edge. The bucket's
+/// `occurrence_count` equals the timestamp count.
+fn bucket_with_timestamps(
+    sig: &str,
+    bucket_start: &str,
+    timestamps: &[&str],
+) -> (GraphRecord, GraphRecord) {
+    let bucket_id = log_stable_id(&["log_occurrence_bucket", sig, bucket_start, DEFAULT_SOURCE]);
+    let node = GraphRecord::node(
+        bucket_id.clone(),
+        NodeKind::LogOccurrenceBucket,
+        None,
+        None,
+        Some(format!("bucket {bucket_start}")),
+        format!("occurrence bucket {bucket_start}"),
+    )
+    .with_domain("log", LOG_SCHEMA_VERSION)
+    .with_log(LogPayload::LogOccurrenceBucket(
+        LogOccurrenceBucketPayload {
+            bucket_start: bucket_start.to_owned(),
+            bucket_width: "1h".to_owned(),
+            occurrence_count: timestamps.len() as u64,
+            source_id: DEFAULT_SOURCE.to_owned(),
+            repository_id: String::new(),
+            occurrence_timestamps: timestamps.iter().map(|t| (*t).to_owned()).collect(),
+        },
+    ))
+    .with_valid_time(bucket_start, "log_event_timestamp");
+    let edge = log_edge(EdgeLabel::Aggregates, &bucket_id, sig, "aggregates");
+    (node, edge)
+}
+
 fn emitted_during(sig: &str, run: &str, basis: CorrelationBasis) -> GraphRecord {
     GraphRecord::Edge {
         id: log_stable_id(&["edge", "EMITTED_DURING", sig, run, basis.as_str()]),
@@ -1163,7 +1231,11 @@ fn first_seen_window_is_scoped_to_repo() {
     let (ca2_id, ca2) = commit_in("repo-a", "a2sha00000", T3);
     let (cb1_id, cb1) = commit_in("repo-b", "b1sha00000", "2026-01-02T06:00:00Z");
     let (cb2_id, cb2) = commit_in("repo-b", "b2sha00000", "2026-01-02T18:00:00Z");
-    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 1, None);
+    // Attribute the signature to repo A (schema v3, #362) so it survives the
+    // `--repo repo-a` runtime filter; this test exercises the CODE-side
+    // commit-timeline bracketing, not the legacy-unattributed exclusion path.
+    let (sig_id, sig) =
+        error_signature_attributed("boom", "error", SIG_FIRST, SIG_LAST, 1, &repo_a);
     let records = vec![
         repo_a_node,
         repo_b_node,
@@ -1870,6 +1942,89 @@ fn as_of_bounds_occurrence_view() {
     let buckets = &ctx.signatures[0].buckets;
     assert_eq!(buckets.len(), 1, "buckets after --as-of are dropped");
     assert_eq!(buckets[0].bucket_start, "2026-01-02T12:00:00Z");
+    // A legacy (empty-timestamps) bucket cannot be sub-divided at the cutoff, so
+    // its whole count survives and the granularity marker degrades (issue #364).
+    assert_eq!(buckets[0].occurrence_count, 5);
+    assert_eq!(
+        ctx.occurrence_count_granularity,
+        Some("hourly_bucket"),
+        "a legacy bucket contributing to the --as-of view degrades granularity"
+    );
+}
+
+#[test]
+fn as_of_v3_bucket_is_endpoint_exact_partial_count() {
+    // Issue #364: a schema-v3 bucket carries per-occurrence `occurrence_timestamps`,
+    // so `--as-of` can bound the occurrence count endpoint-exactly at a mid-hour
+    // instant instead of counting the whole hour-aligned bucket. The bucket at
+    // 12:00 holds occurrences at 12:15 and 12:45; with `--as-of 12:30` only the
+    // 12:15 occurrence is at or before the cutoff, so the reported count is 1, not
+    // the whole-bucket 2. The marker is `endpoint_exact` because every contributing
+    // bucket carried timestamps.
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 2, None);
+    let (bnode, bedge) = bucket_with_timestamps(
+        &sig_id,
+        "2026-01-02T12:00:00Z",
+        &["2026-01-02T12:15:00Z", "2026-01-02T12:45:00Z"],
+    );
+    let records = vec![sig, bnode, bedge];
+    let ctx = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        Some("2026-01-02T12:30:00Z"),
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("resolve");
+    let buckets = &ctx.signatures[0].buckets;
+    assert_eq!(
+        buckets.len(),
+        1,
+        "the straddling bucket is kept with a partial count"
+    );
+    assert_eq!(buckets[0].bucket_start, "2026-01-02T12:00:00Z");
+    assert_eq!(
+        buckets[0].occurrence_count, 1,
+        "only the 12:15 occurrence is at or before the 12:30 cutoff"
+    );
+    assert_eq!(
+        ctx.occurrence_count_granularity,
+        Some("endpoint_exact"),
+        "every contributing bucket carried per-occurrence timestamps"
+    );
+}
+
+#[test]
+fn as_of_v3_bucket_entirely_after_cutoff_is_dropped() {
+    // A v3 bucket whose every occurrence falls after the cutoff contributes zero
+    // and is not listed (issue #364).
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 1, None);
+    let (bnode, bedge) =
+        bucket_with_timestamps(&sig_id, "2026-01-02T12:00:00Z", &["2026-01-02T12:45:00Z"]);
+    let records = vec![sig, bnode, bedge];
+    let ctx = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        Some("2026-01-02T12:30:00Z"),
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("resolve");
+    assert!(
+        ctx.signatures[0].buckets.is_empty(),
+        "a bucket with no occurrence at or before the cutoff is dropped"
+    );
+    assert_eq!(
+        ctx.occurrence_count_granularity,
+        Some("endpoint_exact"),
+        "no legacy bucket contributed, so the marker stays endpoint_exact"
+    );
 }
 
 #[test]
@@ -2134,10 +2289,54 @@ fn stronger_basis_wins_over_weaker_for_same_run_regardless_of_order() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn repo_scope_excludes_foreign_repo_signature() {
+    // Issue #362 (schema v3): `--repo` now filters the log/runtime sections by the
+    // persisted `repository_id`. A symbol named by two signatures — one attributed
+    // to the scoped repository, one to a foreign repository — resolves to ONLY the
+    // in-repo signature when scoped. Both are attributed, so no residual caveat.
+    let (sym_id, sym) = code_symbol("boom_handler", "src/lib.rs", 1, 10);
+    let (sig_a, sig_a_node) =
+        error_signature_attributed("a", "error", SIG_FIRST, SIG_LAST, 1, "repo_a");
+    let (sig_b, sig_b_node) =
+        error_signature_attributed("b", "error", SIG_FIRST, SIG_LAST, 1, "repo_b");
+    let records = vec![
+        sym,
+        sig_a_node,
+        sig_b_node,
+        frame_resolves(&sig_a, &sym_id, 0, FrameResolution::Resolved),
+        frame_resolves(&sig_b, &sym_id, 0, FrameResolution::Resolved),
+    ];
+    let scoped = error_context(
+        &records,
+        "boom_handler",
+        Some("repo_a"),
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("resolve");
+    assert_eq!(
+        scoped.signature_ids,
+        vec![sig_a.clone()],
+        "scoping keeps the repo's attributed signature and drops the foreign one"
+    );
+    assert_eq!(scoped.signatures.len(), 1);
+    assert_eq!(scoped.signatures[0].record_id, sig_a);
+    assert!(
+        scoped.repo_scope_caveat.is_none(),
+        "both signatures are attributed, so no residual caveat fires"
+    );
+}
+
+#[test]
 fn repo_scope_caveat_present_only_when_repo_set() {
+    // Unscoped: field absent. Scoped over a legacy-unattributed (empty
+    // `repository_id`) signature: the signature is conservatively EXCLUDED and the
+    // residual caveat discloses the exclusion (issue #362, schema v3).
     let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 1, None);
     let records = vec![sig];
-    // Unscoped: field is absent (None).
     let unscoped = error_context(
         &records,
         &sig_id,
@@ -2150,7 +2349,8 @@ fn repo_scope_caveat_present_only_when_repo_set() {
     )
     .expect("resolve");
     assert!(unscoped.repo_scope_caveat.is_none());
-    // Scoped: field discloses that the runtime sections are NOT filtered.
+    assert!(unscoped.signature_ids.contains(&sig_id));
+
     let scoped = error_context(
         &records,
         &sig_id,
@@ -2162,17 +2362,38 @@ fn repo_scope_caveat_present_only_when_repo_set() {
         false,
     )
     .expect("resolve");
-    assert_eq!(
-        scoped.repo_scope_caveat,
-        Some(aletheia_egregore::query::REPO_SCOPE_CAVEAT)
-    );
     assert!(
-        scoped
-            .repo_scope_caveat
-            .unwrap()
-            .contains("NOT repository-filtered"),
-        "the caveat must disclose the runtime sections are unfiltered"
+        scoped.signature_ids.is_empty(),
+        "a legacy unattributed signature cannot be proven in-repo and is excluded"
     );
+    let caveat = scoped
+        .repo_scope_caveat
+        .as_ref()
+        .expect("the residual caveat fires when a legacy signature is excluded");
+    assert_eq!(caveat.repo_scope, "acme/widget");
+    assert_eq!(caveat.excluded_unattributed_signature_count, 1);
+}
+
+#[test]
+fn repo_scope_fully_attributed_store_has_no_caveat() {
+    // A fully schema-v3 scoped store (every signature attributed) carries NO
+    // residual caveat — the filtering is sound (issue #362).
+    let (sig_id, sig) =
+        error_signature_attributed("boom", "error", SIG_FIRST, SIG_LAST, 1, "repo_a");
+    let records = vec![sig];
+    let scoped = error_context(
+        &records,
+        &sig_id,
+        Some("repo_a"),
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("resolve");
+    assert_eq!(scoped.signature_ids, vec![sig_id]);
+    assert!(scoped.repo_scope_caveat.is_none());
 }
 
 // ---------------------------------------------------------------------------
