@@ -17,7 +17,7 @@ use crate::{
             path_segments, reference_text, span,
         },
         cross_file::{
-            CallKind, CallSiteFact, DefinitionFact, FileFacts, ImplTargetFact,
+            CallKind, CallPathRoot, CallSiteFact, DefinitionFact, FileFacts, ImplTargetFact,
             ImplTraitRelationFact, OutOfLineModFact, PendingImplFact, UseImportFact, crate_root_id,
         },
     },
@@ -770,15 +770,30 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         if function.kind() == "generic_function" {
             function = function.child_by_field_name("function")?;
         }
-        let (display, segments, call_kind, receiver_owner) = match function.kind() {
+        let (display, segments, call_kind, receiver_owner, path_root) = match function.kind() {
             "identifier" => {
                 let name = self.node_text(function).trim().to_owned();
-                (name.clone(), vec![name], CallKind::Direct, None)
+                (
+                    name.clone(),
+                    vec![name],
+                    CallKind::Direct,
+                    None,
+                    CallPathRoot::Unqualified,
+                )
             }
             "scoped_identifier" => {
                 let display = self.node_text(function).trim().to_owned();
                 let segments = self.normalize_call_path(&display)?;
-                (display, segments, CallKind::Path, None)
+                // Classify the leading crate scope BEFORE it is lost to
+                // normalization (issue #440): a `crate`/`self`/`super` head names
+                // the caller's own crate; any other head may name a workspace
+                // crate, so retain the raw first segment for the registry lookup.
+                let path_root = match display.split("::").next().map(str::trim) {
+                    Some("crate" | "self" | "super") => CallPathRoot::CurrentCrate,
+                    Some(first) if !first.is_empty() => CallPathRoot::Leading(first.to_owned()),
+                    _ => CallPathRoot::Unqualified,
+                };
+                (display, segments, CallKind::Path, None, path_root)
             }
             "field_expression" => {
                 let field = function.child_by_field_name("field")?;
@@ -816,7 +831,13 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 } else {
                     CallKind::Method
                 };
-                (name.clone(), vec![name], call_kind, owner)
+                (
+                    name.clone(),
+                    vec![name],
+                    call_kind,
+                    owner,
+                    CallPathRoot::Unqualified,
+                )
             }
             _ => return None,
         };
@@ -829,6 +850,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             callee_display: display,
             callee_segments: segments,
             call_kind,
+            path_root,
             receiver_owner,
             span: span(node),
         })
@@ -2788,7 +2810,11 @@ fn macro_invocation_name(text: &str) -> String {
 /// Shared with the public-API reachability query (issue #213) so query-time
 /// module attribution matches extraction-time symbol qualification exactly.
 pub(crate) fn file_module_path(repo_relative_path: &str) -> Vec<String> {
-    let owned = path_segments(repo_relative_path);
+    // Compute the module path against the crate-relative remainder, so a
+    // workspace member crate (`crates/foo/src/mod_b.rs`) yields `["mod_b"]`
+    // rather than an empty path (issue #440). A single-crate `src/...` layout
+    // has an empty prefix, so `owned` is byte-identical to the pre-#440 split.
+    let (_, owned) = crate::languages::cross_file::split_crate_prefix(repo_relative_path);
     let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
     if parts.first() != Some(&"src") {
         return Vec::new();
