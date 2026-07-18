@@ -1669,3 +1669,180 @@ fn commit_with_date(repo: &Path, message: &str, date: &str) {
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
+
+// ---------------------------------------------------------------------------
+// Qualified-path and cross-crate call resolution over a workspace (issue #440).
+//
+// End-to-end proof that `eg scan` binds a `crate::mod::fn()` and a cross-crate
+// `dep_crate::mod::fn()` call to the definition Symbol (a `resolved` CALLS
+// edge, visible to `transitive-callers`) instead of leaving disconnected
+// per-file `Diagnostic` stubs, while an external-crate qualified call stays
+// honestly unresolved. Crate members live in their own directories, so the
+// repo-relative paths never begin at `src/` — the exact layout that regressed.
+// ---------------------------------------------------------------------------
+
+/// A `Diagnostic` node whose display name (the callee path) contains `needle`.
+fn unresolved_stub_present(records: &[Value], needle: &str) -> bool {
+    records.iter().any(|record| {
+        record["record_type"] == "node"
+            && record["kind"] == "Diagnostic"
+            && record["name"].as_str().is_some_and(|n| n.contains(needle))
+    })
+}
+
+#[test]
+fn workspace_intra_crate_qualified_call_resolves_to_definition() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            ("crate_a/src/lib.rs", "pub mod mod_a;\npub mod mod_b;\n"),
+            ("crate_a/src/mod_b.rs", "pub fn target() {}\n"),
+            (
+                "crate_a/src/mod_a.rs",
+                "pub fn caller() {\n    crate::mod_b::target();\n}\n",
+            ),
+        ],
+    );
+    let records = scan_fixture(repo);
+
+    let caller = symbol_id(
+        &records,
+        "function",
+        "mod_a::caller",
+        "crate_a/src/mod_a.rs",
+    );
+    let target = symbol_id(
+        &records,
+        "function",
+        "mod_b::target",
+        "crate_a/src/mod_b.rs",
+    );
+    // The call binds the real definition Symbol with a `resolved` CALLS edge.
+    assert_calls_edge_with_resolution(&records, &caller, &target, "resolved");
+    assert!(
+        !unresolved_stub_present(&records, "mod_b::target"),
+        "the qualified call must not remain a Diagnostic stub"
+    );
+}
+
+#[test]
+fn workspace_cross_crate_qualified_call_resolves_to_definition() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            ("crate_b/src/lib.rs", "pub mod mod_c;\n"),
+            ("crate_b/src/mod_c.rs", "pub fn target() {}\n"),
+            ("crate_a/src/lib.rs", "pub mod mod_a;\n"),
+            (
+                "crate_a/src/mod_a.rs",
+                "pub fn caller() {\n    crate_b::mod_c::target();\n}\n",
+            ),
+        ],
+    );
+    let records = scan_fixture(repo);
+
+    let caller = symbol_id(
+        &records,
+        "function",
+        "mod_a::caller",
+        "crate_a/src/mod_a.rs",
+    );
+    let target = symbol_id(
+        &records,
+        "function",
+        "mod_c::target",
+        "crate_b/src/mod_c.rs",
+    );
+    assert_calls_edge_with_resolution(&records, &caller, &target, "resolved");
+}
+
+#[test]
+fn workspace_external_crate_qualified_call_stays_unresolved() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            // A same-named local `target` exists, but the call names `ext_dep`,
+            // which is NOT a workspace crate, so it must not bind here.
+            ("crate_a/src/lib.rs", "pub mod mod_a;\npub mod mod_c;\n"),
+            ("crate_a/src/mod_c.rs", "pub fn target() {}\n"),
+            (
+                "crate_a/src/mod_a.rs",
+                "pub fn caller() {\n    ext_dep::mod_c::target();\n}\n",
+            ),
+        ],
+    );
+    let records = scan_fixture(repo);
+
+    let caller = symbol_id(
+        &records,
+        "function",
+        "mod_a::caller",
+        "crate_a/src/mod_a.rs",
+    );
+    let local = symbol_id(
+        &records,
+        "function",
+        "mod_c::target",
+        "crate_a/src/mod_c.rs",
+    );
+    assert!(
+        calls_edge(&records, &caller, &local).is_none(),
+        "an external-crate qualified call must not bind a same-named local definition"
+    );
+    assert!(
+        unresolved_stub_present(&records, "ext_dep"),
+        "the external qualified call must stay an honest Diagnostic stub"
+    );
+}
+
+#[test]
+fn workspace_qualified_call_disambiguates_same_name_across_modules() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "crate_a/src/lib.rs",
+                "pub mod mod_a;\npub mod mod_b;\npub mod mod_d;\n",
+            ),
+            ("crate_a/src/mod_b.rs", "pub fn target() {}\n"),
+            ("crate_a/src/mod_d.rs", "pub fn target() {}\n"),
+            (
+                "crate_a/src/mod_a.rs",
+                "pub fn caller() {\n    crate::mod_b::target();\n}\n",
+            ),
+        ],
+    );
+    let records = scan_fixture(repo);
+
+    let caller = symbol_id(
+        &records,
+        "function",
+        "mod_a::caller",
+        "crate_a/src/mod_a.rs",
+    );
+    let target_b = symbol_id(
+        &records,
+        "function",
+        "mod_b::target",
+        "crate_a/src/mod_b.rs",
+    );
+    let target_d = symbol_id(
+        &records,
+        "function",
+        "mod_d::target",
+        "crate_a/src/mod_d.rs",
+    );
+    assert_calls_edge_with_resolution(&records, &caller, &target_b, "resolved");
+    assert!(
+        calls_edge(&records, &caller, &target_d).is_none(),
+        "crate::mod_b::target() must not bind mod_d's same-named target"
+    );
+}
