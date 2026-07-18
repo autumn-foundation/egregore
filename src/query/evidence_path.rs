@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
+use super::liveness::Liveness;
 use crate::ir::{CorrelationBasis, EdgeLabel, GraphRecord, SourceSpan};
 
 /// Always-present advisory stamped on every evidence-path envelope. A witness
@@ -444,62 +445,14 @@ pub fn evidence_path(
     // A `--graph` JSONL from `scan`/`ingest` is an APPEND-ONLY history: a
     // non-temporal node/edge re-ingested AFTER its own tombstone revives the id.
     // Embedded `EmbeddedAletheiaSink::read_all_records` (src/adapters/aletheiadb.rs)
-    // already collapses to this current state — it drops a tombstone once a later
-    // node write (higher `NodeId`) or edge write (higher `egregore_seq`) of the
-    // same id supersedes it, both monotonic in write order. `records_from_jsonl`
-    // preserves file/append order, so "latest write for an id" is the record with
-    // the greatest Vec index. A tombstone is ACTIVE only when no later Node/Edge
-    // write of that id follows it — provably equivalent to embedded's per-tombstone
-    // staleness check — so the two supported transports agree (Codex #247 finding).
-    //
-    // `last_write` = greatest index of a Node/Edge write per id (CROSS-KIND, for
-    // tombstone liveness); `last_edge_write` = greatest index of an EDGE write per
-    // id (EDGE-ONLY, for edge-version selection); `last_tomb` = greatest index of a
-    // Tombstone per deleted_id. `has_temporal` still fully exempts
-    // bitemporal/history-bearing records a tombstone can never suppress.
-    //
-    // The two write maps are kept SEPARATE because this graph model lets a Node and
-    // an Edge legitimately share one stable record ID: `GraphRecord::node_kind_ref`
-    // (src/ir.rs) resolves a non-node record sharing a node's ID to `None` and thus
-    // SHADOWS the node (issue #391, matched by the daemon and `eg validate`). If
-    // edge-version selection keyed off the cross-kind `last_write`, a later Node
-    // write of an edge's ID would win, suppressing EVERY version of the edge and
-    // turning a reachable path into `no_path`. Embedded `latest_edge_versions`
-    // (src/adapters/aletheiadb.rs) selects among physical EDGES per `codegraph_id`
-    // INDEPENDENT of node records, so keying edge selection off the edge-only map is
-    // what keeps `--graph` and `--data-dir` consistent (Codex #247 finding).
-    let mut last_write: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut last_edge_write: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut last_tomb: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut has_temporal: BTreeSet<&str> = BTreeSet::new();
-    for (index, r) in records.iter().enumerate() {
-        match r {
-            GraphRecord::Node { id, temporal, .. } => {
-                last_write.insert(id.as_str(), index);
-                if temporal.is_some() {
-                    has_temporal.insert(id.as_str());
-                }
-            }
-            GraphRecord::Edge { id, temporal, .. } => {
-                last_write.insert(id.as_str(), index);
-                last_edge_write.insert(id.as_str(), index);
-                if temporal.is_some() {
-                    has_temporal.insert(id.as_str());
-                }
-            }
-            GraphRecord::Tombstone { deleted_id, .. } => {
-                last_tomb.insert(deleted_id.as_str(), index);
-            }
-        }
-    }
-    // Active tombstone: a tombstone exists and no later non-tombstone write of the
-    // same id follows it (or none exists at all). `has_temporal` overrides.
-    let deleted = |id: &str| {
-        !has_temporal.contains(id)
-            && last_tomb
-                .get(id)
-                .is_some_and(|&ti| last_write.get(id).is_none_or(|&wi| ti > wi))
-    };
+    // already collapses to this current state, so the shared [`Liveness`] gate
+    // reports a tombstone ACTIVE only when it is the id's most recent write —
+    // provably equivalent to embedded's per-tombstone staleness check — and keeps
+    // a SEPARATE edge-only latest-version map (issue #391) for the adjacency read
+    // below, so the two supported transports agree (Codex #247 finding, issue
+    // #421). See `super::liveness` for the full rationale.
+    let liveness = Liveness::new(records);
+    let deleted = |id: &str| liveness.deleted(id);
 
     // Live node index: nodes present and not deleted.
     let by_id: BTreeMap<&str, &GraphRecord> = records
@@ -550,10 +503,10 @@ pub fn evidence_path(
             // the latest EDGE write for the id is live, mirroring embedded
             // `latest_edge_versions` (highest egregore_seq) — which selects among
             // physical edges INDEPENDENT of node records. Keying off the edge-only
-            // `last_edge_write` (never the cross-kind `last_write`) means a later
-            // Node write sharing the edge's ID cannot suppress the edge, so the two
-            // transports surface identical edge metadata (Codex #247 finding).
-            if last_edge_write.get(id.as_str()) != Some(&index) {
+            // map (never the cross-kind write map) means a later Node write sharing
+            // the edge's ID cannot suppress the edge, so the two transports surface
+            // identical edge metadata (Codex #247 finding).
+            if !liveness.is_latest_edge_version(id.as_str(), index) {
                 continue;
             }
             if deleted(id.as_str()) || !is_evidence_path_edge(*label) {

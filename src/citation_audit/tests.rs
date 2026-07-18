@@ -860,6 +860,58 @@ fn tombstoned_frame_target_counts_as_missing_citation() {
     assert!(!report.ok);
 }
 
+// Issue #421 (transport parity): a frame target re-ingested AFTER its own
+// tombstone is live again over `--graph` — matching the embedded `--data-dir`
+// current-state read — so `node_visible` (now latest-write-wins) counts it as a
+// live citation, not a `MissingRequiredHandle`. Before the fix, raw tombstone
+// membership hid the revived symbol and diverged from `--data-dir`.
+#[test]
+fn frame_target_reingested_after_tombstone_is_cited() {
+    fn cited_symbol(id: &str) -> GraphRecord {
+        let mut sym = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 10,
+                end_line: 20,
+            }),
+            None,
+            "summary".to_owned(),
+        );
+        if let GraphRecord::Node { name, .. } = &mut sym {
+            *name = Some("revived".to_owned());
+        }
+        sym
+    }
+    let revived = "codegraph:v1:revived_symbol";
+    let tombstone = GraphRecord::Tombstone {
+        id: "codegraph:v1:tomb_revived".to_owned(),
+        schema_version: 1,
+        deleted_id: revived.to_owned(),
+        summary: "symbol removed".to_owned(),
+        producer: None,
+    };
+    // Append order: symbol, Tombstone(symbol), symbol again → latest write wins.
+    let records = log_deltas_frame_scenario(
+        revived,
+        vec![cited_symbol(revived), tombstone, cited_symbol(revived)],
+    );
+    let report = run_citation_audit(&records, &AuditConfig::default());
+
+    let row = log_deltas_frame_row(&report, revived);
+    assert_eq!(
+        row.status,
+        CitationStatus::Cited,
+        "a frame target revived after its tombstone is a live citation (latest write wins)"
+    );
+    assert_eq!(row.trust_class, "source_fact");
+    assert!(report.gate.code_gate_pass);
+    assert!(report.ok);
+}
+
 // #328 AC3 (guard the correct case): a frame resolving to a PRESENT node is
 // audited under the code-handle rule and stays cited — the fix for the dangling
 // case must not regress a genuinely-resolved frame.

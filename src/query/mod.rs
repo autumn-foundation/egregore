@@ -27,6 +27,7 @@ mod failure_history;
 mod file_at_point;
 mod implementors;
 mod lifeline;
+pub(crate) mod liveness;
 mod locate;
 mod log_deltas;
 mod memory_audit;
