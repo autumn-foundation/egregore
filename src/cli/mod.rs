@@ -72,6 +72,8 @@ mod watch;
 mod who;
 // Appended (issue #225); kept at the end to minimize cross-lane merge conflicts.
 mod path;
+// Appended (issue #444); kept at the end to minimize cross-lane merge conflicts.
+mod who_imports;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
@@ -142,6 +144,8 @@ pub(crate) use verification_coverage::*;
 pub(crate) use watch::*;
 // Appended (issue #225); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use path::*;
+// Appended (issue #444); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use who_imports::*;
 
 use std::{
     collections::BTreeMap,
@@ -189,6 +193,7 @@ use crate::repair;
 #[derive(Debug, Parser)]
 #[command(
     name = "egregore",
+    version,
     about = "Manage agentic SWE knowledge graphs on AletheiaDB"
 )]
 pub(crate) struct Cli {
@@ -2776,6 +2781,54 @@ pub(crate) enum QuerySubcommand {
         /// or before this RFC 3339 instant. Mutually exclusive with --at.
         #[arg(long, conflicts_with = "at")]
         as_of: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// List the files that import a module path (issue #444).
+    ///
+    /// A read-only lookup over the `Import` nodes the language extractors mint:
+    /// given a `::`-separated module path (`serde`, `foo::bar`,
+    /// `crate::query::liveness`), returns every importing file whose recorded
+    /// `use` declaration names a module path with the query as a SEGMENT-AWARE
+    /// prefix (`foo::bar` matches `foo::bar::Baz` and `foo::bar`, never
+    /// `foo::barbell`). Alias (`as`), group (`{A, B}`), and glob (`*`) imports
+    /// are reduced to their module path before matching. Because only
+    /// extractor-minted Import nodes are considered, a doc-comment or string
+    /// mention of the path is invisible — the precision win over `grep`.
+    ///
+    /// The graph carries no per-file owning-crate name, so `crate::`-relative
+    /// and absolute `<crate>::` imports are DISTINCT by default. Pass
+    /// `--crate <name>` to rewrite a leading `crate::` (in the query and in
+    /// imports) to that crate name so the two forms unify. This is
+    /// caller-supplied ground truth, never guessed.
+    ///
+    /// Every row carries a stable record ID plus the repo-relative importing
+    /// file/span handle. Output is deterministic and byte-identical across runs
+    /// and across `--graph` / `--data-dir`. Rows are import-site LEADS, never
+    /// proof the imported item is used.
+    ///
+    /// Exit codes:
+    ///   0 — at least one importer found.
+    ///   1 — malformed module path (machine-readable JSON on stderr).
+    ///   2 — well-formed query with zero importers (`no_match`).
+    ///
+    /// Documented in `docs/cli/who-imports.md`.
+    WhoImports {
+        /// The `::`-separated module path to look up (e.g. `serde::Serialize`).
+        module_path: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Unify a leading `crate::` with this crate name (query + imports).
+        #[arg(long = "crate")]
+        crate_name: Option<String>,
+        /// Restrict the importer set to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -5908,6 +5961,38 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 selected.as_deref(),
                 at.as_deref(),
                 as_of.as_deref(),
+                format,
+            )
+        }
+        // Appended (issue #444); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::WhoImports {
+            module_path,
+            graph,
+            data_dir,
+            crate_name,
+            repo,
+            format,
+        } => {
+            // Strictly read-only lane: opening the live embedded engine
+            // re-persists its on-disk index files, so `--data-dir` reads a
+            // throwaway copy of the store — the original stays byte-for-byte
+            // untouched. `--graph` is a plain file read. No temporal selectors.
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_who_imports_cmd(
+                &records,
+                &module_path,
+                crate_name.as_deref(),
+                &index,
+                selected.as_deref(),
                 format,
             )
         }

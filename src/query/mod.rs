@@ -54,6 +54,8 @@ mod verification_coverage;
 mod who;
 // Appended (issue #225); kept at the end to minimize cross-lane merge conflicts.
 mod path;
+// Appended (issue #444); kept at the end to minimize cross-lane merge conflicts.
+mod who_imports;
 
 pub use as_of::*;
 pub use change_impact::*;
@@ -98,3 +100,5 @@ pub use verification_coverage::*;
 pub use who::*;
 // Appended (issue #225); kept at the end to minimize cross-lane merge conflicts.
 pub use path::*;
+// Appended (issue #444); kept at the end to minimize cross-lane merge conflicts.
+pub use who_imports::*;

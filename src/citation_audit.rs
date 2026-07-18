@@ -1438,6 +1438,28 @@ fn drive_manifest_deps(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
     builder
 }
 
+/// `eg query who-imports <module-path>` (issue #444): every importer row the
+/// lane returns is a live `Import` node carrying its stable record ID plus the
+/// repo-relative importing-file/span handle — the code source-fact citation
+/// rule. Driving over every live Import node proves the class of rows the lane
+/// can return all carry the required handles.
+fn drive_who_imports(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+    let mut builder = WorkflowBuilder::new("who-imports", "source_fact", records);
+    let liveness = Liveness::new(records);
+    for record in records {
+        let GraphRecord::Node {
+            id, kind, temporal, ..
+        } = record
+        else {
+            continue;
+        };
+        if kind.as_str() == "Import" && node_visible(id, temporal.is_some(), &liveness) {
+            builder.push_record(record);
+        }
+    }
+    builder
+}
+
 fn drive_drift(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
     let mut builder = WorkflowBuilder::new("drift", "source_fact", records);
     // Measure the DEFAULT `eg query drift` output, which returns the top
@@ -2369,6 +2391,7 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         drive_subsystem(records),
         drive_symbol(records),
         drive_task(records),
+        drive_who_imports(records),
     ];
 
     let mut workflows = Vec::new();

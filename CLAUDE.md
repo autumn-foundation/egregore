@@ -232,6 +232,13 @@ cargo run -- query deps <ambiguous_name> --graph graph.jsonl       # exit 1 (can
 cargo run -- query deps does_not_exist --graph graph.jsonl         # exit 2 (no_match)
 cargo run -- query deps <symbol_name> --graph history.graph.jsonl --at <sha>  # commit view
 
+# Files that import a module path (issue #444)
+cargo run -- query who-imports serde::Serialize --graph graph.jsonl   # exit 0 (>=1 importer)
+cargo run -- query who-imports foo::bar --graph graph.jsonl           # segment-aware: not foo::barbell
+cargo run -- query who-imports mycrate::foo --crate mycrate --graph graph.jsonl  # unify crate:: with mycrate::
+cargo run -- query who-imports nonexistent::module --graph graph.jsonl  # exit 2 (no_match)
+cargo run -- query who-imports "" --graph graph.jsonl                 # exit 1 (malformed_module_path)
+
 # Symbol- and file-level deltas across a commit range (issue #118)
 cargo run -- query deltas <base_sha> <head_sha> --graph history.graph.jsonl  # exit 0 on match
 cargo run -- query deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
@@ -447,6 +454,29 @@ candidate record IDs; `--at`/`--as-of` return the dependency set at a single-com
 view. Output is newline-delimited JSON (summary envelope line, then one row per line),
 byte-identical across runs, with a `--format text` mode. Rows are dependency leads, never
 proof of runtime behavior. See `docs/cli/deps.md`.
+
+`eg query who-imports <module-path>` lists the files that import a `::`-separated module
+path (`serde`, `foo::bar`, `crate::query::liveness`) — a read-only lookup over the
+extractor-minted `Import` nodes, adding no inbound `IMPORTS` edge and bumping no schema.
+Matching is SEGMENT-AWARE PREFIX: an import matches iff the query segments equal the
+import's first N segments, so `foo::bar` matches `foo::bar::Baz` and `foo::bar` but never
+`foo::barbell`. Each import's path text is first reduced to its module prefix — a trailing
+` as <alias>` is stripped, a group `a::b::{C, D}` and a glob `a::b::*` reduce to `a::b`.
+Because only real `Import` nodes are consulted, a doc-comment or string mention of the path
+produces NO match (the precision win over grep). The graph carries no per-file owning-crate
+name, so by default a `crate::`-relative import and an absolute `<crate>::` import are
+DISTINCT (and a leading `self`/`super` is matched literally); pass `--crate <name>` to
+rewrite a leading `crate::` in BOTH the query and imports to `<name>::` so the two forms
+unify — caller-supplied ground truth, never guessed. Liveness follows the shared
+latest-write-wins `Liveness` gate so `--graph` and `--data-dir` agree on tombstoned/revived
+imports. Output is a deterministic NDJSON envelope (`query_path`, optional `crate_name`,
+`total_importers`, disclaimer) then one `source_fact` row per importer carrying a stable
+`record_id` + repo-relative `repo_relative_path`/`span` + the raw `import_path`; sorted by
+path, start line, then record ID and byte-identical across runs and across `--graph` vs
+`--data-dir`. Exit 0 on a match, exit 2 (`no_match`) for a well-formed query with zero
+importers, exit 1 (`malformed_module_path`) for an empty/leading-or-trailing-`::`/empty-
+interior-segment/whitespace-bearing path. Rows are import-site leads, never proof the
+imported item is used. See `docs/cli/who-imports.md`.
 
 `eg query deltas <base> <head>` returns the observed structural deltas between two commit
 handles (full SHA or unique prefix) from a `scan-history` graph or embedded store, grouped by
