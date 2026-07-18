@@ -666,7 +666,7 @@ pub fn error_context(
             })
             .collect();
         signature_ids.retain(|id| match sig_repo_id.get(id.as_str()) {
-            Some(repo_id) if repo_id.is_empty() => {
+            Some(&"") => {
                 excluded_unattributed.insert(id.clone());
                 false
             }
@@ -797,15 +797,15 @@ pub fn error_context(
         };
         // Endpoint-exact count and exactness for this bucket at the cutoff, or the
         // whole aggregate count when no `--as-of` bounds the view.
-        let (bucket_count, bucket_exact) = match as_of_instant {
-            Some(cutoff) => bucket_occurrences_at_or_before(
-                &bucket.bucket_start,
-                bucket.occurrence_count,
-                &bucket.occurrence_timestamps,
-                cutoff,
-            ),
-            None => (bucket.occurrence_count, true),
-        };
+        let (bucket_count, bucket_exact) =
+            as_of_instant.map_or((bucket.occurrence_count, true), |cutoff| {
+                bucket_occurrences_at_or_before(
+                    &bucket.bucket_start,
+                    bucket.occurrence_count,
+                    &bucket.occurrence_timestamps,
+                    cutoff,
+                )
+            });
         // A bucket contributing nothing at or before the cutoff is not listed.
         if as_of_instant.is_some() && bucket_count == 0 {
             continue;

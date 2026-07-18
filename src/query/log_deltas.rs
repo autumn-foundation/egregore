@@ -1033,7 +1033,8 @@ fn window_bucket_sum(buckets: &[BucketWindow], endpoint: DateTime<Utc>) -> (u64,
 /// timestamp is excluded rather than compared incorrectly. Shared by
 /// [`window_bucket_sum`] (log-deltas) and `error_context`'s `--as-of` bucket
 /// view so the two lanes count identically.
-pub(crate) fn bucket_occurrences_at_or_before(
+#[must_use]
+pub fn bucket_occurrences_at_or_before(
     bucket_start: &str,
     occurrence_count: u64,
     occurrence_timestamps: &[String],
