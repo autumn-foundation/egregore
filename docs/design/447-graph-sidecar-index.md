@@ -40,8 +40,35 @@ Body: a serde struct of `BTreeMap`s (deterministic, sorted serialization):
 - `by_kind: BTreeMap<String, Vec<u64>>` — node-kind string → offsets.
 - `adjacency: BTreeMap<String, Vec<u64>>` — node id → offsets of every incident
   Edge (source OR target).
+- `has_temporal_history: bool` — `true` when the indexed graph is a history /
+  corpus store (any record carries temporal provenance, or a `Commit` node is
+  present). Additive body field, still format v1; `#[serde(default)]` (false).
 
 All `Vec<u64>` offset lists are sorted for determinism.
+
+### Composition with issue #457 (HEAD-anchor default over history stores)
+
+Issue #457 made `deps`/`who-imports` (and `path`, which is NOT index-migrated)
+**HEAD-anchor by default** over a `scan-history`/corpus store: with no `--repo`/
+`--at`/`--as-of` flag they drop records that are not current at the repository's
+stamped HEAD (`query::non_head_current_record_ids`) and disclose a `corpus_mode`
+in the envelope. That gate consumes GLOBAL state — the live `Repository`
+`source_snapshot` HEAD, the `RepositoryIndex` containment ancestry that
+attributes each record to a repository, and **every** version of **every** id
+(an id is current iff ANY of its versions is at HEAD). A targeted `Selector`
+closure hydrates only a bounded neighbourhood, so it cannot feed the gate that
+global set: a closure would silently omit off-HEAD versions (or the `Repository`
+snapshot), producing an answer that DIVERGES from the cold path.
+
+Resolution (safe fallback, correctness over coverage): the index build records
+`has_temporal_history`, and `load_records_from_jsonl_selected` **falls back to
+the cold whole-file scan for every non-`Whole` selector when that flag is set**.
+A plain current-tree `scan` graph carries no temporal records → flag is false →
+the #447 fast path applies, and there head-anchoring drops nothing so the
+closure is byte-identical. A history store still builds a valid `.idx`; it just
+cold-scans on query, so the index answer is byte-identical to the cold answer
+for every migrated lane and every corpus mode. This keeps the fast path exactly
+where it is provably byte-identical.
 
 ### Validity
 

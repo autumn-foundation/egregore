@@ -816,7 +816,15 @@ refuses (exit 2) any graph a cold load would reject, and never writes from a
 query path. Migrated lanes (`deps`, `context`/`symbol`, `at`/`locate`, `file`,
 `who-imports`) take the fast path only for the plain current-state, unscoped
 invocation; `--repo`/`--at`/`--as-of`/`--repo-path` and every other `--graph`
-lane stay on the cold full-file scan. See `docs/cli/index.md`.
+lane stay on the cold full-file scan. Composing with #457 (which made
+`deps`/`who-imports` HEAD-anchor by default over a history store), the index
+body carries a `has_temporal_history` flag (still format v1) set when the graph
+is a `scan-history`/corpus store (any temporal record or `Commit` node); the
+loader then falls back to the cold whole-file scan for the migrated lanes over
+such a store — the #457 HEAD-anchor gate needs global commit topology and every
+record version a targeted closure cannot supply — so the answer stays
+byte-identical, while a plain current-tree `scan` graph keeps the fast path.
+See `docs/cli/index.md`.
 
 `eg query public-api-deltas <base> <head>` classifies changes to the externally-reachable
 public API surface between two commit handles from a `scan-history` graph or embedded store,

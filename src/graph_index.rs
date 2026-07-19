@@ -94,6 +94,22 @@ pub struct GraphIndexBody {
     pub by_kind: BTreeMap<String, Vec<u64>>,
     /// Node id → sorted offsets of every incident edge (source OR target).
     pub adjacency: BTreeMap<String, Vec<u64>>,
+    /// Whether the indexed graph is a history / corpus store — any record
+    /// carries temporal provenance, or a `Commit` node is present (issue #457
+    /// composition). A targeted [`Selector`] closure hydrates only a bounded
+    /// subset of records, but the #457 default HEAD-anchor gate
+    /// (`query::non_head_current_record_ids`) and the other history-view lanes
+    /// consume GLOBAL commit topology and every version of every record to
+    /// decide what is current at HEAD; that global set cannot be soundly
+    /// supplied by a closure, so the loader falls back to a cold whole-file scan
+    /// for a history store (see `load_records_from_jsonl_selected`). A plain
+    /// current-tree `scan` graph carries no temporal records, so this stays
+    /// `false` and the #447 fast path applies. `#[serde(default)]` keeps the
+    /// body format tolerant (the field is additive within v1); `eg index` — the
+    /// only writer — always emits it, and every index freshly built by this
+    /// binary carries the correct value.
+    #[serde(default)]
+    pub has_temporal_history: bool,
 }
 
 /// A parsed sidecar index: the content-addressing header plus the offset body.
@@ -232,6 +248,9 @@ impl GraphIndex {
                     });
                 }
             };
+            if record_is_history_signal(&record) {
+                body.has_temporal_history = true;
+            }
             index_record(&mut body, &record, start);
         }
 
@@ -583,6 +602,22 @@ fn read_record_at(graph_bytes: &[u8], offset: u64) -> Option<GraphRecord> {
     match read_record_line(text) {
         Ok(RecordLineRead::Record(record)) => Some(*record),
         _ => None,
+    }
+}
+
+/// Whether a record marks the graph as a history / corpus store (issue #457
+/// composition): it carries temporal provenance (a history-replayed version) or
+/// it is a `Commit` node. Either signals that the #457 default HEAD-anchor gate
+/// and the other history-view lanes are in effect, so a targeted [`Selector`]
+/// closure cannot reproduce the cold answer and the loader must fall back to a
+/// whole-file scan. A plain current-tree `scan` graph trips neither predicate.
+const fn record_is_history_signal(record: &GraphRecord) -> bool {
+    match record {
+        GraphRecord::Node { kind, temporal, .. } => {
+            temporal.is_some() || matches!(kind, NodeKind::Commit)
+        }
+        GraphRecord::Edge { temporal, .. } => temporal.is_some(),
+        GraphRecord::Tombstone { .. } => false,
     }
 }
 
@@ -956,10 +991,77 @@ mod tests {
     }
 
     #[test]
+    fn plain_graph_has_no_temporal_history_flag() {
+        // The keep-last current-tree fixture carries no temporal provenance and
+        // no Commit node, so the fast path stays enabled (issue #457 composition).
+        let g = sample_graph();
+        let index = GraphIndex::build_from_bytes(jsonl(&g).as_bytes()).expect("build");
+        assert!(!index.body.has_temporal_history);
+    }
+
+    #[test]
+    fn temporal_record_sets_history_flag() {
+        use crate::ir::TemporalMetadata;
+        let mut g = Graph::new();
+        let repo = stable_id(&["node", "Repository", "r"]);
+        g.push(GraphRecord::node(
+            repo,
+            NodeKind::Repository,
+            None,
+            None,
+            Some("r".to_owned()),
+            "Repository r".to_owned(),
+        ));
+        g.push(
+            GraphRecord::syntax_node(
+                sym_id("src/a.rs", "s"),
+                NodeKind::Symbol,
+                "src/a.rs".to_owned(),
+                span(1, 3),
+                "s".to_owned(),
+                "rust",
+                "fn s".to_owned(),
+            )
+            .with_temporal(TemporalMetadata {
+                git_commit: "aaaa1111".to_owned(),
+                git_parent_commits: vec![],
+                valid_time: "2026-01-01T00:00:00Z".to_owned(),
+                author_time: None,
+                observed_at: "2026-01-01T00:00:00Z".to_owned(),
+                valid_time_source: Some("git_commit_committer_date".to_owned()),
+            }),
+        );
+        let index = GraphIndex::build_from_bytes(jsonl(&g).as_bytes()).expect("build");
+        assert!(
+            index.body.has_temporal_history,
+            "a temporal-provenance record marks the graph a history store"
+        );
+    }
+
+    #[test]
+    fn commit_node_sets_history_flag() {
+        let mut g = Graph::new();
+        g.push(GraphRecord::node(
+            stable_id(&["node", "commit", "r", "aaaa1111"]),
+            NodeKind::Commit,
+            None,
+            None,
+            Some("aaaa1111".to_owned()),
+            "Commit aaaa1111".to_owned(),
+        ));
+        let index = GraphIndex::build_from_bytes(jsonl(&g).as_bytes()).expect("build");
+        assert!(
+            index.body.has_temporal_history,
+            "a Commit node marks the graph a history store"
+        );
+    }
+
+    #[test]
     fn empty_graph_builds_empty_index() {
         let index = GraphIndex::build_from_bytes(b"").expect("build");
         assert!(index.body.by_id.is_empty());
         assert_eq!(index.graph_len, 0);
+        assert!(!index.body.has_temporal_history);
     }
 
     #[test]

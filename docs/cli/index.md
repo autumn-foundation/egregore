@@ -48,7 +48,14 @@ line:
   length (`u64`), and the graph file's BLAKE3 (`[u8; 32]`).
 - **Body:** deterministic sorted maps from record ids, node names,
   repo-relative paths, node-kind strings, tombstone `deleted_id`s, and edge
-  adjacency to line-start byte offsets.
+  adjacency to line-start byte offsets, plus a `has_temporal_history` boolean
+  (see below).
+
+The `has_temporal_history` flag (still format v1, an additive body field) is
+`true` when the indexed graph is a **history / corpus store** — any record
+carries temporal provenance, or a `Commit` node is present. It is recorded at
+build time so the loader can decide, before hydrating, whether the fast path is
+sound (see the next section).
 
 The write is atomic (`.idx.tmp` then rename), so a reader never observes a torn
 index. Repeated builds of an unchanged graph produce a byte-identical `.idx`.
@@ -83,6 +90,26 @@ because they need global topology or the commit timeline):
 Every other `--graph` lane is unchanged (it reads the whole file exactly as
 before). The embedded `--data-dir` store has its own indexes and is out of scope
 for this command.
+
+### History / corpus stores fall back to the cold scan
+
+Over a `scan-history` (or otherwise temporal / corpus) graph, several migrated
+lanes changed semantics in issue #457: `deps` and `who-imports` **HEAD-anchor by
+default**, dropping records that are not current at the repository's stamped
+HEAD, and other history-view lanes read across commit snapshots. Deciding what
+is current at HEAD needs global commit topology and **every** version of every
+record — a set a targeted index closure (a bounded neighbourhood of one symbol,
+path, or kind) cannot soundly supply. Hydrating only the closure would silently
+omit off-HEAD versions or the `Repository` snapshot the gate reads, diverging
+from the cold answer.
+
+So the loader composes with #457 by **falling back to the cold whole-file scan
+for any migrated lane whenever the index's `has_temporal_history` flag is set**.
+A plain current-tree `eg scan` graph (no temporal records, no `Commit` nodes)
+keeps the #447 fast path — there head-anchoring drops nothing and the closure is
+byte-identical. A history graph still gets a valid `.idx` (and the freshness and
+build guarantees above), it simply cold-scans on query; the index answer stays
+byte-identical to the cold answer for every lane and every corpus mode.
 
 ## Exit codes
 

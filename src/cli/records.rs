@@ -68,6 +68,18 @@ pub(crate) fn load_records_from_jsonl_selected(
     let Ok(index) = GraphIndex::load_for(graph) else {
         return load_records_from_jsonl(graph);
     };
+    // Compose with #457: over a history / corpus store the default HEAD-anchor
+    // gate (`query::non_head_current_record_ids`) and the other history-view
+    // lanes need GLOBAL commit topology and every version of every record to
+    // decide what is current at HEAD — a set a targeted closure cannot soundly
+    // supply. A closure would silently omit off-HEAD versions (or the
+    // `Repository` snapshot / commit topology the gate reads), diverging from the
+    // cold answer. So a history store falls back to the cold whole-file scan; a
+    // plain current-tree `scan` graph (no temporal records) keeps the #447 fast
+    // path, where head-anchoring drops nothing and the closure is byte-identical.
+    if index.body.has_temporal_history {
+        return load_records_from_jsonl(graph);
+    }
     match index.hydrate(graph, selector) {
         Ok(Some(records)) => Ok(records),
         Ok(None) | Err(_) => load_records_from_jsonl(graph),
