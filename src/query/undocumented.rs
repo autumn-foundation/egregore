@@ -140,16 +140,13 @@ pub fn undocumented_public_api<'a>(
     // repository's stamped HEAD so a symbol deleted at HEAD never resurfaces in
     // the `--include-private` widening (issue #431). Reachability itself is
     // *not* re-derived here — it comes from `public_api_surface` above.
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| {
-            if let GraphRecord::Tombstone { deleted_id, .. } = r {
-                Some(deleted_id.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Latest-write-wins liveness (issue #432): over an append-only `--graph` a
+    // Repository/Symbol/Import re-ingested AFTER its own tombstone is live again.
+    // The shared gate reports a tombstone active only when it is the id's most
+    // recent write, matching the embedded current-state read so `--graph` and
+    // `--data-dir` agree. Orthogonal to (and composed with) the head-anchor gate
+    // below, not a replacement for it.
+    let liveness = super::liveness::Liveness::new(records);
     let is_owned =
         |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
 
@@ -171,7 +168,7 @@ pub fn undocumented_public_api<'a>(
             source_snapshot: Some(snapshot),
             ..
         } = record
-            && !tombstoned.contains(id.as_str())
+            && !liveness.deleted(id.as_str())
             && let SnapshotHead::Commit { sha } = &snapshot.head
         {
             repo_heads.insert(id.as_str(), sha.as_str());
@@ -210,7 +207,7 @@ pub fn undocumented_public_api<'a>(
             continue;
         };
         if language.as_deref() != Some("rust")
-            || tombstoned.contains(id.as_str())
+            || liveness.deleted(id.as_str())
             || !is_owned(id)
             || !owned_record_is_current(id, temporal.as_ref())
             || !repo_relative_path
@@ -473,4 +470,75 @@ fn sort_undocumented_diagnostics(diagnostics: &mut Vec<PublicApiDiagnostic>) {
             .then_with(|| a.detail.cmp(&b.detail))
     });
     diagnostics.dedup();
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    use crate::ir::SCHEMA_VERSION;
+
+    // A crate-visibility rust fn with a captured issue #124 surface (visibility
+    // present) but no doc: excluded from the public surface, so it exercises the
+    // local doc-auditable symbol view (the `--include-private` path).
+    fn crate_fn(id: &str) -> GraphRecord {
+        let mut n = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 100,
+                start_line: 1,
+                end_line: 3,
+            }),
+            Some("undoc_fn".to_owned()),
+            "fn undoc_fn".to_owned(),
+        )
+        .with_declaration_surface(
+            Some("crate".to_owned()),
+            Some("fn undoc_fn()".to_owned()),
+            None,
+        );
+        if let GraphRecord::Node {
+            language,
+            symbol_kind,
+            ..
+        } = &mut n
+        {
+            *language = Some("rust".to_owned());
+            *symbol_kind = Some("function".to_owned());
+        }
+        n
+    }
+
+    fn tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v{SCHEMA_VERSION}:tomb-{deleted_id}"),
+            schema_version: SCHEMA_VERSION,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn symbol_reingested_after_tombstone_listed_include_private() {
+        // Append-only `--graph`: a symbol re-ingested AFTER its own tombstone is
+        // live again in the doc-auditable view, matching the coalesced
+        // `--data-dir` read (issue #432).
+        let id = "codegraph:v1:sym-und";
+        let records = vec![crate_fn(id), tombstone(id), crate_fn(id)];
+        let index = RepositoryIndex::build(&records);
+        let report = undocumented_public_api(&records, &index, None, true, None);
+        assert!(report.items.iter().any(|i| i.record_id == id));
+    }
+
+    #[test]
+    fn symbol_tombstoned_without_reingest_absent_include_private() {
+        let id = "codegraph:v1:sym-und";
+        let records = vec![crate_fn(id), tombstone(id)];
+        let index = RepositoryIndex::build(&records);
+        let report = undocumented_public_api(&records, &index, None, true, None);
+        assert!(!report.items.iter().any(|i| i.record_id == id));
+    }
 }
