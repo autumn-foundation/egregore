@@ -469,10 +469,7 @@ impl EmbeddedAletheiaSink {
     pub fn persist_indexes(&self) -> AdapterResult<()> {
         self.db
             .persist_indexes()
-            .map_err(|error| AdapterError::Rejected {
-                record_id: "embedded-store".to_owned(),
-                message: error.to_string(),
-            })
+            .map_err(|error| classify_store_error("embedded-store", error.to_string()))
     }
 
     /// Reads all records from the embedded store for query purposes.
@@ -2548,10 +2545,7 @@ impl EmbeddedAletheiaSink {
         let node_id = self
             .db
             .create_node(node_label(*kind), builder.build())
-            .map_err(|error| AdapterError::Rejected {
-                record_id: id.clone(),
-                message: error.to_string(),
-            })?;
+            .map_err(|error| classify_store_error(id, error.to_string()))?;
         let node = self
             .db
             .get_node(node_id)
@@ -4312,6 +4306,25 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
     }
 }
 
+/// Classifies a store write/persist error string, mapping the `AletheiaDB`
+/// string-interner capacity overflow (issue #439) to the fatal
+/// [`AdapterError::CapacityExceeded`] and everything else to
+/// [`AdapterError::Rejected`].
+fn classify_store_error(record_id: &str, message: String) -> AdapterError {
+    if crate::adapters::is_string_interner_capacity_error(&message) {
+        AdapterError::CapacityExceeded {
+            resource: "string interner".to_owned(),
+            limit: Some(crate::adapters::preflight::MAX_INTERNED_STRINGS),
+            detail: message,
+        }
+    } else {
+        AdapterError::Rejected {
+            record_id: record_id.to_owned(),
+            message,
+        }
+    }
+}
+
 fn base_properties(
     id: &str,
     record_type: &str,
@@ -4716,6 +4729,42 @@ mod embedded_store_gate {
 mod tests {
     use super::*;
     use crate::ir::{GraphRecord, SourceSpan, TemporalMetadata, stable_id};
+
+    /// Issue #439: a store error carrying `AletheiaDB`'s real interner-overflow
+    /// Display maps through `classify_store_error` to the fatal
+    /// `CapacityExceeded` variant, while an unrelated error stays `Rejected`.
+    /// This exercises the exact mapping the `create_node` / `persist_indexes`
+    /// sites use, without needing a real >100k-distinct ingest (too slow for
+    /// CI). The end-to-end overflow-through-a-live-store path is therefore
+    /// covered only at this boundary; see `docs/cli/ingest.md`.
+    #[test]
+    fn classify_store_error_maps_interner_overflow_to_capacity_exceeded() {
+        let upstream =
+            "Capacity exceeded for string interner: current=100000, limit=100000 (DoS protection)";
+        match classify_store_error("codegraph:v1:abc", upstream.to_owned()) {
+            AdapterError::CapacityExceeded {
+                resource,
+                limit,
+                detail,
+            } => {
+                assert_eq!(resource, "string interner");
+                assert_eq!(
+                    limit,
+                    Some(crate::adapters::preflight::MAX_INTERNED_STRINGS)
+                );
+                assert_eq!(detail, upstream);
+            }
+            other => panic!("expected CapacityExceeded, got {other:?}"),
+        }
+
+        match classify_store_error("codegraph:v1:abc", "node label mismatch".to_owned()) {
+            AdapterError::Rejected { record_id, message } => {
+                assert_eq!(record_id, "codegraph:v1:abc");
+                assert_eq!(message, "node label mismatch");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
 
     /// Issue #200 AC2: a second embedded writer is refused with the typed
     /// contention error while a live embedded peer holds the write lease, and

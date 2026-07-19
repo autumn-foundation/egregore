@@ -109,12 +109,19 @@ Initial edge labels:
 | `REFERENCES` | Symbol/Import -> Symbol | Best-effort syntactic reference (same-file); comment and string-literal text never matches (issue #134) |
 | `CALLS` | Symbol -> Symbol/Diagnostic | Function or method call; resolved repo-wide across files for Rust and labeled with a `resolution` status (see below) |
 | `IMPLEMENTS` | Symbol -> Symbol | Impl/trait relationship where syntactically resolvable |
-| `MENTIONS` | Symbol -> Symbol | Weaker unresolved textual/syntactic mention |
+| `MENTIONS` | Symbol -> Symbol | **RESERVED — not currently emitted by any language extractor.** A reserved label for a weaker unresolved textual/syntactic mention; the Rust/Python/TypeScript/Go extractors emit `REFERENCES` for resolved syntactic usage instead. Consumers must not rely on `MENTIONS` being present. (Distinct from the live agent-memory `MENTIONS_SYMBOL` edge.) |
 | `CHANGED_IN` | File/Symbol -> Commit/Change | Entity changed in a commit |
 | `PARENT_OF` | Commit -> Commit | Git commit ancestry |
 | `DRIFTS_FROM` | SemanticDrift -> File/Symbol | Semantic-domain edge; see [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md). |
 | `DRIFTS_PRIOR` | SemanticDrift -> File/Symbol | Semantic-domain prior edge; see [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md). |
 | `MEASURED_BY` | SemanticDrift -> EmbeddingModel | Reserved semantic-domain model edge; see [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md). |
+
+> **`MENTIONS` is reserved, not emitted (issue #442).** The `MENTIONS` edge
+> label is defined, parsed, and serialized, but no current Rust / Python /
+> TypeScript / Go extractor emits it. Resolved syntactic usage is recorded as
+> `REFERENCES`; consumers must not rely on `MENTIONS` being present in a scanned
+> graph. This is distinct from the live agent-memory `MENTIONS_SYMBOL` edge,
+> which is emitted.
 
 ### Cross-File Call Resolution Boundary (issue #152)
 
