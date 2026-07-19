@@ -43,10 +43,20 @@ pub(crate) fn query_lifeline_cmd(
     }
 
     match query::symbol_lifeline(records, symbol, repo_id) {
-        Ok(events) => {
+        Ok(mut events) => {
             if events.is_empty() {
                 let msg = format!("symbol matched but has no commit-linked history: {symbol}");
                 fail("no_history", &msg, None, format, 2);
+            }
+            // This history-analysis lane emits bare NDJSON with no summary line,
+            // so the corpus disclosure (issue #427) rides every event row; all
+            // rows in one query share the same corpus. Never changes traversal.
+            let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+                query::disclose_corpus(records, query::CorpusMode::Union);
+            for ev in &mut events {
+                ev.corpus_mode = Some(corpus_mode.as_str());
+                ev.corpus_mode_source = Some(corpus_mode_source.as_str());
+                ev.corpus_disclaimer = Some(corpus_disclaimer.clone());
             }
             match format {
                 OutputFormat::Json => {
@@ -84,6 +94,7 @@ pub(crate) fn query_lifeline_cmd(
                             ev.event_type, ev.commit, ev.valid_time, ev.record_id, citation, drift
                         );
                     }
+                    println!("corpus: {}", corpus_mode.as_str());
                 }
             }
             Ok(())

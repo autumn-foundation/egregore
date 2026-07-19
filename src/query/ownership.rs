@@ -156,6 +156,16 @@ pub struct OwnershipMap<'a> {
     pub files: Vec<OwnershipFileRow<'a>>,
     /// Stable machine-readable diagnostics (never silent empty output).
     pub diagnostics: Vec<OwnershipDiagnostic>,
+    /// Corpus this history-analysis lane read (issue #427): `union` over a
+    /// scan-history store, `single_snapshot` over a snapshot-less store. The
+    /// per-author shares are computed over full authorship history even though
+    /// the in-scope file set anchors to a commit (`--at`/`--as-of`), so the
+    /// disclosure is `union`; it never changes traversal.
+    pub corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    pub corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    pub corpus_disclaimer: String,
 }
 
 /// Errors that can occur while resolving an ownership query.
@@ -698,6 +708,9 @@ pub fn ownership_map<'a>(
     }
     diagnostics.sort_by(|a, b| a.code.cmp(b.code).then_with(|| a.detail.cmp(&b.detail)));
 
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        super::disclose_corpus(records, super::CorpusMode::Union);
+
     Ok(OwnershipMap {
         threshold_percent: options.threshold_percent,
         disclaimer: OWNERSHIP_DISCLAIMER,
@@ -707,5 +720,8 @@ pub fn ownership_map<'a>(
         truncated,
         files,
         diagnostics,
+        corpus_mode: corpus_mode.as_str(),
+        corpus_mode_source: corpus_mode_source.as_str(),
+        corpus_disclaimer,
     })
 }

@@ -76,6 +76,15 @@ pub struct FileChurnReport {
     pub commit_ranges: Vec<ChurnCommitRange>,
     /// Ranked rows, highest churn first.
     pub files: Vec<ChurnFile>,
+    /// Corpus this history-analysis lane read (issue #427): `union` over a
+    /// scan-history store, `single_snapshot` over a snapshot-less store. This
+    /// lane analyzes full commit history by design; the disclosure never
+    /// changes traversal.
+    pub corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    pub corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    pub corpus_disclaimer: String,
 }
 
 /// Errors returned by the file churn query.
@@ -300,6 +309,9 @@ pub fn file_churn(
     let total_file_count = rows.len();
     rows.truncate(limit);
 
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        super::disclose_corpus(records, super::CorpusMode::Union);
+
     Ok(FileChurnReport {
         ranking_basis: "distinct_commit_count",
         tie_break: "repo_relative_path",
@@ -309,5 +321,8 @@ pub fn file_churn(
         truncated: total_file_count > rows.len(),
         commit_ranges,
         files: rows,
+        corpus_mode: corpus_mode.as_str(),
+        corpus_mode_source: corpus_mode_source.as_str(),
+        corpus_disclaimer,
     })
 }

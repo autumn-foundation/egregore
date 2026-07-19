@@ -499,6 +499,14 @@ fn test_cli_lifeline_happy_path_json() {
         assert!(event["record_id"].is_string());
         assert!(event["repo_relative_path"].is_string() || event["absent_span_reason"].is_string());
     }
+
+    // Corpus disclosure (issue #427): the NDJSON lane has no summary line, so
+    // the disclosure rides every event row. This fixture's Repository carries
+    // no source_snapshot, so the disclosure is `single_snapshot`.
+    for event in &result {
+        assert_eq!(event["corpus_mode"], "single_snapshot");
+        assert_eq!(event["corpus_mode_source"], "default");
+    }
 }
 
 #[test]

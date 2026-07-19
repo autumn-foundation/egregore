@@ -420,6 +420,12 @@ fn range_deltas_fixture_repo_classifies_all_expected_deltas() {
 
     let deltas = range_deltas(&records, &first, &third, None).expect("range should resolve");
 
+    // Corpus disclosure (issue #427): a real scan-history store carries a
+    // source_snapshot, so this range lane discloses `union` (the range is the
+    // analysis window; the corpus within it is the union).
+    assert_eq!(deltas.corpus_mode, "union");
+    assert_eq!(deltas.corpus_mode_source, "default");
+
     // 100% of expected additions and removals, with introducing commits.
     // Non-root files carry the scanner's module-path-qualified symbol names.
     let added: Vec<(&str, &str)> = names_and_commits(&deltas.added_symbols);
