@@ -1,7 +1,9 @@
+#[cfg(feature = "embedded-aletheiadb")]
 use std::fmt::Write as _;
 
 use super::*;
 
+#[cfg(feature = "embedded-aletheiadb")]
 use crate::repair::{PreflightReport, RepairOptions, RepairSessionReport};
 
 /// Handles `eg repair preflight` and `eg repair run`.
