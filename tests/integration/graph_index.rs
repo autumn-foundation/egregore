@@ -421,6 +421,118 @@ fn version_mismatch_falls_back() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Perf evidence (opt-in). Run with:
+//   cargo test --test integration graph_index::perf_deps_cold_vs_indexed \
+//     -- --ignored --nocapture
+// Generates a large synthetic graph, times a deps/context query cold vs indexed,
+// and writes the numbers to the scratchpad perf file.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "perf benchmark; opt-in via --ignored"]
+fn perf_deps_cold_vs_indexed() {
+    use std::time::Instant;
+
+    // ~2,500 files × ~100 symbols = ~250k symbols; with files, edges, and a
+    // repo the JSONL is well over 200k records.
+    let files = 2_500usize;
+    let per_file = 100usize;
+    let mut graph = Graph::new();
+    let repo_id = stable_id(&["node", "Repository", "big"]);
+    graph.push(GraphRecord::node(
+        repo_id.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("big".to_owned()),
+        "Repository big".to_owned(),
+    ));
+    let mut target = String::new();
+    for f in 0..files {
+        let path = format!("src/mod_{f}/file_{f}.rs");
+        file(&mut graph, &repo_id, &path);
+        let mut prev: Option<String> = None;
+        for s in 0..per_file {
+            let name = format!("sym_{f}_{s}");
+            let id = symbol(&mut graph, &path, &name, (s * 3 + 1, s * 3 + 2));
+            if let Some(p) = &prev {
+                edge(&mut graph, EdgeLabel::Calls, p, &id, "calls");
+            }
+            prev = Some(id.clone());
+            if f == files / 2 && s == per_file / 2 {
+                target = name;
+            }
+        }
+    }
+
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("perf447");
+    let _ = fs::create_dir_all(&dir);
+    let graph_path = dir.join("big.jsonl");
+    let jsonl = graph.to_jsonl().expect("jsonl");
+    let record_count = jsonl.lines().filter(|l| !l.trim().is_empty()).count();
+    let byte_len = jsonl.len();
+    fs::write(&graph_path, &jsonl).expect("write big graph");
+    let _ = fs::remove_file(idx_path(&graph_path));
+
+    let bin = env!("CARGO_BIN_EXE_egregore");
+    let time_query = |label: &str, args: &[&str]| -> u128 {
+        let start = Instant::now();
+        let out = std::process::Command::new(bin)
+            .args(args)
+            .arg("--graph")
+            .arg(&graph_path)
+            .output()
+            .expect("run");
+        let ms = start.elapsed().as_millis();
+        assert!(
+            out.status.success(),
+            "{label} query failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        ms
+    };
+
+    // Cold (no index).
+    let cold_deps = time_query("cold deps", &["query", "deps", &target]);
+    let cold_ctx = time_query("cold context", &["query", "context", &target]);
+
+    // Build the index (timed).
+    let build_start = Instant::now();
+    std::process::Command::new(bin)
+        .args(["index"])
+        .arg(&graph_path)
+        .output()
+        .expect("index");
+    let build_ms = build_start.elapsed().as_millis();
+    let idx_len = fs::metadata(idx_path(&graph_path)).expect("idx").len();
+
+    // Indexed.
+    let idx_deps = time_query("idx deps", &["query", "deps", &target]);
+    let idx_ctx = time_query("idx context", &["query", "context", &target]);
+
+    let report = format!(
+        "# Issue #447 — sidecar index perf evidence\n\n\
+         Synthetic graph: {record_count} records, {byte_len} bytes \
+         ({files} files × {per_file} symbols).\n\
+         Index build: {build_ms} ms, index size {idx_len} bytes.\n\n\
+         | query | cold (ms) | indexed (ms) |\n\
+         |-------|-----------|--------------|\n\
+         | deps <symbol> | {cold_deps} | {idx_deps} |\n\
+         | context <symbol> | {cold_ctx} | {idx_ctx} |\n\n\
+         (Whole-process wall time including startup; the delta is the \
+         load/deserialize cost the index removes.)\n"
+    );
+    let perf_path = "/tmp/claude-0/-home-user-egregore/\
+                     f35ef088-ad5e-51cc-bddb-474709a26a05/scratchpad/447-perf.md";
+    let _ = fs::write(perf_path, &report);
+    println!("{report}");
+    let _ = fs::remove_file(&graph_path);
+    let _ = fs::remove_file(idx_path(&graph_path));
+}
+
 /// An empty graph and a blank-only graph both index and query cleanly.
 #[test]
 fn empty_and_blank_graphs_index() {
