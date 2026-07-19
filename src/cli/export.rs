@@ -171,11 +171,7 @@ fn forget_retracted_ids(records: &[GraphRecord]) -> std::collections::BTreeSet<S
 /// encoded protobuf to `out`. Positionless edges, `Diagnostic` stubs, span-less
 /// nodes, and anonymous `impl` blocks are dropped and reported (AC#7). The
 /// output is byte-identical across runs. See `docs/cli/export-scip.md`.
-pub(crate) fn export_scip(
-    graph: Option<&Path>,
-    data_dir: Option<&Path>,
-    out: &Path,
-) -> Result<()> {
+pub(crate) fn export_scip(graph: Option<&Path>, data_dir: Option<&Path>, out: &Path) -> Result<()> {
     let records = match (graph, data_dir) {
         (Some(path), None) => load_records_from_jsonl(path)?,
         (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
@@ -186,8 +182,7 @@ pub(crate) fn export_scip(
     };
 
     let project_root = crate::scip::package_name(&records);
-    let export =
-        crate::scip::build_index(&records, &project_root, env!("CARGO_PKG_VERSION"));
+    let export = crate::scip::build_index(&records, &project_root, env!("CARGO_PKG_VERSION"));
     let bytes = crate::scip::encode_index(&export.index)?;
 
     fs::write(out, &bytes)
