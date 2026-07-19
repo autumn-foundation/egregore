@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use crate::ir::{EdgeLabel, EvidenceLink, GraphRecord, SourceSpan};
+use crate::ir::{EdgeLabel, GraphRecord, SourceSpan};
 use crate::query::liveness::Liveness;
 
 /// Every [`EdgeLabel`] variant, in declaration order.
@@ -170,7 +170,6 @@ fn edge_classes() -> (Vec<String>, Vec<String>) {
 
 /// Resolves a wire relation string (`"OBSERVES"`) to its [`EdgeLabel`], or `None`
 /// when it names no known variant (unknown vocabulary is out of the closed set).
-#[allow(dead_code)] // wired up in the GREEN sweep
 fn edge_label_from_wire(wire: &str) -> Option<EdgeLabel> {
     ALL_EDGE_LABELS
         .iter()
@@ -209,7 +208,7 @@ impl BrokenCase {
 pub enum EdgeRepresentation {
     /// A standalone `GraphRecord::Edge` record.
     EdgeRecord,
-    /// An inline [`EvidenceLink`] carried on a node.
+    /// An inline [`EvidenceLink`](crate::ir::EvidenceLink) carried on a node.
     InlineEvidenceLink,
 }
 
@@ -303,7 +302,6 @@ pub struct EvidenceLinkAuditReport {
 
 /// Resolution of one CHECKED reference's target against the loaded record set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // wired up in the GREEN sweep
 enum TargetState {
     /// Present and live (not reported).
     Resolved,
@@ -313,9 +311,24 @@ enum TargetState {
     Absent,
 }
 
+/// One CHECKED evidence reference collected during the sweep, before its target
+/// is resolved. Keyed for dedup so a re-ingested edge or a multi-version source
+/// contributes exactly one reference.
+struct CheckedRef<'a> {
+    representation: EdgeRepresentation,
+    source_id: &'a str,
+    edge_label: &'a str,
+    target_id: &'a str,
+    edge_record_id: Option<&'a str>,
+    target_domain: Option<&'a str>,
+}
+
+/// Dedup key for a [`CheckedRef`]: representation + source + label + target +
+/// edge-record-id (empty for inline links).
+type RefKey<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
+
 /// Resolves a record's domain from its stamped `domain` field, falling back to
 /// its stable-ID prefix (mirrors `query::evidence_path::record_domain`).
-#[allow(dead_code)] // wired up in the GREEN sweep
 fn record_domain(record: &GraphRecord) -> String {
     if let GraphRecord::Node {
         domain: Some(domain),
@@ -324,19 +337,18 @@ fn record_domain(record: &GraphRecord) -> String {
     {
         return domain.clone();
     }
-    crate::schema_version::domain_from_record_id(record.id()).unwrap_or_else(|| "unknown".to_owned())
+    crate::schema_version::domain_from_record_id(record.id())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Domain derived from a bare record ID prefix (for a referenced source/target
 /// whose node is not present in the set).
-#[allow(dead_code)] // wired up in the GREEN sweep
 fn domain_from_id(id: &str) -> String {
     crate::schema_version::domain_from_record_id(id).unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Recovers a code target's repo-relative path/span from a still-present node
 /// version (a superseded/temporal version survives even for a tombstoned target).
-#[allow(dead_code)] // wired up in the GREEN sweep
 fn recover_code_handle(node: Option<&&GraphRecord>) -> (Option<String>, Option<SourceSpan>) {
     match node {
         Some(GraphRecord::Node {
@@ -348,29 +360,262 @@ fn recover_code_handle(node: Option<&&GraphRecord>) -> (Option<String>, Option<S
     }
 }
 
+/// Resolves a target ID to a [`TargetState`] against the loaded record set.
+///
+/// A node re-ingested AFTER its own tombstone is live again on both transports
+/// (the [`Liveness`] revival rule), so a present-and-not-`deleted` target is
+/// `Resolved` even when a tombstone for it also exists. A present-but-`deleted`
+/// node, or a bare tombstone with no surviving node, is `Tombstoned`. Neither is
+/// `Absent`.
+fn resolve_target(
+    target: &str,
+    nodes_by_id: &BTreeMap<&str, &GraphRecord>,
+    tombstoned: &BTreeSet<&str>,
+    liveness: &Liveness,
+) -> TargetState {
+    let has_node = nodes_by_id.contains_key(target);
+    if has_node && !liveness.deleted(target) {
+        return TargetState::Resolved;
+    }
+    if has_node || tombstoned.contains(target) {
+        return TargetState::Tombstoned;
+    }
+    TargetState::Absent
+}
+
 /// Sweeps every cross-domain evidence edge (standalone edge records + inline
-/// [`EvidenceLink`]s) and reports each whose target is absent or tombstoned.
+/// [`EvidenceLink`](crate::ir::EvidenceLink)s) and reports each whose target is
+/// absent or tombstoned.
 ///
 /// Pure and deterministic: no I/O, no printing, byte-identical output across runs.
 #[must_use]
 pub fn run_evidence_link_audit(records: &[GraphRecord]) -> EvidenceLinkAuditReport {
     let (checked_edge_labels, excluded_edge_labels) = edge_classes();
-    EvidenceLinkAuditReport {
-        ok: true,
-        checked_edge_count: 0,
-        broken_edge_count: 0,
-        by_source_domain: BTreeMap::new(),
-        by_edge_label: BTreeMap::new(),
-        by_case: BTreeMap::new(),
-        broken_edges: Vec::new(),
-        checked_edge_labels,
-        excluded_edge_labels,
-        diagnostics: vec![EvidenceLinkDiagnostic {
+    let liveness = Liveness::new(records);
+
+    // Latest node version per id (append order: last write wins) + tombstone set.
+    let mut nodes_by_id: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
+    let mut tombstoned: BTreeSet<&str> = BTreeSet::new();
+    for record in records {
+        match record {
+            GraphRecord::Node { id, .. } => {
+                nodes_by_id.insert(id.as_str(), record);
+            }
+            GraphRecord::Tombstone { deleted_id, .. } => {
+                tombstoned.insert(deleted_id.as_str());
+            }
+            GraphRecord::Edge { .. } => {}
+        }
+    }
+
+    // Collect deduplicated CHECKED references, both representations.
+    let mut refs: BTreeMap<RefKey, CheckedRef> = BTreeMap::new();
+    let mut triple_only_count: usize = 0;
+
+    // 1. Standalone edge records. Only the LATEST live version of an edge is
+    //    swept: a re-ingested duplicate collapses to one reference and a
+    //    retracted (tombstoned) edge is not a live citation.
+    for (index, record) in records.iter().enumerate() {
+        let GraphRecord::Edge {
+            id,
+            label,
+            source,
+            target,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if !is_integrity_checked_evidence_edge(*label)
+            || !liveness.is_latest_edge_version(id, index)
+            || liveness.deleted(id)
+        {
+            continue;
+        }
+        refs.insert(
+            (
+                EdgeRepresentation::EdgeRecord.as_wire(),
+                source.as_str(),
+                label.as_str(),
+                target.as_str(),
+                id.as_str(),
+            ),
+            CheckedRef {
+                representation: EdgeRepresentation::EdgeRecord,
+                source_id: source.as_str(),
+                edge_label: label.as_str(),
+                target_id: target.as_str(),
+                edge_record_id: Some(id.as_str()),
+                target_domain: None,
+            },
+        );
+    }
+
+    // 2. Inline evidence links carried on LIVE source nodes (a deleted source's
+    //    inline links are not live citations). The links live on the node, so the
+    //    latest version per id (from `nodes_by_id`) is the one consulted.
+    for record in nodes_by_id.values() {
+        let GraphRecord::Node {
+            id,
+            evidence_links,
+            user_context,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if liveness.deleted(id) {
+            continue;
+        }
+        let inline = evidence_links
+            .iter()
+            .flatten()
+            .chain(user_context.supporting_evidence.iter().flatten())
+            .chain(user_context.contradicting_evidence.iter().flatten());
+        for link in inline {
+            // Only relations in the closed CHECKED vocabulary are integrity-swept.
+            match edge_label_from_wire(&link.relation) {
+                Some(label) if is_integrity_checked_evidence_edge(label) => {}
+                _ => continue,
+            }
+            match link.target_record_id.as_deref() {
+                Some(target) if !target.is_empty() => {
+                    refs.insert(
+                        (
+                            EdgeRepresentation::InlineEvidenceLink.as_wire(),
+                            id.as_str(),
+                            link.relation.as_str(),
+                            target,
+                            "",
+                        ),
+                        CheckedRef {
+                            representation: EdgeRepresentation::InlineEvidenceLink,
+                            source_id: id.as_str(),
+                            edge_label: link.relation.as_str(),
+                            target_id: target,
+                            edge_record_id: None,
+                            target_domain: Some(link.target_domain.as_str()),
+                        },
+                    );
+                }
+                // A triple-only link (no target_record_id) is not an ID reference,
+                // so it is out of the "absent/tombstoned target" scope (issue #217
+                // Out of Scope). Tallied in a diagnostic, never a broken-edge row.
+                _ => triple_only_count += 1,
+            }
+        }
+    }
+
+    let checked_edge_count = refs.len();
+
+    // Classify each reference; keep only the broken ones.
+    let mut broken_edges: Vec<BrokenEvidenceEdge> = Vec::new();
+    for reference in refs.values() {
+        let case = match resolve_target(reference.target_id, &nodes_by_id, &tombstoned, &liveness) {
+            TargetState::Resolved => continue,
+            TargetState::Tombstoned => BrokenCase::Tombstoned,
+            TargetState::Absent => BrokenCase::Absent,
+        };
+        let (source_domain, source_kind) = match nodes_by_id.get(reference.source_id) {
+            Some(node) => (
+                record_domain(node),
+                node.node_kind_name().unwrap_or("unknown").to_owned(),
+            ),
+            None => (domain_from_id(reference.source_id), "unknown".to_owned()),
+        };
+        let (target_repo_relative_path, target_span) =
+            recover_code_handle(nodes_by_id.get(reference.target_id));
+        broken_edges.push(BrokenEvidenceEdge {
+            source_record_id: reference.source_id.to_owned(),
+            source_domain,
+            source_kind,
+            edge_label: reference.edge_label.to_owned(),
+            representation: reference.representation,
+            edge_record_id: reference.edge_record_id.map(str::to_owned),
+            target_record_id: reference.target_id.to_owned(),
+            case,
+            target_domain: reference.target_domain.map(str::to_owned),
+            target_repo_relative_path,
+            target_span,
+        });
+    }
+
+    // Canonical total order (byte-stable across runs).
+    broken_edges.sort_by(|a, b| {
+        (
+            &a.source_domain,
+            &a.edge_label,
+            &a.source_record_id,
+            &a.target_record_id,
+            a.case.as_wire(),
+            a.representation.as_wire(),
+            a.edge_record_id.as_deref().unwrap_or(""),
+        )
+            .cmp(&(
+                &b.source_domain,
+                &b.edge_label,
+                &b.source_record_id,
+                &b.target_record_id,
+                b.case.as_wire(),
+                b.representation.as_wire(),
+                b.edge_record_id.as_deref().unwrap_or(""),
+            ))
+    });
+
+    let mut by_source_domain: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_edge_label: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_case: BTreeMap<String, usize> = BTreeMap::new();
+    for edge in &broken_edges {
+        *by_source_domain
+            .entry(edge.source_domain.clone())
+            .or_default() += 1;
+        *by_edge_label.entry(edge.edge_label.clone()).or_default() += 1;
+        *by_case.entry(edge.case.as_wire().to_owned()).or_default() += 1;
+    }
+
+    let mut diagnostics: Vec<EvidenceLinkDiagnostic> = Vec::new();
+    if broken_edges.is_empty() {
+        diagnostics.push(EvidenceLinkDiagnostic {
             code: "no_broken_evidence_links".to_owned(),
             source_record_id: None,
             edge_label: None,
             count: None,
-        }],
+        });
+    }
+    if triple_only_count > 0 {
+        diagnostics.push(EvidenceLinkDiagnostic {
+            code: "unresolvable_link_no_target_id".to_owned(),
+            source_record_id: None,
+            edge_label: None,
+            count: Some(triple_only_count),
+        });
+    }
+    diagnostics.sort_by(|a, b| {
+        (
+            &a.code,
+            a.source_record_id.as_deref().unwrap_or(""),
+            a.edge_label.as_deref().unwrap_or(""),
+            a.count.unwrap_or(0),
+        )
+            .cmp(&(
+                &b.code,
+                b.source_record_id.as_deref().unwrap_or(""),
+                b.edge_label.as_deref().unwrap_or(""),
+                b.count.unwrap_or(0),
+            ))
+    });
+
+    EvidenceLinkAuditReport {
+        ok: broken_edges.is_empty(),
+        checked_edge_count,
+        broken_edge_count: broken_edges.len(),
+        by_source_domain,
+        by_edge_label,
+        by_case,
+        broken_edges,
+        checked_edge_labels,
+        excluded_edge_labels,
+        diagnostics,
     }
 }
 

@@ -161,7 +161,10 @@ fn observes_to_absent_code_symbol() {
     assert_eq!(broken.source_domain, "agent_memory");
     assert_eq!(broken.source_kind, "Observation");
     assert_eq!(broken.edge_label, "OBSERVES");
-    assert_eq!(broken.representation, EdgeRepresentation::InlineEvidenceLink);
+    assert_eq!(
+        broken.representation,
+        EdgeRepresentation::InlineEvidenceLink
+    );
     assert!(broken.target_repo_relative_path.is_none());
     assert!(!report.ok);
     assert_eq!(report.broken_edge_count, 1);
@@ -344,7 +347,10 @@ fn revived_target_is_not_broken() {
     let sym_v2 = symbol("codegraph:v1:revived", "src/r.rs", mk_span(1, 4));
     // Append order: obs, symbol, tombstone, re-added symbol (revival).
     let report = run_evidence_link_audit(&[obs, sym_v1, tomb, sym_v2]);
-    assert!(report.ok, "re-ingested-after-tombstone target is live again");
+    assert!(
+        report.ok,
+        "re-ingested-after-tombstone target is live again"
+    );
     assert_eq!(report.broken_edge_count, 0);
 }
 
@@ -354,9 +360,15 @@ fn revived_target_is_not_broken() {
 
 #[test]
 fn triple_only_link_is_diagnostic_not_broken() {
-    let obs = observation("agent_memory:v1:obs_triple", vec![triple_only_link("OBSERVES")]);
+    let obs = observation(
+        "agent_memory:v1:obs_triple",
+        vec![triple_only_link("OBSERVES")],
+    );
     let report = run_evidence_link_audit(&[obs]);
-    assert!(report.ok, "a triple-only link is not an absent/tombstoned defect");
+    assert!(
+        report.ok,
+        "a triple-only link is not an absent/tombstoned defect"
+    );
     assert_eq!(report.broken_edge_count, 0);
     let diag = report
         .diagnostics
@@ -465,7 +477,11 @@ fn no_raw_payloads_in_output() {
 fn excluded_label_inline_link_ignored() {
     let obs = observation(
         "agent_memory:v1:obs_excl",
-        vec![link("agent_memory:v1:ghost_sess", "agent_memory", "AUTHORED_BY")],
+        vec![link(
+            "agent_memory:v1:ghost_sess",
+            "agent_memory",
+            "AUTHORED_BY",
+        )],
     );
     let report = run_evidence_link_audit(&[obs]);
     assert!(report.ok, "AUTHORED_BY is not a checked evidence edge");

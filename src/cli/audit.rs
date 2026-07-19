@@ -1088,7 +1088,10 @@ fn render_evidence_links_text(
         "checked evidence edges: {}",
         report.checked_edge_count
     ));
-    lines.push(format!("broken evidence edges: {}", report.broken_edge_count));
+    lines.push(format!(
+        "broken evidence edges: {}",
+        report.broken_edge_count
+    ));
     lines.push("by source domain:".to_owned());
     for (domain, count) in &report.by_source_domain {
         lines.push(format!("  {domain}: {count}"));
