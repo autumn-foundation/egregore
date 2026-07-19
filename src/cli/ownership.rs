@@ -71,6 +71,7 @@ pub(crate) fn print_ownership_text(map: &query::OwnershipMap<'_>) {
         map.returned_file_count, map.total_file_count, map.threshold_percent, anchors, truncated
     );
     println!("note: {}", map.disclaimer);
+    println!("corpus: {}", map.corpus_mode);
     for row in &map.files {
         println!(
             "{} bus_factor={} total_commits={} primary={} share={:.4} ({})",

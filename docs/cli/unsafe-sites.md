@@ -181,3 +181,13 @@ construction.
 - Severity scoring, ranking, or hotspot ordering; `#[allow(unsafe_code)]` /
   `unsafe_op_in_unsafe_fn` policy interpretation.
 - Languages beyond Rust.
+## Corpus scope
+
+This lane is designed as a current-state lane but today reads the **union of all
+commit snapshots** over a `scan-history` store. It discloses this honestly —
+`corpus_mode: "union"` (or `single_snapshot` over a snapshot-less store),
+`corpus_mode_source`, and `corpus_disclaimer` — and does **not** yet accept the
+`--at-head`/`--all-history` flags (an `--at`/`--as-of` selector, where offered,
+still pins a single commit as `commit_pinned`). Flipping it to the HEAD-anchored
+default and adding that flag pair, under the contract published in issue #427, is
+tracked in **issue #456**. See [Corpus scope for query lanes](corpus-modes.md).

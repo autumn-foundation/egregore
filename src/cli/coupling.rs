@@ -110,5 +110,6 @@ pub(crate) fn render_coupling_text(report: &query::CoChangeCoupling<'_>) -> Stri
         let _ = writeln!(out, "  [{}] {}", diagnostic.code, diagnostic.detail);
     }
     let _ = writeln!(out, "note: {}", report.disclaimer);
+    let _ = writeln!(out, "corpus: {}", report.corpus_mode);
     out
 }

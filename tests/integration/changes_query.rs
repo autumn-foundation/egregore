@@ -262,6 +262,12 @@ fn test_happy_path() {
     // Range aaaaaaaa -> cccccccc should return changes from bbbbbbbb and cccccccc
     let ctx = changes_context(&records, "aaaa", "cccc", None).unwrap();
 
+    // Corpus disclosure (issue #427): this hand-built fixture carries no
+    // Repository source_snapshot, so this range lane discloses
+    // `single_snapshot` (the range is the analysis window).
+    assert_eq!(ctx.corpus_mode, "single_snapshot");
+    assert_eq!(ctx.corpus_mode_source, "default");
+
     assert_eq!(ctx.commits.len(), 2);
     assert_eq!(ctx.commits[0].commit, "bbbbbbbb");
     assert_eq!(ctx.commits[1].commit, "cccccccc");

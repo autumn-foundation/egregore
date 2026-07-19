@@ -92,6 +92,15 @@ pub struct RecencyReport {
     pub anchors: Vec<RecencyAnchor>,
     /// Ranked rows, most dormant first.
     pub symbols: Vec<RecencyRow>,
+    /// Corpus this history-analysis lane read (issue #427): `union` over a
+    /// scan-history store, `single_snapshot` over a snapshot-less store. This
+    /// lane analyzes full commit history by design; the disclosure never
+    /// changes traversal.
+    pub corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    pub corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    pub corpus_disclaimer: String,
 }
 
 /// Errors returned by the symbol recency query.
@@ -380,6 +389,9 @@ pub fn symbol_recency(
     let total_symbol_count = rows.len();
     rows.truncate(limit);
 
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        super::disclose_corpus(records, super::CorpusMode::Union);
+
     Ok(RecencyReport {
         ranking_basis: "least_recent_last_change",
         tie_break: "dormancy_seconds_desc,last_change_commit_rank_asc,repo_relative_path_asc,record_id_asc",
@@ -390,5 +402,8 @@ pub fn symbol_recency(
         truncated: total_symbol_count > rows.len(),
         anchors,
         symbols: rows,
+        corpus_mode: corpus_mode.as_str(),
+        corpus_mode_source: corpus_mode_source.as_str(),
+        corpus_disclaimer,
     })
 }

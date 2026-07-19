@@ -55,6 +55,22 @@ pub struct LifelineEvent {
     /// The semantic drift score if this is a modifying event with drift.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drift_score: Option<f64>,
+    /// Corpus this history-analysis lane read (issue #427): `union` over a
+    /// scan-history store, `single_snapshot` over a snapshot-less store. This
+    /// lane emits bare NDJSON with no summary line, so the disclosure rides
+    /// every event row; all rows in one query share the same corpus. Populated
+    /// by the CLI via [`super::disclose_corpus`]; the disclosure never changes
+    /// traversal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corpus_mode: Option<&'static str>,
+    /// How the corpus mode was chosen: always `default` for this lane. Present
+    /// only with `corpus_mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corpus_mode_source: Option<&'static str>,
+    /// One-line human description of the corpus that was read. Present only with
+    /// `corpus_mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corpus_disclaimer: Option<String>,
 }
 
 /// Errors returned by the symbol lifeline query.
@@ -293,6 +309,9 @@ pub fn symbol_lifeline(
                         absent_span_reason,
                         drift_record_id,
                         drift_score,
+                        corpus_mode: None,
+                        corpus_mode_source: None,
+                        corpus_disclaimer: None,
                     });
                 }
             } else {
@@ -326,6 +345,9 @@ pub fn symbol_lifeline(
                     absent_span_reason,
                     drift_record_id: None,
                     drift_score: None,
+                    corpus_mode: None,
+                    corpus_mode_source: None,
+                    corpus_disclaimer: None,
                 });
             }
             commit_live.insert(commit_sha, true);
@@ -354,6 +376,9 @@ pub fn symbol_lifeline(
                     absent_span_reason: Some("tombstone".to_owned()),
                     drift_record_id: None,
                     drift_score: None,
+                    corpus_mode: None,
+                    corpus_mode_source: None,
+                    corpus_disclaimer: None,
                 });
             }
             commit_live.insert(commit_sha, false);

@@ -225,6 +225,16 @@ fn unsafe_sites_returns_real_sites_and_never_decoys() {
         "results must state they are an inventory, not a soundness verdict"
     );
 
+    // Corpus disclosure (issue #427): a real `eg scan` git store carries a
+    // source_snapshot, so with no `--at` this lane discloses the union it reads.
+    assert_eq!(envelope["corpus_mode"], "union");
+    assert_eq!(envelope["corpus_mode_source"], "default");
+    assert!(
+        envelope["corpus_disclaimer"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty())
+    );
+
     let tuples = site_tuples(&envelope);
     assert_eq!(
         tuples,

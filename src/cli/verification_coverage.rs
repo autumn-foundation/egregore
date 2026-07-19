@@ -83,6 +83,15 @@ pub(crate) struct VerificationCoverageResponse<'a> {
     uncovered: Vec<UncoveredItemJson<'a>>,
     counts: VerificationCoverageCountsJson,
     diagnostics: Vec<VerificationCoverageDiagnosticJson<'a>>,
+    /// Corpus the view read (issue #427): `commit_pinned` under `--at`,
+    /// otherwise `head_anchored` over a scan-history store carrying a
+    /// `source_snapshot`, `single_snapshot` over a plain snapshot-less scan.
+    /// Inherited from the public-API surface.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: `selector` under `--at`, else `default`.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 pub(crate) const VERIFICATION_COVERAGE_DISCLAIMER: &str = "Rows report presence or absence of recorded verification evidence in this store only. \
@@ -184,9 +193,12 @@ pub(crate) fn query_verification_coverage_cmd(
     repo_scope: Option<&str>,
     scope: Option<&str>,
     limit: Option<usize>,
+    selector_active: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let report = query::verification_coverage(records, index, repo_scope, scope, limit);
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        disclose_head_anchored_corpus(records, selector_active);
 
     // A supplied scope handle that matched no in-store code item is a usage
     // error (exit 2): `scope_not_found` for a path-shaped handle, `no_match`
@@ -278,6 +290,9 @@ pub(crate) fn query_verification_coverage_cmd(
                         detail: &d.detail,
                     })
                     .collect(),
+                corpus_mode,
+                corpus_mode_source,
+                corpus_disclaimer,
             };
             let output = serde_json::to_string_pretty(&response)
                 .context("failed to serialize verification-coverage report")?;
@@ -338,6 +353,7 @@ pub(crate) fn query_verification_coverage_cmd(
             for d in &report.diagnostics {
                 println!("diagnostic: {}: {}", d.code, d.detail);
             }
+            println!("corpus: {corpus_mode}");
         }
     }
     Ok(())

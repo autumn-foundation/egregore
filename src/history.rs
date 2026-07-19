@@ -152,12 +152,38 @@ fn scan_repository_history_inner(
         let commit_records_start = graph.records().len();
         for path in list_indexed_source_files(repo_root, &commit.sha)? {
             let change_id = change_ids_by_path.get(&path);
-            let source = git_blob(repo_root, &commit.sha, &path)?;
+            let bytes = git_blob_bytes(repo_root, &commit.sha, &path)?;
+            let Ok(source) = std::str::from_utf8(&bytes) else {
+                // Issue #438: a non-UTF-8 committed blob is skipped, not aborted.
+                // Emit a deterministic `Diagnostic` naming the commit + path
+                // (fixed summary, no raw bytes) and keep replaying the tree.
+                // `git show` reads objects only, never mutating the checkout.
+                let diag_id = stable_id(&[
+                    "node",
+                    "diagnostic",
+                    "non_utf8_source",
+                    &repository_id,
+                    &commit.sha,
+                    &path,
+                ]);
+                graph.push(
+                    GraphRecord::node(
+                        diag_id,
+                        NodeKind::Diagnostic,
+                        Some(path.clone()),
+                        None,
+                        Some("non_utf8_source".to_owned()),
+                        "skipped source file: not valid UTF-8".to_owned(),
+                    )
+                    .with_temporal(commit.temporal()),
+                );
+                continue;
+            };
             let source_file = SourceFile {
                 path: repo_root.join(&path),
                 repo_relative_path: path.clone(),
             };
-            let (records, facts) = scan_source_text_records(&source_file, &source, &repository_id)?;
+            let (records, facts) = scan_source_text_records(&source_file, source, &repository_id)?;
             if !facts.is_empty() {
                 facts_by_file.insert(path.clone(), facts);
             }
@@ -376,8 +402,14 @@ fn is_indexed_source(path: &Path) -> bool {
         && !path.components().any(|c| c.as_os_str() == "target")
 }
 
-fn git_blob(repo_root: &Path, sha: &str, path: &str) -> Result<String> {
-    git_output(repo_root, &["show", &format!("{sha}:{path}")])
+/// Reads a committed blob's RAW bytes via `git show <sha>:<path>` (issue #438).
+///
+/// Returns the bytes undecoded so the caller can decode-or-skip a non-UTF-8
+/// blob rather than aborting the whole replay (the shared `git_output` decodes
+/// via `String::from_utf8` and would error). `git show` reads Git objects only
+/// and never mutates the working tree.
+fn git_blob_bytes(repo_root: &Path, sha: &str, path: &str) -> Result<Vec<u8>> {
+    git_output_bytes(repo_root, &["show", &format!("{sha}:{path}")])
 }
 
 fn commit_record(repository_id: &str, commit: &GitCommit) -> GraphRecord {
@@ -468,6 +500,35 @@ fn git_output(repo_root: &Path, args: &[&str]) -> Result<String> {
         command: command_display(repo_root, args),
         message: source.to_string(),
     })
+}
+
+/// Runs a git command and returns its RAW stdout bytes (issue #438).
+///
+/// The bytes-returning sibling of [`git_output`]: it applies the same failure
+/// handling (a non-zero exit is an error) but never decodes stdout as UTF-8, so
+/// a non-UTF-8 blob reaches the caller intact instead of aborting. Used only by
+/// `git_blob_bytes`; the shared `git_output` is deliberately left unchanged.
+fn git_output_bytes(repo_root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| CodegraphError::GitCommand {
+            command: command_display(repo_root, args),
+            message: source.to_string(),
+        })?;
+
+    if !output.status.success() {
+        return Err(CodegraphError::GitCommand {
+            command: command_display(repo_root, args),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+
+    Ok(output.stdout)
 }
 
 fn command_display(repo_root: &Path, args: &[&str]) -> String {

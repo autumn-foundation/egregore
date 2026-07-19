@@ -170,6 +170,19 @@ recent commit whose valid time is at or before the instant; the envelope's
 resolution happens within the selected repository (matching `eg query deps` and
 `eg query transitive-callers`).
 
+## Corpus scope
+
+**Changed default (issue #427).** With **neither** `--at`/`--as-of` nor a corpus
+flag, over a `scan-history` store this lane now defaults to the **HEAD-anchored**
+corpus — records current at each repository's stamped HEAD commit — so a callee
+or edge removed before HEAD no longer appears. This flips the pre-#427 default,
+which read the **union** of all commit snapshots. Pass `--all-history` to opt
+back into that union; pass `--at-head` to force the HEAD-anchored view
+explicitly. The summary envelope discloses `corpus_mode` / `corpus_mode_source` /
+`corpus_disclaimer`. `--at-head` and `--all-history` are mutually exclusive with
+each other and with `--at`/`--as-of` (exit `1`, `unsupported_combination`). See
+[Corpus scope for query lanes](corpus-modes.md).
+
 ## Example
 
 ```sh

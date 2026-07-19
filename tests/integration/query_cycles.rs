@@ -171,6 +171,17 @@ fn query_cycles_acyclic_graph_is_explicit_empty_success() {
         diags.iter().any(|d| d["code"] == "acyclic"),
         "acyclic result must be explicit, got {diags:?}"
     );
+
+    // Corpus disclosure (issue #427): a plain scan graph discloses a single
+    // snapshot (no source_snapshot present).
+    assert_eq!(parsed["corpus_mode"], "single_snapshot");
+    assert_eq!(parsed["corpus_mode_source"], "default");
+    assert!(
+        parsed["corpus_disclaimer"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "corpus_disclaimer must be present"
+    );
 }
 
 // ---------------------------------------------------------------------------

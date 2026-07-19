@@ -76,6 +76,13 @@ pub(crate) struct DebtMarkerResponse<'a> {
     empty_reason: Option<&'static str>,
     diagnostics: Vec<AuditDiagnostic<'a>>,
     page: AuditPage,
+    /// Corpus the view read (issue #427): `commit_pinned` under `--at`,
+    /// `union` over a scan-history store, `single_snapshot` over a plain scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: `selector` under `--at`, else `default`.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 pub(crate) const DEBT_MARKER_DISCLAIMER: &str = "Rows are advisory debt-triage leads derived solely from deterministic \
@@ -219,6 +226,8 @@ pub(crate) fn query_debt_markers_cmd(
         return Ok(());
     }
 
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) = disclose_scoped_corpus(records, at);
+
     let response = DebtMarkerResponse {
         ok: true,
         lane: "debt_markers",
@@ -239,6 +248,9 @@ pub(crate) fn query_debt_markers_cmd(
         },
         markers: rows,
         diagnostics: Vec::new(),
+        corpus_mode,
+        corpus_mode_source,
+        corpus_disclaimer,
     };
 
     let output = serde_json::to_string_pretty(&response)

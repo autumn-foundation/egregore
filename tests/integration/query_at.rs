@@ -618,6 +618,9 @@ fn query_at_default_view_is_no_match_for_path_deleted_at_head() {
         serde_json::from_str(std::str::from_utf8(&output).expect("utf8").trim()).expect("json");
     assert_eq!(parsed["symbol"]["name"], "gone::goner");
     assert_eq!(parsed["symbol"]["git_commit"], c1.as_str());
+    // Issue #427: a `--at` temporal pin discloses the commit-pinned corpus.
+    assert_eq!(parsed["corpus_mode"], "commit_pinned");
+    assert_eq!(parsed["corpus_mode_source"], "selector");
 }
 
 #[test]
@@ -630,6 +633,10 @@ fn query_at_default_view_over_history_graph_resolves_head_spans() {
     assert_eq!(parsed["symbol"]["name"], "keep::keeper");
     assert_eq!(parsed["symbol"]["git_commit"], c2.as_str());
     assert_eq!(parsed["symbol"]["span"]["start_line"], 3);
+    // Issue #427: a scan-history store with a `source_snapshot` discloses the
+    // head-anchored corpus the default view resolves against.
+    assert_eq!(parsed["corpus_mode"], "head_anchored");
+    assert_eq!(parsed["corpus_mode_source"], "default");
 
     // Line 1 is a comment at HEAD (it was inside `keeper` only at c1): the
     // default view must not resurrect the superseded span.
@@ -720,6 +727,9 @@ fn query_at_legacy_fallback_prefers_newest_valid_time_over_emission_order() {
         "the newest (T2) span must win, got {parsed:?}"
     );
     assert_eq!(parsed["symbol"]["git_commit"], "aaaa00000000");
+    // Issue #427: a snapshot-less (legacy) store discloses single_snapshot.
+    assert_eq!(parsed["corpus_mode"], "single_snapshot");
+    assert_eq!(parsed["corpus_mode_source"], "default");
 
     // Line 2 was inside the symbol only in the SUPERSEDED (T1) version: the
     // default view must not resurrect it.

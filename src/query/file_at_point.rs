@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::DateTime;
 
 use super::{CommitOrder, RepositoryIndex};
-use crate::ir::{GraphRecord, NodeKind, SnapshotHead, SourceSpan};
+use crate::ir::{GraphRecord, NodeKind, SourceSpan};
 
 /// The temporal point selector accepted by [`file_symbols_at_point`].
 ///
@@ -493,7 +493,15 @@ pub struct LocationContext<'a> {
 /// history-backed snapshot; history-backed snapshots order by parsed valid
 /// time (unparseable valid times sort oldest), with the commit SHA as a
 /// deterministic tiebreak for equal-time commits (e.g. rebases).
-fn version_recency_key(record: &GraphRecord) -> (u8, Option<DateTime<chrono::FixedOffset>>, &str) {
+///
+/// Shared with the other head-anchored current-state lanes (`public_api`,
+/// `unreferenced`, issue #427): after [`super::non_head_current_record_ids`]
+/// removes fully-off-HEAD IDs, a keep-last dedupe keyed on this recency order
+/// selects the surviving version — the HEAD (newest-valid-time) one — matching
+/// the per-record HEAD gate those lanes previously inlined.
+pub(super) fn version_recency_key(
+    record: &GraphRecord,
+) -> (u8, Option<DateTime<chrono::FixedOffset>>, &str) {
     let GraphRecord::Node { temporal, .. } = record else {
         return (0, None, "");
     };
@@ -541,25 +549,20 @@ pub fn location_context<'a>(
     let is_owned =
         |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
 
-    // HEAD-commit SHA per repository from the stamped source snapshot
-    // (issue #82), later record winning deterministically. Anchors the
-    // default view of a history graph to the HEAD snapshot — matching
-    // `resolve_head_symbols` — because `scan-history` emits no tombstones
-    // for a path deleted or renamed at HEAD: keep-last-per-ID alone would
-    // resurrect the last pre-deletion version as if it were current.
-    let mut repo_heads: BTreeMap<&str, &str> = BTreeMap::new();
-    for record in records {
-        if let GraphRecord::Node {
-            kind: NodeKind::Repository,
-            id,
-            source_snapshot: Some(snapshot),
-            ..
-        } = record
-            && let SnapshotHead::Commit { sha } = &snapshot.head
-        {
-            repo_heads.insert(id.as_str(), sha.as_str());
-        }
-    }
+    // Default (unpinned) current-state view: drop every record that is not part
+    // of any repository's stamped HEAD snapshot (issue #82/#427). This reuses
+    // the shared head-anchor gate (`non_head_current_record_ids`) rather than
+    // inlining a per-record `repo_heads` copy, so the default anchors a history
+    // graph to HEAD — `scan-history` emits no tombstones for a path deleted or
+    // renamed at HEAD, and keep-last-per-ID alone would resurrect the last
+    // pre-deletion version as if it were current. A commit-pinned view
+    // (`at_commit`) selects records by that commit directly and never consults
+    // this set. The set groups by stable ID: an ID with any HEAD-current
+    // version is retained whole, and the recency keep-last below picks its HEAD
+    // (newest-valid-time) version — matching the prior inline gate.
+    let non_head_current: Option<std::collections::HashSet<String>> = at_commit
+        .is_none()
+        .then(|| super::non_head_current_record_ids(records, index));
 
     // Select the view: the current state (HEAD snapshot for history-backed
     // records with a stamped head, newest-version-per-ID otherwise, always
@@ -591,13 +594,9 @@ pub fn location_context<'a>(
             if tombstoned.contains(id.as_str()) {
                 continue;
             }
-            // A history-backed record represents the current state only
-            // at the stamped HEAD commit. Records without a resolvable
-            // owner or without a stamped head (legacy stores) keep the
-            // newest-version-per-ID view.
-            if let Some(t) = temporal
-                && let Some(head) = index.owner_of(id).and_then(|repo| repo_heads.get(repo))
-                && t.git_commit != *head
+            if non_head_current
+                .as_ref()
+                .is_some_and(|set| set.contains(id.as_str()))
             {
                 continue;
             }

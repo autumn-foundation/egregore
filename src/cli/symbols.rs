@@ -99,6 +99,13 @@ pub(crate) fn query_symbol_all(
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
     stamp_freshness(&mut results, freshness_code);
+    // Disclosure-only (issue #427): `query symbol` with no `--at`/`--as-of`
+    // returns every matching Symbol node across the store — the UNION of all
+    // commit snapshots over a scan-history store, or the single snapshot over a
+    // plain `scan`. Disclose that honestly on each row.
+    let (corpus_mode, corpus_mode_source, _) =
+        query::disclose_corpus(records, query::CorpusMode::Union);
+    stamp_symbol_corpus(&mut results, corpus_mode, corpus_mode_source);
     for result in &results {
         print_result(result, format)?;
     }
@@ -172,6 +179,9 @@ pub(crate) fn symbol_row<'a>(
         freshness: None,
         extraction_completeness: completeness,
         diagnostics: None,
+        corpus_mode: None,
+        corpus_mode_source: None,
+        corpus_disclaimer: None,
     })
 }
 
@@ -296,6 +306,13 @@ pub(crate) fn query_symbol_at(
             let deleted = current_deleted_ids(records);
             if let Some(mut result) = symbol_result(record, name, index, records, &deleted) {
                 stamp_freshness(std::slice::from_mut(&mut result), freshness_code);
+                // `--at` pins a single commit: the corpus is commit-pinned,
+                // chosen by the selector (issue #427).
+                stamp_symbol_corpus(
+                    std::slice::from_mut(&mut result),
+                    query::CorpusMode::CommitPinned,
+                    query::CorpusModeSource::Selector,
+                );
                 print_result(&result, format)?;
             }
         }

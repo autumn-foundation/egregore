@@ -142,6 +142,15 @@ pub struct RangeDeltas<'a> {
     pub unresolved: Vec<RangeDeltaDiagnostic>,
     /// Semantic drift falling inside the range, or an unavailability marker.
     pub semantic_drift: RangeDriftSection<'a>,
+    /// Corpus this history-analysis lane read (issue #427): `union` over a
+    /// scan-history store, `single_snapshot` over a snapshot-less store. The
+    /// base/head range is the analysis window; the corpus within it is the
+    /// union. The disclosure never changes traversal.
+    pub corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    pub corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    pub corpus_disclaimer: String,
 }
 
 /// One repository that could own a range endpoint in an unscoped
@@ -896,6 +905,9 @@ pub fn range_deltas<'a>(
         }
     };
 
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        super::disclose_corpus(records, super::CorpusMode::Union);
+
     Ok(RangeDeltas {
         base: base_sha,
         head: head_sha,
@@ -909,6 +921,9 @@ pub fn range_deltas<'a>(
         modified_files,
         unresolved,
         semantic_drift,
+        corpus_mode: corpus_mode.as_str(),
+        corpus_mode_source: corpus_mode_source.as_str(),
+        corpus_disclaimer,
     })
 }
 
