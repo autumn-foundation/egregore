@@ -5,11 +5,28 @@
 //! The shortest local workflow is:
 //! 1. `eg repair preflight --data-dir .egregore` — inspect ownership verdict.
 //! 2. If the daemon is running: `eg daemon stop --data-dir .egregore`.
-//! 3. `eg repair run --data-dir .egregore --confirm` — perform repair.
-//! 4. `eg repair preflight --data-dir .egregore` — confirm the store is clean.
+//! 3. `eg repair run --data-dir .egregore --dry-run` — preview, zero mutations.
+//! 4. `eg repair run --data-dir .egregore --confirm` — perform repair.
 //! 5. `eg daemon start --data-dir .egregore` — resume normal operation.
 //!
-//! All output is machine-readable JSON.
+//! Output is machine-readable JSON by default; `--format text` renders the same
+//! facts human-readably.
+//!
+//! Safety doctrine (see `docs/cli/repair.md`):
+//! - Dry-run and preflight are strictly zero-mutation.
+//! - Mutation happens only under an explicit `--confirm`, and only for the
+//!   `stale_no_owner` verdict; a healthy `stopped` store reports "no repair
+//!   needed" and is never touched.
+//! - Repairs are structural only: stale runtime metadata is removed (default) or
+//!   quarantined (`--quarantine`, recoverable). Content is never guessed.
+//! - A live or ambiguous owner is refused before any work; the confirmed-apply
+//!   path re-acquires the exclusive store lease for the mutation window.
+//! - A confirmed apply writes a redaction-safe per-action manifest (action,
+//!   time, result, original path, before/after BLAKE3 hashes, skipped reason)
+//!   and re-runs detection so the report states the post-repair state honestly.
+//! - Output carries only IDs, handles, counts, hashes, paths, and stable codes —
+//!   never tokens or payload bodies. Pin `--transaction-time` for byte-identical
+//!   output across runs.
 
 use std::{
     fs,
