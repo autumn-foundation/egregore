@@ -74,8 +74,16 @@ The error envelope is printed to stderr as the last non-empty line:
    "representative_ids":["..."]},
  "unattributable":{"total":0,"by_domain":{},"representative_ids":[]},
  "shared_cross_repo":{"total":0,"representative_ids":[]},
+ "temporal_snapshots_retained":{"total":0,"representative_ids":[]},
  "cross_repo_citations":[]}
 ```
+
+`temporal_snapshots_retained` is present in **both** dry-run and `--confirm`
+output. It enumerates (count + representative IDs) the evicted CODE records that
+carry commit/temporal metadata — the records eviction tombstones but that a
+`scan-history` store's shared read path still surfaces on current-state code
+lanes (see [Temporal-store residual](#temporal-store-residual-scan-history)). It
+is empty on a non-temporal (`eg scan`) store.
 
 `--confirm` sets `"action":"evicted"` and adds
 `"eviction":{"event_id":"agent_memory:v1:...","tombstone_count":N}`. A re-run
@@ -100,10 +108,26 @@ byte-identical across runs under a pinned `--transaction-time`.
 3. Each attributed content record is tombstoned; the containment edges from the
    repository to its evicted content are tombstoned too.
 
-The **repository identity node is emptied, not tombstoned**: its content is
-evicted but the `Repository` record survives, so a scoped query
-(`eg query symbol <name> --repo <selector>`) resolves the now-empty repository
-and returns a clean no-match (exit 2) rather than an "unknown selector" error.
+The **repository identity node is itself tombstoned** (catalog-clean eviction):
+the whole repository — not just its contents — disappears from the catalog
+surface. Provenance is not lost — the eviction event references the evicted
+identity by its record-ID handle (a string, not a live node), so the audit trail
+survives.
+
+**Consequence for `--repo <evicted>`.** Because the identity node is gone from
+every serving lane, an evicted repository no longer resolves as a `--repo`
+selector on query lanes: `eg query symbol <name> --repo <evicted-selector>` exits
+**1** with an `unknown_repository_selector` diagnostic (the selector is now
+genuinely unknown), NOT a scoped in-repo no-match. To prove zero leakage, use an
+UNSCOPED lane: the evicted repository's symbols never appear in
+`eg query symbol <name>`, and its `Repository` record is absent from every
+current-state read.
+
+`eg forget-repo` itself keeps resolving an evicted selector for its own
+**idempotent** re-run: it resolves against the history-inclusive view with
+eviction tombstones stripped and keys the no-op on the surviving eviction EVENT,
+so a second `--confirm` reports `already_evicted` (never a second event or
+tombstone) even though the identity node is tombstoned.
 
 ## The eviction event
 
@@ -133,16 +157,31 @@ reported under `cross_repo_citations`, never silently dropped or cascade-evicted
 
 On a **non-temporal** (`eg scan`) store, eviction is clean and complete: a base-ID
 tombstone excludes each evicted node (and its edges) from every current-state
-read. On a **`scan-history`** store, code nodes are commit-anchored (temporal):
-the embedded current-state read re-emits every per-commit snapshot regardless of
-tombstones (the same mechanical wall that makes `eg forget` REFUSE temporal
-records). A base-ID tombstone therefore does not suppress an evicted repository's
-temporal code snapshots from the current-state serving lanes, and no per-commit
-version ID exists to tombstone at the read layer. This slice evicts the
-non-temporal records and reports the residual; a physical purge of temporal
-snapshots would require an `aletheiadb` capability that does not exist. Bi-temporal
-honesty actually WANTS the historical `--at <commit>` snapshots preserved — the
-eviction is recorded as a transaction-time fact by the audit event.
+read.
+
+On a **`scan-history`** store, code nodes are commit-anchored (temporal), and
+here eviction has a **documented residual**: the shared `read_all_records` path
+re-emits every per-commit code snapshot with **no tombstone check**, so a base-ID
+tombstone does NOT suppress an evicted repository's temporal code snapshots from
+the current-state (HEAD-anchored) code serving lanes.
+
+**Why the residual exists.** That same shared read path deliberately serves issue
+#231 `eg forget`'s `--at`-after-deletion **bi-temporal honesty** (a historical
+`--at <commit>` view must still see a record deleted later). An eviction tombstone
+cannot be distinguished from a `forget` tombstone at the read layer without a new
+schema field or a repository-ownership recompute in the hot path — both out of
+scope for this slice — and there is no distinct per-commit version ID to tombstone
+anyway. A physical purge would require an `aletheiadb` capability that does not
+exist. Bi-temporal honesty in fact WANTS the historical `--at <commit>` snapshots
+preserved; the open question is only the HEAD-anchored current-state read.
+
+**The residual is disclosed, never silent.** Every plan and report — dry-run and
+`--confirm` alike — carries a `temporal_snapshots_retained` section enumerating
+(count + representative record IDs) exactly the commit-anchored code records that
+remain visible. On a non-temporal store the section is empty. The
+non-temporal records and the `Repository` identity node are fully evicted; only
+commit-anchored code snapshots persist in current-state code lanes. A follow-up
+issue (#NNN) tracks the full fix (a read-layer distinction or physical purge).
 
 Read-only in dry-run, redaction-safe (record IDs, domains, kinds, handles,
 counts, and the redacted reason/actor only), deterministic and byte-identical

@@ -869,14 +869,19 @@ invariant): a record reached from exactly one repo is attributed; reached from �
 NEVER evicted (`shared_cross_repo`); with no derivable attribution it is REPORTED under
 `unattributable` and NEVER evicted (legacy `log:v2:` empty `repository_id`, orphan artifact); a
 SURVIVING record citing an evicted handle is KEPT with its dangling link reported under
-`cross_repo_citations`. The repository IDENTITY node is emptied, not tombstoned, so a scoped
-`eg query symbol <name> --repo <selector>` resolves the now-empty repo and returns a clean
-no-match (exit 2). Eviction is logical and bi-temporally honest (bytes stay for `--at` history);
-selector resolution reuses `resolve_selector` (unknown/ambiguous → exit 2, candidates listed).
-Deterministic and byte-identical under a pinned `--transaction-time`. Residual: on a
-`scan-history` store, commit-anchored temporal code snapshots are re-emitted by the current-state
-read regardless of tombstones (the same wall #231 hits), so temporal snapshots are a documented
-residual gap, not suppressed. See `docs/cli/forget-repo.md`.
+`cross_repo_citations`. The repository IDENTITY node is ALSO tombstoned (catalog-clean eviction),
+so an evicted repo drops off the catalog: a scoped `eg query symbol <name> --repo <evicted>` now
+exits 1 (`unknown_repository_selector`, the selector is genuinely gone), not an in-repo no-match —
+prove zero leakage via an unscoped lane. Idempotency keys on the surviving eviction EVENT (resolves
+against the history view with eviction tombstones stripped), so a second `--confirm` is
+`already_evicted` despite the tombstoned identity. Eviction is logical and bi-temporally honest
+(bytes stay for `--at` history); selector resolution reuses `resolve_selector` (unknown/ambiguous →
+exit 2, candidates listed). Deterministic and byte-identical under a pinned `--transaction-time`.
+Residual: on a `scan-history` store, commit-anchored temporal code snapshots are re-emitted by the
+current-state read regardless of tombstones (the same wall #231's `--at` honesty relies on), so
+they are a DOCUMENTED residual gap disclosed in the report's `temporal_snapshots_retained` section
+(present in dry-run and `--confirm`), not silently suppressed; follow-up #NNN tracks the full fix.
+See `docs/cli/forget-repo.md`.
 
 `eg query undocumented` lists externally-reachable public symbols whose captured doc-comment
 fact (issue #124) is absent, by joining the issue #213 public surface with the recorded doc

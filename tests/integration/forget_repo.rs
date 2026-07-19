@@ -49,6 +49,7 @@ mod embedded {
     use aletheia_egregore::{
         EdgeLabel, EmbeddingModel, GraphRecord, IdentitySource, MetricKind, NodeKind,
         RepositoryIdentityPayload, SelectionBasis, SemanticDriftMetadata, SourceSpan,
+        TemporalMetadata,
         ir::{
             AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, ErrorSignaturePayload, Graph,
             LOG_SCHEMA_VERSION, LogPayload, PROJECT_SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION,
@@ -484,17 +485,35 @@ mod embedded {
         let (code, _, stderr) = forget_repo(&store, "acme/widget-a", true);
         assert_eq!(code, 0, "eviction succeeds: {stderr}");
 
-        // Scoped query to repo A must now be a clean no-match (exit 2), never a
-        // silent fallback to repo B.
+        // Eviction tombstones the repository IDENTITY node too (catalog-clean), so
+        // repo A drops off the catalog surface entirely: a `--repo acme/widget-a`
+        // selector no longer resolves and the scoped lane exits 1 (unknown
+        // selector), NOT the emptied-shell's exit-2 in-repo no-match. This is the
+        // honest post-identity-tombstone behavior; see docs/cli/forget-repo.md.
         let (code, _stdout, _) = run(
             &store,
             &["query", "symbol", "widget", "--repo", "acme/widget-a"],
         );
-        assert_eq!(code, 2, "evicted repo A resolves zero symbols");
+        assert_eq!(
+            code, 1,
+            "evicted repo A no longer resolves as a --repo selector"
+        );
 
-        // The current serving view carries NONE of repo A's cross-domain records.
+        // Zero leakage proven WITHOUT depending on the --repo exit code: the
+        // UNSCOPED symbol lane must not surface repo A's symbol, and repo A's
+        // identity is gone from the catalog (no Repository node with its id).
+        let (code, unscoped, _) = run(&store, &["query", "symbol", "widget"]);
+        assert_eq!(code, 0, "unscoped widget lookup still resolves repo B");
+        assert!(
+            !unscoped.contains(&a.symbol_id) && !unscoped.contains(&a.repo_id),
+            "no repo-A row may leak into the unscoped lane: {unscoped}"
+        );
+
+        // The current serving view carries NONE of repo A's cross-domain records —
+        // INCLUDING its Repository identity node (the catalog entry).
         let records = current_records(&store);
         for id in [
+            &a.repo_id,
             &a.symbol_id,
             &a.file_id,
             &a.drift_id,
@@ -844,6 +863,281 @@ mod embedded {
         assert!(
             records.iter().any(|r| r.id() == b.observation_id),
             "the citing repo B record must survive"
+        );
+    }
+
+    // ── AC-TEMPORAL: scan-history commit-anchored code is a documented residual ─
+
+    /// Handles for one temporal (scan-history) fixture repository: its
+    /// commit-anchored code snapshots (retained by the shared read path) and its
+    /// non-temporal records (fully suppressed by a base-ID tombstone).
+    struct TemporalRepoHandles {
+        repo_id: String,
+        /// Commit-anchored `Symbol` snapshot record IDs (the residual).
+        temporal_symbol_ids: Vec<String>,
+        /// A non-temporal, non-code record (agent observation) that eviction
+        /// tombstones out of every current-state lane.
+        observation_id: String,
+    }
+
+    /// Pushes one TEMPORAL repository: `src/lib.rs` defines `widget` at two
+    /// commits (each a distinct commit-anchored `Symbol` snapshot carrying
+    /// `TemporalMetadata`), plus one non-temporal agent observation reachable
+    /// through an `OBSERVES` evidence edge. Mirrors the scan-history commit-model
+    /// exercised by `repo_scope.rs`.
+    fn push_temporal_repo(graph: &mut Graph, display: &str, remote: &str) -> TemporalRepoHandles {
+        let repo_id = stable_id(&["repository", "remote", remote]);
+        graph.push(
+            GraphRecord::node(
+                repo_id.clone(),
+                NodeKind::Repository,
+                None,
+                None,
+                Some(display.to_owned()),
+                format!("Repository {display}"),
+            )
+            .with_repository_identity(RepositoryIdentityPayload {
+                identity_source: IdentitySource::Remote,
+                remote_url: Some(remote.to_owned()),
+                root_commit_sha: None,
+                canonical_path: None,
+                basename: display.rsplit('/').next().unwrap_or(display).to_owned(),
+            }),
+        );
+
+        let file_id = stable_id(&["node", "file", &repo_id, "src/lib.rs"]);
+        graph.push(GraphRecord::node(
+            file_id.clone(),
+            NodeKind::File,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("src/lib.rs".to_owned()),
+            format!("Rust source file src/lib.rs in {display}"),
+        ));
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id.clone(),
+            file_id.clone(),
+            Some("1.0".to_owned()),
+            "Repository contains source file".to_owned(),
+        ));
+
+        // Two commit-anchored snapshots of the same source symbol.
+        let mut temporal_symbol_ids = Vec::new();
+        let mut last_symbol_id = String::new();
+        for (commit, valid_time) in [
+            ("aaaa000100000000", "2026-01-01T00:00:00Z"),
+            ("aaaa000200000000", "2026-01-03T00:00:00Z"),
+        ] {
+            let symbol_id = stable_id(&[
+                "node",
+                "symbol",
+                "function",
+                &repo_id,
+                "src/lib.rs",
+                "widget",
+                commit,
+            ]);
+            graph.push(
+                GraphRecord::symbol(
+                    symbol_id.clone(),
+                    "function",
+                    "src/lib.rs".to_owned(),
+                    span(10, 20),
+                    "widget".to_owned(),
+                    format!("Rust function widget in {display} at {commit}"),
+                )
+                .with_temporal(TemporalMetadata {
+                    git_commit: commit.to_owned(),
+                    git_parent_commits: vec![],
+                    valid_time: valid_time.to_owned(),
+                    author_time: None,
+                    observed_at: valid_time.to_owned(),
+                    valid_time_source: None,
+                }),
+            );
+            graph.push(GraphRecord::edge(
+                EdgeLabel::Defines,
+                file_id.clone(),
+                symbol_id.clone(),
+                Some("1.0".to_owned()),
+                "file defines symbol".to_owned(),
+            ));
+            temporal_symbol_ids.push(symbol_id.clone());
+            last_symbol_id = symbol_id;
+        }
+        temporal_symbol_ids.sort();
+
+        // One NON-temporal agent observation, reachable from the owned code via an
+        // OBSERVES evidence edge (the base-ID-tombstone-suppressible half).
+        let observation_id = stable_id(&["node", "observation", &repo_id, "obs-0"]);
+        graph.push(
+            GraphRecord::node(
+                observation_id.clone(),
+                NodeKind::Observation,
+                None,
+                None,
+                Some("observation".to_owned()),
+                format!("agent observation about {display}"),
+            )
+            .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION),
+        );
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Observes,
+            observation_id.clone(),
+            last_symbol_id,
+            Some("0.9".to_owned()),
+            "observation observes symbol".to_owned(),
+        ));
+
+        TemporalRepoHandles {
+            repo_id,
+            temporal_symbol_ids,
+            observation_id,
+        }
+    }
+
+    /// A two-repository TEMPORAL (scan-history) store: each repo carries
+    /// commit-anchored code snapshots plus one non-temporal observation.
+    fn two_repo_temporal_store() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        TemporalRepoHandles,
+        TemporalRepoHandles,
+    ) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut graph = Graph::new();
+        let a = push_temporal_repo(
+            &mut graph,
+            "acme/widget-a",
+            "https://example.com/acme/widget-a",
+        );
+        let b = push_temporal_repo(
+            &mut graph,
+            "acme/widget-b",
+            "https://example.com/acme/widget-b",
+        );
+        let jsonl = temp.path().join("history.store.jsonl");
+        fs::write(&jsonl, graph.to_jsonl().expect("serialize graph")).expect("write fixture");
+        (temp, jsonl, a, b)
+    }
+
+    /// Pins the DESIGN-248 §4 temporal residual: on a `scan-history` store the
+    /// base-ID tombstone eviction writes CANNOT suppress commit-anchored code
+    /// snapshots from current-state code lanes (the shared `read_all_records`
+    /// by-commit loop re-emits every snapshot with no tombstone check — the same
+    /// read path that serves #231 `forget`'s `--at` bi-temporal honesty). This
+    /// test characterizes the honest current behavior so it can never silently
+    /// change:
+    ///   (a) repo A's NON-temporal records are gone from current-state lanes;
+    ///   (b) repo A's TEMPORAL code snapshots are STILL surfaced, and the report's
+    ///       `temporal_snapshots_retained` section is non-empty and names them;
+    ///   (c) repo B is byte-identical on every lane before vs after;
+    ///   (d) exactly one eviction event is written.
+    #[test]
+    fn scan_history_temporal_code_snapshots_are_documented_residual() {
+        let (temp, jsonl, a, b) = two_repo_temporal_store();
+        let store = ingest_store(temp.path(), &jsonl);
+
+        // Baseline repo-B lanes BEFORE eviction (the wrong-delete guard, temporal).
+        let lanes: [&[&str]; 2] = [
+            &["query", "symbol", "widget", "--repo", "acme/widget-b"],
+            &["query", "context", "widget", "--repo", "acme/widget-b"],
+        ];
+        let before: Vec<(i32, String)> = lanes
+            .iter()
+            .map(|args| {
+                let (code, out, _) = run(&store, args);
+                (code, out)
+            })
+            .collect();
+
+        // Dry-run must already DISCLOSE the temporal residual (present in both
+        // dry-run and --confirm output).
+        let (code, stdout, _) = forget_repo(&store, "acme/widget-a", false);
+        assert_eq!(code, 0);
+        let dry: serde_json::Value = serde_json::from_str(stdout.trim()).expect("dry-run JSON");
+        let retained = dry["temporal_snapshots_retained"].to_string();
+        assert!(
+            dry["temporal_snapshots_retained"]["total"]
+                .as_u64()
+                .expect("total")
+                >= 2,
+            "dry-run must disclose the temporal residual: {dry}"
+        );
+        for id in &a.temporal_symbol_ids {
+            assert!(
+                retained.contains(id),
+                "temporal snapshot {id} must be named in the residual section: {dry}"
+            );
+        }
+
+        // Confirm the eviction.
+        let (code, stdout, stderr) = forget_repo(&store, "acme/widget-a", true);
+        assert_eq!(code, 0, "eviction succeeds: {stderr}");
+        let confirmed: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("confirm JSON");
+        assert!(
+            confirmed["temporal_snapshots_retained"]["total"]
+                .as_u64()
+                .expect("total")
+                >= 2,
+            "--confirm output carries the residual section too: {confirmed}"
+        );
+
+        let records = current_records(&store);
+
+        // (a) Repo A's NON-temporal records (observation + identity) ARE gone.
+        assert!(
+            records.iter().all(|r| r.id() != a.observation_id),
+            "repo A's non-temporal observation must be suppressed"
+        );
+        assert!(
+            records.iter().all(|r| r.id() != a.repo_id),
+            "repo A's identity node must be suppressed (catalog-clean)"
+        );
+
+        // (b) THE RESIDUAL: repo A's temporal code snapshots STILL surface in the
+        // current-state read despite the tombstones (documented, not silent).
+        for id in &a.temporal_symbol_ids {
+            assert!(
+                records.iter().any(|r| r.id() == *id),
+                "DOCUMENTED RESIDUAL: temporal snapshot {id} is re-emitted by the \
+                 shared read path despite eviction; the report discloses it"
+            );
+        }
+
+        // (c) Repo B is byte-identical on every lane after evicting repo A.
+        for (args, baseline) in lanes.iter().zip(before.iter()) {
+            let (code, out, _) = run(&store, args);
+            assert_eq!(
+                (code, out.as_str()),
+                (baseline.0, baseline.1.as_str()),
+                "repo B lane {args:?} must be byte-identical after evicting repo A"
+            );
+        }
+        for id in &b.temporal_symbol_ids {
+            assert!(
+                records.iter().any(|r| r.id() == *id),
+                "repo B snapshot {id} survives"
+            );
+        }
+        assert!(records.iter().any(|r| r.id() == b.observation_id));
+
+        // (d) Exactly one eviction event was written.
+        let events = records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Node { kind: NodeKind::Retraction, source_handle: Some(h), .. }
+                        if h == &a.repo_id
+                )
+            })
+            .count();
+        assert_eq!(
+            events, 1,
+            "exactly one eviction event for the temporal store"
         );
     }
 }

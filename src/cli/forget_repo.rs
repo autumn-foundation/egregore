@@ -35,7 +35,8 @@ pub(crate) fn forget_repo_cmd(
         // survives eviction, so the current-state view still resolves an
         // already-evicted repository for the no-op report.
         let records = load_records_from_data_dir_readonly(data_dir)?;
-        let plan = match crate::repo_evict::plan_eviction(&records, &req) {
+        let resolution_records = load_records_from_db_history_readonly(data_dir)?;
+        let plan = match crate::repo_evict::plan_eviction(&records, &resolution_records, &req) {
             Ok(plan) => plan,
             Err(error) => {
                 eprintln!("{}", error.to_json());
@@ -61,8 +62,15 @@ pub(crate) fn forget_repo_cmd(
     let records = sink
         .read_all_records()
         .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    // History-inclusive view: after a prior eviction the identity node is
+    // tombstoned out of `records`, but survives here (eviction tombstones stripped
+    // inside `plan_eviction`) so an already-evicted selector still resolves for the
+    // idempotent no-op.
+    let resolution_records = sink
+        .read_all_records_including_superseded()
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
 
-    let plan = match crate::repo_evict::plan_eviction(&records, &req) {
+    let plan = match crate::repo_evict::plan_eviction(&records, &resolution_records, &req) {
         Ok(plan) => plan,
         Err(error) => {
             eprintln!("{}", error.to_json());

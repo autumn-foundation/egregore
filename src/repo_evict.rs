@@ -8,10 +8,25 @@
 //! This is the SANCTIONED BULK EXCEPTION to issue #231's rule that deterministic
 //! code facts are never tombstoned: the unit forgotten is the whole repository,
 //! not a single fact being corrected. Eviction is *logical* — one
-//! [`GraphRecord::Tombstone`] per attributed record plus exactly ONE auditable
-//! eviction event (a reused [`NodeKind::Retraction`] node whose prior handle is
-//! the repository identity) — so the bytes stay in the store for bi-temporal
-//! history views while every current-state read/serving lane drops the repo.
+//! [`GraphRecord::Tombstone`] per attributed record (INCLUDING the repository
+//! identity node itself, so the evicted repo disappears from the catalog surface,
+//! not just its contents) plus exactly ONE auditable eviction event (a reused
+//! [`NodeKind::Retraction`] node whose prior handle is the repository identity) —
+//! so the bytes stay in the store for bi-temporal history views while every
+//! current-state read/serving lane drops the repo. Provenance survives in the
+//! eviction event, which references the evicted identity as a string handle.
+//!
+//! # Scan-history temporal residual
+//!
+//! On a NON-temporal (`eg scan`) store a base-ID tombstone fully suppresses every
+//! evicted record from every current-state read. On a `scan-history` (temporal)
+//! store the shared `read_all_records` re-emits every commit-anchored code
+//! snapshot with NO tombstone check — the same read path that serves issue #231
+//! `forget`'s deliberate `--at`-after-deletion bi-temporal honesty — so a base-ID
+//! tombstone CANNOT suppress commit-anchored code snapshots from the HEAD-anchored
+//! current-state code lanes. The plan therefore discloses those still-visible
+//! snapshots under `temporal_snapshots_retained` (empty on a non-temporal store)
+//! rather than silently leaking them. See `docs/cli/forget-repo.md`.
 //!
 //! # Cross-domain attribution
 //!
@@ -236,6 +251,11 @@ pub struct EvictionPlan {
     pub unattributable: Vec<EvictedRecord>,
     /// Records reported but NOT evicted because they are shared across repos.
     pub shared_cross_repo: Vec<EvictedRecord>,
+    /// Evicted CODE records carrying commit/temporal metadata that a
+    /// `scan-history` store's shared read path still re-emits into current-state
+    /// code lanes despite the tombstone (the documented residual; empty on a
+    /// non-temporal store).
+    pub temporal_snapshots_retained: Vec<EvictedRecord>,
     /// Surviving cross-repository citations of evicted handles.
     pub cross_repo_citations: Vec<CrossRepoCitation>,
     /// The auditable eviction event.
@@ -286,6 +306,23 @@ fn is_eviction_event(record: &GraphRecord) -> bool {
         record,
         GraphRecord::Node { kind: NodeKind::Retraction, source_handle: Some(h), id, .. }
             if id == &eviction_event_id(h)
+    )
+}
+
+/// True when `record` is an eviction tombstone (self-verifying).
+///
+/// A tombstone is an eviction tombstone iff its own ID equals
+/// [`eviction_tombstone_id`] recomputed from the record it deletes — no schema
+/// field needed. Used to make an evicted repository identity RESOLVE again for the
+/// idempotent no-op: the resolution index is built with these tombstones stripped,
+/// so a re-run finds the surviving eviction EVENT (never a second tombstone pass)
+/// even though the identity node is now tombstoned for every serving lane.
+#[must_use]
+fn is_eviction_tombstone(record: &GraphRecord) -> bool {
+    matches!(
+        record,
+        GraphRecord::Tombstone { id, deleted_id, .. }
+            if id == &eviction_tombstone_id(deleted_id).0
     )
 }
 
@@ -435,6 +472,7 @@ fn already_evicted_plan(
         by_domain: empty_by_domain(),
         unattributable: Vec::new(),
         shared_cross_repo: Vec::new(),
+        temporal_snapshots_retained: Vec::new(),
         cross_repo_citations: Vec::new(),
         event,
     }
@@ -509,9 +547,13 @@ fn walk_reachability<'a>(
 
 /// Plans the logical eviction of one repository from `records`.
 ///
-/// `records` is the current-state read (`read_all_records`): the repository
-/// identity node survives eviction, so a previously-evicted repository still
-/// resolves for the idempotent no-op.
+/// `records` is the current-state read (`read_all_records`) — the working set the
+/// plan is computed over. `resolution_records` is the history-inclusive read
+/// (`read_all_records_including_superseded`) used ONLY to resolve the selector and
+/// detect an existing eviction: eviction tombstones the repository identity node,
+/// so it is gone from `records`, but its bytes survive in `resolution_records`
+/// where — with eviction tombstones stripped — it resolves again for the
+/// idempotent no-op. Pass the same slice for both when no eviction has run yet.
 ///
 /// # Errors
 ///
@@ -522,16 +564,29 @@ fn walk_reachability<'a>(
 #[allow(clippy::too_many_lines)]
 pub fn plan_eviction(
     records: &[GraphRecord],
+    resolution_records: &[GraphRecord],
     req: &EvictionRequest,
 ) -> Result<EvictionPlan, EvictError> {
     validate_request(req)?;
 
-    // Build the repository index from the current-state view. The repository
-    // IDENTITY node is deliberately never tombstoned by eviction (only its
-    // content is), so the selector keeps resolving to the now-empty repository —
-    // a scoped query returns a clean no-match rather than an "unknown selector"
-    // error, and a re-run resolves for the idempotency check.
-    let index = RepositoryIndex::build(records);
+    // Resolve the selector against the history-inclusive view with eviction
+    // tombstones stripped, so an already-evicted repository (its identity node
+    // tombstoned out of every serving lane) still resolves — the idempotent no-op
+    // keys on the surviving eviction EVENT, not on the now-tombstoned identity.
+    // Eviction tombstones only exist AFTER a prior eviction, so the common path
+    // (first eviction) builds the index directly without cloning the view.
+    let stripped_view: Vec<GraphRecord>;
+    let resolution_view: &[GraphRecord] = if resolution_records.iter().any(is_eviction_tombstone) {
+        stripped_view = resolution_records
+            .iter()
+            .filter(|record| !is_eviction_tombstone(record))
+            .cloned()
+            .collect();
+        &stripped_view
+    } else {
+        resolution_records
+    };
+    let index = RepositoryIndex::build(resolution_view);
     let repository_id = index.resolve_selector(req.selector.trim())?.to_owned();
     let repository_display = index.display_of(&repository_id).map(str::to_owned);
 
@@ -594,10 +649,12 @@ pub fn plan_eviction(
             continue;
         }
         if let Some(&repo) = owner.get(id) {
-            // The repository identity node is emptied, not tombstoned: its
-            // content is evicted but the identity survives so the selector keeps
-            // resolving to an empty, evicted repository.
-            if repo == target && id != target {
+            // Evict every owned node INCLUDING the repository identity node
+            // itself, so the evicted repo drops from the catalog surface (a
+            // `--repo <evicted>` selector then resolves as unknown, exit 1), not
+            // just from its content lanes. Provenance survives in the eviction
+            // event's string handle to the identity.
+            if repo == target {
                 evicted_nodes.insert(id);
             }
             continue;
@@ -612,18 +669,16 @@ pub fn plan_eviction(
         }
     }
 
-    // Evicted edges: both endpoints are within the eviction scope — the evicted
-    // content nodes plus the surviving repository identity node, so the
-    // containment edges from the now-empty repository to its evicted content are
+    // Evicted edges: both endpoints are evicted nodes. The identity node is now
+    // itself an evicted node, so its containment edges to the evicted content are
     // tombstoned rather than left dangling.
-    let edge_scope = |id: &str| evicted_nodes.contains(id) || id == target;
     let mut evicted_edges: Vec<&str> = Vec::new();
     for (&id, &record) in &edge_records {
         if let GraphRecord::Edge {
             source, target: t, ..
         } = record
-            && edge_scope(source.as_str())
-            && edge_scope(t.as_str())
+            && evicted_nodes.contains(source.as_str())
+            && evicted_nodes.contains(t.as_str())
         {
             evicted_edges.push(id);
         }
@@ -660,6 +715,26 @@ pub fn plan_eviction(
             });
         }
     }
+
+    // Disclose the scan-history temporal residual: evicted CODE nodes carrying
+    // commit/temporal metadata are re-emitted by the shared `read_all_records`
+    // by-commit loop with no tombstone check, so current-state code lanes still
+    // surface them on a `scan-history` store despite the tombstone. Empty on a
+    // non-temporal store, where a base-ID tombstone fully suppresses the node.
+    let mut temporal_snapshots_retained: Vec<EvictedRecord> = evicted_nodes
+        .iter()
+        .filter(|&&id| {
+            matches!(
+                node_records.get(id),
+                Some(GraphRecord::Node {
+                    temporal: Some(_),
+                    ..
+                })
+            )
+        })
+        .map(|&id| projection(node_records[id]))
+        .collect();
+    temporal_snapshots_retained.sort_by(|a, b| a.record_id.cmp(&b.record_id));
 
     // Assemble the sorted, deterministic evicted-record list.
     let mut evicted: Vec<EvictedRecord> = evicted_nodes
@@ -710,6 +785,7 @@ pub fn plan_eviction(
         by_domain,
         unattributable,
         shared_cross_repo: shared,
+        temporal_snapshots_retained,
         cross_repo_citations,
         event,
     })
@@ -801,6 +877,10 @@ impl EvictionPlan {
             "total": self.shared_cross_repo.len(),
             "representative_ids": representative_ids(&self.shared_cross_repo),
         });
+        let temporal_retained = json!({
+            "total": self.temporal_snapshots_retained.len(),
+            "representative_ids": representative_ids(&self.temporal_snapshots_retained),
+        });
         let citations: Vec<Value> = self
             .cross_repo_citations
             .iter()
@@ -826,6 +906,7 @@ impl EvictionPlan {
             "planned": planned,
             "unattributable": unattributable,
             "shared_cross_repo": shared,
+            "temporal_snapshots_retained": temporal_retained,
             "cross_repo_citations": citations,
         });
         if action != "dry_run" {
@@ -894,13 +975,13 @@ mod tests {
             transaction_time: None,
         };
         assert_eq!(
-            plan_eviction(&[], &req).unwrap_err().code(),
+            plan_eviction(&[], &[], &req).unwrap_err().code(),
             "missing_reason"
         );
         req.reason = "reason".to_owned();
         req.evicted_by = String::new();
         assert_eq!(
-            plan_eviction(&[], &req).unwrap_err().code(),
+            plan_eviction(&[], &[], &req).unwrap_err().code(),
             "missing_evicted_by"
         );
     }
@@ -913,7 +994,7 @@ mod tests {
             evicted_by: "op-1".to_owned(),
             transaction_time: Some("2026-07-01T00:00:00Z".to_owned()),
         };
-        let err = plan_eviction(&[], &req).unwrap_err();
+        let err = plan_eviction(&[], &[], &req).unwrap_err();
         assert_eq!(err.code(), "unknown_repository_selector");
         assert_eq!(err.exit_code(), 2);
     }
