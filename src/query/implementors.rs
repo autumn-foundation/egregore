@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::DateTime;
 
 use super::RepositoryIndex;
+use super::liveness::Liveness;
 use crate::ir::{EdgeLabel, GraphRecord, NodeKind, TemporalMetadata};
 
 // ---------------------------------------------------------------------------
@@ -96,16 +97,6 @@ fn implementors_view_key(
     }
 }
 
-fn implementors_tombstoned_ids(records: &[GraphRecord]) -> BTreeSet<&str> {
-    records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect()
-}
-
 /// Resolves the trait handle (exact symbol name or canonical record ID) to
 /// live Symbol candidates in the current view: one record per stable ID,
 /// tombstoned IDs excluded, sorted by record ID.
@@ -116,15 +107,20 @@ pub fn implementors_resolve_trait<'r>(
     index: &RepositoryIndex,
     repo: Option<&str>,
 ) -> ImplementorsResolution<'r> {
-    let deleted = implementors_tombstoned_ids(records);
+    // Latest-write-wins liveness (issue #432): over an append-only `--graph` a
+    // trait Symbol re-ingested AFTER its own tombstone is live again. The shared
+    // gate reports a tombstone active only when it is the id's most recent write,
+    // matching the embedded current-state read so `--graph` and `--data-dir`
+    // agree.
+    let liveness = Liveness::new(records);
     let mut best: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
     // A current embedded read emits active tombstones but FILTERS OUT the
     // deleted node itself, so a saved record-ID handle used after deletion
     // may see only `Tombstone { deleted_id }` in the stream. The Node-only
     // loop below can never observe that shape — seed the stale signal from
-    // the tombstone set directly so the answer is the documented
+    // the liveness gate directly so the answer is the documented
     // stale_handle, never no_match.
-    let mut saw_deleted = deleted.contains(handle);
+    let mut saw_deleted = liveness.deleted(handle);
     let mut non_target_kinds: BTreeSet<&str> = BTreeSet::new();
     for record in records {
         let GraphRecord::Node {
@@ -146,7 +142,7 @@ pub fn implementors_resolve_trait<'r>(
         {
             continue;
         }
-        if deleted.contains(id.as_str()) {
+        if liveness.deleted(id.as_str()) {
             saw_deleted = true;
             continue;
         }
@@ -515,7 +511,14 @@ pub fn implementors_rows_for<'r>(
     index: &RepositoryIndex,
 ) -> Vec<ImplementorLead<'r>> {
     let trait_id = trait_record.id();
-    let deleted = implementors_tombstoned_ids(records);
+    // Latest-write-wins liveness (issue #432): over an append-only `--graph` an
+    // impl Symbol or an IMPLEMENTS edge re-ingested AFTER its own tombstone is
+    // live again. The shared gate reports a tombstone active only when it is the
+    // id's most recent write, matching the embedded current-state read so
+    // `--graph` and `--data-dir` agree. This lane reads only edge topology
+    // (source/target), not version-varying edge metadata, so node/edge liveness
+    // (`deleted`) is sufficient — no `is_latest_edge_version` needed.
+    let liveness = Liveness::new(records);
 
     // One Symbol record per stable ID for impl lookup and type resolution.
     // When pinned, a record at exactly the pinned commit wins. `pinned_nodes`
@@ -608,7 +611,7 @@ pub fn implementors_rows_for<'r>(
             // when a relationship disappears from a rebuilt file, so the
             // current view must drop a tombstoned edge even when its source
             // symbol is still live — never resurface a stale implementor.
-            if deleted.contains(id.as_str()) || deleted.contains(source.as_str()) {
+            if liveness.deleted(id.as_str()) || liveness.deleted(source.as_str()) {
                 continue;
             }
             let replace = edge_view
@@ -667,7 +670,7 @@ pub fn implementors_rows_for<'r>(
         let resolved = parsed.as_deref().and_then(|base| {
             resolve_implementing_type(
                 &node_view,
-                &deleted,
+                &liveness,
                 impl_record,
                 base,
                 index,
@@ -792,7 +795,7 @@ type ImplementorCandidateRank = (bool, bool, bool, bool);
 
 fn resolve_implementing_type<'r>(
     node_view: &BTreeMap<&str, &'r GraphRecord>,
-    deleted: &BTreeSet<&str>,
+    liveness: &Liveness<'_>,
     impl_record: &'r GraphRecord,
     base: &str,
     index: &RepositoryIndex,
@@ -836,7 +839,6 @@ fn resolve_implementing_type<'r>(
             name: Some(name),
             symbol_kind,
             repo_relative_path,
-            temporal,
             ..
         } = candidate
         else {
@@ -845,7 +847,9 @@ fn resolve_implementing_type<'r>(
         if symbol_kind.as_deref() == Some("impl") {
             continue;
         }
-        if temporal.is_none() && deleted.contains(id.as_str()) {
+        // `Liveness::deleted` already carries the has_temporal exemption, so it
+        // replaces the manual `temporal.is_none() && contains` pair (issue #432).
+        if liveness.deleted(id.as_str()) {
             continue;
         }
         if index.owner_of(id) != impl_owner {
@@ -885,4 +889,122 @@ fn resolve_implementing_type<'r>(
         }
     }
     best.map(|(_, record)| record)
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    use crate::ir::{SCHEMA_VERSION, SourceSpan};
+
+    fn sym(id: &str, name: &str, kind: &str) -> GraphRecord {
+        let mut n = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 100,
+                start_line: 1,
+                end_line: 3,
+            }),
+            Some(name.to_owned()),
+            format!("{kind} {name}"),
+        );
+        if let GraphRecord::Node {
+            language,
+            symbol_kind,
+            ..
+        } = &mut n
+        {
+            *language = Some("rust".to_owned());
+            *symbol_kind = Some(kind.to_owned());
+        }
+        n
+    }
+
+    fn implements_edge(source: &str, target: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::Implements,
+            source.to_owned(),
+            target.to_owned(),
+            Some("1.0".to_owned()),
+            "implements".to_owned(),
+        )
+    }
+
+    fn tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v{SCHEMA_VERSION}:tomb-{deleted_id}"),
+            schema_version: SCHEMA_VERSION,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn trait_reingested_after_tombstone_resolves() {
+        // Append-only `--graph`: a trait Symbol re-ingested AFTER its own
+        // tombstone is live again, matching the coalesced `--data-dir` read
+        // (issue #432).
+        let tid = "codegraph:v1:trait-imp";
+        let records = vec![
+            sym(tid, "MyTrait", "trait"),
+            tombstone(tid),
+            sym(tid, "MyTrait", "trait"),
+        ];
+        let index = RepositoryIndex::build(&records);
+        assert!(matches!(
+            implementors_resolve_trait(&records, "MyTrait", &index, None),
+            ImplementorsResolution::Resolved(_)
+        ));
+    }
+
+    #[test]
+    fn trait_tombstoned_without_reingest_is_stale() {
+        let tid = "codegraph:v1:trait-imp";
+        let records = vec![sym(tid, "MyTrait", "trait"), tombstone(tid)];
+        let index = RepositoryIndex::build(&records);
+        assert!(matches!(
+            implementors_resolve_trait(&records, "MyTrait", &index, None),
+            ImplementorsResolution::Stale
+        ));
+    }
+
+    #[test]
+    fn implements_edge_reingested_after_tombstone_yields_row() {
+        // Edge liveness: an IMPLEMENTS edge re-ingested AFTER its own tombstone
+        // is live again over `--graph` (issue #432).
+        let tid = "codegraph:v1:trait-rows";
+        let iid = "codegraph:v1:impl-rows";
+        let edge_id = implements_edge(iid, tid).id().to_owned();
+        let records = vec![
+            sym(tid, "RowTrait", "trait"),
+            sym(iid, "impl RowTrait for Widget", "impl"),
+            implements_edge(iid, tid),
+            tombstone(&edge_id),
+            implements_edge(iid, tid),
+        ];
+        let index = RepositoryIndex::build(&records);
+        let trait_rec = records.iter().find(|r| r.id() == tid).unwrap();
+        let rows = implementors_rows_for(&records, trait_rec, None, &index);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn implements_edge_tombstoned_without_reingest_no_row() {
+        let tid = "codegraph:v1:trait-rows";
+        let iid = "codegraph:v1:impl-rows";
+        let edge_id = implements_edge(iid, tid).id().to_owned();
+        let records = vec![
+            sym(tid, "RowTrait", "trait"),
+            sym(iid, "impl RowTrait for Widget", "impl"),
+            implements_edge(iid, tid),
+            tombstone(&edge_id),
+        ];
+        let index = RepositoryIndex::build(&records);
+        let trait_rec = records.iter().find(|r| r.id() == tid).unwrap();
+        let rows = implementors_rows_for(&records, trait_rec, None, &index);
+        assert!(rows.is_empty());
+    }
 }
