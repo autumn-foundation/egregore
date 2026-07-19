@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::liveness::Liveness;
 use super::{RepositoryIndex, path_is_under_prefix};
 use crate::ir::{GraphRecord, NodeKind};
 
@@ -161,6 +162,14 @@ pub fn debt_markers<'a>(
         }
     };
 
+    // Latest-write-wins liveness (issues #421/#432): over an append-only
+    // `--graph` a node re-ingested AFTER its own tombstone is live again,
+    // matching the embedded `--data-dir` current-state read. The shared gate
+    // reports a tombstone active only when it is the id's most recent write and
+    // preserves the history/temporal exemption, so the `tombstoned` set below
+    // retains a deleted_id only while its tombstone is still the latest write.
+    // See `super::liveness`.
+    let liveness = Liveness::new(records);
     let tombstoned: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| {
@@ -170,6 +179,7 @@ pub fn debt_markers<'a>(
                 None
             }
         })
+        .filter(|&id| liveness.deleted(id))
         .collect();
 
     // A node participates in the selected valid-time view when it belongs to
@@ -333,5 +343,66 @@ fn debt_marker_sort_key<'k>(marker: &DebtMarkerRow<'k>) -> (&'k str, usize, &'k 
             id.as_str(),
         ),
         _ => ("", 0, "", ""),
+    }
+}
+
+#[cfg(test)]
+mod liveness_parity_tests {
+    //! Transport-parity regression (issues #421/#432): over an append-only
+    //! `--graph`, a `DebtMarker` re-ingested AFTER its own tombstone is live
+    //! again — matching the embedded `--data-dir` current-state read — while a
+    //! tombstone with no later re-add still deletes its id.
+    use super::*;
+    use crate::ir::{SCHEMA_VERSION, SourceSpan};
+
+    fn debt_marker(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::DebtMarker,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some("todo".to_owned()),
+            "todo marker".to_owned(),
+        )
+        .with_note("clean this up")
+    }
+
+    fn tomb(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v6:tomb_{deleted_id}"),
+            schema_version: SCHEMA_VERSION,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn marker_reingested_after_tombstone_is_live() {
+        let id = "codegraph:v6:marker_a";
+        let records = vec![debt_marker(id), tomb(id), debt_marker(id)];
+        let index = RepositoryIndex::build(&records);
+        let inv = debt_markers(&records, None, None, &index, None).expect("inventory");
+        assert!(
+            inv.markers.iter().any(|m| m.record.id() == id),
+            "a marker re-ingested after its tombstone must be reported live"
+        );
+    }
+
+    #[test]
+    fn marker_tombstone_without_reingest_stays_deleted() {
+        let id = "codegraph:v6:marker_a";
+        let records = vec![debt_marker(id), tomb(id)];
+        let index = RepositoryIndex::build(&records);
+        let inv = debt_markers(&records, None, None, &index, None).expect("inventory");
+        assert!(
+            inv.markers.is_empty(),
+            "a tombstone with no later re-ingest still deletes the marker"
+        );
     }
 }
