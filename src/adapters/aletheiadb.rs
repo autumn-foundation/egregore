@@ -4318,6 +4318,8 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "AGGREGATES" => Ok(EdgeLabel::Aggregates),
         "FRAME_RESOLVES_TO" => Ok(EdgeLabel::FrameResolvesTo),
         "EMITTED_DURING" => Ok(EdgeLabel::EmittedDuring),
+        // Struct-literal construction edge (issue #443).
+        "CONSTRUCTS" => Ok(EdgeLabel::Constructs),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded edge label {label}"),

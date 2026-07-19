@@ -18,8 +18,8 @@ use crate::{
         },
         cross_file::{
             CallKind, CallPathRoot, CallSiteFact, ConstructSiteFact, DefinitionFact, FileFacts,
-            ImplTargetFact, ImplTraitRelationFact, OutOfLineModFact, PendingImplFact, UseImportFact,
-            crate_root_id,
+            ImplTargetFact, ImplTraitRelationFact, OutOfLineModFact, PendingImplFact,
+            UseImportFact, crate_root_id,
         },
     },
     redaction::REDACTION_POLICY_VERSION,

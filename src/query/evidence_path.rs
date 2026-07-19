@@ -158,9 +158,8 @@ const fn is_evidence_path_edge(label: EdgeLabel) -> bool {
         // grounding evidence. `Constructs` (issue #443) is code-graph topology,
         // same lane as `Calls`/`References`/`Contains`.
         Contains | Defines | Imports | References | Calls | Implements | Mentions | ChangedIn
-        | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy | SessionOf | AuthoredBy | Constructs => {
-            false
-        }
+        | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy | SessionOf | AuthoredBy
+        | Constructs => false,
     }
 }
 
