@@ -43,16 +43,32 @@ pub struct ScanCoverageTally {
     /// source-filter skipped, retained so the scan can reclassify any that a
     /// later File-producing extractor (e.g. manifest dependency extraction,
     /// issue #180) nonetheless indexes with a `File` node — keeping
-    /// `files_indexed` honest about what actually received a graph node. Only
-    /// populated on the complete (Git-tracked) walk; empty on the fallback,
-    /// which carries no walked/skipped denominator. A sorted map for
-    /// determinism.
+    /// `files_indexed` honest about what actually received a graph node. At
+    /// discovery time this is populated with extension skips only on the
+    /// complete (Git-tracked) walk; the fallback records none there. The scan
+    /// loop additionally threads decode/unreadable skips (issue #438) into it
+    /// via `record_unindexed_skip` on BOTH paths, so `reconcile_scan_coverage`
+    /// folds those into `skipped_by_extension` even in the fallback (which still
+    /// lacks a full extension-skip denominator). A sorted map for determinism.
     pub skipped_paths: std::collections::BTreeMap<String, String>,
     /// `true` only on the Git-tracked-files path, which yields a complete
     /// walked/skipped denominator. The non-Git filesystem-walk fallback sets
     /// this `false` (it enumerates only matching files, so it has no
     /// denominator) and never fabricates one.
     pub coverage_complete: bool,
+}
+
+impl ScanCoverageTally {
+    /// Records a walked-and-matched source file that could not be indexed
+    /// (issue #438): a non-UTF-8 or unreadable file skipped after the source
+    /// filter already matched it. Threading its repo-relative path (keyed on the
+    /// same lowercased extension discovery uses) into `skipped_paths` lets
+    /// `reconcile_scan_coverage` count it under `skipped_by_extension` — since it
+    /// never receives a `File` node — so it is honestly UNINDEXED and the AC4
+    /// invariant `files_indexed + Σ skipped == files_walked` still holds.
+    pub fn record_unindexed_skip(&mut self, repo_relative_path: String, extension: String) {
+        self.skipped_paths.insert(repo_relative_path, extension);
+    }
 }
 
 /// Discovers supported source files (Rust, Python, TypeScript, Go) under a repository root.
@@ -144,11 +160,7 @@ fn discover_files_matching(
                 if matcher(&path) {
                     files.push(path);
                 } else {
-                    let ext = path
-                        .extension()
-                        .and_then(OsStr::to_str)
-                        .map(str::to_ascii_lowercase)
-                        .unwrap_or_default();
+                    let ext = lowercased_extension(&path);
                     *tally.skipped_by_extension.entry(ext.clone()).or_default() += 1;
                     tally.skipped_paths.insert(rel.clone(), ext);
                 }
@@ -191,6 +203,19 @@ fn discover_files_matching(
 
     source_files.sort_by(|left, right| left.repo_relative_path.cmp(&right.repo_relative_path));
     Ok((source_files, tally))
+}
+
+/// The lowercased file extension of `path`, or `""` when it has none.
+///
+/// The single source of truth for the `skipped_by_extension` tally key, shared
+/// by discovery's extension-skip classification and the decode/read-skip
+/// reclassification path (issue #438) so a decode-skipped `.rs` and an
+/// extension-skipped `.md` are keyed identically.
+pub(crate) fn lowercased_extension(path: &Path) -> String {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default()
 }
 
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {

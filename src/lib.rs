@@ -281,12 +281,26 @@ fn scan_repository_at_with_override_inner(
 
     let mut facts_by_file = BTreeMap::new();
     for source_file in source_files {
-        let (records, facts) = scan_source_file_records(&source_file, &repository_id)?;
-        for record in records {
-            graph.push(record.with_valid_time_inferred(transaction_time));
-        }
-        if !facts.is_empty() {
-            facts_by_file.insert(source_file.repo_relative_path.clone(), facts);
+        match scan_source_file_records(&source_file, &repository_id)? {
+            SourceFileScanOutcome::Extracted { records, facts } => {
+                for record in records {
+                    graph.push(record.with_valid_time_inferred(transaction_time));
+                }
+                if !facts.is_empty() {
+                    facts_by_file.insert(source_file.repo_relative_path.clone(), facts);
+                }
+            }
+            // A non-UTF-8 or unreadable file is skipped (issue #438): record its
+            // deterministic diagnostic and thread the skip into the coverage
+            // tally so `reconcile_scan_coverage` counts it UNINDEXED.
+            SourceFileScanOutcome::Skipped {
+                diagnostic,
+                repo_relative_path,
+                extension,
+            } => {
+                graph.push((*diagnostic).with_valid_time_inferred(transaction_time));
+                coverage_tally.record_unindexed_skip(repo_relative_path, extension);
+            }
         }
     }
 
@@ -498,11 +512,31 @@ pub(crate) fn reconcile_scan_coverage(graph: &Graph, tally: &mut fs::ScanCoverag
         tally.files_indexed = tally.files_walked - skipped_total;
     } else {
         // The fallback walk enumerated only matching files, so it has no
-        // walked/skipped denominator. Count the distinct File-node paths as
+        // extension-skip denominator. Count the distinct File-node paths as
         // indexed (this now includes any manifest File nodes) and mirror the
-        // best-effort `files_walked == files_indexed` without a skip tally.
+        // best-effort `files_walked == files_indexed`.
         tally.files_indexed = indexed_paths.len();
         tally.files_walked = indexed_paths.len();
+        // Even without a full denominator, a decode/unreadable skip (issue #438)
+        // is a file the walk DID visit but could not index — recorded in
+        // `skipped_paths` via `record_unindexed_skip` (the fallback never
+        // records extension skips there). Fold each such path that received no
+        // `File` node into `skipped_by_extension` (keyed by its recorded
+        // lowercased extension, `""` for none) and add it to `files_walked`, so
+        // the skip is honestly counted walked + skipped instead of silently
+        // vanishing outside the Git-tracked path. Mirror the complete branch's
+        // "skipped_paths minus indexed File nodes" subtraction so a path that
+        // did receive a `File` node is never double-counted. `coverage_complete`
+        // stays `false`: the fallback still lacks an extension-skip denominator.
+        let mut skipped_by_extension = BTreeMap::new();
+        for (path, ext) in &tally.skipped_paths {
+            if !indexed_paths.contains(path.as_str()) {
+                *skipped_by_extension.entry(ext.clone()).or_default() += 1;
+            }
+        }
+        let skipped_total: usize = skipped_by_extension.values().sum();
+        tally.skipped_by_extension = skipped_by_extension;
+        tally.files_walked += skipped_total;
     }
 }
 
@@ -547,16 +581,117 @@ pub(crate) fn scan_coverage_records(
     vec![node, edge]
 }
 
+/// Outcome of attempting to scan one discovered source file (issue #438).
+///
+/// A file that cannot be decoded as UTF-8, or cannot be read at all, no longer
+/// aborts the whole scan: it becomes a [`SourceFileScanOutcome::Skipped`]
+/// carrying a deterministic `Diagnostic` node and the accounting the caller
+/// threads into scan coverage so the file is honestly counted UNINDEXED.
+pub(crate) enum SourceFileScanOutcome {
+    /// The file decoded and extracted normally.
+    Extracted {
+        records: Vec<GraphRecord>,
+        facts: languages::cross_file::FileFacts,
+    },
+    /// The file was skipped (non-UTF-8 or unreadable). `diagnostic` names the
+    /// repo-relative path and the fixed decode/read-failure reason;
+    /// `repo_relative_path`/`extension` reconcile the skip into `ScanCoverage`.
+    /// The diagnostic node is boxed so the (common) `Extracted` variant is not
+    /// bloated by the large `GraphRecord` node.
+    Skipped {
+        diagnostic: Box<GraphRecord>,
+        repo_relative_path: String,
+        extension: String,
+    },
+}
+
+/// Builds the `Diagnostic` node for a source file skipped during scanning
+/// (issue #438).
+///
+/// The summary is a FIXED, platform-independent string (no raw bytes, no
+/// OS-error text) so the graph is byte-stable across runs and machines. The ID
+/// keys on the failure class + repository + repo-relative path. `Diagnostic`
+/// markers legitimately stand alone (they are exempt from the `eg validate`
+/// orphan check, like the extractor's macro diagnostic), so no anchoring edge
+/// is minted.
+fn skipped_source_diagnostic(
+    repository_id: &str,
+    repo_relative_path: &str,
+    class: &str,
+    summary: &str,
+) -> GraphRecord {
+    let diag_id = stable_id(&[
+        "node",
+        "diagnostic",
+        class,
+        repository_id,
+        repo_relative_path,
+    ]);
+    GraphRecord::node(
+        diag_id,
+        NodeKind::Diagnostic,
+        Some(repo_relative_path.to_owned()),
+        None,
+        Some(class.to_owned()),
+        summary.to_owned(),
+    )
+}
+
+/// Builds the `Skipped` outcome for a source file that cannot be READ at all —
+/// an io error such as a permission failure (issue #438).
+///
+/// Shared by the full-scan path ([`scan_source_file_records`], where the first
+/// `std::fs::read` fails) and the incremental refresh path (`incremental.rs`,
+/// where the earlier byte-hash read fails before extraction is reached), so both
+/// emit the IDENTICAL deterministic `unreadable_source` diagnostic — id shape
+/// `["node","diagnostic","unreadable_source",repository_id,repo_relative_path]`,
+/// fixed summary — and reconcile scan coverage the same way. Factoring the
+/// construction here keeps the two call sites from duplicating it.
+pub(crate) fn unreadable_skip_outcome(
+    source_file: &fs::SourceFile,
+    repository_id: &str,
+) -> SourceFileScanOutcome {
+    let repo_relative_path = source_file.repo_relative_path.clone();
+    let extension = fs::lowercased_extension(&source_file.path);
+    SourceFileScanOutcome::Skipped {
+        diagnostic: Box::new(skipped_source_diagnostic(
+            repository_id,
+            &repo_relative_path,
+            "unreadable_source",
+            "skipped source file: unreadable",
+        )),
+        repo_relative_path,
+        extension,
+    }
+}
+
 pub(crate) fn scan_source_file_records(
     source_file: &fs::SourceFile,
     repository_id: &str,
-) -> Result<(Vec<GraphRecord>, languages::cross_file::FileFacts)> {
-    let source =
-        std::fs::read_to_string(&source_file.path).map_err(|source| CodegraphError::ReadFile {
-            path: source_file.path.clone(),
-            source,
-        })?;
-    scan_source_text_records(source_file, &source, repository_id)
+) -> Result<SourceFileScanOutcome> {
+    let repo_relative_path = source_file.repo_relative_path.clone();
+    let extension = fs::lowercased_extension(&source_file.path);
+    // Read bytes, then decode: this single path covers BOTH the non-UTF-8 class
+    // (a genuine text file in another encoding) and the adjacent unreadable
+    // class (permission/io error) — skip and record rather than abort (issue
+    // #438).
+    let Ok(bytes) = std::fs::read(&source_file.path) else {
+        return Ok(unreadable_skip_outcome(source_file, repository_id));
+    };
+    let Ok(source) = std::str::from_utf8(&bytes) else {
+        return Ok(SourceFileScanOutcome::Skipped {
+            diagnostic: Box::new(skipped_source_diagnostic(
+                repository_id,
+                &repo_relative_path,
+                "non_utf8_source",
+                "skipped source file: not valid UTF-8",
+            )),
+            repo_relative_path,
+            extension,
+        });
+    };
+    let (records, facts) = scan_source_text_records(source_file, source, repository_id)?;
+    Ok(SourceFileScanOutcome::Extracted { records, facts })
 }
 
 pub(crate) fn scan_source_text_records(
@@ -619,4 +754,50 @@ pub(crate) fn normalize_path(path: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GraphRecord, NodeKind, SourceFileScanOutcome, fs::SourceFile, scan_source_file_records,
+    };
+
+    /// Issue #438: an unreadable source file (here the reader is pointed at a
+    /// directory, so `std::fs::read` returns an io error deterministically and
+    /// without permission games) yields a `Skipped` outcome carrying an
+    /// `unreadable` diagnostic rather than aborting the scan.
+    #[test]
+    fn unreadable_source_file_is_skipped_not_aborted() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // A directory at the source path: reading it as a file is an io error on
+        // every platform (EISDIR on Unix), root-safe and deterministic.
+        let dir_as_source = temp.path().join("src");
+        std::fs::create_dir_all(&dir_as_source).expect("dir");
+        let source_file = SourceFile {
+            path: dir_as_source,
+            repo_relative_path: "src".to_owned(),
+        };
+
+        let outcome = scan_source_file_records(&source_file, "repo:test").expect("must not abort");
+        match outcome {
+            SourceFileScanOutcome::Skipped {
+                diagnostic,
+                repo_relative_path,
+                ..
+            } => {
+                assert_eq!(repo_relative_path, "src");
+                let GraphRecord::Node { kind, summary, .. } = diagnostic.as_ref() else {
+                    panic!("skip diagnostic must be a node");
+                };
+                assert_eq!(*kind, NodeKind::Diagnostic);
+                assert!(
+                    summary.contains("unreadable"),
+                    "expected an unreadable diagnostic, got: {summary}"
+                );
+            }
+            SourceFileScanOutcome::Extracted { .. } => {
+                panic!("an unreadable path must be Skipped, not Extracted")
+            }
+        }
+    }
 }
