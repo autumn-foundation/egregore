@@ -93,6 +93,192 @@ pub(crate) fn eval_semantic_cmd(
     Ok(())
 }
 
+/// Prints a redaction-safe JSON error and exits with the usage/capability code (2).
+fn semantic_relevance_exit(code: &str, message: &str) -> ! {
+    eprintln!(
+        "{}",
+        serde_json::json!({ "code": code, "message": message })
+    );
+    process::exit(2);
+}
+
+/// Resolves the relevance floors from the optional `--min-*` overrides,
+/// defaulting to the issue #106 floors. A non-finite or out-of-[0,1] override
+/// would silently disable or invert the gate, so it exits 2.
+fn resolve_relevance_floors(
+    min_hit_rate_5: Option<f64>,
+    min_mrr: Option<f64>,
+) -> crate::semantic_eval::RelevanceFloors {
+    let mut floors = crate::semantic_eval::RelevanceFloors::default();
+    if let Some(value) = min_hit_rate_5 {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            semantic_relevance_exit(
+                "invalid_min_hit_rate_5",
+                "--min-hit-rate-5 must be a finite value in [0.0, 1.0]",
+            );
+        }
+        floors.min_hit_rate_at_5 = value;
+    }
+    if let Some(value) = min_mrr {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            semantic_relevance_exit(
+                "invalid_min_mrr",
+                "--min-mrr must be a finite value in [0.0, 1.0]",
+            );
+        }
+        floors.min_mrr = value;
+    }
+    floors
+}
+
+/// Prints the relevance report as canonical JSON and exits with its code
+/// (0 pass, 1 gate failure, 2 capability/usage). The report is always printed
+/// first so gate failures remain debuggable.
+fn emit_relevance_report(
+    report: &crate::semantic_eval::RelevanceReport,
+    format: OutputFormat,
+) -> ! {
+    // JSON is the canonical, deterministic form; text mirrors it.
+    let _ = format;
+    println!(
+        "{}",
+        crate::semantic_eval::render_relevance_report_json(report)
+    );
+    process::exit(crate::semantic_eval::relevance_exit_code(report));
+}
+
+/// Gates semantic-search relevance against a labeled corpus (issue #106).
+///
+/// Mirrors `eg audit token-cost`'s 0/1/2 exit discipline. The store-backed path
+/// requires the `embeddings` feature; with it off, emits an honest
+/// capability-unavailable report (exit 2) and never silently passes.
+pub(crate) fn audit_semantic_relevance_cmd(
+    corpus_path: &Path,
+    data_dir: &Path,
+    min_hit_rate_5: Option<f64>,
+    min_mrr: Option<f64>,
+    fp_threshold: f64,
+    top_k: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    let floors = resolve_relevance_floors(min_hit_rate_5, min_mrr);
+
+    #[cfg(feature = "embeddings")]
+    let report =
+        build_embedded_relevance_report(corpus_path, data_dir, floors, fp_threshold, top_k);
+
+    #[cfg(not(feature = "embeddings"))]
+    let report = {
+        // Honest degradation: the gate cannot run without the embedding model.
+        let _ = (corpus_path, data_dir, fp_threshold, top_k);
+        crate::semantic_eval::capability_unavailable_report(floors, "requires_embeddings_feature")
+    };
+
+    emit_relevance_report(&report, format);
+}
+
+/// Runs every corpus query against the embedded store and builds the #106
+/// relevance report. Load/environment failures (missing store, embed failure)
+/// exit 2, matching the audit usage/capability convention.
+#[cfg(feature = "embeddings")]
+fn build_embedded_relevance_report(
+    corpus_path: &Path,
+    data_dir: &Path,
+    floors: crate::semantic_eval::RelevanceFloors,
+    fp_threshold: f64,
+    top_k: usize,
+) -> crate::semantic_eval::RelevanceReport {
+    use crate::embeddings::{
+        DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_NAME, aletheia_embeddings,
+    };
+    use crate::semantic_eval::{
+        SearchHit, SemanticRelevanceCorpus, build_relevance_report, evaluate_relevance_query,
+    };
+
+    if let Err(error) = validate_existing_embedded_store(data_dir) {
+        semantic_relevance_exit("store_unavailable", &error.to_string());
+    }
+
+    let corpus = SemanticRelevanceCorpus::from_json_file(corpus_path)
+        .unwrap_or_else(|error| semantic_relevance_exit("corpus_load_error", &error.to_string()));
+
+    let embedder = aletheia_embeddings::EmbedderBuilder::new()
+        .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
+        .model_id(Some(DEFAULT_EMBEDDING_MODEL_NAME))
+        .from_pretrained_hf()
+        .unwrap_or_else(|error| {
+            semantic_relevance_exit("embedding_model_unavailable", &error.to_string())
+        });
+
+    let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+        .unwrap_or_else(|error| semantic_relevance_exit("store_open_error", &error.to_string()));
+
+    // The shared vector index may also hold agent-memory nodes (issue #91); score
+    // only deterministic code hits, exactly like `eg query semantic`, by
+    // over-fetching the full pool and filtering to File/Symbol before scoring.
+    let total_records = match sink.read_all_records() {
+        Ok(records) => records.len(),
+        Err(error) => semantic_relevance_exit("store_read_error", &error.to_string()),
+    };
+
+    // hit-rate@10 requires keeping at least 10 code hits per query.
+    let keep = top_k.max(10);
+
+    let rt = tokio::runtime::Runtime::new()
+        .unwrap_or_else(|error| semantic_relevance_exit("runtime_error", &error.to_string()));
+
+    let mut results = Vec::new();
+    for query in &corpus.queries {
+        let embed_data = rt
+            .block_on(aletheia_embeddings::embed_query(
+                &[query.text.as_str()],
+                &embedder,
+                None,
+            ))
+            .unwrap_or_else(|error| {
+                semantic_relevance_exit("embed_query_error", &error.to_string())
+            });
+
+        let query_vector =
+            match aletheia_embeddings::embed_data_to_dense_iter(embed_data, Some(1)).next() {
+                Some(Ok(dense)) => dense.embedding,
+                _ => semantic_relevance_exit(
+                    "embed_query_error",
+                    &format!("no dense embedding returned for query {}", query.id),
+                ),
+            };
+
+        let matches = sink
+            .semantic_search(&query_vector, total_records.max(keep))
+            .unwrap_or_else(|error| {
+                semantic_relevance_exit("semantic_search_error", &error.to_string())
+            });
+
+        let hits: Vec<SearchHit> = matches
+            .iter()
+            .filter(|m| {
+                m.kind
+                    .as_deref()
+                    .is_some_and(|k| k == "File" || k == "Symbol")
+            })
+            .take(keep)
+            .map(SearchHit::from)
+            .collect();
+
+        #[allow(clippy::cast_possible_truncation)]
+        results.push(evaluate_relevance_query(
+            &query.id,
+            &query.text,
+            &query.class,
+            &query.expected,
+            &hits,
+            fp_threshold as f32,
+        ));
+    }
+
+    build_relevance_report(&results, floors, corpus.source_snapshot)
+}
+
 /// Runs the agent-memory recall corpus evaluation against an embedded store
 /// seeded with imported memory records (issue #91).
 ///

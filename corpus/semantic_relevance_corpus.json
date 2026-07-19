@@ -1,6 +1,10 @@
 {
   "corpus_version": "1",
   "description": "Rust semantic-search relevance corpus for the egregore codebase. Each query has reviewed expected targets as repo-relative file paths and optional symbol names. Ambiguous queries have no clear correct answer and are used only to count false positives.",
+  "source_snapshot": {
+    "commit": "68fdf380850e3c352af9c1d30f88c58dbbf4c552",
+    "note": "trunk HEAD the reviewed expected targets were authored against. Re-pinning this commit requires re-reviewing the expected targets and re-validating the hit-rate@5 / MRR floors (see docs/cli/semantic-relevance-eval.md)."
+  },
   "queries": [
     {
       "id": "q001",

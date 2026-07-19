@@ -1,0 +1,106 @@
+{
+  "description": "Degraded ranking fixture for the #106 semantic-relevance gate. Rankings here are deliberately poor: only 2 of 10 labeled queries return the expected target at all, so hit-rate@5 = 0.20 and MRR = 0.20, breaching both floors. Used by the RED test to prove the gate fails and names the breached metrics.",
+  "source_snapshot": { "commit": "fixture", "note": "Synthetic bad rankings." },
+  "queries": [
+    {
+      "id": "q01",
+      "text": "labeled query, expected at rank 1 (one of two hits)",
+      "class": "concept_absent",
+      "expected": [{ "repo_relative_path": "src/a01.rs", "symbol_name": null, "note": null }],
+      "ranked_hits": [
+        { "record_id": "r01a", "name": null, "repo_relative_path": "src/a01.rs", "score": 0.90 }
+      ]
+    },
+    {
+      "id": "q02",
+      "text": "labeled query, expected at rank 1 (one of two hits)",
+      "class": "synonym_heavy",
+      "expected": [{ "repo_relative_path": "src/a02.rs", "symbol_name": null, "note": null }],
+      "ranked_hits": [
+        { "record_id": "r02a", "name": null, "repo_relative_path": "src/a02.rs", "score": 0.89 }
+      ]
+    },
+    {
+      "id": "q03",
+      "text": "labeled query, no matching hit",
+      "class": "architecture",
+      "expected": [{ "repo_relative_path": "src/a03.rs", "symbol_name": null, "note": null }],
+      "ranked_hits": [
+        { "record_id": "f03a", "name": null, "repo_relative_path": "src/filler/x.rs", "score": 0.70 },
+        { "record_id": "f03b", "name": null, "repo_relative_path": "src/filler/y.rs", "score": 0.69 }
+      ]
+    },
+    {
+      "id": "q04",
+      "text": "labeled query, no matching hit",
+      "class": "error_handling",
+      "expected": [{ "repo_relative_path": "src/a04.rs", "symbol_name": null, "note": null }],
+      "ranked_hits": [
+        { "record_id": "f04a", "name": null, "repo_relative_path": "src/filler/x.rs", "score": 0.70 }
+      ]
+    },
+    {
+      "id": "q05",
+      "text": "labeled query, no matching hit",
+      "class": "persistence_query",
+      "expected": [{ "repo_relative_path": "src/a05.rs", "symbol_name": null, "note": null }],
+      "ranked_hits": [
+        { "record_id": "f05a", "name": null, "repo_relative_path": "src/filler/x.rs", "score": 0.70 }
+      ]
+    },
+    {
+      "id": "q06",
+      "text": "labeled query, no matching hit",
+      "class": "concept_absent",
+      "expected": [{ "repo_relative_path": "src/a06.rs", "symbol_name": "target_fn", "note": null }],
+      "ranked_hits": [
+        { "record_id": "f06a", "name": "other_fn", "repo_relative_path": "src/a06.rs", "score": 0.70 }
+      ]
+    },
+    {
+      "id": "q07",
+      "text": "labeled query, no matching hit",
+      "class": "synonym_heavy",
+      "expected": [{ "repo_relative_path": "src/a07.rs", "symbol_name": null, "note": null }],
+      "ranked_hits": [
+        { "record_id": "f07a", "name": null, "repo_relative_path": "src/filler/x.rs", "score": 0.70 }
+      ]
+    },
+    {
+      "id": "q08",
+      "text": "labeled query, no matching hit",
+      "class": "architecture",
+      "expected": [{ "repo_relative_path": "src/a08.rs", "symbol_name": null, "note": null }],
+      "ranked_hits": [
+        { "record_id": "f08a", "name": null, "repo_relative_path": "src/filler/x.rs", "score": 0.70 }
+      ]
+    },
+    {
+      "id": "q09",
+      "text": "labeled query, no matching hit",
+      "class": "error_handling",
+      "expected": [{ "repo_relative_path": "src/a09.rs", "symbol_name": null, "note": null }],
+      "ranked_hits": [
+        { "record_id": "f09a", "name": null, "repo_relative_path": "src/filler/x.rs", "score": 0.70 }
+      ]
+    },
+    {
+      "id": "q10",
+      "text": "labeled query, no matching hit",
+      "class": "persistence_query",
+      "expected": [{ "repo_relative_path": "src/a10.rs", "symbol_name": null, "note": null }],
+      "ranked_hits": [
+        { "record_id": "f10a", "name": null, "repo_relative_path": "src/filler/x.rs", "score": 0.70 }
+      ]
+    },
+    {
+      "id": "qa1",
+      "text": "ambiguous query with no clear answer",
+      "class": "ambiguous",
+      "expected": [],
+      "ranked_hits": [
+        { "record_id": "amb1", "name": null, "repo_relative_path": "src/filler/m.rs", "score": 0.30 }
+      ]
+    }
+  ]
+}

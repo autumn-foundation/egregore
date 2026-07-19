@@ -74,6 +74,23 @@ pub(crate) fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
             require_final_head,
             format,
         ),
+        AuditSubcommand::SemanticRelevance {
+            corpus,
+            data_dir,
+            min_hit_rate_5,
+            min_mrr,
+            fp_threshold,
+            top_k,
+            format,
+        } => audit_semantic_relevance_cmd(
+            &corpus,
+            &data_dir,
+            min_hit_rate_5,
+            min_mrr,
+            fp_threshold,
+            top_k,
+            format,
+        ),
     }
 }
 

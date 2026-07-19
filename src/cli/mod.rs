@@ -3307,6 +3307,44 @@ pub(crate) enum AuditSubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Gate semantic-search relevance against a labeled query corpus (issue #106).
+    ///
+    /// Runs every corpus query against an `--embed` embedded store, computes
+    /// hit-rate@k (k = 1, 5, 10), MRR, and recall, and gates on hit-rate@5 and
+    /// MRR floors. The store-backed path requires the `embeddings` feature; with
+    /// it off the command emits an honest capability-unavailable report and never
+    /// silently passes. Rows carry record IDs, handles, metrics, and counts only.
+    ///
+    /// Exit codes:
+    ///   0 — both floors met (`ok: true`).
+    ///   1 — a floor was missed (`ok: false`); the full JSON report is still
+    ///       printed with a machine-readable `breaches` list naming each metric
+    ///       and its observed value.
+    ///   2 — usage/capability error (bad `--min-*`, unreadable corpus/store, or
+    ///       the `embeddings` feature is unavailable).
+    SemanticRelevance {
+        /// Path to the labeled relevance corpus JSON.
+        #[arg(long, default_value = "corpus/semantic_relevance_corpus.json")]
+        corpus: PathBuf,
+        /// Embedded `AletheiaDB` store directory built with `--embed`.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Minimum hit-rate@5 the corpus must clear. Defaults to the issue floor.
+        #[arg(long)]
+        min_hit_rate_5: Option<f64>,
+        /// Minimum MRR the corpus must clear. Defaults to the issue floor.
+        #[arg(long)]
+        min_mrr: Option<f64>,
+        /// Ambiguous-query false-positive score threshold.
+        #[arg(long, default_value_t = 0.5)]
+        fp_threshold: f64,
+        /// Retrieval depth kept per query (must be >= 10 to measure hit@10).
+        #[arg(long, default_value_t = 10)]
+        top_k: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 /// Actions for `eg audit evidence-pack` (issue #338).

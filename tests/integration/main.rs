@@ -100,6 +100,7 @@ mod schema_versioning;
 mod semantic_drift;
 mod semantic_drift_calibration;
 mod semantic_relevance;
+mod semantic_relevance_gate;
 mod store_contention;
 mod store_export;
 mod symbol_metadata;
