@@ -1654,6 +1654,19 @@ pub(crate) enum QuerySubcommand {
         /// or before this RFC 3339 instant. Mutually exclusive with --at.
         #[arg(long, conflicts_with = "at")]
         as_of: Option<String>,
+        /// Corpus selector (issue #427): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding callees removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history/--at/--as-of
+        /// (enforced at runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #427): read the UNION of all commit snapshots
+        /// so a callee removed at a later commit still appears. Mutually
+        /// exclusive with --at-head/--at/--as-of (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -5192,6 +5205,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             max_depth,
             at,
             as_of,
+            at_head,
+            all_history,
             format,
         } => {
             // Validate the bound before any store I/O: a zero-hop walk can
@@ -5232,6 +5247,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 max_depth,
                 at.as_deref(),
                 as_of.as_deref(),
+                at_head,
+                all_history,
                 format,
             )
         }
