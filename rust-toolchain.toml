@@ -1,0 +1,7 @@
+# Pin the exact toolchain the project gate runs under so environments cannot
+# drift (a stray rustup override to a newer channel lacking rustfmt/clippy has
+# made clean trunk fail the clippy gate in some containers). Bump deliberately:
+# edit `channel` here, then re-run the full verification matrix in CLAUDE.md.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]

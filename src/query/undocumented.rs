@@ -4,7 +4,7 @@ use super::{
     PUBLIC_API_SYMBOL_KINDS, PublicApiDiagnostic, RepositoryIndex, is_library_crate_path,
     public_api_surface,
 };
-use crate::ir::{GraphRecord, NodeKind, SourceSpan};
+use crate::ir::{GraphRecord, NodeKind, SnapshotHead, SourceSpan, TemporalMetadata};
 
 // ---------------------------------------------------------------------------
 // undocumented public API lane (issue #257)
@@ -134,10 +134,12 @@ pub fn undocumented_public_api<'a>(
 ) -> UndocumentedReport<'a> {
     let surface = public_api_surface(records, index, repo_scope);
 
-    // Doc-auditable symbol records (keep-last, current-state view), mirroring
-    // the surface's scope: the Rust library crate, minus tombstones, within
-    // the repo scope. Reachability itself is *not* re-derived here — it comes
-    // from `public_api_surface` above.
+    // Doc-auditable symbol records in the current-state view, mirroring the
+    // surface's scope: the Rust library crate, minus tombstones, within the
+    // repo scope, and — like `public_api_surface` — anchored to each
+    // repository's stamped HEAD so a symbol deleted at HEAD never resurfaces in
+    // the `--include-private` widening (issue #431). Reachability itself is
+    // *not* re-derived here — it comes from `public_api_surface` above.
     let tombstoned: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| {
@@ -150,6 +152,44 @@ pub fn undocumented_public_api<'a>(
         .collect();
     let is_owned =
         |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
+
+    // Stamped HEAD commit per live repository (`source_snapshot`, issue #82).
+    // History replay re-emits the full graph at every commit with `temporal`
+    // provenance and mints no tombstone for a between-commit removal, so a
+    // temporal record is part of the current state only when its commit is its
+    // repository's stamped HEAD — the same rule `resolve_head_symbols` and
+    // `public_api_surface` use (issues #428/#430). Without this anchor the
+    // `--include-private` widening below resurrects a private symbol deleted at
+    // HEAD (issue #431). Snapshot-less stores (plain current-tree `scan`) keep
+    // the conservative fallback: nodes resolve by keep-last dedupe by stable
+    // ID.
+    let mut repo_heads: BTreeMap<&str, &str> = BTreeMap::new();
+    for record in records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::Repository,
+            source_snapshot: Some(snapshot),
+            ..
+        } = record
+            && !tombstoned.contains(id.as_str())
+            && let SnapshotHead::Commit { sha } = &snapshot.head
+        {
+            repo_heads.insert(id.as_str(), sha.as_str());
+        }
+    }
+    // A temporal code record is current only when its commit is its owning
+    // repository's stamped HEAD. Fallbacks: no temporal provenance => current;
+    // owner not in `repo_heads` (snapshot-less store) => keep everything.
+    let owned_record_is_current = |id: &str, temporal: Option<&TemporalMetadata>| -> bool {
+        let Some(t) = temporal else {
+            return true;
+        };
+        index
+            .owner_of(id)
+            .and_then(|owner| repo_heads.get(owner))
+            .is_none_or(|head_sha| t.git_commit == *head_sha)
+    };
+
     let mut symbols: BTreeMap<&str, &'a GraphRecord> = BTreeMap::new();
     // Doc facts recorded at `pub use` sites: rustdoc exposes a doc comment
     // written above the re-export on the public item, so a site doc counts
@@ -163,6 +203,7 @@ pub fn undocumented_public_api<'a>(
             repo_relative_path,
             symbol_kind,
             doc,
+            temporal,
             ..
         } = record
         else {
@@ -171,6 +212,7 @@ pub fn undocumented_public_api<'a>(
         if language.as_deref() != Some("rust")
             || tombstoned.contains(id.as_str())
             || !is_owned(id)
+            || !owned_record_is_current(id, temporal.as_ref())
             || !repo_relative_path
                 .as_deref()
                 .is_some_and(is_library_crate_path)

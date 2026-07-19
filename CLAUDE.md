@@ -1252,3 +1252,26 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 For ingestion work, also test against a temporary AletheiaDB data dir before touching the shared memory store.
+
+### Toolchain pin
+
+The toolchain is pinned at the repo root by `rust-toolchain.toml` to an **exact**
+version with the `rustfmt` and `clippy` components:
+
+```toml
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+```
+
+Why an exact pin rather than bare `stable`: bare `stable` still drifts as the
+channel advances, and a stray `rustup` override to a newer channel that lacks
+`rustfmt`/`clippy` has made clean trunk fail the `clippy` gate in some
+containers. Pinning the exact gate version with the two required components
+makes `cargo fmt`/`cargo test`/`cargo clippy` deterministic across every
+environment — rustup auto-installs the pinned toolchain (with components) on the
+first `cargo` invocation.
+
+To bump it: edit `channel` in `rust-toolchain.toml` deliberately, then re-run
+the full verification matrix above under the new version and confirm the whole
+matrix passes before committing the bump.

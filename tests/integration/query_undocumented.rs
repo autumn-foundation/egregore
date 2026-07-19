@@ -7,7 +7,7 @@
 
 use std::{fs, path::Path, path::PathBuf};
 
-use aletheia_egregore::scan_repository_at_with_override;
+use aletheia_egregore::{scan_repository_at_with_override, scan_repository_history_with_override};
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
@@ -672,6 +672,155 @@ fn query_undocumented_empty_result_with_unresolved_reexports_is_not_certified_cl
             .iter()
             .any(|d| d["code"] == "reexport_target_unresolved"),
         "the unresolved re-export must still be diagnosed, got {diags:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// History graphs: symbols deleted at HEAD must not resurface (issue #431)
+//
+// PR #430 HEAD-anchored `public_api_surface`, fixing the externally-reachable
+// (default) path. The `--include-private` whole-crate widening has its own
+// keep-last gather in `undocumented.rs` that did not HEAD-anchor, so a private
+// symbol deleted at HEAD still resurfaced there. These are the #430-style
+// RED→GREEN guards for that second gather.
+// ---------------------------------------------------------------------------
+
+fn run_git<const N: usize>(repo: &Path, args: [&str; N]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("git command should execute");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_commit_all(repo: &Path, message: &str, date: &str) {
+    run_git(repo, ["add", "."]);
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "-m", message])
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("git commit should execute");
+    assert!(
+        output.status.success(),
+        "git commit failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Builds a two-commit history graph: c1 defines `alive_pub` (public),
+/// `alive_private` and `doomed_private` (both private, undocumented); c2
+/// (HEAD) deletes `doomed_private` and keeps the other two. Returns the
+/// `TempDir` (keep alive) and the written history-graph path.
+fn head_delete_history_graph() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path();
+    run_git(repo, ["init"]);
+    run_git(repo, ["config", "user.email", "undoc@example.invalid"]);
+    run_git(repo, ["config", "user.name", "Undoc Test"]);
+    run_git(repo, ["config", "core.autocrlf", "false"]);
+    run_git(repo, ["config", "commit.gpgsign", "false"]);
+
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn alive_pub() -> usize {\n    0\n}\n\n\
+         fn alive_private() -> usize {\n    1\n}\n\n\
+         fn doomed_private() -> usize {\n    2\n}\n",
+    )
+    .expect("lib.rs at c1");
+    git_commit_all(
+        repo,
+        "c1: define alive + doomed symbols",
+        "2026-01-01T00:00:00Z",
+    );
+
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn alive_pub() -> usize {\n    0\n}\n\n\
+         fn alive_private() -> usize {\n    1\n}\n",
+    )
+    .expect("lib.rs at c2");
+    git_commit_all(repo, "c2: delete doomed_private", "2026-01-02T00:00:00Z");
+
+    let jsonl = scan_repository_history_with_override(repo, Some("undoc-history"))
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let graph = repo.join("history.graph.jsonl");
+    fs::write(&graph, jsonl).expect("write history graph");
+    (temp, graph)
+}
+
+/// RED→GREEN (issue #431): the `--include-private` whole-crate audit must keep
+/// a private symbol alive at HEAD and DROP a private symbol deleted at HEAD.
+/// Before the fix, `doomed_private` resurfaced because the include-private
+/// gather deduped by stable ID without anchoring to the `Repository`
+/// `source_snapshot` HEAD.
+#[test]
+fn history_graph_include_private_excludes_head_deleted_private_symbol() {
+    let (_temp, graph) = head_delete_history_graph();
+    let parsed = run_undocumented(&graph, &["--include-private"]);
+    let paths = item_paths(&parsed);
+
+    assert!(
+        paths.iter().any(|p| p == "alive_private"),
+        "a private symbol alive at HEAD must appear under --include-private; \
+         got {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p == "doomed_private"),
+        "a private symbol deleted at HEAD must not resurface under \
+         --include-private; got {paths:?}"
+    );
+}
+
+/// Regression guard (issue #431): HEAD-anchoring the include-private gather
+/// must not perturb the reachable/default path. The default audit over the
+/// same history fixture reports the live public symbol, never the deleted
+/// symbol, and is byte-identical across runs.
+#[test]
+fn history_graph_default_path_unaffected_by_include_private_fix() {
+    let (_temp, graph) = head_delete_history_graph();
+
+    let parsed = run_undocumented(&graph, &[]);
+    let paths = item_paths(&parsed);
+    assert!(
+        paths.iter().any(|p| p == "alive_pub"),
+        "the live public symbol must appear on the default path; got {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p == "doomed_private"),
+        "a private symbol must never appear on the default (reachable) path; \
+         got {paths:?}"
+    );
+
+    let run = || {
+        egregore()
+            .args(["query", "undocumented", "--graph"])
+            .arg(&graph)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+    assert_eq!(
+        run(),
+        run(),
+        "the default path must be byte-identical across runs"
     );
 }
 
