@@ -134,6 +134,16 @@ pub struct CallSiteFact {
     /// Normalized impl owner for `self`-receiver calls; `None` elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_owner: Option<String>,
+    /// Provable nominal receiver type for a non-`self` identifier receiver
+    /// (`let x: T = …; x.m()` or `fn f(x: T) { x.m() }`), reduced to a
+    /// matchable nominal type path; `None` when the receiver's type is not
+    /// syntactically provable (issue #441). Only stamped for `Method` calls
+    /// whose receiver is a simple, unshadowed identifier binding. `self`
+    /// receivers keep `receiver_owner` unchanged and never set this.
+    /// `#[serde(default)]` so a pre-#441 cache deserializes with `None`
+    /// (today's unnarrowed method fan-out, unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_type: Option<String>,
     /// Source span of the call expression.
     pub span: SourceSpan,
 }
@@ -1599,6 +1609,12 @@ struct DefinitionIndex<'facts> {
     /// directories is ambiguous and stored as `None`, so it never confers a
     /// (possibly wrong) cross-crate binding — resolution stays conservative.
     crate_name_roots: BTreeMap<String, Option<String>>,
+    /// The repo-wide impl-target index, retained so a receiver-type method
+    /// narrowing (issue #441) can prove a `let x: T` / param `x: T` receiver
+    /// resolves to a UNIQUE LOCAL NON-TRAIT type before narrowing `x.m()` to
+    /// that type's method. The `implemented` map above is derived from this
+    /// same index; retaining it lets the `Method` arm reuse it directly.
+    impl_index: ImplTargetIndex<'facts>,
 }
 
 impl<'facts> DefinitionIndex<'facts> {
@@ -1723,6 +1739,7 @@ impl<'facts> DefinitionIndex<'facts> {
             by_simple_name,
             implemented,
             crate_name_roots,
+            impl_index,
         }
     }
 
@@ -1731,6 +1748,119 @@ impl<'facts> DefinitionIndex<'facts> {
     fn implemented_traits(&self, crate_root: &str, impl_type: &str) -> Option<&BTreeSet<String>> {
         self.implemented
             .get(&(crate_root.to_owned(), impl_type.to_owned()))
+    }
+
+    /// Resolves a provable receiver type path (issue #441) to the simple-leaf
+    /// name of the UNIQUE LOCAL NON-TRAIT type it names within `crate_root`, or
+    /// `None` when the type is not such a unique local non-trait type.
+    ///
+    /// The receiver type is reduced to its trailing simple segment and matched
+    /// against this crate root's impl-target index by that leaf. Resolution
+    /// succeeds ONLY when exactly one distinct impl-target qualified name in the
+    /// root carries that leaf AND it is a non-trait impl-target kind
+    /// (`struct`/`enum`/`type_alias`). This is what keeps the narrowing sound:
+    /// an EXTERNAL receiver type (`u32`) matches nothing and resolves to `None`
+    /// (fall back to today's fan-out); a TRAIT-typed receiver (`dyn Device`)
+    /// resolves to a trait and is refused; a leaf shared by two local types is
+    /// ambiguous and refused (prefer a MISSING narrowing over a WRONG one).
+    fn resolve_receiver_type_owner(&self, crate_root: &str, receiver_type: &str) -> Option<String> {
+        let leaf = receiver_type.rsplit("::").next()?.trim();
+        if leaf.is_empty() {
+            return None;
+        }
+        // (qualified name) -> whether that name is a non-trait impl-target type.
+        let mut matched: BTreeMap<&str, bool> = BTreeMap::new();
+        for ((root, qualified), facts) in &self.impl_index.by_qualified {
+            if *root != crate_root {
+                continue;
+            }
+            let def_leaf = qualified.rsplit("::").next().unwrap_or(qualified);
+            if def_leaf != leaf {
+                continue;
+            }
+            if !facts
+                .iter()
+                .any(|fact| is_impl_target_kind(&fact.symbol_kind))
+            {
+                continue;
+            }
+            let is_non_trait = facts
+                .iter()
+                .any(|fact| is_impl_target_kind(&fact.symbol_kind) && fact.symbol_kind != "trait")
+                && !facts.iter().any(|fact| fact.symbol_kind == "trait");
+            matched.insert(qualified, is_non_trait);
+        }
+        match matched.len() {
+            1 => matched
+                .into_values()
+                .next()
+                .filter(|is_non_trait| *is_non_trait)
+                .map(|_| leaf.to_owned()),
+            // 0 matches: external type. 2+ matches: leaf ambiguous across the
+            // crate root. Either way, no narrowing.
+            _ => None,
+        }
+    }
+
+    /// Narrows a receiver-call method pool to a proven owner type's own methods
+    /// (issue #441 shares this with the #420 `SelfMethod` self-dispatch path so
+    /// the two can never desync). Given the owner's simple-leaf name and the
+    /// broad method pool, it applies: (1) inherent-method precedence — a method
+    /// whose `match_segments` end with `[owner, name]`; then (2) the #414
+    /// IMPLEMENTS-gated trait-default fallback — a trait default is bound only
+    /// for a trait the owner PROVABLY implements, and two or more implemented
+    /// traits declaring the method stay UNRESOLVED (empty), never fanned out.
+    /// An owner that names nothing yields an empty pool (a MISS, never a WRONG
+    /// edge). Byte-for-byte the former `SelfMethod` `Some(owner)` body.
+    fn narrow_methods_to_owner(
+        &self,
+        owner: &str,
+        methods: Vec<&'facts DefinitionFact>,
+        simple_name: &str,
+        caller_crate_root: &str,
+    ) -> Vec<&'facts DefinitionFact> {
+        let narrowing = [owner.to_owned(), simple_name.to_owned()];
+        let inherent: Vec<&DefinitionFact> = methods
+            .iter()
+            .copied()
+            .filter(|definition| segments_end_with(&definition.match_segments, &narrowing))
+            .collect();
+        // Inherent methods (and a trait's own `self.other()` inside its body,
+        // whose owner IS the trait name) take precedence over trait defaults
+        // (Rust dispatch). If the owner segment matches directly, bind it and
+        // never reach for a trait default.
+        if !inherent.is_empty() {
+            return inherent;
+        }
+        // IMPLEMENTS-gated dispatch (issue #414): the owner has no directly-named
+        // method. Bind to a trait default ONLY for a trait the owner PROVABLY
+        // implements (IMPLEMENTS index join), matched by crate-root-relative
+        // trait qualified name. An unrelated trait is excluded; multiple
+        // implemented traits declaring the method stay UNRESOLVED; no proof =>
+        // empty (unresolved, no wrong edge).
+        let Some(implemented) = self.implemented_traits(caller_crate_root, owner) else {
+            return Vec::new();
+        };
+        let gated: Vec<&DefinitionFact> = methods
+            .into_iter()
+            .filter(|definition| {
+                definition.is_trait_method
+                    && crate_root_id(&definition.repo_relative_path) == caller_crate_root
+                    && definition.match_segments.len() >= 2
+                    && implemented.contains(
+                        &definition.match_segments[..definition.match_segments.len() - 1]
+                            .join("::"),
+                    )
+            })
+            .collect();
+        if gated.len() >= 2 {
+            // Multiple implemented traits declare this method. Rust dispatch
+            // depends on which trait is in lexical scope at the CALL SITE, which
+            // this pass does not resolve; emitting all would mint a false edge to
+            // an out-of-scope trait's default. Stay conservative: UNRESOLVED.
+            return Vec::new();
+        }
+        gated
     }
 
     /// Returns the in-repo candidates for a call site, deterministically
@@ -1767,18 +1897,39 @@ impl<'facts> DefinitionIndex<'facts> {
                 .copied()
                 .filter(|definition| is_free_function(definition))
                 .collect(),
-            CallKind::Method => pool
-                .iter()
-                .copied()
-                .filter(|definition| {
-                    // A receiver call `x.read()` can dispatch to an inherent
-                    // impl method OR a trait method (issue #390). Trait methods
-                    // keep kind `"function"`, so widen the pool by the marker —
-                    // still a labeled lead: multiple same-name candidates emit
-                    // ambiguous edges to all, never a silent pick.
-                    definition.symbol_kind == "method" || definition.is_trait_method
-                })
-                .collect(),
+            CallKind::Method => {
+                // A receiver call `x.read()` can dispatch to an inherent impl
+                // method OR a trait method (issue #390). Trait methods keep kind
+                // `"function"`, so widen the pool by the marker.
+                let methods: Vec<&DefinitionFact> = pool
+                    .iter()
+                    .copied()
+                    .filter(|definition| {
+                        definition.symbol_kind == "method" || definition.is_trait_method
+                    })
+                    .collect();
+                // Provable receiver-type narrowing (issue #441): when the
+                // receiver is a simple, unshadowed identifier whose type is
+                // syntactically PROVABLE and resolves to a UNIQUE LOCAL NON-TRAIT
+                // type, narrow to THAT type's own method exactly as the
+                // `SelfMethod` arm narrows to `self`'s owner — one shared
+                // implementation so the two can never desync. Any non-provable /
+                // external / trait-typed / ambiguous receiver leaves the pool
+                // untouched: today's ambiguous fan-out to every same-named method
+                // (the pre-#441 behavior stays byte-identical).
+                if let Some(receiver_type) = &call.receiver_type
+                    && let Some(owner) =
+                        self.resolve_receiver_type_owner(caller_crate_root, receiver_type)
+                {
+                    return self.narrow_methods_to_owner(
+                        &owner,
+                        methods,
+                        simple_name,
+                        caller_crate_root,
+                    );
+                }
+                methods
+            }
             CallKind::SelfMethod => {
                 // A `self.method()` receiver call reaches an inherent impl
                 // method OR a trait method: inside a trait body `self` is the
@@ -1796,87 +1947,17 @@ impl<'facts> DefinitionIndex<'facts> {
                 match &call.receiver_owner {
                     // A `self` call always carries its enclosing owner (the impl
                     // owner, or the trait name inside a trait body), so narrow
-                    // strictly to `[owner, name]` and return that set even when
-                    // it is EMPTY. Never fall back to the unnarrowed pool: a
-                    // trait `self.other()` naming nothing on the trait must stay
-                    // unresolved, never fan out to an unrelated `U::other`
-                    // (prefer a MISSING edge over a WRONG one). Because the
-                    // trait method `T::read` has `match_segments = [.., "T",
-                    // "read"]`, `self.read()` with owner `T` narrows to `T::read`
-                    // only; an unrelated `U::read` (`[.., "U", "read"]`) fails
-                    // the `[T, read]` suffix. Symmetrically an impl owner `S`
-                    // excludes any trait method `T::g`.
+                    // strictly to `[owner, name]` via the shared narrowing and
+                    // return that set even when it is EMPTY. Never fall back to
+                    // the unnarrowed pool: a trait `self.other()` naming nothing
+                    // on the trait must stay unresolved, never fan out to an
+                    // unrelated `U::other` (prefer a MISSING edge over a WRONG
+                    // one). Because the trait method `T::read` has
+                    // `match_segments = [.., "T", "read"]`, `self.read()` with
+                    // owner `T` narrows to `T::read` only; an unrelated `U::read`
+                    // (`[.., "U", "read"]`) fails the `[T, read]` suffix.
                     Some(owner) => {
-                        let narrowing = [owner.clone(), simple_name.to_owned()];
-                        let inherent: Vec<&DefinitionFact> = methods
-                            .iter()
-                            .copied()
-                            .filter(|definition| {
-                                segments_end_with(&definition.match_segments, &narrowing)
-                            })
-                            .collect();
-                        // Inherent methods (and a trait's own `self.other()`
-                        // inside its body, whose owner IS the trait name) take
-                        // precedence over trait defaults (Rust dispatch). If the
-                        // owner segment matches directly, bind it and never reach
-                        // for a trait default.
-                        if !inherent.is_empty() {
-                            return inherent;
-                        }
-                        // IMPLEMENTS-gated self-dispatch (issue #414): the owner
-                        // `S` has no directly-named method `S::read`. Bind to a
-                        // trait default ONLY for a trait S PROVABLY implements
-                        // (IMPLEMENTS index join), matched by crate-root-relative
-                        // trait qualified name (`match_segments[..len-1]`). An
-                        // unrelated `U::read` (S does not implement U) is
-                        // excluded; multiple implemented traits declaring the
-                        // method stay UNRESOLVED (see below); no proof => empty
-                        // (unresolved, no wrong edge).
-                        // Conservatism (the #412 invariant extended): supertrait
-                        // defaults, blanket impls, and cross-crate-root traits
-                        // are NOT resolved — the direct IMPLEMENTS index never
-                        // places their trait qualified name in S's set
-                        // (supertrait: only the directly-named trait is recorded;
-                        // blanket impl: `impl_type` is a generic param, never a
-                        // concrete S; cross-root: the crate_root guard) — so they
-                        // degrade to unresolved (a MISS, never a WRONG edge). Two
-                        // distinct same-simple-name types in different modules of
-                        // one crate root are likewise treated as ambiguous and
-                        // stay unresolved (the bare-simple-name receiver-owner
-                        // limitation), guarded when the implemented map is built.
-                        let Some(implemented) = self.implemented_traits(caller_crate_root, owner)
-                        else {
-                            return Vec::new();
-                        };
-                        let gated: Vec<&DefinitionFact> = methods
-                            .into_iter()
-                            .filter(|definition| {
-                                definition.is_trait_method
-                                    && crate_root_id(&definition.repo_relative_path)
-                                        == caller_crate_root
-                                    && definition.match_segments.len() >= 2
-                                    && implemented.contains(
-                                        &definition.match_segments
-                                            [..definition.match_segments.len() - 1]
-                                            .join("::"),
-                                    )
-                            })
-                            .collect();
-                        if gated.len() >= 2 {
-                            // Multiple implemented traits declare this method.
-                            // Rust dispatch depends on which trait is in lexical
-                            // scope at the CALL SITE (its `use` imports), which
-                            // this pass does not resolve. Emitting all candidates
-                            // would mint a false CALLS edge to an out-of-scope
-                            // trait's default (Codex P1 on #420). Per the #414
-                            // charge, multiple candidate impls stay conservative:
-                            // UNRESOLVED. A single gated candidate is safe: if the
-                            // call compiles with exactly one trait supplying the
-                            // method, that trait is provably in scope (else E0599),
-                            // so the caller labels it `resolved`.
-                            return Vec::new();
-                        }
-                        gated
+                        self.narrow_methods_to_owner(owner, methods, simple_name, caller_crate_root)
                     }
                     // A `self` call with no resolvable owner cannot be narrowed;
                     // this is unreachable for extractor-produced facts (a `self`
@@ -2012,6 +2093,7 @@ mod tests {
             // real extractor sets a specific `path_root` for scoped-path calls.
             path_root: CallPathRoot::Unqualified,
             receiver_owner: owner.map(ToOwned::to_owned),
+            receiver_type: None,
             span: span(),
         }
     }

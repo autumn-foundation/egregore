@@ -1846,3 +1846,358 @@ fn workspace_qualified_call_disambiguates_same_name_across_modules() {
         "crate::mod_b::target() must not bind mod_d's same-named target"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Provable receiver-type method-call narrowing (issue #441).
+//
+// Today `x.method()` fans out one `ambiguous` CALLS edge per same-named method
+// in the workspace (see `receiver_call_to_two_trait_methods_is_ambiguous_to_both`).
+// Issue #441 narrows the receiver call to a SINGLE `resolved` edge when the
+// receiver's type is PROVABLE (syntax-level, no type inference) AND resolves to
+// a UNIQUE LOCAL NON-TRAIT type (via the existing ImplTargetIndex); otherwise
+// behavior stays byte-identical to today (ambiguous fan-out). A provable
+// receiver type whose type has NO matching method emits NOTHING NEW — never a
+// guess.
+//
+// The four provable receiver patterns (this suite covers 1 and 4 as the new
+// behavior; 2 UFCS is a #440 regression-guard; 3 self.method() is #420):
+//   1. `let x: T = …; x.method()`  (explicit ascription, unshadowed)
+//   4. `fn f(x: T) { x.method() }` (typed param, simple identifier pattern)
+//
+// Two shared two-type workspaces: `Foo::send`/`Bar::send` (and `Foo::run`/
+// `Bar::run`). The narrowing must pick the provable receiver's method ONLY.
+// ---------------------------------------------------------------------------
+
+/// A two-type workspace where both `Foo` and `Bar` declare an inherent
+/// method `send`, plus a caller file to be provided per test.
+fn two_type_send_workspace(caller_src: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "src/foo.rs",
+            "pub struct Foo;\nimpl Foo {\n    pub fn send(&self) -> u32 {\n        1\n    }\n}\n"
+                .to_owned(),
+        ),
+        (
+            "src/bar.rs",
+            "pub struct Bar;\nimpl Bar {\n    pub fn send(&self) -> u32 {\n        2\n    }\n}\n"
+                .to_owned(),
+        ),
+        ("src/caller.rs", caller_src.to_owned()),
+    ]
+}
+
+fn write_owned_fixture(root: &Path, files: &[(&str, String)]) {
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, contents)| (*path, contents.as_str()))
+        .collect();
+    write_fixture(root, &borrowed);
+}
+
+#[test]
+fn typed_let_receiver_narrows_to_the_provable_local_type() {
+    // RED (issue #441, pattern 1): `let f: Foo = make(); f.send()` — the receiver
+    // `f` has a PROVABLE type `Foo` (explicit ascription, binding unshadowed).
+    // `f.send()` must bind ONLY `Foo::send` with a single `resolved` edge, never
+    // fan out an ambiguous edge to `Bar::send`. Today (pre-#441) the receiver
+    // type is discarded and `f.send()` fans out ambiguous to BOTH.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_owned_fixture(
+        repo,
+        &two_type_send_workspace(
+            "pub fn caller() -> u32 {\n    let f: Foo = make();\n    f.send()\n}\n",
+        ),
+    );
+
+    let records = scan_fixture(repo);
+    let foo_send = symbol_id(&records, "method", "foo::Foo::send", "src/foo.rs");
+    let bar_send = symbol_id(&records, "method", "bar::Bar::send", "src/bar.rs");
+    let caller = symbol_id(&records, "function", "caller::caller", "src/caller.rs");
+
+    assert_calls_edge_with_resolution(&records, &caller, &foo_send, "resolved");
+    assert!(
+        calls_edge(&records, &caller, &bar_send).is_none(),
+        "a provable receiver type `Foo` must narrow f.send() to Foo::send only, never fan out to Bar::send"
+    );
+}
+
+#[test]
+fn typed_param_receiver_narrows_to_the_provable_local_type() {
+    // RED (issue #441, pattern 4): `fn caller(f: Foo) { f.send() }` — the param
+    // `f` has a PROVABLE nominal type `Foo` (simple identifier pattern). The
+    // receiver call must narrow to a single `resolved` edge to `Foo::send`,
+    // never an ambiguous fan-out to `Bar::send`. Today the param type is
+    // discarded and `f.send()` fans out ambiguous to BOTH.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_owned_fixture(
+        repo,
+        &two_type_send_workspace("pub fn caller(f: Foo) -> u32 {\n    f.send()\n}\n"),
+    );
+
+    let records = scan_fixture(repo);
+    let foo_send = symbol_id(&records, "method", "foo::Foo::send", "src/foo.rs");
+    let bar_send = symbol_id(&records, "method", "bar::Bar::send", "src/bar.rs");
+    let caller = symbol_id(&records, "function", "caller::caller", "src/caller.rs");
+
+    assert_calls_edge_with_resolution(&records, &caller, &foo_send, "resolved");
+    assert!(
+        calls_edge(&records, &caller, &bar_send).is_none(),
+        "a typed param `f: Foo` must narrow f.send() to Foo::send only, never fan out to Bar::send"
+    );
+}
+
+#[test]
+fn two_types_with_same_named_method_bind_only_the_provable_receiver() {
+    // RED (issue #441): types `Foo` and `Bar` both declare `run`. With a provable
+    // `let f: Foo = …`, `f.run()` binds a single `resolved` edge to `Foo::run`
+    // and NO edge to `Bar::run`. The complementary both-sides check to the
+    // typed-let case.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/foo.rs",
+                "pub struct Foo;\nimpl Foo {\n    pub fn run(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/bar.rs",
+                "pub struct Bar;\nimpl Bar {\n    pub fn run(&self) -> u32 {\n        2\n    }\n}\n",
+            ),
+            (
+                "src/caller.rs",
+                "pub fn caller() -> u32 {\n    let f: Foo = make();\n    f.run()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let foo_run = symbol_id(&records, "method", "foo::Foo::run", "src/foo.rs");
+    let bar_run = symbol_id(&records, "method", "bar::Bar::run", "src/bar.rs");
+    let caller = symbol_id(&records, "function", "caller::caller", "src/caller.rs");
+
+    assert_calls_edge_with_resolution(&records, &caller, &foo_run, "resolved");
+    assert!(
+        calls_edge(&records, &caller, &bar_run).is_none(),
+        "a provable receiver `Foo` must bind f.run() to Foo::run only, never Bar::run"
+    );
+}
+
+#[test]
+fn shadowed_receiver_binding_falls_back_to_ambiguous_fanout() {
+    // GUARD / CONSERVATIVE FALLBACK (issue #441): a second, NON-ascribed binder
+    // of the receiver name (`let f = other();`) shadows the earlier typed `let f:
+    // Foo`, so `f`'s type is no longer provable. The narrowing must NOT fire —
+    // the call falls back to today's ambiguous fan-out to ALL same-named methods.
+    // This currently passes (no narrowing exists); it pins the shadow veto so the
+    // GREEN implementation does not over-narrow a shadowed binding.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_owned_fixture(
+        repo,
+        &two_type_send_workspace(
+            "pub fn caller() -> u32 {\n    let f: Foo = make();\n    let f = other();\n    f.send()\n}\n",
+        ),
+    );
+
+    let records = scan_fixture(repo);
+    let foo_send = symbol_id(&records, "method", "foo::Foo::send", "src/foo.rs");
+    let bar_send = symbol_id(&records, "method", "bar::Bar::send", "src/bar.rs");
+    let caller = symbol_id(&records, "function", "caller::caller", "src/caller.rs");
+
+    // A shadowed receiver name is non-provable: keep the ambiguous fan-out.
+    assert_calls_edge_with_resolution(&records, &caller, &foo_send, "ambiguous");
+    assert_calls_edge_with_resolution(&records, &caller, &bar_send, "ambiguous");
+}
+
+#[test]
+// `bar_configure`/`baz_configure` are intentionally parallel (two types with the
+// same method), which trips the similar-names lint without aiding clarity here.
+#[allow(clippy::similar_names)]
+fn provable_receiver_with_no_matching_method_invents_no_edge() {
+    // RED (issue #441): a provable `let f: Foo = …` whose type `Foo` has NO
+    // matching method must emit NOTHING NEW — never guess an edge to another
+    // type's same-named method. `Foo` has only `send`; `Bar` and `Baz` both
+    // declare `configure`; `f.configure()` must bind NEITHER. Today (pre-#441)
+    // the receiver type is discarded and `f.configure()` fans out ambiguous to
+    // BOTH `Bar::configure` and `Baz::configure`.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/foo.rs",
+                "pub struct Foo;\nimpl Foo {\n    pub fn send(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/bar.rs",
+                "pub struct Bar;\nimpl Bar {\n    pub fn configure(&self) -> u32 {\n        2\n    }\n}\n",
+            ),
+            (
+                "src/baz.rs",
+                "pub struct Baz;\nimpl Baz {\n    pub fn configure(&self) -> u32 {\n        3\n    }\n}\n",
+            ),
+            (
+                "src/caller.rs",
+                "pub fn caller() -> u32 {\n    let f: Foo = make();\n    f.configure()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let bar_configure = symbol_id(&records, "method", "bar::Bar::configure", "src/bar.rs");
+    let baz_configure = symbol_id(&records, "method", "baz::Baz::configure", "src/baz.rs");
+    let caller = symbol_id(&records, "function", "caller::caller", "src/caller.rs");
+
+    // Foo has no `configure`: the provable receiver invents no edge to the other
+    // types' same-named methods.
+    assert!(
+        calls_edge(&records, &caller, &bar_configure).is_none(),
+        "a provable `Foo` with no `configure` must not bind Bar::configure"
+    );
+    assert!(
+        calls_edge(&records, &caller, &baz_configure).is_none(),
+        "a provable `Foo` with no `configure` must not bind Baz::configure"
+    );
+    // No Diagnostic invented for a provable-but-unmatched receiver method call.
+    assert!(
+        !records.iter().any(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Diagnostic"
+                && record["name"] == "configure"
+        }),
+        "a provable-but-unmatched receiver method call must not emit a Diagnostic node"
+    );
+}
+
+#[test]
+fn external_typed_receiver_stays_ambiguous() {
+    // LAW GUARD (issue #441): the receiver type must resolve to a UNIQUE LOCAL
+    // NON-TRAIT type or NO narrowing happens. `let x: u32 = 0; x.read()` — `u32`
+    // is external, so the ImplTargetIndex resolves nothing and the ambiguous
+    // fan-out to every in-repo `read` is UNCHANGED. Currently passes; it proves
+    // the GREEN implementation does not narrow on a non-local receiver type.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/foo.rs",
+                "pub struct Foo;\nimpl Foo {\n    pub fn read(&self) -> u32 {\n        1\n    }\n}\n",
+            ),
+            (
+                "src/bar.rs",
+                "pub struct Bar;\nimpl Bar {\n    pub fn read(&self) -> u32 {\n        2\n    }\n}\n",
+            ),
+            (
+                "src/caller.rs",
+                "pub fn caller() -> u32 {\n    let x: u32 = 0;\n    x.read()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let foo_read = symbol_id(&records, "method", "foo::Foo::read", "src/foo.rs");
+    let bar_read = symbol_id(&records, "method", "bar::Bar::read", "src/bar.rs");
+    let caller = symbol_id(&records, "function", "caller::caller", "src/caller.rs");
+
+    assert_calls_edge_with_resolution(&records, &caller, &foo_read, "ambiguous");
+    assert_calls_edge_with_resolution(&records, &caller, &bar_read, "ambiguous");
+}
+
+#[test]
+fn trait_typed_receiver_stays_ambiguous() {
+    // LAW GUARD (issue #441): a trait-typed receiver stays on its current path
+    // (out of #441 scope — that is #267 dyn/generic dispatch). `d: &dyn Device`
+    // resolves to a local TRAIT, not a non-trait type, so no narrowing fires and
+    // `d.read()` keeps its ambiguous fan-out to both trait methods. Currently
+    // passes; it proves the GREEN implementation excludes trait-typed receivers.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "src/device.rs",
+                "pub trait Device {\n    fn read(&self) -> u32;\n}\n",
+            ),
+            (
+                "src/sensor.rs",
+                "pub trait Sensor {\n    fn read(&self) -> u32;\n}\n",
+            ),
+            (
+                "src/caller.rs",
+                "pub fn caller(d: &dyn Device) -> u32 {\n    d.read()\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let device_read = symbol_id(&records, "function", "device::read", "src/device.rs");
+    let sensor_read = symbol_id(&records, "function", "sensor::read", "src/sensor.rs");
+    let caller = symbol_id(&records, "function", "caller::caller", "src/caller.rs");
+
+    assert_calls_edge_with_resolution(&records, &caller, &device_read, "ambiguous");
+    assert_calls_edge_with_resolution(&records, &caller, &sensor_read, "ambiguous");
+}
+
+#[test]
+fn ufcs_receiver_call_resolves_to_the_named_type() {
+    // GUARD (issue #441 pattern 2, expected already green from #440): a UFCS
+    // `Foo::send(&f)` is a `Path` call that binds the exact named type's method
+    // via the #440 qualified-path arm — a single `resolved` edge to `Foo::send`,
+    // never `Bar::send`. `Self::send(...)` normalization is separately covered by
+    // the in-trait/impl `Self::` tests in this file.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_owned_fixture(
+        repo,
+        &two_type_send_workspace(
+            "pub fn caller() -> u32 {\n    let f = make();\n    Foo::send(&f)\n}\n",
+        ),
+    );
+
+    let records = scan_fixture(repo);
+    let foo_send = symbol_id(&records, "method", "foo::Foo::send", "src/foo.rs");
+    let bar_send = symbol_id(&records, "method", "bar::Bar::send", "src/bar.rs");
+    let caller = symbol_id(&records, "function", "caller::caller", "src/caller.rs");
+
+    assert_calls_edge_with_resolution(&records, &caller, &foo_send, "resolved");
+    assert!(
+        calls_edge(&records, &caller, &bar_send).is_none(),
+        "Foo::send(&f) UFCS must bind Foo::send only, never Bar::send"
+    );
+}
+
+#[test]
+fn narrowed_receiver_edges_are_byte_stable_across_repeated_scans() {
+    // GUARD (issue #441): determinism guard for the receiver-type narrowing
+    // path. The typed-let fixture scanned repeatedly must yield byte-identical
+    // output. Passes today (the current ambiguous fan-out is already stable) and
+    // must keep passing once GREEN narrows it.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_owned_fixture(
+        repo,
+        &two_type_send_workspace(
+            "pub fn caller() -> u32 {\n    let f: Foo = make();\n    f.send()\n}\n",
+        ),
+    );
+
+    let first = scan_repository_at_with_override(repo, FIXED_TIME, Some(REPO_ID))
+        .expect("fixture repo should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    for run in 2..=5 {
+        let next = scan_repository_at_with_override(repo, FIXED_TIME, Some(REPO_ID))
+            .expect("fixture repo should rescan")
+            .to_jsonl()
+            .expect("graph should reserialize");
+        assert_eq!(first, next, "scan {run} must be byte-identical to scan 1");
+    }
+}

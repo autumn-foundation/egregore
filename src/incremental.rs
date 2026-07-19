@@ -112,14 +112,19 @@ use crate::{
 /// `DefinitionFact.match_segments`/`crate_root` in workspace layouts, and the
 /// new `CallSiteFact.path_root` field changes the cached call-site shape, so
 /// per-file caches must rebuild rather than replay pre-#440 unresolved stubs.
-/// 20 -> 21 for the issue #438 non-UTF-8/unreadable source skip: such a file now
+/// (21 is reserved for issue #451.) 21 -> 22 for the issue #441
+/// `CallSiteFact.receiver_type` field: a provable receiver type is now stamped
+/// on non-`self` identifier method calls, changing the cached call-site shape,
+/// so per-file caches must rebuild to narrow those calls instead of replaying
+/// the pre-#441 ambiguous fan-out.
+/// 22 -> 23 for the issue #438 non-UTF-8/unreadable source skip: such a file now
 /// caches a `Diagnostic` (never a `File` node) and shifts the coverage counts,
 /// so older caches must rebuild rather than replay the pre-skip record set.
 ///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 21;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 23;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

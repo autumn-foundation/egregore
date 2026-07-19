@@ -210,6 +210,13 @@ struct RustExtractor<'graph, 'source> {
     test_scope_depth: usize,
     /// `true` when the whole file lives under a top-level `tests/` directory.
     file_in_tests_dir: bool,
+    /// Per-function receiver-type environment (issue #441): a receiver binding
+    /// identifier -> its reduced nominal type path, built from typed fn params
+    /// and `let x: T` ascriptions whose binding is UNSHADOWED in the function
+    /// body. Set on entering a function body (before its call sites are
+    /// collected) and restored on exit, so `call_site_fact` can stamp a
+    /// provable `receiver_type` on `x.method()` when `x` is in this map.
+    type_env: BTreeMap<String, String>,
 }
 
 impl<'graph, 'source> RustExtractor<'graph, 'source> {
@@ -250,6 +257,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             file_in_tests_dir: path_segments(&file.repo_relative_path)
                 .first()
                 .is_some_and(|segment| segment == "tests"),
+            type_env: BTreeMap::new(),
         }
     }
 
@@ -681,7 +689,15 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 repo_relative_path: self.file.repo_relative_path.clone(),
             });
         }
+        // Build this function's provable receiver-type environment (issue #441)
+        // and install it for the duration of the call-site collection, then
+        // restore the caller's environment. Nested functions collect their own
+        // call sites through their own `extract_function` and build their own
+        // environment, so scopes never bleed.
+        let type_env = self.build_type_env(node);
+        let outer_type_env = std::mem::replace(&mut self.type_env, type_env);
         self.collect_call_sites(node, &id, &qualified_name);
+        self.type_env = outer_type_env;
         self.symbol_bodies.push(SymbolBody {
             id,
             name: qualified_name,
@@ -770,77 +786,91 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         if function.kind() == "generic_function" {
             function = function.child_by_field_name("function")?;
         }
-        let (display, segments, call_kind, receiver_owner, path_root) = match function.kind() {
-            "identifier" => {
-                let name = self.node_text(function).trim().to_owned();
-                (
-                    name.clone(),
-                    vec![name],
-                    CallKind::Direct,
-                    None,
-                    CallPathRoot::Unqualified,
-                )
-            }
-            "scoped_identifier" => {
-                let display = self.node_text(function).trim().to_owned();
-                let segments = self.normalize_call_path(&display)?;
-                // Classify the leading crate scope BEFORE it is lost to
-                // normalization (issue #440): a `crate`/`self`/`super` head names
-                // the caller's own crate; any other head may name a workspace
-                // crate, so retain the raw first segment for the registry lookup.
-                let path_root = match display.split("::").next().map(str::trim) {
-                    Some("crate" | "self" | "super") => CallPathRoot::CurrentCrate,
-                    Some(first) if !first.is_empty() => CallPathRoot::Leading(first.to_owned()),
-                    _ => CallPathRoot::Unqualified,
-                };
-                (display, segments, CallKind::Path, None, path_root)
-            }
-            "field_expression" => {
-                let field = function.child_by_field_name("field")?;
-                if field.kind() != "field_identifier" {
-                    return None;
+        let (display, segments, call_kind, receiver_owner, path_root, receiver_type) =
+            match function.kind() {
+                "identifier" => {
+                    let name = self.node_text(function).trim().to_owned();
+                    (
+                        name.clone(),
+                        vec![name],
+                        CallKind::Direct,
+                        None,
+                        CallPathRoot::Unqualified,
+                        None,
+                    )
                 }
-                let name = self.node_text(field).trim().to_owned();
-                let receiver_is_self = function
-                    .child_by_field_name("value")
-                    .is_some_and(|value| value.kind() == "self");
-                let owner = receiver_is_self
-                    .then(|| {
-                        // A `self.method()` receiver call carries the owner of
-                        // the enclosing `Self` so the SelfMethod branch can
-                        // narrow to it: the impl owner inside an impl block
-                        // (unchanged), else the enclosing trait name inside a
-                        // trait body (issue #390). Inside a trait there is no
-                        // `impl_context`, so before this the owner was None and
-                        // the call collapsed to a plain `Method` that fanned out
-                        // to every same-named trait method. `impl_context` takes
-                        // precedence when both are set (a nested impl inside a
-                        // trait default body). The trait name is the raw
-                        // `trait_context` string, matching the trait-method
-                        // owner segment in `definition_match_segments`.
-                        self.impl_context
-                            .as_ref()
-                            .and_then(|impl_context| {
-                                normalize_impl_owner(&impl_context.method_owner)
-                            })
-                            .or_else(|| self.trait_context.clone())
-                    })
-                    .flatten();
-                let call_kind = if owner.is_some() {
-                    CallKind::SelfMethod
-                } else {
-                    CallKind::Method
-                };
-                (
-                    name.clone(),
-                    vec![name],
-                    call_kind,
-                    owner,
-                    CallPathRoot::Unqualified,
-                )
-            }
-            _ => return None,
-        };
+                "scoped_identifier" => {
+                    let display = self.node_text(function).trim().to_owned();
+                    let segments = self.normalize_call_path(&display)?;
+                    // Classify the leading crate scope BEFORE it is lost to
+                    // normalization (issue #440): a `crate`/`self`/`super` head names
+                    // the caller's own crate; any other head may name a workspace
+                    // crate, so retain the raw first segment for the registry lookup.
+                    let path_root = match display.split("::").next().map(str::trim) {
+                        Some("crate" | "self" | "super") => CallPathRoot::CurrentCrate,
+                        Some(first) if !first.is_empty() => CallPathRoot::Leading(first.to_owned()),
+                        _ => CallPathRoot::Unqualified,
+                    };
+                    (display, segments, CallKind::Path, None, path_root, None)
+                }
+                "field_expression" => {
+                    let field = function.child_by_field_name("field")?;
+                    if field.kind() != "field_identifier" {
+                        return None;
+                    }
+                    let name = self.node_text(field).trim().to_owned();
+                    let receiver_value = function.child_by_field_name("value");
+                    let receiver_is_self =
+                        receiver_value.is_some_and(|value| value.kind() == "self");
+                    let owner = receiver_is_self
+                        .then(|| {
+                            // A `self.method()` receiver call carries the owner of
+                            // the enclosing `Self` so the SelfMethod branch can
+                            // narrow to it: the impl owner inside an impl block
+                            // (unchanged), else the enclosing trait name inside a
+                            // trait body (issue #390). Inside a trait there is no
+                            // `impl_context`, so before this the owner was None and
+                            // the call collapsed to a plain `Method` that fanned out
+                            // to every same-named trait method. `impl_context` takes
+                            // precedence when both are set (a nested impl inside a
+                            // trait default body). The trait name is the raw
+                            // `trait_context` string, matching the trait-method
+                            // owner segment in `definition_match_segments`.
+                            self.impl_context
+                                .as_ref()
+                                .and_then(|impl_context| {
+                                    normalize_impl_owner(&impl_context.method_owner)
+                                })
+                                .or_else(|| self.trait_context.clone())
+                        })
+                        .flatten();
+                    let call_kind = if owner.is_some() {
+                        CallKind::SelfMethod
+                    } else {
+                        CallKind::Method
+                    };
+                    // Provable receiver type (issue #441): for a non-`self` receiver
+                    // that is a simple `identifier` binding whose type is in this
+                    // function's unshadowed type environment, stamp the reduced
+                    // nominal type so the resolver can narrow `x.method()` to that
+                    // type's own method. A `self` receiver keeps `receiver_owner`
+                    // only; a receiver that is not a bare identifier, or whose name
+                    // is not a provable binding, gets `None` (today's fan-out).
+                    let receiver_type = (!receiver_is_self)
+                        .then(|| receiver_value.filter(|value| value.kind() == "identifier"))
+                        .flatten()
+                        .and_then(|value| self.type_env.get(self.node_text(value).trim()).cloned());
+                    (
+                        name.clone(),
+                        vec![name],
+                        call_kind,
+                        owner,
+                        CallPathRoot::Unqualified,
+                        receiver_type,
+                    )
+                }
+                _ => return None,
+            };
         if segments.is_empty() || segments.iter().any(|segment| !is_simple_ident(segment)) {
             return None;
         }
@@ -852,8 +882,131 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             call_kind,
             path_root,
             receiver_owner,
+            receiver_type,
             span: span(node),
         })
+    }
+
+    /// Builds the per-function provable receiver-type environment (issue #441):
+    /// binding identifier -> reduced nominal type path, for a receiver whose
+    /// type is syntactically PROVABLE and UNSHADOWED in the function body.
+    ///
+    /// Entries come from (a) fn params with a simple-identifier pattern and a
+    /// nominal type, and (b) `let x: T` declarations with a simple-identifier
+    /// pattern, an explicit type ascription, and a nominal type. Reference,
+    /// pointer, and single-level generic types reduce to their core nominal
+    /// type; anything else yields no entry ([`reduce_receiver_type`]).
+    ///
+    /// SHADOWING VETO (conservative): every binding occurrence of each
+    /// identifier anywhere in the body is counted — additional `let` shadows,
+    /// `for x in`, closure params, `if let`/`while let`, and `match` arm
+    /// bindings, including nested destructuring. Any identifier bound at MORE
+    /// THAN ONE site is non-provable and dropped, so a shadowed receiver falls
+    /// back to today's ambiguous fan-out (prefer a MISSING narrowing to a WRONG
+    /// one). Only expression-position identifiers (the receiver USE `x.m()`)
+    /// are never counted as binders, so a single typed binding survives.
+    fn build_type_env(&self, fn_node: Node<'_>) -> BTreeMap<String, String> {
+        let mut env: BTreeMap<String, String> = BTreeMap::new();
+        let mut binder_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+        if let Some(params) = fn_node.child_by_field_name("parameters") {
+            let mut cursor = params.walk();
+            let children: Vec<Node<'_>> = params.named_children(&mut cursor).collect();
+            for param in children {
+                if param.kind() != "parameter" {
+                    continue;
+                }
+                let Some(pattern) = param.child_by_field_name("pattern") else {
+                    continue;
+                };
+                let mut idents = Vec::new();
+                collect_pattern_idents(pattern, self.source, &mut idents);
+                for ident in &idents {
+                    *binder_counts.entry(ident.clone()).or_default() += 1;
+                }
+                if pattern.kind() == "identifier"
+                    && let Some(type_node) = param.child_by_field_name("type")
+                    && let Some(reduced) = reduce_receiver_type(type_node, self.source)
+                {
+                    env.insert(self.node_text(pattern).trim().to_owned(), reduced);
+                }
+            }
+        }
+
+        if let Some(body) = fn_node.child_by_field_name("body") {
+            self.scan_body_binders(body, &mut env, &mut binder_counts);
+        }
+
+        env.retain(|name, _| binder_counts.get(name).copied() == Some(1));
+        env
+    }
+
+    /// Recursively scans a function body, recording `let x: T` type-env entries
+    /// and counting every binder occurrence for the shadowing veto (issue #441).
+    /// Recursion stops at nested item scopes (`fn`/`impl`/`trait`/`mod`/macros),
+    /// mirroring [`collect_call_sites`](Self::collect_call_sites), so a nested
+    /// item's bindings never veto (or populate) the enclosing function's
+    /// environment; closures ARE descended into (their call sites belong to this
+    /// function, so their params shadow this scope).
+    fn scan_body_binders(
+        &self,
+        node: Node<'_>,
+        env: &mut BTreeMap<String, String>,
+        binder_counts: &mut BTreeMap<String, usize>,
+    ) {
+        let kind = node.kind();
+        match kind {
+            "let_declaration" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    let mut idents = Vec::new();
+                    collect_pattern_idents(pattern, self.source, &mut idents);
+                    for ident in &idents {
+                        *binder_counts.entry(ident.clone()).or_default() += 1;
+                    }
+                    if pattern.kind() == "identifier"
+                        && let Some(type_node) = node.child_by_field_name("type")
+                        && let Some(reduced) = reduce_receiver_type(type_node, self.source)
+                    {
+                        env.insert(self.node_text(pattern).trim().to_owned(), reduced);
+                    }
+                }
+            }
+            "for_expression" | "let_condition" | "match_arm" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    let mut idents = Vec::new();
+                    collect_pattern_idents(pattern, self.source, &mut idents);
+                    for ident in &idents {
+                        *binder_counts.entry(ident.clone()).or_default() += 1;
+                    }
+                }
+            }
+            "closure_expression" => {
+                if let Some(params) = node.child_by_field_name("parameters") {
+                    let mut idents = Vec::new();
+                    collect_pattern_idents(params, self.source, &mut idents);
+                    for ident in &idents {
+                        *binder_counts.entry(ident.clone()).or_default() += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if matches!(
+            kind,
+            "function_item"
+                | "impl_item"
+                | "trait_item"
+                | "mod_item"
+                | "macro_definition"
+                | "macro_invocation"
+        ) {
+            return;
+        }
+        let mut cursor = node.walk();
+        let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        for child in children {
+            self.scan_body_binders(child, env, binder_counts);
+        }
     }
 
     /// Normalizes a `::`-separated call path for matching: strips leading
@@ -2741,6 +2894,65 @@ fn normalize_impl_owner_path(owner: &str) -> Option<String> {
     let owner = strip_impl_prefix(owner).trim();
     let owner = owner.split('<').next()?.trim();
     (!owner.is_empty()).then(|| owner.to_owned())
+}
+
+/// Reduces a type AST node to a matchable nominal type path for the #441
+/// receiver-type environment, or `None` when it does not name a plain nominal
+/// type. Reference/pointer wrappers (`&T`, `&mut T`, `&'a T`, `*const T`) are
+/// peeled, and a single-level generic (`Wrapper<T>`) reduces to its base type;
+/// a `type_identifier` yields its text and a `scoped_type_identifier` its full
+/// path text. A trait object (`dyn Device`), `impl Trait`, slice, array, tuple,
+/// unit, or any other non-nominal form yields `None`, so trait-typed and
+/// non-nominal receivers never enter the environment.
+fn reduce_receiver_type(type_node: Node<'_>, source: &str) -> Option<String> {
+    let mut core = type_node;
+    loop {
+        match core.kind() {
+            // Peel reference/pointer wrappers and reduce a single-level generic
+            // to its base `type` child (all three expose the core via the same
+            // `type` field).
+            "reference_type" | "pointer_type" | "generic_type" => {
+                core = core.child_by_field_name("type")?;
+            }
+            "type_identifier" | "scoped_type_identifier" => {
+                let text = node_source(core, source).trim();
+                return (!text.is_empty()).then(|| text.to_owned());
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Collects every binding identifier a pattern introduces (issue #441), for the
+/// shadowing veto. Pushes `identifier` and `shorthand_field_identifier` nodes;
+/// for `tuple_struct_pattern`/`struct_pattern` the constructor/type path (the
+/// `type` field) is skipped so the enum/struct NAME is never miscounted as a
+/// binder. Type names inside patterns are `type_identifier`/`field_identifier`
+/// nodes (never `identifier`), so they are naturally excluded elsewhere.
+fn collect_pattern_idents(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" | "shorthand_field_identifier" => {
+            out.push(node_source(node, source).trim().to_owned());
+        }
+        "tuple_struct_pattern" | "struct_pattern" => {
+            let type_field = node.child_by_field_name("type");
+            let mut cursor = node.walk();
+            let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+            for child in children {
+                if Some(child) == type_field {
+                    continue;
+                }
+                collect_pattern_idents(child, source, out);
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+            for child in children {
+                collect_pattern_idents(child, source, out);
+            }
+        }
+    }
 }
 
 /// Strips a leading `impl` keyword and its generic parameter list, if any.
