@@ -46,6 +46,9 @@ use crate::daemon::{
 pub const REPAIR_SCHEMA_VERSION: u32 = 1;
 
 const RECOVERY_REPORT_FILE: &str = "repair-report.json";
+const REPAIR_MANIFEST_FILE: &str = "repair-manifest.json";
+const QUARANTINE_DIR: &str = "quarantine";
+const RUNTIME_METADATA_FILE: &str = "egregored.json";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -83,13 +86,73 @@ pub enum RepairRefusalCode {
 }
 
 /// Stable machine-readable repair action identifiers.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepairAction {
     /// Remove the stale `egregored.json` runtime metadata file.
     StaleMetadataCleanup,
+    /// Move the stale `egregored.json` aside into the quarantine subdirectory
+    /// (recoverable) instead of deleting it.
+    StaleMetadataQuarantine,
     /// Write a machine-readable recovery report to the runtime directory.
     RecoveryReportGeneration,
+}
+
+/// Stable machine-readable result of a single manifest action.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairActionResult {
+    /// The action was performed and the filesystem was mutated.
+    Applied,
+    /// Dry-run preview: the action would be performed but was not.
+    Planned,
+    /// The action was intentionally not performed (see `skipped_reason`).
+    Skipped,
+    /// The action was attempted but failed.
+    Failed,
+}
+
+/// One redaction-safe per-action manifest row.
+///
+/// Carries only paths, stable codes, and BLAKE3 content hashes — never the
+/// runtime metadata's `token`, never any payload body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairManifestEntry {
+    /// The repair action this row records.
+    pub action: RepairAction,
+    /// RFC 3339 instant the action was taken (pinned in tests for determinism).
+    pub action_time: String,
+    /// Outcome of the action.
+    pub result: RepairActionResult,
+    /// The runtime metadata path acted on.
+    pub original_path: PathBuf,
+    /// Recoverable destination path (quarantine action only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_path: Option<PathBuf>,
+    /// BLAKE3 hex of the metadata bytes before the action (absent if unreadable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_metadata_hash: Option<String>,
+    /// BLAKE3 hex of the metadata bytes after the action. `None` after a removal;
+    /// equal to `before_metadata_hash` after a quarantine move.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_metadata_hash: Option<String>,
+    /// Stable reason string when `result` is `skipped`; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<String>,
+}
+
+/// Operator-selected options for [`run_repair_with`].
+#[derive(Debug, Clone, Default)]
+pub struct RepairOptions {
+    /// Preview mode: plan the actions and return without any mutation.
+    pub dry_run: bool,
+    /// Apply mode: perform the repair after proving exclusive ownership.
+    pub confirm: bool,
+    /// Quarantine (move aside) stale metadata instead of deleting it.
+    pub quarantine: bool,
+    /// Fixed RFC 3339 action time for deterministic output (useful for tests).
+    /// Defaults to the current wall-clock instant.
+    pub transaction_time: Option<String>,
 }
 
 /// Snapshot of daemon state for before/after comparison in repair reports.
@@ -150,6 +213,9 @@ pub struct InspectSummary {
 pub enum RepairSessionResult {
     /// Repair completed successfully.
     Success,
+    /// The store was already healthy: nothing needed repair and nothing was
+    /// created, modified, or deleted.
+    NoRepairNeeded,
     /// Repair was refused due to one or more refusal codes.
     Refused,
     /// Repair failed due to an unexpected I/O or internal error.
@@ -171,6 +237,11 @@ pub struct PreflightReport {
     pub ownership_verdict: OwnershipVerdict,
     /// True when the verdict permits a repair session.
     pub allow: bool,
+    /// True when the store actually has stale runtime metadata to repair. A
+    /// healthy `stopped` store (or any refused verdict) reports `false`, so an
+    /// operator can distinguish "allowed but nothing to do" from "there is a
+    /// repair to apply".
+    pub repair_needed: bool,
     /// Stable refusal codes (empty when `allow` is true).
     pub refusal_reasons: Vec<RepairRefusalCode>,
     /// Daemon state snapshot before any repair action.
@@ -218,6 +289,15 @@ pub struct RepairSessionReport {
     pub skipped_actions: Vec<RepairAction>,
     /// File paths changed during the session (empty in dry-run and refusal).
     pub changed_file_paths: Vec<PathBuf>,
+    /// Redaction-safe per-action manifest. In dry-run each row is `planned`; in a
+    /// confirmed apply each row is `applied` (or `failed`). Empty for refusals
+    /// and for a healthy stopped store (nothing to record).
+    pub manifest: Vec<RepairManifestEntry>,
+    /// Ownership verdict re-derived AFTER a confirmed mutation, so the report
+    /// states honestly whether the store is now clean or still has remaining
+    /// state. Absent for dry-run and refusal (nothing changed to re-verify).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_ownership_verdict: Option<OwnershipVerdict>,
     /// Stable refusal codes (empty when `result` is `success` or `dry_run`).
     pub refusal_reasons: Vec<RepairRefusalCode>,
 }
@@ -265,41 +345,65 @@ pub fn preflight(data_dir: &Path) -> Result<PreflightReport> {
 
     let before_daemon_status = metadata.as_ref().map(DaemonStatusSnapshot::from_metadata);
 
+    // A repair is actually needed only for stale metadata with no owner. A
+    // healthy stopped store is allowed but has nothing to repair.
+    let repair_needed = allow && verdict == OwnershipVerdict::StaleNoOwner;
+
     Ok(PreflightReport {
         schema_version: REPAIR_SCHEMA_VERSION,
         data_dir: data_dir.to_path_buf(),
         runtime_dir,
         ownership_verdict: verdict,
         allow,
+        repair_needed,
         refusal_reasons,
         before_daemon_status,
         safe_daemon_command,
     })
 }
 
-/// Runs an offline repair session for a data directory.
+/// Runs an offline repair session for a data directory (convenience wrapper).
 ///
-/// - `dry_run = true`: determines what the session would do and returns without
-///   making any filesystem or graph mutations. Equivalent to preflight with
-///   full action planning.
-/// - `confirm = true`: executes the repair actions after verifying exclusive
-///   ownership. Requires `dry_run = false`.
-/// - Neither flag: refuses with [`RepairRefusalCode::ConfirmationRequired`].
-///
-/// The first repair slice supports:
-/// - [`RepairAction::StaleMetadataCleanup`]: removes stale `egregored.json`.
-/// - [`RepairAction::RecoveryReportGeneration`]: writes a recovery report to
-///   the runtime directory.
-///
-/// Graph-record deletion, store rewrites, compaction, migration, and raw
-/// payload export are unsupported and will never be attempted.
+/// Equivalent to [`run_repair_with`] with default removal (not quarantine) and a
+/// wall-clock action time. See that function for the full contract.
 ///
 /// # Errors
 ///
 /// Returns an error if runtime inspection fails or a filesystem write fails
 /// during an actual (non-dry-run) repair.
 pub fn run_repair(data_dir: &Path, dry_run: bool, confirm: bool) -> Result<RepairSessionReport> {
-    let started_at = now_rfc3339();
+    run_repair_with(
+        data_dir,
+        &RepairOptions {
+            dry_run,
+            confirm,
+            ..RepairOptions::default()
+        },
+    )
+}
+
+/// Runs an offline repair session with explicit [`RepairOptions`].
+///
+/// Verdict handling:
+/// - `live` / `ambiguous` / unsupported daemon schema → refuse, zero mutation.
+/// - `stopped` (healthy) → [`RepairSessionResult::NoRepairNeeded`], zero mutation
+///   regardless of flags; no recovery report or manifest is written.
+/// - `stale_no_owner` → dry-run preview, or (with `confirm`) an apply that
+///   removes (default) or quarantines (`quarantine = true`) the stale metadata,
+///   writes a redaction-safe manifest, and re-verifies the store.
+///
+/// `dry_run` and `confirm` are mutually exclusive at the CLI. With neither, the
+/// `stale_no_owner` path refuses with [`RepairRefusalCode::ConfirmationRequired`].
+///
+/// Graph-record deletion, store rewrites, compaction, migration, and raw payload
+/// export are unsupported and never attempted.
+///
+/// # Errors
+///
+/// Returns an error if runtime inspection fails, a filesystem write fails during
+/// a confirmed apply, or `transaction_time` is not a valid RFC 3339 instant.
+pub fn run_repair_with(data_dir: &Path, opts: &RepairOptions) -> Result<RepairSessionReport> {
+    let started_at = resolve_action_time(opts.transaction_time.as_deref())?;
     let runtime_dir = runtime_dir_for_data_dir(data_dir);
 
     let VerdictOutcome {
@@ -313,63 +417,89 @@ pub fn run_repair(data_dir: &Path, dry_run: bool, confirm: bool) -> Result<Repai
         .map(DaemonStatusSnapshot::from_metadata);
     let before_inspect_summary = Some(build_inspect_summary(data_dir, raw_metadata.as_ref()));
 
-    // Determine refusal conditions
+    // Refusal conditions (Live / Ambiguous / unsupported schema): zero mutation.
     let refusal_reasons: Vec<RepairRefusalCode> = if schema_unsupported {
         vec![RepairRefusalCode::UnsupportedRuntimeSchema]
     } else {
         match &verdict {
             OwnershipVerdict::Live => vec![RepairRefusalCode::LiveDaemonActive],
             OwnershipVerdict::Ambiguous => vec![RepairRefusalCode::AmbiguousOwnership],
-            OwnershipVerdict::Stopped | OwnershipVerdict::StaleNoOwner => {
-                if !dry_run && !confirm {
-                    vec![RepairRefusalCode::ConfirmationRequired]
-                } else {
-                    vec![]
-                }
-            }
+            OwnershipVerdict::Stopped | OwnershipVerdict::StaleNoOwner => vec![],
         }
     };
 
     if !refusal_reasons.is_empty() {
-        let ended_at = now_rfc3339();
+        return Ok(refused_report(RefusedReport {
+            data_dir: data_dir.to_path_buf(),
+            runtime_dir,
+            verdict,
+            dry_run: opts.dry_run,
+            started_at: started_at.clone(),
+            ended_at: started_at,
+            before_daemon_status,
+            before_inspect_summary,
+            refusal_reasons,
+        }));
+    }
+
+    // Healthy stopped store: nothing to repair. Never mutate — not even under
+    // `--confirm` — and never write a recovery report or manifest. This
+    // short-circuits BEFORE the confirmation gate because a store with nothing
+    // to repair has nothing to confirm.
+    if verdict == OwnershipVerdict::Stopped {
         return Ok(RepairSessionReport {
             schema_version: REPAIR_SCHEMA_VERSION,
             data_dir: data_dir.to_path_buf(),
             runtime_dir,
-            ownership_verdict: verdict,
-            dry_run,
-            started_at,
-            ended_at,
-            result: RepairSessionResult::Refused,
+            ownership_verdict: verdict.clone(),
+            dry_run: opts.dry_run,
+            started_at: started_at.clone(),
+            ended_at: started_at,
+            result: RepairSessionResult::NoRepairNeeded,
             before_daemon_status,
             after_daemon_status: None,
             before_inspect_summary,
             after_inspect_summary: None,
             attempted_actions: vec![],
-            skipped_actions: vec![
-                RepairAction::StaleMetadataCleanup,
-                RepairAction::RecoveryReportGeneration,
-            ],
+            skipped_actions: vec![],
             changed_file_paths: vec![],
-            refusal_reasons,
+            manifest: vec![],
+            after_ownership_verdict: Some(verdict),
+            refusal_reasons: vec![],
         });
     }
 
+    // From here the verdict is StaleNoOwner: a repair is actually needed. The
+    // confirmation gate applies only to the apply path.
+    if !opts.dry_run && !opts.confirm {
+        return Ok(refused_report(RefusedReport {
+            data_dir: data_dir.to_path_buf(),
+            runtime_dir,
+            verdict,
+            dry_run: false,
+            started_at: started_at.clone(),
+            ended_at: started_at,
+            before_daemon_status,
+            before_inspect_summary,
+            refusal_reasons: vec![RepairRefusalCode::ConfirmationRequired],
+        }));
+    }
+
     // Dry-run: plan the actions and return without mutating anything.
-    if dry_run {
-        let RepairActions {
+    if opts.dry_run {
+        let RepairExecution {
             attempted_actions,
+            manifest,
             changed_file_paths,
-        } = execute_repair_actions(&runtime_dir, true)?;
-        let ended_at = now_rfc3339();
+        } = repair_actions(&runtime_dir, opts.quarantine, &started_at, false)?;
         return Ok(RepairSessionReport {
             schema_version: REPAIR_SCHEMA_VERSION,
             data_dir: data_dir.to_path_buf(),
             runtime_dir,
             ownership_verdict: verdict,
             dry_run: true,
-            started_at,
-            ended_at,
+            started_at: started_at.clone(),
+            ended_at: started_at,
             result: RepairSessionResult::DryRun,
             before_daemon_status,
             after_daemon_status: None,
@@ -378,6 +508,8 @@ pub fn run_repair(data_dir: &Path, dry_run: bool, confirm: bool) -> Result<Repai
             attempted_actions,
             skipped_actions: vec![],
             changed_file_paths,
+            manifest,
+            after_ownership_verdict: None,
             refusal_reasons: vec![],
         });
     }
@@ -387,7 +519,9 @@ pub fn run_repair(data_dir: &Path, dry_run: bool, confirm: bool) -> Result<Repai
         data_dir: data_dir.to_path_buf(),
         runtime_dir,
         verdict,
+        quarantine: opts.quarantine,
         started_at,
+        transaction_time: opts.transaction_time.clone(),
         before_daemon_status,
         before_inspect_summary,
     })
@@ -397,14 +531,56 @@ pub fn run_repair(data_dir: &Path, dry_run: bool, confirm: bool) -> Result<Repai
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Common inputs threaded from [`run_repair`] into the confirmed-repair path.
+/// Common inputs threaded from [`run_repair_with`] into the confirmed-repair path.
 struct SessionContext {
     data_dir: PathBuf,
     runtime_dir: PathBuf,
     verdict: OwnershipVerdict,
+    quarantine: bool,
     started_at: String,
+    transaction_time: Option<String>,
     before_daemon_status: Option<DaemonStatusSnapshot>,
     before_inspect_summary: Option<InspectSummary>,
+}
+
+/// Inputs for a refusal report (avoids repeating the full struct literal).
+struct RefusedReport {
+    data_dir: PathBuf,
+    runtime_dir: PathBuf,
+    verdict: OwnershipVerdict,
+    dry_run: bool,
+    started_at: String,
+    ended_at: String,
+    before_daemon_status: Option<DaemonStatusSnapshot>,
+    before_inspect_summary: Option<InspectSummary>,
+    refusal_reasons: Vec<RepairRefusalCode>,
+}
+
+/// Builds a zero-mutation refusal report.
+fn refused_report(r: RefusedReport) -> RepairSessionReport {
+    RepairSessionReport {
+        schema_version: REPAIR_SCHEMA_VERSION,
+        data_dir: r.data_dir,
+        runtime_dir: r.runtime_dir,
+        ownership_verdict: r.verdict,
+        dry_run: r.dry_run,
+        started_at: r.started_at,
+        ended_at: r.ended_at,
+        result: RepairSessionResult::Refused,
+        before_daemon_status: r.before_daemon_status,
+        after_daemon_status: None,
+        before_inspect_summary: r.before_inspect_summary,
+        after_inspect_summary: None,
+        attempted_actions: vec![],
+        skipped_actions: vec![
+            RepairAction::StaleMetadataCleanup,
+            RepairAction::RecoveryReportGeneration,
+        ],
+        changed_file_paths: vec![],
+        manifest: vec![],
+        after_ownership_verdict: None,
+        refusal_reasons: r.refusal_reasons,
+    }
 }
 
 /// Executes a confirmed (non-dry-run) repair while holding the exclusive store
@@ -412,53 +588,51 @@ struct SessionContext {
 ///
 /// Acquiring the lease proves exclusive ownership and closes the race where
 /// another `eg daemon start` could acquire the store between the verdict and the
-/// metadata deletion. If the lease cannot be taken, an owner appeared in the gap
+/// metadata mutation. If the lease cannot be taken, an owner appeared in the gap
 /// and we refuse rather than mutate.
 fn run_confirmed_repair(ctx: SessionContext) -> Result<RepairSessionReport> {
     let SessionContext {
         data_dir,
         runtime_dir,
         verdict,
+        quarantine,
         started_at,
+        transaction_time,
         before_daemon_status,
         before_inspect_summary,
     } = ctx;
 
     let Ok(_lease) = StoreLease::acquire(&data_dir) else {
-        let ended_at = now_rfc3339();
-        return Ok(RepairSessionReport {
-            schema_version: REPAIR_SCHEMA_VERSION,
+        let ended_at = resolve_action_time(transaction_time.as_deref())?;
+        return Ok(refused_report(RefusedReport {
             data_dir,
             runtime_dir,
-            ownership_verdict: OwnershipVerdict::Ambiguous,
+            verdict: OwnershipVerdict::Ambiguous,
             dry_run: false,
             started_at,
             ended_at,
-            result: RepairSessionResult::Refused,
             before_daemon_status,
-            after_daemon_status: None,
             before_inspect_summary,
-            after_inspect_summary: None,
-            attempted_actions: vec![],
-            skipped_actions: vec![
-                RepairAction::StaleMetadataCleanup,
-                RepairAction::RecoveryReportGeneration,
-            ],
-            changed_file_paths: vec![],
             refusal_reasons: vec![RepairRefusalCode::AmbiguousOwnership],
-        });
+        }));
     };
 
-    let RepairActions {
+    let RepairExecution {
         attempted_actions,
+        manifest,
         changed_file_paths,
-    } = execute_repair_actions(&runtime_dir, false)?;
+    } = repair_actions(&runtime_dir, quarantine, &started_at, true)?;
 
-    let ended_at = now_rfc3339();
-    // We hold the only lease and removed the stale metadata, so once this session
-    // exits the store has no external owner: report the lock as not held.
+    let ended_at = resolve_action_time(transaction_time.as_deref())?;
+
+    // Before/after re-verification: re-run detection now that the mutation is
+    // done (still under our exclusive lease) so the report states the store's
+    // post-repair state honestly rather than assuming success.
+    let after_ownership_verdict = determine_verdict(&data_dir)?.verdict;
+    // We hold the only lease and moved/removed the stale metadata, so once this
+    // session exits the store has no external owner: report the lock as not held.
     let after_inspect_summary = Some(InspectSummary {
-        metadata_exists: runtime_dir.join("egregored.json").exists(),
+        metadata_exists: runtime_dir.join(RUNTIME_METADATA_FILE).exists(),
         lock_held: false,
         daemon_state: None,
     });
@@ -479,18 +653,27 @@ fn run_confirmed_repair(ctx: SessionContext) -> Result<RepairSessionReport> {
         attempted_actions,
         skipped_actions: vec![],
         changed_file_paths,
+        manifest: manifest.clone(),
+        after_ownership_verdict: Some(after_ownership_verdict),
         refusal_reasons: vec![],
     };
 
-    // Write the recovery report to the runtime dir so the operator can reference
-    // it. The CLI and docs promise this report exists after a confirmed repair,
-    // so propagate any write failure instead of silently succeeding.
     fs::create_dir_all(&runtime_dir).map_err(|e| {
         anyhow::anyhow!(
             "failed to create runtime dir {}: {e}",
             runtime_dir.display()
         )
     })?;
+
+    // Write the redaction-safe repair manifest. The CLI and docs promise it
+    // exists after a confirmed apply, so propagate any write failure.
+    let manifest_path = runtime_dir.join(REPAIR_MANIFEST_FILE);
+    let manifest_json = serde_json::to_vec_pretty(&manifest)?;
+    fs::write(&manifest_path, manifest_json)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", manifest_path.display()))?;
+
+    // Write the recovery report to the runtime dir so the operator can reference
+    // it. Propagate any write failure instead of silently succeeding.
     let report_path = runtime_dir.join(RECOVERY_REPORT_FILE);
     let json = serde_json::to_vec_pretty(&report)?;
     fs::write(&report_path, json)
@@ -499,32 +682,142 @@ fn run_confirmed_repair(ctx: SessionContext) -> Result<RepairSessionReport> {
     Ok(report)
 }
 
-struct RepairActions {
+/// Result of planning (or performing) the stale-metadata repair.
+struct RepairExecution {
     attempted_actions: Vec<RepairAction>,
+    manifest: Vec<RepairManifestEntry>,
     changed_file_paths: Vec<PathBuf>,
 }
 
-fn execute_repair_actions(runtime_dir: &Path, dry_run: bool) -> Result<RepairActions> {
+/// Plans (`apply == false`) or performs (`apply == true`) the stale-metadata
+/// repair. Only ever touches the runtime sidecar's `egregored.json`; the action
+/// is a removal (default) or a recoverable quarantine move (`quarantine`).
+///
+/// The returned manifest is redaction-safe: paths, stable codes, and BLAKE3
+/// content hashes only — never the metadata's `token`, never any payload body.
+fn repair_actions(
+    runtime_dir: &Path,
+    quarantine: bool,
+    action_time: &str,
+    apply: bool,
+) -> Result<RepairExecution> {
     let mut attempted_actions = Vec::new();
+    let mut manifest = Vec::new();
     let mut changed_file_paths = Vec::new();
-    let metadata_path = runtime_dir.join("egregored.json");
+    let metadata_path = runtime_dir.join(RUNTIME_METADATA_FILE);
 
-    attempted_actions.push(RepairAction::StaleMetadataCleanup);
-    if metadata_path.exists() && !dry_run {
-        fs::remove_file(&metadata_path).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to remove stale metadata at {}: {e}",
-                metadata_path.display()
-            )
-        })?;
-        changed_file_paths.push(metadata_path);
+    let action = if quarantine {
+        RepairAction::StaleMetadataQuarantine
+    } else {
+        RepairAction::StaleMetadataCleanup
+    };
+    attempted_actions.push(action);
+
+    let before_hash = hash_file(&metadata_path);
+    let planned_or_applied = if apply {
+        RepairActionResult::Applied
+    } else {
+        RepairActionResult::Planned
+    };
+
+    if !metadata_path.exists() {
+        // Nothing to act on: record an honest, deterministic skip.
+        manifest.push(RepairManifestEntry {
+            action,
+            action_time: action_time.to_owned(),
+            result: RepairActionResult::Skipped,
+            original_path: metadata_path,
+            quarantine_path: None,
+            before_metadata_hash: None,
+            after_metadata_hash: None,
+            skipped_reason: Some("metadata_absent".to_owned()),
+        });
+    } else if quarantine {
+        let dest = quarantine_destination(runtime_dir, before_hash.as_deref());
+        if apply {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    anyhow::anyhow!("failed to create quarantine dir {}: {e}", parent.display())
+                })?;
+            }
+            fs::rename(&metadata_path, &dest).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to quarantine stale metadata {} -> {}: {e}",
+                    metadata_path.display(),
+                    dest.display()
+                )
+            })?;
+            changed_file_paths.push(metadata_path.clone());
+        }
+        manifest.push(RepairManifestEntry {
+            action,
+            action_time: action_time.to_owned(),
+            result: planned_or_applied,
+            original_path: metadata_path,
+            quarantine_path: Some(dest),
+            // A move preserves content, so the after-hash equals the before-hash.
+            after_metadata_hash: before_hash.clone(),
+            before_metadata_hash: before_hash,
+            skipped_reason: None,
+        });
+    } else {
+        if apply {
+            fs::remove_file(&metadata_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to remove stale metadata at {}: {e}",
+                    metadata_path.display()
+                )
+            })?;
+            changed_file_paths.push(metadata_path.clone());
+        }
+        manifest.push(RepairManifestEntry {
+            action,
+            action_time: action_time.to_owned(),
+            result: planned_or_applied,
+            original_path: metadata_path,
+            quarantine_path: None,
+            before_metadata_hash: before_hash,
+            // Removal leaves no file: there is no after-hash.
+            after_metadata_hash: None,
+            skipped_reason: None,
+        });
     }
 
     attempted_actions.push(RepairAction::RecoveryReportGeneration);
-    Ok(RepairActions {
+    Ok(RepairExecution {
         attempted_actions,
+        manifest,
         changed_file_paths,
     })
+}
+
+/// BLAKE3 hex of a file's bytes, or `None` if the file is absent/unreadable.
+fn hash_file(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(blake3::hash(&bytes).to_hex().to_string())
+}
+
+/// Deterministic recoverable destination for a quarantined metadata file.
+fn quarantine_destination(runtime_dir: &Path, before_hash: Option<&str>) -> PathBuf {
+    let suffix =
+        before_hash.map_or_else(|| "unknown".to_owned(), |h| h[..h.len().min(16)].to_owned());
+    runtime_dir
+        .join(QUARANTINE_DIR)
+        .join(format!("{RUNTIME_METADATA_FILE}.quarantined-{suffix}"))
+}
+
+/// Resolves the action timestamp: a pinned RFC 3339 value (validated) or the
+/// current wall clock. Pinning makes repair output byte-identical across runs.
+fn resolve_action_time(pinned: Option<&str>) -> Result<String> {
+    match pinned {
+        Some(ts) => {
+            chrono::DateTime::parse_from_rfc3339(ts).map_err(|e| {
+                anyhow::anyhow!("invalid transaction time {ts:?}: must be RFC 3339: {e}")
+            })?;
+            Ok(ts.to_owned())
+        }
+        None => Ok(now_rfc3339()),
+    }
 }
 
 /// Outcome of inspecting a data directory's ownership state.
