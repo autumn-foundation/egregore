@@ -170,7 +170,13 @@ fn seed_graph() -> Graph {
     let _dup2 = symbol(&mut graph, "src/dup2.rs", "dup", (5, 8));
 
     // alpha's outbound dependency edges.
-    edge(&mut graph, EdgeLabel::Calls, &alpha, &beta, "alpha calls beta");
+    edge(
+        &mut graph,
+        EdgeLabel::Calls,
+        &alpha,
+        &beta,
+        "alpha calls beta",
+    );
     // Give the CALLS edge a resolution so deps prints resolution status.
     graph.push(
         GraphRecord::edge(
@@ -230,11 +236,7 @@ fn run_lane(graph: &Path, args: &[&str]) -> (Vec<u8>, i32) {
 }
 
 fn build_index(graph: &Path) {
-    egregore()
-        .args(["index"])
-        .arg(graph)
-        .assert()
-        .success();
+    egregore().args(["index"]).arg(graph).assert().success();
 }
 
 /// The core assertion: a lane's stdout + exit code are byte-identical cold vs

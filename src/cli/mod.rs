@@ -4578,17 +4578,13 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // unscoped `query symbol <name>`; `--repo`/`--at`/`--as-of` and
             // freshness stamping (`--repo-path`) need global topology or the
             // commit timeline and stay cold.
-            let selector = if repo.is_none()
-                && at.is_none()
-                && as_of.is_none()
-                && repo_path.is_none()
-            {
-                symbol_handle_selector(&name)
-            } else {
-                crate::graph_index::Selector::Whole
-            };
-            let records =
-                load_records_selected(graph.as_deref(), data_dir.as_deref(), &selector)?;
+            let selector =
+                if repo.is_none() && at.is_none() && as_of.is_none() && repo_path.is_none() {
+                    symbol_handle_selector(&name)
+                } else {
+                    crate::graph_index::Selector::Whole
+                };
+            let records = load_records_selected(graph.as_deref(), data_dir.as_deref(), &selector)?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             let selected = selected.as_deref();
@@ -4870,8 +4866,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             } else {
                 crate::graph_index::Selector::Whole
             };
-            let records =
-                load_records_selected(graph.as_deref(), data_dir.as_deref(), &selector)?;
+            let records = load_records_selected(graph.as_deref(), data_dir.as_deref(), &selector)?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             let freshness_code = query_freshness_code_with_hint(
@@ -4985,8 +4980,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             } else {
                 crate::graph_index::Selector::Whole
             };
-            let records =
-                load_records_selected(graph.as_deref(), data_dir.as_deref(), &selector)?;
+            let records = load_records_selected(graph.as_deref(), data_dir.as_deref(), &selector)?;
             // Pre-compute the context owner so the freshness hint matches the
             // repository that actually owns the returned source facts.  Without this,
             // `query_freshness_code` auto-detects the identity from `repo_path`, which
@@ -5279,13 +5273,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 // Sidecar-index fast path (issue #447) for the plain
                 // current-state, unscoped query; `--repo`/`--at`/`--as-of` need
                 // global topology / commit timelines and stay cold.
-                (Some(graph_path), None)
-                    if repo.is_none() && at.is_none() && as_of.is_none() =>
-                {
-                    load_records_from_jsonl_selected(
-                        graph_path,
-                        &symbol_handle_selector(&handle),
-                    )?
+                (Some(graph_path), None) if repo.is_none() && at.is_none() && as_of.is_none() => {
+                    load_records_from_jsonl_selected(graph_path, &symbol_handle_selector(&handle))?
                 }
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
@@ -5919,9 +5908,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 // Sidecar-index fast path (issue #447): a file's spans are a
                 // `ByPath` closure. `--repo`/`--at`/`--as-of` need global
                 // topology / the commit timeline and stay cold.
-                (Some(graph_path), None)
-                    if repo.is_none() && at.is_none() && as_of.is_none() =>
-                {
+                (Some(graph_path), None) if repo.is_none() && at.is_none() && as_of.is_none() => {
                     load_records_from_jsonl_selected(
                         graph_path,
                         &crate::graph_index::Selector::ByPath(path.to_owned()),

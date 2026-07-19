@@ -585,7 +585,10 @@ fn read_record_at(graph_bytes: &[u8], offset: u64) -> Option<GraphRecord> {
 
 /// Adds one record's contribution to the index maps at `offset`.
 fn index_record(body: &mut GraphIndexBody, record: &GraphRecord, offset: u64) {
-    body.by_id.entry(record.id().to_owned()).or_default().push(offset);
+    body.by_id
+        .entry(record.id().to_owned())
+        .or_default()
+        .push(offset);
     match record {
         GraphRecord::Node {
             id,
@@ -606,9 +609,7 @@ fn index_record(body: &mut GraphIndexBody, record: &GraphRecord, offset: u64) {
             }
             let _ = id;
         }
-        GraphRecord::Edge {
-            source, target, ..
-        } => {
+        GraphRecord::Edge { source, target, .. } => {
             body.adjacency
                 .entry(source.clone())
                 .or_default()
@@ -968,7 +969,11 @@ mod tests {
         let g = sample_graph();
         let text = jsonl(&g);
         let index = GraphIndex::build_from_bytes(text.as_bytes()).expect("build");
-        assert!(index.closure_offsets(&Selector::Whole, text.as_bytes()).is_none());
+        assert!(
+            index
+                .closure_offsets(&Selector::Whole, text.as_bytes())
+                .is_none()
+        );
     }
 
     #[test]
@@ -1000,7 +1005,10 @@ mod tests {
         assert!(index.body.by_deleted_id.contains_key("codegraph:v6:ghost"));
         // ById on the deleted id still pulls the tombstone.
         let offsets = index
-            .closure_offsets(&Selector::ById("codegraph:v6:ghost".to_owned()), text.as_bytes())
+            .closure_offsets(
+                &Selector::ById("codegraph:v6:ghost".to_owned()),
+                text.as_bytes(),
+            )
             .expect("offsets");
         assert_eq!(offsets.len(), 1);
     }

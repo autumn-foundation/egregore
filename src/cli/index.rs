@@ -29,12 +29,9 @@ pub(crate) fn index_cmd(graph: &Path) -> Result<()> {
     };
 
     let index_path = index_path_for(graph);
-    index.write_atomic(&index_path).with_context(|| {
-        format!(
-            "failed to write sidecar index to {}",
-            index_path.display()
-        )
-    })?;
+    index
+        .write_atomic(&index_path)
+        .with_context(|| format!("failed to write sidecar index to {}", index_path.display()))?;
 
     let summary = serde_json::json!({
         "ok": true,
