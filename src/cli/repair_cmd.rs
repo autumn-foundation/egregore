@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use super::*;
 
 use crate::repair::{PreflightReport, RepairOptions, RepairSessionReport};
@@ -54,31 +56,30 @@ pub(crate) fn repair_cmd(action: RepairCliAction) -> Result<()> {
 #[cfg(feature = "embedded-aletheiadb")]
 fn render_preflight_text(report: &PreflightReport) -> String {
     let mut out = String::new();
-    out.push_str("repair preflight\n");
-    out.push_str(&format!("  data_dir: {}\n", report.data_dir.display()));
-    out.push_str(&format!(
-        "  runtime_dir: {}\n",
-        report.runtime_dir.display()
-    ));
-    out.push_str(&format!(
-        "  ownership_verdict: {}\n",
+    let _ = writeln!(out, "repair preflight");
+    let _ = writeln!(out, "  data_dir: {}", report.data_dir.display());
+    let _ = writeln!(out, "  runtime_dir: {}", report.runtime_dir.display());
+    let _ = writeln!(
+        out,
+        "  ownership_verdict: {}",
         verdict_str(&report.ownership_verdict)
-    ));
-    out.push_str(&format!("  allow: {}\n", report.allow));
-    out.push_str(&format!("  repair_needed: {}\n", report.repair_needed));
+    );
+    let _ = writeln!(out, "  allow: {}", report.allow);
+    let _ = writeln!(out, "  repair_needed: {}", report.repair_needed);
     if let Some(status) = &report.before_daemon_status {
-        out.push_str(&format!("  daemon_state: {}\n", status.state));
+        let _ = writeln!(out, "  daemon_state: {}", status.state);
     }
     if report.refusal_reasons.is_empty() {
         out.push_str("  refusal_reasons: none\n");
     } else {
-        out.push_str(&format!(
-            "  refusal_reasons: {}\n",
+        let _ = writeln!(
+            out,
+            "  refusal_reasons: {}",
             join_codes(&report.refusal_reasons)
-        ));
+        );
     }
     if let Some(cmd) = &report.safe_daemon_command {
-        out.push_str(&format!("  next: {cmd}\n"));
+        let _ = writeln!(out, "  next: {cmd}");
     }
     out
 }
@@ -87,55 +88,52 @@ fn render_preflight_text(report: &PreflightReport) -> String {
 #[cfg(feature = "embedded-aletheiadb")]
 fn render_run_text(report: &RepairSessionReport) -> String {
     let mut out = String::new();
-    out.push_str("repair run\n");
-    out.push_str(&format!("  data_dir: {}\n", report.data_dir.display()));
-    out.push_str(&format!(
-        "  runtime_dir: {}\n",
-        report.runtime_dir.display()
-    ));
-    out.push_str(&format!(
-        "  ownership_verdict: {}\n",
+    let _ = writeln!(out, "repair run");
+    let _ = writeln!(out, "  data_dir: {}", report.data_dir.display());
+    let _ = writeln!(out, "  runtime_dir: {}", report.runtime_dir.display());
+    let _ = writeln!(
+        out,
+        "  ownership_verdict: {}",
         verdict_str(&report.ownership_verdict)
-    ));
-    out.push_str(&format!("  dry_run: {}\n", report.dry_run));
-    out.push_str(&format!(
-        "  result: {}\n",
-        serde_json::to_value(&report.result)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .unwrap_or_default()
-    ));
+    );
+    let _ = writeln!(out, "  dry_run: {}", report.dry_run);
+    let _ = writeln!(out, "  result: {}", enum_str(&report.result));
     if let Some(after) = &report.after_ownership_verdict {
-        out.push_str(&format!(
-            "  after_ownership_verdict: {}\n",
-            verdict_str(after)
-        ));
+        let _ = writeln!(out, "  after_ownership_verdict: {}", verdict_str(after));
     }
     if report.changed_file_paths.is_empty() {
         out.push_str("  changed_files: none\n");
     } else {
         for path in &report.changed_file_paths {
-            out.push_str(&format!("  changed_file: {}\n", path.display()));
+            let _ = writeln!(out, "  changed_file: {}", path.display());
         }
     }
     for entry in &report.manifest {
-        let action = serde_json::to_value(entry.action)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .unwrap_or_default();
-        let result = serde_json::to_value(entry.result)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .unwrap_or_default();
-        out.push_str(&format!("  manifest: {action} [{result}]\n"));
+        let _ = writeln!(
+            out,
+            "  manifest: {} [{}]",
+            enum_str(&entry.action),
+            enum_str(&entry.result)
+        );
     }
     if !report.refusal_reasons.is_empty() {
-        out.push_str(&format!(
-            "  refusal_reasons: {}\n",
+        let _ = writeln!(
+            out,
+            "  refusal_reasons: {}",
             join_codes(&report.refusal_reasons)
-        ));
+        );
     }
     out
+}
+
+/// Renders any `#[serde(rename_all = "snake_case")]` unit enum as its stable
+/// wire string.
+#[cfg(feature = "embedded-aletheiadb")]
+fn enum_str<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 #[cfg(feature = "embedded-aletheiadb")]

@@ -447,26 +447,19 @@ pub fn run_repair_with(data_dir: &Path, opts: &RepairOptions) -> Result<RepairSe
     // short-circuits BEFORE the confirmation gate because a store with nothing
     // to repair has nothing to confirm.
     if verdict == OwnershipVerdict::Stopped {
-        return Ok(RepairSessionReport {
-            schema_version: REPAIR_SCHEMA_VERSION,
+        return Ok(non_mutating_report(NonMutatingReport {
             data_dir: data_dir.to_path_buf(),
             runtime_dir,
-            ownership_verdict: verdict.clone(),
+            after_ownership_verdict: Some(verdict.clone()),
+            verdict,
             dry_run: opts.dry_run,
-            started_at: started_at.clone(),
-            ended_at: started_at,
+            at: started_at,
             result: RepairSessionResult::NoRepairNeeded,
             before_daemon_status,
-            after_daemon_status: None,
             before_inspect_summary,
-            after_inspect_summary: None,
             attempted_actions: vec![],
-            skipped_actions: vec![],
-            changed_file_paths: vec![],
             manifest: vec![],
-            after_ownership_verdict: Some(verdict),
-            refusal_reasons: vec![],
-        });
+        }));
     }
 
     // From here the verdict is StaleNoOwner: a repair is actually needed. The
@@ -490,28 +483,21 @@ pub fn run_repair_with(data_dir: &Path, opts: &RepairOptions) -> Result<RepairSe
         let RepairExecution {
             attempted_actions,
             manifest,
-            changed_file_paths,
+            changed_file_paths: _,
         } = repair_actions(&runtime_dir, opts.quarantine, &started_at, false)?;
-        return Ok(RepairSessionReport {
-            schema_version: REPAIR_SCHEMA_VERSION,
+        return Ok(non_mutating_report(NonMutatingReport {
             data_dir: data_dir.to_path_buf(),
             runtime_dir,
-            ownership_verdict: verdict,
+            verdict,
             dry_run: true,
-            started_at: started_at.clone(),
-            ended_at: started_at,
+            at: started_at,
             result: RepairSessionResult::DryRun,
             before_daemon_status,
-            after_daemon_status: None,
             before_inspect_summary,
-            after_inspect_summary: None,
             attempted_actions,
-            skipped_actions: vec![],
-            changed_file_paths,
             manifest,
             after_ownership_verdict: None,
-            refusal_reasons: vec![],
-        });
+        }));
     }
 
     // Confirmed repair runs under the exclusive store lease.
@@ -554,6 +540,47 @@ struct RefusedReport {
     before_daemon_status: Option<DaemonStatusSnapshot>,
     before_inspect_summary: Option<InspectSummary>,
     refusal_reasons: Vec<RepairRefusalCode>,
+}
+
+/// Inputs for a zero-mutation outcome report (no-repair-needed or dry-run).
+struct NonMutatingReport {
+    data_dir: PathBuf,
+    runtime_dir: PathBuf,
+    verdict: OwnershipVerdict,
+    dry_run: bool,
+    at: String,
+    result: RepairSessionResult,
+    before_daemon_status: Option<DaemonStatusSnapshot>,
+    before_inspect_summary: Option<InspectSummary>,
+    attempted_actions: Vec<RepairAction>,
+    manifest: Vec<RepairManifestEntry>,
+    after_ownership_verdict: Option<OwnershipVerdict>,
+}
+
+/// Builds a zero-mutation outcome report. Shared by the healthy-stopped
+/// (`no_repair_needed`) and dry-run paths — neither creates, modifies, or
+/// deletes any file.
+fn non_mutating_report(r: NonMutatingReport) -> RepairSessionReport {
+    RepairSessionReport {
+        schema_version: REPAIR_SCHEMA_VERSION,
+        data_dir: r.data_dir,
+        runtime_dir: r.runtime_dir,
+        ownership_verdict: r.verdict,
+        dry_run: r.dry_run,
+        started_at: r.at.clone(),
+        ended_at: r.at,
+        result: r.result,
+        before_daemon_status: r.before_daemon_status,
+        after_daemon_status: None,
+        before_inspect_summary: r.before_inspect_summary,
+        after_inspect_summary: None,
+        attempted_actions: r.attempted_actions,
+        skipped_actions: vec![],
+        changed_file_paths: vec![],
+        manifest: r.manifest,
+        after_ownership_verdict: r.after_ownership_verdict,
+        refusal_reasons: vec![],
+    }
 }
 
 /// Builds a zero-mutation refusal report.
