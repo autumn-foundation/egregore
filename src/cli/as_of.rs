@@ -39,6 +39,13 @@ pub(crate) fn query_symbol_as_of(
                 .filter_map(|r| symbol_result(r, name, index, records, &deleted))
                 .collect();
             stamp_freshness(&mut symbol_results, freshness_code);
+            // `--as-of` pins a single valid-time instant: the corpus is
+            // commit-pinned, chosen by the selector (issue #427).
+            stamp_symbol_corpus(
+                &mut symbol_results,
+                query::CorpusMode::CommitPinned,
+                query::CorpusModeSource::Selector,
+            );
             for result in &symbol_results {
                 print_result(result, format)?;
             }

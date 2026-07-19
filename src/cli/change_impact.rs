@@ -63,6 +63,13 @@ pub(crate) struct ChangeImpactResponse<'a> {
     depth: usize,
     /// Per-response disclaimer: rows are LEADS, not proof (AC5).
     disclaimer: &'static str,
+    /// Corpus the current-state view read (issue #427):
+    /// `union` over a scan-history store, `single_snapshot` over a plain scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
     direct_callers: Vec<ImpactLeadJson<'a>>,
     direct_callees: Vec<ImpactLeadJson<'a>>,
     referencing_files: Vec<ImpactLeadJson<'a>>,
@@ -248,6 +255,9 @@ pub(crate) fn query_change_impact_cmd(
         })
         .collect();
 
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        query::disclose_corpus(records, query::CorpusMode::Union);
+
     let response = ChangeImpactResponse {
         ok: true,
         handle,
@@ -255,6 +265,9 @@ pub(crate) fn query_change_impact_cmd(
         target_ids: ctx.target_ids.iter().map(String::as_str).collect(),
         depth: ctx.depth,
         disclaimer: IMPACT_DISCLAIMER,
+        corpus_mode: corpus_mode.as_str(),
+        corpus_mode_source: corpus_mode_source.as_str(),
+        corpus_disclaimer,
         direct_callers: ctx
             .direct_callers
             .iter()

@@ -192,6 +192,39 @@ pub fn store_has_source_snapshot(records: &[GraphRecord]) -> bool {
     !collect_repo_heads(records).is_empty()
 }
 
+/// Discloses the corpus a lane actually read, WITHOUT changing its behavior
+/// (issue #427, disclosure-only wave).
+///
+/// This is for "latent Category-A" lanes: lanes designed as current-state that
+/// today read the UNION over a scan-history store. They gain no `--at-head`/
+/// `--all-history` flags this wave — they only become HONEST by disclosing the
+/// corpus they read. `history_behavior` is what the lane does over a
+/// scan-history store today (`Union` for these lanes).
+///
+/// Rule: over a snapshot-less store (plain `scan`, or any store with no
+/// `Repository` `source_snapshot`) the store is a single snapshot where
+/// head == union, so the disclosure is [`CorpusMode::SingleSnapshot`].
+/// Otherwise the disclosure is `history_behavior` (the corpus the lane actually
+/// traverses). The source is always [`CorpusModeSource::Default`]; a lane with
+/// an `--at`/`--as-of` selector in effect discloses `CommitPinned` +
+/// [`CorpusModeSource::Selector`] itself rather than calling this helper.
+#[must_use]
+pub fn disclose_corpus(
+    records: &[GraphRecord],
+    history_behavior: CorpusMode,
+) -> (CorpusMode, CorpusModeSource, String) {
+    let mode = if store_has_source_snapshot(records) {
+        history_behavior
+    } else {
+        CorpusMode::SingleSnapshot
+    };
+    (
+        mode,
+        CorpusModeSource::Default,
+        mode.disclaimer().to_owned(),
+    )
+}
+
 /// Computes the set of record IDs that are NOT part of a store's current HEAD
 /// state (issue #427), for current-state code lanes that head-anchor by default.
 ///
@@ -941,5 +974,33 @@ mod corpus_tests {
         ));
         let index = RepositoryIndex::build(&records);
         assert!(!non_head_current_record_ids(&records, &index).contains("codegraph:v5:notemporal"));
+    }
+
+    // ── disclose_corpus ─────────────────────────────────────────────────────
+    #[test]
+    fn disclose_corpus_snapshotless_is_single_snapshot() {
+        // A plain scan / snapshot-less store: head == union, disclose single.
+        let records = vec![
+            sym("codegraph:v5:a", "a", C1, T1),
+            sym("codegraph:v5:b", "b", C2, T2),
+        ];
+        let (mode, source, disclaimer) = disclose_corpus(&records, CorpusMode::Union);
+        assert_eq!(mode, CorpusMode::SingleSnapshot);
+        assert_eq!(source, CorpusModeSource::Default);
+        assert_eq!(disclaimer, CorpusMode::SingleSnapshot.disclaimer());
+    }
+
+    #[test]
+    fn disclose_corpus_with_snapshot_is_history_behavior() {
+        // A scan-history store with a source_snapshot: disclose the corpus the
+        // lane actually reads (Union for latent Cat-A lanes).
+        let records = vec![
+            repo_node("codegraph:v5:repo", Some(C2)),
+            sym("codegraph:v5:a", "a", C1, T1),
+        ];
+        let (mode, source, disclaimer) = disclose_corpus(&records, CorpusMode::Union);
+        assert_eq!(mode, CorpusMode::Union);
+        assert_eq!(source, CorpusModeSource::Default);
+        assert_eq!(disclaimer, CorpusMode::Union.disclaimer());
     }
 }

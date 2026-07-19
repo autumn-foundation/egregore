@@ -159,6 +159,9 @@ pub(crate) fn query_subsystem_cmd(
         })
         .collect();
 
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        query::disclose_corpus(records, query::CorpusMode::Union);
+
     let response = SubsystemResponse {
         ok: true,
         prefix: ctx.prefix.as_str(),
@@ -172,6 +175,9 @@ pub(crate) fn query_subsystem_cmd(
         log_signatures,
         unresolved,
         excluded,
+        corpus_mode: corpus_mode.as_str(),
+        corpus_mode_source: corpus_mode_source.as_str(),
+        corpus_disclaimer,
     };
 
     let output =

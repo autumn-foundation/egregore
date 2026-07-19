@@ -129,6 +129,9 @@ pub(crate) fn query_failures_cmd(
         + superseding_successes.len()
         + patch_artifacts.len();
 
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        query::disclose_corpus(records, query::CorpusMode::Union);
+
     let response = FailureHistoryResponse {
         ok: true,
         target_handle: handle,
@@ -146,6 +149,9 @@ pub(crate) fn query_failures_cmd(
             has_more: false,
             returned,
         },
+        corpus_mode: corpus_mode.as_str(),
+        corpus_mode_source: corpus_mode_source.as_str(),
+        corpus_disclaimer,
     };
 
     let output =

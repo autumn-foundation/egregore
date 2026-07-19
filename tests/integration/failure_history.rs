@@ -446,6 +446,16 @@ fn by_symbol_id_returns_both_agent_failures_and_runtime_failure() {
     assert_eq!(v["ok"], true);
     assert_eq!(v["target_type"], "symbol");
 
+    // Corpus disclosure (issue #427): a snapshot-less graph discloses a single
+    // snapshot (this lane reads the union over a scan-history store).
+    assert_eq!(v["corpus_mode"], "single_snapshot");
+    assert_eq!(v["corpus_mode_source"], "default");
+    assert!(
+        v["corpus_disclaimer"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty())
+    );
+
     let agent = v["agent_failures"]
         .as_array()
         .expect("agent_failures array");

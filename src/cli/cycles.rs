@@ -100,6 +100,13 @@ pub(crate) struct CyclesResponse<'a> {
     cycles: Vec<DependencyCycleJson<'a>>,
     counts: CycleCountsJson,
     diagnostics: Vec<CycleDiagnosticJson<'a>>,
+    /// Corpus the current-state view read (issue #427):
+    /// `union` over a scan-history store, `single_snapshot` over a plain scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 pub(crate) const CYCLES_EDGE_POLICY: &str = "resolved CALLS edges and imports name-resolving to exactly one in-repo defining file \
@@ -188,6 +195,9 @@ pub(crate) fn query_cycles_cmd(
 
     let ctx = query::dependency_cycles(records, index, repo_scope, scope_target.as_ref());
 
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        query::disclose_corpus(records, query::CorpusMode::Union);
+
     match format {
         OutputFormat::Json => {
             let response = CyclesResponse {
@@ -261,6 +271,9 @@ pub(crate) fn query_cycles_cmd(
                         detail: &d.detail,
                     })
                     .collect(),
+                corpus_mode: corpus_mode.as_str(),
+                corpus_mode_source: corpus_mode_source.as_str(),
+                corpus_disclaimer,
             };
             let output = serde_json::to_string_pretty(&response)
                 .context("failed to serialize dependency cycles")?;
@@ -283,6 +296,7 @@ pub(crate) fn query_cycles_cmd(
             for d in &ctx.diagnostics {
                 println!("[{}] {}", d.code, d.detail);
             }
+            println!("corpus: {}", corpus_mode.as_str());
         }
     }
     Ok(())

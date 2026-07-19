@@ -3864,6 +3864,56 @@ pub(crate) struct SymbolResult<'a> {
     extraction_completeness: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<Vec<DiagnosticRef<'a>>>,
+    /// Corpus this row was read from (issue #427). Present only on the
+    /// `query symbol` lane (stamped by [`stamp_symbol_corpus`]); absent on the
+    /// shared `query symbols` partial-name lane so its row shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corpus_mode: Option<&'static str>,
+    /// How the corpus mode was chosen (`default`/`selector`). Present only with
+    /// `corpus_mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corpus_mode_source: Option<&'static str>,
+    /// One-line human description of the corpus that was read. Present only with
+    /// `corpus_mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corpus_disclaimer: Option<String>,
+}
+
+/// Resolves the corpus-disclosure triple for a lane whose only temporal
+/// selector is `--at` (issue #427): `commit_pinned` + `selector` when `at` is
+/// set, otherwise the [`query::disclose_corpus`] default (`union` over a
+/// scan-history store, `single_snapshot` over a plain scan).
+pub(crate) fn disclose_scoped_corpus(
+    records: &[GraphRecord],
+    at: Option<&str>,
+) -> (&'static str, &'static str, String) {
+    if at.is_some() {
+        let mode = query::CorpusMode::CommitPinned;
+        (
+            mode.as_str(),
+            query::CorpusModeSource::Selector.as_str(),
+            mode.disclaimer().to_owned(),
+        )
+    } else {
+        let (mode, source, disclaimer) = query::disclose_corpus(records, query::CorpusMode::Union);
+        (mode.as_str(), source.as_str(), disclaimer)
+    }
+}
+
+/// Stamps corpus-disclosure fields (issue #427) onto every `query symbol` row.
+///
+/// The `query symbol` lane emits bare NDJSON rows with no summary envelope, so
+/// the disclosure rides each row. All rows in one query share the same corpus.
+pub(crate) fn stamp_symbol_corpus(
+    results: &mut [SymbolResult<'_>],
+    mode: query::CorpusMode,
+    source: query::CorpusModeSource,
+) {
+    for row in results.iter_mut() {
+        row.corpus_mode = Some(mode.as_str());
+        row.corpus_mode_source = Some(source.as_str());
+        row.corpus_disclaimer = Some(mode.disclaimer().to_owned());
+    }
 }
 
 pub(crate) fn get_file_diagnostics<'a>(
@@ -4092,6 +4142,13 @@ pub(crate) struct ContextResponse<'a> {
     unresolved: Vec<ContextUnresolved<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     excluded: Vec<ExcludedDiagnostic<'a>>,
+    /// Corpus the current-state view read (issue #427):
+    /// `union` over a scan-history store, `single_snapshot` over a plain scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 /// Full task context query response envelope.
@@ -4176,6 +4233,13 @@ pub(crate) struct SubsystemResponse<'a> {
     unresolved: Vec<ContextUnresolved<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     excluded: Vec<ExcludedDiagnostic<'a>>,
+    /// Corpus the current-state view read (issue #427):
+    /// `union` over a scan-history store, `single_snapshot` over a plain scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -4450,6 +4514,13 @@ pub(crate) struct FailureHistoryResponse<'a> {
     agents: Vec<&'a str>,
     diagnostics: Vec<AuditDiagnostic<'a>>,
     page: AuditPage,
+    /// Corpus the current-state view read (issue #427):
+    /// `union` over a scan-history store, `single_snapshot` over a plain scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 // ---------------------------------------------------------------------------

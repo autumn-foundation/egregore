@@ -131,6 +131,9 @@ pub(crate) fn query_file(
             } else {
                 None
             },
+            corpus_mode: None,
+            corpus_mode_source: None,
+            corpus_disclaimer: None,
         });
     }
 
