@@ -1,0 +1,5 @@
+{"type":"suite","event":"started","test_count":2}
+{"type":"test","event":"started","name":"mini_crate::test_alpha"}
+{"type":"test","name":"mini_crate::test_alpha","event":"ok"}
+{"type":"test","event":"started","name":"mini_crate::test_gamma"}
+{"type":"test","name":"mini_crate::test_gamma","event":"ok"}

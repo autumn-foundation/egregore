@@ -11,6 +11,7 @@ mod antigravity;
 mod asof_file_symbols;
 mod author_attribution_doc;
 mod bundle;
+mod capture_tests;
 mod change_impact;
 mod changes_query;
 mod citation_audit;

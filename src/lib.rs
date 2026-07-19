@@ -97,6 +97,8 @@ pub mod schema_version;
 pub mod semantic_eval;
 /// Transitive memory supersession and contradiction resolution (issue #92).
 pub mod temporal_status;
+/// Capture `cargo test` / libtest JSON runs as citable `TestRun` records (issue #165).
+pub mod test_capture;
 /// Query-answer token-cost measurement against the ripgrep baseline (issue #84).
 pub mod token_cost;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
