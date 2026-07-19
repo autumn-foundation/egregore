@@ -539,13 +539,13 @@ pub fn location_context<'a>(
     index: &'a RepositoryIndex,
     repo_scope: Option<&str>,
 ) -> LocationContext<'a> {
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect();
+    // Latest-write-wins liveness (issue #432): over an append-only `--graph` a
+    // Symbol/Module/File re-ingested AFTER its own tombstone is live again. The
+    // shared gate reports a tombstone active only when it is the id's most recent
+    // write, matching the embedded current-state read so `--graph` and
+    // `--data-dir` agree. This is an orthogonal filter composed WITH the
+    // head-anchor gate (`non_head_current`) below, not a replacement for it.
+    let liveness = super::liveness::Liveness::new(records);
     let is_owned =
         |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
 
@@ -591,7 +591,7 @@ pub fn location_context<'a>(
                 continue;
             }
         } else {
-            if tombstoned.contains(id.as_str()) {
+            if liveness.deleted(id.as_str()) {
                 continue;
             }
             if non_head_current
@@ -675,4 +675,56 @@ pub fn location_context<'a>(
         .copied();
 
     ctx
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    use crate::ir::SCHEMA_VERSION;
+
+    fn symbol(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 100,
+                start_line: 10,
+                end_line: 20,
+            }),
+            Some("target_fn".to_owned()),
+            "fn target_fn".to_owned(),
+        )
+    }
+
+    fn tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v{SCHEMA_VERSION}:tomb-{deleted_id}"),
+            schema_version: SCHEMA_VERSION,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn symbol_reingested_after_tombstone_is_located() {
+        // Append-only `--graph`: a Symbol re-ingested AFTER its own tombstone is
+        // live again, matching the coalesced `--data-dir` read (issue #432).
+        let sym_id = "codegraph:v1:sym-fap";
+        let records = vec![symbol(sym_id), tombstone(sym_id), symbol(sym_id)];
+        let index = RepositoryIndex::build(&records);
+        let ctx = location_context(&records, "src/lib.rs", 15, None, &index, None);
+        assert_eq!(ctx.primary.map(GraphRecord::id), Some(sym_id));
+    }
+
+    #[test]
+    fn symbol_tombstoned_without_reingest_stays_deleted() {
+        let sym_id = "codegraph:v1:sym-fap";
+        let records = vec![symbol(sym_id), tombstone(sym_id)];
+        let index = RepositoryIndex::build(&records);
+        let ctx = location_context(&records, "src/lib.rs", 15, None, &index, None);
+        assert!(ctx.primary.is_none());
+    }
 }
