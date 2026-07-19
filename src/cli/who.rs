@@ -13,8 +13,14 @@ impl PrintText for WhoResult<'_> {
             .freshness
             .map_or(String::new(), |code| format!(" (freshness: {code})"));
         format!(
-            "{} last changed by {} in commit {} @ {} ({}){}",
-            self.symbol_name, author, self.commit_sha, self.valid_time, path, freshness
+            "{} last changed by {} in commit {} @ {} ({}){}\ncorpus: {}",
+            self.symbol_name,
+            author,
+            self.commit_sha,
+            self.valid_time,
+            path,
+            freshness,
+            self.corpus_mode
         )
     }
 }

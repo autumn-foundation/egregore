@@ -105,6 +105,11 @@ fn query_locate_resolves_innermost_method_with_chain_and_bundle() {
     assert_eq!(parsed["ok"], true);
     assert_eq!(parsed["path"], "src/lib.rs");
     assert_eq!(parsed["line"], 10);
+    // Issue #427: this single-commit scan carries no `source_snapshot`, so the
+    // default view discloses single_snapshot (the shared head-anchor path over a
+    // snapshot-bearing store is covered by the `query at` history tests).
+    assert_eq!(parsed["corpus_mode"], "single_snapshot");
+    assert_eq!(parsed["corpus_mode_source"], "default");
 
     // Innermost: the method, not the impl/module/file.
     let symbol = &parsed["symbol"];
@@ -455,6 +460,9 @@ fn query_locate_at_commit_resolves_span_at_that_commit() {
         parsed["source_facts"].is_array(),
         "bundle present under --at"
     );
+    // Issue #427: a `--at` temporal pin discloses the commit-pinned corpus.
+    assert_eq!(parsed["corpus_mode"], "commit_pinned");
+    assert_eq!(parsed["corpus_mode_source"], "selector");
 
     // … but not at C1, where the symbol lived at lines 1–5: line 12 is beyond
     // the file's last recorded structural span at that commit.

@@ -290,6 +290,11 @@ fn test_query_who_at_selector() {
 
     let text = String::from_utf8(output).expect("utf8");
     assert!(text.contains("scan_repository last changed by Alice <alice@example.com> in commit commit1_sha @ 2026-01-01T00:00:00Z (src/lib.rs)"));
+    // Issue #427: a temporal pin (--at/--as-of) discloses the commit-pinned corpus.
+    assert!(
+        text.contains("corpus: commit_pinned"),
+        "text output must disclose the commit-pinned corpus, got: {text}"
+    );
 }
 
 #[test]
@@ -311,6 +316,11 @@ fn test_query_who_as_of_selector() {
 
     let text = String::from_utf8(output).expect("utf8");
     assert!(text.contains("scan_repository last changed by Alice <alice@example.com> in commit commit1_sha @ 2026-01-01T00:00:00Z (src/lib.rs)"));
+    // Issue #427: a temporal pin (--at/--as-of) discloses the commit-pinned corpus.
+    assert!(
+        text.contains("corpus: commit_pinned"),
+        "text output must disclose the commit-pinned corpus, got: {text}"
+    );
 }
 
 #[test]
@@ -337,6 +347,11 @@ fn test_query_who_json_format() {
     assert_eq!(parsed["author_email"], "bob@example.com");
     assert_eq!(parsed["valid_time"], "2026-01-02T00:00:00Z");
     assert_eq!(parsed["repo_relative_path"], "src/lib.rs");
+    // Issue #427: this fixture carries no `source_snapshot`, so the default
+    // current-state view discloses single_snapshot.
+    assert_eq!(parsed["corpus_mode"], "single_snapshot");
+    assert_eq!(parsed["corpus_mode_source"], "default");
+    assert!(parsed["corpus_disclaimer"].as_str().is_some());
 }
 
 #[test]

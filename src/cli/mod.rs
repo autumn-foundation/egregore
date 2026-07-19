@@ -3900,6 +3900,30 @@ pub(crate) fn disclose_scoped_corpus(
     }
 }
 
+/// Resolves the corpus-disclosure triple for a lane that HEAD-anchors its
+/// current-state view by default (issue #427): `commit_pinned` + `selector`
+/// when a temporal selector (`--at`/`--as-of`) is active, otherwise the
+/// [`query::disclose_corpus`] head-anchored default (`head_anchored` over a
+/// scan-history store carrying a `source_snapshot`, `single_snapshot` over a
+/// plain snapshot-less scan).
+pub(crate) fn disclose_head_anchored_corpus(
+    records: &[GraphRecord],
+    selector_active: bool,
+) -> (&'static str, &'static str, String) {
+    if selector_active {
+        let mode = query::CorpusMode::CommitPinned;
+        (
+            mode.as_str(),
+            query::CorpusModeSource::Selector.as_str(),
+            mode.disclaimer().to_owned(),
+        )
+    } else {
+        let (mode, source, disclaimer) =
+            query::disclose_corpus(records, query::CorpusMode::HeadAnchored);
+        (mode.as_str(), source.as_str(), disclaimer)
+    }
+}
+
 /// Stamps corpus-disclosure fields (issue #427) onto every `query symbol` row.
 ///
 /// The `query symbol` lane emits bare NDJSON rows with no summary envelope, so
@@ -4041,6 +4065,15 @@ pub(crate) struct WhoResult<'a> {
     /// Optional store-freshness code.
     #[serde(skip_serializing_if = "Option::is_none")]
     freshness: Option<&'a str>,
+    /// Corpus this answer was read from (issue #427): `commit_pinned` under
+    /// `--at`/`--as-of`, otherwise `head_anchored` over a scan-history store
+    /// carrying a `source_snapshot`, `single_snapshot` over a plain scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: `selector` under a temporal pin, else
+    /// `default`.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -4863,6 +4896,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         }
                     });
 
+                    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+                        disclose_head_anchored_corpus(&records, at.is_some() || as_of.is_some());
                     let result = WhoResult {
                         symbol_name: &name,
                         commit_sha,
@@ -4871,6 +4906,9 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         valid_time,
                         repo_relative_path,
                         freshness,
+                        corpus_mode,
+                        corpus_mode_source,
+                        corpus_disclaimer,
                     };
                     print_result(&result, format)?;
                     Ok(())
@@ -6085,6 +6123,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 selected.as_deref(),
                 scope.as_deref(),
                 limit,
+                at.is_some(),
                 format,
             )
         }

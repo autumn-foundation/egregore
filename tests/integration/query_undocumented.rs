@@ -136,6 +136,12 @@ fn query_undocumented_exits_0_with_cited_evidence_rows() {
     let parsed = run_undocumented(&graph, &[]);
 
     assert_eq!(parsed["ok"], true, "ok must be true on success");
+    // Issue #427: this single-commit scan carries no `source_snapshot`, so this
+    // lane (which inherits head-anchoring from the public-API surface) discloses
+    // single_snapshot; a snapshot-bearing store would disclose head_anchored.
+    assert_eq!(parsed["corpus_mode"], "single_snapshot");
+    assert_eq!(parsed["corpus_mode_source"], "default");
+    assert!(parsed["corpus_disclaimer"].as_str().is_some());
     let items = parsed["items"].as_array().expect("items array");
     assert!(!items.is_empty(), "fixture must yield undocumented items");
     for it in items {

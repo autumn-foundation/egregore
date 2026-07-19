@@ -730,6 +730,14 @@ fn history_graph_ignores_stale_edges_and_symbols_from_older_commits() {
         Value::String(head_sha),
         "history candidates must cite the HEAD-commit record"
     );
+    // Issue #427: a scan-history store carrying a `source_snapshot` discloses
+    // the head-anchored corpus this current-state lane reads.
+    assert_eq!(
+        parsed["corpus_mode"], "head_anchored",
+        "history store with a source_snapshot discloses head_anchored"
+    );
+    assert_eq!(parsed["corpus_mode_source"], "default");
+    assert!(parsed["corpus_disclaimer"].as_str().is_some());
 }
 
 // ---------------------------------------------------------------------------
