@@ -563,6 +563,59 @@ fn successful_repair_leaves_daemon_start_working() {
 }
 
 // ---------------------------------------------------------------------------
+// SPEC (issue #72 AC "healthy stopped store"): a healthy stopped store must
+// report "no repair needed" and MUST NOT create, modify, or delete any runtime
+// file — not even under --confirm. This is the AC8 regression: the prior impl
+// ran stale_metadata_cleanup for the Stopped verdict too, deleting a healthy
+// stopped store's egregored.json.
+//
+// RED: written against the existing run_repair API. With the prior impl this
+// FAILS at runtime because the confirmed path removes egregored.json for a
+// Stopped verdict.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn confirmed_repair_on_healthy_stopped_store_does_not_mutate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    // Healthy stopped store: metadata with state `stopped`, lock present but not
+    // held (no active owner).
+    write_stopped_metadata(&data_dir);
+
+    let metadata_path = runtime_dir_for_data_dir(&data_dir).join("egregored.json");
+    let before_bytes = fs::read(&metadata_path).expect("stopped metadata must exist");
+
+    let report = run_repair(&data_dir, false, true).expect("run_repair must return a report");
+
+    // The healthy stopped store must be left byte-for-byte untouched.
+    assert!(
+        metadata_path.exists(),
+        "confirmed repair must NOT delete a healthy stopped store's metadata"
+    );
+    let after_bytes = fs::read(&metadata_path).expect("metadata must still exist");
+    assert_eq!(
+        before_bytes, after_bytes,
+        "confirmed repair must not modify a healthy stopped store's metadata"
+    );
+    assert!(
+        report.changed_file_paths.is_empty(),
+        "healthy stopped store repair must change zero files, got {:?}",
+        report.changed_file_paths
+    );
+    // No recovery report or manifest may be created for a healthy stopped store.
+    let runtime_dir = runtime_dir_for_data_dir(&data_dir);
+    assert!(
+        !runtime_dir.join("repair-report.json").exists(),
+        "healthy stopped store repair must not write a recovery report"
+    );
+    assert!(
+        !runtime_dir.join("repair-manifest.json").exists(),
+        "healthy stopped store repair must not write a repair manifest"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // SPEC: AC 8 — embedded ingest blocked when stale crashed metadata exists
 // ---------------------------------------------------------------------------
 
