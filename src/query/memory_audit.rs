@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::liveness::Liveness;
 use crate::ir::{EdgeLabel, GraphRecord, NodeKind};
 
 /// Error returned when resolving a memory record ID or source/session handle.
@@ -308,16 +309,24 @@ pub(crate) type TombstonedSet<'a> = BTreeSet<&'a str>;
 pub(crate) fn verification_support_indexes(
     records: &[GraphRecord],
 ) -> (OutgoingEdgeIndex<'_>, TombstonedSet<'_>) {
+    // Latest-write-wins liveness (issues #421/#432): a record (node or edge)
+    // re-ingested AFTER its own tombstone is live again over an append-only
+    // `--graph`, matching the embedded `--data-dir` read. The `tombstoned` set
+    // retains a deleted_id only while its tombstone is still the id's most recent
+    // write, and edges are keyed to their latest EDGE version so a stale earlier
+    // version never supplies verification-link metadata. See `super::liveness`.
+    let liveness = Liveness::new(records);
     let tombstoned: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| match r {
             GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
             _ => None,
         })
+        .filter(|&id| liveness.deleted(id))
         .collect();
 
     let mut edges_from: BTreeMap<&str, Vec<(&EdgeLabel, &str)>> = BTreeMap::new();
-    for r in records {
+    for (index, r) in records.iter().enumerate() {
         if let GraphRecord::Edge {
             id,
             label,
@@ -326,7 +335,8 @@ pub(crate) fn verification_support_indexes(
             ..
         } = r
         {
-            if !tombstoned.contains(id.as_str()) {
+            if liveness.is_latest_edge_version(id.as_str(), index) && !liveness.deleted(id.as_str())
+            {
                 edges_from
                     .entry(source.as_str())
                     .or_default()
@@ -508,12 +518,20 @@ pub fn resolve_memory_ids(
     // not make a live handle ambiguous. Drop them before counting, but remember
     // whether the handle matched anything at all so a handle that pointed only at
     // deleted claims is reported as `stale_handle`, not `no_match`.
+    //
+    // Latest-write-wins liveness (issues #421/#432): a claim/scope re-ingested
+    // AFTER its own tombstone is live again over an append-only `--graph`, so the
+    // set retains a deleted_id only while its tombstone is still the id's most
+    // recent write — matching the embedded `--data-dir` read. See
+    // `super::liveness`.
+    let liveness = Liveness::new(records);
     let tombstoned: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| match r {
             GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
             _ => None,
         })
+        .filter(|&id| liveness.deleted(id))
         .collect();
 
     // If the queried canonical ID is itself tombstoned — a deleted claim, or a
@@ -585,20 +603,34 @@ pub fn memory_audit_context<'a>(
 ) -> MemoryAuditContext<'a> {
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
 
+    // Latest-write-wins liveness (issues #421/#432): over an append-only
+    // `--graph` a record (node or edge) re-ingested AFTER its own tombstone is
+    // live again, matching the embedded `--data-dir` current-state read. The
+    // shared gate drives both the edge index (only the latest, non-deleted EDGE
+    // version supplies evidence/provenance adjacency) and the `tombstoned` set
+    // below (a deleted_id is retained only while its tombstone is still the id's
+    // most recent write, with the history/temporal exemption). See
+    // `super::liveness`.
+    let liveness = Liveness::new(records);
+
     // Outgoing edges keyed by source ID, for verification detection.
     let mut edges_from: BTreeMap<&str, Vec<(&EdgeLabel, &str)>> = BTreeMap::new();
-    for r in records {
+    for (index, r) in records.iter().enumerate() {
         if let GraphRecord::Edge {
+            id,
             label,
             source,
             target,
             ..
         } = r
         {
-            edges_from
-                .entry(source.as_str())
-                .or_default()
-                .push((label, target.as_str()));
+            if liveness.is_latest_edge_version(id.as_str(), index) && !liveness.deleted(id.as_str())
+            {
+                edges_from
+                    .entry(source.as_str())
+                    .or_default()
+                    .push((label, target.as_str()));
+            }
         }
     }
 
@@ -611,6 +643,7 @@ pub fn memory_audit_context<'a>(
             GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
             _ => None,
         })
+        .filter(|&id| liveness.deleted(id))
         .collect();
     let present = |id: &str| -> Option<&'a GraphRecord> {
         if tombstoned.contains(id) {
@@ -763,8 +796,9 @@ pub fn memory_audit_context<'a>(
         }
 
         // 3) Edges touching the claim node.
-        for r in records {
+        for (index, r) in records.iter().enumerate() {
             let GraphRecord::Edge {
+                id: edge_id,
                 label,
                 source,
                 target,
@@ -773,6 +807,15 @@ pub fn memory_audit_context<'a>(
             else {
                 continue;
             };
+            // Latest-write-wins for edge metadata (issues #421/#432): only the
+            // latest, non-deleted EDGE version of a stable id supplies claim
+            // adjacency, so a superseded or tombstoned-then-revived edge agrees
+            // with the embedded `--data-dir` read. See `super::liveness`.
+            if !liveness.is_latest_edge_version(edge_id.as_str(), index)
+                || liveness.deleted(edge_id.as_str())
+            {
+                continue;
+            }
             let claim_id = claim.id();
             if source == claim_id {
                 // AUTHORED_BY provenance is resolved by the chain walk below;
@@ -975,4 +1018,162 @@ pub fn memory_audit_context<'a>(
     ctx.excluded = excluded.into_values().collect();
     ctx.diagnostics = diagnostics;
     ctx
+}
+
+#[cfg(test)]
+mod liveness_parity_tests {
+    //! Transport-parity regression (issues #421/#432): over an append-only
+    //! `--graph`, a claim, an evidence target, or a verification edge re-ingested
+    //! AFTER its own tombstone is live again — matching the embedded `--data-dir`
+    //! current-state read — while a tombstone with no re-add still deletes its id.
+    use super::*;
+    use crate::ir::SCHEMA_VERSION;
+
+    fn obs(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Observation,
+            None,
+            None,
+            Some("obs".to_owned()),
+            "observation".to_owned(),
+        )
+    }
+
+    fn file(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::File,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("src/lib.rs".to_owned()),
+            "file".to_owned(),
+        )
+    }
+
+    fn verif(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Verification,
+            None,
+            None,
+            Some("v".to_owned()),
+            "verification".to_owned(),
+        )
+    }
+
+    fn edge(label: EdgeLabel, source: &str, target: &str) -> GraphRecord {
+        GraphRecord::edge(
+            label,
+            source.to_owned(),
+            target.to_owned(),
+            None,
+            "edge".to_owned(),
+        )
+    }
+
+    fn tomb(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v6:tomb_{deleted_id}"),
+            schema_version: SCHEMA_VERSION,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    fn canonical(seed: char) -> String {
+        format!("agent_memory:v1:{}", seed.to_string().repeat(64))
+    }
+
+    #[test]
+    fn claim_reingested_after_tombstone_resolves_live() {
+        let id = canonical('a');
+        let records = vec![obs(&id), tomb(&id), obs(&id)];
+        let res = resolve_memory_ids(&records, &id).expect("resolve");
+        assert!(
+            res.matched.contains(id.as_str()),
+            "a claim re-ingested after its tombstone must resolve live"
+        );
+        assert!(!res.tombstoned_only, "a revived claim is not stale-only");
+    }
+
+    #[test]
+    fn claim_tombstone_without_reingest_is_stale() {
+        let id = canonical('a');
+        let records = vec![obs(&id), tomb(&id)];
+        let res = resolve_memory_ids(&records, &id).expect("resolve");
+        assert!(
+            res.matched.is_empty(),
+            "a deleted claim resolves to nothing"
+        );
+        assert!(
+            res.tombstoned_only,
+            "a tombstone with no re-add is reported stale"
+        );
+    }
+
+    #[test]
+    fn revived_evidence_target_is_placed_not_stale() {
+        let claim = "agent_memory:v1:claim1";
+        let f = "codegraph:v6:file1";
+        let records = vec![
+            obs(claim),
+            file(f),
+            edge(EdgeLabel::Observes, claim, f),
+            tomb(f),
+            file(f),
+        ];
+        let ctx = memory_audit_context(&records, claim, false);
+        assert!(
+            ctx.related_code_handles.iter().any(|i| i.record.id() == f),
+            "a revived evidence target must be placed as live evidence"
+        );
+        assert!(
+            !ctx.diagnostics
+                .iter()
+                .any(|d| d.code == "stale_evidence_target"),
+            "a revived evidence target must not be reported stale"
+        );
+    }
+
+    #[test]
+    fn evidence_target_tombstone_without_reingest_stays_stale() {
+        let claim = "agent_memory:v1:claim1";
+        let f = "codegraph:v6:file1";
+        let records = vec![
+            obs(claim),
+            file(f),
+            edge(EdgeLabel::Observes, claim, f),
+            tomb(f),
+        ];
+        let ctx = memory_audit_context(&records, claim, false);
+        assert!(
+            ctx.related_code_handles.is_empty(),
+            "a deleted evidence target must not be placed"
+        );
+        assert!(
+            ctx.diagnostics
+                .iter()
+                .any(|d| d.code == "stale_evidence_target"),
+            "a deleted evidence target is reported stale"
+        );
+    }
+
+    #[test]
+    fn verification_edge_reingested_after_tombstone_confers_verification() {
+        let claim = "agent_memory:v1:claim1";
+        let v = "agent_memory:v1:verif1";
+        let e1 = edge(EdgeLabel::ValidatedBy, claim, v);
+        let edge_id = e1.id().to_owned();
+        let e2 = edge(EdgeLabel::ValidatedBy, claim, v);
+        let records = vec![obs(claim), verif(v), e1, tomb(&edge_id), e2];
+        let (edges_from, tombstoned) = verification_support_indexes(&records);
+        let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+        let claim_node = by_id.get(claim).copied().expect("claim present");
+        assert!(
+            is_verified_claim(claim_node, &by_id, &edges_from, &tombstoned),
+            "a verification edge re-ingested after its tombstone must confer verification"
+        );
+    }
 }
