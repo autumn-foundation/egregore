@@ -6,7 +6,8 @@
 use std::{fs, path::PathBuf};
 
 use aletheia_egregore::{
-    EdgeLabel, GraphRecord, NodeKind, SourceSpan,
+    EdgeLabel, GraphRecord, NodeKind, SnapshotHead, SourceSnapshotPayload, SourceSpan,
+    TemporalMetadata,
     ir::{Graph, stable_id},
 };
 use assert_cmd::Command;
@@ -590,4 +591,269 @@ fn data_dir_query_is_read_only() {
         before, after,
         "querying the embedded store must not create, modify, or delete any store file"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #427 — corpus-mode default (HEAD-anchored) vs opt-in union.
+//
+// who-imports has NO --at/--as-of selector, so there is no commit-pinned
+// corpus. Over a `scan-history` store carrying a `source_snapshot`, an unpinned
+// query now DEFAULTS to HEAD-anchored (imports current at each repository's
+// stamped HEAD); `--all-history` opts into the union, `--at-head` makes the
+// default explicit.
+// ---------------------------------------------------------------------------
+
+const T1: &str = "2026-01-01T00:00:00Z";
+const T2: &str = "2026-02-01T00:00:00Z";
+
+fn temporal(commit: &str, vt: &str) -> TemporalMetadata {
+    TemporalMetadata {
+        git_commit: commit.to_owned(),
+        git_parent_commits: Vec::new(),
+        valid_time: vt.to_owned(),
+        author_time: Some(vt.to_owned()),
+        observed_at: vt.to_owned(),
+        valid_time_source: Some("git_commit_committer_date".to_owned()),
+    }
+}
+
+/// Pushes an Import node (with temporal provenance) plus its owning-file
+/// IMPORTS edge, mirroring `scan-history` per-commit records.
+fn hist_import(graph: &mut Graph, path: &str, name: &str, line: usize, commit: &str, vt: &str) {
+    let id = import_id(path, name);
+    graph.push(
+        GraphRecord::syntax_node(
+            id.clone(),
+            NodeKind::Import,
+            path.to_owned(),
+            span(line),
+            name.to_owned(),
+            "rust",
+            format!("Rust import {name}"),
+        )
+        .with_temporal(temporal(commit, vt)),
+    );
+    graph.push(
+        GraphRecord::edge(
+            EdgeLabel::Imports,
+            file_id(path),
+            id,
+            None,
+            format!("{path} imports {name}"),
+        )
+        .with_temporal(temporal(commit, vt)),
+    );
+}
+
+/// History fixture WITH a `source_snapshot` HEAD at c2 (`bbbb2222`).
+///
+/// `foo::bar::Kept` (src/keep.rs) is imported at HEAD (c2); `foo::bar::Legacy`
+/// (src/old.rs) is imported only at c1 and removed at HEAD. Head-anchoring must
+/// exclude the legacy import from the default/`--at-head` corpus but the
+/// `--all-history` union keeps it. Returns `(temp, path)`.
+fn seed_history_snapshot() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("who-history-snapshot.jsonl");
+    let mut graph = Graph::new();
+
+    let repo_id = stable_id(&["node", "Repository", "repo-wh427"]);
+    graph.push(
+        GraphRecord::node(
+            repo_id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("repo-wh427".to_owned()),
+            "Repository repo-wh427".to_owned(),
+        )
+        .with_source_snapshot(SourceSnapshotPayload {
+            head: SnapshotHead::Commit {
+                sha: "bbbb2222".to_owned(),
+            },
+            dirty: false,
+            repository_id: repo_id.clone(),
+            scanned_at: T2.to_owned(),
+        }),
+    );
+
+    file(&mut graph, &repo_id, "src/keep.rs");
+    file(&mut graph, &repo_id, "src/old.rs");
+
+    hist_import(
+        &mut graph,
+        "src/keep.rs",
+        "foo::bar::Kept",
+        1,
+        "bbbb2222",
+        T2,
+    );
+    hist_import(
+        &mut graph,
+        "src/old.rs",
+        "foo::bar::Legacy",
+        1,
+        "aaaa1111",
+        T1,
+    );
+
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+    (temp, path)
+}
+
+#[test]
+fn all_history_flag_includes_import_removed_at_head() {
+    let (_t, path) = seed_history_snapshot();
+    let (header, rows) = run_ok(&[
+        "query",
+        "who-imports",
+        "foo::bar",
+        "--graph",
+        path.to_str().unwrap(),
+        "--all-history",
+    ]);
+    assert_eq!(header["corpus_mode"], "union");
+    assert_eq!(header["corpus_mode_source"], "explicit_flag");
+    assert_eq!(
+        header["total_importers"].as_u64(),
+        Some(2),
+        "--all-history keeps the c1 import"
+    );
+    let matched: Vec<&str> = rows
+        .iter()
+        .map(|r| r["import_path"].as_str().unwrap())
+        .collect();
+    assert!(matched.contains(&"foo::bar::Kept"));
+    assert!(matched.contains(&"foo::bar::Legacy"));
+}
+
+#[test]
+fn default_head_anchors_and_excludes_import_removed_at_head() {
+    let (_t, path) = seed_history_snapshot();
+    let (header, rows) = run_ok(&[
+        "query",
+        "who-imports",
+        "foo::bar",
+        "--graph",
+        path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        header["corpus_mode"], "head_anchored",
+        "a snapshot store defaults to head-anchored"
+    );
+    assert_eq!(header["corpus_mode_source"], "default");
+    assert_eq!(
+        header["total_importers"].as_u64(),
+        Some(1),
+        "the deleted-at-HEAD import is excluded under the default"
+    );
+    let matched: Vec<&str> = rows
+        .iter()
+        .map(|r| r["import_path"].as_str().unwrap())
+        .collect();
+    assert!(matched.contains(&"foo::bar::Kept"));
+    assert!(
+        !matched.contains(&"foo::bar::Legacy"),
+        "legacy import removed at HEAD must not appear: {matched:?}"
+    );
+}
+
+#[test]
+fn at_head_flag_matches_default_and_is_explicit() {
+    let (_t, path) = seed_history_snapshot();
+    let (header, rows) = run_ok(&[
+        "query",
+        "who-imports",
+        "foo::bar",
+        "--graph",
+        path.to_str().unwrap(),
+        "--at-head",
+    ]);
+    assert_eq!(header["corpus_mode"], "head_anchored");
+    assert_eq!(
+        header["corpus_mode_source"], "explicit_flag",
+        "--at-head records an explicit selection"
+    );
+    assert_eq!(header["total_importers"].as_u64(), Some(1));
+    let matched: Vec<&str> = rows
+        .iter()
+        .map(|r| r["import_path"].as_str().unwrap())
+        .collect();
+    assert!(!matched.contains(&"foo::bar::Legacy"), "{matched:?}");
+}
+
+#[test]
+fn at_head_with_all_history_is_unsupported() {
+    let (_t, path) = seed_history_snapshot();
+    let assert = egregore()
+        .args([
+            "query",
+            "who-imports",
+            "foo::bar",
+            "--graph",
+            path.to_str().unwrap(),
+            "--at-head",
+            "--all-history",
+        ])
+        .assert()
+        .failure()
+        .code(1);
+    let stdout = assert.get_output().stdout.clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let value: serde_json::Value =
+        serde_json::from_str(out.lines().next().expect("envelope line")).expect("json envelope");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "unsupported_combination");
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn data_dir_and_graph_agree_on_head_anchored_default() {
+    let (_t, path) = seed_history_snapshot();
+    let temp_db = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp_db.path().join("store");
+
+    egregore()
+        .arg("ingest")
+        .arg(&path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let (graph_header, graph_rows) = run_ok(&[
+        "query",
+        "who-imports",
+        "foo::bar",
+        "--graph",
+        path.to_str().unwrap(),
+    ]);
+    let store_stdout = egregore()
+        .args(["query", "who-imports", "foo::bar", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let (store_header, store_rows) = parse_ndjson(&store_stdout);
+
+    assert_eq!(graph_header["corpus_mode"], "head_anchored");
+    assert_eq!(store_header["corpus_mode"], "head_anchored");
+    let ids_of = |rows: &[serde_json::Value]| -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r["import_path"].as_str().map(str::to_owned))
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        ids_of(&graph_rows),
+        ids_of(&store_rows),
+        "graph and store must agree on HEAD state"
+    );
+    let matched = ids_of(&graph_rows);
+    assert!(matched.contains(&"foo::bar::Kept".to_owned()));
+    assert!(!matched.contains(&"foo::bar::Legacy".to_owned()));
 }

@@ -2892,6 +2892,20 @@ pub(crate) enum QuerySubcommand {
         /// Restrict the importer set to one repository in a multi-repo store.
         #[arg(long)]
         repo: Option<String>,
+        /// Corpus selector (issue #427): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding imports removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. who-imports has no --at/--as-of selector; mutually
+        /// exclusive with --all-history (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #427): read the UNION of all commit snapshots
+        /// so an import present only in an earlier commit still appears.
+        /// Mutually exclusive with --at-head (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -6054,6 +6068,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             data_dir,
             crate_name,
             repo,
+            at_head,
+            all_history,
             format,
         } => {
             // Strictly read-only lane: opening the live embedded engine
@@ -6076,6 +6092,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 crate_name.as_deref(),
                 &index,
                 selected.as_deref(),
+                at_head,
+                all_history,
                 format,
             )
         }
