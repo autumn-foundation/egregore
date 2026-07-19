@@ -290,16 +290,13 @@ pub fn public_api_surface<'a>(
     index: &RepositoryIndex,
     repo_scope: Option<&str>,
 ) -> PublicApiSurface<'a> {
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| {
-            if let GraphRecord::Tombstone { deleted_id, .. } = r {
-                Some(deleted_id.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Latest-write-wins liveness (issue #432): over an append-only `--graph` a
+    // Symbol/Module/Import re-ingested AFTER its own tombstone is live again. The
+    // shared gate reports a tombstone active only when it is the id's most recent
+    // write, matching the embedded current-state read so `--graph` and
+    // `--data-dir` agree. This is an orthogonal filter composed WITH the
+    // head-anchor gate (`non_head_current`) below, not a replacement for it.
+    let liveness = super::liveness::Liveness::new(records);
     let is_owned =
         |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
 
@@ -336,9 +333,7 @@ pub fn public_api_surface<'a>(
         if language.as_deref() != Some("rust") {
             continue;
         }
-        if tombstoned.contains(id.as_str())
-            || !is_owned(id)
-            || non_head_current.contains(id.as_str())
+        if liveness.deleted(id.as_str()) || !is_owned(id) || non_head_current.contains(id.as_str())
         {
             continue;
         }
@@ -418,7 +413,10 @@ pub fn public_api_surface<'a>(
             ..
         } = record
         {
-            if !tombstoned.contains(id.as_str()) {
+            // Import edges carry no version-varying metadata (only source/target
+            // topology, keyed by target below), so plain latest-write-wins
+            // liveness is sufficient — no `is_latest_edge_version` needed here.
+            if !liveness.deleted(id.as_str()) {
                 import_owner.insert(target.as_str(), source.as_str());
             }
         }
@@ -627,3 +625,71 @@ pub fn public_api_surface<'a>(
 // ---------------------------------------------------------------------------
 // public-API surface deltas across a commit range (issue #157)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    use crate::ir::SCHEMA_VERSION;
+
+    fn pub_fn(id: &str) -> GraphRecord {
+        let mut n = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 100,
+                start_line: 1,
+                end_line: 3,
+            }),
+            Some("exported_fn".to_owned()),
+            "pub fn exported_fn".to_owned(),
+        )
+        .with_declaration_surface(
+            Some("public".to_owned()),
+            Some("fn exported_fn()".to_owned()),
+            None,
+        );
+        if let GraphRecord::Node {
+            language,
+            symbol_kind,
+            ..
+        } = &mut n
+        {
+            *language = Some("rust".to_owned());
+            *symbol_kind = Some("function".to_owned());
+        }
+        n
+    }
+
+    fn tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v{SCHEMA_VERSION}:tomb-{deleted_id}"),
+            schema_version: SCHEMA_VERSION,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn symbol_reingested_after_tombstone_is_in_surface() {
+        // Append-only `--graph`: a public symbol re-ingested AFTER its own
+        // tombstone is live again, matching the coalesced `--data-dir` read
+        // (issue #432).
+        let id = "codegraph:v1:sym-pa";
+        let records = vec![pub_fn(id), tombstone(id), pub_fn(id)];
+        let index = RepositoryIndex::build(&records);
+        let surface = public_api_surface(&records, &index, None);
+        assert!(surface.items.iter().any(|i| i.record_id == id));
+    }
+
+    #[test]
+    fn symbol_tombstoned_without_reingest_absent() {
+        let id = "codegraph:v1:sym-pa";
+        let records = vec![pub_fn(id), tombstone(id)];
+        let index = RepositoryIndex::build(&records);
+        let surface = public_api_surface(&records, &index, None);
+        assert!(!surface.items.iter().any(|i| i.record_id == id));
+    }
+}
