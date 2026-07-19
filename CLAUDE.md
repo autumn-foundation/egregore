@@ -880,7 +880,7 @@ exit 2, candidates listed). Deterministic and byte-identical under a pinned `--t
 Residual: on a `scan-history` store, commit-anchored temporal code snapshots are re-emitted by the
 current-state read regardless of tombstones (the same wall #231's `--at` honesty relies on), so
 they are a DOCUMENTED residual gap disclosed in the report's `temporal_snapshots_retained` section
-(present in dry-run and `--confirm`), not silently suppressed; follow-up #NNN tracks the full fix.
+(present in dry-run and `--confirm`), not silently suppressed; follow-up #472 tracks the full fix.
 See `docs/cli/forget-repo.md`.
 
 `eg query undocumented` lists externally-reachable public symbols whose captured doc-comment

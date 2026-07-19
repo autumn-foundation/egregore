@@ -181,7 +181,7 @@ preserved; the open question is only the HEAD-anchored current-state read.
 remain visible. On a non-temporal store the section is empty. The
 non-temporal records and the `Repository` identity node are fully evicted; only
 commit-anchored code snapshots persist in current-state code lanes. A follow-up
-issue (#NNN) tracks the full fix (a read-layer distinction or physical purge).
+issue (#472) tracks the full fix (a read-layer distinction or physical purge).
 
 Read-only in dry-run, redaction-safe (record IDs, domains, kinds, handles,
 counts, and the redacted reason/actor only), deterministic and byte-identical
