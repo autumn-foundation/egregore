@@ -3650,6 +3650,10 @@ impl EmbeddedAletheiaSink {
         Ok(record)
     }
 
+    // A long but flat field-by-field edge reconstruction; each optional edge
+    // property (resolution, frame_resolution, frame_index, basis, is_exhaustive,
+    // …) is parsed inline, so the line count exceeds the default lint threshold.
+    #[allow(clippy::too_many_lines)]
     fn read_edge_record_internal(
         &self,
         record_id: &str,
@@ -3738,21 +3742,15 @@ impl EmbeddedAletheiaSink {
                     })
                 })
                 .transpose()?,
-            is_exhaustive: optional_str_property(
+            is_exhaustive: parse_is_exhaustive_property(
                 record_id,
-                "is_exhaustive",
-                edge.get_property("is_exhaustive"),
-            )?
-            .as_deref()
-            .map(|value| match value {
-                "true" => Ok(true),
-                "false" => Ok(false),
-                other => Err(read_back_error(
+                optional_str_property(
                     record_id,
-                    format!("is_exhaustive invalid: {other}"),
-                )),
-            })
-            .transpose()?,
+                    "is_exhaustive",
+                    edge.get_property("is_exhaustive"),
+                )?
+                .as_deref(),
+            )?,
             temporal: temporal_from_properties(record_id, |key| edge.get_property(key))?,
             summary: required_str_property(record_id, "summary", edge.get_property("summary"))?,
             producer: optional_str_property(
@@ -4264,6 +4262,24 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded node kind {kind}"),
+        )),
+    }
+}
+
+/// Parses the persisted `is_exhaustive` marker string on a `CONSTRUCTS` edge
+/// (issue #443) back into `Option<bool>`. `None` when absent (every
+/// non-`CONSTRUCTS` edge, or a legacy record); a malformed value fails closed.
+fn parse_is_exhaustive_property(
+    record_id: &str,
+    value: Option<&str>,
+) -> AdapterResult<Option<bool>> {
+    match value {
+        None => Ok(None),
+        Some("true") => Ok(Some(true)),
+        Some("false") => Ok(Some(false)),
+        Some(other) => Err(read_back_error(
+            record_id,
+            format!("is_exhaustive invalid: {other}"),
         )),
     }
 }

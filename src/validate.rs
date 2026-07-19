@@ -147,7 +147,10 @@ const ORPHANABLE_KINDS: [NodeKind; 8] = [
 /// issue #103, matching what the extractor and history replay actually emit.
 const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
     match label {
-        EdgeLabel::Defines => Some(&[NodeKind::Symbol]),
+        // `File/Module —DEFINES→ Symbol`, and a `Symbol —CONSTRUCTS→ Symbol`
+        // struct-literal construction edge (issue #443) which always targets the
+        // constructed type's definition Symbol (never a `Diagnostic`).
+        EdgeLabel::Defines | EdgeLabel::Constructs => Some(&[NodeKind::Symbol]),
         EdgeLabel::Contains => Some(&[
             NodeKind::Change,
             NodeKind::Commit,
@@ -174,10 +177,6 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
             NodeKind::UnsafeSite,
         ]),
         EdgeLabel::Calls | EdgeLabel::Mentions => Some(&[NodeKind::Diagnostic, NodeKind::Symbol]),
-        // A `Symbol —CONSTRUCTS→ Symbol` struct-literal construction edge
-        // (issue #443) always targets the constructed type's definition Symbol;
-        // it is never emitted to a `Diagnostic`.
-        EdgeLabel::Constructs => Some(&[NodeKind::Symbol]),
         EdgeLabel::Imports => Some(&[NodeKind::Import]),
         // The commit-anchor project edges terminate at a `Commit` only: a PR
         // `Task —MERGED_AS→ Commit` (issue #333) and its review-side mirror
