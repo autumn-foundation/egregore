@@ -408,6 +408,17 @@ pub fn encode_index(index: &Index) -> Result<Vec<u8>> {
         .map_err(|error| anyhow::anyhow!("failed to encode SCIP index: {error}"))
 }
 
+/// Parses protobuf bytes back into a SCIP `Index` (in-process round-trip
+/// validation; no external `scip` CLI required).
+///
+/// # Errors
+/// Returns an error if the bytes are not a valid SCIP `Index` message.
+pub fn decode_index(bytes: &[u8]) -> Result<Index> {
+    use protobuf::Message;
+    Index::parse_from_bytes(bytes)
+        .map_err(|error| anyhow::anyhow!("failed to decode SCIP index: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

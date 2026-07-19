@@ -548,13 +548,22 @@ pub(crate) enum Commands {
     /// retracted body cannot resurface. Output carries no header, manifest, or
     /// timestamp and is byte-identical across runs on an unchanged store; the
     /// read is strictly read-only. See `docs/cli/export.md`.
+    ///
+    /// The bare form (`eg export --data-dir <dir> --out <file.jsonl>`) is the
+    /// issue #155 JSONL dump. The `scip` subcommand
+    /// (`eg export scip --graph <f>|--data-dir <d> --out <index.scip>`, issue
+    /// #233) emits a definitions-only SCIP code-intelligence index instead;
+    /// see `docs/cli/export-scip.md`.
     Export {
-        /// Embedded `AletheiaDB` data directory to export.
+        /// Optional export format subcommand (`scip`). Omitted → JSONL dump.
+        #[command(subcommand)]
+        format: Option<ExportSubcommand>,
+        /// Embedded `AletheiaDB` data directory to export (bare JSONL form).
         #[arg(long)]
-        data_dir: PathBuf,
-        /// Output JSONL path (created or overwritten).
+        data_dir: Option<PathBuf>,
+        /// Output JSONL path, created or overwritten (bare JSONL form).
         #[arg(long)]
-        out: PathBuf,
+        out: Option<PathBuf>,
     },
     /// Import a rust-swe-agent .traj trajectory file into agent-memory JSONL.
     ImportTraj {
@@ -3452,6 +3461,30 @@ pub(crate) enum BundleSubcommand {
     },
 }
 
+/// Subcommands for `export` (issue #233).
+#[derive(Debug, Subcommand)]
+pub(crate) enum ExportSubcommand {
+    /// Export a definitions-only SCIP code-intelligence index (issue #233).
+    ///
+    /// Reads a `scan`/`scan-history` graph JSONL (`--graph`) or an embedded
+    /// store (`--data-dir`), strictly read-only, and writes an encoded SCIP
+    /// protobuf to `--out`. Every span-bearing symbol becomes a
+    /// `SymbolInformation` + definition `Occurrence`; edges, diagnostics,
+    /// span-less nodes, and anonymous `impl` blocks are dropped. Byte-identical
+    /// across runs. See `docs/cli/export-scip.md`.
+    Scip {
+        /// Path to the graph JSONL file (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long, conflicts_with = "graph")]
+        data_dir: Option<PathBuf>,
+        /// Output path for the encoded SCIP index (created or overwritten).
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
 /// Subcommands for `protected`.
 #[derive(Debug, Subcommand)]
 pub(crate) enum ProtectedSubcommand {
@@ -3636,7 +3669,26 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             #[cfg(feature = "embedded-aletheiadb")]
             force,
         ),
-        Commands::Export { data_dir, out } => export(&data_dir, &out),
+        Commands::Export {
+            format,
+            data_dir,
+            out,
+        } => match format {
+            Some(ExportSubcommand::Scip {
+                graph,
+                data_dir: scip_data_dir,
+                out,
+            }) => export_scip(graph.as_deref(), scip_data_dir.as_deref(), &out),
+            None => {
+                let data_dir = data_dir.ok_or_else(|| {
+                    anyhow::anyhow!("eg export requires --data-dir <dir> for the JSONL dump")
+                })?;
+                let out = out.ok_or_else(|| {
+                    anyhow::anyhow!("eg export requires --out <file> for the JSONL dump")
+                })?;
+                export(&data_dir, &out)
+            }
+        },
         Commands::ImportTraj {
             traj_path,
             out,
