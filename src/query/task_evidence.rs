@@ -87,14 +87,13 @@ pub fn resolve_task_ids(
 
     // Source-link records (ExternalLink nodes, EXTERNAL_HANDLE edges) that were
     // tombstoned must not resolve their task on current-state reads: a retracted
-    // external handle is stale, not a live handle.
-    let tombstoned: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-            _ => None,
-        })
-        .collect();
+    // external handle is stale, not a live handle. Over an append-only `--graph`,
+    // a node/edge re-ingested AFTER its own tombstone is live again; the shared
+    // gate reports a tombstone active only when it is the id's most recent write,
+    // matching the embedded current-state read so `--graph` and `--data-dir`
+    // agree (issue #432). These gates read only node/edge liveness (no
+    // version-varying edge metadata), so `deleted` is sufficient.
+    let liveness = super::liveness::Liveness::new(records);
 
     // Case 1: Canonical Task record ID
     if id_or_handle.starts_with("project:") {
@@ -228,7 +227,7 @@ pub fn resolve_task_ids(
                 }
             }
 
-            if matches && !tombstoned.contains(id.as_str()) {
+            if matches && !liveness.deleted(id.as_str()) {
                 matched_links.insert(id.clone());
             }
         }
@@ -258,7 +257,7 @@ pub fn resolve_task_ids(
             ..
         } = r
             && matched_links.contains(target)
-            && !tombstoned.contains(edge_id.as_str())
+            && !liveness.deleted(edge_id.as_str())
         {
             for task_record in records {
                 if let GraphRecord::Node {
@@ -278,7 +277,7 @@ pub fn resolve_task_ids(
     // before reporting ambiguity so a re-created/re-imported task sharing a
     // handle with an older deleted one resolves the live task instead of failing
     // `Ambiguous`.
-    matched_ids.retain(|id| !tombstoned.contains(id.as_str()));
+    matched_ids.retain(|id| !liveness.deleted(id.as_str()));
 
     if matched_ids.len() > 1 {
         let candidates: Vec<String> = matched_ids.iter().cloned().collect();
@@ -728,3 +727,157 @@ pub fn task_evidence_context<'a>(
 }
 
 // ── user_context query helpers ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    use crate::ir::PROJECT_SCHEMA_VERSION;
+
+    fn ext_link(id: &str, url: &str) -> GraphRecord {
+        let mut n = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::ExternalLink,
+            None,
+            None,
+            Some("external link".to_owned()),
+            "external link".to_owned(),
+        )
+        .with_domain("project", PROJECT_SCHEMA_VERSION);
+        if let GraphRecord::Node { url: u, .. } = &mut n {
+            *u = Some(url.to_owned());
+        }
+        n
+    }
+
+    fn task_with_link(id: &str, link_id: &str) -> GraphRecord {
+        let mut n = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Task,
+            None,
+            None,
+            Some("a task".to_owned()),
+            "task".to_owned(),
+        )
+        .with_domain("project", PROJECT_SCHEMA_VERSION);
+        if let GraphRecord::Node {
+            source_external_link_id,
+            ..
+        } = &mut n
+        {
+            *source_external_link_id = Some(link_id.to_owned());
+        }
+        n
+    }
+
+    fn bare_task(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Task,
+            None,
+            None,
+            Some("a task".to_owned()),
+            "task".to_owned(),
+        )
+        .with_domain("project", PROJECT_SCHEMA_VERSION)
+    }
+
+    fn external_handle_edge(task_id: &str, link_id: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::ExternalHandle,
+            task_id.to_owned(),
+            link_id.to_owned(),
+            None,
+            "external handle".to_owned(),
+        )
+    }
+
+    fn project_tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("project:v{PROJECT_SCHEMA_VERSION}:tomb-{deleted_id}"),
+            schema_version: PROJECT_SCHEMA_VERSION,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    const URL: &str = "https://github.com/o/r/issues/7";
+
+    #[test]
+    fn task_reingested_after_tombstone_resolves() {
+        // Append-only `--graph`: a Task re-created AFTER its own tombstone is live
+        // again, matching the coalesced `--data-dir` read (issue #432).
+        let link_id = "project:v1:link-te";
+        let task_id = "project:v1:task-te";
+        let records = vec![
+            ext_link(link_id, URL),
+            task_with_link(task_id, link_id),
+            project_tombstone(task_id),
+            task_with_link(task_id, link_id),
+        ];
+        let resolved = resolve_task_ids(&records, URL).expect("resolves");
+        assert!(resolved.contains(task_id));
+    }
+
+    #[test]
+    fn task_tombstoned_without_reingest_not_resolved() {
+        let link_id = "project:v1:link-te";
+        let task_id = "project:v1:task-te";
+        let records = vec![
+            ext_link(link_id, URL),
+            task_with_link(task_id, link_id),
+            project_tombstone(task_id),
+        ];
+        let resolved = resolve_task_ids(&records, URL).expect("resolves");
+        assert!(!resolved.contains(task_id));
+    }
+
+    #[test]
+    fn external_link_reingested_after_tombstone_resolves() {
+        // The ExternalLink node itself revived after its tombstone (gate at the
+        // link-match site).
+        let link_id = "project:v1:link-te";
+        let task_id = "project:v1:task-te";
+        let records = vec![
+            ext_link(link_id, URL),
+            project_tombstone(link_id),
+            ext_link(link_id, URL),
+            task_with_link(task_id, link_id),
+        ];
+        let resolved = resolve_task_ids(&records, URL).expect("resolves");
+        assert!(resolved.contains(task_id));
+    }
+
+    #[test]
+    fn external_handle_edge_reingested_after_tombstone_resolves() {
+        // Task resolves ONLY via the EXTERNAL_HANDLE edge (no
+        // source_external_link_id field), so the edge-liveness gate is exercised.
+        let link_id = "project:v1:link-te";
+        let task_id = "project:v1:task-te";
+        let edge_id = external_handle_edge(task_id, link_id).id().to_owned();
+        let records = vec![
+            ext_link(link_id, URL),
+            bare_task(task_id),
+            external_handle_edge(task_id, link_id),
+            project_tombstone(&edge_id),
+            external_handle_edge(task_id, link_id),
+        ];
+        let resolved = resolve_task_ids(&records, URL).expect("resolves");
+        assert!(resolved.contains(task_id));
+    }
+
+    #[test]
+    fn external_handle_edge_tombstoned_without_reingest_not_resolved() {
+        let link_id = "project:v1:link-te";
+        let task_id = "project:v1:task-te";
+        let edge_id = external_handle_edge(task_id, link_id).id().to_owned();
+        let records = vec![
+            ext_link(link_id, URL),
+            bare_task(task_id),
+            external_handle_edge(task_id, link_id),
+            project_tombstone(&edge_id),
+        ];
+        let resolved = resolve_task_ids(&records, URL).expect("resolves");
+        assert!(!resolved.contains(task_id));
+    }
+}
