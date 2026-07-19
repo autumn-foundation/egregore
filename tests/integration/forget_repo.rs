@@ -34,7 +34,13 @@
 //! reference and every `forget-repo` shell-out is an unrecognized subcommand.
 //! The fixture builders below are the load-bearing scaffolding and must be sound.
 
-#![allow(missing_docs, clippy::too_many_lines)]
+#![allow(
+    missing_docs,
+    clippy::too_many_lines,
+    clippy::doc_markdown,
+    clippy::struct_field_names,
+    clippy::items_after_statements
+)]
 
 #[cfg(feature = "embedded-aletheiadb")]
 mod embedded {
@@ -44,9 +50,9 @@ mod embedded {
         EdgeLabel, EmbeddingModel, GraphRecord, IdentitySource, MetricKind, NodeKind,
         RepositoryIdentityPayload, SelectionBasis, SemanticDriftMetadata, SourceSpan,
         ir::{
-            ARTIFACT_SCHEMA_VERSION, AGENT_MEMORY_SCHEMA_VERSION, ErrorSignaturePayload,
-            Graph, LOG_SCHEMA_VERSION, LogPayload, PROJECT_SCHEMA_VERSION,
-            VERIFICATION_SCHEMA_VERSION, log_stable_id, stable_id,
+            AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, ErrorSignaturePayload, Graph,
+            LOG_SCHEMA_VERSION, LogPayload, PROJECT_SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION,
+            log_stable_id, stable_id,
         },
     };
     use assert_cmd::Command;
@@ -303,7 +309,12 @@ mod embedded {
     /// semantic drift + one agent observation + one task + one artifact + one
     /// verification + one log signature. Returns `(tempdir, store_path, repo A
     /// handles, repo B handles)`.
-    fn two_repo_cross_domain_store() -> (tempfile::TempDir, std::path::PathBuf, RepoHandles, RepoHandles) {
+    fn two_repo_cross_domain_store() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        RepoHandles,
+        RepoHandles,
+    ) {
         let temp = tempfile::tempdir().expect("temp dir");
         let mut graph = Graph::new();
         let a = push_repo(
@@ -475,7 +486,10 @@ mod embedded {
 
         // Scoped query to repo A must now be a clean no-match (exit 2), never a
         // silent fallback to repo B.
-        let (code, _stdout, _) = run(&store, &["query", "symbol", "widget", "--repo", "acme/widget-a"]);
+        let (code, _stdout, _) = run(
+            &store,
+            &["query", "symbol", "widget", "--repo", "acme/widget-a"],
+        );
         assert_eq!(code, 2, "evicted repo A resolves zero symbols");
 
         // The current serving view carries NONE of repo A's cross-domain records.
@@ -533,7 +547,11 @@ mod embedded {
         }
 
         // Nothing on disk changed and repo A is still fully live.
-        assert_eq!(store_digest(&store), before, "dry-run must not mutate the store");
+        assert_eq!(
+            store_digest(&store),
+            before,
+            "dry-run must not mutate the store"
+        );
         let records = current_records(&store);
         assert!(records.iter().any(|r| r.id() == a.symbol_id));
     }
@@ -550,7 +568,10 @@ mod embedded {
         let store2 = ingest_store(temp2.path(), &jsonl2);
         let (_c2, second, _) = forget_repo(&store2, "acme/widget-a", true);
 
-        assert_eq!(first, second, "pinned --transaction-time yields byte-identical envelopes");
+        assert_eq!(
+            first, second,
+            "pinned --transaction-time yields byte-identical envelopes"
+        );
     }
 
     // ── AC-EVENT: exactly one auditable eviction event ────────────────────────
@@ -577,7 +598,11 @@ mod embedded {
                 )
             })
             .collect();
-        assert_eq!(events.len(), 1, "exactly one eviction event names the evicted repo");
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one eviction event names the evicted repo"
+        );
         assert_eq!(events[0].id(), expected_event_id);
     }
 
@@ -669,7 +694,10 @@ mod embedded {
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert_eq!(candidates, ids.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(
+            candidates,
+            ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
     }
 
     // ── AC-BITEMP: a pre-eviction historical read still sees repo A ───────────
