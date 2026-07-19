@@ -57,7 +57,7 @@ impl CorpusMode {
             }
             Self::Union => {
                 "Corpus: the union of all commit snapshots; an edge or target removed \
-                 at a later commit can still appear. Pass --at-head for HEAD-only state."
+                 at a later commit still appears in the corpus."
             }
             Self::CommitPinned => "Corpus: the single-commit snapshot selected by --at/--as-of.",
             Self::SingleSnapshot => {

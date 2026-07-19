@@ -139,17 +139,25 @@ recent commit whose valid time is at or before the instant; the envelope's
 `at_commit` reports which commit answered. When `--repo` is set, commit
 resolution happens within the selected repository.
 
-### Temporal scope of an unpinned read
+### Corpus scope of an unpinned read
 
-With **neither** `--at` nor `--as-of`, a `scan-history` graph or store is read
-as the **union of all commit snapshots** — `scan-history` emits no edge
-tombstones, so a resolved `CALLS` edge that was removed at a later commit is
-still present in the union. A directed path over such an edge therefore still
-yields `path_found`. This is deliberate and matches `deps`,
-`transitive-callers`, and `transitive-callees`, which read the same union.
-Pass `--at <HEAD_SHA>` for HEAD-only (single-snapshot) semantics — the walk
-then sees only the edges live at that commit, so an edge deleted before `HEAD`
-no longer contributes a path.
+**Breaking change (issue #427).** With **neither** `--at`/`--as-of` nor a corpus
+flag, over a `scan-history` graph or store this lane now defaults to the
+**HEAD-anchored** corpus — records current at each repository's stamped HEAD
+commit. A resolved `CALLS` edge that was removed before HEAD is excluded, so a
+directed path that depended on it now yields `no_path` rather than `path_found`.
+
+This **flips the previous default**, which read the **union of all commit
+snapshots** (`scan-history` emits no edge tombstones, so a removed edge still
+appeared in the union and could yield `path_found`). To restore the old
+behavior, pass `--all-history`; to force the HEAD-anchored view explicitly, pass
+`--at-head`. This matches the flipped defaults of `deps`, `transitive-callers`,
+and `transitive-callees`.
+
+The summary envelope discloses `corpus_mode` / `corpus_mode_source` /
+`corpus_disclaimer`. `--at-head` and `--all-history` are mutually exclusive with
+each other and with `--at`/`--as-of` (exit `1`, `unsupported_combination`). See
+[Corpus scope for query lanes](corpus-modes.md).
 
 ## Example
 

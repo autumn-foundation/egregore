@@ -137,3 +137,10 @@ ID rather than silently picking one; re-run with the stable record ID or a
 - **`git blame`** — line-level authorship of the current snapshot, not a
   symbol's event series over time.
 - **rust-analyzer / LSP** — HEAD-only navigation; no temporal axis.
+## Corpus scope
+
+This is a history-analysis lane: it reads the **union of all commit snapshots**
+by design and carries no `--at-head`/`--all-history` corpus flags. The summary
+envelope discloses `corpus_mode: "union"` (or `single_snapshot` over a
+snapshot-less store), `corpus_mode_source`, and `corpus_disclaimer` for
+transparency. See [Corpus scope for query lanes](corpus-modes.md).

@@ -192,3 +192,12 @@ Sound dead-code analysis and reachability proofs, transitive
 entry-point reachability, public-surface exclusion (issue #240 sharpens the
 triage with the issue #213 reachability rule), automatic removal, semantic
 ranking, and daemon/MCP verbs (issues #59/#53).
+## Corpus scope
+
+Over a `scan-history` store this lane is **HEAD-anchored** by default: it reports
+the state current at each repository's stamped HEAD commit, so an item removed
+before HEAD does not appear. The summary envelope discloses `corpus_mode`
+(`head_anchored`, or `single_snapshot` over a snapshot-less store),
+`corpus_mode_source`, and `corpus_disclaimer`. An `--at`/`--as-of` selector this
+lane accepts pins a single commit (`commit_pinned`). See
+[Corpus scope for query lanes](corpus-modes.md).

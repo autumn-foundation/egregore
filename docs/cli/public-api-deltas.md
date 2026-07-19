@@ -225,3 +225,10 @@ surface change, not proof of breakage — and an unflagged range is not proof
 of compatibility** (trait coherence, type inference, and macro-expanded
 surface are out of scope; see `cargo-semver-checks` for build-verified
 claims).
+## Corpus scope
+
+This is a history-analysis lane: it reads the **union of all commit snapshots**
+by design and carries no `--at-head`/`--all-history` corpus flags. The summary
+envelope discloses `corpus_mode: "union"` (or `single_snapshot` over a
+snapshot-less store), `corpus_mode_source`, and `corpus_disclaimer` for
+transparency. See [Corpus scope for query lanes](corpus-modes.md).
