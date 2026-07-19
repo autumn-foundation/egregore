@@ -1889,26 +1889,8 @@ impl<'facts> DefinitionIndex<'facts> {
         // -> library crate-root binding, so a `dep_crate::…` qualified call can
         // be confined to that crate's definitions. A name shared by two crate
         // directories is marked ambiguous (`None`) — never a wrong binding.
-        let mut crate_name_roots: BTreeMap<String, Option<String>> = BTreeMap::new();
-        for path in facts_by_file.keys() {
-            let (prefix, _) = split_crate_prefix(path);
-            if prefix.is_empty() {
-                continue;
-            }
-            let Some(name) = crate_name_of(path) else {
-                continue;
-            };
-            let lib_root = format!("{prefix}::lib");
-            match crate_name_roots.get(&name) {
-                None => {
-                    crate_name_roots.insert(name, Some(lib_root));
-                }
-                Some(Some(existing)) if *existing != lib_root => {
-                    crate_name_roots.insert(name, None);
-                }
-                _ => {}
-            }
-        }
+        // Shared with the #443 CONSTRUCTS resolution pass via one helper.
+        let crate_name_roots = build_crate_name_roots(facts_by_file);
 
         // Resolve every recorded `impl Trait for Type` relation to the trait's
         // crate-root-relative qualified name via the repo-wide impl-target
