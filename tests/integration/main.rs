@@ -32,6 +32,7 @@ mod evidence_path;
 mod evidence_write;
 mod failure_history;
 mod forget;
+mod forget_repo;
 mod freshness;
 mod git_scope_scan;
 mod go_scan;
