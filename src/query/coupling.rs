@@ -189,6 +189,16 @@ pub struct CoChangeCoupling<'a> {
     pub partners: Vec<CouplingPartner<'a>>,
     /// Explicit-empty and advisory diagnostics.
     pub diagnostics: Vec<CouplingDiagnostic>,
+    /// Corpus this history-analysis lane read (issue #427): `union` over a
+    /// scan-history store, `single_snapshot` over a snapshot-less store. The
+    /// co-change analysis spans commits by design, so the disclosure is `union`
+    /// even when a `--base/--head/--at/--as-of` selector scopes the commit set;
+    /// the disclosure never changes traversal.
+    pub corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    pub corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    pub corpus_disclaimer: String,
 }
 
 /// Errors that can occur while resolving a co-change coupling query.
@@ -779,6 +789,9 @@ pub fn co_change_coupling<'a>(
         });
     }
 
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        super::disclose_corpus(records, super::CorpusMode::Union);
+
     Ok(CoChangeCoupling {
         target: CouplingTarget {
             record_id: target_info.record_id,
@@ -795,5 +808,8 @@ pub fn co_change_coupling<'a>(
         truncated,
         partners,
         diagnostics,
+        corpus_mode: corpus_mode.as_str(),
+        corpus_mode_source: corpus_mode_source.as_str(),
+        corpus_disclaimer,
     })
 }

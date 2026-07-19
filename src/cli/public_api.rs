@@ -53,6 +53,14 @@ pub(crate) struct PublicApiResponse<'a> {
     items: Vec<PublicApiItemJson<'a>>,
     counts: PublicApiCountsJson,
     diagnostics: Vec<PublicApiDiagnosticJson<'a>>,
+    /// Corpus the current-state view read (issue #427): `head_anchored` over a
+    /// scan-history store carrying a `source_snapshot`, `single_snapshot` over
+    /// a plain snapshot-less scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 pub(crate) const PUBLIC_API_DISCLAIMER: &str = "Parse-derived enumeration of the externally-reachable public API surface from recorded \
@@ -64,6 +72,8 @@ pub(crate) fn query_public_api_cmd(
     repo_scope: Option<&str>,
 ) -> Result<()> {
     let surface = query::public_api_surface(records, index, repo_scope);
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        disclose_head_anchored_corpus(records, false);
 
     let response = PublicApiResponse {
         ok: true,
@@ -102,6 +112,9 @@ pub(crate) fn query_public_api_cmd(
                 detail: &d.detail,
             })
             .collect(),
+        corpus_mode,
+        corpus_mode_source,
+        corpus_disclaimer,
     };
 
     let output = serde_json::to_string_pretty(&response)

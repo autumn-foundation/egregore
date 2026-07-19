@@ -168,3 +168,10 @@ other Egregore domain in the same store, and its dormancy is reproducible
 - Complexity or risk weighting (dormancy only).
 - Semantic/embedding drift ranking (`eg query drift`, #55).
 - Uncommitted working-tree changes.
+## Corpus scope
+
+This is a history-analysis lane: it reads the **union of all commit snapshots**
+by design and carries no `--at-head`/`--all-history` corpus flags. The summary
+envelope discloses `corpus_mode: "union"` (or `single_snapshot` over a
+snapshot-less store), `corpus_mode_source`, and `corpus_disclaimer` for
+transparency. See [Corpus scope for query lanes](corpus-modes.md).

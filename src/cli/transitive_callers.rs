@@ -80,6 +80,13 @@ pub(crate) struct TransitiveCallersHeaderJson<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     as_of: Option<&'a str>,
     total_reachable: usize,
+    /// Corpus the current-state view read (issue #427):
+    /// `head_anchored`/`union`/`commit_pinned`/`single_snapshot`.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: `default`/`explicit_flag`/`selector`.
+    corpus_mode_source: &'static str,
+    /// One-line human description of what the corpus includes.
+    corpus_disclaimer: &'static str,
     disclaimer: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     truncation: Option<TransitiveTruncationJson>,
@@ -245,7 +252,11 @@ pub(crate) fn resolve_transitive_commit_view(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools
+)]
 pub(crate) fn query_transitive_callers_cmd(
     records: &[GraphRecord],
     handle: &str,
@@ -254,30 +265,70 @@ pub(crate) fn query_transitive_callers_cmd(
     max_depth: usize,
     at: Option<&str>,
     as_of: Option<&str>,
+    at_head: bool,
+    all_history: bool,
     format: OutputFormat,
 ) -> Result<()> {
+    // ── corpus-mode selection (issue #427) ────────────────────────────────────
+    // Current-state code lanes default to HEAD-anchoring (records current at
+    // each repository's stamped `source_snapshot` HEAD) when a snapshot exists;
+    // `--all-history` opts into the union of all commit snapshots and `--at-head`
+    // makes the default explicit. `--at`/`--as-of` still pin a single commit.
+    let has_snapshot = query::store_has_source_snapshot(records);
+    let (corpus_mode, corpus_mode_source) = match query::resolve_corpus_mode(
+        at.is_some() || as_of.is_some(),
+        at_head,
+        all_history,
+        has_snapshot,
+    ) {
+        Ok(pair) => pair,
+        Err(message) => {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": { "code": "unsupported_combination", "message": message },
+            });
+            println!("{}", serde_json::to_string(&envelope)?);
+            std::process::exit(1);
+        }
+    };
+
     // ── temporal narrowing: one commit's snapshot view (issue #139 AC6) ───────
     let mut at_commit: Option<String> = None;
-    let filtered: Option<Vec<GraphRecord>> = if at.is_some() || as_of.is_some() {
-        let sha = resolve_transitive_commit_view(records, index, repo_scope, at, as_of)?;
-        let view: Vec<GraphRecord> = records
-            .iter()
-            .filter(|r| match r {
-                GraphRecord::Node {
-                    temporal: Some(t), ..
-                }
-                | GraphRecord::Edge {
-                    temporal: Some(t), ..
-                } => t.git_commit == sha,
-                _ => false,
-            })
-            .cloned()
-            .collect();
-        at_commit = Some(sha);
-        Some(view)
-    } else {
-        None
-    };
+    let filtered: Option<Vec<GraphRecord>> =
+        if matches!(corpus_mode, query::CorpusMode::CommitPinned) {
+            let sha = resolve_transitive_commit_view(records, index, repo_scope, at, as_of)?;
+            let view: Vec<GraphRecord> = records
+                .iter()
+                .filter(|r| match r {
+                    GraphRecord::Node {
+                        temporal: Some(t), ..
+                    }
+                    | GraphRecord::Edge {
+                        temporal: Some(t), ..
+                    } => t.git_commit == sha,
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+            at_commit = Some(sha);
+            Some(view)
+        } else if matches!(corpus_mode, query::CorpusMode::HeadAnchored) {
+            // Head-anchor: drop every record not current at its owning repository's
+            // stamped HEAD BEFORE the walk, so a caller/call-edge removed at HEAD
+            // does not appear. Snapshot-less stores never reach here (the default
+            // resolves to SingleSnapshot). See `query::non_head_current_record_ids`.
+            let non_current = query::non_head_current_record_ids(records, index);
+            let view: Vec<GraphRecord> = records
+                .iter()
+                .filter(|r| !non_current.contains(r.id()))
+                .cloned()
+                .collect();
+            Some(view)
+        } else {
+            // Union / SingleSnapshot: keep the full record set; the walk applies
+            // its own keep-last-per-id / latest-edge-version liveness.
+            None
+        };
     let records: &[GraphRecord] = filtered.as_deref().unwrap_or(records);
 
     // ── handle resolution (symbol record ID or exact symbol name only) ────────
@@ -430,6 +481,9 @@ pub(crate) fn query_transitive_callers_cmd(
         at_commit: at_commit.as_deref(),
         as_of,
         total_reachable: rows_json.len(),
+        corpus_mode: corpus_mode.as_str(),
+        corpus_mode_source: corpus_mode_source.as_str(),
+        corpus_disclaimer: corpus_mode.disclaimer(),
         disclaimer: TRANSITIVE_CALLERS_DISCLAIMER,
         truncation: ctx.truncation.as_ref().map(|t| TransitiveTruncationJson {
             code: "max_depth_truncated",

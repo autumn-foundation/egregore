@@ -305,6 +305,10 @@ fn covered_uncovered_partition_is_correct_and_buckets_never_merge() {
     assert_eq!(report["ok"], Value::Bool(true));
     assert_eq!(report["capability"], "verification_links_recorded");
     assert_eq!(report["language"], "Rust");
+    // Issue #427: this hand-built fixture carries no `source_snapshot`, so the
+    // default view discloses single_snapshot.
+    assert_eq!(report["corpus_mode"], "single_snapshot");
+    assert_eq!(report["corpus_mode_source"], "default");
 
     let covered = report["covered"].as_array().unwrap();
     let uncovered = report["uncovered"].as_array().unwrap();
@@ -781,6 +785,9 @@ fn at_commit_pins_the_surface_snapshot() {
     let report = run(&path, &["--at", &commit_a[..8]]);
     assert_eq!(report["counts"]["symbols_in_scope"], 1);
     assert_eq!(report["covered"][0]["path"], "alpha");
+    // Issue #427: a `--at` pin discloses the commit-pinned corpus.
+    assert_eq!(report["corpus_mode"], "commit_pinned");
+    assert_eq!(report["corpus_mode_source"], "selector");
     let all: Vec<&str> = report["covered"]
         .as_array()
         .unwrap()

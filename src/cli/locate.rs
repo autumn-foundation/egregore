@@ -36,6 +36,15 @@ pub(crate) struct LocateResponse<'a> {
     unresolved: Vec<ContextUnresolved<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     excluded: Vec<ExcludedDiagnostic<'a>>,
+    /// Corpus the position was resolved against (issue #427): `commit_pinned`
+    /// under `--at`/`--as-of`, otherwise `head_anchored` over a scan-history
+    /// store carrying a `source_snapshot`, `single_snapshot` over a plain scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: `selector` under a temporal pin, else
+    /// `default`.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 /// Resolves a `--at` prefix or `--as-of` instant to a fully-qualified commit
@@ -201,6 +210,8 @@ pub(crate) fn query_locate_cmd(
             context,
         } => {
             let symbol = location_node_json(primary).expect("primary is a node by construction");
+            let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+                disclose_head_anchored_corpus(records, at.is_some() || as_of.is_some());
             let sections = build_context_sections(&context);
             let resolver = crate::temporal_status::TemporalResolver::build(records);
             let (observations, excluded) =
@@ -227,6 +238,9 @@ pub(crate) fn query_locate_cmd(
                 verification_evidence: sections.verification_evidence,
                 unresolved: sections.unresolved,
                 excluded,
+                corpus_mode,
+                corpus_mode_source,
+                corpus_disclaimer,
             };
 
             match format {
@@ -270,4 +284,5 @@ fn print_locate_text(response: &LocateResponse<'_>) {
         response.verification_evidence.len(),
         response.unresolved.len(),
     );
+    println!("# corpus: {}", response.corpus_mode);
 }

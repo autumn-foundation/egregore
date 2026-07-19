@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::RepositoryIndex;
 use crate::ir::{
-    CallResolution, EdgeLabel, GraphRecord, NodeKind, SnapshotHead, SourceSpan, TemporalMetadata,
+    CallResolution, EdgeLabel, GraphRecord, NodeKind, SourceSpan, TemporalMetadata,
     parse_codegraph_id, stable_id,
 };
 
@@ -165,49 +165,21 @@ pub fn unreferenced_symbols<'a>(
     let is_owned =
         |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
 
-    // Stamped HEAD commit per live repository (`source_snapshot`, issue #82).
-    // History replay re-emits the full graph at every commit with `temporal`
-    // provenance and no tombstones for between-commit removals, so a temporal
-    // record is part of the current state only when its commit is its
-    // repository's stamped HEAD — the same rule `resolve_head_symbols` uses.
-    // Snapshot-less stores (pre-#186 graphs) keep the conservative fallback:
-    // nodes resolve by keep-last dedupe and every recorded edge counts.
-    let mut repo_heads: BTreeMap<&str, &str> = BTreeMap::new();
-    for record in records {
-        if let GraphRecord::Node {
-            id,
-            kind: NodeKind::Repository,
-            source_snapshot: Some(snapshot),
-            ..
-        } = record
-            && !tombstoned.contains(id.as_str())
-            && let SnapshotHead::Commit { sha } = &snapshot.head
-        {
-            repo_heads.insert(id.as_str(), sha.as_str());
-        }
-    }
-    // Current-state check for records attributable through the containment
-    // topology (symbols; reference edges via their target symbol).
-    let owned_record_is_current = |id: &str, temporal: Option<&TemporalMetadata>| -> bool {
-        let Some(t) = temporal else {
-            return true;
-        };
-        index
-            .owner_of(id)
-            .and_then(|owner| repo_heads.get(owner))
-            .is_none_or(|head_sha| t.git_commit == *head_sha)
-    };
-    // Current-state check for records outside the containment topology
-    // (Diagnostic markers, unresolved-call edges): no owner is resolvable, so
-    // a temporal record is current when its commit is any repository's
-    // stamped HEAD. Commit SHAs never collide across repositories in
-    // practice, and snapshot-less stores keep everything (fallback).
-    let unowned_record_is_current = |temporal: Option<&TemporalMetadata>| -> bool {
-        let Some(t) = temporal else {
-            return true;
-        };
-        repo_heads.is_empty() || repo_heads.values().any(|sha| *sha == t.git_commit)
-    };
+    // Default current-state view: the set of record IDs NOT current at their
+    // repository's stamped HEAD (`source_snapshot`, issue #82/#427), computed by
+    // the shared head-anchor gate rather than an inlined `repo_heads` /
+    // `owned_record_is_current` / `unowned_record_is_current` copy. History
+    // replay re-emits the full graph at every commit with `temporal` provenance
+    // and no tombstone for a between-commit removal, so a symbol/edge absent at
+    // HEAD would otherwise resurface. The drop-set groups by stable ID (an ID
+    // with any HEAD-current version is retained whole) and the recency keep-last
+    // below selects its HEAD version — matching the prior inline per-record
+    // gate; snapshot-less stores yield an empty drop-set (keep-last dedupe, every
+    // recorded edge counts). Records outside the containment topology (Diagnostic
+    // markers, unresolved-call edges) are head-anchored by the shared gate's
+    // any-head rule — commit SHAs never collide across repositories in practice,
+    // so it agrees with the removed owner-specific check.
+    let non_head_current = super::non_head_current_record_ids(records, index);
 
     // Candidate population: live, in-scope Symbol nodes, keep-last dedupe by
     // stable ID so history graphs resolve to their newest version.
@@ -237,7 +209,7 @@ pub fn unreferenced_symbols<'a>(
         }
         match kind {
             NodeKind::Symbol => {
-                if !is_owned(id) || !owned_record_is_current(id, temporal.as_ref()) {
+                if !is_owned(id) || non_head_current.contains(id.as_str()) {
                     continue;
                 }
                 // impl blocks are unnameable declaration details, never
@@ -245,7 +217,17 @@ pub fn unreferenced_symbols<'a>(
                 if symbol_kind.as_deref() == Some("impl") {
                     continue;
                 }
-                symbols.insert(id.as_str(), record);
+                // Keep-last dedupe by recency so a retained ID's HEAD
+                // (newest-valid-time) version wins — the shared drop-set keeps
+                // every version of a HEAD-current ID, and this selects the same
+                // version the removed per-record HEAD gate did.
+                let replace = symbols.get(id.as_str()).is_none_or(|existing| {
+                    super::file_at_point::version_recency_key(record)
+                        >= super::file_at_point::version_recency_key(existing)
+                });
+                if replace {
+                    symbols.insert(id.as_str(), record);
+                }
             }
             NodeKind::Diagnostic if domain.is_none() => {
                 if let Some(path) = repo_relative_path.as_deref() {
@@ -313,7 +295,7 @@ pub fn unreferenced_symbols<'a>(
                     (Some((_, sa)), Some((_, sb))) if sa == sb
                 )
         };
-        for (id, path, name, temporal) in &diagnostic_rows {
+        for (id, path, name, _temporal) in &diagnostic_rows {
             let attributed = name.and_then(|name| {
                 let ordinal_bound = name_counts.get(&(*path, name)).copied().unwrap_or(0);
                 repository_ids.iter().copied().find(|repo| {
@@ -334,17 +316,12 @@ pub fn unreferenced_symbols<'a>(
             if !in_scope {
                 continue;
             }
-            let current = attributed.map_or_else(
-                || unowned_record_is_current(*temporal),
-                |repo| {
-                    temporal.is_none_or(|t| {
-                        repo_heads
-                            .get(repo)
-                            .is_none_or(|head_sha| t.git_commit == *head_sha)
-                    })
-                },
-            );
-            if current {
+            // Head-anchor the marker through the shared drop-set. A Diagnostic
+            // is outside the containment topology (`owner_of` cannot attribute
+            // it), so the shared gate applies its any-head rule; commit SHAs do
+            // not collide across repositories, so this agrees with the removed
+            // attributed-repo-specific HEAD check for both attribution branches.
+            if !non_head_current.contains(*id) {
                 file_diagnostics
                     .entry((attributed.map(&canonical_repo), path))
                     .or_default()
@@ -367,7 +344,6 @@ pub fn unreferenced_symbols<'a>(
             source,
             target,
             resolution,
-            temporal,
             ..
         } = record
         else {
@@ -387,14 +363,17 @@ pub fn unreferenced_symbols<'a>(
             // own repository's unresolved calls — never another repository's
             // noise — and currency is checked against the source
             // repository's stamped HEAD.
-            if is_owned(source.as_str())
-                && owned_record_is_current(source.as_str(), temporal.as_ref())
-            {
+            // The edge is head-anchored by its own record ID (unowned → the
+            // shared gate's any-head rule, which equals the source repository's
+            // stamped-HEAD check since the edge's commit lives in that repo).
+            if is_owned(source.as_str()) && !non_head_current.contains(id.as_str()) {
                 unresolved_call_edges += 1;
             }
             continue;
         }
-        if !owned_record_is_current(target.as_str(), temporal.as_ref()) {
+        // A stale reference edge (present at an older commit, absent at HEAD)
+        // must not mark its target referenced; drop it by its own record ID.
+        if non_head_current.contains(id.as_str()) {
             continue;
         }
         referenced_ids.insert(target.as_str());

@@ -52,15 +52,21 @@ is exercised at runtime.
   excluded; one re-added after its tombstone is included, via the shared
   `Liveness` gate (issue #421), so `--graph` and `--data-dir` agree on
   tombstoned / revived records.
-- **A `scan-history` graph is read as the UNION of all commit snapshots.** This
-  lane offers no `--at` / `--as-of` and applies no HEAD-only filter. History
-  replay stamps a per-commit `Import` record but does **not** tombstone an
-  import removed in a later commit, so an import that existed only in an early
-  commit is **still returned** by an unpinned query — it is not filtered down to
-  the head state. This mirrors the documented union behaviour of `deps`, `path`,
-  and `transitive-callers` (their `--at <HEAD>` HEAD-only mode has no equivalent
-  here). Over a `scan` (current-tree) graph there is exactly one snapshot, so the
-  answer is the current state directly.
+- **A `scan-history` graph defaults to the HEAD-anchored corpus (breaking change,
+  issue #427).** By default an unpinned query now returns only imports current at
+  each repository's stamped HEAD commit, so an import removed before HEAD is
+  excluded. This **flips the previous default**, which read the **union of all
+  commit snapshots**: history replay stamps a per-commit `Import` record but does
+  not tombstone an import removed in a later commit, so under the old default an
+  import that existed only in an early commit was still returned. Pass
+  `--all-history` to restore that union; pass `--at-head` to force the
+  HEAD-anchored view explicitly. This lane offers no `--at` / `--as-of`. The
+  summary envelope discloses `corpus_mode` / `corpus_mode_source` /
+  `corpus_disclaimer`; `--at-head` and `--all-history` are mutually exclusive
+  (exit `1`, `unsupported_combination`). This matches the flipped defaults of
+  `deps`, `path`, `transitive-callers`, and `transitive-callees`. Over a `scan`
+  (current-tree) graph there is exactly one snapshot, so the answer is the current
+  state directly. See [Corpus scope for query lanes](corpus-modes.md).
 - **Deterministic.** Rows are ordered by `(repo_relative_path,
   span.start_line, record_id)` and output is byte-identical across repeated
   runs and across `--graph` vs `--data-dir` on an unchanged store.
@@ -148,11 +154,11 @@ eg query who-imports serde::Serialize --graph graph.jsonl
   only via the explicit `--crate` flag (see the
   [crate-unification boundary](#crate-unification-boundary)); relative `self` /
   `super` prefixes are matched literally.
-- **No temporal views.** `--at` / `--as-of` are not offered. Over a `scan`
-  (current-tree) graph the answer is the current state directly; over a
-  `scan-history` graph the lane reads the **union of all commit snapshots** (an
-  import removed in a later commit can still be returned — there is no HEAD-only
-  filtering in this slice), mirroring `deps` / `path`. See
-  [Semantics](#semantics).
+- **No `--at` / `--as-of` temporal pin.** A single-commit view is not offered.
+  Corpus scope is instead controlled by `--at-head` / `--all-history`: over a
+  `scan-history` graph the lane now defaults to the **HEAD-anchored** corpus and
+  `--all-history` opts into the **union of all commit snapshots** (the old
+  default), mirroring `deps` / `path`. See [Semantics](#semantics) and
+  [Corpus scope for query lanes](corpus-modes.md).
 - **No usage proof.** A match means a `use` declaration names the module path,
   never that the imported item is referenced or exercised.

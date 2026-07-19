@@ -339,6 +339,12 @@ fn ownership_aggregates_shares_and_bus_factor() {
 
     // The disclaimer labels rows as empirical history, never authority.
     assert!(map.disclaimer.contains("not declared ownership"));
+
+    // Corpus disclosure (issue #427): this hand-built fixture carries no
+    // Repository source_snapshot, so the disclosure is `single_snapshot`. The
+    // per-author shares are computed over full authorship history regardless.
+    assert_eq!(map.corpus_mode, "single_snapshot");
+    assert_eq!(map.corpus_mode_source, "default");
 }
 
 #[test]

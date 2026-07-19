@@ -66,6 +66,14 @@ pub(crate) struct LocationResponse<'a> {
     repository_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<&'a str>,
+    /// Corpus the view was resolved against (issue #427): `commit_pinned` under
+    /// `--at`, otherwise `head_anchored` over a scan-history store carrying a
+    /// `source_snapshot`, `single_snapshot` over a plain snapshot-less scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: `selector` under `--at`, else `default`.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 pub(crate) fn location_node_json(record: &GraphRecord) -> Option<LocationNodeJson<'_>> {
@@ -189,6 +197,8 @@ pub(crate) fn query_at_cmd(
 
     let symbol = location_node_json(primary).expect("primary is a node by construction");
     let repository_id = index.owner_of(symbol.record_id);
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        disclose_head_anchored_corpus(records, at_prefix.is_some());
     let response = LocationResponse {
         ok: true,
         path,
@@ -201,6 +211,9 @@ pub(crate) fn query_at_cmd(
             .collect(),
         repository_id,
         repository: repository_id.and_then(|repo| index.display_of(repo)),
+        corpus_mode,
+        corpus_mode_source,
+        corpus_disclaimer,
     };
 
     let output =

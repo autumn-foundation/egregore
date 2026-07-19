@@ -193,3 +193,13 @@ Each site is a deterministic `PanicRiskSite` code-graph node emitted by
 Trust separation holds: `PanicRiskSite` records live in the code-graph domain
 (`source_fact` trust class), separate from agent-authored observations by
 construction.
+## Corpus scope
+
+This lane is designed as a current-state lane but today reads the **union of all
+commit snapshots** over a `scan-history` store. It discloses this honestly —
+`corpus_mode: "union"` (or `single_snapshot` over a snapshot-less store),
+`corpus_mode_source`, and `corpus_disclaimer` — and does **not** yet accept the
+`--at-head`/`--all-history` flags (an `--at`/`--as-of` selector, where offered,
+still pins a single commit as `commit_pinned`). Flipping it to the HEAD-anchored
+default and adding that flag pair, under the contract published in issue #427, is
+tracked in **issue #456**. See [Corpus scope for query lanes](corpus-modes.md).

@@ -1592,6 +1592,19 @@ pub(crate) enum QuerySubcommand {
         /// or before this RFC 3339 instant. Mutually exclusive with --at.
         #[arg(long, conflicts_with = "at")]
         as_of: Option<String>,
+        /// Corpus selector (issue #427): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding callers removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history/--at/--as-of
+        /// (enforced at runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #427): read the UNION of all commit snapshots
+        /// so a caller removed at a later commit still appears. Mutually
+        /// exclusive with --at-head/--at/--as-of (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -1656,6 +1669,19 @@ pub(crate) enum QuerySubcommand {
         /// or before this RFC 3339 instant. Mutually exclusive with --at.
         #[arg(long, conflicts_with = "at")]
         as_of: Option<String>,
+        /// Corpus selector (issue #427): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding callees removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history/--at/--as-of
+        /// (enforced at runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #427): read the UNION of all commit snapshots
+        /// so a callee removed at a later commit still appears. Mutually
+        /// exclusive with --at-head/--at/--as-of (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -1708,6 +1734,19 @@ pub(crate) enum QuerySubcommand {
         /// this RFC 3339 instant. Mutually exclusive with --at.
         #[arg(long, conflicts_with = "at")]
         as_of: Option<String>,
+        /// Corpus selector (issue #427): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding dependencies removed at
+        /// HEAD. This is the DEFAULT when a source snapshot exists; the flag
+        /// makes it explicit. Mutually exclusive with --all-history/--at/--as-of
+        /// (enforced at runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #427): read the UNION of all commit snapshots
+        /// so a dependency removed at a later commit still appears. Mutually
+        /// exclusive with --at-head/--at/--as-of (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -2806,6 +2845,20 @@ pub(crate) enum QuerySubcommand {
         /// or before this RFC 3339 instant. Mutually exclusive with --at.
         #[arg(long, conflicts_with = "at")]
         as_of: Option<String>,
+        /// Corpus selector (issue #427): head-anchor the current-state view to
+        /// each repository's stamped HEAD, so a path over an edge removed at
+        /// HEAD yields `no_path`. This is the DEFAULT when a source snapshot
+        /// exists; the flag makes it explicit. Mutually exclusive with
+        /// --all-history/--at/--as-of (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #427): trace over the UNION of all commit
+        /// snapshots so a path over an edge removed at a later commit still
+        /// resolves. Mutually exclusive with --at-head/--at/--as-of (enforced
+        /// at runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -2854,6 +2907,20 @@ pub(crate) enum QuerySubcommand {
         /// Restrict the importer set to one repository in a multi-repo store.
         #[arg(long)]
         repo: Option<String>,
+        /// Corpus selector (issue #427): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding imports removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. who-imports has no --at/--as-of selector; mutually
+        /// exclusive with --all-history (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #427): read the UNION of all commit snapshots
+        /// so an import present only in an earlier commit still appears.
+        /// Mutually exclusive with --at-head (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -3813,6 +3880,80 @@ pub(crate) struct SymbolResult<'a> {
     extraction_completeness: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<Vec<DiagnosticRef<'a>>>,
+    /// Corpus this row was read from (issue #427). Present only on the
+    /// `query symbol` lane (stamped by [`stamp_symbol_corpus`]); absent on the
+    /// shared `query symbols` partial-name lane so its row shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corpus_mode: Option<&'static str>,
+    /// How the corpus mode was chosen (`default`/`selector`). Present only with
+    /// `corpus_mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corpus_mode_source: Option<&'static str>,
+    /// One-line human description of the corpus that was read. Present only with
+    /// `corpus_mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corpus_disclaimer: Option<String>,
+}
+
+/// Resolves the corpus-disclosure triple for a lane whose only temporal
+/// selector is `--at` (issue #427): `commit_pinned` + `selector` when `at` is
+/// set, otherwise the [`query::disclose_corpus`] default (`union` over a
+/// scan-history store, `single_snapshot` over a plain scan).
+pub(crate) fn disclose_scoped_corpus(
+    records: &[GraphRecord],
+    at: Option<&str>,
+) -> (&'static str, &'static str, String) {
+    if at.is_some() {
+        let mode = query::CorpusMode::CommitPinned;
+        (
+            mode.as_str(),
+            query::CorpusModeSource::Selector.as_str(),
+            mode.disclaimer().to_owned(),
+        )
+    } else {
+        let (mode, source, disclaimer) = query::disclose_corpus(records, query::CorpusMode::Union);
+        (mode.as_str(), source.as_str(), disclaimer)
+    }
+}
+
+/// Resolves the corpus-disclosure triple for a lane that HEAD-anchors its
+/// current-state view by default (issue #427): `commit_pinned` + `selector`
+/// when a temporal selector (`--at`/`--as-of`) is active, otherwise the
+/// [`query::disclose_corpus`] head-anchored default (`head_anchored` over a
+/// scan-history store carrying a `source_snapshot`, `single_snapshot` over a
+/// plain snapshot-less scan).
+pub(crate) fn disclose_head_anchored_corpus(
+    records: &[GraphRecord],
+    selector_active: bool,
+) -> (&'static str, &'static str, String) {
+    if selector_active {
+        let mode = query::CorpusMode::CommitPinned;
+        (
+            mode.as_str(),
+            query::CorpusModeSource::Selector.as_str(),
+            mode.disclaimer().to_owned(),
+        )
+    } else {
+        let (mode, source, disclaimer) =
+            query::disclose_corpus(records, query::CorpusMode::HeadAnchored);
+        (mode.as_str(), source.as_str(), disclaimer)
+    }
+}
+
+/// Stamps corpus-disclosure fields (issue #427) onto every `query symbol` row.
+///
+/// The `query symbol` lane emits bare NDJSON rows with no summary envelope, so
+/// the disclosure rides each row. All rows in one query share the same corpus.
+pub(crate) fn stamp_symbol_corpus(
+    results: &mut [SymbolResult<'_>],
+    mode: query::CorpusMode,
+    source: query::CorpusModeSource,
+) {
+    for row in results.iter_mut() {
+        row.corpus_mode = Some(mode.as_str());
+        row.corpus_mode_source = Some(source.as_str());
+        row.corpus_disclaimer = Some(mode.disclaimer().to_owned());
+    }
 }
 
 pub(crate) fn get_file_diagnostics<'a>(
@@ -3940,6 +4081,15 @@ pub(crate) struct WhoResult<'a> {
     /// Optional store-freshness code.
     #[serde(skip_serializing_if = "Option::is_none")]
     freshness: Option<&'a str>,
+    /// Corpus this answer was read from (issue #427): `commit_pinned` under
+    /// `--at`/`--as-of`, otherwise `head_anchored` over a scan-history store
+    /// carrying a `source_snapshot`, `single_snapshot` over a plain scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: `selector` under a temporal pin, else
+    /// `default`.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -4041,6 +4191,13 @@ pub(crate) struct ContextResponse<'a> {
     unresolved: Vec<ContextUnresolved<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     excluded: Vec<ExcludedDiagnostic<'a>>,
+    /// Corpus the current-state view read (issue #427):
+    /// `union` over a scan-history store, `single_snapshot` over a plain scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 /// Full task context query response envelope.
@@ -4125,6 +4282,13 @@ pub(crate) struct SubsystemResponse<'a> {
     unresolved: Vec<ContextUnresolved<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     excluded: Vec<ExcludedDiagnostic<'a>>,
+    /// Corpus the current-state view read (issue #427):
+    /// `union` over a scan-history store, `single_snapshot` over a plain scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -4399,6 +4563,13 @@ pub(crate) struct FailureHistoryResponse<'a> {
     agents: Vec<&'a str>,
     diagnostics: Vec<AuditDiagnostic<'a>>,
     page: AuditPage,
+    /// Corpus the current-state view read (issue #427):
+    /// `union` over a scan-history store, `single_snapshot` over a plain scan.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -4751,6 +4922,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         }
                     });
 
+                    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+                        disclose_head_anchored_corpus(&records, at.is_some() || as_of.is_some());
                     let result = WhoResult {
                         symbol_name: &name,
                         commit_sha,
@@ -4759,6 +4932,9 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         valid_time,
                         repo_relative_path,
                         freshness,
+                        corpus_mode,
+                        corpus_mode_source,
+                        corpus_disclaimer,
                     };
                     print_result(&result, format)?;
                     Ok(())
@@ -5153,6 +5329,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             max_depth,
             at,
             as_of,
+            at_head,
+            all_history,
             format,
         } => {
             // Validate the bound before any store I/O: a zero-hop walk can
@@ -5193,6 +5371,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 max_depth,
                 at.as_deref(),
                 as_of.as_deref(),
+                at_head,
+                all_history,
                 format,
             )
         }
@@ -5204,6 +5384,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             max_depth,
             at,
             as_of,
+            at_head,
+            all_history,
             format,
         } => {
             // Validate the bound before any store I/O: a zero-hop walk can
@@ -5244,6 +5426,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 max_depth,
                 at.as_deref(),
                 as_of.as_deref(),
+                at_head,
+                all_history,
                 format,
             )
         }
@@ -5254,6 +5438,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo,
             at,
             as_of,
+            at_head,
+            all_history,
             format,
         } => {
             // Strictly read-only lane (issue #424): opening the embedded engine
@@ -5288,6 +5474,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 selected.as_deref(),
                 at.as_deref(),
                 as_of.as_deref(),
+                at_head,
+                all_history,
                 format,
             )
         }
@@ -6001,6 +6189,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 selected.as_deref(),
                 scope.as_deref(),
                 limit,
+                at.is_some(),
                 format,
             )
         }
@@ -6013,6 +6202,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo,
             at,
             as_of,
+            at_head,
+            all_history,
             format,
         } => {
             // Strictly read-only: opening the live embedded engine re-persists
@@ -6041,6 +6232,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 selected.as_deref(),
                 at.as_deref(),
                 as_of.as_deref(),
+                at_head,
+                all_history,
                 format,
             )
         }
@@ -6051,6 +6244,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             data_dir,
             crate_name,
             repo,
+            at_head,
+            all_history,
             format,
         } => {
             // Strictly read-only lane: opening the live embedded engine
@@ -6080,6 +6275,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 crate_name.as_deref(),
                 &index,
                 selected.as_deref(),
+                at_head,
+                all_history,
                 format,
             )
         }

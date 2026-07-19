@@ -189,6 +189,15 @@ the path and writes no output file. See `docs/cli/export.md`.
 
 Query commands (local JSONL graph, no network):
 
+Corpus scope (issue #427): every query lane discloses the corpus its answer was computed over
+via the envelope fields `corpus_mode` (`head_anchored`/`union`/`commit_pinned`/`single_snapshot`),
+`corpus_mode_source`, and `corpus_disclaimer`. Current-state code lanes default to HEAD-anchored
+over a `scan-history` store; the flipped lanes (`deps`, `transitive-callers`, `transitive-callees`,
+`path`, `who-imports`) expose `--all-history` (union) / `--at-head` (force head), mutually
+exclusive with each other and with `--at`/`--as-of` (exit 1 `unsupported_combination`).
+History-analysis lanes are union by design. The full contract is documented once in
+`docs/cli/corpus-modes.md`.
+
 ```powershell
 # Symbol-level cross-domain context
 cargo run -- query context <symbol_name> --graph graph.jsonl
@@ -399,7 +408,13 @@ of record-ID/edge-label handles. Cycles terminate deterministically (each symbol
 once, shortest path); reaching the bound emits a truncation diagnostic counting dropped
 frontier nodes per depth. Call-resolution labels (issues #152/#134) propagate along paths:
 each row carries the weakest resolution on its chain. Ambiguous names exit 1 listing all
-candidate record IDs; `--at`/`--as-of` walk a single-commit history view. Output is
+candidate record IDs; `--at`/`--as-of` walk a single-commit history view. Over a
+`scan-history` store the default corpus is now HEAD-anchored (records current at each
+repository's stamped HEAD); `--all-history` opts into the union of all commit snapshots (the
+pre-#427 default) and `--at-head` forces head — mutually exclusive with each other and with
+`--at`/`--as-of` (exit 1 `unsupported_combination`), and the envelope discloses
+`corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (issue #427; see
+`docs/cli/corpus-modes.md`). Output is
 newline-delimited JSON (summary envelope line, then one row per line), byte-identical across
 runs. Rows are reachability leads, never proof of breakage. See
 `docs/cli/transitive-callers.md`.
@@ -416,7 +431,13 @@ silently dropped and never counted as reachable. Cycles terminate deterministica
 node reported once, shortest path); reaching the bound emits a truncation diagnostic counting
 dropped frontier nodes per depth. Call-resolution labels (issues #152/#134) propagate along
 paths: each row carries the weakest resolution on its chain. Ambiguous names exit 1 listing
-all candidate record IDs; `--at`/`--as-of` walk a single-commit history view. Output is
+all candidate record IDs; `--at`/`--as-of` walk a single-commit history view. Over a
+`scan-history` store the default corpus is now HEAD-anchored (records current at each
+repository's stamped HEAD); `--all-history` opts into the union of all commit snapshots (the
+pre-#427 default) and `--at-head` forces head — mutually exclusive with each other and with
+`--at`/`--as-of` (exit 1 `unsupported_combination`), and the envelope discloses
+`corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (issue #427; see
+`docs/cli/corpus-modes.md`). Output is
 newline-delimited JSON (summary envelope line, then reachable rows, then unresolved rows),
 byte-identical across runs. Rows are reachability leads, never proof of breakage or runtime
 behavior. See `docs/cli/transitive-callees.md`.
@@ -438,10 +459,15 @@ reconstructed by following those pointers. Both endpoints resolve independently;
 ambiguous name exits 1 listing all candidate record IDs (the `endpoint` field names which
 side failed), an unknown/stale endpoint exits 2 (`no_match`/`stale_handle`), and both
 endpoints resolving with no directed path is an explicit `no_path` verdict at exit 2.
-`--at`/`--as-of` trace a single-commit history view (mutually exclusive); with neither, a
-scan-history graph/store is read as the UNION of all commit snapshots (no edge tombstones),
-so an edge removed at a later commit can still yield `path_found` — pass `--at <HEAD>` for
-HEAD-only semantics (matches `deps`/`transitive-callers`/`transitive-callees`). Read-only over
+`--at`/`--as-of` trace a single-commit history view (mutually exclusive). BREAKING CHANGE
+(issue #427): with neither selector nor a corpus flag, a scan-history graph/store now defaults
+to the HEAD-anchored corpus (records current at each repository's stamped HEAD), so an edge
+removed before HEAD yields `no_path` instead of `path_found`. This flips the pre-#427 default,
+which read the UNION of all commit snapshots; `--all-history` restores that union and
+`--at-head` forces head — mutually exclusive with each other and with `--at`/`--as-of` (exit 1
+`unsupported_combination`), matching `deps`/`transitive-callers`/`transitive-callees`. The
+envelope discloses `corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (see
+`docs/cli/corpus-modes.md`). Read-only over
 `--graph`/`--data-dir`, redaction-safe (record IDs, names, paths, spans only), with a
 `--format text` mode. See `docs/cli/path.md`.
 
@@ -452,7 +478,13 @@ handle, and any `CALLS` resolution status (issues #152/#134). Unresolved targets
 with no in-repo definition, or a missing target record) are an explicit `unresolved`
 category with a stable reason, never silently dropped. Ambiguous names exit 1 listing all
 candidate record IDs; `--at`/`--as-of` return the dependency set at a single-commit history
-view. Output is newline-delimited JSON (summary envelope line, then one row per line),
+view. Over a `scan-history` store the default corpus is now HEAD-anchored (records current at
+each repository's stamped HEAD, so a dependency removed before HEAD is excluded); `--all-history`
+opts into the union of all commit snapshots (the pre-#427 default) and `--at-head` forces head
+— mutually exclusive with each other and with `--at`/`--as-of` (exit 1
+`unsupported_combination`), and the envelope discloses
+`corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (issue #427; see
+`docs/cli/corpus-modes.md`). Output is newline-delimited JSON (summary envelope line, then one row per line),
 byte-identical across runs, with a `--format text` mode. Rows are dependency leads, never
 proof of runtime behavior. See `docs/cli/deps.md`.
 
@@ -473,11 +505,15 @@ bare `use`) keyword prefix the extractor leaves on a re-export node's `name`
 (`pub use crate::internal::Widget`) is stripped before matching, so `crate::…` re-export sites
 are found (issue #449). Liveness follows the shared
 latest-write-wins `Liveness` gate so `--graph` and `--data-dir` agree on tombstoned/revived
-imports. This slice has no `--at`/`--as-of` and no HEAD-only filter: over a `scan`
-(current-tree) graph the answer is current state, but over a `scan-history` graph the lane
-reads the UNION of all commit snapshots (history replay never tombstones a later-removed
-import, so an import present only in an early commit is still returned), mirroring
-`deps`/`path`. Output is a deterministic NDJSON envelope (`query_path`, optional `crate_name`,
+imports. This slice has no `--at`/`--as-of`. BREAKING CHANGE (issue #427): over a
+`scan-history` graph the lane now defaults to the HEAD-anchored corpus (imports current at each
+repository's stamped HEAD), flipping the pre-#427 default that read the UNION of all commit
+snapshots (history replay never tombstones a later-removed import, so under the old default an
+import present only in an early commit was still returned); `--all-history` restores that union
+and `--at-head` forces head — mutually exclusive (exit 1 `unsupported_combination`), and the
+envelope discloses `corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (see
+`docs/cli/corpus-modes.md`), mirroring `deps`/`path`. Over a `scan` (current-tree) graph the
+answer is current state directly. Output is a deterministic NDJSON envelope (`query_path`, optional `crate_name`,
 `total_importers`, disclaimer) then one `source_fact` row per importer carrying a stable
 `record_id` + repo-relative `repo_relative_path`/`span` + the raw `import_path`; sorted by
 path, start line, then record ID and byte-identical across runs and across `--graph` vs
@@ -1267,3 +1303,26 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 For ingestion work, also test against a temporary AletheiaDB data dir before touching the shared memory store.
+
+### Toolchain pin
+
+The toolchain is pinned at the repo root by `rust-toolchain.toml` to an **exact**
+version with the `rustfmt` and `clippy` components:
+
+```toml
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+```
+
+Why an exact pin rather than bare `stable`: bare `stable` still drifts as the
+channel advances, and a stray `rustup` override to a newer channel that lacks
+`rustfmt`/`clippy` has made clean trunk fail the `clippy` gate in some
+containers. Pinning the exact gate version with the two required components
+makes `cargo fmt`/`cargo test`/`cargo clippy` deterministic across every
+environment — rustup auto-installs the pinned toolchain (with components) on the
+first `cargo` invocation.
+
+To bump it: edit `channel` in `rust-toolchain.toml` deliberately, then re-run
+the full verification matrix above under the new version and confirm the whole
+matrix passes before committing the bump.

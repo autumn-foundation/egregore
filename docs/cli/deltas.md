@@ -190,3 +190,10 @@ co-change coupling lane in PR #312 (issue #153).
 And once more, because it is the sharp edge: **absence of a delta is not
 proof a behavior was preserved** — this query reports observed structural and
 semantic movement, nothing else.
+## Corpus scope
+
+This is a history-analysis lane: it reads the **union of all commit snapshots**
+by design and carries no `--at-head`/`--all-history` corpus flags. The summary
+envelope discloses `corpus_mode: "union"` (or `single_snapshot` over a
+snapshot-less store), `corpus_mode_source`, and `corpus_disclaimer` for
+transparency. See [Corpus scope for query lanes](corpus-modes.md).

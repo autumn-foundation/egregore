@@ -131,6 +131,9 @@ pub(crate) fn query_file(
             } else {
                 None
             },
+            corpus_mode: None,
+            corpus_mode_source: None,
+            corpus_disclaimer: None,
         });
     }
 
@@ -185,6 +188,9 @@ pub(crate) fn query_file_at_point(
     };
     match query::file_symbols_at_point(records, path, selector, selected_repo) {
         Ok(result) => {
+            // A temporal selector is always in effect on this path, so the
+            // corpus is the single-commit snapshot it pins (issue #427).
+            let corpus_mode = query::CorpusMode::CommitPinned;
             match format {
                 OutputFormat::Json => {
                     #[derive(serde::Serialize)]
@@ -192,8 +198,21 @@ pub(crate) fn query_file_at_point(
                         ok: bool,
                         #[serde(flatten)]
                         result: query::FileSymbolsAtPoint<'a>,
+                        /// Corpus this answer was read from (issue #427):
+                        /// always `commit_pinned` on the `--at`/`--as-of` path.
+                        corpus_mode: &'static str,
+                        /// How the corpus mode was chosen: always `selector`.
+                        corpus_mode_source: &'static str,
+                        /// One-line human description of the corpus.
+                        corpus_disclaimer: String,
                     }
-                    let response = FileAtPointResponse { ok: true, result };
+                    let response = FileAtPointResponse {
+                        ok: true,
+                        result,
+                        corpus_mode: corpus_mode.as_str(),
+                        corpus_mode_source: query::CorpusModeSource::Selector.as_str(),
+                        corpus_disclaimer: corpus_mode.disclaimer().to_owned(),
+                    };
                     let output = serde_json::to_string_pretty(&response)
                         .context("failed to serialize file-at-point result")?;
                     println!("{output}");
@@ -216,6 +235,7 @@ pub(crate) fn query_file_at_point(
                             .resolved_valid_time
                             .map_or(String::new(), |vt| format!(" ({vt})"))
                     );
+                    println!("# corpus: {}", corpus_mode.as_str());
                 }
             }
             Ok(())

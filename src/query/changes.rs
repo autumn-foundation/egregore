@@ -562,6 +562,15 @@ pub struct ChangesContext<'a> {
     pub unexplained: Vec<UnexplainedChange<'a>>,
     /// Citations from observations/tasks to absent target records.
     pub unresolved: Vec<UnresolvedRef>,
+    /// Corpus this history-analysis lane read (issue #427): `union` over a
+    /// scan-history store, `single_snapshot` over a snapshot-less store. The
+    /// base/head range is the analysis window; the corpus within it is the
+    /// union. The disclosure never changes traversal.
+    pub corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    pub corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    pub corpus_disclaimer: String,
 }
 
 /// Errors that can occur during commit range query resolution.
@@ -1684,6 +1693,9 @@ pub fn changes_context<'a>(
     // pass above; collapse exact duplicates after sorting.
     unresolved.dedup();
 
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        super::disclose_corpus(records, super::CorpusMode::Union);
+
     Ok(ChangesContext {
         changed_files,
         changed_symbols,
@@ -1696,6 +1708,9 @@ pub fn changes_context<'a>(
         verification_evidence: output_verification_evidence,
         unexplained,
         unresolved,
+        corpus_mode: corpus_mode.as_str(),
+        corpus_mode_source: corpus_mode_source.as_str(),
+        corpus_disclaimer,
     })
 }
 

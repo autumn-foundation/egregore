@@ -50,8 +50,13 @@ never a silent empty payload, never synthesized items (AC6).
 ## Scope and bounds
 
 - **Rust only**, at the **current** graph state. Records from other languages
-  never contribute; when a stable ID appears more than once (history graphs)
-  the latest record wins deterministically.
+  never contribute. Over a `scan-history` store the surface is **HEAD-anchored**:
+  the version of each symbol that is current at its repository's stamped HEAD
+  commit is used (a symbol removed before HEAD does not appear), resolved
+  deterministically. The envelope discloses `corpus_mode`
+  (`head_anchored`, or `single_snapshot` for a snapshot-less store) /
+  `corpus_mode_source` / `corpus_disclaimer`; `--at`/`--as-of` pin a single
+  commit (`commit_pinned`). See [Corpus scope for query lanes](corpus-modes.md).
 - The surface is the **library crate rooted at `src/`**. `src/bin/**` holds
   separate binary crates; `tests/`, `examples/`, and `benches/` are separate
   target crates — `pub` items there are never part of the library contract.

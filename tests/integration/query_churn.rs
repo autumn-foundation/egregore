@@ -216,6 +216,18 @@ fn churn_ranks_engineered_high_churn_file_first_over_fixture_history() {
     assert_eq!(result["returned_file_count"], 3);
     assert_eq!(result["ranking_basis"], "distinct_commit_count");
     assert_eq!(result["tie_break"], "repo_relative_path");
+
+    // Corpus disclosure (issue #427): a real scan-history store carries a
+    // source_snapshot, so this history-analysis lane discloses `union`.
+    assert_eq!(result["corpus_mode"], "union");
+    assert_eq!(result["corpus_mode_source"], "default");
+    assert!(
+        result["corpus_disclaimer"]
+            .as_str()
+            .expect("corpus_disclaimer string")
+            .contains("union of all commit snapshots"),
+        "disclaimer describes the union corpus"
+    );
 }
 
 #[test]

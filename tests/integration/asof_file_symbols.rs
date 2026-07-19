@@ -587,6 +587,10 @@ fn query_file_at_cli_reconstructs_past_symbol_sets() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["resolved_commit"], second.as_str());
     assert_eq!(body["at"], second.as_str());
+    // Issue #427: the `--at`/`--as-of` path always reads a single-commit
+    // snapshot, disclosed as commit_pinned.
+    assert_eq!(body["corpus_mode"], "commit_pinned");
+    assert_eq!(body["corpus_mode_source"], "selector");
     for row in body["symbols"].as_array().unwrap() {
         assert!(row["record_id"].as_str().is_some_and(|s| !s.is_empty()));
         assert_eq!(row["repo_relative_path"], "src/f.rs");
