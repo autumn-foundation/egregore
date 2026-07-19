@@ -357,6 +357,7 @@ pub(crate) fn decide_cmd(
                                 frame_resolution: None,
                                 frame_index: None,
                                 basis: None,
+                                is_exhaustive: None,
                                 temporal: None,
                                 summary: "PromotionDecision decided on PromoteCandidate".to_owned(),
                                 producer: None,
@@ -403,6 +404,7 @@ pub(crate) fn decide_cmd(
                                         frame_resolution: None,
                                         frame_index: None,
                                         basis: None,
+                                        is_exhaustive: None,
                                         temporal: None,
                                         summary:
                                             "PromotionDecision revoked durable user-context record"
@@ -427,6 +429,7 @@ pub(crate) fn decide_cmd(
                                         frame_resolution: None,
                                         frame_index: None,
                                         basis: None,
+                                        is_exhaustive: None,
                                         temporal: None,
                                         summary: "PromotionDecision materialized durable user-context record".to_owned(),
                                         producer: None,
@@ -450,6 +453,7 @@ pub(crate) fn decide_cmd(
                             frame_resolution: None,
                             frame_index: None,
                             basis: None,
+                            is_exhaustive: None,
                             temporal: None,
                             summary: "PromotionPrompt prompted for PromoteCandidate".to_owned(),
                             producer: None,

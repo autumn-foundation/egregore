@@ -219,6 +219,9 @@ pub fn orientation_map(
                 | EdgeLabel::Calls
                 | EdgeLabel::Implements
                 | EdgeLabel::Mentions
+                // A struct-literal `CONSTRUCTS` edge (issue #443) is code
+                // topology and counts toward a type's inbound reference degree.
+                | EdgeLabel::Constructs
         )
     };
 

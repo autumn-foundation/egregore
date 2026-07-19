@@ -2761,6 +2761,7 @@ impl EmbeddedAletheiaSink {
             frame_resolution,
             frame_index,
             basis,
+            is_exhaustive,
             temporal,
             summary,
             producer,
@@ -2796,6 +2797,9 @@ impl EmbeddedAletheiaSink {
             "basis",
             basis.map(crate::ir::CorrelationBasis::as_str),
         );
+        // Struct-literal exhaustiveness marker on `CONSTRUCTS` edges (issue #443).
+        let is_exhaustive_str = is_exhaustive.map(|value| if value { "true" } else { "false" });
+        builder = insert_optional(builder, "is_exhaustive", is_exhaustive_str);
         builder = insert_temporal(builder, temporal.as_ref());
         if let Some(p) = producer
             && let Ok(json) = serde_json::to_string(p)
@@ -3734,6 +3738,21 @@ impl EmbeddedAletheiaSink {
                     })
                 })
                 .transpose()?,
+            is_exhaustive: optional_str_property(
+                record_id,
+                "is_exhaustive",
+                edge.get_property("is_exhaustive"),
+            )?
+            .as_deref()
+            .map(|value| match value {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                other => Err(read_back_error(
+                    record_id,
+                    format!("is_exhaustive invalid: {other}"),
+                )),
+            })
+            .transpose()?,
             temporal: temporal_from_properties(record_id, |key| edge.get_property(key))?,
             summary: required_str_property(record_id, "summary", edge.get_property("summary"))?,
             producer: optional_str_property(

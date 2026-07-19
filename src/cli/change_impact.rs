@@ -40,6 +40,13 @@ pub(crate) struct ImpactLeadJson<'a> {
     anchor_id: &'a str,
     /// Hop distance from the anchor (1-based).
     hop: usize,
+    /// E0063 blast-radius flag on a `CONSTRUCTS` construction-site row (issue
+    /// #443): `true` when the collapsed literal(s) include the exhaustive,
+    /// non-`..base` form that breaks when a required field is added (default
+    /// `true` when the edge marker is absent); `false` when every site used
+    /// `..base`. Absent on non-construction rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    e0063_risk: Option<bool>,
     /// Every row is an impact LEAD — not proof of breakage (AC5).
     trust: &'static str,
 }
@@ -68,6 +75,9 @@ pub(crate) struct ChangeImpactResponse<'a> {
     referencing_files: Vec<ImpactLeadJson<'a>>,
     implementation_symbols: Vec<ImpactLeadJson<'a>>,
     containing_context: Vec<ImpactLeadJson<'a>>,
+    /// Struct-literal construction sites of the anchor type (issue #443); each
+    /// row carries an `e0063_risk` flag. Always present (empty when none).
+    construction_sites: Vec<ImpactLeadJson<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     truncations: Vec<ImpactTruncationJson>,
     diagnostics: Vec<AuditDiagnostic<'a>>,
@@ -121,6 +131,8 @@ pub(crate) fn impact_lead_json<'a>(lead: &'a query::ImpactLead<'a>) -> Option<Im
         edge_git_commit,
         anchor_id: lead.anchor_id,
         hop: lead.hop,
+        e0063_risk: (lead.relation == "CONSTRUCTS")
+            .then(|| lead.edge.construct_is_exhaustive().unwrap_or(true)),
         trust: "impact_lead",
     })
 }
@@ -213,6 +225,7 @@ pub(crate) fn query_change_impact_cmd(
         .chain(&ctx.referencing_files)
         .chain(&ctx.implementation_symbols)
         .chain(&ctx.containing_context)
+        .chain(&ctx.construction_sites)
     {
         protected_payload_diagnostics(lead.record, &mut diagnostics);
     }
@@ -235,7 +248,8 @@ pub(crate) fn query_change_impact_cmd(
         + ctx.direct_callees.len()
         + ctx.referencing_files.len()
         + ctx.implementation_symbols.len()
-        + ctx.containing_context.len();
+        + ctx.containing_context.len()
+        + ctx.construction_sites.len();
 
     let truncations: Vec<ImpactTruncationJson> = ctx
         .truncations
@@ -277,6 +291,11 @@ pub(crate) fn query_change_impact_cmd(
             .collect(),
         containing_context: ctx
             .containing_context
+            .iter()
+            .filter_map(impact_lead_json)
+            .collect(),
+        construction_sites: ctx
+            .construction_sites
             .iter()
             .filter_map(impact_lead_json)
             .collect(),

@@ -155,6 +155,7 @@ fn build_fixture_records() -> Vec<GraphRecord> {
         frame_resolution: None,
         frame_index: None,
         basis: None,
+        is_exhaustive: None,
         temporal: None,
         summary: "Contradiction edge".to_owned(),
         producer: None,

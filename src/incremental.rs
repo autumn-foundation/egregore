@@ -117,11 +117,15 @@ use crate::{
 /// on non-`self` identifier method calls, changing the cached call-site shape,
 /// so per-file caches must rebuild to narrow those calls instead of replaying
 /// the pre-#441 ambiguous fan-out.
+/// 22 -> 24: #443 struct-literal CONSTRUCTS edges (23 reserved for #451). The
+/// new `FileFacts.construct_sites` field changes the cached per-file fact shape,
+/// so per-file caches must rebuild to emit the CONSTRUCTS edges instead of
+/// replaying pre-#443 facts that carried none.
 ///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 22;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 24;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

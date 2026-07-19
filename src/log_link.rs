@@ -444,6 +444,7 @@ pub fn link_logs(records: &[GraphRecord], opts: &LinkLogsOptions) -> LinkLogsRes
                 frame_resolution: None,
                 frame_index: None,
                 basis: Some(p.basis),
+                is_exhaustive: None,
                 temporal: None,
                 summary: format!(
                     "error signature {} emitted during {} ({})",
@@ -484,6 +485,7 @@ pub fn link_logs(records: &[GraphRecord], opts: &LinkLogsOptions) -> LinkLogsRes
                 frame_resolution: None,
                 frame_index: None,
                 basis: None,
+                is_exhaustive: None,
                 temporal: None,
                 summary: format!("error signature {sig_id} references task {task_id}"),
                 producer: None,

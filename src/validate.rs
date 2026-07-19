@@ -174,6 +174,10 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
             NodeKind::UnsafeSite,
         ]),
         EdgeLabel::Calls | EdgeLabel::Mentions => Some(&[NodeKind::Diagnostic, NodeKind::Symbol]),
+        // A `Symbol —CONSTRUCTS→ Symbol` struct-literal construction edge
+        // (issue #443) always targets the constructed type's definition Symbol;
+        // it is never emitted to a `Diagnostic`.
+        EdgeLabel::Constructs => Some(&[NodeKind::Symbol]),
         EdgeLabel::Imports => Some(&[NodeKind::Import]),
         // The commit-anchor project edges terminate at a `Commit` only: a PR
         // `Task —MERGED_AS→ Commit` (issue #333) and its review-side mirror
@@ -1252,6 +1256,7 @@ mod tests {
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            is_exhaustive: None,
             temporal: None,
             summary: "test edge".to_owned(),
             producer: None,
