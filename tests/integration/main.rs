@@ -35,6 +35,7 @@ mod forget;
 mod freshness;
 mod git_scope_scan;
 mod go_scan;
+mod graph_index;
 mod history;
 mod history_safety;
 mod identity;
