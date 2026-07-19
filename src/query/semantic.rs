@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use super::liveness::Liveness;
 use super::{SymbolContext, record_context};
 use crate::ir::{EdgeLabel, EvidenceLink, GraphRecord, NodeKind, SemanticDriftMetadata};
 
@@ -137,12 +138,20 @@ fn record_kind(records: &[GraphRecord], id: &str) -> Option<NodeKind> {
 /// (temporal) version survives a current-state tombstone; a tombstoned
 /// current-state symbol is excluded.
 fn live_symbol_ids_for_name(records: &[GraphRecord], name: &str) -> Vec<String> {
+    // Latest-write-wins liveness (issues #421/#432): over an append-only
+    // `--graph` a symbol re-ingested AFTER its own tombstone is live again,
+    // matching the embedded `--data-dir` current-state read. Retaining a
+    // deleted_id only while its tombstone is still the id's most recent write
+    // keeps the two transports' ambiguous-candidate lists in agreement. See
+    // `super::liveness`.
+    let liveness = Liveness::new(records);
     let tombstoned: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| match r {
             GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
             _ => None,
         })
+        .filter(|&id| liveness.deleted(id))
         .collect();
     let mut ids: Vec<String> = records
         .iter()
@@ -310,6 +319,88 @@ pub(super) fn semantic_drift(record: &GraphRecord) -> Option<&SemanticDriftMetad
 
 pub(super) const fn drift_score(drift: &SemanticDriftMetadata) -> f64 {
     drift.score
+}
+
+#[cfg(test)]
+mod liveness_parity_tests {
+    //! Transport-parity regression (issues #421/#432): over an append-only
+    //! `--graph`, a same-name symbol re-ingested AFTER its own tombstone rejoins
+    //! the ambiguous-candidate set — matching the embedded `--data-dir`
+    //! current-state read — while a tombstone with no re-add keeps it out.
+    use super::*;
+    use crate::ir::{SCHEMA_VERSION, SourceSpan};
+
+    fn sym(id: &str, name: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    fn tomb(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v6:tomb_{deleted_id}"),
+            schema_version: SCHEMA_VERSION,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn reingested_same_name_symbol_rejoins_candidate_set() {
+        let a = "codegraph:v6:a";
+        let b = "codegraph:v6:b";
+        let records = vec![sym(a, "foo"), sym(b, "foo"), tomb(b), sym(b, "foo")];
+        let ids = live_symbol_ids_for_name(&records, "foo");
+        assert_eq!(
+            ids,
+            vec![a.to_owned(), b.to_owned()],
+            "a revived same-name symbol must rejoin the ambiguous candidate set"
+        );
+    }
+
+    #[test]
+    fn tombstoned_same_name_symbol_without_reingest_stays_out() {
+        let a = "codegraph:v6:a";
+        let b = "codegraph:v6:b";
+        let records = vec![sym(a, "foo"), sym(b, "foo"), tomb(b)];
+        let ids = live_symbol_ids_for_name(&records, "foo");
+        assert_eq!(
+            ids,
+            vec![a.to_owned()],
+            "a tombstone with no re-add keeps the symbol out of the candidate set"
+        );
+    }
+
+    #[test]
+    fn bundle_surfaces_revived_ambiguous_candidates() {
+        let a = "codegraph:v6:a";
+        let b = "codegraph:v6:b";
+        let records = vec![sym(a, "foo"), sym(b, "foo"), tomb(b), sym(b, "foo")];
+        let lead = SemanticLead {
+            record_id: a.to_owned(),
+            name: Some("foo".to_owned()),
+            repo_relative_path: Some("src/lib.rs".to_owned()),
+            score: 1.0,
+            span: None,
+        };
+        let bundle = semantic_context_bundle(&records, std::slice::from_ref(&lead), 0.0);
+        assert_eq!(
+            bundle.matches[0].candidate_record_ids,
+            vec![a.to_owned(), b.to_owned()],
+            "the bundle must surface both live candidates for an ambiguous revived name"
+        );
+    }
 }
 
 // ── Subsystem-scoped cross-domain context query (issue #83) ──────────────────
