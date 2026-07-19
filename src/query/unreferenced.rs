@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::RepositoryIndex;
+use super::liveness::Liveness;
 use crate::ir::{
     CallResolution, EdgeLabel, GraphRecord, NodeKind, SourceSpan, TemporalMetadata,
     parse_codegraph_id, stable_id,
@@ -152,6 +153,16 @@ pub fn unreferenced_symbols<'a>(
     index: &RepositoryIndex,
     repo_scope: Option<&str>,
 ) -> UnreferencedSymbols<'a> {
+    // Latest-write-wins liveness (issues #421/#432): over an append-only
+    // `--graph` a node OR reference edge re-ingested AFTER its own tombstone is
+    // live again, matching the embedded `--data-dir` current-state read. The
+    // `tombstoned` set below therefore retains a deleted_id only while its
+    // tombstone is still the id's most recent write, and the inbound-reference
+    // scan additionally selects only the latest EDGE version per id so a stale
+    // earlier version cannot supply reference metadata. Orthogonal to the
+    // `non_head_current` corpus gate (#82/#427), which still applies below. See
+    // `super::liveness`.
+    let liveness = Liveness::new(records);
     let tombstoned: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| {
@@ -161,6 +172,7 @@ pub fn unreferenced_symbols<'a>(
                 None
             }
         })
+        .filter(|&id| liveness.deleted(id))
         .collect();
     let is_owned =
         |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
@@ -337,7 +349,7 @@ pub fn unreferenced_symbols<'a>(
     // vanish from the candidate set.
     let mut referenced_ids: BTreeSet<&str> = BTreeSet::new();
     let mut unresolved_call_edges = 0usize;
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         let GraphRecord::Edge {
             id,
             label,
@@ -349,6 +361,14 @@ pub fn unreferenced_symbols<'a>(
         else {
             continue;
         };
+        // Latest-write-wins for edge metadata (#421/#432): a stable edge id may
+        // be re-ingested with changed label/resolution over an append-only
+        // `--graph`. Only the latest EDGE write for the id is live, mirroring the
+        // embedded `latest_edge_versions` read, so a superseded earlier version
+        // never double-counts or mis-classifies an inbound reference.
+        if !liveness.is_latest_edge_version(id.as_str(), index) {
+            continue;
+        }
         if tombstoned.contains(id.as_str()) {
             continue;
         }
@@ -504,4 +524,126 @@ pub fn unreferenced_symbols<'a>(
     });
     result.diagnostics.dedup();
     result
+}
+
+#[cfg(test)]
+mod liveness_parity_tests {
+    //! Transport-parity regression (issues #421/#432): over an append-only
+    //! `--graph`, a symbol OR reference edge re-ingested AFTER its own tombstone
+    //! is live again, and only the latest EDGE version supplies reference
+    //! metadata — matching the embedded `--data-dir` current-state read.
+    use super::*;
+    use crate::ir::SCHEMA_VERSION;
+
+    fn sym(id: &str, name: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    fn calls(source: &str, target: &str, resolution: CallResolution) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::Calls,
+            source.to_owned(),
+            target.to_owned(),
+            Some("1.0".to_owned()),
+            "calls".to_owned(),
+        )
+        .with_resolution(resolution)
+    }
+
+    fn tomb(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v6:tomb_{deleted_id}"),
+            schema_version: SCHEMA_VERSION,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn symbol_reingested_after_tombstone_is_a_candidate() {
+        let id = "codegraph:v6:lonely";
+        let records = vec![sym(id, "lonely"), tomb(id), sym(id, "lonely")];
+        let index = RepositoryIndex::build(&records);
+        let result = unreferenced_symbols(&records, &index, None);
+        assert!(
+            result.candidates.iter().any(|c| c.record_id == id),
+            "a symbol re-ingested after its tombstone must be a live candidate"
+        );
+    }
+
+    #[test]
+    fn symbol_tombstone_without_reingest_is_not_a_candidate() {
+        let id = "codegraph:v6:lonely";
+        let records = vec![sym(id, "lonely"), tomb(id)];
+        let index = RepositoryIndex::build(&records);
+        let result = unreferenced_symbols(&records, &index, None);
+        assert!(
+            !result.candidates.iter().any(|c| c.record_id == id),
+            "a tombstone with no later re-ingest still deletes the symbol"
+        );
+    }
+
+    #[test]
+    fn reference_edge_reingested_after_tombstone_marks_target_referenced() {
+        let from_id = "codegraph:v6:caller";
+        let to_id = "codegraph:v6:callee";
+        let e1 = calls(from_id, to_id, CallResolution::Resolved);
+        let edge_id = e1.id().to_owned();
+        let e2 = calls(from_id, to_id, CallResolution::Resolved);
+        let records = vec![
+            sym(from_id, "caller"),
+            sym(to_id, "callee"),
+            e1,
+            tomb(&edge_id),
+            e2,
+        ];
+        let index = RepositoryIndex::build(&records);
+        let result = unreferenced_symbols(&records, &index, None);
+        assert!(
+            !result.candidates.iter().any(|c| c.record_id == to_id),
+            "a reference edge re-ingested after its tombstone must mark its target referenced"
+        );
+    }
+
+    #[test]
+    fn only_latest_edge_version_supplies_reference_metadata() {
+        // Two versions of one stable CALLS edge id: v1 `unresolved`, v2
+        // `resolved`. Only the latest EDGE write (v2) is read, so the target is
+        // referenced and no stale `unresolved_call_edges_present` diagnostic is
+        // raised from the superseded v1.
+        let from_id = "codegraph:v6:caller";
+        let to_id = "codegraph:v6:callee";
+        let records = vec![
+            sym(from_id, "caller"),
+            sym(to_id, "callee"),
+            calls(from_id, to_id, CallResolution::Unresolved),
+            calls(from_id, to_id, CallResolution::Resolved),
+        ];
+        let index = RepositoryIndex::build(&records);
+        let result = unreferenced_symbols(&records, &index, None);
+        assert!(
+            !result.candidates.iter().any(|c| c.record_id == to_id),
+            "the latest resolved edge version must mark the target referenced"
+        );
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "unresolved_call_edges_present"),
+            "a superseded unresolved edge version must not raise the unresolved diagnostic"
+        );
+    }
 }
