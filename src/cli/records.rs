@@ -65,12 +65,12 @@ pub(crate) fn load_records_from_jsonl_selected(
     }
     // Try the index; ANY failure (absent, stale, corrupt, version mismatch, or a
     // hydration I/O error) transparently degrades to the cold scan.
-    match GraphIndex::load_for(graph) {
-        Ok(index) => match index.hydrate(graph, selector) {
-            Ok(Some(records)) => Ok(records),
-            Ok(None) | Err(_) => load_records_from_jsonl(graph),
-        },
-        Err(_) => load_records_from_jsonl(graph),
+    let Ok(index) = GraphIndex::load_for(graph) else {
+        return load_records_from_jsonl(graph);
+    };
+    match index.hydrate(graph, selector) {
+        Ok(Some(records)) => Ok(records),
+        Ok(None) | Err(_) => load_records_from_jsonl(graph),
     }
 }
 

@@ -19,7 +19,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -31,16 +31,18 @@ use crate::{
     schema_version::{RecordLineRead, read_record_line},
 };
 
-/// Sidecar index format version. Bumped whenever the header or body layout
-/// changes; an index whose stored version differs is treated as invalid and the
-/// caller cold-scans (self-invalidation, mirroring `crate::incremental`).
+/// Sidecar index format version.
+///
+/// Bumped whenever the header or body layout changes; an index whose stored
+/// version differs is treated as invalid and the caller cold-scans
+/// (self-invalidation, mirroring `crate::incremental`).
 pub const INDEX_FORMAT_VERSION: u32 = 1;
 
 /// File magic identifying an Egregore graph sidecar index.
 const INDEX_MAGIC: &[u8; 4] = b"EGIX";
 
-/// Fixed header width: 4 (magic) + 4 (version u32) + 8 (graph_len u64)
-/// + 32 (graph_blake3) = 48 bytes, followed by a single `\n` separator.
+/// Fixed header width: 4 (magic) + 4 (version `u32`) + 8 (`graph_len` `u64`)
+/// + 32 (`graph_blake3`) = 48 bytes, followed by a single `\n` separator.
 const HEADER_LEN: usize = 4 + 4 + 8 + 32;
 
 /// Returns the sidecar index path for a graph file (`foo.jsonl` →
@@ -73,8 +75,10 @@ pub enum Selector {
 }
 
 /// The serializable body of a [`GraphIndex`]: sorted maps from lookup keys to
-/// sorted line-start byte offsets. `BTreeMap`/sorted `Vec`s make the serialized
-/// bytes deterministic (byte-identical across builds of an unchanged graph).
+/// sorted line-start byte offsets.
+///
+/// `BTreeMap`/sorted `Vec`s make the serialized bytes deterministic
+/// (byte-identical across builds of an unchanged graph).
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphIndexBody {
     /// Record `id()` → sorted line-start offsets of ALL physical versions.
@@ -189,11 +193,10 @@ impl GraphIndex {
         // (the semantics `records_from_jsonl` relies on) while keeping offsets
         // in raw file bytes so a later seek lands on the exact line start.
         let mut cursor: u64 = 0;
-        let mut line_no: usize = 0;
-        for raw_line in bytes.split_inclusive(|b| *b == b'\n') {
+        for (index, raw_line) in bytes.split_inclusive(|b| *b == b'\n').enumerate() {
+            let line_no = index + 1;
             let start = cursor;
             cursor += raw_line.len() as u64;
-            line_no += 1;
             // Trim the trailing '\n' and optional '\r'.
             let mut content = raw_line;
             if content.last() == Some(&b'\n') {
@@ -307,14 +310,19 @@ impl GraphIndex {
         if &bytes[0..4] != INDEX_MAGIC {
             return Err(LoadError::Corrupt("bad magic".to_owned()));
         }
-        let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
+        // The length check above guarantees at least `HEADER_LEN + 1` bytes, so
+        // these fixed-width reads never index out of range; building the arrays
+        // by element avoids a fallible `try_into` (and its panic-doc lint).
+        let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         if version != INDEX_FORMAT_VERSION {
             return Err(LoadError::VersionMismatch {
                 found: version,
                 expected: INDEX_FORMAT_VERSION,
             });
         }
-        let graph_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
+        let graph_len = u64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
         let mut graph_blake3 = [0u8; 32];
         graph_blake3.copy_from_slice(&bytes[16..48]);
         if bytes[HEADER_LEN] != b'\n' {
@@ -378,12 +386,12 @@ impl GraphIndex {
                 self.expand_by_id(id, graph_bytes, &mut offsets, &mut expanded, &mut climbed);
             }
             Selector::ByName(name) => {
-                for id in self.ids_at(&self.body.by_name, name, graph_bytes) {
+                for id in Self::ids_at(&self.body.by_name, name, graph_bytes) {
                     self.expand_by_id(&id, graph_bytes, &mut offsets, &mut expanded, &mut climbed);
                 }
             }
             Selector::ByPath(path) => {
-                let ids = self.ids_at(&self.body.by_path, path, graph_bytes);
+                let ids = Self::ids_at(&self.body.by_path, path, graph_bytes);
                 for id in &ids {
                     self.add_id_versions(id, &mut offsets);
                 }
@@ -394,7 +402,7 @@ impl GraphIndex {
                 }
             }
             Selector::ByKind(kind) => {
-                let ids = self.ids_at(&self.body.by_kind, kind, graph_bytes);
+                let ids = Self::ids_at(&self.body.by_kind, kind, graph_bytes);
                 for id in &ids {
                     self.add_id_versions(id, &mut offsets);
                 }
@@ -452,12 +460,7 @@ impl GraphIndex {
 
     /// Reads the ids present at a lookup key's offsets (by seeking to each and
     /// reading the record's `id()`). Deterministic (a `BTreeSet`).
-    fn ids_at(
-        &self,
-        map: &BTreeMap<String, Vec<u64>>,
-        key: &str,
-        graph_bytes: &[u8],
-    ) -> Vec<String> {
+    fn ids_at(map: &BTreeMap<String, Vec<u64>>, key: &str, graph_bytes: &[u8]) -> Vec<String> {
         let mut ids: BTreeSet<String> = BTreeSet::new();
         if let Some(offsets) = map.get(key) {
             for &offset in offsets {
@@ -630,9 +633,9 @@ fn index_record(body: &mut GraphIndexBody, record: &GraphRecord, offset: u64) {
     }
 }
 
-/// The `by_kind` key for a node kind — its PascalCase serialization (e.g.
+/// The `by_kind` key for a node kind — its `PascalCase` serialization (e.g.
 /// `Import`), matching `NodeKind`'s serde representation.
-fn node_kind_key(kind: NodeKind) -> &'static str {
+const fn node_kind_key(kind: NodeKind) -> &'static str {
     kind.as_str()
 }
 
@@ -646,34 +649,10 @@ pub fn cold_records(graph_bytes: &str) -> anyhow::Result<Vec<GraphRecord>> {
     records_from_jsonl(graph_bytes).map_err(|error| anyhow::anyhow!("{error}"))
 }
 
-/// Reads one record line's raw bytes back for a caller that already has a `File`
-/// handle (kept for symmetry; hydration uses [`GraphIndex::hydrate`]).
-///
-/// # Errors
-///
-/// Propagates I/O errors from the seek/read.
-pub fn read_line_at(file: &mut fs::File, offset: u64) -> std::io::Result<String> {
-    file.seek(SeekFrom::Start(offset))?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    Ok(line.trim_end_matches(['\n', '\r']).to_owned())
-}
-
-/// Reads the whole graph into a string (cold path helper used by fallbacks).
-///
-/// # Errors
-///
-/// Propagates the file read error.
-pub fn read_graph_string(graph: &Path) -> std::io::Result<String> {
-    let mut file = fs::File::open(graph)?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
-    Ok(buf)
-}
-
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::similar_names)]
+
     use super::*;
     use crate::ir::{Graph, GraphRecord, NodeKind, SourceSpan, stable_id};
 
@@ -719,7 +698,7 @@ mod tests {
         ));
         graph.push(GraphRecord::edge(
             EdgeLabel::Contains,
-            repo.clone(),
+            repo,
             fid.clone(),
             None,
             "contains".to_owned(),
@@ -753,7 +732,7 @@ mod tests {
         ));
         graph.push(GraphRecord::edge(
             EdgeLabel::Defines,
-            fid.clone(),
+            fid,
             callee.clone(),
             None,
             "defines".to_owned(),
@@ -767,7 +746,7 @@ mod tests {
         ));
         // A second physical version of `caller` (append-only supersession).
         graph.push(GraphRecord::syntax_node(
-            caller.clone(),
+            caller,
             NodeKind::Symbol,
             "src/a.rs".to_owned(),
             span(5, 11),
@@ -779,7 +758,7 @@ mod tests {
         graph.push(GraphRecord::Tombstone {
             id: stable_id(&["tomb", &callee]),
             schema_version: crate::ir::SCHEMA_VERSION,
-            deleted_id: callee.clone(),
+            deleted_id: callee,
             summary: "deleted".to_owned(),
             producer: None,
         });
