@@ -91,6 +91,11 @@ pub(crate) fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
             top_k,
             format,
         ),
+        AuditSubcommand::EvidenceLinks {
+            graph,
+            data_dir,
+            format,
+        } => audit_evidence_links_cmd(graph.as_deref(), data_dir.as_deref(), format),
     }
 }
 
@@ -1000,6 +1005,124 @@ pub(crate) fn audit_memory_health_cmd(
     let exit_code = i32::from(!report.ok);
     drop(store_copy);
     std::process::exit(exit_code);
+}
+
+/// Handles `eg audit evidence-links` (issue #217): store-wide cross-domain
+/// evidence-link integrity sweep. Exit 0 clean (`ok: true`), 1 broken links
+/// found (the full report is still printed to stdout so #72 repair / CI can
+/// consume it), 2 usage/load error (both/neither input flag, unreadable/empty
+/// store or graph).
+pub(crate) fn audit_evidence_links_cmd(
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+    format: OutputFormat,
+) -> Result<()> {
+    // Read-only: an embedded store is read through a throwaway copy so opening
+    // the engine never re-persists index files into the original (AC6). The guard
+    // keeps the copy alive for the duration of the read below.
+    let store_copy = data_dir.map(|dir| match readonly_audit_store(dir) {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    });
+    let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
+
+    // History-inclusive load so tombstones and superseded target versions stay
+    // VISIBLE — required to tell "absent" from "tombstoned" and to recover a
+    // tombstoned code target's path/span. `--graph` JSONL already carries that
+    // history; `--data-dir` reads the superseded-inclusive view of the copy. The
+    // loader enforces exactly-one-of `--graph`/`--data-dir` (both/neither exit 2).
+    let records = match load_query_records_history(graph, effective_data_dir) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("{error}");
+            drop(store_copy);
+            std::process::exit(2);
+        }
+    };
+
+    // A genuinely empty input (an empty/whitespace-only graph or an initialized
+    // store holding zero records) is a LOAD error naming the path: a false "clean"
+    // verdict on an empty store would be dangerous for a trust gate. Mirrors the
+    // `review-coverage` / `evidence-pack` empty-input contract.
+    if records.is_empty() {
+        let source_path = graph
+            .or(data_dir)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        drop(store_copy);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "code": "empty_evidence_input",
+                "path": source_path,
+                "message": "evidence input holds zero records; provide a non-empty graph or store",
+            })
+        );
+        std::process::exit(2);
+    }
+
+    let report = crate::evidence_link_audit::run_evidence_link_audit(&records);
+
+    let output = match format {
+        OutputFormat::Json => serde_json::to_string_pretty(&report)
+            .context("failed to serialize evidence-link audit report")?,
+        OutputFormat::Text => render_evidence_links_text(&report),
+    };
+    println!("{output}");
+    let exit_code = i32::from(!report.ok);
+    drop(store_copy);
+    std::process::exit(exit_code);
+}
+
+/// Renders an evidence-link audit report as a deterministic human-readable form
+/// (issue #217 AC7: counts per domain and per edge label).
+fn render_evidence_links_text(
+    report: &crate::evidence_link_audit::EvidenceLinkAuditReport,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("ok: {}", report.ok));
+    lines.push(format!(
+        "checked evidence edges: {}",
+        report.checked_edge_count
+    ));
+    lines.push(format!("broken evidence edges: {}", report.broken_edge_count));
+    lines.push("by source domain:".to_owned());
+    for (domain, count) in &report.by_source_domain {
+        lines.push(format!("  {domain}: {count}"));
+    }
+    lines.push("by edge label:".to_owned());
+    for (label, count) in &report.by_edge_label {
+        lines.push(format!("  {label}: {count}"));
+    }
+    lines.push("by case:".to_owned());
+    for (case, count) in &report.by_case {
+        lines.push(format!("  {case}: {count}"));
+    }
+    lines.push("broken edges:".to_owned());
+    for edge in &report.broken_edges {
+        let target = edge
+            .target_repo_relative_path
+            .as_deref()
+            .map_or_else(String::new, |p| format!(" @ {p}"));
+        lines.push(format!(
+            "  {} [{}] {} -> {} ({}){}",
+            edge.source_record_id,
+            edge.edge_label,
+            edge.representation.as_wire(),
+            edge.target_record_id,
+            edge.case.as_wire(),
+            target
+        ));
+    }
+    lines.push("diagnostics:".to_owned());
+    for d in &report.diagnostics {
+        let count = d.count.map_or_else(String::new, |c| format!(" count={c}"));
+        lines.push(format!("  {}{count}", d.code));
+    }
+    lines.join("\n")
 }
 
 /// Collects embedded-store semantic retrieval leads for the audit, when the
