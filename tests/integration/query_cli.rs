@@ -567,6 +567,15 @@ fn query_symbol_prints_jsonl_for_matching_symbol() {
             .expect("valid JSON on first line");
     assert_eq!(parsed["name"], "scan_repository");
     assert_eq!(parsed["kind"], "Symbol");
+    // Corpus disclosure (issue #427): `query symbol` has no summary envelope, so
+    // each row discloses its corpus. A plain scan graph discloses single_snapshot.
+    assert_eq!(parsed["corpus_mode"], "single_snapshot");
+    assert_eq!(parsed["corpus_mode_source"], "default");
+    assert!(
+        parsed["corpus_disclaimer"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty())
+    );
     assert!(
         parsed["record_id"].is_string(),
         "record_id should be string"
@@ -1439,6 +1448,16 @@ fn query_context_returns_structured_json_with_all_sections() {
 
     assert_eq!(parsed["ok"], true, "ok must be true on success");
     assert_eq!(parsed["symbol_name"], "my_function");
+
+    // Corpus disclosure (issue #427): a snapshot-less graph discloses a single
+    // snapshot (this lane reads the union over a scan-history store).
+    assert_eq!(parsed["corpus_mode"], "single_snapshot");
+    assert_eq!(parsed["corpus_mode_source"], "default");
+    assert!(
+        parsed["corpus_disclaimer"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty())
+    );
 
     // source_facts section must contain the symbol node
     let facts = parsed["source_facts"]

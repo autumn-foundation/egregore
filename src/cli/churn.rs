@@ -54,6 +54,7 @@ pub(crate) fn query_churn_cmd(
                             query::CHURN_MAX_LIMIT
                         );
                     }
+                    println!("corpus: {}", report.corpus_mode);
                 }
             }
             Ok(())

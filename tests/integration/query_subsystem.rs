@@ -332,6 +332,16 @@ fn query_subsystem_exits_0_and_returns_json_for_known_prefix() {
     let stdout = String::from_utf8(output).expect("utf8");
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON output");
     assert_eq!(parsed["ok"], true, "ok must be true on success");
+
+    // Corpus disclosure (issue #427): a snapshot-less graph discloses a single
+    // snapshot (this lane reads the union over a scan-history store).
+    assert_eq!(parsed["corpus_mode"], "single_snapshot");
+    assert_eq!(parsed["corpus_mode_source"], "default");
+    assert!(
+        parsed["corpus_disclaimer"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty())
+    );
 }
 
 #[test]

@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ir::{GraphRecord, NodeKind, SourceSpan};
-use crate::query::RepositoryIndex;
+use crate::query::{CorpusMode, RepositoryIndex, disclose_corpus};
 
 /// Name of the pinned, deterministic token-count method (AC3).
 pub const TOKEN_COUNT_METHOD: &str = "word-punct-v1";
@@ -366,6 +366,15 @@ struct SymbolAnswerRow<'a> {
     extraction_completeness: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<Vec<DiagnosticRef<'a>>>,
+    /// Corpus-disclosure fields (issue #427), present on `eg query symbol` rows
+    /// (which carry the declaration surface) and absent on `eg query file`
+    /// listing rows — mirroring the real CLI output the gate measures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corpus_mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corpus_mode_source: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corpus_disclaimer: Option<String>,
 }
 
 /// One semantic answer row, serialized like the `eg query semantic` JSON line.
@@ -519,6 +528,14 @@ where
         }
     }
 
+    // The `eg query symbol` lane discloses the corpus it read on every row
+    // (issue #427); `eg query file` does not. Compute it once over the same
+    // records the real lane sees so the measured token count matches.
+    let symbol_corpus = include_declaration_surface.then(|| {
+        let (mode, source, _) = disclose_corpus(records, CorpusMode::Union);
+        (mode.as_str(), source.as_str(), mode.disclaimer().to_owned())
+    });
+
     let mut serialized = Vec::with_capacity(matched.len());
     let mut has_expected = false;
     let mut expected_has_handle = false;
@@ -568,6 +585,9 @@ where
                 } else {
                     None
                 },
+                corpus_mode: symbol_corpus.as_ref().map(|c| c.0),
+                corpus_mode_source: symbol_corpus.as_ref().map(|c| c.1),
+                corpus_disclaimer: symbol_corpus.as_ref().map(|c| c.2.clone()),
             };
             if id.as_str() == expected_record_id {
                 has_expected = true;

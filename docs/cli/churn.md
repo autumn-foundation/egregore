@@ -146,3 +146,10 @@ Egregore domain in the same store.
 - Complexity weighting (frequency only in this slice).
 - Semantic/embedding drift ranking (`eg query drift`, #55).
 - Uncommitted working-tree churn.
+## Corpus scope
+
+This is a history-analysis lane: it reads the **union of all commit snapshots**
+by design and carries no `--at-head`/`--all-history` corpus flags. The summary
+envelope discloses `corpus_mode: "union"` (or `single_snapshot` over a
+snapshot-less store), `corpus_mode_source`, and `corpus_disclaimer` for
+transparency. See [Corpus scope for query lanes](corpus-modes.md).

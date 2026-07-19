@@ -130,6 +130,16 @@ fn cli_witness_path_byte_stable_and_shaped() {
             .any(|v| v == "CALLS")
     );
 
+    // Corpus disclosure (issue #427): a snapshot-less graph discloses a single
+    // snapshot; evidence-path over a scan-history store would disclose union.
+    assert_eq!(summary["corpus_mode"], "single_snapshot");
+    assert_eq!(summary["corpus_mode_source"], "default");
+    assert!(
+        summary["corpus_disclaimer"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty())
+    );
+
     let hop0: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
     assert_eq!(hop0["index"], 0);
     assert_eq!(hop0["edge"]["label"], "OBSERVES");

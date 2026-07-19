@@ -702,6 +702,11 @@ fn public_api_deltas_fixture_repo_classifies_expected_surface_changes() {
     )
     .expect("range should resolve");
 
+    // Corpus disclosure (issue #427): a real scan-history store carries a
+    // source_snapshot, so this range lane discloses `union`.
+    assert_eq!(report.corpus_mode, "union");
+    assert_eq!(report.corpus_mode_source, "default");
+
     assert_eq!(names(&report.added), vec!["brand_new"]);
     assert_eq!(names(&report.removed), vec!["doomed"]);
     assert_eq!(names(&report.signature_changed), vec!["sig_changes"]);

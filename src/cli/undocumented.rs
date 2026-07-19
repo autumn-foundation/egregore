@@ -66,12 +66,21 @@ pub(crate) struct UndocumentedResponse<'a> {
     items: Vec<UndocumentedItemJson<'a>>,
     counts: UndocumentedCountsJson,
     diagnostics: Vec<PublicApiDiagnosticJson<'a>>,
+    /// Corpus the current-state view read (issue #427): `head_anchored` over a
+    /// scan-history store carrying a `source_snapshot`, `single_snapshot` over
+    /// a plain snapshot-less scan. Inherited from the public-API surface.
+    corpus_mode: &'static str,
+    /// How the corpus mode was chosen: always `default` for this lane.
+    corpus_mode_source: &'static str,
+    /// One-line human description of the corpus that was read.
+    corpus_disclaimer: String,
 }
 
 pub(crate) const UNDOCUMENTED_DISCLAIMER: &str = "Asserts the presence or absence of a recorded doc comment (///, /** */, or #[doc = \
      \"...\"]) on externally-reachable public symbols. Never a claim about doc quality, \
      accuracy, or completeness.";
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn query_undocumented_cmd(
     records: &[GraphRecord],
     index: &query::RepositoryIndex,
@@ -86,6 +95,8 @@ pub(crate) fn query_undocumented_cmd(
     } else {
         "doc_facts_recorded"
     };
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        disclose_head_anchored_corpus(records, false);
 
     match format {
         OutputFormat::Json => {
@@ -131,6 +142,9 @@ pub(crate) fn query_undocumented_cmd(
                         detail: &d.detail,
                     })
                     .collect(),
+                corpus_mode,
+                corpus_mode_source,
+                corpus_disclaimer,
             };
             let output = serde_json::to_string_pretty(&response)
                 .context("failed to serialize undocumented report")?;
@@ -178,6 +192,7 @@ pub(crate) fn query_undocumented_cmd(
             for d in &report.diagnostics {
                 println!("diagnostic: {}: {}", d.code, d.detail);
             }
+            println!("corpus: {corpus_mode}");
         }
     }
     Ok(())

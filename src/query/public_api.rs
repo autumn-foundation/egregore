@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::RepositoryIndex;
-use crate::ir::{EdgeLabel, GraphRecord, NodeKind, SnapshotHead, SourceSpan, TemporalMetadata};
+use crate::ir::{EdgeLabel, GraphRecord, NodeKind, SourceSpan};
 
 /// Symbol kinds that can appear on the externally-reachable public API
 /// surface. Methods, tests, and `impl` blocks are declaration details of
@@ -303,42 +303,20 @@ pub fn public_api_surface<'a>(
     let is_owned =
         |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
 
-    // Stamped HEAD commit per live repository (`source_snapshot`, issue #82).
-    // History replay re-emits the full graph at every commit with `temporal`
-    // provenance and no tombstone for a between-commit removal, so a temporal
-    // record is part of the current state only when its commit is its
-    // repository's stamped HEAD — the same rule `resolve_head_symbols` uses.
-    // Snapshot-less stores (plain current-tree `scan`) keep the conservative
-    // fallback: nodes resolve by keep-last dedupe by stable ID (issue #428).
-    let mut repo_heads: BTreeMap<&str, &str> = BTreeMap::new();
-    for record in records {
-        if let GraphRecord::Node {
-            id,
-            kind: NodeKind::Repository,
-            source_snapshot: Some(snapshot),
-            ..
-        } = record
-            && !tombstoned.contains(id.as_str())
-            && let SnapshotHead::Commit { sha } = &snapshot.head
-        {
-            repo_heads.insert(id.as_str(), sha.as_str());
-        }
-    }
-    // A temporal code record is current only when its commit is its owning
-    // repository's stamped HEAD. Fallbacks: no temporal provenance => current;
-    // owner not in `repo_heads` (snapshot-less store) => keep everything.
-    let owned_record_is_current = |id: &str, temporal: Option<&TemporalMetadata>| -> bool {
-        let Some(t) = temporal else {
-            return true;
-        };
-        index
-            .owner_of(id)
-            .and_then(|owner| repo_heads.get(owner))
-            .is_none_or(|head_sha| t.git_commit == *head_sha)
-    };
+    // Default current-state view: the set of record IDs NOT current at their
+    // repository's stamped HEAD (`source_snapshot`, issue #82/#428), computed by
+    // the shared head-anchor gate (`non_head_current_record_ids`) rather than an
+    // inlined `repo_heads` / `owned_record_is_current` copy. History replay
+    // re-emits the full graph at every commit with `temporal` provenance and no
+    // tombstone for a between-commit deletion, so a symbol deleted at HEAD would
+    // otherwise resurface. The drop-set groups by stable ID (an ID with any
+    // HEAD-current version is retained whole) and the recency keep-last below
+    // selects its HEAD version. Snapshot-less stores (plain current-tree `scan`)
+    // yield an empty drop-set: nodes resolve by keep-last dedupe by stable ID.
+    let non_head_current = super::non_head_current_record_ids(records, index);
 
     // Current-state view: keep-last dedupe by stable ID so history graphs
-    // resolve to their newest version deterministically.
+    // resolve to their newest (HEAD) version deterministically.
     let mut nodes: BTreeMap<&str, &'a GraphRecord> = BTreeMap::new();
     let mut saw_rust_code = false;
     for record in records {
@@ -347,7 +325,6 @@ pub fn public_api_surface<'a>(
             kind,
             language,
             repo_relative_path,
-            temporal,
             ..
         } = record
         else {
@@ -361,7 +338,7 @@ pub fn public_api_surface<'a>(
         }
         if tombstoned.contains(id.as_str())
             || !is_owned(id)
-            || !owned_record_is_current(id, temporal.as_ref())
+            || non_head_current.contains(id.as_str())
         {
             continue;
         }
@@ -372,7 +349,17 @@ pub fn public_api_surface<'a>(
         {
             continue;
         }
-        nodes.insert(id.as_str(), record);
+        // Keep-last dedupe by recency so a retained ID's HEAD (newest-valid-time)
+        // version wins — the shared drop-set keeps every version of a
+        // HEAD-current ID, and this selects the same version the removed
+        // per-record HEAD gate did.
+        let replace = nodes.get(id.as_str()).is_none_or(|existing| {
+            super::file_at_point::version_recency_key(record)
+                >= super::file_at_point::version_recency_key(existing)
+        });
+        if replace {
+            nodes.insert(id.as_str(), record);
+        }
     }
 
     let mut surface = PublicApiSurface::default();

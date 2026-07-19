@@ -736,6 +736,20 @@ fn success_envelope_by_symbol_id() {
         "disclaimer must mention 'not proof'"
     );
 
+    // Corpus disclosure (issue #427): a plain scan graph has no source_snapshot,
+    // so the current-state view discloses a single snapshot.
+    assert_eq!(
+        v["corpus_mode"], "single_snapshot",
+        "plain scan graph discloses single_snapshot"
+    );
+    assert_eq!(v["corpus_mode_source"], "default");
+    assert!(
+        v["corpus_disclaimer"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "corpus_disclaimer must be present"
+    );
+
     // All five impact groups must be present (even if empty)
     for group in &[
         "direct_callers",

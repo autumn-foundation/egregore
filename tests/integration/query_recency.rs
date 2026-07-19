@@ -212,6 +212,11 @@ fn recency_ranks_most_dormant_symbol_first_over_fixture_history() {
             .contains("newest indexed commit"),
         "dormancy basis must document the newest-indexed-commit anchor, never wall-clock"
     );
+
+    // Corpus disclosure (issue #427): a real scan-history store carries a
+    // source_snapshot, so this history-analysis lane discloses `union`.
+    assert_eq!(result["corpus_mode"], "union");
+    assert_eq!(result["corpus_mode_source"], "default");
 }
 
 #[test]

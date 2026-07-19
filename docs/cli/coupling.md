@@ -231,3 +231,10 @@ silent output:
 And once more, because it is the sharp edge: **co-change is correlation
 recorded in history, never causation** — inspect the partner, don't assume
 it must change.
+## Corpus scope
+
+This is a history-analysis lane: it reads the **union of all commit snapshots**
+by design and carries no `--at-head`/`--all-history` corpus flags. The summary
+envelope discloses `corpus_mode: "union"` (or `single_snapshot` over a
+snapshot-less store), `corpus_mode_source`, and `corpus_disclaimer` for
+transparency. See [Corpus scope for query lanes](corpus-modes.md).

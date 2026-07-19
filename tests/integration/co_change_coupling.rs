@@ -192,6 +192,12 @@ fn coupling_ranks_partners_by_jaccard_with_counts_and_confidence() {
 
     assert!(report.disclaimer.contains("not proof"));
     assert!(report.diagnostics.is_empty());
+
+    // Corpus disclosure (issue #427): this hand-built fixture carries no
+    // Repository source_snapshot, so head == union and the disclosure is
+    // `single_snapshot`; the co-change analysis spans commits regardless.
+    assert_eq!(report.corpus_mode, "single_snapshot");
+    assert_eq!(report.corpus_mode_source, "default");
 }
 
 #[test]

@@ -122,6 +122,7 @@ pub(crate) fn render_public_api_deltas_text(report: &query::PublicApiDeltas<'_>)
         report.base, report.head, report.range_commit_count
     );
     let _ = writeln!(out, "disclaimer: {}", report.disclaimer);
+    let _ = writeln!(out, "corpus: {}", report.corpus_mode);
     write_rows(&mut out, "added", &report.added);
     write_rows(&mut out, "removed", &report.removed);
     write_rows(&mut out, "signature_changed", &report.signature_changed);

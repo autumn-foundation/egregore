@@ -138,3 +138,12 @@ Because the default trunk store carries no verification→code links, the honest
 default answer is the `verification_facts_unavailable` capability verdict — an
 explicit "this evidence was never recorded", never a fabricated "everything is
 untested".
+## Corpus scope
+
+Over a `scan-history` store this lane is **HEAD-anchored** by default: it reports
+the state current at each repository's stamped HEAD commit, so an item removed
+before HEAD does not appear. The summary envelope discloses `corpus_mode`
+(`head_anchored`, or `single_snapshot` over a snapshot-less store),
+`corpus_mode_source`, and `corpus_disclaimer`. An `--at`/`--as-of` selector this
+lane accepts pins a single commit (`commit_pinned`). See
+[Corpus scope for query lanes](corpus-modes.md).

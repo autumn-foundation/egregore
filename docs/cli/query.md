@@ -201,6 +201,27 @@ One human-readable line per result for terminal use. The exact format is not sta
 
 ---
 
+## Corpus scope (issue #427)
+
+Every lane on this page discloses the corpus its answer was computed over via the
+envelope fields `corpus_mode` / `corpus_mode_source` / `corpus_disclaimer`. The
+full contract — the four `corpus_mode` values, the `--at-head`/`--all-history`
+flag pair, and the per-category defaults — is documented once in
+[Corpus scope for query lanes](corpus-modes.md).
+
+- **`eg query at`, `eg query locate`, `eg query file`, `eg query who`** are
+  **HEAD-anchored** by default (they disclose `head_anchored`, or
+  `single_snapshot` over a snapshot-less store); an `--at`/`--as-of` selector
+  pins a single commit (`commit_pinned`).
+- **`eg query subsystem`, `eg query symbol`, `eg query context`** are latent
+  current-state lanes that today read the **union of all commit snapshots** over
+  a `scan-history` store and disclose `corpus_mode: "union"` honestly. They do
+  **not** yet accept `--at-head`/`--all-history`; flipping them to the
+  HEAD-anchored default and adding that flag pair, under the contract published
+  in issue #427, is tracked in **issue #456**.
+
+---
+
 ## Store freshness (`--repo-path`, issue #82)
 
 `eg query symbol`, `eg query file`, and `eg query context` accept an optional

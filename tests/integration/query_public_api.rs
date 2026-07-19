@@ -624,4 +624,15 @@ fn history_graph_excludes_head_deleted_public_symbols() {
         !paths.contains(&"doomed_fn".to_owned()),
         "a public symbol deleted at HEAD must not resurface as live public API; got {paths:?}"
     );
+    // Issue #427: a scan-history store carrying a `source_snapshot` discloses
+    // the head-anchored corpus the surface actually reads.
+    assert_eq!(
+        parsed["corpus_mode"], "head_anchored",
+        "history store with a source_snapshot discloses head_anchored"
+    );
+    assert_eq!(parsed["corpus_mode_source"], "default");
+    assert!(
+        parsed["corpus_disclaimer"].as_str().is_some(),
+        "corpus_disclaimer must be present"
+    );
 }

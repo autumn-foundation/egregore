@@ -68,6 +68,7 @@ pub(crate) fn query_recency_cmd(
                             query::RECENCY_MAX_LIMIT
                         );
                     }
+                    println!("corpus: {}", report.corpus_mode);
                 }
             }
             Ok(())

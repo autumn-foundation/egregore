@@ -5,7 +5,8 @@
 use std::{fs, path::PathBuf};
 
 use aletheia_egregore::{
-    CallResolution, EdgeLabel, GraphRecord, NodeKind, SourceSpan, TemporalMetadata,
+    CallResolution, EdgeLabel, GraphRecord, NodeKind, SnapshotHead, SourceSnapshotPayload,
+    SourceSpan, TemporalMetadata,
     ir::{Graph, SCHEMA_VERSION, stable_id},
 };
 use assert_cmd::Command;
@@ -1508,5 +1509,299 @@ fn data_dir_query_is_read_only() {
     assert_eq!(
         before, after,
         "querying the embedded store must not create, modify, or delete any store file"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #427 — corpus-mode default (HEAD-anchored) vs opt-in union.
+// ---------------------------------------------------------------------------
+
+/// History fixture WITH a `source_snapshot` HEAD at c2 (`bbbb2222`).
+///
+/// At c1 `caller_a` calls `anchor_h`; at c2 that call is gone and `caller_b`
+/// calls `anchor_h` instead. The `Repository` node carries a `source_snapshot`
+/// pinning HEAD to c2, so head-anchoring is possible: the deleted-at-HEAD
+/// `caller_a` must be excluded from the default/`--at-head` corpus but present
+/// in the `--all-history` union. Returns `(temp, path, anchor_id, caller_a_id,
+/// caller_b_id)`.
+fn seed_history_snapshot() -> (tempfile::TempDir, PathBuf, String, String, String) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("history-snapshot.jsonl");
+    let mut graph = Graph::new();
+
+    let repo_id = stable_id(&["node", "Repository", "repo-h427"]);
+    graph.push(
+        GraphRecord::node(
+            repo_id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("repo-h427".to_owned()),
+            "Repository repo-h427".to_owned(),
+        )
+        .with_source_snapshot(SourceSnapshotPayload {
+            head: SnapshotHead::Commit {
+                sha: "bbbb2222".to_owned(),
+            },
+            dirty: false,
+            repository_id: repo_id.clone(),
+            scanned_at: T2.to_owned(),
+        }),
+    );
+
+    // Commits, attributed to the repo via CONTAINS.
+    let mut commit_in = |sha: &str, parents: &[&str], vt: &str| {
+        let commit_id = stable_id(&["node", "commit", "repo-h427", sha]);
+        graph.push(
+            GraphRecord::node(
+                commit_id.clone(),
+                NodeKind::Commit,
+                None,
+                None,
+                Some(sha.to_owned()),
+                format!("Commit {sha}"),
+            )
+            .with_temporal(temporal(sha, parents, vt)),
+        );
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id.clone(),
+            commit_id,
+            None,
+            format!("repo contains commit {sha}"),
+        ));
+    };
+    commit_in("aaaa1111", &[], T1);
+    commit_in("bbbb2222", &["aaaa1111"], T2);
+
+    // File attributed to the repo; symbols attributed to the file via DEFINES,
+    // so `RepositoryIndex::owner_of` resolves each symbol to `repo-h427`.
+    file(&mut graph, &repo_id, "src/h.rs");
+
+    // Symbol + its DEFINES edge both carry temporal for the commit, mirroring
+    // real `scan-history` so the embedded sink accepts edges to a multi-version
+    // target node (the anchor exists at both c1 and c2).
+    let hist_symbol = |graph: &mut Graph, name: &str, commit: &str, vt: &str| -> String {
+        let id = sym_id("src/h.rs", name);
+        graph.push(
+            GraphRecord::syntax_node(
+                id.clone(),
+                NodeKind::Symbol,
+                "src/h.rs".to_owned(),
+                span(1, 10),
+                name.to_owned(),
+                "rust",
+                format!("fn {name}"),
+            )
+            .with_temporal(temporal(commit, &[], vt)),
+        );
+        graph.push(
+            GraphRecord::edge(
+                EdgeLabel::Defines,
+                file_id("src/h.rs"),
+                id.clone(),
+                None,
+                format!("src/h.rs defines {name}"),
+            )
+            .with_temporal(temporal(commit, &[], vt)),
+        );
+        id
+    };
+
+    let anchor_id = hist_symbol(&mut graph, "anchor_h", "aaaa1111", T1);
+    let caller_a_id = hist_symbol(&mut graph, "caller_a", "aaaa1111", T1);
+    hist_symbol(&mut graph, "anchor_h", "bbbb2222", T2);
+    let caller_b_id = hist_symbol(&mut graph, "caller_b", "bbbb2222", T2);
+
+    let hist_call = |graph: &mut Graph, from: &str, to: &str, commit: &str, vt: &str| {
+        graph.push(
+            GraphRecord::edge(
+                EdgeLabel::Calls,
+                from.to_owned(),
+                to.to_owned(),
+                Some("1.0".to_owned()),
+                "historical call".to_owned(),
+            )
+            .with_resolution(CallResolution::Resolved)
+            .with_temporal(temporal(commit, &[], vt)),
+        );
+    };
+    hist_call(&mut graph, &caller_a_id, &anchor_id, "aaaa1111", T1);
+    hist_call(&mut graph, &caller_b_id, &anchor_id, "bbbb2222", T2);
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+    (temp, path, anchor_id, caller_a_id, caller_b_id)
+}
+
+#[test]
+fn all_history_flag_includes_deleted_at_head_caller() {
+    let (_t, path, anchor_id, caller_a_id, caller_b_id) = seed_history_snapshot();
+    let (header, rows) = run_query(&[
+        "query",
+        "transitive-callers",
+        &anchor_id,
+        "--graph",
+        path.to_str().unwrap(),
+        "--all-history",
+    ]);
+    assert_eq!(header["corpus_mode"], "union");
+    assert_eq!(header["corpus_mode_source"], "explicit_flag");
+    let ids = row_ids(&rows);
+    assert!(
+        ids.contains(&caller_a_id.as_str()),
+        "--all-history keeps the c1 caller: {ids:?}"
+    );
+    assert!(
+        ids.contains(&caller_b_id.as_str()),
+        "--all-history keeps the c2 caller: {ids:?}"
+    );
+}
+
+#[test]
+fn default_head_anchors_and_excludes_deleted_at_head_caller() {
+    let (_t, path, anchor_id, caller_a_id, caller_b_id) = seed_history_snapshot();
+    let (header, rows) = run_query(&[
+        "query",
+        "transitive-callers",
+        &anchor_id,
+        "--graph",
+        path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        header["corpus_mode"], "head_anchored",
+        "a snapshot store defaults to head-anchored"
+    );
+    assert_eq!(header["corpus_mode_source"], "default");
+    let ids = row_ids(&rows);
+    assert!(
+        !ids.contains(&caller_a_id.as_str()),
+        "the deleted-at-HEAD caller_a must not appear under the default: {ids:?}"
+    );
+    assert!(
+        ids.contains(&caller_b_id.as_str()),
+        "the HEAD caller caller_b must appear: {ids:?}"
+    );
+}
+
+#[test]
+fn at_head_flag_matches_default_and_is_explicit() {
+    let (_t, path, anchor_id, caller_a_id, caller_b_id) = seed_history_snapshot();
+    let (header, rows) = run_query(&[
+        "query",
+        "transitive-callers",
+        &anchor_id,
+        "--graph",
+        path.to_str().unwrap(),
+        "--at-head",
+    ]);
+    assert_eq!(header["corpus_mode"], "head_anchored");
+    assert_eq!(
+        header["corpus_mode_source"], "explicit_flag",
+        "--at-head records an explicit selection"
+    );
+    let ids = row_ids(&rows);
+    assert!(!ids.contains(&caller_a_id.as_str()), "{ids:?}");
+    assert!(ids.contains(&caller_b_id.as_str()), "{ids:?}");
+}
+
+/// The conflicting corpus/temporal flags exit 1 with a machine-readable
+/// `unsupported_combination` diagnostic on stdout.
+fn assert_unsupported_combination(extra: &[&str]) {
+    let (_t, path, anchor_id, _a, _b) = seed_history_snapshot();
+    let mut args: Vec<String> = vec![
+        "query".into(),
+        "transitive-callers".into(),
+        anchor_id,
+        "--graph".into(),
+        path.to_str().unwrap().to_owned(),
+    ];
+    args.extend(extra.iter().map(|s| (*s).to_owned()));
+    let assert = egregore().args(&args).assert().failure().code(1);
+    let stdout = assert.get_output().stdout.clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let value: serde_json::Value =
+        serde_json::from_str(out.lines().next().expect("envelope line")).expect("json envelope");
+    assert_eq!(value["ok"], false);
+    assert_eq!(
+        value["error"]["code"], "unsupported_combination",
+        "expected unsupported_combination for {extra:?}: {out}"
+    );
+}
+
+#[test]
+fn at_head_with_all_history_is_unsupported() {
+    assert_unsupported_combination(&["--at-head", "--all-history"]);
+}
+
+#[test]
+fn at_head_with_at_is_unsupported() {
+    assert_unsupported_combination(&["--at-head", "--at", "bbbb2222"]);
+}
+
+#[test]
+fn at_head_with_as_of_is_unsupported() {
+    assert_unsupported_combination(&["--at-head", "--as-of", "2026-03-01T00:00:00Z"]);
+}
+
+#[test]
+fn all_history_with_at_is_unsupported() {
+    assert_unsupported_combination(&["--all-history", "--at", "bbbb2222"]);
+}
+
+#[test]
+fn all_history_with_as_of_is_unsupported() {
+    assert_unsupported_combination(&["--all-history", "--as-of", "2026-03-01T00:00:00Z"]);
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn data_dir_and_graph_agree_on_head_anchored_default() {
+    let (_t, path, anchor_id, caller_a_id, caller_b_id) = seed_history_snapshot();
+    let temp_db = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp_db.path().join("store");
+
+    egregore()
+        .arg("ingest")
+        .arg(&path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let (graph_header, graph_rows) = run_query(&[
+        "query",
+        "transitive-callers",
+        &anchor_id,
+        "--graph",
+        path.to_str().unwrap(),
+    ]);
+    let store_stdout = egregore()
+        .args(["query", "transitive-callers", &anchor_id, "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let (store_header, store_rows) = parse_ndjson(&store_stdout);
+
+    assert_eq!(graph_header["corpus_mode"], "head_anchored");
+    assert_eq!(store_header["corpus_mode"], "head_anchored");
+    let mut graph_ids: Vec<&str> = row_ids(&graph_rows);
+    let mut store_ids: Vec<&str> = row_ids(&store_rows);
+    graph_ids.sort_unstable();
+    store_ids.sort_unstable();
+    assert_eq!(
+        graph_ids, store_ids,
+        "graph and store must agree on HEAD state"
+    );
+    assert!(
+        !graph_ids.contains(&caller_a_id.as_str()),
+        "caller_a excluded on both"
+    );
+    assert!(
+        graph_ids.contains(&caller_b_id.as_str()),
+        "caller_b included on both"
     );
 }

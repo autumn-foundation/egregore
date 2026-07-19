@@ -235,6 +235,16 @@ fn unwrap_expect_returns_real_sites_and_never_decoys() {
         "results must be labeled advisory"
     );
 
+    // Corpus disclosure (issue #427): a real `eg scan` git store carries a
+    // source_snapshot, so with no `--at` this lane discloses the union it reads.
+    assert_eq!(envelope["corpus_mode"], "union");
+    assert_eq!(envelope["corpus_mode_source"], "default");
+    assert!(
+        envelope["corpus_disclaimer"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty())
+    );
+
     let tuples = site_tuples(&envelope);
     assert_eq!(
         tuples,
@@ -1038,6 +1048,11 @@ fn unwrap_expect_at_commit_pins_the_inventory_to_valid_time() {
     let site = &at_second["sites"][0];
     assert_eq!(site["git_commit"].as_str(), Some(second.as_str()));
     assert!(site["valid_time"].as_str().is_some());
+
+    // Corpus disclosure (issue #427): `--at` pins a single commit, so the corpus
+    // is commit-pinned and the source is the selector.
+    assert_eq!(at_second["corpus_mode"], "commit_pinned");
+    assert_eq!(at_second["corpus_mode_source"], "selector");
 
     // Pinned after the removal: gone again.
     let (at_third, _) = run_lane(&graph_path, &["--at", &third]);

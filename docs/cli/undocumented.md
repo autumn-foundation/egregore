@@ -176,3 +176,12 @@ eg query undocumented --graph graph.jsonl --repo acme/widget
   re-export handling, no `#[doc]` recognition, no citable handle.
 - **`eg query public-api`** — the surface this lane consumes; use it to see
   the full contract, documented or not.
+## Corpus scope
+
+Over a `scan-history` store this lane is **HEAD-anchored** by default: it reports
+the state current at each repository's stamped HEAD commit, so an item removed
+before HEAD does not appear. The summary envelope discloses `corpus_mode`
+(`head_anchored`, or `single_snapshot` over a snapshot-less store),
+`corpus_mode_source`, and `corpus_disclaimer`. An `--at`/`--as-of` selector this
+lane accepts pins a single commit (`commit_pinned`). See
+[Corpus scope for query lanes](corpus-modes.md).

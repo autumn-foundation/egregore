@@ -191,6 +191,9 @@ pub(crate) fn query_context_cmd(
     let (observations, excluded) =
         apply_supersession(sections.observations, &resolver, supersession);
 
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        query::disclose_corpus(records, query::CorpusMode::Union);
+
     let response = ContextResponse {
         ok: true,
         symbol_name,
@@ -203,6 +206,9 @@ pub(crate) fn query_context_cmd(
         verification_evidence: sections.verification_evidence,
         unresolved: sections.unresolved,
         excluded,
+        corpus_mode: corpus_mode.as_str(),
+        corpus_mode_source: corpus_mode_source.as_str(),
+        corpus_disclaimer,
     };
 
     let output = serde_json::to_string_pretty(&response).context("failed to serialize context")?;

@@ -15,22 +15,42 @@ pub(crate) fn query_evidence_path_cmd(
     target_id: &str,
     format: OutputFormat,
 ) -> Result<()> {
+    // Disclosure-only (issue #427): evidence-path is a current-state view over
+    // the live evidence-edge subgraph, but over a scan-history store it walks the
+    // UNION of all commit snapshots (no head anchoring; temporal versions are not
+    // pinned to a HEAD). Disclose that honestly.
+    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
+        query::disclose_corpus(records, query::CorpusMode::Union);
+    let corpus = Corpus {
+        mode: corpus_mode.as_str(),
+        source: corpus_mode_source.as_str(),
+        disclaimer: corpus_disclaimer,
+    };
+
     match query::evidence_path(records, source_id, target_id) {
         Ok(path) => {
             match format {
-                OutputFormat::Json => print_path_json(&path)?,
-                OutputFormat::Text => print_path_text(&path),
+                OutputFormat::Json => print_path_json(&path, &corpus)?,
+                OutputFormat::Text => print_path_text(&path, &corpus),
             }
             Ok(())
         }
         Err(err) => {
             match format {
-                OutputFormat::Json => print_error_json(&err)?,
+                OutputFormat::Json => print_error_json(&err, &corpus)?,
                 OutputFormat::Text => print_error_text(&err),
             }
             std::process::exit(exit_code_for(&err));
         }
     }
+}
+
+/// Corpus-disclosure fields (issue #427) threaded onto every evidence-path
+/// envelope.
+struct Corpus {
+    mode: &'static str,
+    source: &'static str,
+    disclaimer: String,
 }
 
 /// Maps a failure mode to its CLI exit code.
@@ -44,7 +64,7 @@ const fn exit_code_for(err: &query::EvidencePathError) -> i32 {
 }
 
 /// Success envelope: a summary line followed by one hop per line (NDJSON).
-fn print_path_json(path: &query::EvidencePath) -> Result<()> {
+fn print_path_json(path: &query::EvidencePath, corpus: &Corpus) -> Result<()> {
     #[derive(serde::Serialize)]
     struct Summary<'a> {
         ok: bool,
@@ -54,6 +74,9 @@ fn print_path_json(path: &query::EvidencePath) -> Result<()> {
         traversed_edge_classes: &'a [String],
         excluded_edge_classes: &'a [String],
         disclaimer: &'static str,
+        corpus_mode: &'a str,
+        corpus_mode_source: &'a str,
+        corpus_disclaimer: &'a str,
     }
     let summary = Summary {
         ok: true,
@@ -63,6 +86,9 @@ fn print_path_json(path: &query::EvidencePath) -> Result<()> {
         traversed_edge_classes: &path.traversed_edge_classes,
         excluded_edge_classes: &path.excluded_edge_classes,
         disclaimer: query::EVIDENCE_PATH_DISCLAIMER,
+        corpus_mode: corpus.mode,
+        corpus_mode_source: corpus.source,
+        corpus_disclaimer: &corpus.disclaimer,
     };
     println!(
         "{}",
@@ -78,7 +104,7 @@ fn print_path_json(path: &query::EvidencePath) -> Result<()> {
 }
 
 /// Error envelope: a single JSON line.
-fn print_error_json(err: &query::EvidencePathError) -> Result<()> {
+fn print_error_json(err: &query::EvidencePathError, corpus: &Corpus) -> Result<()> {
     let error = match err {
         query::EvidencePathError::IdenticalEndpoints { handle } => serde_json::json!({
             "error_type": "identical_endpoints",
@@ -97,6 +123,9 @@ fn print_error_json(err: &query::EvidencePathError) -> Result<()> {
             "traversed_edge_classes": traversed_edge_classes,
             "excluded_edge_classes": excluded_edge_classes,
             "disclaimer": query::EVIDENCE_PATH_DISCLAIMER,
+            "corpus_mode": corpus.mode,
+            "corpus_mode_source": corpus.source,
+            "corpus_disclaimer": corpus.disclaimer,
         }),
         query::EvidencePathError::EndpointNotFound { side, handle } => serde_json::json!({
             "error_type": "endpoint_not_found",
@@ -120,7 +149,7 @@ fn print_error_json(err: &query::EvidencePathError) -> Result<()> {
 }
 
 /// Compact human rendering: header, one line per hop, footer.
-fn print_path_text(path: &query::EvidencePath) {
+fn print_path_text(path: &query::EvidencePath, corpus: &Corpus) {
     println!(
         "evidence-path: {} [{}/{}]  ->  {} [{}/{}]",
         path.source.record_id,
@@ -150,6 +179,7 @@ fn print_path_text(path: &query::EvidencePath) {
         path.traversed_edge_classes.len(),
         path.excluded_edge_classes.len(),
     );
+    println!("corpus: {}", corpus.mode);
     println!("{}", query::EVIDENCE_PATH_DISCLAIMER);
 }
 
