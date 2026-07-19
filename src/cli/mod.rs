@@ -32,6 +32,7 @@ mod forget;
 mod freshness_cmd;
 mod implementors;
 mod import;
+mod index;
 mod ingest;
 mod inspect;
 mod lifeline;
@@ -105,6 +106,7 @@ pub(crate) use forget::*;
 pub(crate) use freshness_cmd::*;
 pub(crate) use implementors::*;
 pub(crate) use import::*;
+pub(crate) use index::*;
 pub(crate) use ingest::*;
 pub(crate) use inspect::*;
 pub(crate) use lifeline::*;
@@ -499,6 +501,19 @@ pub(crate) enum Commands {
         /// Output format (JSONL diagnostics by default).
         #[arg(long, default_value = "json")]
         format: OutputFormat,
+    },
+    /// Build a persistent sidecar index for a graph JSONL (issue #447).
+    ///
+    /// Writes `<graph>.idx` next to the graph so targeted `eg query … --graph`
+    /// lanes seek to the records they need instead of deserializing the whole
+    /// file. The index is content-addressed on the graph's BLAKE3 + length: a
+    /// query lane transparently cold-scans when the index is absent, stale, or
+    /// corrupt, so results are byte-identical with or without it. This command
+    /// is the only writer of the index and refuses (exit 2) any graph a cold
+    /// load would also reject. See `docs/cli/index.md`.
+    Index {
+        /// Graph JSONL path to index.
+        graph: PathBuf,
     },
     /// Ingest graph JSONL through a storage adapter.
     Ingest {
@@ -3613,6 +3628,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             format,
         ),
         Commands::Validate { graph, format } => validate_cmd(&graph, format),
+        Commands::Index { graph } => index_cmd(&graph),
         Commands::Ingest {
             graph,
             adapter,
@@ -4729,7 +4745,17 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     format,
                 );
             }
-            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            // Sidecar-index fast path (issue #447) for the plain current-state,
+            // unscoped `query symbol <name>`; `--repo`/`--at`/`--as-of` and
+            // freshness stamping (`--repo-path`) need global topology or the
+            // commit timeline and stay cold.
+            let selector =
+                if repo.is_none() && at.is_none() && as_of.is_none() && repo_path.is_none() {
+                    symbol_handle_selector(&name)
+                } else {
+                    crate::graph_index::Selector::Whole
+                };
+            let records = load_records_selected(graph.as_deref(), data_dir.as_deref(), &selector)?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             let selected = selected.as_deref();
@@ -5008,7 +5034,15 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     .expect("clap requires --data-dir with --daemon");
                 return query_file_via_daemon(&path, dir, repo.as_deref(), format);
             }
-            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            // Sidecar-index fast path (issue #447): a file's defined-symbol set
+            // is a `ByPath` closure. `--repo` (scope) and `--repo-path`
+            // (freshness stamping) need global topology and stay cold.
+            let selector = if repo.is_none() && repo_path.is_none() {
+                crate::graph_index::Selector::ByPath(path.clone())
+            } else {
+                crate::graph_index::Selector::Whole
+            };
+            let records = load_records_selected(graph.as_deref(), data_dir.as_deref(), &selector)?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             let freshness_code = query_freshness_code_with_hint(
@@ -5114,7 +5148,15 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo_path,
             supersession,
         } => {
-            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            // Sidecar-index fast path (issue #447): the plain context bundle is a
+            // `ByName` closure. With `--repo-path` the freshness hint needs the
+            // full topology to attribute every source fact, so it stays cold.
+            let selector = if repo_path.is_none() {
+                symbol_handle_selector(&name)
+            } else {
+                crate::graph_index::Selector::Whole
+            };
+            let records = load_records_selected(graph.as_deref(), data_dir.as_deref(), &selector)?;
             // Pre-compute the context owner so the freshness hint matches the
             // repository that actually owns the returned source facts.  Without this,
             // `query_freshness_code` auto-detects the identity from `repo_path`, which
@@ -5414,6 +5456,12 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     load_records_from_db_history_readonly(dir)?
                 }
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                // Sidecar-index fast path (issue #447) for the plain
+                // current-state, unscoped query; `--repo`/`--at`/`--as-of` need
+                // global topology / commit timelines and stay cold.
+                (Some(graph_path), None) if repo.is_none() && at.is_none() && as_of.is_none() => {
+                    load_records_from_jsonl_selected(graph_path, &symbol_handle_selector(&handle))?
+                }
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
             };
@@ -5987,6 +6035,15 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // a throwaway copy, never the live store (same contract as the
             // other read-only query lanes).
             let records = match (graph.as_deref(), data_dir.as_deref()) {
+                // Sidecar-index fast path (issue #447): a file's spans are a
+                // `ByPath` closure. `--repo`/`--at` need global topology / the
+                // commit timeline and stay cold.
+                (Some(graph_path), None) if repo.is_none() && at.is_none() => {
+                    load_records_from_jsonl_selected(
+                        graph_path,
+                        &crate::graph_index::Selector::ByPath(path.to_owned()),
+                    )?
+                }
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
                 (Some(_), Some(_)) => {
@@ -6036,6 +6093,15 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // Strictly read-only lookup: `--data-dir` reads from a throwaway
             // copy, never the live store (same contract as `query at`).
             let records = match (graph.as_deref(), data_dir.as_deref()) {
+                // Sidecar-index fast path (issue #447): a file's spans are a
+                // `ByPath` closure. `--repo`/`--at`/`--as-of` need global
+                // topology / the commit timeline and stay cold.
+                (Some(graph_path), None) if repo.is_none() && at.is_none() && as_of.is_none() => {
+                    load_records_from_jsonl_selected(
+                        graph_path,
+                        &crate::graph_index::Selector::ByPath(path.to_owned()),
+                    )?
+                }
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
                 (Some(_), Some(_)) => {
@@ -6191,6 +6257,13 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     anyhow::bail!("provide only one of --graph or --data-dir, not both")
                 }
                 (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                // Sidecar-index fast path (issue #447): who-imports scans the
+                // `Import` nodes, a `ByKind` closure. `--repo` needs global
+                // topology for owner attribution and stays cold.
+                (Some(graph_path), None) if repo.is_none() => load_records_from_jsonl_selected(
+                    graph_path,
+                    &crate::graph_index::Selector::ByKind("Import".to_owned()),
+                )?,
                 (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
                 (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
             };
@@ -6262,6 +6335,19 @@ pub(crate) fn fail_on_unscoped_daemon_repo_collision(records: &[serde_json::Valu
 /// On an unknown or ambiguous selector this prints a stable machine-readable
 /// JSON diagnostic to stderr and exits 1 — no partial rows reach stdout, and
 /// ambiguity is never resolved by picking a repository implicitly (issue #67).
+/// Maps a symbol handle to its sidecar-index [`Selector`](crate::graph_index::Selector)
+/// for the `--graph` fast path (issue #447): a canonical `codegraph:` record id
+/// resolves [`ById`](crate::graph_index::Selector::ById), any other token is
+/// treated as an exact symbol name [`ByName`](crate::graph_index::Selector::ByName).
+/// Both closures are supersets that reproduce the cold answer.
+pub(crate) fn symbol_handle_selector(handle: &str) -> crate::graph_index::Selector {
+    if handle.starts_with("codegraph:") {
+        crate::graph_index::Selector::ById(handle.to_owned())
+    } else {
+        crate::graph_index::Selector::ByName(handle.to_owned())
+    }
+}
+
 pub(crate) fn resolve_repo_scope(
     index: &query::RepositoryIndex,
     repo: Option<&str>,

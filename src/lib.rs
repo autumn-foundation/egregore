@@ -43,6 +43,8 @@ pub mod freshness;
 pub mod fs;
 /// GitHub Issues/PRs importer (issue #46).
 pub mod github;
+/// Persistent sidecar index for `eg query … --graph` lanes (issue #447).
+pub mod graph_index;
 /// Git history replay.
 pub mod history;
 /// Repository identity computation.

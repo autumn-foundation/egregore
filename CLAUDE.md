@@ -17,6 +17,7 @@ cargo run -- scan . --out graph.jsonl
 cargo run -- scan-history . --out history.graph.jsonl
 cargo run -- scan-logs app.log --repo-path . --out log.graph.jsonl
 cargo run -- inspect graph.jsonl
+cargo run -- index graph.jsonl
 cargo run -- ingest graph.jsonl --adapter dry-run
 cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
 cargo run -- inspect --data-dir .egregore
@@ -803,6 +804,28 @@ diagnostic per defect in deterministic canonical order (byte-identical across ru
 is redaction-safe — record IDs, categories, relation labels, paths, spans, and counts only.
 Structural reference closure only: never parse correctness, semantic accuracy, schema-version
 compatibility, or extraction completeness. See `docs/cli/validate.md`.
+
+`eg index <graph>` builds a persistent sidecar index at `<graph>.idx` (issue
+#447) so targeted `eg query … --graph` lanes seek to the records they need
+instead of deserializing the whole file. The index is content-addressed on the
+graph's BLAKE3 + byte length: a stale, corrupt, missing, or version-mismatched
+index is silently ignored and the lane transparently cold-scans, so results are
+BYTE-IDENTICAL with or without the index (a pure access-path optimization).
+`eg index` is the only writer (atomic `.idx.tmp` + rename, deterministic bytes),
+refuses (exit 2) any graph a cold load would reject, and never writes from a
+query path. Migrated lanes (`deps`, `context`/`symbol`, `at`/`locate`, `file`,
+`who-imports`) take the fast path only for the plain current-state, unscoped
+invocation; `--repo`/`--at`/`--as-of`/`--repo-path` and every other `--graph`
+lane stay on the cold full-file scan. Composing with #457 (which made
+`deps`/`who-imports` HEAD-anchor by default over a history store), the index
+body carries a `has_temporal_history` flag (still format v1) set when the graph
+is a `scan-history`/corpus store (any temporal record or `Commit` node); the
+loader then falls back to the cold whole-file scan for the migrated lanes over
+such a store — the #457 HEAD-anchor gate needs global commit topology and every
+record version a targeted closure cannot supply — so the answer stays
+byte-identical, while a plain current-tree `scan` graph keeps the fast path.
+See `docs/cli/index.md`.
+
 `eg query public-api-deltas <base> <head>` classifies changes to the externally-reachable
 public API surface between two commit handles from a `scan-history` graph or embedded store,
 composing the issue #118 range mechanics with the issue #124 visibility/signature capture.
