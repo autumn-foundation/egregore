@@ -32,6 +32,7 @@ mod forget;
 mod freshness_cmd;
 mod implementors;
 mod import;
+mod index;
 mod ingest;
 mod inspect;
 mod lifeline;
@@ -105,6 +106,7 @@ pub(crate) use forget::*;
 pub(crate) use freshness_cmd::*;
 pub(crate) use implementors::*;
 pub(crate) use import::*;
+pub(crate) use index::*;
 pub(crate) use ingest::*;
 pub(crate) use inspect::*;
 pub(crate) use lifeline::*;
@@ -499,6 +501,19 @@ pub(crate) enum Commands {
         /// Output format (JSONL diagnostics by default).
         #[arg(long, default_value = "json")]
         format: OutputFormat,
+    },
+    /// Build a persistent sidecar index for a graph JSONL (issue #447).
+    ///
+    /// Writes `<graph>.idx` next to the graph so targeted `eg query … --graph`
+    /// lanes seek to the records they need instead of deserializing the whole
+    /// file. The index is content-addressed on the graph's BLAKE3 + length: a
+    /// query lane transparently cold-scans when the index is absent, stale, or
+    /// corrupt, so results are byte-identical with or without it. This command
+    /// is the only writer of the index and refuses (exit 2) any graph a cold
+    /// load would also reject. See `docs/cli/index.md`.
+    Index {
+        /// Graph JSONL path to index.
+        graph: PathBuf,
     },
     /// Ingest graph JSONL through a storage adapter.
     Ingest {
@@ -3546,6 +3561,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             format,
         ),
         Commands::Validate { graph, format } => validate_cmd(&graph, format),
+        Commands::Index { graph } => index_cmd(&graph),
         Commands::Ingest {
             graph,
             adapter,

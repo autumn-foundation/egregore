@@ -21,6 +21,59 @@ pub(crate) fn load_records_from_jsonl(graph: &Path) -> Result<Vec<GraphRecord>> 
         .map_err(|e| anyhow::anyhow!("failed to parse graph JSONL: {e}"))
 }
 
+/// Loads query records for a targeted lane, using the sidecar index (issue #447)
+/// to hydrate only the [`Selector`]'s closure when a valid `<graph>.idx` exists.
+///
+/// This is the ONE loader hook for the graph sidecar index. It is a pure
+/// access-path optimization: the records it returns for a non-`Whole` selector
+/// are a byte-identical superset of the records the migrated lane needs, so the
+/// lane's output is unchanged from the cold path.
+///
+/// * `--data-dir`: unchanged embedded load (the embedded store is out of scope
+///   for #447); the selector is ignored.
+/// * `--graph` + [`Selector::Whole`]: the existing cold scan, byte-identical to
+///   today (no index consulted).
+/// * `--graph` + a non-`Whole` selector: load and validate `<graph>.idx`; on a
+///   valid index hydrate the closure by seek, otherwise transparently fall back
+///   to the cold scan. This path NEVER fails because of the index and NEVER
+///   writes it.
+pub(crate) fn load_records_selected(
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+    selector: &crate::graph_index::Selector,
+) -> Result<Vec<GraphRecord>> {
+    match (graph, data_dir) {
+        (Some(path), None) => load_records_from_jsonl_selected(path, selector),
+        (None, Some(dir)) => load_records_from_db(dir),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("provide only one of --graph or --data-dir, not both")
+        }
+        (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+    }
+}
+
+/// `--graph` half of [`load_records_selected`]: hydrate the selector's closure
+/// through a valid sidecar index, else cold-scan the whole file.
+pub(crate) fn load_records_from_jsonl_selected(
+    graph: &Path,
+    selector: &crate::graph_index::Selector,
+) -> Result<Vec<GraphRecord>> {
+    use crate::graph_index::{GraphIndex, Selector};
+
+    if matches!(selector, Selector::Whole) {
+        return load_records_from_jsonl(graph);
+    }
+    // Try the index; ANY failure (absent, stale, corrupt, version mismatch, or a
+    // hydration I/O error) transparently degrades to the cold scan.
+    match GraphIndex::load_for(graph) {
+        Ok(index) => match index.hydrate(graph, selector) {
+            Ok(Some(records)) => Ok(records),
+            Ok(None) | Err(_) => load_records_from_jsonl(graph),
+        },
+        Err(_) => load_records_from_jsonl(graph),
+    }
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 pub(crate) fn validate_existing_embedded_store(data_dir: &Path) -> Result<()> {
     match fs::read_dir(data_dir) {
