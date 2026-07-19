@@ -383,32 +383,32 @@ fn resolve_target(
     TargetState::Absent
 }
 
-/// Sweeps every cross-domain evidence edge (standalone edge records + inline
-/// [`EvidenceLink`](crate::ir::EvidenceLink)s) and reports each whose target is
-/// absent or tombstoned.
-///
-/// Pure and deterministic: no I/O, no printing, byte-identical output across runs.
-#[must_use]
-pub fn run_evidence_link_audit(records: &[GraphRecord]) -> EvidenceLinkAuditReport {
-    let (checked_edge_labels, excluded_edge_labels) = edge_classes();
-    let liveness = Liveness::new(records);
+/// Resolves a source record's `(domain, kind)` for a broken-edge row: from the
+/// present node version when available, else from the bare ID prefix.
+fn source_domain_kind(
+    source_id: &str,
+    nodes_by_id: &BTreeMap<&str, &GraphRecord>,
+) -> (String, String) {
+    nodes_by_id.get(source_id).map_or_else(
+        || (domain_from_id(source_id), "unknown".to_owned()),
+        |node| {
+            (
+                record_domain(node),
+                node.node_kind_name().unwrap_or("unknown").to_owned(),
+            )
+        },
+    )
+}
 
-    // Latest node version per id (append order: last write wins) + tombstone set.
-    let mut nodes_by_id: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
-    let mut tombstoned: BTreeSet<&str> = BTreeSet::new();
-    for record in records {
-        match record {
-            GraphRecord::Node { id, .. } => {
-                nodes_by_id.insert(id.as_str(), record);
-            }
-            GraphRecord::Tombstone { deleted_id, .. } => {
-                tombstoned.insert(deleted_id.as_str());
-            }
-            GraphRecord::Edge { .. } => {}
-        }
-    }
-
-    // Collect deduplicated CHECKED references, both representations.
+/// Collects deduplicated CHECKED evidence references in both representations —
+/// standalone [`GraphRecord::Edge`] records and inline
+/// [`EvidenceLink`](crate::ir::EvidenceLink)s on live nodes — returning the
+/// reference map plus the count of triple-only (no-target-id) inline links.
+fn collect_checked_refs<'a>(
+    records: &'a [GraphRecord],
+    liveness: &Liveness,
+    nodes_by_id: &BTreeMap<&'a str, &'a GraphRecord>,
+) -> (BTreeMap<RefKey<'a>, CheckedRef<'a>>, usize) {
     let mut refs: BTreeMap<RefKey, CheckedRef> = BTreeMap::new();
     let mut triple_only_count: usize = 0;
 
@@ -506,23 +506,25 @@ pub fn run_evidence_link_audit(records: &[GraphRecord]) -> EvidenceLinkAuditRepo
         }
     }
 
-    let checked_edge_count = refs.len();
+    (refs, triple_only_count)
+}
 
-    // Classify each reference; keep only the broken ones.
+/// Classifies each collected reference against the loaded record set, returning
+/// the canonically-ordered broken edges (target absent or tombstoned).
+fn classify_refs(
+    refs: &BTreeMap<RefKey<'_>, CheckedRef<'_>>,
+    nodes_by_id: &BTreeMap<&str, &GraphRecord>,
+    tombstoned: &BTreeSet<&str>,
+    liveness: &Liveness,
+) -> Vec<BrokenEvidenceEdge> {
     let mut broken_edges: Vec<BrokenEvidenceEdge> = Vec::new();
     for reference in refs.values() {
-        let case = match resolve_target(reference.target_id, &nodes_by_id, &tombstoned, &liveness) {
+        let case = match resolve_target(reference.target_id, nodes_by_id, tombstoned, liveness) {
             TargetState::Resolved => continue,
             TargetState::Tombstoned => BrokenCase::Tombstoned,
             TargetState::Absent => BrokenCase::Absent,
         };
-        let (source_domain, source_kind) = match nodes_by_id.get(reference.source_id) {
-            Some(node) => (
-                record_domain(node),
-                node.node_kind_name().unwrap_or("unknown").to_owned(),
-            ),
-            None => (domain_from_id(reference.source_id), "unknown".to_owned()),
-        };
+        let (source_domain, source_kind) = source_domain_kind(reference.source_id, nodes_by_id);
         let (target_repo_relative_path, target_span) =
             recover_code_handle(nodes_by_id.get(reference.target_id));
         broken_edges.push(BrokenEvidenceEdge {
@@ -561,6 +563,40 @@ pub fn run_evidence_link_audit(records: &[GraphRecord]) -> EvidenceLinkAuditRepo
                 b.edge_record_id.as_deref().unwrap_or(""),
             ))
     });
+
+    broken_edges
+}
+
+/// Sweeps every cross-domain evidence edge (standalone edge records + inline
+/// [`EvidenceLink`](crate::ir::EvidenceLink)s) and reports each whose target is
+/// absent or tombstoned.
+///
+/// Pure and deterministic: no I/O, no printing, byte-identical output across runs.
+#[must_use]
+pub fn run_evidence_link_audit(records: &[GraphRecord]) -> EvidenceLinkAuditReport {
+    let (checked_edge_labels, excluded_edge_labels) = edge_classes();
+    let liveness = Liveness::new(records);
+
+    // Latest node version per id (append order: last write wins) + tombstone set.
+    let mut nodes_by_id: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
+    let mut tombstoned: BTreeSet<&str> = BTreeSet::new();
+    for record in records {
+        match record {
+            GraphRecord::Node { id, .. } => {
+                nodes_by_id.insert(id.as_str(), record);
+            }
+            GraphRecord::Tombstone { deleted_id, .. } => {
+                tombstoned.insert(deleted_id.as_str());
+            }
+            GraphRecord::Edge { .. } => {}
+        }
+    }
+
+    // Collect deduplicated CHECKED references (both representations), then
+    // classify each against the loaded record set.
+    let (refs, triple_only_count) = collect_checked_refs(records, &liveness, &nodes_by_id);
+    let checked_edge_count = refs.len();
+    let broken_edges = classify_refs(&refs, &nodes_by_id, &tombstoned, &liveness);
 
     let mut by_source_domain: BTreeMap<String, usize> = BTreeMap::new();
     let mut by_edge_label: BTreeMap<String, usize> = BTreeMap::new();

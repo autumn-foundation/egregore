@@ -17,7 +17,7 @@ fn egregore() -> Command {
     Command::cargo_bin("egregore").expect("binary should run")
 }
 
-fn mk_span(start_line: usize, end_line: usize) -> SourceSpan {
+const fn mk_span(start_line: usize, end_line: usize) -> SourceSpan {
     SourceSpan {
         start_byte: 0,
         end_byte: 42,
@@ -122,9 +122,9 @@ fn tombstone(id: &str, deleted_id: &str) -> GraphRecord {
 }
 
 /// A seeded broken store spanning >=3 source domains and both target-absence
-/// cases (issue #217 AC1): agent_memory OBSERVES a tombstoned code symbol,
-/// agent_memory VALIDATED_BY an absent verification record, and a project
-/// CLOSES_ACCEPTANCE_CRITERION edge to an absent record.
+/// cases (issue #217 AC1): `agent_memory` `OBSERVES` a tombstoned code symbol,
+/// `agent_memory` `VALIDATED_BY` an absent verification record, and a project
+/// `CLOSES_ACCEPTANCE_CRITERION` edge to an absent record.
 fn broken_records() -> Vec<GraphRecord> {
     vec![
         // Tombstoned code symbol (path/span recoverable).
