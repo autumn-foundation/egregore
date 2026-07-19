@@ -12,13 +12,9 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 
-use aletheia_egregore::{
-    GraphRecord, NodeKind,
-    ir::SourceSpan,
-    scip::decode_index,
-};
+use aletheia_egregore::{GraphRecord, NodeKind, ir::SourceSpan, scip::decode_index};
 
-fn span(start_line: usize, end_line: usize) -> SourceSpan {
+const fn span(start_line: usize, end_line: usize) -> SourceSpan {
     SourceSpan {
         start_byte: 0,
         end_byte: 1,
@@ -29,25 +25,31 @@ fn span(start_line: usize, end_line: usize) -> SourceSpan {
 
 /// A small code graph: one repository, one file, two real definitions, plus a
 /// Diagnostic stub and a positionless edge that must never become occurrences.
+fn line(record: &GraphRecord) -> String {
+    serde_json::to_string(record).expect("serialize record")
+}
+
 fn fixture_jsonl() -> String {
-    let records = vec![
-        GraphRecord::node(
+    // Each GraphRecord::Node is a large struct, so serialize each as a temporary
+    // (never held together in a stack array) into a small array of lines.
+    let mut lines: Vec<String> = [
+        line(&GraphRecord::node(
             "repo-1".to_string(),
             NodeKind::Repository,
             None,
             None,
             Some("widget".to_string()),
             "Repository widget".to_string(),
-        ),
-        GraphRecord::node(
+        )),
+        line(&GraphRecord::node(
             "file-1".to_string(),
             NodeKind::File,
             Some("src/lib.rs".to_string()),
             None,
             Some("src/lib.rs".to_string()),
             "File src/lib.rs".to_string(),
-        ),
-        GraphRecord::syntax_symbol(
+        )),
+        line(&GraphRecord::syntax_symbol(
             "s-widget".to_string(),
             "struct",
             "src/lib.rs".to_string(),
@@ -56,8 +58,8 @@ fn fixture_jsonl() -> String {
             "rust",
             0,
             "Rust struct Widget".to_string(),
-        ),
-        GraphRecord::syntax_symbol(
+        )),
+        line(&GraphRecord::syntax_symbol(
             "s-render".to_string(),
             "method",
             "src/lib.rs".to_string(),
@@ -66,27 +68,24 @@ fn fixture_jsonl() -> String {
             "rust",
             0,
             "Rust method Widget::render".to_string(),
-        ),
-        GraphRecord::node(
+        )),
+        line(&GraphRecord::node(
             "d-1".to_string(),
             NodeKind::Diagnostic,
             Some("src/lib.rs".to_string()),
             Some(span(30, 31)),
             Some("macro_bang".to_string()),
             "Diagnostic".to_string(),
-        ),
-        GraphRecord::edge(
+        )),
+        line(&GraphRecord::edge(
             aletheia_egregore::ir::EdgeLabel::Defines,
             "file-1".to_string(),
             "s-widget".to_string(),
             Some("1.0".to_string()),
             "File defines Widget".to_string(),
-        ),
-    ];
-    let mut lines: Vec<String> = records
-        .iter()
-        .map(|r| serde_json::to_string(r).expect("serialize record"))
-        .collect();
+        )),
+    ]
+    .to_vec();
     lines.sort_unstable();
     format!("{}\n", lines.join("\n"))
 }
@@ -108,7 +107,9 @@ fn export_scip_from_graph_writes_parseable_index() {
         .arg(&out)
         .assert()
         .success()
-        .stdout(predicate::str::contains("exported 2 definitions across 1 documents"))
+        .stdout(predicate::str::contains(
+            "exported 2 definitions across 1 documents",
+        ))
         .stdout(predicate::str::contains("1 diagnostic-stubs"));
 
     // The written bytes parse back as a SCIP Index (in-process, no scip CLI).

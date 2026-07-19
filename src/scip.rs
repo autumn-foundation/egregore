@@ -1,6 +1,12 @@
 //! SCIP code-intelligence export (issue #233).
 //!
-//! STUB (RED phase). Real implementation lands next.
+//! Pure, deterministic, filesystem-local mapping from an Egregore code graph to
+//! a Sourcegraph SCIP index protobuf. Definitions-only: every span-bearing
+//! `Symbol` / `Module` node becomes one `SymbolInformation` plus one
+//! `SymbolRole::Definition` `Occurrence`; positionless edges, `Diagnostic`
+//! stubs, span-less nodes, and anonymous `impl` blocks are dropped and tallied.
+//! Output is byte-identical across runs and independent of insertion order.
+//! See `docs/cli/export-scip.md`.
 
 use crate::ir::{GraphRecord, NodeKind, SourceSpan};
 use anyhow::Result;
@@ -8,8 +14,8 @@ use anyhow::Result;
 // leading `::` disambiguates from `crate::scip`.
 use ::scip::symbol::format_symbol;
 use ::scip::types::{
-    descriptor, symbol_information, Descriptor, Document, Index, Metadata, Occurrence, Package,
-    Signature, Symbol, SymbolInformation, SymbolRole, TextEncoding, ToolInfo,
+    Descriptor, Document, Index, Metadata, Occurrence, Package, Signature, Symbol,
+    SymbolInformation, SymbolRole, TextEncoding, ToolInfo, descriptor, symbol_information,
 };
 use protobuf::MessageField;
 use std::collections::BTreeMap;
@@ -60,6 +66,82 @@ struct Definition {
     occurrence: Occurrence,
 }
 
+/// Walks the records once, collecting the set of document paths (every `File`
+/// node, plus any path that carries an emitted definition) and the list of
+/// resolved definitions, tallying every dropped definition candidate (AC#7).
+fn collect_definitions(
+    records: &[GraphRecord],
+    package: &str,
+) -> (
+    std::collections::BTreeSet<String>,
+    Vec<Definition>,
+    SkipTally,
+) {
+    let mut skipped = SkipTally::default();
+    // Every File node contributes a Document, even when it defines no symbols.
+    let mut doc_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut definitions: Vec<Definition> = Vec::new();
+
+    for record in records {
+        let GraphRecord::Node {
+            kind,
+            repo_relative_path,
+            span,
+            name,
+            symbol_kind,
+            disambiguator,
+            visibility,
+            signature,
+            doc,
+            ..
+        } = record
+        else {
+            // Edges and tombstones are positionless / non-definitional.
+            continue;
+        };
+        match kind {
+            NodeKind::File => {
+                if let Some(path) = repo_relative_path {
+                    doc_paths.insert(path.clone());
+                }
+            }
+            NodeKind::Diagnostic => skipped.diagnostic += 1,
+            NodeKind::Symbol | NodeKind::Module => {
+                let kind_str = definition_kind_str(*kind, symbol_kind.as_deref());
+                if kind_str == "impl" {
+                    skipped.impl_block += 1;
+                    continue;
+                }
+                let (Some(path), Some(span), Some(name)) = (repo_relative_path, span, name) else {
+                    skipped.no_span += 1;
+                    continue;
+                };
+                let moniker = build_moniker(package, name, kind_str, disambiguator.unwrap_or(0));
+                let info = build_symbol_information(
+                    &moniker,
+                    name,
+                    kind_str,
+                    visibility.as_deref(),
+                    signature.as_deref(),
+                    doc.as_deref(),
+                );
+                let occurrence = build_occurrence(&moniker, span);
+                doc_paths.insert(path.clone());
+                definitions.push(Definition {
+                    path: path.clone(),
+                    start_line: span.start_line,
+                    name: name.clone(),
+                    record_id: record.id().to_string(),
+                    info,
+                    occurrence,
+                });
+            }
+            _ => {}
+        }
+    }
+    (doc_paths, definitions, skipped)
+}
+
 /// Builds a definitions-only SCIP `Index` from graph records (issue #233).
 ///
 /// Deterministic and filesystem-local: it reads only the in-memory records
@@ -73,75 +155,11 @@ struct Definition {
 #[must_use]
 pub fn build_index(records: &[GraphRecord], project_root: &str, tool_version: &str) -> ScipExport {
     let package = package_name(records);
-    let mut skipped = SkipTally::default();
-
-    // Every File node contributes a Document, even when it defines no symbols.
-    let mut doc_paths: BTreeMap<String, ()> = BTreeMap::new();
-    let mut definitions: Vec<Definition> = Vec::new();
-
-    for record in records {
-        if let GraphRecord::Node {
-            kind,
-            repo_relative_path,
-            span,
-            name,
-            symbol_kind,
-            disambiguator,
-            visibility,
-            signature,
-            doc,
-            ..
-        } = record
-        {
-            match kind {
-                NodeKind::File => {
-                    if let Some(path) = repo_relative_path {
-                        doc_paths.insert(path.clone(), ());
-                    }
-                }
-                NodeKind::Diagnostic => skipped.diagnostic += 1,
-                NodeKind::Symbol | NodeKind::Module => {
-                    let kind_str = definition_kind_str(*kind, symbol_kind.as_deref());
-                    if kind_str == "impl" {
-                        skipped.impl_block += 1;
-                        continue;
-                    }
-                    let (Some(path), Some(span), Some(name)) =
-                        (repo_relative_path, span, name)
-                    else {
-                        skipped.no_span += 1;
-                        continue;
-                    };
-                    let disamb = disambiguator.unwrap_or(0);
-                    let moniker = build_moniker(&package, name, kind_str, disamb);
-                    let info = build_symbol_information(
-                        &moniker,
-                        name,
-                        kind_str,
-                        visibility.as_deref(),
-                        signature.as_deref(),
-                        doc.as_deref(),
-                    );
-                    let occurrence = build_occurrence(&moniker, span);
-                    doc_paths.insert(path.clone(), ());
-                    definitions.push(Definition {
-                        path: path.clone(),
-                        start_line: span.start_line,
-                        name: name.clone(),
-                        record_id: record.id().to_string(),
-                        info,
-                        occurrence,
-                    });
-                }
-                _ => {}
-            }
-        }
-        // Edges and tombstones are positionless / non-definitional — dropped.
-    }
+    let (doc_paths, definitions, skipped) = collect_definitions(records, &package);
 
     // Group definitions by document path.
     let mut by_path: BTreeMap<String, Vec<Definition>> = BTreeMap::new();
-    for path in doc_paths.keys() {
+    for path in &doc_paths {
         by_path.entry(path.clone()).or_default();
     }
     let definition_count = definitions.len();
@@ -200,19 +218,17 @@ pub fn build_index(records: &[GraphRecord], project_root: &str, tool_version: &s
 /// falling back to a fixed default when no repository is present.
 #[must_use]
 pub fn package_name(records: &[GraphRecord]) -> String {
-    for record in records {
-        if let GraphRecord::Node {
-            kind: NodeKind::Repository,
-            name: Some(name),
-            ..
-        } = record
-        {
-            if !name.is_empty() {
-                return name.clone();
-            }
-        }
-    }
-    DEFAULT_PACKAGE.to_string()
+    records
+        .iter()
+        .find_map(|record| match record {
+            GraphRecord::Node {
+                kind: NodeKind::Repository,
+                name: Some(name),
+                ..
+            } if !name.is_empty() => Some(name.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| DEFAULT_PACKAGE.to_string())
 }
 
 /// Normalizes a `Symbol`/`Module` node into a stable kind token used for both
@@ -243,8 +259,16 @@ fn definition_kind_str(kind: NodeKind, symbol_kind: Option<&str>) -> &'static st
 /// The ADR-0004 source-order `disambiguator` feeds the SCIP method-disambiguator
 /// slot for callables (and a trailing `Meta` descriptor for other kinds) so the
 /// moniker is unique exactly where the Egregore identity is.
-fn build_moniker(package: &str, qualified_name: &str, kind_str: &str, disambiguator: u64) -> String {
-    let segments: Vec<&str> = qualified_name.split("::").filter(|s| !s.is_empty()).collect();
+fn build_moniker(
+    package: &str,
+    qualified_name: &str,
+    kind_str: &str,
+    disambiguator: u64,
+) -> String {
+    let segments: Vec<&str> = qualified_name
+        .split("::")
+        .filter(|s| !s.is_empty())
+        .collect();
     let mut descriptors: Vec<Descriptor> = Vec::new();
     let last = segments.len().saturating_sub(1);
     for (i, seg) in segments.iter().enumerate() {
@@ -342,14 +366,13 @@ fn build_symbol_information(
     if let Some(doc) = doc {
         documentation.push(doc.to_string());
     }
-    let signature_documentation = match signature {
-        Some(sig) => MessageField::some(Signature {
+    let signature_documentation = signature.map_or_else(MessageField::none, |sig| {
+        MessageField::some(Signature {
             language: "rust".to_string(),
             text: sig.to_string(),
             ..Default::default()
-        }),
-        None => MessageField::none(),
-    };
+        })
+    });
     SymbolInformation {
         symbol: moniker.to_string(),
         display_name: name.to_string(),
@@ -467,12 +490,11 @@ mod tests {
                 "File src/lib.rs".to_string(),
             ),
             sym("s-widget", "struct", "Widget", span(3, 10)),
-            sym("s-render", "method", "Widget::render", span(5, 8))
-                .with_declaration_surface(
-                    Some("public".to_string()),
-                    Some("fn render(&self)".to_string()),
-                    Some("Renders the widget.".to_string()),
-                ),
+            sym("s-render", "method", "Widget::render", span(5, 8)).with_declaration_surface(
+                Some("public".to_string()),
+                Some("fn render(&self)".to_string()),
+                Some("Renders the widget.".to_string()),
+            ),
             sym("s-helper", "function", "helper", span(12, 14)),
             // A span-bearing module lands as a namespace definition.
             GraphRecord::node(
@@ -539,7 +561,10 @@ mod tests {
         assert_eq!(doc.occurrences.len(), 4);
         // Every occurrence is a definition; no reference occurrences.
         for occ in &doc.occurrences {
-            assert_eq!(occ.symbol_roles, ::scip::types::SymbolRole::Definition as i32);
+            assert_eq!(
+                occ.symbol_roles,
+                ::scip::types::SymbolRole::Definition as i32
+            );
         }
         // Metadata: tool info + UTF8 encoding.
         let meta = parsed.metadata.as_ref().expect("metadata");
@@ -570,7 +595,11 @@ mod tests {
     fn definition_set_matches_file_defined_symbols() {
         let export = build_index(&fixture(), "widget", "0.0.0");
         let doc = &export.index.documents[0];
-        let mut names: Vec<&str> = doc.symbols.iter().map(|s| s.display_name.as_str()).collect();
+        let mut names: Vec<&str> = doc
+            .symbols
+            .iter()
+            .map(|s| s.display_name.as_str())
+            .collect();
         names.sort_unstable();
         assert_eq!(names, vec!["Widget", "Widget::render", "helper", "inner"]);
     }
@@ -587,10 +616,12 @@ mod tests {
         let sig = render.signature_documentation.as_ref().expect("signature");
         assert_eq!(sig.text, "fn render(&self)");
         assert!(render.documentation.iter().any(|d| d.contains("public")));
-        assert!(render
-            .documentation
-            .iter()
-            .any(|d| d.contains("Renders the widget.")));
+        assert!(
+            render
+                .documentation
+                .iter()
+                .any(|d| d.contains("Renders the widget."))
+        );
     }
 
     #[test]
@@ -621,7 +652,7 @@ mod tests {
         let b = encode_index(&build_index(&records, "widget", "0.0.0").index).expect("b");
         assert_eq!(a, b, "repeated builds must be byte-identical");
 
-        let mut shuffled = records.clone();
+        let mut shuffled = fixture();
         shuffled.reverse();
         let c = encode_index(&build_index(&shuffled, "widget", "0.0.0").index).expect("c");
         assert_eq!(a, c, "insertion order must not affect bytes");
@@ -659,7 +690,12 @@ mod tests {
         ];
         let export = build_index(&records, "widget", "0.0.0");
         assert_eq!(export.definition_count, 0);
-        let total_occ: usize = export.index.documents.iter().map(|d| d.occurrences.len()).sum();
+        let total_occ: usize = export
+            .index
+            .documents
+            .iter()
+            .map(|d| d.occurrences.len())
+            .sum();
         let total_sym: usize = export.index.documents.iter().map(|d| d.symbols.len()).sum();
         assert_eq!(total_occ, 0);
         assert_eq!(total_sym, 0);
