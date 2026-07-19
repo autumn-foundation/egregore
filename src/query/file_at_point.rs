@@ -493,7 +493,15 @@ pub struct LocationContext<'a> {
 /// history-backed snapshot; history-backed snapshots order by parsed valid
 /// time (unparseable valid times sort oldest), with the commit SHA as a
 /// deterministic tiebreak for equal-time commits (e.g. rebases).
-fn version_recency_key(record: &GraphRecord) -> (u8, Option<DateTime<chrono::FixedOffset>>, &str) {
+///
+/// Shared with the other head-anchored current-state lanes (`public_api`,
+/// `unreferenced`, issue #427): after [`super::non_head_current_record_ids`]
+/// removes fully-off-HEAD IDs, a keep-last dedupe keyed on this recency order
+/// selects the surviving version — the HEAD (newest-valid-time) one — matching
+/// the per-record HEAD gate those lanes previously inlined.
+pub(super) fn version_recency_key(
+    record: &GraphRecord,
+) -> (u8, Option<DateTime<chrono::FixedOffset>>, &str) {
     let GraphRecord::Node { temporal, .. } = record else {
         return (0, None, "");
     };
