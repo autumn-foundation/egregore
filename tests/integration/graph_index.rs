@@ -11,7 +11,8 @@
 use std::{fs, path::Path, path::PathBuf};
 
 use aletheia_egregore::{
-    CallResolution, EdgeLabel, GraphRecord, NodeKind, SourceSpan,
+    CallResolution, EdgeLabel, GraphRecord, NodeKind, SnapshotHead, SourceSnapshotPayload,
+    SourceSpan, TemporalMetadata,
     ir::{Graph, SCHEMA_VERSION, stable_id},
 };
 use assert_cmd::Command;
@@ -352,6 +353,271 @@ fn differential_who_imports() {
     assert_lane_identical(&graph, &["query", "who-imports", "serde::Serialize"]);
     assert_lane_identical(&graph, &["query", "who-imports", "foo::bar"]);
     assert_lane_identical(&graph, &["query", "who-imports", "nonexistent::mod"]);
+}
+
+// ---------------------------------------------------------------------------
+// History-store composition with #457 HEAD-anchoring
+//
+// Over a `scan-history` graph, `deps`/`who-imports` HEAD-anchor by default and
+// `path` reads the union — all consuming global commit topology / every record
+// version that a targeted index closure cannot soundly supply. The sidecar
+// loader detects a history store (temporal records / Commit nodes recorded in
+// the index header) and falls back to the cold whole-file scan, so the indexed
+// answer stays byte-identical to the cold answer. These fixtures make
+// `corpus_mode` non-trivial (`head_anchored`) so that path is exercised.
+// ---------------------------------------------------------------------------
+
+const HT1: &str = "2026-01-01T00:00:00+00:00";
+const HT2: &str = "2026-02-01T00:00:00+00:00";
+
+fn hist_temporal(commit: &str, parents: &[&str], valid_time: &str) -> TemporalMetadata {
+    TemporalMetadata {
+        git_commit: commit.to_owned(),
+        git_parent_commits: parents.iter().map(|s| (*s).to_owned()).collect(),
+        valid_time: valid_time.to_owned(),
+        author_time: None,
+        observed_at: valid_time.to_owned(),
+        valid_time_source: Some("git_commit_committer_date".to_owned()),
+    }
+}
+
+/// A `scan-history` fixture with a `source_snapshot` pinning HEAD to commit c2.
+///
+/// At c1 `anchor` calls `dep_gone` and imports `only_old::mod`; at c2 that call
+/// and import are gone and `anchor` calls `dep_head` / imports `serde::Serialize`
+/// instead. Head-anchoring (the #457 default) must therefore drop `dep_gone`
+/// and `only_old::mod` from the default corpus. Returns (tempdir, graph path).
+#[allow(clippy::too_many_lines)]
+fn seed_history_graph() -> (tempfile::TempDir, PathBuf) {
+    let mut graph = Graph::new();
+    let repo_id = stable_id(&["node", "Repository", "rh"]);
+    graph.push(
+        GraphRecord::node(
+            repo_id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("rh".to_owned()),
+            "Repository rh".to_owned(),
+        )
+        .with_source_snapshot(SourceSnapshotPayload {
+            head: SnapshotHead::Commit {
+                sha: "bbbb2222".to_owned(),
+            },
+            dirty: false,
+            repository_id: repo_id.clone(),
+            scanned_at: HT2.to_owned(),
+        }),
+    );
+
+    // Commits attributed to the repo via CONTAINS.
+    let commit_in = |g: &mut Graph, sha: &str, parents: &[&str], vt: &str| {
+        let cid = stable_id(&["node", "commit", "rh", sha]);
+        g.push(
+            GraphRecord::node(
+                cid.clone(),
+                NodeKind::Commit,
+                None,
+                None,
+                Some(sha.to_owned()),
+                format!("Commit {sha}"),
+            )
+            .with_temporal(hist_temporal(sha, parents, vt)),
+        );
+        g.push(GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id.clone(),
+            cid,
+            None,
+            format!("repo contains commit {sha}"),
+        ));
+    };
+    commit_in(&mut graph, "aaaa1111", &[], HT1);
+    commit_in(&mut graph, "bbbb2222", &["aaaa1111"], HT2);
+
+    // File attributed to the repo so owner_of resolves each symbol.
+    file(&mut graph, &repo_id, "src/h.rs");
+
+    let hist_symbol = |g: &mut Graph, name: &str, commit: &str, vt: &str| -> String {
+        let id = sym_id("src/h.rs", name);
+        g.push(
+            GraphRecord::syntax_node(
+                id.clone(),
+                NodeKind::Symbol,
+                "src/h.rs".to_owned(),
+                span(1, 10),
+                name.to_owned(),
+                "rust",
+                format!("fn {name}"),
+            )
+            .with_temporal(hist_temporal(commit, &[], vt)),
+        );
+        g.push(
+            GraphRecord::edge(
+                EdgeLabel::Defines,
+                file_id("src/h.rs"),
+                id.clone(),
+                None,
+                format!("src/h.rs defines {name}"),
+            )
+            .with_temporal(hist_temporal(commit, &[], vt)),
+        );
+        id
+    };
+
+    let anchor_id = hist_symbol(&mut graph, "anchor", "aaaa1111", HT1);
+    let dep_gone_id = hist_symbol(&mut graph, "dep_gone", "aaaa1111", HT1);
+    hist_symbol(&mut graph, "anchor", "bbbb2222", HT2);
+    let dep_head_id = hist_symbol(&mut graph, "dep_head", "bbbb2222", HT2);
+
+    let hist_call = |g: &mut Graph, from: &str, to: &str, commit: &str, vt: &str| {
+        g.push(
+            GraphRecord::edge(
+                EdgeLabel::Calls,
+                from.to_owned(),
+                to.to_owned(),
+                Some("1.0".to_owned()),
+                "historical call".to_owned(),
+            )
+            .with_resolution(CallResolution::Resolved)
+            .with_temporal(hist_temporal(commit, &[], vt)),
+        );
+    };
+    hist_call(&mut graph, &anchor_id, &dep_gone_id, "aaaa1111", HT1);
+    hist_call(&mut graph, &anchor_id, &dep_head_id, "bbbb2222", HT2);
+
+    // Imports: one present only at c1 (dropped at HEAD), one present at HEAD.
+    let hist_import = |g: &mut Graph, name: &str, commit: &str, vt: &str, line: usize| {
+        let id = import_id("src/h.rs", name);
+        g.push(
+            GraphRecord::syntax_node(
+                id.clone(),
+                NodeKind::Import,
+                "src/h.rs".to_owned(),
+                span(line, line),
+                name.to_owned(),
+                "rust",
+                format!("Rust import {name}"),
+            )
+            .with_temporal(hist_temporal(commit, &[], vt)),
+        );
+        g.push(
+            GraphRecord::edge(
+                EdgeLabel::Imports,
+                file_id("src/h.rs"),
+                id,
+                None,
+                format!("src/h.rs imports {name}"),
+            )
+            .with_temporal(hist_temporal(commit, &[], vt)),
+        );
+    };
+    hist_import(&mut graph, "only_old::mod", "aaaa1111", HT1, 2);
+    hist_import(&mut graph, "serde::Serialize", "bbbb2222", HT2, 2);
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("history.jsonl");
+    fs::write(&path, graph.to_jsonl().expect("jsonl")).expect("write");
+    (temp, path)
+}
+
+/// Parses the first NDJSON line of a lane's stdout as the summary/header object.
+fn header_of(out: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(out);
+    let first = text.lines().next().unwrap_or("{}");
+    serde_json::from_str(first).unwrap_or(serde_json::Value::Null)
+}
+
+/// `deps` over a history store head-anchors by default (#457). The fixture's
+/// `corpus_mode` must be `head_anchored`, and the indexed answer (loader falls
+/// back to a cold scan for a history store) must be byte-identical to cold.
+#[test]
+fn differential_deps_history_head_anchored() {
+    let (_t, graph) = seed_history_graph();
+    // The fixture actually exercises the #457 head-anchor default.
+    let _ = fs::remove_file(idx_path(&graph));
+    let (cold_out, _) = run_lane(&graph, &["query", "deps", "anchor"]);
+    let header = header_of(&cold_out);
+    assert_eq!(
+        header["corpus_mode"], "head_anchored",
+        "history fixture must exercise the #457 head-anchor default; got {header}"
+    );
+    // Byte-identical cold vs indexed for the default and explicit corpus modes.
+    assert_lane_identical(&graph, &["query", "deps", "anchor"]);
+    assert_lane_identical(&graph, &["query", "deps", "anchor", "--all-history"]);
+    assert_lane_identical(&graph, &["query", "deps", "anchor", "--at-head"]);
+    assert_lane_identical(&graph, &["query", "deps", "dep_head"]);
+}
+
+/// `who-imports` over a history store head-anchors by default (#457). Indexed
+/// (cold-scan fallback) must equal cold, including the dropped-at-HEAD import.
+#[test]
+fn differential_who_imports_history_head_anchored() {
+    let (_t, graph) = seed_history_graph();
+    let _ = fs::remove_file(idx_path(&graph));
+    let (cold_out, _) = run_lane(&graph, &["query", "who-imports", "serde::Serialize"]);
+    let header = header_of(&cold_out);
+    assert_eq!(
+        header["corpus_mode"], "head_anchored",
+        "history who-imports must head-anchor by default; got {header}"
+    );
+    assert_lane_identical(&graph, &["query", "who-imports", "serde::Serialize"]);
+    // `only_old::mod` exists only off-HEAD: head-anchored default drops it,
+    // `--all-history` keeps it. Both must be byte-identical cold vs indexed.
+    assert_lane_identical(&graph, &["query", "who-imports", "only_old::mod"]);
+    assert_lane_identical(
+        &graph,
+        &["query", "who-imports", "only_old::mod", "--all-history"],
+    );
+    assert_lane_identical(&graph, &["query", "who-imports", "serde"]);
+}
+
+/// `path` is not migrated (always `Whole`) but must stay byte-identical over a
+/// history store with or without an index.
+#[test]
+fn differential_path_history() {
+    let (_t, graph) = seed_history_graph();
+    assert_lane_identical(&graph, &["query", "path", "anchor", "dep_head"]);
+    assert_lane_identical(
+        &graph,
+        &["query", "path", "anchor", "dep_gone", "--all-history"],
+    );
+}
+
+/// Every migrated `--graph` lane must be byte-identical cold vs indexed over a
+/// history store (the loader's cold-scan fallback for a history graph).
+#[test]
+fn differential_all_migrated_lanes_history() {
+    let (_t, graph) = seed_history_graph();
+    assert_lane_identical(&graph, &["query", "deps", "anchor"]);
+    assert_lane_identical(&graph, &["query", "context", "anchor"]);
+    assert_lane_identical(&graph, &["query", "symbol", "anchor"]);
+    assert_lane_identical(&graph, &["query", "at", "src/h.rs:3"]);
+    assert_lane_identical(&graph, &["query", "locate", "src/h.rs:3"]);
+    assert_lane_identical(&graph, &["query", "file", "src/h.rs"]);
+    assert_lane_identical(&graph, &["query", "who-imports", "serde::Serialize"]);
+}
+
+/// The index built over a history graph records the history signal, and its
+/// presence never changes any migrated lane's answer (asserted above); this
+/// pins the header-flag contract directly.
+#[test]
+fn history_graph_index_marks_temporal_history() {
+    use aletheia_egregore::graph_index::GraphIndex;
+    let (_t, graph) = seed_history_graph();
+    let index = GraphIndex::build(&graph).expect("build index over history graph");
+    assert!(
+        index.body.has_temporal_history,
+        "a scan-history graph must set has_temporal_history so the loader cold-scans"
+    );
+
+    // And a plain current-tree fixture must NOT set it (fast path stays on).
+    let (_t2, plain) = write_graph(&seed_graph());
+    let plain_index = GraphIndex::build(&plain).expect("build index over plain graph");
+    assert!(
+        !plain_index.body.has_temporal_history,
+        "a plain scan graph keeps the #447 fast path"
+    );
 }
 
 // ---------------------------------------------------------------------------
