@@ -11,7 +11,10 @@ use std::{
 use aletheia_egregore::{
     adapters::EmbeddedAletheiaSink,
     daemon::{StoreLease, runtime_dir_for_data_dir, runtime_metadata_is_stale},
-    repair::{OwnershipVerdict, RepairRefusalCode, RepairSessionResult, preflight, run_repair},
+    repair::{
+        OwnershipVerdict, RepairAction, RepairActionResult, RepairOptions, RepairRefusalCode,
+        RepairSessionResult, preflight, run_repair, run_repair_with,
+    },
 };
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -560,6 +563,460 @@ fn successful_repair_leaves_daemon_start_working() {
         .status()
         .ok();
     wait_until_stopped(&data_dir);
+}
+
+// ---------------------------------------------------------------------------
+// SPEC (issue #72 AC "healthy stopped store"): a healthy stopped store must
+// report "no repair needed" and MUST NOT create, modify, or delete any runtime
+// file — not even under --confirm. This is the AC8 regression: the prior impl
+// ran stale_metadata_cleanup for the Stopped verdict too, deleting a healthy
+// stopped store's egregored.json.
+//
+// RED: written against the existing run_repair API. With the prior impl this
+// FAILS at runtime because the confirmed path removes egregored.json for a
+// Stopped verdict.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn confirmed_repair_on_healthy_stopped_store_does_not_mutate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    // Healthy stopped store: metadata with state `stopped`, lock present but not
+    // held (no active owner).
+    write_stopped_metadata(&data_dir);
+
+    let metadata_path = runtime_dir_for_data_dir(&data_dir).join("egregored.json");
+    let before_bytes = fs::read(&metadata_path).expect("stopped metadata must exist");
+
+    let report = run_repair(&data_dir, false, true).expect("run_repair must return a report");
+
+    // The healthy stopped store must be left byte-for-byte untouched.
+    assert_eq!(
+        report.result,
+        RepairSessionResult::NoRepairNeeded,
+        "healthy stopped store must report no_repair_needed, not a mutating success"
+    );
+    assert!(
+        metadata_path.exists(),
+        "confirmed repair must NOT delete a healthy stopped store's metadata"
+    );
+    let after_bytes = fs::read(&metadata_path).expect("metadata must still exist");
+    assert_eq!(
+        before_bytes, after_bytes,
+        "confirmed repair must not modify a healthy stopped store's metadata"
+    );
+    assert!(
+        report.changed_file_paths.is_empty(),
+        "healthy stopped store repair must change zero files, got {:?}",
+        report.changed_file_paths
+    );
+    assert!(
+        report.manifest.is_empty(),
+        "healthy stopped store repair must record no manifest actions"
+    );
+    // No recovery report or manifest may be created for a healthy stopped store.
+    let runtime_dir = runtime_dir_for_data_dir(&data_dir);
+    assert!(
+        !runtime_dir.join("repair-report.json").exists(),
+        "healthy stopped store repair must not write a recovery report"
+    );
+    assert!(
+        !runtime_dir.join("repair-manifest.json").exists(),
+        "healthy stopped store repair must not write a repair manifest"
+    );
+}
+
+#[test]
+fn dry_run_on_healthy_stopped_store_reports_no_repair_needed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_stopped_metadata(&data_dir);
+
+    let metadata_path = runtime_dir_for_data_dir(&data_dir).join("egregored.json");
+    let before = fs::read(&metadata_path).unwrap();
+
+    let report = run_repair(&data_dir, true, false).expect("dry-run must return a report");
+    assert_eq!(
+        report.result,
+        RepairSessionResult::NoRepairNeeded,
+        "dry-run on a healthy stopped store must report no_repair_needed"
+    );
+    assert_eq!(
+        fs::read(&metadata_path).unwrap(),
+        before,
+        "dry-run on a healthy stopped store must not touch metadata"
+    );
+    // The healthy stopped store re-verifies clean.
+    assert_eq!(
+        report.after_ownership_verdict,
+        Some(OwnershipVerdict::Stopped)
+    );
+}
+
+#[test]
+fn preflight_stopped_store_reports_no_repair_needed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_stopped_metadata(&data_dir);
+
+    let report = preflight(&data_dir).expect("preflight ok");
+    assert_eq!(report.ownership_verdict, OwnershipVerdict::Stopped);
+    assert!(report.allow, "stopped store is allowed (not refused)");
+    assert!(
+        !report.repair_needed,
+        "a healthy stopped store needs no repair"
+    );
+}
+
+#[test]
+fn preflight_stale_store_reports_repair_needed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_stale_crashed_metadata(&data_dir);
+
+    let report = preflight(&data_dir).expect("preflight ok");
+    assert_eq!(report.ownership_verdict, OwnershipVerdict::StaleNoOwner);
+    assert!(report.allow);
+    assert!(
+        report.repair_needed,
+        "stale metadata with no owner needs repair"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SPEC (issue #72 AC "quarantining or removing"): apply mode supports moving
+// stale metadata ASIDE (recoverable) instead of deleting it, and writes a
+// redaction-safe manifest with before/after hashes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn quarantine_apply_moves_metadata_aside_and_is_recoverable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    // Stale, crashed metadata with no active owner — the one repairable case.
+    write_stale_crashed_metadata(&data_dir);
+
+    let runtime_dir = runtime_dir_for_data_dir(&data_dir);
+    let metadata_path = runtime_dir.join("egregored.json");
+    let original_bytes = fs::read(&metadata_path).unwrap();
+
+    let report = run_repair_with(
+        &data_dir,
+        &RepairOptions {
+            confirm: true,
+            quarantine: true,
+            ..RepairOptions::default()
+        },
+    )
+    .expect("quarantine repair must succeed");
+
+    assert_eq!(report.result, RepairSessionResult::Success);
+    // Original location must be cleared.
+    assert!(
+        !metadata_path.exists(),
+        "quarantine must move the metadata out of its original path"
+    );
+
+    // The manifest must record a quarantine action with a recoverable dest and
+    // content-preserving before==after hashes.
+    let entry = report
+        .manifest
+        .iter()
+        .find(|e| e.action == RepairAction::StaleMetadataQuarantine)
+        .expect("manifest must carry a quarantine entry");
+    assert_eq!(entry.result, RepairActionResult::Applied);
+    assert_eq!(
+        entry.before_metadata_hash, entry.after_metadata_hash,
+        "a quarantine move preserves content, so before/after hashes must match"
+    );
+    let dest = entry
+        .quarantine_path
+        .clone()
+        .expect("quarantine entry must carry the recoverable destination path");
+
+    // The moved bytes must be byte-for-byte recoverable at the destination.
+    assert!(dest.exists(), "quarantined file must exist at the dest");
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        original_bytes,
+        "quarantine must preserve the metadata bytes exactly (recoverable)"
+    );
+    // The store re-verifies clean.
+    assert_eq!(
+        report.after_ownership_verdict,
+        Some(OwnershipVerdict::Stopped)
+    );
+}
+
+#[test]
+fn apply_writes_repair_manifest_with_required_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_stale_crashed_metadata(&data_dir);
+
+    let report = run_repair_with(
+        &data_dir,
+        &RepairOptions {
+            confirm: true,
+            ..RepairOptions::default()
+        },
+    )
+    .expect("repair ok");
+    assert_eq!(report.result, RepairSessionResult::Success);
+
+    // The manifest file must exist on disk.
+    let manifest_path = runtime_dir_for_data_dir(&data_dir).join("repair-manifest.json");
+    assert!(
+        manifest_path.exists(),
+        "confirmed apply must write repair-manifest.json"
+    );
+
+    // Each manifest entry must carry every AC-required field.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let entries = manifest.as_array().expect("manifest is a JSON array");
+    assert!(
+        !entries.is_empty(),
+        "manifest must record at least one action"
+    );
+    let cleanup = entries
+        .iter()
+        .find(|e| e["action"] == "stale_metadata_cleanup")
+        .expect("removal manifest entry must exist");
+    for field in &["action", "action_time", "result", "original_path"] {
+        assert!(
+            cleanup.get(field).is_some(),
+            "manifest entry must carry field {field}"
+        );
+    }
+    assert_eq!(cleanup["result"], "applied");
+    // Removal records a before-hash but no after-hash (the file is gone).
+    assert!(
+        cleanup["before_metadata_hash"].is_string(),
+        "removal must record the before hash"
+    );
+    assert!(
+        cleanup.get("after_metadata_hash").is_none(),
+        "removal leaves no file, so after_metadata_hash is omitted"
+    );
+}
+
+#[test]
+fn dry_run_manifest_preview_is_planned_and_no_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_stale_crashed_metadata(&data_dir);
+
+    let report = run_repair(&data_dir, true, false).expect("dry-run ok");
+    assert_eq!(report.result, RepairSessionResult::DryRun);
+    assert!(
+        !report.manifest.is_empty(),
+        "dry-run must preview a manifest"
+    );
+    for entry in &report.manifest {
+        assert_eq!(
+            entry.result,
+            RepairActionResult::Planned,
+            "dry-run manifest rows must be planned, not applied"
+        );
+    }
+    // No manifest file may be written in dry-run.
+    assert!(
+        !runtime_dir_for_data_dir(&data_dir)
+            .join("repair-manifest.json")
+            .exists(),
+        "dry-run must not write a manifest file"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SPEC (issue #72 AC "5x determinism"): repeating the same dry-run fixture
+// returns byte-identical status, ordering, diagnostics, and manifest preview.
+// The action time is pinned so wall-clock stamps cannot break byte-identity.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dry_run_is_byte_identical_across_five_cli_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_stale_crashed_metadata(&data_dir);
+
+    let mut outputs: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..5 {
+        let out = Command::cargo_bin("egregore")
+            .unwrap()
+            .arg("repair")
+            .arg("run")
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .arg("--dry-run")
+            .arg("--transaction-time")
+            .arg("2026-01-02T03:04:05Z")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        outputs.push(out);
+    }
+    for (i, out) in outputs.iter().enumerate().skip(1) {
+        assert_eq!(
+            &outputs[0], out,
+            "dry-run stdout must be byte-identical across runs (run {i} differed)"
+        );
+    }
+    // The pinned time must actually appear (proves timestamps are deterministic).
+    let text = String::from_utf8(outputs[0].clone()).unwrap();
+    assert!(
+        text.contains("2026-01-02T03:04:05Z"),
+        "pinned transaction time must drive the deterministic output"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SPEC (issue #72 AC "text and JSON output"): --format text renders the same
+// facts human-readably; default stays JSON.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preflight_format_text_renders_verdict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_stale_crashed_metadata(&data_dir);
+
+    Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("repair")
+        .arg("preflight")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--format")
+        .arg("text")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "ownership_verdict: stale_no_owner",
+        ))
+        .stdout(predicate::str::contains("repair_needed: true"));
+}
+
+#[test]
+fn run_format_text_default_stays_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_stale_crashed_metadata(&data_dir);
+
+    // No --format: default must be JSON (parseable object).
+    let output = Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("repair")
+        .arg("run")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output).expect("default output is JSON");
+    assert_eq!(parsed["result"], "dry_run");
+
+    // --format text: human-readable, not JSON.
+    Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("repair")
+        .arg("run")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--dry-run")
+        .arg("--format")
+        .arg("text")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("repair run"))
+        .stdout(predicate::str::contains("result: dry_run"));
+}
+
+// ---------------------------------------------------------------------------
+// SPEC (issue #72 AC "before/after re-verification"): after a mutating apply the
+// detection pass is re-run and the report states the post-repair state honestly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn confirmed_repair_reverifies_store_is_clean() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_stale_crashed_metadata(&data_dir);
+
+    let report = run_repair(&data_dir, false, true).expect("repair ok");
+    assert_eq!(report.result, RepairSessionResult::Success);
+    // Re-verification: the store is now a clean Stopped store.
+    assert_eq!(
+        report.after_ownership_verdict,
+        Some(OwnershipVerdict::Stopped),
+        "after a successful repair the store must re-verify as Stopped (clean)"
+    );
+    let after = report
+        .after_inspect_summary
+        .expect("success carries an after inspect summary");
+    assert!(!after.metadata_exists, "stale metadata must be gone");
+    assert!(!after.lock_held, "no external owner remains");
+}
+
+// ---------------------------------------------------------------------------
+// SPEC (issue #72 AC "no bearer tokens"): repair output and the on-disk manifest
+// must never leak the daemon token from the runtime metadata.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn repair_output_and_manifest_never_leak_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    // This fixture writes a token of "test-token-stale".
+    write_stale_crashed_metadata(&data_dir);
+    let token = "test-token-stale";
+
+    let report = run_repair_with(
+        &data_dir,
+        &RepairOptions {
+            confirm: true,
+            ..RepairOptions::default()
+        },
+    )
+    .expect("repair ok");
+
+    let report_json = serde_json::to_string(&report).unwrap();
+    assert!(
+        !report_json.contains(token),
+        "repair report must never carry the bearer token"
+    );
+
+    let manifest_bytes =
+        fs::read(runtime_dir_for_data_dir(&data_dir).join("repair-manifest.json")).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&manifest_bytes).contains(token),
+        "repair manifest must never carry the bearer token"
+    );
+    let recovery_bytes =
+        fs::read(runtime_dir_for_data_dir(&data_dir).join("repair-report.json")).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&recovery_bytes).contains(token),
+        "recovery report must never carry the bearer token"
+    );
 }
 
 // ---------------------------------------------------------------------------

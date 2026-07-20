@@ -3002,14 +3002,21 @@ pub(crate) enum RepairCliAction {
         /// Embedded `AletheiaDB` data directory.
         #[arg(long, default_value = ".egregore")]
         data_dir: PathBuf,
+        /// Output format: `json` (default, machine-readable) or `text`.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
     },
     /// Run an offline repair session (requires `--confirm` or `--dry-run`).
     ///
-    /// Dry-run proves zero mutations while returning the same allow/refuse verdict.
-    /// Confirmed repair removes stale metadata and writes a recovery report.
+    /// Dry-run proves zero mutations while returning the same allow/refuse verdict
+    /// and a `planned` manifest preview. Confirmed repair removes (default) or
+    /// quarantines stale metadata, writes a redaction-safe manifest, and writes a
+    /// recovery report. A healthy stopped store reports `no_repair_needed` and is
+    /// never touched.
     ///
-    /// Supported actions: `stale_metadata_cleanup`, `recovery_report_generation`.
-    /// Unsupported: graph-record deletion, store rewrite, compaction, migration.
+    /// Supported actions: `stale_metadata_cleanup`, `stale_metadata_quarantine`,
+    /// `recovery_report_generation`. Unsupported: graph-record deletion, store
+    /// rewrite, compaction, migration.
     Run {
         /// Embedded `AletheiaDB` data directory.
         #[arg(long, default_value = ".egregore")]
@@ -3022,6 +3029,17 @@ pub(crate) enum RepairCliAction {
         /// Mutually exclusive with `--confirm`.
         #[arg(long, conflicts_with = "confirm")]
         dry_run: bool,
+        /// Quarantine (move aside, recoverable) stale metadata instead of
+        /// deleting it.
+        #[arg(long)]
+        quarantine: bool,
+        /// Output format: `json` (default, machine-readable) or `text`.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
+        /// Fixed RFC 3339 action time for deterministic output (useful for
+        /// tests). Defaults to the current wall-clock instant.
+        #[arg(long)]
+        transaction_time: Option<String>,
     },
 }
 
