@@ -187,6 +187,28 @@ payloads stay `protected:v1:` handles/hashes, never rehydrated). A missing,
 empty, unreadable, or record-empty `--data-dir` fails with a diagnostic naming
 the path and writes no output file. See `docs/cli/export.md`.
 
+`eg export scip --graph <f>|--data-dir <d> --out <index.scip>` emits a
+DEFINITIONS-ONLY SCIP code-intelligence index (issue #233) — the one-way interop
+bridge that lights up go-to-definition and workspace-symbol search in
+SCIP/LSIF consumers (Sourcegraph, editor indexes), but NOT find-references: graph
+edges are positionless, so the index carries zero reference occurrences (follow-ups
+#462 reference-occurrence spans, #463 column-precise ranges). Built on
+Sourcegraph's official pure-Rust `scip` crate (no `protoc`/C). Each `File` node →
+one `Document`; each span-bearing `Symbol`/`Module` node → one `SymbolInformation`
++ one `SymbolRole::Definition` `Occurrence` with a whole-line
+`[start_line-1, 0, end_line, 0]` range (no source re-read). Visibility/signature/doc
+ride `documentation`/`signature_documentation`. Monikers are GLOBAL
+(`scip-egregore cargo <repo-name> 0.0.0 <descriptors>`), grammar-valid via the
+crate's own `Symbol` formatter, with descriptors derived deterministically from
+ADR-0004 identity (module-qualified name split on `::`, kind-driven suffix, the
+source-order disambiguator feeding the SCIP method slot). Fabrication guards
+(AC#7): positionless edges, `Diagnostic` stubs, span-less nodes, and anonymous
+`impl` blocks are DROPPED and tallied in the stdout report. Strictly read-only,
+fully local (no network/upload), byte-identical across runs and independent of
+insertion order (documents sorted by path; entries by
+`(start_line, name, record_id)`). The bare `eg export` JSONL dump is unchanged.
+See `docs/cli/export-scip.md`.
+
 Query commands (local JSONL graph, no network):
 
 Corpus scope (issue #427): every query lane discloses the corpus its answer was computed over

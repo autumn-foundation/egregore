@@ -99,6 +99,7 @@ mod review_coverage;
 mod scan_coverage;
 mod scan_logs;
 mod schema_versioning;
+mod scip_export;
 mod semantic_drift;
 mod semantic_drift_calibration;
 mod semantic_relevance;

@@ -95,6 +95,8 @@ pub mod repair;
 pub mod review_coverage;
 /// Record schema-version compatibility checks.
 pub mod schema_version;
+/// SCIP code-intelligence export (issue #233).
+pub mod scip;
 /// Semantic search relevance evaluation harness (issue #58).
 pub mod semantic_eval;
 /// Transitive memory supersession and contradiction resolution (issue #92).

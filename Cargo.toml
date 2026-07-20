@@ -65,6 +65,16 @@ semver = "1.0.28"
 # Already present transitively in Cargo.lock (via proc-macro2), so this pins
 # no new crate version.
 unicode-ident = "1.0.24"
+# Sourcegraph's official SCIP protobuf bindings for the code-intelligence export
+# (issue #233). Apache-2.0, pure Rust: ships pre-generated bindings (no build.rs,
+# no protoc, no C toolchain) and pulls only the pure-Rust `protobuf` runtime.
+# Unconditional (non-optional) — the SCIP export is always available.
+scip = "0.9"
+# Pure-Rust protobuf runtime, pulled transitively by `scip` (it pins `=3.7.2`).
+# Declared directly so the exporter can call the `protobuf::Message` encode /
+# decode surface in-memory (byte-for-byte determinism + in-process round-trip
+# validation); cargo unifies this with scip's transitive pin.
+protobuf = "3.7"
 rmcp = { version = "1.7.0", features = ["macros", "server", "transport-io"], optional = true }
 schemars = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }

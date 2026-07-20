@@ -163,6 +163,46 @@ fn forget_retracted_ids(records: &[GraphRecord]) -> std::collections::BTreeSet<S
     retracted
 }
 
+/// Exports a definitions-only SCIP code-intelligence index (issue #233).
+///
+/// Reads a graph JSONL (`--graph`) or an embedded store (`--data-dir`),
+/// strictly read-only and offline, maps every span-bearing `Symbol`/`Module`
+/// node to a SCIP `SymbolInformation` + definition `Occurrence`, and writes the
+/// encoded protobuf to `out`. Positionless edges, `Diagnostic` stubs, span-less
+/// nodes, and anonymous `impl` blocks are dropped and reported (AC#7). The
+/// output is byte-identical across runs. See `docs/cli/export-scip.md`.
+pub(crate) fn export_scip(graph: Option<&Path>, data_dir: Option<&Path>, out: &Path) -> Result<()> {
+    let records = match (graph, data_dir) {
+        (Some(path), None) => load_records_from_jsonl(path)?,
+        (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+        (Some(_), Some(_)) => {
+            anyhow::bail!("provide only one of --graph or --data-dir, not both")
+        }
+        (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+    };
+
+    let project_root = crate::scip::package_name(&records);
+    let export = crate::scip::build_index(&records, &project_root, env!("CARGO_PKG_VERSION"));
+    let bytes = crate::scip::encode_index(&export.index)?;
+
+    fs::write(out, &bytes)
+        .with_context(|| format!("failed to write SCIP index to {}", out.display()))?;
+
+    let skipped = export.skipped;
+    println!(
+        "exported {} definitions across {} documents to {}; \
+         skipped {} nodes ({} no-span, {} diagnostic-stubs, {} impl-blocks)",
+        export.definition_count,
+        export.document_count,
+        out.display(),
+        skipped.no_span + skipped.diagnostic + skipped.impl_block,
+        skipped.no_span,
+        skipped.diagnostic,
+        skipped.impl_block,
+    );
+    Ok(())
+}
+
 /// Feature-off stub: embedded-store export needs the embedded adapter.
 #[cfg(not(feature = "embedded-aletheiadb"))]
 pub(crate) fn export_embedded_store(data_dir: &Path, _out: &Path) -> Result<()> {
