@@ -257,20 +257,46 @@ pub fn debt_markers<'a>(
         }
     };
 
+    // Latest-write-wins coalescing (issue #432): over an append-only `--graph`
+    // the same non-temporal `DebtMarker` id can appear as several physical writes
+    // — a re-ingest, or a re-add after a tombstone. The embedded `--data-dir`
+    // read collapses these to the latest version, so emit only the latest write
+    // per id here too; without this the lane over-counts one live marker as
+    // several rows (the mirror of the pre-fix tombstone under-count). Temporal
+    // history versions are keyed by commit and kept individually.
+    let latest_nontemporal: BTreeMap<&str, usize> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| match r {
+            GraphRecord::Node {
+                kind: NodeKind::DebtMarker,
+                id,
+                temporal: None,
+                ..
+            } => Some((id.as_str(), i)),
+            _ => None,
+        })
+        .collect();
+
     // 5. Collect, resolve enclosing symbols, and order deterministically.
     let mut markers: Vec<DebtMarkerRow<'a>> = Vec::new();
-    for record in records {
+    for (record_index, record) in records.iter().enumerate() {
         let GraphRecord::Node {
             kind: NodeKind::DebtMarker,
+            id,
             name: Some(category),
             note: Some(note),
             repo_relative_path: Some(path),
             span: Some(marker_span),
+            temporal,
             ..
         } = record
         else {
             continue;
         };
+        if temporal.is_none() && latest_nontemporal.get(id.as_str()) != Some(&record_index) {
+            continue;
+        }
         if !record_in_repo_scope(record) || !in_selected_view(record) {
             continue;
         }
@@ -403,6 +429,37 @@ mod liveness_parity_tests {
         assert!(
             inv.markers.is_empty(),
             "a tombstone with no later re-ingest still deletes the marker"
+        );
+    }
+
+    #[test]
+    fn marker_reingested_after_tombstone_emits_one_row() {
+        // Latest-write-wins coalescing (issue #432): a revived marker must emit
+        // EXACTLY ONE row, matching the coalesced `--data-dir` read — not one row
+        // per physical write.
+        let id = "codegraph:v6:marker_a";
+        let records = vec![debt_marker(id), tomb(id), debt_marker(id)];
+        let index = RepositoryIndex::build(&records);
+        let inv = debt_markers(&records, None, None, &index, None).expect("inventory");
+        assert_eq!(
+            inv.markers.len(),
+            1,
+            "a revived marker coalesces to a single row"
+        );
+    }
+
+    #[test]
+    fn duplicate_marker_versions_emit_one_row() {
+        // A double non-temporal write with NO tombstone must also coalesce to one
+        // row (the broader multi-version case, not tombstone-entangled).
+        let id = "codegraph:v6:marker_a";
+        let records = vec![debt_marker(id), debt_marker(id)];
+        let index = RepositoryIndex::build(&records);
+        let inv = debt_markers(&records, None, None, &index, None).expect("inventory");
+        assert_eq!(
+            inv.markers.len(),
+            1,
+            "duplicate non-temporal versions coalesce to one row"
         );
     }
 }

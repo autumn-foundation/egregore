@@ -254,19 +254,45 @@ pub fn unsafe_sites<'a>(
         }
     };
 
+    // Latest-write-wins coalescing (issue #432): over an append-only `--graph`
+    // the same non-temporal `UnsafeSite` id can appear as several physical writes
+    // — a re-ingest, or a re-add after a tombstone. The embedded `--data-dir`
+    // read collapses these to the latest version, so emit only the latest write
+    // per id here too; without this the lane over-counts one live site as several
+    // rows (the mirror of the pre-fix tombstone under-count). Temporal history
+    // versions are keyed by commit and kept individually.
+    let latest_nontemporal: BTreeMap<&str, usize> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| match r {
+            GraphRecord::Node {
+                kind: NodeKind::UnsafeSite,
+                id,
+                temporal: None,
+                ..
+            } => Some((id.as_str(), i)),
+            _ => None,
+        })
+        .collect();
+
     // 5. Collect, resolve enclosing symbols, and order deterministically.
     let mut sites: Vec<UnsafeSiteLead<'a>> = Vec::new();
-    for record in records {
+    for (record_index, record) in records.iter().enumerate() {
         let GraphRecord::Node {
             kind: NodeKind::UnsafeSite,
+            id,
             name: Some(site_kind),
             repo_relative_path: Some(path),
             span: Some(site_span),
+            temporal,
             ..
         } = record
         else {
             continue;
         };
+        if temporal.is_none() && latest_nontemporal.get(id.as_str()) != Some(&record_index) {
+            continue;
+        }
         if !record_in_repo_scope(record) || !in_selected_view(record) {
             continue;
         }
@@ -397,6 +423,36 @@ mod liveness_parity_tests {
         assert!(
             inv.sites.is_empty(),
             "a tombstone with no later re-ingest still deletes the site"
+        );
+    }
+
+    #[test]
+    fn site_reingested_after_tombstone_emits_one_row() {
+        // Latest-write-wins coalescing (issue #432): a revived site must emit
+        // EXACTLY ONE row, matching the coalesced `--data-dir` read.
+        let id = "codegraph:v6:site_a";
+        let records = vec![unsafe_site(id), tomb(id), unsafe_site(id)];
+        let index = RepositoryIndex::build(&records);
+        let inv = unsafe_sites(&records, None, None, &index, None).expect("inventory");
+        assert_eq!(
+            inv.sites.len(),
+            1,
+            "a revived site coalesces to a single row"
+        );
+    }
+
+    #[test]
+    fn duplicate_site_versions_emit_one_row() {
+        // A double non-temporal write with NO tombstone must also coalesce to one
+        // row (the broader multi-version case, not tombstone-entangled).
+        let id = "codegraph:v6:site_a";
+        let records = vec![unsafe_site(id), unsafe_site(id)];
+        let index = RepositoryIndex::build(&records);
+        let inv = unsafe_sites(&records, None, None, &index, None).expect("inventory");
+        assert_eq!(
+            inv.sites.len(),
+            1,
+            "duplicate non-temporal versions coalesce to one row"
         );
     }
 }

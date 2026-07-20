@@ -308,6 +308,16 @@ pub fn task_evidence_context<'a>(
         })
         .collect();
 
+    // Latest-write-wins liveness for the anchor Task (issue #432). The resolver
+    // (`resolve_task_ids`) already gates task resolution with this same shared
+    // helper, so a Task re-ingested AFTER its own tombstone resolves live there;
+    // the direct anchor-Task gate below must agree, or a handle resolves and then
+    // produces an empty/no_match context — an incoherence. Only the DIRECT
+    // anchor-Task gate is converted here; the shared BFS-relay path
+    // (`is_bfs_relay_node`) is deliberately deferred to issue #469. See
+    // `super::liveness`.
+    let liveness = super::liveness::Liveness::new(records);
+
     let present_ids: BTreeSet<&str> = records.iter().map(GraphRecord::id).collect();
 
     let by_id: std::collections::BTreeMap<&str, &GraphRecord> =
@@ -341,7 +351,7 @@ pub fn task_evidence_context<'a>(
             && id == task_id
         {
             let is_historical = temporal.is_some();
-            if is_historical || !tombstoned_ids.contains(id.as_str()) {
+            if is_historical || !liveness.deleted(id.as_str()) {
                 tasks.insert(r.id());
             }
         }
@@ -701,9 +711,71 @@ pub fn task_evidence_context<'a>(
         out
     };
 
+    // Coalesce the anchor Task to its latest live version (issue #432): over an
+    // append-only `--graph` a Task revived after its own tombstone has several
+    // physical non-temporal writes, so — mirroring the coalesced `--data-dir`
+    // read — emit only the latest non-temporal write, and only when no later
+    // tombstone supersedes it (byte-identical to the shared `resolve` gate for
+    // every non-revive case, including a purely-tombstoned or purely-live task).
+    // History-backed (temporal) versions are kept individually, exactly as
+    // before. This uses the same liveness view the resolver uses, so the two now
+    // agree instead of the resolver reviving a task the context then drops.
+    let tasks_out: Vec<&'a GraphRecord> = {
+        let mut temporal_versions: Vec<&'a GraphRecord> = Vec::new();
+        let mut latest_nontemporal: Option<(usize, &'a GraphRecord)> = None;
+        let mut last_tomb_idx: Option<usize> = None;
+        for (idx, r) in records.iter().enumerate() {
+            if let GraphRecord::Tombstone { deleted_id, .. } = r
+                && deleted_id == task_id
+            {
+                last_tomb_idx = Some(idx);
+            }
+            if !tasks.contains(r.id()) {
+                continue;
+            }
+            match r {
+                GraphRecord::Node {
+                    temporal: Some(_), ..
+                } => temporal_versions.push(r),
+                GraphRecord::Node { temporal: None, .. } => {
+                    latest_nontemporal = Some((idx, r));
+                }
+                _ => {}
+            }
+        }
+        let mut out = temporal_versions;
+        if let Some((idx, r)) = latest_nontemporal
+            && last_tomb_idx.is_none_or(|t| idx > t)
+        {
+            out.push(r);
+        }
+        out.sort_by(|a, b| {
+            a.id().cmp(b.id()).then_with(|| {
+                let a_commit = if let GraphRecord::Node {
+                    temporal: Some(t), ..
+                } = a
+                {
+                    t.git_commit.as_str()
+                } else {
+                    ""
+                };
+                let b_commit = if let GraphRecord::Node {
+                    temporal: Some(t), ..
+                } = b
+                {
+                    t.git_commit.as_str()
+                } else {
+                    ""
+                };
+                a_commit.cmp(b_commit)
+            })
+        });
+        out
+    };
+
     TaskEvidenceContext {
         task_id: task_id.to_owned(),
-        tasks: resolve(&tasks),
+        tasks: tasks_out,
         acceptance_criteria: resolve(&acceptance_criteria),
         source_facts: resolve(&source_facts),
         observations: resolve(&observations),
@@ -879,5 +951,50 @@ mod liveness_tests {
         ];
         let resolved = resolve_task_ids(&records, URL).expect("resolves");
         assert!(!resolved.contains(task_id));
+    }
+
+    #[test]
+    fn revived_task_resolves_and_context_agrees() {
+        // Resolver/context coherence (issue #432): a Task re-created AFTER its
+        // own tombstone resolves live, so `task_evidence_context` must return a
+        // populated (non-`no_match`) bundle for that same id — not the empty
+        // bundle the pre-fix raw-`tombstoned_ids` gate produced.
+        let link_id = "project:v1:link-te";
+        let task_id = "project:v1:task-te";
+        let records = vec![
+            ext_link(link_id, URL),
+            task_with_link(task_id, link_id),
+            project_tombstone(task_id),
+            task_with_link(task_id, link_id),
+        ];
+        let resolved = resolve_task_ids(&records, URL).expect("resolves");
+        assert!(resolved.contains(task_id), "resolver revives the task");
+
+        let ctx = task_evidence_context(&records, task_id);
+        assert!(
+            !ctx.is_no_match(),
+            "a resolved (revived) task must have a populated context"
+        );
+        // Coalesced to exactly one live version, matching the `--data-dir` read.
+        assert_eq!(ctx.tasks.len(), 1, "revived task collapses to one row");
+        assert_eq!(ctx.tasks[0].id(), task_id);
+    }
+
+    #[test]
+    fn tombstoned_task_without_reingest_has_no_context() {
+        // A tombstone with no later re-add still deletes the task: the context is
+        // `no_match`, matching the resolver dropping it.
+        let link_id = "project:v1:link-te";
+        let task_id = "project:v1:task-te";
+        let records = vec![
+            ext_link(link_id, URL),
+            task_with_link(task_id, link_id),
+            project_tombstone(task_id),
+        ];
+        let ctx = task_evidence_context(&records, task_id);
+        assert!(
+            ctx.is_no_match(),
+            "a tombstone with no re-add yields an empty context"
+        );
     }
 }
