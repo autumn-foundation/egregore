@@ -222,15 +222,44 @@ pub fn unsafe_sites<'a>(
     }
 
     // 4. Symbol spans per path, for enclosing-symbol resolution.
+    //
+    // Coalesce non-temporal Symbol versions to the latest write per id (issue
+    // #432): over an append-only `--graph` a symbol revived AFTER its own
+    // tombstone leaves several physical writes whose spans can differ, and the
+    // embedded `--data-dir` read exposes only the latest. Without coalescing, a
+    // STALE pre-tombstone span could be accepted as the enclosing symbol (the
+    // `same_file_version` current-view check reads only liveness, not version
+    // recency), diverging from `--data-dir`. History-backed (temporal) versions
+    // are kept individually — `same_file_version` already keys them by commit.
+    let latest_symbol: BTreeMap<&str, usize> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| match r {
+            GraphRecord::Node {
+                kind: NodeKind::Symbol,
+                id,
+                temporal: None,
+                span: Some(_),
+                repo_relative_path: Some(_),
+                ..
+            } => Some((id.as_str(), i)),
+            _ => None,
+        })
+        .collect();
     let mut symbols_by_path: BTreeMap<&str, Vec<&GraphRecord>> = BTreeMap::new();
-    for record in records {
+    for (i, record) in records.iter().enumerate() {
         if let GraphRecord::Node {
             kind: NodeKind::Symbol,
+            id,
             repo_relative_path: Some(path),
             span: Some(_),
+            temporal,
             ..
         } = record
         {
+            if temporal.is_none() && latest_symbol.get(id.as_str()) != Some(&i) {
+                continue;
+            }
             symbols_by_path
                 .entry(path.as_str())
                 .or_default()
@@ -453,6 +482,58 @@ mod liveness_parity_tests {
             inv.sites.len(),
             1,
             "duplicate non-temporal versions coalesce to one row"
+        );
+    }
+
+    fn symbol_with_span(id: &str, start: usize, end: usize) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: start,
+                end_byte: end,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some("outer".to_owned()),
+            "symbol outer".to_owned(),
+        )
+    }
+
+    #[test]
+    fn revived_symbol_with_changed_span_is_not_stale_enclosing() {
+        // FINDING 2 (issue #432, round 2): a revived Symbol with a DIFFERENT span
+        // must not leave its STALE pre-tombstone span as an enclosing-symbol
+        // candidate. The enclosing-symbol index must coalesce to the latest write
+        // per id so `--graph` and `--data-dir` agree.
+        let sym_id = "codegraph:v6:sym_a";
+        // Site sits at bytes [10, 20].
+        let site = GraphRecord::node(
+            "codegraph:v6:site_a".to_owned(),
+            NodeKind::UnsafeSite,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 10,
+                end_byte: 20,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some("block".to_owned()),
+            "unsafe block".to_owned(),
+        );
+        let records = vec![
+            symbol_with_span(sym_id, 0, 100), // stale span encloses
+            tomb(sym_id),
+            symbol_with_span(sym_id, 0, 5), // revived span does NOT enclose
+            site,
+        ];
+        let index = RepositoryIndex::build(&records);
+        let inv = unsafe_sites(&records, None, None, &index, None).expect("inventory");
+        assert_eq!(inv.sites.len(), 1, "one live site row");
+        assert!(
+            inv.sites[0].enclosing_symbol.is_none(),
+            "the stale pre-tombstone span must not be reported as the enclosing symbol"
         );
     }
 }
