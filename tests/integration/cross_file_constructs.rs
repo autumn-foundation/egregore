@@ -277,6 +277,56 @@ fn enum_struct_variant_constructs_the_enum() {
     assert_eq!(edge["is_exhaustive"], true);
 }
 
+// ── (h) aux-helper `crate::` construction resolves to the entry crate ─────────
+
+#[test]
+fn crate_qualified_construction_in_test_helper_resolves_to_entry_crate() {
+    // A struct `Deal` defined in the integration-test ENTRY file `tests/it.rs`
+    // (crate root `test:it`) is constructed via a `crate::Deal { … }` literal in
+    // the helper module `tests/common/mod.rs` that `tests/it.rs` pulls in with
+    // `mod common;`. Rust resolves `crate::` in the helper against the including
+    // ENTRY crate, but path-based [`crate_root_id`] stamps the helper its OWN
+    // synthetic root `test:common`, so without the aux-helper crate-root remap
+    // (which `cross_file_implements_records` already applies) the `crate::Deal`
+    // literal is confined to `test:common`, misses `Deal` under `test:it`, and
+    // its CONSTRUCTS edge / E0063 lead disappears. This mirrors the IMPLEMENTS
+    // aux-helper fixture (`impl crate::T for Foo` in a helper) faithfully.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    write_fixture(
+        repo,
+        &[
+            (
+                "tests/it.rs",
+                concat!(
+                    "mod common;\n\n",
+                    "pub struct Deal {\n    pub id: u64,\n}\n\n",
+                    "#[test]\nfn t() {\n    let _ = common::make();\n}\n",
+                ),
+            ),
+            (
+                "tests/common/mod.rs",
+                "pub fn make() -> crate::Deal {\n    crate::Deal { id: 1 }\n}\n",
+            ),
+        ],
+    );
+
+    let records = scan_fixture(repo);
+    let deal = symbol_id(&records, "struct", "Deal", "tests/it.rs");
+    let make = symbol_id(&records, "function", "make", "tests/common/mod.rs");
+
+    let edge = constructs_edge(&records, &make, &deal).unwrap_or_else(|| {
+        panic!(
+            "missing CONSTRUCTS edge from helper `crate::Deal` literal {make} -> entry-crate {deal}"
+        )
+    });
+    assert_eq!(
+        edge["is_exhaustive"], true,
+        "an exhaustive (no ..base) literal must be E0063-breakable: {edge}"
+    );
+    assert_eq!(edge["confidence"], "1.0");
+}
+
 // ── (g) byte-determinism ──────────────────────────────────────────────────────
 
 #[test]

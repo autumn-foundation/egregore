@@ -1048,6 +1048,25 @@ pub fn cross_file_construct_records(
     _repository_id: &str,
     facts_by_file: &BTreeMap<String, FileFacts>,
 ) -> Vec<GraphRecord> {
+    // Reassign auxiliary-target helper modules (`tests/common/mod.rs`) to the
+    // entry crate that `mod`-includes them, exactly as
+    // [`cross_file_implements_records`] does (issue #394; Codex round on
+    // PR #467). A `crate::Type { … }` literal in such a helper resolves against
+    // the including ENTRY crate in Rust, but path-based [`crate_root_id`] stamps
+    // the helper its OWN synthetic root (`test:common`), which would confine the
+    // literal to the wrong partition and drop its CONSTRUCTS edge. The remap
+    // rewrites both the index side (a helper's own `ImplTargetFact`s, via
+    // [`apply_crate_root_remap`]) and the caller side (the construct site's
+    // `caller_crate_root`, looked up below). When nothing needs remapping the
+    // borrowed facts are used directly, keeping output byte-identical.
+    let remap = reassign_aux_helper_crate_roots(facts_by_file);
+    let remapped;
+    let facts_by_file: &BTreeMap<String, FileFacts> = if remap.is_empty() {
+        facts_by_file
+    } else {
+        remapped = apply_crate_root_remap(facts_by_file, &remap);
+        &remapped
+    };
     let index = ImplTargetIndex::build(facts_by_file);
     let crate_name_roots = build_crate_name_roots(facts_by_file);
 
@@ -1055,7 +1074,10 @@ pub fn cross_file_construct_records(
     // collapsing repeated construction sites between the same pair.
     let mut edges: BTreeMap<(String, String), (String, bool)> = BTreeMap::new();
     for (path, facts) in facts_by_file {
-        let caller_crate_root = crate_root_id(path);
+        let caller_crate_root = remap
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| crate_root_id(path));
         for site in &facts.construct_sites {
             let Some(target) = index.resolve_construct(
                 &site.type_segments,
