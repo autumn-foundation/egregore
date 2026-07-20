@@ -347,7 +347,7 @@ fn is_eviction_tombstone(record: &GraphRecord) -> bool {
 const fn is_evidence_edge(label: EdgeLabel) -> bool {
     use EdgeLabel::{
         Aggregates, AuthoredBy, Calls, CapturedFrom, ChangedIn, ClosesAcceptanceCriterion,
-        Contains, Contradicts, DecidedOn, Defines, DriftsFrom, DriftsPrior, EmittedDuring,
+        Constructs, Contains, Contradicts, DecidedOn, Defines, DriftsFrom, DriftsPrior, EmittedDuring,
         ExplainsChange, ExternalHandle, FailedOn, FingerprintedAs, FrameResolvesTo, HasEvidence,
         Implements, Imports, MaterializedAs, MeasuredBy, Mentions, MentionsSymbol, MergedAs,
         Observes, OwnedByTask, ParentOf, ProducedEvidence, ProducedPatch, PromptedFor, ProposedBy,
@@ -393,7 +393,9 @@ const fn is_evidence_edge(label: EdgeLabel) -> bool {
         // EXCLUDED — code-graph topology (RepositoryIndex containment already
         // attributes these) and intra-agent-memory / semantic scaffolding.
         Contains | Defines | Imports | References | Calls | Implements | Mentions | ChangedIn
-        | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy | SessionOf | AuthoredBy => false,
+        | Constructs | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy | SessionOf | AuthoredBy => {
+            false
+        }
     }
 }
 
