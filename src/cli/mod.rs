@@ -76,6 +76,8 @@ mod who;
 mod path;
 // Appended (issue #444); kept at the end to minimize cross-lane merge conflicts.
 mod who_imports;
+// Appended (issue #248); kept at the end to minimize cross-lane merge conflicts.
+mod forget_repo;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
@@ -149,6 +151,9 @@ pub(crate) use watch::*;
 pub(crate) use path::*;
 // Appended (issue #444); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use who_imports::*;
+// Appended (issue #248); kept at the end to minimize cross-lane merge conflicts.
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) use forget_repo::*;
 
 use std::{
     collections::BTreeMap,
@@ -900,6 +905,37 @@ pub(crate) enum Commands {
         /// tests). Defaults to the current wall-clock instant.
         #[arg(long)]
         transaction_time: Option<String>,
+    },
+    /// Logically evict EVERY record of ONE repository from a shared multi-repo
+    /// embedded store, across every domain (issue #248).
+    ///
+    /// Dry-run is the DEFAULT: without `--confirm` the command is strictly
+    /// read-only, takes no write lease, and prints the eviction plan. `--confirm`
+    /// writes one eviction event plus one tombstone per attributed record.
+    /// Selector-resolution failures exit 2 (unknown / ambiguous); malformed
+    /// fields exit 1. See `docs/cli/forget-repo.md`.
+    #[cfg(feature = "embedded-aletheiadb")]
+    ForgetRepo {
+        /// Repository selector (record ID, `owner/name`, basename, remote URL,
+        /// root commit SHA, or canonical path).
+        selector: String,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
+        /// Operator eviction reason recorded on the auditable eviction event.
+        #[arg(long)]
+        reason: String,
+        /// Operator handle recorded as the eviction actor.
+        #[arg(long, default_value = "operator")]
+        evicted_by: String,
+        /// Fixed RFC 3339 transaction time for deterministic output (useful for
+        /// tests). Defaults to the current wall-clock instant.
+        #[arg(long)]
+        transaction_time: Option<String>,
+        /// Perform the eviction. Without this flag the command is a read-only
+        /// dry-run that mutates nothing.
+        #[arg(long)]
+        confirm: bool,
     },
     /// Offline repair workflow for Egregore stores.
     ///
@@ -3987,6 +4023,22 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             retracted_by,
             transaction_time,
         } => forget_cmd(&handle, &data_dir, reason, retracted_by, transaction_time),
+        #[cfg(feature = "embedded-aletheiadb")]
+        Commands::ForgetRepo {
+            selector,
+            data_dir,
+            reason,
+            evicted_by,
+            transaction_time,
+            confirm,
+        } => forget_repo_cmd(
+            &selector,
+            &data_dir,
+            reason,
+            evicted_by,
+            transaction_time,
+            confirm,
+        ),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Repair { action } => repair_cmd(action),
         #[cfg(feature = "embedded-aletheiadb")]

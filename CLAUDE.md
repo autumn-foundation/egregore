@@ -888,6 +888,46 @@ transaction-time views predating the retraction still see the record (bi-tempora
 and re-running on an already-retracted handle is a no-op success returning the original
 event. With a pinned `--transaction-time` the envelope is deterministic and byte-identical
 across runs. See `docs/cli/forget.md`.
+
+Whole-repository logical eviction (issue #248):
+
+```powershell
+# Dry-run (DEFAULT): read-only plan, mutates nothing, takes no write lease
+cargo run -- forget-repo acme/widget --data-dir .egregore --reason "offboarded customer"   # action: dry_run
+# Perform the eviction (one event + one tombstone per attributed record)
+cargo run -- forget-repo acme/widget --data-dir .egregore --reason "offboarded" --confirm   # action: evicted
+cargo run -- forget-repo acme/widget --data-dir .egregore --reason "x" --confirm            # action: already_evicted (idempotent)
+cargo run -- forget-repo no-such-repo --data-dir .egregore --reason "x"                      # exit 2 (unknown_repository_selector)
+```
+
+`eg forget-repo <selector>` logically evicts EVERY record of ONE repository from a shared
+multi-repo embedded store across all domains, leaving co-resident repositories byte-identical
+— the SANCTIONED BULK EXCEPTION to #231 (the unit is the whole repository, not one fact).
+Dry-run is the default (strictly read-only, no write lease, reads a throwaway snapshot copy);
+`--confirm` opens the leased store (inherits `store_contended`) and writes exactly ONE eviction
+event (a reused `NodeKind::Retraction`, agent-memory domain, NO schema bump, prior handle = the
+repository id, deterministic id in a namespace distinct from #231) plus one domain-scoped
+tombstone per attributed record. Attribution SEEDS from `RepositoryIndex` (code containment,
+`SemanticDrift`, log `repository_id` #362) then EXTENDS by an undirected walk over the
+cross-domain evidence subgraph (exhaustive `EdgeLabel` match, no wildcard — the #247 completeness
+invariant): a record reached from exactly one repo is attributed; reached from ≥2 is SHARED and
+NEVER evicted (`shared_cross_repo`); with no derivable attribution it is REPORTED under
+`unattributable` and NEVER evicted (legacy `log:v2:` empty `repository_id`, orphan artifact); a
+SURVIVING record citing an evicted handle is KEPT with its dangling link reported under
+`cross_repo_citations`. The repository IDENTITY node is ALSO tombstoned (catalog-clean eviction),
+so an evicted repo drops off the catalog: a scoped `eg query symbol <name> --repo <evicted>` now
+exits 1 (`unknown_repository_selector`, the selector is genuinely gone), not an in-repo no-match —
+prove zero leakage via an unscoped lane. Idempotency keys on the surviving eviction EVENT (resolves
+against the history view with eviction tombstones stripped), so a second `--confirm` is
+`already_evicted` despite the tombstoned identity. Eviction is logical and bi-temporally honest
+(bytes stay for `--at` history); selector resolution reuses `resolve_selector` (unknown/ambiguous →
+exit 2, candidates listed). Deterministic and byte-identical under a pinned `--transaction-time`.
+Residual: on a `scan-history` store, commit-anchored temporal code snapshots are re-emitted by the
+current-state read regardless of tombstones (the same wall #231's `--at` honesty relies on), so
+they are a DOCUMENTED residual gap disclosed in the report's `temporal_snapshots_retained` section
+(present in dry-run and `--confirm`), not silently suppressed; follow-up #472 tracks the full fix.
+See `docs/cli/forget-repo.md`.
+
 `eg query undocumented` lists externally-reachable public symbols whose captured doc-comment
 fact (issue #124) is absent, by joining the issue #213 public surface with the recorded doc
 facts — never a `pub` grep and never a rustdoc build. Any doc form (`///`, `/** */`,

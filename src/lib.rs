@@ -91,6 +91,8 @@ pub mod redaction_report;
 /// Offline repair workflow for Egregore stores (issue #49).
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod repair;
+/// Whole-repository logical eviction (issue #248).
+pub mod repo_evict;
 /// Standing citable review-coverage gate over merged PRs (issue #339).
 pub mod review_coverage;
 /// Record schema-version compatibility checks.
