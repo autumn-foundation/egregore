@@ -54,7 +54,7 @@ a throwaway snapshot copy and never takes the lease.
 
 | Code | Condition |
 |------|-----------|
-| 0 | Dry-run plan; successful eviction; idempotent no-op (`already_evicted`). |
+| 0 | Dry-run plan; successful eviction; idempotent no-op (`already_evicted`); repair of a partial prior eviction (`repaired`). |
 | 1 | Malformed request field: empty `--reason` (`missing_reason`), empty `--evicted-by` (`missing_evicted_by`), invalid `--transaction-time` (`invalid_transaction_time`). |
 | 2 | `unknown_repository_selector` (no repository matches) / `ambiguous_repository_selector` (more than one matches; candidates listed). |
 
@@ -87,8 +87,12 @@ is empty on a non-temporal (`eg scan`) store.
 
 `--confirm` sets `"action":"evicted"` and adds
 `"eviction":{"event_id":"agent_memory:v1:...","tombstone_count":N}`. A re-run
-sets `"action":"already_evicted"`. Every list is sorted and the whole envelope is
-byte-identical across runs under a pinned `--transaction-time`.
+sets `"action":"already_evicted"` when the prior eviction still suppresses the
+repository, or `"action":"repaired"` when it re-issues tombstones for records that
+are live again (see [Verify-and-repair](#verify-and-repair-mirrors-231-eg-forget));
+a dry-run over that same repair-pending state reports `"action":"repair_needed"`.
+Every list is sorted and the whole envelope is byte-identical across runs under a
+pinned `--transaction-time`.
 
 ## Cross-domain attribution
 
@@ -128,6 +132,22 @@ current-state read.
 eviction tombstones stripped and keys the no-op on the surviving eviction EVENT,
 so a second `--confirm` reports `already_evicted` (never a second event or
 tombstone) even though the identity node is tombstoned.
+
+### Verify-and-repair (mirrors #231 `eg forget`)
+
+The no-op is only reported once the re-run VERIFIES the prior eviction still
+suppresses the repository. On finding the eviction event, `forget-repo`
+recomputes attribution over the current-state view: if every tombstone-
+suppressible attributed record is still suppressed it is a true no-op
+(`already_evicted`, nothing written); but if any such record is **live again** —
+a crash between the event write and the tombstone writes, or records revived by a
+later re-scan/re-ingest — the re-run **repairs** by re-issuing tombstones for the
+currently-live records **without writing a second eviction event** (the original
+is preserved verbatim). `--confirm` reports `action: repaired`; a dry-run over the
+same state reports `action: repair_needed`. A commit-anchored temporal
+(`scan-history`) code snapshot — the documented residual a base-ID tombstone can
+never suppress — is excluded from the repair trigger, so a re-run over a
+`scan-history` store settles to `already_evicted` instead of looping.
 
 ## The eviction event
 

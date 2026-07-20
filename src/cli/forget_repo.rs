@@ -45,6 +45,11 @@ pub(crate) fn forget_repo_cmd(
         };
         let action = if plan.already_evicted {
             "already_evicted"
+        } else if plan.repair {
+            // A prior eviction event exists but attributed records are live
+            // again; a `--confirm` would re-issue tombstones without a second
+            // event. Disclose it honestly rather than a false `already_evicted`.
+            "repair_needed"
         } else {
             "dry_run"
         };
@@ -91,7 +96,10 @@ pub(crate) fn forget_repo_cmd(
         }
         sink.persist_indexes()
             .with_context(|| format!("failed to persist embedded store {}", data_dir.display()))?;
-        "evicted"
+        // A repair re-issues tombstones for records that a prior eviction event
+        // named but that are live again; no second event is written. Report it
+        // distinctly from a fresh eviction.
+        if plan.repair { "repaired" } else { "evicted" }
     };
 
     println!("{}", serde_json::to_string(&plan.to_envelope(action))?);

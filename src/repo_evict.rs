@@ -241,8 +241,18 @@ pub struct EvictionPlan {
     pub repository_id: String,
     /// Human-usable display handle for the repository.
     pub repository_display: Option<String>,
-    /// True when the repository was already evicted (idempotent no-op).
+    /// True when the repository was already evicted (idempotent no-op): a prior
+    /// eviction event exists AND every tombstone-suppressible attributed record
+    /// is still actively suppressed, so nothing is written.
     pub already_evicted: bool,
+    /// True when this plan REPAIRS a prior partial eviction: an eviction event
+    /// already exists, but attributed records are currently live again (a crash
+    /// between the event write and the tombstone writes, or records revived by a
+    /// later re-scan/re-ingest). The repair re-issues tombstones for the
+    /// currently-live records WITHOUT writing a second eviction event; the
+    /// original event is preserved verbatim. Mutually exclusive with
+    /// `already_evicted`.
+    pub repair: bool,
     /// Records to tombstone (nodes + edges), sorted by record ID.
     pub evicted: Vec<EvictedRecord>,
     /// Per-domain evicted-record counts (all seven domains present).
@@ -437,13 +447,12 @@ fn empty_by_domain() -> BTreeMap<String, usize> {
     by_domain
 }
 
-/// Builds the idempotent no-op plan from an existing eviction event node.
-fn already_evicted_plan(
-    repository_id: String,
-    repository_display: Option<String>,
-    event_node: &GraphRecord,
-) -> EvictionPlan {
-    let (evicted_by, reason, transaction_time) = match event_node {
+/// Extracts the recorded (`evicted_by`, `reason`, `transaction_time`) triple from
+/// a stored eviction event node, defaulting each missing field to empty. Shared by
+/// the idempotent no-op and the repair path so a re-run always re-uses the
+/// original event's actor / reason / transaction time verbatim.
+fn event_meta(event_node: &GraphRecord) -> (String, String, String) {
+    match event_node {
         GraphRecord::Node {
             text,
             agent_id,
@@ -455,7 +464,16 @@ fn already_evicted_plan(
             transaction_time.clone().unwrap_or_default(),
         ),
         _ => (String::new(), String::new(), String::new()),
-    };
+    }
+}
+
+/// Builds the idempotent no-op plan from an existing eviction event node.
+fn already_evicted_plan(
+    repository_id: String,
+    repository_display: Option<String>,
+    event_node: &GraphRecord,
+) -> EvictionPlan {
+    let (evicted_by, reason, transaction_time) = event_meta(event_node);
     let event = RepoEvictionEvent {
         event_id: eviction_event_id(&repository_id),
         repository_id: repository_id.clone(),
@@ -468,6 +486,7 @@ fn already_evicted_plan(
         repository_id,
         repository_display,
         already_evicted: true,
+        repair: false,
         evicted: Vec::new(),
         by_domain: empty_by_domain(),
         unattributable: Vec::new(),
@@ -590,8 +609,14 @@ pub fn plan_eviction(
     let repository_id = index.resolve_selector(req.selector.trim())?.to_owned();
     let repository_display = index.display_of(&repository_id).map(str::to_owned);
 
-    // Idempotency: once an eviction event names this repository, re-running never
-    // writes a second event or duplicate tombstones.
+    // Idempotency + repair: once an eviction event names this repository, a
+    // re-run never writes a SECOND event. But the no-op is only safe when the
+    // prior eviction still actively suppresses every tombstone-suppressible
+    // attributed record. A crash between the event write and the tombstone
+    // writes, or records revived by a later re-scan/re-ingest, can leave the
+    // event present while the repository's records are live again — so detect
+    // the event here, then decide no-op vs. REPAIR after recomputing attribution
+    // over the current-state view (mirrors #231 `eg forget`'s repair path).
     let existing_event = records.iter().find(|record| {
         matches!(
             record,
@@ -599,13 +624,6 @@ pub fn plan_eviction(
                 if h == &repository_id && id == &eviction_event_id(&repository_id)
         )
     });
-    if let Some(event_node) = existing_event {
-        return Ok(already_evicted_plan(
-            repository_id,
-            repository_display,
-            event_node,
-        ));
-    }
 
     // Deduplicate the (possibly superseded-inclusive) view by record ID.
     let mut node_records: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
@@ -765,6 +783,63 @@ pub fn plan_eviction(
         *by_domain.entry(record.domain.clone()).or_insert(0) += 1;
     }
 
+    // A temporal (scan-history) code snapshot cannot be suppressed by a base-ID
+    // tombstone (the shared read path re-emits it regardless), so it is a
+    // DOCUMENTED RESIDUAL, never a repair trigger — otherwise a re-run over a
+    // temporal store would loop, re-issuing ineffective tombstones forever.
+    // Repair triggers only on a currently-live record a tombstone CAN suppress.
+    let temporal_ids: BTreeSet<&str> = temporal_snapshots_retained
+        .iter()
+        .map(|record| record.record_id.as_str())
+        .collect();
+    let has_suppressible_live = evicted
+        .iter()
+        .any(|record| !temporal_ids.contains(record.record_id.as_str()));
+
+    if let Some(event_node) = existing_event {
+        if !has_suppressible_live {
+            // True idempotent no-op: the prior eviction still fully suppresses
+            // every tombstone-suppressible attributed record. Nothing is written.
+            return Ok(already_evicted_plan(
+                repository_id,
+                repository_display,
+                event_node,
+            ));
+        }
+        // REPAIR: the event exists but attributed records are live again. Re-issue
+        // tombstones for the currently-live records WITHOUT writing a second
+        // eviction event; the original event's actor / reason / transaction time
+        // are preserved verbatim.
+        let (evicted_by, reason, transaction_time) = event_meta(event_node);
+        let mut tombstone_ids: Vec<String> = evicted
+            .iter()
+            .map(|record| eviction_tombstone_id(&record.record_id).0)
+            .collect();
+        tombstone_ids.sort();
+        let event = RepoEvictionEvent {
+            event_id: eviction_event_id(&repository_id),
+            repository_id: repository_id.clone(),
+            evicted_by,
+            reason,
+            transaction_time,
+            tombstone_ids,
+        };
+        return Ok(EvictionPlan {
+            repository_id,
+            repository_display,
+            already_evicted: false,
+            repair: true,
+            evicted,
+            by_domain,
+            unattributable,
+            shared_cross_repo: shared,
+            temporal_snapshots_retained,
+            cross_repo_citations,
+            event,
+        });
+    }
+
+    // Fresh eviction: no prior event names this repository.
     let transaction_time = req
         .transaction_time
         .clone()
@@ -788,6 +863,7 @@ pub fn plan_eviction(
         repository_id,
         repository_display,
         already_evicted: false,
+        repair: false,
         evicted,
         by_domain,
         unattributable,
@@ -803,14 +879,18 @@ pub fn plan_eviction(
 ///
 /// The event is written first so the tombstones are the latest writes for their
 /// targets and stay active (matching #231's ordering discipline). Returns an
-/// empty vector for an already-evicted plan (idempotent no-op).
+/// empty vector for an already-evicted plan (idempotent no-op). On a REPAIR plan
+/// (`repair`) the event node is OMITTED — the original event survives and no
+/// second event is written — and only the re-issued tombstones are returned.
 #[must_use]
 pub fn eviction_records(plan: &EvictionPlan) -> Vec<GraphRecord> {
     if plan.already_evicted {
         return Vec::new();
     }
     let mut out: Vec<GraphRecord> = Vec::with_capacity(plan.evicted.len() + 1);
-    out.push(build_event_node(&plan.event));
+    if !plan.repair {
+        out.push(build_event_node(&plan.event));
+    }
     for record in &plan.evicted {
         let (tombstone_id, version) = eviction_tombstone_id(&record.record_id);
         out.push(GraphRecord::Tombstone {

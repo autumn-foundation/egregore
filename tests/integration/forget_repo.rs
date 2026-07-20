@@ -654,6 +654,133 @@ mod embedded {
         assert_eq!(event_count, 1, "no duplicate eviction event on re-run");
     }
 
+    // ── AC-REPAIR: a partial prior eviction is verified-and-repaired ──────────
+
+    /// Builds a bare eviction EVENT node for `repo_id` (no tombstones) — the
+    /// on-disk shape left by a crash between the event write and the tombstone
+    /// writes, matching `repo_evict::build_event_node`'s recorded fields.
+    fn eviction_event_node(repo_id: &str) -> GraphRecord {
+        let mut node = GraphRecord::node(
+            aletheia_egregore::repo_evict::eviction_event_id(repo_id),
+            NodeKind::Retraction,
+            None,
+            None,
+            None,
+            format!("Repository eviction of {repo_id}"),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
+        if let GraphRecord::Node {
+            source_handle,
+            agent_id,
+            text,
+            transaction_time,
+            valid_time,
+            valid_time_source,
+            ..
+        } = &mut node
+        {
+            *source_handle = Some(repo_id.to_owned());
+            *agent_id = Some("op-1".to_owned());
+            *text = Some("offboarded customer repository".to_owned());
+            *transaction_time = Some(TX.to_owned());
+            *valid_time = Some(TX.to_owned());
+            *valid_time_source = Some("inferred_from_transaction_time".to_owned());
+        }
+        node
+    }
+
+    /// Codex #248 P1: on finding an existing eviction event, `forget-repo` must
+    /// VERIFY the attributed records are still suppressed and REPAIR (re-issue
+    /// tombstones for any that are currently live) instead of unconditionally
+    /// reporting `already_evicted` and writing nothing. RED trigger: a store
+    /// where the eviction EVENT for repo A landed but the tombstones did not (a
+    /// partial write), so repo A's records are fully live. A re-run `--confirm`
+    /// must suppress them again WITHOUT writing a second event.
+    #[test]
+    fn partial_eviction_is_verified_and_repaired_without_second_event() {
+        let (temp, jsonl, a, b) = two_repo_cross_domain_store();
+
+        // Simulate the partial write: append only the eviction event for repo A.
+        let mut graph = Graph::new();
+        graph.push(eviction_event_node(&a.repo_id));
+        let mut store_text = fs::read_to_string(&jsonl).expect("read fixture");
+        store_text.push_str(&graph.to_jsonl().expect("serialize"));
+        fs::write(&jsonl, store_text).expect("append partial eviction event");
+        let store = ingest_store(temp.path(), &jsonl);
+
+        // Pre-condition: repo A is live and the event is present.
+        let before = current_records(&store);
+        assert!(
+            before.iter().any(|r| r.id() == a.symbol_id),
+            "repo A must be live before the repair run"
+        );
+        assert!(
+            before.iter().any(|r| matches!(
+                r,
+                GraphRecord::Node { kind: NodeKind::Retraction, source_handle: Some(h), .. }
+                    if h == &a.repo_id
+            )),
+            "the prior eviction event must be present before the repair run"
+        );
+
+        // Re-run `--confirm`: must REPAIR (re-issue tombstones), not falsely no-op.
+        let (code, stdout, stderr) = forget_repo(&store, "acme/widget-a", true);
+        assert_eq!(code, 0, "repair confirm succeeds: {stderr}");
+        let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON");
+        assert_eq!(
+            envelope["action"], "repaired",
+            "a partial prior eviction is repaired, not no-oped: {envelope}"
+        );
+
+        // Repo A's records are now suppressed from the current-state read.
+        let after = current_records(&store);
+        for id in [
+            &a.repo_id,
+            &a.symbol_id,
+            &a.file_id,
+            &a.drift_id,
+            &a.observation_id,
+            &a.task_id,
+            &a.artifact_id,
+            &a.verification_id,
+        ] {
+            assert!(
+                after.iter().all(|r| r.id() != *id),
+                "repo A record {id} must be suppressed after the repair"
+            );
+        }
+        // Repo B is untouched.
+        assert!(
+            after.iter().any(|r| r.id() == b.symbol_id),
+            "repo B must survive the repair of repo A"
+        );
+
+        // NO second eviction event was written — the original is preserved.
+        let events = after
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Node { kind: NodeKind::Retraction, source_handle: Some(h), .. }
+                        if h == &a.repo_id
+                )
+            })
+            .count();
+        assert_eq!(
+            events, 1,
+            "repair must not write a second eviction event; the original is preserved"
+        );
+
+        // A subsequent `--confirm` is now a true idempotent no-op.
+        let (code, stdout, _) = forget_repo(&store, "acme/widget-a", true);
+        assert_eq!(code, 0);
+        let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON");
+        assert_eq!(
+            envelope["action"], "already_evicted",
+            "after repair, the repository is fully evicted and a re-run no-ops"
+        );
+    }
+
     // ── AC-SEL: unknown / ambiguous selector taxonomy ─────────────────────────
 
     #[test]
