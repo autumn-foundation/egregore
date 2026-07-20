@@ -1,0 +1,3 @@
+{"type":"suite","event":"started","test_count":1}
+this is not valid json at all
+{"type":"test","name":"mini_crate::test_alpha","event":"ok"}

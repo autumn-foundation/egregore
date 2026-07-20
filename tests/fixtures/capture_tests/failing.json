@@ -1,0 +1,6 @@
+{"type":"suite","event":"started","test_count":2}
+{"type":"test","event":"started","name":"mini_crate::test_alpha"}
+{"type":"test","name":"mini_crate::test_alpha","event":"ok"}
+{"type":"test","event":"started","name":"mini_crate::test_beta"}
+{"type":"test","name":"mini_crate::test_beta","event":"failed","stdout":"assertion `left == right` failed\n  left: 1\n right: 2\nsecret_token=SHOULD_NOT_APPEAR_IN_GRAPH"}
+{"type":"suite","event":"failed","passed":1,"failed":1,"ignored":0,"measured":0,"filtered_out":0,"exec_time":0.02}

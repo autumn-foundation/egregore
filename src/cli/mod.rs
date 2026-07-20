@@ -7,6 +7,7 @@ mod at;
 mod audit;
 mod bundle;
 mod candidates;
+mod capture_tests;
 mod change_impact;
 mod changes;
 mod churn;
@@ -293,6 +294,74 @@ pub(crate) enum Commands {
         /// time. Not part of the handle identity.
         #[arg(long)]
         captured_at: Option<String>,
+    },
+    /// Capture a `cargo test` / libtest JSON run as a citable verification-domain
+    /// `TestRun` record (issue #165).
+    ///
+    /// CAPTURE-ONLY: never executes a test runner. The caller runs the tests,
+    /// captures the machine-readable libtest JSON event stream to a file, and
+    /// hands that file plus the run metadata here. Parses it into a
+    /// redaction-safe `TestRun` node (verification domain, `test_run` kind);
+    /// raw failing-test output never enters the graph. With `--graph` (a code
+    /// graph from `eg scan`) each test whose final `::`-segment resolves to
+    /// exactly one `Symbol` mints `MENTIONS_SYMBOL` / `TOUCHED_FILE` and, for a
+    /// failure, `FAILED_ON` edges; zero or two-plus matches mint a `Diagnostic`
+    /// instead of a wrong edge.
+    ///
+    /// Exit codes: 0 success (partial stream still 0); 1 usage/provenance error;
+    /// 3 protected-store I/O failure; 4 empty input; 5 unparseable input. A
+    /// captured pass is a recorded observation of one run — "no captured
+    /// failure" is not proof of correctness. See `docs/cli/capture-tests.md`.
+    CaptureTests {
+        /// Path to the file holding the libtest JSON event stream (stored, never run).
+        #[arg(long)]
+        input: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Stable session identity (part of the record ID).
+        #[arg(long)]
+        session_id: String,
+        /// Commit handle / external identifier (part of the record ID).
+        #[arg(long)]
+        commit: String,
+        /// Suite name (part of the record ID and the node name).
+        #[arg(long)]
+        suite: String,
+        /// The exact command that produced the stream. Stored, never executed.
+        #[arg(long)]
+        command: String,
+        /// The runner's exit status.
+        #[arg(long)]
+        exit_code: i64,
+        /// Caller-supplied RFC 3339 timestamp. Validated.
+        #[arg(long)]
+        executed_at: String,
+        /// Optional runner name (e.g. `libtest`, `cargo-nextest`).
+        #[arg(long)]
+        runner: Option<String>,
+        /// Optional runner version.
+        #[arg(long)]
+        runner_version: Option<String>,
+        /// Optional repository identity (reserved for scoping).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Optional code graph (from `eg scan`) to resolve test names to Symbol/File.
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Input format. Only `libtest-json` (the default) is accepted.
+        #[arg(long, default_value = "libtest-json")]
+        format: String,
+        /// Capture the raw input bytes into the protected store (issue #60).
+        /// Requires `--protected-store` and `--producer`.
+        #[arg(long)]
+        protected_raw_artifacts: bool,
+        /// Protected store directory (required with `--protected-raw-artifacts`).
+        #[arg(long)]
+        protected_store: Option<PathBuf>,
+        /// Producer identity for the captured blob (required with `--protected-raw-artifacts`).
+        #[arg(long)]
+        producer: Option<String>,
     },
     /// Link error signatures to the agent runs and tasks that preceded them
     /// (issue #323).
@@ -3662,6 +3731,41 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             producer.as_deref(),
             captured_at.as_deref(),
         ),
+        Commands::CaptureTests {
+            input,
+            out,
+            session_id,
+            commit,
+            suite,
+            command,
+            exit_code,
+            executed_at,
+            runner,
+            runner_version,
+            repo,
+            graph,
+            format,
+            protected_raw_artifacts,
+            protected_store,
+            producer,
+        } => capture_tests::capture_tests(&capture_tests::CaptureTestsArgs {
+            input: &input,
+            out: &out,
+            session_id: &session_id,
+            commit: &commit,
+            suite: &suite,
+            command: &command,
+            exit_code,
+            executed_at: &executed_at,
+            runner: runner.as_deref(),
+            runner_version: runner_version.as_deref(),
+            repo: repo.as_deref(),
+            graph: graph.as_deref(),
+            format: &format,
+            protected_raw_artifacts,
+            protected_store: protected_store.as_deref(),
+            producer: producer.as_deref(),
+        }),
         Commands::LinkLogs {
             graph,
             data_dir,
