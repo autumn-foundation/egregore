@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use super::liveness::Liveness;
 use crate::ir::{EdgeLabel, GraphRecord, NodeKind, parse_codegraph_id};
 
 /// Why a repository selector failed to resolve.
@@ -72,20 +73,38 @@ impl RepositoryIndex {
     pub fn build(records: &[GraphRecord]) -> Self {
         // Tombstoned repositories (e.g. an identity change in an incremental
         // scan) are not part of the current state: they must neither resolve
-        // as selectors nor make a live repository's selector ambiguous.
-        let tombstoned: BTreeSet<&str> = records
+        // as selectors nor make a live repository's selector ambiguous. Over an
+        // append-only `--graph`, a Repository node re-ingested AFTER its own
+        // tombstone is live again; the shared gate reports a tombstone active
+        // only when it is the id's most recent write, matching the embedded
+        // current-state read so `--graph` and `--data-dir` agree (issue #432).
+        let liveness = Liveness::new(records);
+
+        // Coalesce Repository nodes to the latest write per id (issue #432):
+        // over an append-only `--graph` a repository revived AFTER its own
+        // tombstone — or re-scanned from a different checkout under a remote
+        // identity whose id is stable but whose `canonical_path`/selectors
+        // differ — has several physical writes whose version-varying
+        // identity/selector fields differ. The embedded `--data-dir` read
+        // exposes only the latest write, so building the entry from the FIRST
+        // write (the prior `or_insert_with`) would resolve on STALE selectors
+        // over `--graph` while `--data-dir` resolves on the latest. Selecting
+        // the latest write per id keeps the two transports in agreement.
+        let latest_repo: BTreeMap<&str, usize> = records
             .iter()
-            .filter_map(|r| {
-                if let GraphRecord::Tombstone { deleted_id, .. } = r {
-                    Some(deleted_id.as_str())
-                } else {
-                    None
-                }
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                GraphRecord::Node {
+                    id,
+                    kind: NodeKind::Repository,
+                    ..
+                } => Some((id.as_str(), i)),
+                _ => None,
             })
             .collect();
 
         let mut repos: BTreeMap<String, RepositoryEntry> = BTreeMap::new();
-        for record in records {
+        for (record_index, record) in records.iter().enumerate() {
             let GraphRecord::Node {
                 id,
                 kind: NodeKind::Repository,
@@ -96,7 +115,10 @@ impl RepositoryIndex {
             else {
                 continue;
             };
-            if tombstoned.contains(id.as_str()) {
+            if latest_repo.get(id.as_str()) != Some(&record_index) {
+                continue;
+            }
+            if liveness.deleted(id.as_str()) {
                 continue;
             }
             let mut selectors: BTreeSet<String> = BTreeSet::new();
@@ -363,9 +385,90 @@ impl RepositoryIndex {
 mod tests {
     use super::*;
     use crate::ir::{
-        ErrorSignaturePayload, LOG_SCHEMA_VERSION, LogOccurrenceBucketPayload, LogPayload,
-        log_stable_id,
+        ErrorSignaturePayload, IdentitySource, LOG_SCHEMA_VERSION, LogOccurrenceBucketPayload,
+        LogPayload, RepositoryIdentityPayload, SCHEMA_VERSION, log_stable_id,
     };
+
+    fn repo_node(id: &str, basename: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(basename.to_owned()),
+            format!("repository {basename}"),
+        )
+        .with_repository_identity(RepositoryIdentityPayload {
+            identity_source: IdentitySource::OperatorOverride,
+            remote_url: None,
+            root_commit_sha: None,
+            canonical_path: None,
+            basename: basename.to_owned(),
+        })
+    }
+
+    fn repo_tombstone(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v{SCHEMA_VERSION}:tomb-{deleted_id}"),
+            schema_version: SCHEMA_VERSION,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn repository_reingested_after_tombstone_resolves_selector() {
+        // Append-only `--graph`: a Repository node re-ingested AFTER its own
+        // tombstone is live again (latest write wins), matching the embedded
+        // coalesced read (issue #432).
+        let repo_id = "codegraph:v1:repo-x";
+        let records = vec![
+            repo_node(repo_id, "myrepo"),
+            repo_tombstone(repo_id),
+            repo_node(repo_id, "myrepo"),
+        ];
+        let index = RepositoryIndex::build(&records);
+        assert_eq!(index.resolve_selector("myrepo"), Ok(repo_id));
+    }
+
+    #[test]
+    fn revived_repository_with_changed_selectors_uses_latest_version() {
+        // Issue #432 (round 2): a Repository revived AFTER its tombstone with an
+        // UPDATED identity/selector set must resolve on its LATEST selectors, not
+        // the STALE pre-tombstone ones. Over an append-only `--graph` both
+        // physical writes are present; the embedded `--data-dir` read exposes only
+        // the latest. Building the entry from the latest write per id keeps the
+        // two transports in agreement.
+        let repo_id = "codegraph:v1:repo-x";
+        let records = vec![
+            repo_node(repo_id, "old-name"),
+            repo_tombstone(repo_id),
+            repo_node(repo_id, "new-name"),
+        ];
+        let index = RepositoryIndex::build(&records);
+        // The latest selector resolves.
+        assert_eq!(index.resolve_selector("new-name"), Ok(repo_id));
+        // The stale pre-tombstone selector must NOT resolve.
+        assert!(
+            matches!(
+                index.resolve_selector("old-name"),
+                Err(RepositorySelectorError::Unknown { .. })
+            ),
+            "a stale pre-tombstone selector must not resolve the revived repository"
+        );
+    }
+
+    #[test]
+    fn repository_tombstoned_without_reingest_stays_deleted() {
+        let repo_id = "codegraph:v1:repo-x";
+        let records = vec![repo_node(repo_id, "myrepo"), repo_tombstone(repo_id)];
+        let index = RepositoryIndex::build(&records);
+        assert!(matches!(
+            index.resolve_selector("myrepo"),
+            Err(RepositorySelectorError::Unknown { .. })
+        ));
+    }
 
     /// Builds an `ErrorSignature` log node carrying `repository_id` (schema v3,
     /// issue #362). An empty `repository_id` models a legacy `log:v2:` record.

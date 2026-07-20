@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::liveness::Liveness;
 use super::{RepositoryIndex, path_is_under_prefix};
 use crate::ir::{GraphRecord, NodeKind};
 
@@ -161,6 +162,14 @@ pub fn debt_markers<'a>(
         }
     };
 
+    // Latest-write-wins liveness (issues #421/#432): over an append-only
+    // `--graph` a node re-ingested AFTER its own tombstone is live again,
+    // matching the embedded `--data-dir` current-state read. The shared gate
+    // reports a tombstone active only when it is the id's most recent write and
+    // preserves the history/temporal exemption, so the `tombstoned` set below
+    // retains a deleted_id only while its tombstone is still the latest write.
+    // See `super::liveness`.
+    let liveness = Liveness::new(records);
     let tombstoned: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| {
@@ -170,6 +179,7 @@ pub fn debt_markers<'a>(
                 None
             }
         })
+        .filter(|&id| liveness.deleted(id))
         .collect();
 
     // A node participates in the selected valid-time view when it belongs to
@@ -215,15 +225,44 @@ pub fn debt_markers<'a>(
     }
 
     // 4. Symbol spans per path, for enclosing-symbol resolution.
+    //
+    // Coalesce non-temporal Symbol versions to the latest write per id (issue
+    // #432): over an append-only `--graph` a symbol revived AFTER its own
+    // tombstone leaves several physical writes whose spans can differ, and the
+    // embedded `--data-dir` read exposes only the latest. Without coalescing, a
+    // STALE pre-tombstone span could be accepted as the enclosing symbol (the
+    // `same_file_version` current-view check reads only liveness, not version
+    // recency), diverging from `--data-dir`. History-backed (temporal) versions
+    // are kept individually — `same_file_version` already keys them by commit.
+    let latest_symbol: BTreeMap<&str, usize> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| match r {
+            GraphRecord::Node {
+                kind: NodeKind::Symbol,
+                id,
+                temporal: None,
+                span: Some(_),
+                repo_relative_path: Some(_),
+                ..
+            } => Some((id.as_str(), i)),
+            _ => None,
+        })
+        .collect();
     let mut symbols_by_path: BTreeMap<&str, Vec<&GraphRecord>> = BTreeMap::new();
-    for record in records {
+    for (i, record) in records.iter().enumerate() {
         if let GraphRecord::Node {
             kind: NodeKind::Symbol,
+            id,
             repo_relative_path: Some(path),
             span: Some(_),
+            temporal,
             ..
         } = record
         {
+            if temporal.is_none() && latest_symbol.get(id.as_str()) != Some(&i) {
+                continue;
+            }
             symbols_by_path
                 .entry(path.as_str())
                 .or_default()
@@ -247,20 +286,46 @@ pub fn debt_markers<'a>(
         }
     };
 
+    // Latest-write-wins coalescing (issue #432): over an append-only `--graph`
+    // the same non-temporal `DebtMarker` id can appear as several physical writes
+    // — a re-ingest, or a re-add after a tombstone. The embedded `--data-dir`
+    // read collapses these to the latest version, so emit only the latest write
+    // per id here too; without this the lane over-counts one live marker as
+    // several rows (the mirror of the pre-fix tombstone under-count). Temporal
+    // history versions are keyed by commit and kept individually.
+    let latest_nontemporal: BTreeMap<&str, usize> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| match r {
+            GraphRecord::Node {
+                kind: NodeKind::DebtMarker,
+                id,
+                temporal: None,
+                ..
+            } => Some((id.as_str(), i)),
+            _ => None,
+        })
+        .collect();
+
     // 5. Collect, resolve enclosing symbols, and order deterministically.
     let mut markers: Vec<DebtMarkerRow<'a>> = Vec::new();
-    for record in records {
+    for (record_index, record) in records.iter().enumerate() {
         let GraphRecord::Node {
             kind: NodeKind::DebtMarker,
+            id,
             name: Some(category),
             note: Some(note),
             repo_relative_path: Some(path),
             span: Some(marker_span),
+            temporal,
             ..
         } = record
         else {
             continue;
         };
+        if temporal.is_none() && latest_nontemporal.get(id.as_str()) != Some(&record_index) {
+            continue;
+        }
         if !record_in_repo_scope(record) || !in_selected_view(record) {
             continue;
         }
@@ -333,5 +398,155 @@ fn debt_marker_sort_key<'k>(marker: &DebtMarkerRow<'k>) -> (&'k str, usize, &'k 
             id.as_str(),
         ),
         _ => ("", 0, "", ""),
+    }
+}
+
+#[cfg(test)]
+mod liveness_parity_tests {
+    //! Transport-parity regression (issues #421/#432): over an append-only
+    //! `--graph`, a `DebtMarker` re-ingested AFTER its own tombstone is live
+    //! again — matching the embedded `--data-dir` current-state read — while a
+    //! tombstone with no later re-add still deletes its id.
+    use super::*;
+    use crate::ir::{SCHEMA_VERSION, SourceSpan};
+
+    fn debt_marker(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::DebtMarker,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some("todo".to_owned()),
+            "todo marker".to_owned(),
+        )
+        .with_note("clean this up")
+    }
+
+    fn tomb(deleted_id: &str) -> GraphRecord {
+        GraphRecord::Tombstone {
+            id: format!("codegraph:v6:tomb_{deleted_id}"),
+            schema_version: SCHEMA_VERSION,
+            deleted_id: deleted_id.to_owned(),
+            summary: "removed".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn marker_reingested_after_tombstone_is_live() {
+        let id = "codegraph:v6:marker_a";
+        let records = vec![debt_marker(id), tomb(id), debt_marker(id)];
+        let index = RepositoryIndex::build(&records);
+        let inv = debt_markers(&records, None, None, &index, None).expect("inventory");
+        assert!(
+            inv.markers.iter().any(|m| m.record.id() == id),
+            "a marker re-ingested after its tombstone must be reported live"
+        );
+    }
+
+    #[test]
+    fn marker_tombstone_without_reingest_stays_deleted() {
+        let id = "codegraph:v6:marker_a";
+        let records = vec![debt_marker(id), tomb(id)];
+        let index = RepositoryIndex::build(&records);
+        let inv = debt_markers(&records, None, None, &index, None).expect("inventory");
+        assert!(
+            inv.markers.is_empty(),
+            "a tombstone with no later re-ingest still deletes the marker"
+        );
+    }
+
+    #[test]
+    fn marker_reingested_after_tombstone_emits_one_row() {
+        // Latest-write-wins coalescing (issue #432): a revived marker must emit
+        // EXACTLY ONE row, matching the coalesced `--data-dir` read — not one row
+        // per physical write.
+        let id = "codegraph:v6:marker_a";
+        let records = vec![debt_marker(id), tomb(id), debt_marker(id)];
+        let index = RepositoryIndex::build(&records);
+        let inv = debt_markers(&records, None, None, &index, None).expect("inventory");
+        assert_eq!(
+            inv.markers.len(),
+            1,
+            "a revived marker coalesces to a single row"
+        );
+    }
+
+    fn symbol_with_span(id: &str, start: usize, end: usize) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: start,
+                end_byte: end,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some("outer".to_owned()),
+            "symbol outer".to_owned(),
+        )
+    }
+
+    #[test]
+    fn revived_symbol_with_changed_span_is_not_stale_enclosing() {
+        // FINDING 2 (issue #432, round 2): a Symbol revived AFTER its tombstone
+        // with a DIFFERENT span must not leave its STALE pre-tombstone span as an
+        // enclosing-symbol candidate. Over an append-only `--graph` both physical
+        // symbol writes are present; the embedded `--data-dir` read exposes only
+        // the latest span. The enclosing-symbol index must coalesce to the latest
+        // write per id so the two transports agree.
+        let marker_id = "codegraph:v6:marker_a";
+        let sym_id = "codegraph:v6:sym_a";
+        // Marker sits at bytes [10, 20].
+        let marker = GraphRecord::node(
+            marker_id.to_owned(),
+            NodeKind::DebtMarker,
+            Some("src/lib.rs".to_owned()),
+            Some(SourceSpan {
+                start_byte: 10,
+                end_byte: 20,
+                start_line: 1,
+                end_line: 2,
+            }),
+            Some("todo".to_owned()),
+            "todo marker".to_owned(),
+        )
+        .with_note("clean this up");
+        let records = vec![
+            // Stale symbol span [0, 100] ENCLOSES the marker.
+            symbol_with_span(sym_id, 0, 100),
+            tomb(sym_id),
+            // Revived symbol span [0, 5] does NOT enclose the marker.
+            symbol_with_span(sym_id, 0, 5),
+            marker,
+        ];
+        let index = RepositoryIndex::build(&records);
+        let inv = debt_markers(&records, None, None, &index, None).expect("inventory");
+        assert_eq!(inv.markers.len(), 1, "one live marker row");
+        assert!(
+            inv.markers[0].enclosing_symbol.is_none(),
+            "the stale pre-tombstone span must not be reported as the enclosing symbol"
+        );
+    }
+
+    #[test]
+    fn duplicate_marker_versions_emit_one_row() {
+        // A double non-temporal write with NO tombstone must also coalesce to one
+        // row (the broader multi-version case, not tombstone-entangled).
+        let id = "codegraph:v6:marker_a";
+        let records = vec![debt_marker(id), debt_marker(id)];
+        let index = RepositoryIndex::build(&records);
+        let inv = debt_markers(&records, None, None, &index, None).expect("inventory");
+        assert_eq!(
+            inv.markers.len(),
+            1,
+            "duplicate non-temporal versions coalesce to one row"
+        );
     }
 }
