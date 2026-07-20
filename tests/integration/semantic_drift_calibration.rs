@@ -141,6 +141,7 @@ fn eval_drift_fails_when_corpus_has_absolute_path() {
         .failure();
 }
 
+#[cfg(windows)]
 #[test]
 fn eval_drift_fails_when_corpus_has_windows_drive_prefix() {
     let temp = tempdir().expect("create temp dir");
