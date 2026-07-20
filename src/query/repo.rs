@@ -80,8 +80,31 @@ impl RepositoryIndex {
         // current-state read so `--graph` and `--data-dir` agree (issue #432).
         let liveness = Liveness::new(records);
 
+        // Coalesce Repository nodes to the latest write per id (issue #432):
+        // over an append-only `--graph` a repository revived AFTER its own
+        // tombstone — or re-scanned from a different checkout under a remote
+        // identity whose id is stable but whose `canonical_path`/selectors
+        // differ — has several physical writes whose version-varying
+        // identity/selector fields differ. The embedded `--data-dir` read
+        // exposes only the latest write, so building the entry from the FIRST
+        // write (the prior `or_insert_with`) would resolve on STALE selectors
+        // over `--graph` while `--data-dir` resolves on the latest. Selecting
+        // the latest write per id keeps the two transports in agreement.
+        let latest_repo: BTreeMap<&str, usize> = records
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                GraphRecord::Node {
+                    id,
+                    kind: NodeKind::Repository,
+                    ..
+                } => Some((id.as_str(), i)),
+                _ => None,
+            })
+            .collect();
+
         let mut repos: BTreeMap<String, RepositoryEntry> = BTreeMap::new();
-        for record in records {
+        for (record_index, record) in records.iter().enumerate() {
             let GraphRecord::Node {
                 id,
                 kind: NodeKind::Repository,
@@ -92,6 +115,9 @@ impl RepositoryIndex {
             else {
                 continue;
             };
+            if latest_repo.get(id.as_str()) != Some(&record_index) {
+                continue;
+            }
             if liveness.deleted(id.as_str()) {
                 continue;
             }
@@ -404,6 +430,33 @@ mod tests {
         ];
         let index = RepositoryIndex::build(&records);
         assert_eq!(index.resolve_selector("myrepo"), Ok(repo_id));
+    }
+
+    #[test]
+    fn revived_repository_with_changed_selectors_uses_latest_version() {
+        // Issue #432 (round 2): a Repository revived AFTER its tombstone with an
+        // UPDATED identity/selector set must resolve on its LATEST selectors, not
+        // the STALE pre-tombstone ones. Over an append-only `--graph` both
+        // physical writes are present; the embedded `--data-dir` read exposes only
+        // the latest. Building the entry from the latest write per id keeps the
+        // two transports in agreement.
+        let repo_id = "codegraph:v1:repo-x";
+        let records = vec![
+            repo_node(repo_id, "old-name"),
+            repo_tombstone(repo_id),
+            repo_node(repo_id, "new-name"),
+        ];
+        let index = RepositoryIndex::build(&records);
+        // The latest selector resolves.
+        assert_eq!(index.resolve_selector("new-name"), Ok(repo_id));
+        // The stale pre-tombstone selector must NOT resolve.
+        assert!(
+            matches!(
+                index.resolve_selector("old-name"),
+                Err(RepositorySelectorError::Unknown { .. })
+            ),
+            "a stale pre-tombstone selector must not resolve the revived repository"
+        );
     }
 
     #[test]
