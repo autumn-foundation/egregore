@@ -669,23 +669,31 @@ pub fn plan_eviction(
         }
     }
 
-    // Evicted edges: both endpoints are evicted nodes. The identity node is now
-    // itself an evicted node, so its containment edges to the evicted content are
-    // tombstoned rather than left dangling.
+    // Evicted edges: an edge is part of repo A's footprint whenever its SOURCE
+    // (the owning endpoint) is an evicted node — regardless of whether the target
+    // survives. This covers both fully-internal edges (both endpoints evicted,
+    // e.g. the identity node's containment edges to evicted content) AND an
+    // outbound A->B edge (CALLS/REFERENCES/etc.) into a surviving repository. The
+    // adapter's current-state read (`read_all_records` -> `latest_edge_versions`)
+    // suppresses an edge only when the edge's OWN id is tombstoned, so leaving a
+    // source-evicted edge un-tombstoned would leak part of repo A after eviction.
+    // The mirror direction (a SURVIVING source pointing at an evicted target) is a
+    // cross-repo citation, handled below.
     let mut evicted_edges: Vec<&str> = Vec::new();
     for (&id, &record) in &edge_records {
-        if let GraphRecord::Edge {
-            source, target: t, ..
-        } = record
+        if let GraphRecord::Edge { source, .. } = record
             && evicted_nodes.contains(source.as_str())
-            && evicted_nodes.contains(t.as_str())
         {
             evicted_edges.push(id);
         }
     }
 
-    // Cross-repo citations: an evidence edge with exactly one endpoint evicted
-    // and the other a surviving node. The survivor is kept; the link is reported.
+    // Cross-repo citations: an evidence edge whose SOURCE is a surviving node and
+    // whose TARGET is an evicted node. The survivor (source) is kept — evicting it
+    // would alter the co-resident repository's footprint — and its now-dangling
+    // link is reported, never silently dropped. The opposite direction (source
+    // evicted) is repo A's own footprint and is tombstoned above, so it never
+    // reaches this citation branch.
     let mut cross_repo_citations: Vec<CrossRepoCitation> = Vec::new();
     for record in edge_records.values() {
         if let GraphRecord::Edge {
@@ -699,7 +707,6 @@ pub fn plan_eviction(
             let src_evicted = evicted_nodes.contains(source.as_str());
             let tgt_evicted = evicted_nodes.contains(t.as_str());
             let (survivor, evicted_target) = match (src_evicted, tgt_evicted) {
-                (true, false) if node_records.contains_key(t.as_str()) => (t.as_str(), source),
                 (false, true) if node_records.contains_key(source.as_str()) => (source.as_str(), t),
                 _ => continue,
             };

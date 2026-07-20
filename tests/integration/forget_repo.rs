@@ -866,6 +866,102 @@ mod embedded {
         );
     }
 
+    /// Regression for the Codex #248 P2: a TOPOLOGY edge (CALLS) FROM an evicted
+    /// repo-A node TO a surviving repo-B node is part of repo A's footprint and
+    /// must be tombstoned when its SOURCE is an evicted node — even though the
+    /// target survives. The adapter's current-state read (`read_all_records` ->
+    /// `latest_edge_versions`) only suppresses an edge whose OWN id is tombstoned,
+    /// so leaving the A->B edge un-tombstoned leaks part of repo A after
+    /// `forget-repo --confirm`. The OTHER direction (source SURVIVING, target
+    /// evicted) is an unchanged cross-repo citation: kept and reported.
+    #[test]
+    fn evicted_repo_a_outbound_topology_edge_is_tombstoned() {
+        let (temp, jsonl, a, b) = two_repo_cross_domain_store();
+
+        // A->B topology edge (repo A's symbol CALLS repo B's symbol): owned by A.
+        let a_to_b_calls = GraphRecord::edge(
+            EdgeLabel::Calls,
+            a.symbol_id.clone(),
+            b.symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "repo A symbol calls repo B symbol".to_owned(),
+        );
+        let a_to_b_calls_id = a_to_b_calls.id().to_owned();
+        // B->A evidence citation (repo B's observation OBSERVES repo A's symbol):
+        // owned by surviving B; must be KEPT and REPORTED, never tombstoned.
+        let b_to_a_cite = GraphRecord::edge(
+            EdgeLabel::Observes,
+            b.observation_id.clone(),
+            a.symbol_id.clone(),
+            Some("0.5".to_owned()),
+            "repo B observation cites repo A symbol".to_owned(),
+        );
+        let b_to_a_cite_id = b_to_a_cite.id().to_owned();
+
+        let mut graph = aletheia_egregore::ir::Graph::new();
+        graph.push(a_to_b_calls);
+        graph.push(b_to_a_cite);
+        let mut store_text = fs::read_to_string(&jsonl).expect("read fixture");
+        store_text.push_str(&graph.to_jsonl().expect("serialize"));
+        fs::write(&jsonl, store_text).expect("append cross-repo edges");
+        let store = ingest_store(temp.path(), &jsonl);
+
+        // Before eviction, both edges are present in the current serving view.
+        let before = current_records(&store);
+        assert!(
+            before.iter().any(|r| r.id() == a_to_b_calls_id),
+            "A->B CALLS edge must exist before eviction"
+        );
+
+        let (code, stdout, _) = forget_repo(&store, "acme/widget-a", true);
+        assert_eq!(code, 0);
+
+        // The A->B topology edge is GONE from current records (its source, an
+        // evicted repo-A node, makes it repo A's footprint).
+        let after = current_records(&store);
+        assert!(
+            !after.iter().any(|r| r.id() == a_to_b_calls_id),
+            "A->B CALLS edge must be tombstoned out of current records after evicting A"
+        );
+
+        // The B->A citation edge (owned by surviving B) is KEPT and REPORTED.
+        assert!(
+            after.iter().any(|r| r.id() == b_to_a_cite_id),
+            "B->A citation edge (owned by surviving repo B) must be kept"
+        );
+        let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON");
+        let citations = envelope["cross_repo_citations"].to_string();
+        assert!(
+            citations.contains(&b.observation_id) && citations.contains(&a.symbol_id),
+            "the surviving B->A cross-repo citation must be reported: {envelope}"
+        );
+
+        // The tombstoned A->B edge must not surface as a dangling-reference defect
+        // in the current serving view: serializing that view (`read_all_records`)
+        // to JSONL and running `eg validate` must name the A->B edge in NO defect.
+        // (The intentionally-kept B->A citation edge legitimately dangles onto the
+        // evicted target and IS reported by validate — that is the reported
+        // cross-repo citation, not a regression.)
+        let mut view = aletheia_egregore::ir::Graph::new();
+        for record in &after {
+            view.push(record.clone());
+        }
+        let view_path = temp.path().join("post-evict.view.jsonl");
+        fs::write(&view_path, view.to_jsonl().expect("serialize view")).expect("write view");
+        let validate_out = egregore()
+            .args(["validate"])
+            .arg(&view_path)
+            .args(["--format", "text"])
+            .assert()
+            .get_output()
+            .clone();
+        let validate_text = String::from_utf8(validate_out.stdout).expect("utf8 validate");
+        assert!(
+            !validate_text.contains(&a_to_b_calls_id),
+            "validate must flag NO defect for the tombstoned A->B edge: {validate_text}"
+        );
+    }
+
     // ── AC-TEMPORAL: scan-history commit-anchored code is a documented residual ─
 
     /// Handles for one temporal (scan-history) fixture repository: its
