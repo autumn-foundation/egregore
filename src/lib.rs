@@ -33,6 +33,8 @@ pub mod error;
 pub mod evidence;
 /// Evidence-link freshness verdicts for agent observations (issue #85).
 pub mod evidence_freshness;
+/// Store-wide cross-domain evidence-link integrity audit (issue #217).
+pub mod evidence_link_audit;
 /// Versioned SOC2 control->evidence-class catalog loader, validator, and hash-pin (issue #337).
 pub mod evidence_pack;
 /// Operator-facing logical retraction of persisted records (issue #231).

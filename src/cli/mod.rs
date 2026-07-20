@@ -3559,6 +3559,28 @@ pub(crate) enum AuditSubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Audit store-wide evidence-link integrity across all domains (issue #217).
+    ///
+    /// Sweeps every cross-domain evidence edge (standalone edge records and
+    /// inline `EvidenceLink`s) in a JSONL graph (`--graph`) or embedded store
+    /// (`--data-dir`) and reports each whose target record is absent or
+    /// tombstoned. Strictly read-only; no network, indexing, or remote calls.
+    ///
+    /// Exit codes:
+    ///   0 — no broken evidence links (`ok: true`).
+    ///   1 — broken links found (`ok: false`); the full report is still printed.
+    ///   2 — usage/load error (both/neither input flag, unreadable/empty store).
+    EvidenceLinks {
+        /// Graph JSONL path (mutually exclusive with `--data-dir`).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` store directory (mutually exclusive with `--graph`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 /// Actions for `eg audit evidence-pack` (issue #338).
