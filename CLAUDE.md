@@ -271,6 +271,12 @@ cargo run -- query who-imports mycrate::foo --crate mycrate --graph graph.jsonl 
 cargo run -- query who-imports nonexistent::module --graph graph.jsonl  # exit 2 (no_match)
 cargo run -- query who-imports "" --graph graph.jsonl                 # exit 1 (malformed_module_path)
 
+# Symbols that construct a type via a `Type { … }` literal (issue #471)
+cargo run -- query who-constructs Deal --graph graph.jsonl            # exit 0 (>=1 constructor)
+cargo run -- query who-constructs Deal --graph history.graph.jsonl --all-history  # union of all snapshots
+cargo run -- query who-constructs Lonely --graph graph.jsonl          # exit 2 (no_match: zero constructors)
+cargo run -- query who-constructs "" --graph graph.jsonl             # exit 1 (malformed_type_handle)
+
 # Symbol- and file-level deltas across a commit range (issue #118)
 cargo run -- query deltas <base_sha> <head_sha> --graph history.graph.jsonl  # exit 0 on match
 cargo run -- query deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
@@ -543,6 +549,41 @@ path, start line, then record ID and byte-identical across runs and across `--gr
 importers, exit 1 (`malformed_module_path`) for an empty/leading-or-trailing-`::`/empty-
 interior-segment/whitespace-bearing path. Rows are import-site leads, never proof the
 imported item is used. See `docs/cli/who-imports.md`.
+
+`eg query who-constructs <Type>` lists the symbols that construct a type via a
+`Type { … }` struct/enum literal — a read-only lookup over the extractor-minted
+`CONSTRUCTS` edges (PR #467 / issue #443), the inbound type-anchored mirror of
+`deps` and the symmetric partner to `who-imports`. It is the dedicated,
+first-class form of the `construction_sites` group `eg query change-impact`
+already surfaces: both read the same edges and expose the same `e0063_risk`
+signal. The `<Type>` handle resolves as an exact type NAME or a canonical record
+ID via the shared symbol resolver (a file/task/other non-symbol handle is
+unsupported, exit 1; an empty handle is `malformed_type_handle`, exit 1; a name
+matching more than one live type is ambiguous, exit 1 with all candidate record
+IDs). Each row cites the constructing symbol's stable `record_id` +
+`repo_relative_path`/`span` + the producing `edge_record_id`, plus `e0063_risk`
+(`true` when at least one collapsed site uses the exhaustive, non-`..base`
+literal form that fails to compile — rustc E0063 — when a required field is
+added; `false` when every site used struct-update `..base`/FRU, which stays
+valid; derived as `is_exhaustive.unwrap_or(true)`, so a legacy edge with no
+marker is conservatively risky) and the raw `is_exhaustive` marker. Construction
+is caller-granularity: per-site spans collapse to the constructing symbol, same
+as `CALLS`, and a constructor that builds the type more than once appears once.
+Liveness is the shared latest-write-wins `Liveness` gate (tombstoned
+constructors excluded, revived ones included, latest edge version supplies the
+row), so `--graph` and `--data-dir` agree and are byte-identical. Over a
+`scan-history` store the corpus DEFAULTS to HEAD-anchored (sites current at each
+repository's stamped HEAD); `--all-history` opts into the union and `--at-head`
+makes the default explicit — mutually exclusive with each other and with
+`--at`/`--as-of` (exit 1 `unsupported_combination`), and the envelope discloses
+`corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (issue #427; see
+`docs/cli/corpus-modes.md`). Output is a deterministic NDJSON envelope
+(`handle`, resolved `target`, `total_constructors`, disclaimer) then one
+`source_fact` row per constructor, sorted by path, start line, then record ID.
+Exit 0 on a match, exit 2 (`no_match`) for a well-formed type with zero live
+constructors. Rows are construction-site LEADS and `e0063_risk` an actionable
+signal, never proof a specific field addition breaks. See
+`docs/cli/who-constructs.md`.
 
 `eg query deltas <base> <head>` returns the observed structural deltas between two commit
 handles (full SHA or unique prefix) from a `scan-history` graph or embedded store, grouped by

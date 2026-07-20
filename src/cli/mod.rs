@@ -76,6 +76,8 @@ mod who;
 mod path;
 // Appended (issue #444); kept at the end to minimize cross-lane merge conflicts.
 mod who_imports;
+// Appended (issue #471); kept at the end to minimize cross-lane merge conflicts.
+mod who_constructs;
 // Appended (issue #248); kept at the end to minimize cross-lane merge conflicts.
 mod forget_repo;
 
@@ -151,6 +153,8 @@ pub(crate) use watch::*;
 pub(crate) use path::*;
 // Appended (issue #444); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use who_imports::*;
+// Appended (issue #471); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use who_constructs::*;
 // Appended (issue #248); kept at the end to minimize cross-lane merge conflicts.
 #[cfg(feature = "embedded-aletheiadb")]
 pub(crate) use forget_repo::*;
@@ -3033,6 +3037,61 @@ pub(crate) enum QuerySubcommand {
         /// so an import present only in an earlier commit still appears.
         /// Mutually exclusive with --at-head (enforced at runtime with an
         /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// List the symbols that construct a type via a `Type { … }` literal
+    /// (issue #471) — the inbound `CONSTRUCTS` construction sites (PR #467).
+    ///
+    /// The type-anchored, first-class form of the `construction_sites` group
+    /// `eg query change-impact <type>` already surfaces: both read the same
+    /// `CONSTRUCTS` edges and expose the same `e0063_risk` signal. Resolve a
+    /// type NAME or canonical record ID; each row cites the constructing
+    /// symbol's stable record ID + repo-relative file/span handle and the
+    /// `e0063_risk` flag (`true` when a new required field would break the
+    /// site — the exhaustive, non-`..base` form; `false` for the FRU `..base`
+    /// form). Output is deterministic and byte-identical across runs and across
+    /// `--graph` / `--data-dir`. Rows are construction-site LEADS.
+    ///
+    /// Exit codes:
+    ///   0 — at least one constructor found.
+    ///   1 — malformed handle, ambiguous name, or unsupported handle
+    ///       (machine-readable JSON on stderr).
+    ///   2 — well-formed type with zero live constructors (`no_match`).
+    ///
+    /// Documented in `docs/cli/who-constructs.md`.
+    WhoConstructs {
+        /// The type to look up (exact name or canonical record ID).
+        handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the constructor set to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Resolve construction sites at this commit (full SHA or unique
+        /// prefix). Mutually exclusive with --as-of and the corpus flags.
+        #[arg(long)]
+        at: Option<String>,
+        /// Resolve construction sites as of this RFC 3339 instant. Mutually
+        /// exclusive with --at and the corpus flags.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Corpus selector (issue #427): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding sites removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history / --at / --as-of.
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #427): read the UNION of all commit snapshots
+        /// so a site present only in an earlier commit still appears. Mutually
+        /// exclusive with --at-head / --at / --as-of.
         #[arg(long)]
         all_history: bool,
         /// Output format.
@@ -6561,6 +6620,48 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 crate_name.as_deref(),
                 &index,
                 selected.as_deref(),
+                at_head,
+                all_history,
+                format,
+            )
+        }
+        // Appended (issue #471); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::WhoConstructs {
+            handle,
+            graph,
+            data_dir,
+            repo,
+            at,
+            as_of,
+            at_head,
+            all_history,
+            format,
+        } => {
+            // Strictly read-only lane: `--data-dir` reads a throwaway copy so the
+            // live store stays byte-for-byte untouched. Temporal selectors need
+            // the history-inclusive store view; the current-state read suffices
+            // otherwise. `--graph` is a plain file read (the CONSTRUCTS edges are
+            // Edge records, not a single-kind closure, so no sidecar fast path).
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) if at.is_some() || as_of.is_some() => {
+                    load_records_from_db_history_readonly(dir)?
+                }
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_who_constructs_cmd(
+                &records,
+                &handle,
+                &index,
+                selected.as_deref(),
+                at.as_deref(),
+                as_of.as_deref(),
                 at_head,
                 all_history,
                 format,
