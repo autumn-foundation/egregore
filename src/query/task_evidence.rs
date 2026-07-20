@@ -191,7 +191,36 @@ pub fn resolve_task_ids(
         }
     }
 
+    // Coalesce ExternalLink nodes to the latest write per id BEFORE comparing
+    // version-varying url/handle fields (issue #432): over an append-only
+    // `--graph` a link revived after its own tombstone has several physical
+    // writes whose url/system_native_id can differ, so matching a STALE
+    // pre-tombstone url would resolve a task the embedded `--data-dir` read
+    // (which exposes only the latest write) never would. History-backed
+    // (temporal) versions are kept individually. Append-order `insert` keeps the
+    // latest write per id.
+    let mut latest_link: std::collections::BTreeMap<&str, &GraphRecord> =
+        std::collections::BTreeMap::new();
+    let mut temporal_links: Vec<&GraphRecord> = Vec::new();
     for r in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::ExternalLink,
+            id,
+            temporal,
+            ..
+        } = r
+        {
+            if temporal.is_some() {
+                temporal_links.push(r);
+            } else {
+                latest_link.insert(id.as_str(), r);
+            }
+        }
+    }
+    let link_candidates: Vec<&GraphRecord> =
+        latest_link.into_values().chain(temporal_links).collect();
+
+    for r in link_candidates {
         if let GraphRecord::Node {
             kind: NodeKind::ExternalLink,
             id,
@@ -978,6 +1007,38 @@ mod liveness_tests {
         // Coalesced to exactly one live version, matching the `--data-dir` read.
         assert_eq!(ctx.tasks.len(), 1, "revived task collapses to one row");
         assert_eq!(ctx.tasks[0].id(), task_id);
+    }
+
+    #[test]
+    fn revived_link_with_changed_url_does_not_match_stale_url() {
+        // FINDING 1 (issue #432, round 2): an ExternalLink revived AFTER its
+        // tombstone with an UPDATED url must NOT resolve its task for the
+        // PRE-tombstone url. Over an append-only `--graph` the stale physical
+        // version is still present; the embedded `--data-dir` read exposes only
+        // the latest url. Coalescing the link to its latest write per id keeps
+        // the two transports in agreement.
+        const OLD_URL: &str = "https://github.com/o/r/issues/7";
+        const NEW_URL: &str = "https://github.com/o/r/issues/8";
+        let link_id = "project:v1:link-te";
+        let task_id = "project:v1:task-te";
+        let records = vec![
+            ext_link(link_id, OLD_URL),
+            project_tombstone(link_id),
+            ext_link(link_id, NEW_URL),
+            task_with_link(task_id, link_id),
+        ];
+        // The latest (live) url still resolves.
+        let resolved_new = resolve_task_ids(&records, NEW_URL).expect("resolves");
+        assert!(
+            resolved_new.contains(task_id),
+            "the latest link url resolves the task"
+        );
+        // The stale pre-tombstone url must NOT resolve — matching `--data-dir`.
+        let resolved_old = resolve_task_ids(&records, OLD_URL).expect("resolves");
+        assert!(
+            !resolved_old.contains(task_id),
+            "a stale pre-tombstone url must not resolve the revived link's task"
+        );
     }
 
     #[test]
