@@ -318,6 +318,7 @@ fn make_edge(label: EdgeLabel, source: String, target: String, summary: &str) ->
         frame_resolution: None,
         frame_index: None,
         basis: None,
+        is_exhaustive: None,
         temporal: None,
         summary: summary.to_owned(),
         producer: None,

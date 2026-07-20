@@ -120,11 +120,15 @@ use crate::{
 /// 22 -> 23 for the issue #438 non-UTF-8/unreadable source skip: such a file now
 /// caches a `Diagnostic` (never a `File` node) and shifts the coverage counts,
 /// so older caches must rebuild rather than replay the pre-skip record set.
+/// 23 -> 24: #443 struct-literal CONSTRUCTS edges. The new
+/// `FileFacts.construct_sites` field changes the cached per-file fact shape, so
+/// per-file caches must rebuild to emit the CONSTRUCTS edges instead of
+/// replaying pre-#443 facts that carried none.
 ///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 23;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 24;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

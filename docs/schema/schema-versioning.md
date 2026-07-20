@@ -22,7 +22,7 @@ Readers interpret `schema_version` as scoped to:
 Examples:
 
 ```text
-(codegraph, Symbol, 5)
+(codegraph, Symbol, 7)
 (project, Task, 1)
 (agent_memory, ToolCall, 1)
 (semantic, SemanticDrift, 1)
@@ -57,6 +57,15 @@ reject cross-version mismatches with `unknown_schema_version` rather than
 silently coercing. No `migrating` one-way transform manifest is provided because
 the remedy is a **re-scan / re-ingest**: `eg scan-logs` regenerates every log
 record under the current identity deterministically from the source log.
+
+The `codegraph` domain (`SCHEMA_VERSION`) was bumped 5 → 6 by issue #135 (the
+`ScanCoverage` node), then 6 → 7 by issue #443: the `CONSTRUCTS` struct-literal
+edge label (constructing Symbol → constructed type's definition Symbol) plus an
+optional `is_exhaustive` marker field on edge records (the E0063 exhaustiveness
+of the collapsed construction sites). Both additions are additive; the optional
+`is_exhaustive` field is `#[serde(default, skip_serializing_if)]` so a legacy
+edge record without it still deserializes. Re-extraction from source
+regenerates every codegraph record under the current version deterministically.
 
 Rationale: per-domain and per-kind scoping lets #6, #11, #13, #14, and #15 land
 independently. A new project `Task` shape must not force a version bump for

@@ -147,7 +147,10 @@ const ORPHANABLE_KINDS: [NodeKind; 8] = [
 /// issue #103, matching what the extractor and history replay actually emit.
 const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
     match label {
-        EdgeLabel::Defines => Some(&[NodeKind::Symbol]),
+        // `File/Module —DEFINES→ Symbol`, and a `Symbol —CONSTRUCTS→ Symbol`
+        // struct-literal construction edge (issue #443) which always targets the
+        // constructed type's definition Symbol (never a `Diagnostic`).
+        EdgeLabel::Defines | EdgeLabel::Constructs => Some(&[NodeKind::Symbol]),
         EdgeLabel::Contains => Some(&[
             NodeKind::Change,
             NodeKind::Commit,
@@ -1252,6 +1255,7 @@ mod tests {
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            is_exhaustive: None,
             temporal: None,
             summary: "test edge".to_owned(),
             producer: None,

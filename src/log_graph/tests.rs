@@ -178,6 +178,7 @@ fn frame_resolves_to_schema_tuple_is_known() {
         frame_resolution: Some(crate::ir::FrameResolution::Resolved),
         frame_index: Some(0),
         basis: None,
+        is_exhaustive: None,
         temporal: None,
         summary: "frame resolves to symbol".to_owned(),
         producer: None,

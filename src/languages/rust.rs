@@ -17,8 +17,9 @@ use crate::{
             path_segments, reference_text, span,
         },
         cross_file::{
-            CallKind, CallPathRoot, CallSiteFact, DefinitionFact, FileFacts, ImplTargetFact,
-            ImplTraitRelationFact, OutOfLineModFact, PendingImplFact, UseImportFact, crate_root_id,
+            CallKind, CallPathRoot, CallSiteFact, ConstructSiteFact, DefinitionFact, FileFacts,
+            ImplTargetFact, ImplTraitRelationFact, OutOfLineModFact, PendingImplFact,
+            UseImportFact, crate_root_id,
         },
     },
     redaction::REDACTION_POLICY_VERSION,
@@ -768,6 +769,16 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                     }
                     self.collect_call_sites(child, caller_id, caller_name);
                 }
+                "struct_expression" => {
+                    // A struct-literal construction `Type { … }` (issue #443).
+                    // Record it, then keep walking children so a nested literal
+                    // in a field value (`Outer { inner: Inner { … } }`) is also
+                    // collected.
+                    if let Some(fact) = self.construct_site_fact(child, caller_id, caller_name) {
+                        self.facts.construct_sites.push(fact);
+                    }
+                    self.collect_call_sites(child, caller_id, caller_name);
+                }
                 _ => self.collect_call_sites(child, caller_id, caller_name),
             }
         }
@@ -883,6 +894,52 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             path_root,
             receiver_owner,
             receiver_type,
+            span: span(node),
+        })
+    }
+
+    /// Classifies one `struct_expression` (`Type { … }`) into a
+    /// [`ConstructSiteFact`] (issue #443), or `None` when the constructed type is
+    /// not a resolvable simple nominal path.
+    ///
+    /// The `name` field is reduced to its nominal type path (generic arguments
+    /// dropped) and normalized with the same `crate`/`self`/`super`-stripping and
+    /// leading-`Self`→impl-owner rewrite calls use. Exhaustiveness is the
+    /// absence of a `..base` (`base_field_initializer`) in the literal body.
+    fn construct_site_fact(
+        &self,
+        node: Node<'_>,
+        constructor_id: &str,
+        constructor_name: &str,
+    ) -> Option<ConstructSiteFact> {
+        let name_node = node.child_by_field_name("name")?;
+        // Reuse the receiver-type reducer: it yields the nominal path text for a
+        // `type_identifier`/`scoped_type_identifier` and peels a single-level
+        // generic (`Wrapper<T>` -> `Wrapper`).
+        let display = reduce_receiver_type(name_node, self.source)?;
+        let segments = self.normalize_call_path(&display)?;
+        if segments.is_empty() || segments.iter().any(|segment| !is_simple_ident(segment)) {
+            return None;
+        }
+        // Classify the leading crate scope BEFORE normalization erased it,
+        // mirroring the path-qualified call classifier (issue #440). A leading
+        // `Self` names the impl owner's own (current) crate, so it is
+        // `CurrentCrate`, not a `Leading` type segment.
+        let path_root = match display.split("::").next().map(str::trim) {
+            Some("crate" | "self" | "super" | "Self") => CallPathRoot::CurrentCrate,
+            Some(first) if display.contains("::") && !first.is_empty() => {
+                CallPathRoot::Leading(first.to_owned())
+            }
+            _ => CallPathRoot::Unqualified,
+        };
+        let is_exhaustive = !struct_literal_has_base(node);
+        Some(ConstructSiteFact {
+            constructor_id: constructor_id.to_owned(),
+            constructor_name: constructor_name.to_owned(),
+            type_display: display,
+            type_segments: segments,
+            path_root,
+            is_exhaustive,
             span: span(node),
         })
     }
@@ -2985,6 +3042,20 @@ fn strip_impl_prefix(owner: &str) -> &str {
 /// True when `text` is a plain identifier (letters, digits, underscores).
 fn is_simple_ident(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// `true` when a `struct_expression`'s body carries a `..base` functional-record
+/// -update tail (a `base_field_initializer`), issue #443. Such a literal is NOT
+/// the E0063-breakable exhaustive form: `..base` supplies any fields the literal
+/// omits, so adding a required field does not break it. A literal with no base is
+/// exhaustive and breaks when a required field is added.
+fn struct_literal_has_base(node: Node<'_>) -> bool {
+    let Some(body) = node.child_by_field_name("body") else {
+        return false;
+    };
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .any(|child| child.kind() == "base_field_initializer")
 }
 
 /// `true` when one attribute item's source text is a dedicated test attribute:

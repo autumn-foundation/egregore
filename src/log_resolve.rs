@@ -368,6 +368,7 @@ pub fn resolve_frames(records: &[GraphRecord], at_commit: Option<&str>) -> Resol
             frame_resolution: Some(p.resolution),
             frame_index: Some(p.frame_index),
             basis: None,
+            is_exhaustive: None,
             temporal: None,
             summary: format!(
                 "backtrace frame {} of {} resolves ({}) to {}",

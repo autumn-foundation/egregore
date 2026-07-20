@@ -83,6 +83,12 @@ pub struct ChangeImpactContext<'a> {
     pub implementation_symbols: Vec<ImpactLead<'a>>,
     /// The containing file/module (inbound `DEFINES`/`CONTAINS` edges).
     pub containing_context: Vec<ImpactLead<'a>>,
+    /// Struct-literal construction sites that build the anchor type (inbound
+    /// `CONSTRUCTS` edges, issue #443). Each lead's source is a constructing
+    /// Symbol; the edge's `is_exhaustive` marker becomes the row's `e0063_risk`
+    /// (an exhaustive, non-`..base` literal breaks E0063 when a required field is
+    /// added). Leads to inspect, never proof of breakage.
+    pub construction_sites: Vec<ImpactLead<'a>>,
     /// Stable machine-readable diagnostics (unresolved edges, unsupported
     /// relations, truncation notices).
     pub diagnostics: Vec<MemoryAuditDiagnostic>,
@@ -103,6 +109,9 @@ const IMPACT_LABELS: &[EdgeLabel] = &[
     EdgeLabel::Implements,
     EdgeLabel::Defines,
     EdgeLabel::Contains,
+    // Struct-literal construction sites (issue #443): an inbound `CONSTRUCTS`
+    // edge to a type is a construction lead for the E0063 blast-radius question.
+    EdgeLabel::Constructs,
 ];
 
 /// First resolved change-impact anchor whose node kind is **not** a code
@@ -237,6 +246,7 @@ pub fn change_impact_context<'a>(
     let mut referencing_files: BTreeMap<(&str, &str), ImpactLead<'_>> = BTreeMap::new();
     let mut implementation_symbols: BTreeMap<(&str, &str), ImpactLead<'_>> = BTreeMap::new();
     let mut containing_context: BTreeMap<(&str, &str), ImpactLead<'_>> = BTreeMap::new();
+    let mut construction_sites: BTreeMap<(&str, &str), ImpactLead<'_>> = BTreeMap::new();
     let mut diagnostics: Vec<MemoryAuditDiagnostic> = Vec::new();
 
     // The queried target's own resolved anchor(s). These are never reported as
@@ -537,6 +547,44 @@ pub fn change_impact_context<'a>(
                             }
                         }
                     }
+                    EdgeLabel::Constructs => {
+                        // constructing symbol → anchor type: the source builds a
+                        // `Type { … }` literal of the anchor (issue #443). Report
+                        // it as a construction lead; the edge's `is_exhaustive`
+                        // marker drives the row's `e0063_risk` at serialization.
+                        match by_id.get(source_id) {
+                            Some(&node) if !original_targets.contains(node.id()) => {
+                                construction_sites.entry((node.id(), edge_id)).or_insert(
+                                    ImpactLead {
+                                        record: node,
+                                        edge: edge_record,
+                                        relation: "CONSTRUCTS",
+                                        direction: ImpactDirection::Inbound,
+                                        anchor_id,
+                                        hop,
+                                    },
+                                );
+                                if hop < depth
+                                    && matches!(
+                                        record_node_kind(node),
+                                        Some(NodeKind::Symbol | NodeKind::Module)
+                                    )
+                                {
+                                    next_frontier.insert(node.id());
+                                }
+                            }
+                            Some(_) => {}
+                            None => {
+                                diagnostics.push(MemoryAuditDiagnostic {
+                                    code: "unresolved_edge_target".to_owned(),
+                                    source_record_id: edge_id.to_owned(),
+                                    target_handle: source_id.to_owned(),
+                                    relation: "CONSTRUCTS".to_owned(),
+                                    target_domain: "codegraph".to_owned(),
+                                });
+                            }
+                        }
+                    }
                     _ => {
                         // Unexpected in-scope label — emit diagnostic
                         diagnostics.push(MemoryAuditDiagnostic {
@@ -788,6 +836,13 @@ pub fn change_impact_context<'a>(
         depth,
         &mut truncations,
     );
+    let construction_sites = drain_sorted(
+        construction_sites,
+        "construction_sites",
+        MAX_LEADS_PER_GROUP,
+        depth,
+        &mut truncations,
+    );
 
     // ── Sort and dedup diagnostics ────────────────────────────────────────────
     diagnostics.sort_by(|a, b| {
@@ -840,6 +895,7 @@ pub fn change_impact_context<'a>(
         referencing_files,
         implementation_symbols,
         containing_context,
+        construction_sites,
         diagnostics,
         depth,
         truncations,

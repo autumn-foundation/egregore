@@ -72,7 +72,7 @@ eg query change-impact Widget --graph graph.jsonl --repo acme/widget
 
 ## Response shape
 
-The top-level envelope always includes all five groups (even when empty) so
+The top-level envelope always includes all six groups (even when empty) so
 "checked and none found" is distinct from "class not checked":
 
 ```json
@@ -88,6 +88,7 @@ The top-level envelope always includes all five groups (even when empty) so
   "referencing_files": [...],
   "implementation_symbols": [...],
   "containing_context": [...],
+  "construction_sites": [...],
   "truncations": [],
   "diagnostics": [],
   "page": { "cursor": null, "has_more": false, "returned": 3 }

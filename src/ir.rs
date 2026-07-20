@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 /// Current schema version for code-graph records.
-pub const SCHEMA_VERSION: u32 = 6;
+///
+/// 6→7: issue #443 adds the `CONSTRUCTS` struct-literal edge label and the
+/// optional `is_exhaustive` marker field on edge records.
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Schema version for agent-memory records (`Agent`, `AgentSession`, `Observation`, etc.).
 /// Documented in `docs/schema/agent-memory.md`.
@@ -1566,6 +1569,13 @@ pub enum GraphRecord {
         /// edge carries exactly one basis — none is emitted without one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         basis: Option<CorrelationBasis>,
+        /// Struct-literal exhaustiveness marker (issue #443); present only on
+        /// `CONSTRUCTS` edges. `Some(true)` when at least one collapsed
+        /// construction site is the E0063-breakable exhaustive form (no
+        /// `..base` functional-record-update), `Some(false)` when every
+        /// collapsed site used `..base`. Absent on every non-`CONSTRUCTS` edge.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_exhaustive: Option<bool>,
         /// Git and bitemporal provenance for history-backed records.
         #[serde(skip_serializing_if = "Option::is_none")]
         temporal: Option<TemporalMetadata>,
@@ -2214,6 +2224,7 @@ impl GraphRecord {
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            is_exhaustive: None,
             temporal: None,
             summary,
             producer: None,
@@ -2242,6 +2253,7 @@ impl GraphRecord {
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            is_exhaustive: None,
             temporal: None,
             summary,
             producer: None,
@@ -2277,6 +2289,7 @@ impl GraphRecord {
             frame_resolution: None,
             frame_index: None,
             basis: None,
+            is_exhaustive: None,
             temporal: None,
             summary,
             producer: None,
@@ -2346,6 +2359,26 @@ impl GraphRecord {
     pub const fn basis(&self) -> Option<CorrelationBasis> {
         match self {
             Self::Edge { basis, .. } => *basis,
+            Self::Node { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches a struct-literal exhaustiveness marker to a `CONSTRUCTS` edge
+    /// record (issue #443). No-op on node and tombstone records.
+    #[must_use]
+    pub const fn with_construct_exhaustive(mut self, exhaustive: bool) -> Self {
+        if let Self::Edge { is_exhaustive, .. } = &mut self {
+            *is_exhaustive = Some(exhaustive);
+        }
+        self
+    }
+
+    /// Returns the struct-literal exhaustiveness marker when this record is a
+    /// `CONSTRUCTS` edge carrying one; `None` otherwise (issue #443).
+    #[must_use]
+    pub const fn construct_is_exhaustive(&self) -> Option<bool> {
+        match self {
+            Self::Edge { is_exhaustive, .. } => *is_exhaustive,
             Self::Node { .. } | Self::Tombstone { .. } => None,
         }
     }
@@ -3313,6 +3346,10 @@ pub enum EdgeLabel {
     /// An `ErrorSignature` was emitted during a verification/agent run (evidence
     /// link, reserved for #322/#323; declared here, not emitted by `scan-logs`).
     EmittedDuring,
+    /// A struct-literal construction site `Type { … }`: constructing Symbol →
+    /// constructed type's definition Symbol (issue #443). Code-graph topology,
+    /// not an evidence link.
+    Constructs,
 }
 
 impl EdgeLabel {
@@ -3367,6 +3404,7 @@ impl EdgeLabel {
             "AGGREGATES" => Some(Self::Aggregates),
             "FRAME_RESOLVES_TO" => Some(Self::FrameResolvesTo),
             "EMITTED_DURING" => Some(Self::EmittedDuring),
+            "CONSTRUCTS" => Some(Self::Constructs),
             _ => None,
         }
     }
@@ -3428,6 +3466,7 @@ impl EdgeLabel {
                 | Self::DriftsFrom
                 | Self::DriftsPrior
                 | Self::MeasuredBy
+                | Self::Constructs
         )
     }
 
@@ -3482,6 +3521,7 @@ impl EdgeLabel {
             Self::Aggregates => "AGGREGATES",
             Self::FrameResolvesTo => "FRAME_RESOLVES_TO",
             Self::EmittedDuring => "EMITTED_DURING",
+            Self::Constructs => "CONSTRUCTS",
         }
     }
 }

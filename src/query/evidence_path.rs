@@ -100,6 +100,7 @@ const ALL_EDGE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::Aggregates,
     EdgeLabel::FrameResolvesTo,
     EdgeLabel::EmittedDuring,
+    EdgeLabel::Constructs,
 ];
 
 /// True if this edge is a cross-domain evidence/provenance edge the witness
@@ -109,12 +110,12 @@ const ALL_EDGE_LABELS: &[EdgeLabel] = &[
 const fn is_evidence_path_edge(label: EdgeLabel) -> bool {
     use EdgeLabel::{
         Aggregates, AuthoredBy, Calls, CapturedFrom, ChangedIn, ClosesAcceptanceCriterion,
-        Contains, Contradicts, DecidedOn, Defines, DriftsFrom, DriftsPrior, EmittedDuring,
-        ExplainsChange, ExternalHandle, FailedOn, FingerprintedAs, FrameResolvesTo, HasEvidence,
-        Implements, Imports, MaterializedAs, MeasuredBy, Mentions, MentionsSymbol, MergedAs,
-        Observes, OwnedByTask, ParentOf, ProducedEvidence, ProducedPatch, PromptedFor, ProposedBy,
-        References, ReferencesTask, RelatesTo, RequestedReviewFrom, ReviewedBy, ReviewsCommit,
-        RevokedBy, ScopedToRepo, SessionOf, Supersedes, TouchedFile, TouchesFile,
+        Constructs, Contains, Contradicts, DecidedOn, Defines, DriftsFrom, DriftsPrior,
+        EmittedDuring, ExplainsChange, ExternalHandle, FailedOn, FingerprintedAs, FrameResolvesTo,
+        HasEvidence, Implements, Imports, MaterializedAs, MeasuredBy, Mentions, MentionsSymbol,
+        MergedAs, Observes, OwnedByTask, ParentOf, ProducedEvidence, ProducedPatch, PromptedFor,
+        ProposedBy, References, ReferencesTask, RelatesTo, RequestedReviewFrom, ReviewedBy,
+        ReviewsCommit, RevokedBy, ScopedToRepo, SessionOf, Supersedes, TouchedFile, TouchesFile,
         TransitionsReview, ValidatedBy,
     };
     match label {
@@ -154,9 +155,11 @@ const fn is_evidence_path_edge(label: EdgeLabel) -> bool {
         | Aggregates => true,
         // EXCLUDED — code-graph structural topology (that is the CALLS-walker
         // lane's job) and intra-agent-memory organizational scaffolding; not
-        // grounding evidence.
+        // grounding evidence. `Constructs` (issue #443) is code-graph topology,
+        // same lane as `Calls`/`References`/`Contains`.
         Contains | Defines | Imports | References | Calls | Implements | Mentions | ChangedIn
-        | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy | SessionOf | AuthoredBy => false,
+        | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy | SessionOf | AuthoredBy
+        | Constructs => false,
     }
 }
 
@@ -1238,7 +1241,7 @@ mod tests {
             ALL_EDGE_LABELS.len(),
             "traversed + excluded must cover every EdgeLabel variant exactly once"
         );
-        assert_eq!(ALL_EDGE_LABELS.len(), 47, "EdgeLabel has 47 variants");
+        assert_eq!(ALL_EDGE_LABELS.len(), 48, "EdgeLabel has 48 variants");
         // No overlap between the two class lists.
         for label in &traversed {
             assert!(!excluded.contains(label), "{label} in both classes");
@@ -1252,6 +1255,7 @@ mod tests {
         assert!(excluded.contains(&"CONTAINS".to_owned()));
         assert!(excluded.contains(&"DEFINES".to_owned()));
         assert!(excluded.contains(&"AUTHORED_BY".to_owned()));
+        assert!(excluded.contains(&"CONSTRUCTS".to_owned()));
 
         // (c) the AC2-named example labels are all traversed.
         for label in [

@@ -20,6 +20,7 @@ mod co_change_coupling;
 mod codex;
 mod control_catalog;
 mod cross_file_calls;
+mod cross_file_constructs;
 mod daemon;
 mod deps;
 mod deterministic_scan;

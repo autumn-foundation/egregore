@@ -148,6 +148,41 @@ pub struct CallSiteFact {
     pub span: SourceSpan,
 }
 
+/// A syntactic struct-literal construction site `Type { … }` found inside a
+/// recorded symbol body (issue #443).
+///
+/// The constructing symbol is the enclosing fn/method; the constructed type is
+/// the (normalized) type path the literal names. Resolution to the type's
+/// definition Symbol — minting a `CONSTRUCTS` edge — happens in the repo-wide
+/// [`cross_file_construct_records`] pass, mirroring the CALLS resolution model.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConstructSiteFact {
+    /// Stable record ID of the constructing Symbol node (the enclosing fn/method).
+    pub constructor_id: String,
+    /// Qualified name of the constructing symbol.
+    pub constructor_name: String,
+    /// Constructed type as written in source (generic arguments dropped, e.g.
+    /// `crate_a::Deal`, `Self`, `Shape::Circle`).
+    pub type_display: String,
+    /// Normalized constructed-type path segments (`crate`/`self`/`super`
+    /// stripped, leading `Self` rewritten to the impl owner). The last segment
+    /// is the simple type name (or, for an enum-struct variant literal, the
+    /// variant name — the resolver retries after dropping it).
+    pub type_segments: Vec<String>,
+    /// How the type path's leading segment names its crate scope (issue #440),
+    /// classified exactly as a path-qualified call is. `#[serde(default)]` so a
+    /// pre-#443 cache deserializes to `Unqualified` (repo-wide matching).
+    #[serde(default)]
+    pub path_root: CallPathRoot,
+    /// `true` when the literal is the E0063-breakable EXHAUSTIVE form — it has
+    /// NO `..base` functional-record-update tail, so adding a required field to
+    /// the struct breaks this site. `false` when the literal carries `..base`
+    /// (a `base_field_initializer`), which absorbs new fields and does not break.
+    pub is_exhaustive: bool,
+    /// Source span of the struct-literal expression.
+    pub span: SourceSpan,
+}
+
 /// One out-of-line module declaration (`mod name;`) exported for the
 /// repo-wide out-of-line test-scope pass (issue #223).
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -324,6 +359,10 @@ pub struct FileFacts {
     /// Call sites found inside recorded symbol bodies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub call_sites: Vec<CallSiteFact>,
+    /// Struct-literal construction sites found inside recorded symbol bodies
+    /// (issue #443).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub construct_sites: Vec<ConstructSiteFact>,
     /// Out-of-line module declarations in the file (issue #223).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub out_of_line_mods: Vec<OutOfLineModFact>,
@@ -351,6 +390,7 @@ impl FileFacts {
     pub const fn is_empty(&self) -> bool {
         self.definitions.is_empty()
             && self.call_sites.is_empty()
+            && self.construct_sites.is_empty()
             && self.out_of_line_mods.is_empty()
             && self.impl_targets.is_empty()
             && self.pending_impls.is_empty()
@@ -887,7 +927,9 @@ fn join_segments(dir: &[String], suffix: &str) -> Option<String> {
 /// Computes the cross-file call records for one scanned tree.
 ///
 /// Returned records are `Diagnostic` nodes for unresolved calls followed by
-/// `CALLS` edges, in deterministic order.
+/// `CALLS` edges, in deterministic order. It also appends the `CONSTRUCTS`
+/// struct-literal edges (issue #443) via [`cross_file_construct_records`], so
+/// every driver that emits cross-file CALLS gets CONSTRUCTS with no extra wiring.
 #[must_use]
 pub fn cross_file_call_records(
     repository_id: &str,
@@ -978,7 +1020,133 @@ pub fn cross_file_call_records(
             .with_resolution(CallResolution::Unresolved),
         );
     }
+    records.extend(cross_file_construct_records(repository_id, facts_by_file));
     records
+}
+
+/// Computes the cross-file struct-literal `CONSTRUCTS` records for one scanned
+/// tree (issue #443).
+///
+/// Each [`ConstructSiteFact`] names a type path (`Type { … }`); this pass
+/// resolves that path to a UNIQUE constructible type definition Symbol
+/// (`struct`/`enum`) via the repo-wide [`ImplTargetIndex`], applying the same
+/// crate-root confinement the Path CALLS arm uses (issue #440): a
+/// `crate`/`self`/`super` head confines to the caller's crate root, a bare head
+/// naming a workspace crate confines to that crate's library root with the crate
+/// segment dropped, and an unqualified head matches repo-wide. An enum-struct
+/// variant literal (`Shape::Circle { … }`) whose full path does not resolve is
+/// retried after dropping the trailing variant segment, binding the enum.
+///
+/// Only a UNIQUE resolution mints an edge; an ambiguous (2+ candidate) or
+/// unresolved/external type mints NOTHING (no edge, no diagnostic) — ambiguity
+/// never silently picks one, mirroring the CALLS/IMPLEMENTS passes. Sites are
+/// collapsed per `(constructor, type)` pair; the edge's `is_exhaustive` marker
+/// is the OR of the collapsed sites' markers (true when ANY collapsed site is
+/// the E0063-breakable non-`..base` form). Deterministic and byte-stable.
+#[must_use]
+pub fn cross_file_construct_records(
+    _repository_id: &str,
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> Vec<GraphRecord> {
+    // Reassign auxiliary-target helper modules (`tests/common/mod.rs`) to the
+    // entry crate that `mod`-includes them, exactly as
+    // [`cross_file_implements_records`] does (issue #394; Codex round on
+    // PR #467). A `crate::Type { … }` literal in such a helper resolves against
+    // the including ENTRY crate in Rust, but path-based [`crate_root_id`] stamps
+    // the helper its OWN synthetic root (`test:common`), which would confine the
+    // literal to the wrong partition and drop its CONSTRUCTS edge. The remap
+    // rewrites both the index side (a helper's own `ImplTargetFact`s, via
+    // [`apply_crate_root_remap`]) and the caller side (the construct site's
+    // `caller_crate_root`, looked up below). When nothing needs remapping the
+    // borrowed facts are used directly, keeping output byte-identical.
+    let remap = reassign_aux_helper_crate_roots(facts_by_file);
+    let remapped;
+    let facts_by_file: &BTreeMap<String, FileFacts> = if remap.is_empty() {
+        facts_by_file
+    } else {
+        remapped = apply_crate_root_remap(facts_by_file, &remap);
+        &remapped
+    };
+    let index = ImplTargetIndex::build(facts_by_file);
+    let crate_name_roots = build_crate_name_roots(facts_by_file);
+
+    // (constructor_id, type_symbol_id) -> (summary, OR-of-site-exhaustiveness),
+    // collapsing repeated construction sites between the same pair.
+    let mut edges: BTreeMap<(String, String), (String, bool)> = BTreeMap::new();
+    for (path, facts) in facts_by_file {
+        let caller_crate_root = remap
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| crate_root_id(path));
+        for site in &facts.construct_sites {
+            let Some(target) = index.resolve_construct(
+                &site.type_segments,
+                &site.path_root,
+                &caller_crate_root,
+                &crate_name_roots,
+            ) else {
+                continue;
+            };
+            // A distinct fn/method Symbol and a distinct type Symbol never share
+            // a record ID, so a self-edge is unreachable; guard anyway.
+            if target.id == site.constructor_id {
+                continue;
+            }
+            let key = (site.constructor_id.clone(), target.id.clone());
+            let entry = edges.entry(key).or_insert_with(|| {
+                (
+                    format!("{} constructs {}", site.constructor_name, site.type_display),
+                    false,
+                )
+            });
+            entry.1 = entry.1 || site.is_exhaustive;
+        }
+    }
+
+    edges
+        .into_iter()
+        .map(|((source, target), (summary, is_exhaustive))| {
+            GraphRecord::edge(
+                EdgeLabel::Constructs,
+                source,
+                target,
+                Some("1.0".to_owned()),
+                summary,
+            )
+            .with_construct_exhaustive(is_exhaustive)
+        })
+        .collect()
+}
+
+/// Builds the workspace crate-name → library-crate-root registry (issue #440)
+/// shared by the CALLS and CONSTRUCTS resolution passes: every crate directory
+/// the scanned file set reveals contributes its inferred name → library root
+/// binding; a name shared by two crate directories is marked ambiguous (`None`)
+/// so a qualified reference to it is never confined to a wrong root.
+fn build_crate_name_roots(
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> BTreeMap<String, Option<String>> {
+    let mut crate_name_roots: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for path in facts_by_file.keys() {
+        let (prefix, _) = split_crate_prefix(path);
+        if prefix.is_empty() {
+            continue;
+        }
+        let Some(name) = crate_name_of(path) else {
+            continue;
+        };
+        let lib_root = format!("{prefix}::lib");
+        match crate_name_roots.get(&name) {
+            None => {
+                crate_name_roots.insert(name, Some(lib_root));
+            }
+            Some(Some(existing)) if *existing != lib_root => {
+                crate_name_roots.insert(name, None);
+            }
+            _ => {}
+        }
+    }
+    crate_name_roots
 }
 
 /// Computes the cross-file `IMPLEMENTS` records for one scanned tree
@@ -1262,6 +1430,105 @@ impl<'facts> ImplTargetIndex<'facts> {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Resolves a struct-literal construction type path (issue #443) to the
+    /// UNIQUE constructible type definition Symbol it names, or `None` when
+    /// nothing matches or the match is ambiguous. Crate-root confinement mirrors
+    /// the Path CALLS arm (issue #440): `CurrentCrate` confines to the caller's
+    /// crate root, `Leading(name)` confines to a workspace crate's library root
+    /// (dropping the crate segment) or falls back to the caller root, and
+    /// `Unqualified` matches repo-wide.
+    ///
+    /// An enum-struct variant literal (`Shape::Circle { … }`) does not resolve on
+    /// its full path (the variant is not a type definition), so a path of length
+    /// ≥2 is retried after dropping the trailing variant segment, binding the
+    /// enum. Only a unique resolution binds; ambiguity binds nothing.
+    fn resolve_construct(
+        &self,
+        type_segments: &[String],
+        path_root: &CallPathRoot,
+        caller_crate_root: &str,
+        crate_name_roots: &BTreeMap<String, Option<String>>,
+    ) -> Option<&'facts ImplTargetFact> {
+        let (target_root, segments): (Option<&str>, &[String]) = match path_root {
+            CallPathRoot::CurrentCrate => (Some(caller_crate_root), type_segments),
+            CallPathRoot::Leading(name) => {
+                let normalized = name.replace('-', "_");
+                match crate_name_roots.get(&normalized) {
+                    Some(Some(root)) => (Some(root.as_str()), &type_segments[1..]),
+                    _ => (Some(caller_crate_root), type_segments),
+                }
+            }
+            CallPathRoot::Unqualified => (None, type_segments),
+        };
+        if segments.is_empty() {
+            return None;
+        }
+        if let Some(target) = self.unique_constructible(target_root, segments) {
+            return Some(target);
+        }
+        // Enum-struct variant fallback: drop the trailing variant segment and
+        // retry against the enum type (`Shape::Circle` -> `Shape`).
+        if segments.len() >= 2 {
+            return self.unique_constructible(target_root, &segments[..segments.len() - 1]);
+        }
+        None
+    }
+
+    /// Returns the UNIQUE constructible (`struct`/`enum`) impl-target whose
+    /// crate-root-relative qualified name ends with `segments`, confined to
+    /// `target_root` when `Some` (else repo-wide). `None` on zero or ≥2 distinct
+    /// matches — ambiguity never picks one.
+    fn unique_constructible(
+        &self,
+        target_root: Option<&str>,
+        segments: &[String],
+    ) -> Option<&'facts ImplTargetFact> {
+        let mut matched: Vec<&ImplTargetFact> = Vec::new();
+        for ((root, qualified), facts) in &self.by_qualified {
+            if let Some(want) = target_root
+                && *root != want
+            {
+                continue;
+            }
+            if !qualified_ends_with(qualified, segments) {
+                continue;
+            }
+            for fact in facts {
+                if is_constructible_kind(&fact.symbol_kind) {
+                    matched.push(fact);
+                }
+            }
+        }
+        matched.sort_by(|a, b| a.id.cmp(&b.id));
+        matched.dedup_by(|a, b| a.id == b.id);
+        match matched.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+}
+
+/// `true` when a symbol kind names a type a struct literal `Type { … }` can
+/// construct (issue #443): a `struct` or an `enum` (its struct variants). Trait
+/// and `type_alias` targets are excluded — a trait can never be constructed, and
+/// an alias is not the constructed type's own definition Symbol.
+fn is_constructible_kind(symbol_kind: &str) -> bool {
+    matches!(symbol_kind, "struct" | "enum")
+}
+
+/// `true` when `qualified`'s `::`-separated segments end with `suffix`
+/// (segment-aware suffix match), so a bare `Deal` matches `Deal` and
+/// `m::Deal`, and `m::Deal` matches `a::m::Deal` but never `mm::Deal`.
+fn qualified_ends_with(qualified: &str, suffix: &[String]) -> bool {
+    let full: Vec<&str> = qualified.split("::").collect();
+    if suffix.len() > full.len() {
+        return false;
+    }
+    full[full.len() - suffix.len()..]
+        .iter()
+        .zip(suffix)
+        .all(|(segment, expected)| *segment == expected.as_str())
 }
 
 /// Tri-state outcome of asking whether a module-item `use` in the impl's exact
@@ -1644,26 +1911,8 @@ impl<'facts> DefinitionIndex<'facts> {
         // -> library crate-root binding, so a `dep_crate::…` qualified call can
         // be confined to that crate's definitions. A name shared by two crate
         // directories is marked ambiguous (`None`) — never a wrong binding.
-        let mut crate_name_roots: BTreeMap<String, Option<String>> = BTreeMap::new();
-        for path in facts_by_file.keys() {
-            let (prefix, _) = split_crate_prefix(path);
-            if prefix.is_empty() {
-                continue;
-            }
-            let Some(name) = crate_name_of(path) else {
-                continue;
-            };
-            let lib_root = format!("{prefix}::lib");
-            match crate_name_roots.get(&name) {
-                None => {
-                    crate_name_roots.insert(name, Some(lib_root));
-                }
-                Some(Some(existing)) if *existing != lib_root => {
-                    crate_name_roots.insert(name, None);
-                }
-                _ => {}
-            }
-        }
+        // Shared with the #443 CONSTRUCTS resolution pass via one helper.
+        let crate_name_roots = build_crate_name_roots(facts_by_file);
 
         // Resolve every recorded `impl Trait for Type` relation to the trait's
         // crate-root-relative qualified name via the repo-wide impl-target
