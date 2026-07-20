@@ -1372,6 +1372,8 @@ cargo test --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+CI (`.github/workflows/ci.yml`) runs this same matrix on every pull request and every push to trunk: a fast fmt + clippy job, and a test-config matrix (default, `--no-default-features`, `--features nova`, `--all-features`) on `ubuntu-latest`. Running the matrix locally remains the pre-push practice — CI is the backstop, not a substitute.
+
 For ingestion work, also test against a temporary AletheiaDB data dir before touching the shared memory store.
 
 ### Toolchain pin
