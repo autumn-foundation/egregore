@@ -99,12 +99,12 @@ const ALL_EDGE_LABELS: &[EdgeLabel] = &[
 const fn is_integrity_checked_evidence_edge(label: EdgeLabel) -> bool {
     use EdgeLabel::{
         Aggregates, AuthoredBy, Calls, CapturedFrom, ChangedIn, ClosesAcceptanceCriterion,
-        Constructs, Contains, Contradicts, DecidedOn, Defines, DriftsFrom, DriftsPrior, EmittedDuring,
-        ExplainsChange, ExternalHandle, FailedOn, FingerprintedAs, FrameResolvesTo, HasEvidence,
-        Implements, Imports, MaterializedAs, MeasuredBy, Mentions, MentionsSymbol, MergedAs,
-        Observes, OwnedByTask, ParentOf, ProducedEvidence, ProducedPatch, PromptedFor, ProposedBy,
-        References, ReferencesTask, RelatesTo, RequestedReviewFrom, ReviewedBy, ReviewsCommit,
-        RevokedBy, ScopedToRepo, SessionOf, Supersedes, TouchedFile, TouchesFile,
+        Constructs, Contains, Contradicts, DecidedOn, Defines, DriftsFrom, DriftsPrior,
+        EmittedDuring, ExplainsChange, ExternalHandle, FailedOn, FingerprintedAs, FrameResolvesTo,
+        HasEvidence, Implements, Imports, MaterializedAs, MeasuredBy, Mentions, MentionsSymbol,
+        MergedAs, Observes, OwnedByTask, ParentOf, ProducedEvidence, ProducedPatch, PromptedFor,
+        ProposedBy, References, ReferencesTask, RelatesTo, RequestedReviewFrom, ReviewedBy,
+        ReviewsCommit, RevokedBy, ScopedToRepo, SessionOf, Supersedes, TouchedFile, TouchesFile,
         TransitionsReview, ValidatedBy,
     };
     match label {
@@ -146,9 +146,8 @@ const fn is_integrity_checked_evidence_edge(label: EdgeLabel) -> bool {
         // NOT CHECKED — code-graph structural topology (that is #103's job) and
         // intra-agent-memory organizational scaffolding; never grounding evidence.
         Contains | Defines | Imports | References | Calls | Implements | Mentions | ChangedIn
-        | Constructs | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy | SessionOf | AuthoredBy => {
-            false
-        }
+        | Constructs | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy | SessionOf
+        | AuthoredBy => false,
     }
 }
 
