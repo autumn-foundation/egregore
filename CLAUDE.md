@@ -174,10 +174,13 @@ reproduces the `eg inspect` totals and per-domain/kind/schema-version counts
 (parity holds for stores without retractions). Lines are sorted and `\n`-joined
 as `Graph::to_jsonl` does, so repeated exports of an unchanged store are
 byte-identical. The one deliberate deviation from "every physical record": a
-record hidden by `eg forget` (#231) is never re-emitted (every physical version
-of the retracted id is dropped, fail-closed on privacy), while its `Retraction`
-event and tombstone audit trail are preserved — so a re-ingested forget-export
-is `eg validate`-clean. Unknown `(domain, kind, schema_version)` records (only
+record hidden by `eg forget` (#231) OR `eg forget-repo` eviction (#248) is never
+re-emitted (every physical version of the suppressed id is dropped, fail-closed
+on privacy, AND any surviving edge whose source/target endpoint is a suppressed
+id is dropped — the JSONL analog of the serving read's liveness, so no live edge
+strands on a vanished node), while its `Retraction`/eviction event and tombstone
+audit trail are preserved — so a re-ingested export of a store containing
+retractions and/or evictions is `eg validate`-clean. Unknown `(domain, kind, schema_version)` records (only
 bumped versions of known kinds, since ingest rejects unknown kinds at the write
 path) re-emit their reconstructed canonical line verbatim; a record that cannot
 be reconstructed (a required prop absent — only reachable via artificial raw
