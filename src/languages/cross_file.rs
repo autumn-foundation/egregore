@@ -183,6 +183,34 @@ pub struct ConstructSiteFact {
     pub span: SourceSpan,
 }
 
+/// One route-registration reference found inside a `routes![…]` macro
+/// invocation (issue #445).
+///
+/// The registering symbol is the enclosing fn/method that owns the macro call;
+/// the handler reference is a bare identifier the macro registers. Resolution to
+/// the handler's definition Symbol — minting a `REGISTERS_ROUTE` edge — happens
+/// in the repo-wide [`cross_file_route_records`] pass, mirroring the CALLS/
+/// CONSTRUCTS resolution model (unique resolution only).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteRegistrationFact {
+    /// Stable record ID of the registering Symbol node (the enclosing fn/method).
+    pub owner_id: String,
+    /// Qualified name of the registering symbol.
+    pub owner_name: String,
+    /// Handler reference as written in the macro (e.g. `list_contacts`).
+    pub handler_display: String,
+    /// Normalized handler-name path segments. In this slice each reference is a
+    /// bare single-segment identifier (the simple handler name).
+    pub handler_segments: Vec<String>,
+    /// How the handler reference's leading segment names its crate scope; always
+    /// `Unqualified` in this slice. `#[serde(default)]` so a pre-#445 cache
+    /// deserializes to `Unqualified`.
+    #[serde(default)]
+    pub path_root: CallPathRoot,
+    /// Source span of the handler identifier token.
+    pub span: SourceSpan,
+}
+
 /// One out-of-line module declaration (`mod name;`) exported for the
 /// repo-wide out-of-line test-scope pass (issue #223).
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -363,6 +391,10 @@ pub struct FileFacts {
     /// (issue #443).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub construct_sites: Vec<ConstructSiteFact>,
+    /// Route-registration references found inside `routes![…]` macro
+    /// invocations in recorded symbol bodies (issue #445).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_registration_sites: Vec<RouteRegistrationFact>,
     /// Out-of-line module declarations in the file (issue #223).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub out_of_line_mods: Vec<OutOfLineModFact>,
@@ -391,6 +423,7 @@ impl FileFacts {
         self.definitions.is_empty()
             && self.call_sites.is_empty()
             && self.construct_sites.is_empty()
+            && self.route_registration_sites.is_empty()
             && self.out_of_line_mods.is_empty()
             && self.impl_targets.is_empty()
             && self.pending_impls.is_empty()
