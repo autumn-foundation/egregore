@@ -6,7 +6,10 @@ use crate::error::Result;
 ///
 /// 6→7: issue #443 adds the `CONSTRUCTS` struct-literal edge label and the
 /// optional `is_exhaustive` marker field on edge records.
-pub const SCHEMA_VERSION: u32 = 7;
+/// 7→8: issue #445 adds the `REGISTERS_ROUTE` route-registration edge label and
+/// the optional `route` route-annotation field (method + path) on `Symbol`
+/// nodes.
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Schema version for agent-memory records (`Agent`, `AgentSession`, `Observation`, etc.).
 /// Documented in `docs/schema/agent-memory.md`.
@@ -1193,6 +1196,15 @@ pub enum GraphRecord {
         /// per `docs/schema/schema-versioning.md §2`; never an identity input.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content_signature: Option<String>,
+        // ── Route-annotation facts (issue #445) ───────────────────────────────
+        /// Routing attributes (`#[get("/path")]`, `#[post("/path")]`, …)
+        /// captured on a handler `Symbol` node: each entry pairs the HTTP method
+        /// (the uppercased attribute name) with the first string-literal path in
+        /// the attribute. A handler may carry several method attributes, so this
+        /// is a vector. Absent on nodes with no routing attribute. Additive per
+        /// `docs/schema/schema-versioning.md §2`; never an identity input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<Vec<RouteAnnotation>>,
         /// Git and bitemporal provenance for history-backed records.
         #[serde(skip_serializing_if = "Option::is_none")]
         temporal: Option<TemporalMetadata>,
@@ -1724,6 +1736,7 @@ impl GraphRecord {
             call_context: None,
             note: None,
             content_signature: None,
+            route: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1850,6 +1863,7 @@ impl GraphRecord {
             call_context: None,
             note: None,
             content_signature: None,
+            route: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1975,6 +1989,7 @@ impl GraphRecord {
             call_context: None,
             note: None,
             content_signature: None,
+            route: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -2105,6 +2120,7 @@ impl GraphRecord {
             call_context: None,
             note: None,
             content_signature: None,
+            route: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -2510,6 +2526,29 @@ impl GraphRecord {
             Self::Node {
                 content_signature, ..
             } => content_signature.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches route-annotation facts (`#[get("/path")]`, …) to a handler
+    /// `Symbol` node (issue #445). The value is additive metadata per
+    /// `docs/schema/schema-versioning.md §2` and MUST NOT contribute to stable
+    /// ID composition. No-op on non-node records or an empty annotation list.
+    #[must_use]
+    pub fn with_route(mut self, annotations: Vec<RouteAnnotation>) -> Self {
+        if let Self::Node { route, .. } = &mut self {
+            if !annotations.is_empty() {
+                *route = Some(annotations);
+            }
+        }
+        self
+    }
+
+    /// Returns the route-annotation facts when present (issue #445).
+    #[must_use]
+    pub fn route(&self) -> Option<&[RouteAnnotation]> {
+        match self {
+            Self::Node { route, .. } => route.as_deref(),
             Self::Edge { .. } | Self::Tombstone { .. } => None,
         }
     }
@@ -3350,6 +3389,10 @@ pub enum EdgeLabel {
     /// constructed type's definition Symbol (issue #443). Code-graph topology,
     /// not an evidence link.
     Constructs,
+    /// A route-registration macro invocation (`routes![handler_a, handler_b]`):
+    /// the Symbol owning the registration site → each registered handler Symbol
+    /// (issue #445). Code-graph topology, not an evidence link.
+    RegistersRoute,
 }
 
 impl EdgeLabel {
@@ -3405,6 +3448,7 @@ impl EdgeLabel {
             "FRAME_RESOLVES_TO" => Some(Self::FrameResolvesTo),
             "EMITTED_DURING" => Some(Self::EmittedDuring),
             "CONSTRUCTS" => Some(Self::Constructs),
+            "REGISTERS_ROUTE" => Some(Self::RegistersRoute),
             _ => None,
         }
     }
@@ -3467,6 +3511,7 @@ impl EdgeLabel {
                 | Self::DriftsPrior
                 | Self::MeasuredBy
                 | Self::Constructs
+                | Self::RegistersRoute
         )
     }
 
@@ -3522,8 +3567,23 @@ impl EdgeLabel {
             Self::FrameResolvesTo => "FRAME_RESOLVES_TO",
             Self::EmittedDuring => "EMITTED_DURING",
             Self::Constructs => "CONSTRUCTS",
+            Self::RegistersRoute => "REGISTERS_ROUTE",
         }
     }
+}
+
+/// One routing-attribute fact captured on a handler `Symbol` node (issue #445).
+///
+/// `method` is the uppercased attribute identifier (`GET`, `POST`, `PUT`,
+/// `DELETE`, `PATCH`, `HEAD`, `OPTIONS`); `path` is the first string-literal
+/// argument inside the attribute (`/api/v1/contacts`). Additive metadata; never
+/// an identity input.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct RouteAnnotation {
+    /// HTTP method, uppercased from the attribute identifier.
+    pub method: String,
+    /// Route path, the first string literal in the attribute.
+    pub path: String,
 }
 
 /// Source byte and line span for syntax-backed records.

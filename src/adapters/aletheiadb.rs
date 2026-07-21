@@ -20,8 +20,8 @@ use crate::{
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
         EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, IdentitySource, MetricKind, NodeKind,
-        Producer, SelectionBasis, SemanticDriftMetadata, SourceSpan, TemporalMetadata,
-        UserContextFields,
+        Producer, RouteAnnotation, SelectionBasis, SemanticDriftMetadata, SourceSpan,
+        TemporalMetadata, UserContextFields,
     },
 };
 use ::aletheiadb::api::transaction::WriteOps;
@@ -2196,6 +2196,7 @@ impl EmbeddedAletheiaSink {
             call_context,
             note,
             content_signature,
+            route,
             temporal,
             semantic_drift,
             evidence_links,
@@ -2320,6 +2321,11 @@ impl EmbeddedAletheiaSink {
         builder = insert_optional(builder, "call_context", call_context.as_deref());
         builder = insert_optional(builder, "note", note.as_deref());
         builder = insert_optional(builder, "content_signature", content_signature.as_deref());
+        if let Some(route) = route
+            && let Ok(json) = serde_json::to_string(route)
+        {
+            builder = builder.insert("route_json", json.as_str());
+        }
         builder = insert_temporal(builder, temporal.as_ref());
         builder = insert_semantic_drift(builder, semantic_drift.as_deref());
         builder = insert_optional(builder, "node_valid_time", valid_time.as_deref());
@@ -3056,6 +3062,11 @@ impl EmbeddedAletheiaSink {
                 "content_signature",
                 node.get_property("content_signature"),
             )?,
+            route: optional_str_property(record_id, "route_json", node.get_property("route_json"))?
+                .as_deref()
+                .map(serde_json::from_str::<Vec<RouteAnnotation>>)
+                .transpose()
+                .map_err(|e| read_back_error(record_id, format!("route_json invalid: {e}")))?,
             temporal: temporal_from_properties(record_id, |key| node.get_property(key))?,
             semantic_drift: semantic_drift_from_properties(record_id, |key| {
                 node.get_property(key)
@@ -4336,6 +4347,8 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "EMITTED_DURING" => Ok(EdgeLabel::EmittedDuring),
         // Struct-literal construction edge (issue #443).
         "CONSTRUCTS" => Ok(EdgeLabel::Constructs),
+        // Route-registration edge (issue #445).
+        "REGISTERS_ROUTE" => Ok(EdgeLabel::RegistersRoute),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded edge label {label}"),

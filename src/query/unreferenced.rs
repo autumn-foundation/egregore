@@ -33,11 +33,21 @@ pub const UNREFERENCED_REFERENCE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::Imports,
     EdgeLabel::Mentions,
     EdgeLabel::References,
+    // A `REGISTERS_ROUTE` edge (issue #445) from a `routes![…]` registration
+    // site is a real inbound reference, so an attribute-routed handler is not
+    // flagged as dead / test-only.
+    EdgeLabel::RegistersRoute,
 ];
 
 /// Stable wire strings for [`UNREFERENCED_REFERENCE_LABELS`], sorted.
-pub const UNREFERENCED_REFERENCE_CLASS_NAMES: &[&str] =
-    &["CALLS", "IMPLEMENTS", "IMPORTS", "MENTIONS", "REFERENCES"];
+pub const UNREFERENCED_REFERENCE_CLASS_NAMES: &[&str] = &[
+    "CALLS",
+    "IMPLEMENTS",
+    "IMPORTS",
+    "MENTIONS",
+    "REFERENCES",
+    "REGISTERS_ROUTE",
+];
 
 /// Extraction-completeness caveat attached to a candidate whose file scope
 /// contains extractor `Diagnostic` markers (issue #87 semantics).

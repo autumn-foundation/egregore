@@ -222,6 +222,10 @@ pub fn orientation_map(
                 // A struct-literal `CONSTRUCTS` edge (issue #443) is code
                 // topology and counts toward a type's inbound reference degree.
                 | EdgeLabel::Constructs
+                // A `REGISTERS_ROUTE` edge (issue #445) is code topology and
+                // counts toward a handler's inbound reference degree, so an
+                // attribute-routed handler is not misclassified as dead.
+                | EdgeLabel::RegistersRoute
         )
     };
 

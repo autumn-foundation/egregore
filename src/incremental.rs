@@ -124,11 +124,16 @@ use crate::{
 /// `FileFacts.construct_sites` field changes the cached per-file fact shape, so
 /// per-file caches must rebuild to emit the CONSTRUCTS edges instead of
 /// replaying pre-#443 facts that carried none.
+/// 24 -> 25: #445 route-registration facts. The new
+/// `FileFacts.route_registration_sites` field and the route attributes captured
+/// on Symbol facts change the cached per-file fact shape, so per-file caches
+/// must rebuild to emit the REGISTERS_ROUTE edges and route annotations instead
+/// of replaying pre-#445 facts that carried none.
 ///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 24;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 25;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

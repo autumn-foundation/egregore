@@ -101,6 +101,7 @@ const ALL_EDGE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::FrameResolvesTo,
     EdgeLabel::EmittedDuring,
     EdgeLabel::Constructs,
+    EdgeLabel::RegistersRoute,
 ];
 
 /// True if this edge is a cross-domain evidence/provenance edge the witness
@@ -114,9 +115,9 @@ const fn is_evidence_path_edge(label: EdgeLabel) -> bool {
         EmittedDuring, ExplainsChange, ExternalHandle, FailedOn, FingerprintedAs, FrameResolvesTo,
         HasEvidence, Implements, Imports, MaterializedAs, MeasuredBy, Mentions, MentionsSymbol,
         MergedAs, Observes, OwnedByTask, ParentOf, ProducedEvidence, ProducedPatch, PromptedFor,
-        ProposedBy, References, ReferencesTask, RelatesTo, RequestedReviewFrom, ReviewedBy,
-        ReviewsCommit, RevokedBy, ScopedToRepo, SessionOf, Supersedes, TouchedFile, TouchesFile,
-        TransitionsReview, ValidatedBy,
+        ProposedBy, References, ReferencesTask, RegistersRoute, RelatesTo, RequestedReviewFrom,
+        ReviewedBy, ReviewsCommit, RevokedBy, ScopedToRepo, SessionOf, Supersedes, TouchedFile,
+        TouchesFile, TransitionsReview, ValidatedBy,
     };
     match label {
         // TRAVERSED — cross-domain evidence / provenance / grounding edges.
@@ -155,11 +156,12 @@ const fn is_evidence_path_edge(label: EdgeLabel) -> bool {
         | Aggregates => true,
         // EXCLUDED — code-graph structural topology (that is the CALLS-walker
         // lane's job) and intra-agent-memory organizational scaffolding; not
-        // grounding evidence. `Constructs` (issue #443) is code-graph topology,
-        // same lane as `Calls`/`References`/`Contains`.
+        // grounding evidence. `Constructs` (issue #443) and `RegistersRoute`
+        // (issue #445) are code-graph topology, same lane as
+        // `Calls`/`References`/`Contains`.
         Contains | Defines | Imports | References | Calls | Implements | Mentions | ChangedIn
-        | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy | SessionOf | AuthoredBy
-        | Constructs => false,
+        | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy | SessionOf | AuthoredBy | Constructs
+        | RegistersRoute => false,
     }
 }
 
@@ -1241,7 +1243,7 @@ mod tests {
             ALL_EDGE_LABELS.len(),
             "traversed + excluded must cover every EdgeLabel variant exactly once"
         );
-        assert_eq!(ALL_EDGE_LABELS.len(), 48, "EdgeLabel has 48 variants");
+        assert_eq!(ALL_EDGE_LABELS.len(), 49, "EdgeLabel has 49 variants");
         // No overlap between the two class lists.
         for label in &traversed {
             assert!(!excluded.contains(label), "{label} in both classes");
@@ -1256,6 +1258,7 @@ mod tests {
         assert!(excluded.contains(&"DEFINES".to_owned()));
         assert!(excluded.contains(&"AUTHORED_BY".to_owned()));
         assert!(excluded.contains(&"CONSTRUCTS".to_owned()));
+        assert!(excluded.contains(&"REGISTERS_ROUTE".to_owned()));
 
         // (c) the AC2-named example labels are all traversed.
         for label in [

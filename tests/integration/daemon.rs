@@ -4406,7 +4406,8 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::Mentions
         | EdgeLabel::ChangedIn
         | EdgeLabel::ParentOf
-        | EdgeLabel::Constructs => "code-graph-internal",
+        | EdgeLabel::Constructs
+        | EdgeLabel::RegistersRoute => "code-graph-internal",
         // Semantic drift registry: documented in docs/schema/semantic-drift.md
         EdgeLabel::DriftsFrom | EdgeLabel::DriftsPrior | EdgeLabel::MeasuredBy => {
             "semantic-domain-registry"
