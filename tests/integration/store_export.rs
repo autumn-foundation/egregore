@@ -20,9 +20,12 @@ use std::{fs, path::Path};
 
 #[cfg(feature = "embedded-aletheiadb")]
 use aletheia_egregore::{
-    GraphRecord, NodeKind, SCHEMA_VERSION,
-    adapters::records_from_jsonl,
-    ir::{AGENT_MEMORY_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION},
+    EdgeLabel, GraphRecord, IdentitySource, NodeKind, RepositoryIdentityPayload, SCHEMA_VERSION,
+    SourceSpan,
+    adapters::{EmbeddedAletheiaSink, records_from_jsonl},
+    ir::{
+        AGENT_MEMORY_SCHEMA_VERSION, Graph, PROJECT_SCHEMA_VERSION, ScanCoveragePayload, stable_id,
+    },
 };
 
 /// Sentinel body that `eg forget` must keep out of any export.
@@ -490,6 +493,307 @@ fn export_record_empty_store_fails_naming_the_path_and_writes_no_file() {
             data_dir.to_string_lossy().as_ref(),
         ));
     assert!(!out.exists(), "no output file on a record-empty store");
+}
+
+// ── issue #473: export after a repository eviction (#248) / forget (#231) must
+//    round-trip `eg validate` clean — no stranded/dangling edges ─────────────
+
+/// A stable `SourceSpan` for a symbol fixture.
+#[cfg(feature = "embedded-aletheiadb")]
+const fn span(start_line: usize, end_line: usize) -> SourceSpan {
+    SourceSpan {
+        start_byte: start_line * 10,
+        end_byte: end_line * 10,
+        start_line,
+        end_line,
+    }
+}
+
+/// Stable handles of a fixture repository the eviction/forget tests assert on.
+// Every field is a stable record ID, so the shared `_id` postfix is meaningful
+// rather than the redundant naming `struct_field_names` targets.
+#[cfg(feature = "embedded-aletheiadb")]
+#[allow(clippy::struct_field_names)]
+struct RepoHandles {
+    repo_id: String,
+    file_id: String,
+    symbol_id: String,
+    coverage_id: String,
+}
+
+/// Pushes one repository's code-topology subgraph — `Repository` (with remote
+/// identity so `--repo`/eviction selectors resolve), a `File` it CONTAINS, a
+/// `Symbol` the file DEFINES, and a `ScanCoverage` node the repository CONTAINS
+/// (so `missing_required_container` is exercised) — into `graph`, returning its
+/// stable handles. Every node has at least one incident edge, so re-emitting a
+/// tombstoned node alongside its citing edge is exactly the defect #473 fixes.
+#[cfg(feature = "embedded-aletheiadb")]
+fn push_repo_topology(graph: &mut Graph, display: &str, remote: &str) -> RepoHandles {
+    let repo_id = stable_id(&["repository", "remote", remote]);
+    graph.push(
+        GraphRecord::node(
+            repo_id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(display.to_owned()),
+            format!("Repository {display}"),
+        )
+        .with_repository_identity(RepositoryIdentityPayload {
+            identity_source: IdentitySource::Remote,
+            remote_url: Some(remote.to_owned()),
+            root_commit_sha: None,
+            canonical_path: None,
+            basename: display.rsplit('/').next().unwrap_or(display).to_owned(),
+        }),
+    );
+
+    let file_id = stable_id(&["node", "file", &repo_id, "src/lib.rs"]);
+    graph.push(GraphRecord::node(
+        file_id.clone(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("src/lib.rs".to_owned()),
+        format!("Rust source file src/lib.rs in {display}"),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.clone(),
+        file_id.clone(),
+        Some("1.0".to_owned()),
+        "Repository contains source file".to_owned(),
+    ));
+
+    let symbol_id = stable_id(&["node", "symbol", "function", &repo_id, "widget"]);
+    graph.push(GraphRecord::symbol(
+        symbol_id.clone(),
+        "function",
+        "src/lib.rs".to_owned(),
+        span(10, 20),
+        "widget".to_owned(),
+        format!("Rust function widget in {display}"),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id.clone(),
+        symbol_id.clone(),
+        Some("1.0".to_owned()),
+        "file defines symbol".to_owned(),
+    ));
+
+    // One ScanCoverage node the Repository CONTAINS (issue #135), so the
+    // `missing_required_container` container-integrity rule is in play.
+    let coverage_id = stable_id(&["node", "scan-coverage", &repo_id]);
+    graph.push(
+        GraphRecord::node(
+            coverage_id.clone(),
+            NodeKind::ScanCoverage,
+            None,
+            None,
+            Some("scan-coverage".to_owned()),
+            format!("scan coverage for {display}"),
+        )
+        .with_scan_coverage(ScanCoveragePayload {
+            files_walked: 1,
+            files_indexed: 1,
+            skipped_by_extension: std::collections::BTreeMap::new(),
+            indexed_languages: vec!["Rust".to_owned()],
+            coverage_complete: true,
+            coverage_generation: None,
+        }),
+    );
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.clone(),
+        coverage_id.clone(),
+        Some("1.0".to_owned()),
+        "Repository contains scan coverage".to_owned(),
+    ));
+
+    RepoHandles {
+        repo_id,
+        file_id,
+        symbol_id,
+        coverage_id,
+    }
+}
+
+/// Runs `eg forget-repo <selector> --data-dir <store> --confirm`, mirroring the
+/// invocation `tests/integration/forget_repo.rs` uses, and asserts it succeeds.
+#[cfg(feature = "embedded-aletheiadb")]
+fn forget_repo_confirm(store: &Path, selector: &str) {
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("forget-repo")
+        .arg(selector)
+        .arg("--reason")
+        .arg("offboarded customer repository")
+        .arg("--evicted-by")
+        .arg("op-1")
+        .arg("--transaction-time")
+        .arg("2026-07-01T00:00:00Z")
+        .arg("--confirm")
+        .arg("--data-dir")
+        .arg(store)
+        .assert()
+        .success();
+}
+
+/// The set of stable record IDs live in the store's current SERVING view
+/// (tombstoned records excluded) — the liveness fingerprint an export must
+/// preserve across a round-trip.
+#[cfg(feature = "embedded-aletheiadb")]
+fn live_ids(store: &Path) -> std::collections::BTreeSet<String> {
+    let sink = EmbeddedAletheiaSink::open(store).expect("store opens");
+    sink.read_all_records()
+        .expect("current serving view reads")
+        .iter()
+        .map(|record| record.id().to_owned())
+        .collect()
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn export_of_evicted_repo_round_trips_validate_clean() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph_path = temp.path().join("graph.jsonl");
+    let store_a = temp.path().join("A");
+    let out = temp.path().join("export.jsonl");
+    let store_b = temp.path().join("B");
+
+    // Two interleaved repositories, each a full code topology with edges.
+    let mut graph = Graph::new();
+    let a = push_repo_topology(
+        &mut graph,
+        "acme/widget-a",
+        "https://example.com/acme/widget-a",
+    );
+    let b = push_repo_topology(
+        &mut graph,
+        "acme/widget-b",
+        "https://example.com/acme/widget-b",
+    );
+    fs::write(&graph_path, graph.to_jsonl().expect("serialize graph")).expect("fixture writes");
+    ingest_embedded(&graph_path, &store_a);
+
+    // Evict repo A. Its every attributed record is now tombstoned in the store,
+    // while repo B stays live.
+    forget_repo_confirm(&store_a, "acme/widget-a");
+
+    // Post-eviction serving view: repo A's records are dead, repo B's live.
+    let serving_after_evict = live_ids(&store_a);
+    for id in [&a.repo_id, &a.file_id, &a.symbol_id] {
+        assert!(
+            !serving_after_evict.contains(id),
+            "evicted repo-A record {id} must be absent from the serving view"
+        );
+    }
+    for id in [&b.repo_id, &b.file_id, &b.symbol_id] {
+        assert!(
+            serving_after_evict.contains(id),
+            "surviving repo-B record {id} must remain in the serving view"
+        );
+    }
+
+    // Export the whole physical inventory back to canonical JSONL.
+    export_to(&store_a, &out);
+
+    // #473 CORE: the export must be referentially closed. Today it re-emits the
+    // evicted repo-A nodes alongside their still-present citing edges (and the
+    // eviction tombstones), so `eg validate` trips
+    // `tombstone_strands_live_edge` / `edge_to_tombstoned_record` /
+    // `dangling_edge_endpoint` / `missing_required_container`.
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("validate")
+        .arg(&out)
+        .assert()
+        .success();
+
+    // Round-trip liveness invariant: re-ingesting the export into a FRESH store
+    // reproduces the post-eviction serving view exactly — evicted repo-A records
+    // stay dead, surviving repo-B records stay live.
+    ingest_embedded(&out, &store_b);
+    let serving_reingested = live_ids(&store_b);
+    assert_eq!(
+        serving_after_evict, serving_reingested,
+        "re-ingesting the export must reproduce the post-eviction serving view"
+    );
+    // The evicted repo's ScanCoverage handle in particular must not resurface.
+    assert!(
+        !serving_reingested.contains(&a.coverage_id),
+        "evicted repo-A scan coverage must not be revived by a round-trip"
+    );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn export_of_forgotten_record_with_edges_round_trips_validate_clean() {
+    // Guards the edge-dropping half of the #473 fix on the single-`forget`
+    // (#231) path: the existing forget test uses an edge-less Observation, so a
+    // fix that only suppresses forgotten NODES (leaving their citing edges) would
+    // still pass it. Here the forgotten Observation is the target of an
+    // `OBSERVES` edge, so re-emitting it while dropping only the node body would
+    // strand the edge.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph_path = temp.path().join("graph.jsonl");
+    let data_dir = temp.path().join("store");
+    let out = temp.path().join("export.jsonl");
+
+    let mut graph = Graph::new();
+    let repo = push_repo_topology(
+        &mut graph,
+        "acme/widget-a",
+        "https://example.com/acme/widget-a",
+    );
+    // An Observation citing the repo's Symbol via an OBSERVES edge. Its ID must
+    // be agent-memory-prefixed so `eg forget` accepts it (a `codegraph:` handle
+    // is refused as a deterministic code fact).
+    let obs_id = "agent_memory:v1:obs-forget-me".to_owned();
+    graph.push(
+        GraphRecord::node(
+            obs_id.clone(),
+            NodeKind::Observation,
+            None,
+            None,
+            Some("secret".to_owned()),
+            "Observation by agent:sess".to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION),
+    );
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Observes,
+        obs_id.clone(),
+        repo.symbol_id,
+        Some("0.9".to_owned()),
+        "observation observes symbol".to_owned(),
+    ));
+    fs::write(&graph_path, graph.to_jsonl().expect("serialize graph")).expect("fixture writes");
+    ingest_embedded(&graph_path, &data_dir);
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("forget")
+        .arg(&obs_id)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--reason")
+        .arg("leaked customer name")
+        .assert()
+        .success();
+
+    export_to(&data_dir, &out);
+
+    // The forgotten Observation is dropped; its OBSERVES edge must be dropped too
+    // so validate stays clean (no `tombstone_strands_live_edge` /
+    // `edge_to_tombstoned_record`).
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("validate")
+        .arg(&out)
+        .assert()
+        .success();
 }
 
 #[cfg(not(feature = "embedded-aletheiadb"))]

@@ -21,19 +21,25 @@ pub(crate) fn export(data_dir: &Path, out: &Path) -> Result<()> {
 /// deduplication, tombstones and superseded versions included, unknown
 /// `(domain, kind, schema_version)` tuples preserved.
 ///
-/// Forget suppression. The one deliberate departure from the raw physical
-/// inventory: a record hidden by a transaction-time `eg forget` retraction
-/// (issue #231) is never re-emitted — re-exporting its body would resurface
-/// exactly the bytes forget hid, a redaction leak. A forget retraction is
-/// identified by its `Retraction` event node (`source_handle` names the
-/// retracted record) and its deterministic retraction tombstone
-/// (`retraction_tombstone_id`); the retracted ORIGINAL is dropped while the
-/// audit trail — the `Retraction` event and its `Tombstone` — is preserved.
-/// Valid-time tombstones from history replay carry neither signal and are kept
-/// (a legitimate historical fact that must round-trip). Every physical version
-/// of a retracted stable ID is dropped (fail-closed on privacy), so a
-/// forget-then-re-observe log signature is over-suppressed rather than leaked;
-/// this is the single enumerated deviation from "every physical record".
+/// Suppression. The one deliberate departure from the raw physical inventory: a
+/// record hidden by a transaction-time `eg forget` retraction (issue #231) OR an
+/// `eg forget-repo` eviction (issue #248) is never re-emitted — re-exporting its
+/// body would resurface exactly the bytes those commands hid, a redaction /
+/// eviction leak. Suppression is identified by a `Retraction` event node
+/// (`source_handle` names the target; both #231 and #248 reuse it) and the
+/// deterministic retraction (`retraction_tombstone_id`) / eviction
+/// (`eviction_tombstone_id`) tombstones; the suppressed ORIGINAL is dropped while
+/// the audit trail — the event nodes and the `Tombstone`s — is preserved. In
+/// addition, any SURVIVING edge whose source or target endpoint is a suppressed
+/// id is dropped (the JSONL analog of the serving read's liveness gate), so no
+/// live edge strands on a vanished node — this covers intra-evicted-repo edges
+/// and surviving cross-repo citations into evicted records. The result
+/// round-trips `eg validate` clean. Valid-time tombstones from history replay
+/// carry none of these signals and are kept (a legitimate historical fact that
+/// must round-trip). Every physical version of a suppressed stable ID is dropped
+/// (fail-closed on privacy), so a forget-then-re-observe log signature is
+/// over-suppressed rather than leaked; this is the single enumerated deviation
+/// from "every physical record".
 ///
 /// Determinism. Lines are sorted and joined exactly as `Graph::to_jsonl` does
 /// (sort, `\n` join, single trailing newline), and the output carries no
@@ -72,11 +78,27 @@ pub(crate) fn export_embedded_store(data_dir: &Path, out: &Path) -> Result<()> {
         );
     }
 
-    let forget_retracted = forget_retracted_ids(&report.records);
+    let suppressed = suppressed_record_ids(&report.records);
 
     let mut lines: Vec<String> = Vec::new();
     for record in &report.records {
-        if forget_retracted.contains(record.id()) {
+        // Drop every physical version of a suppressed stable ID (the retracted /
+        // evicted body). The `Retraction` / eviction event nodes and the
+        // tombstones themselves are NOT suppressed — their IDs are the event /
+        // tombstone hash, never the suppressed target — so the audit trail is
+        // preserved.
+        if suppressed.contains(record.id()) {
+            continue;
+        }
+        // A surviving edge whose source or target endpoint names a suppressed
+        // record would strand a live edge on a vanished node, tripping
+        // `eg validate` (`edge_to_tombstoned_record` / `tombstone_strands_live_edge`).
+        // Drop it — the JSONL analog of the serving read's liveness gate. This
+        // covers intra-evicted-repo edges AND surviving cross-repo citations
+        // into evicted records.
+        if let GraphRecord::Edge { source, target, .. } = record
+            && (suppressed.contains(source) || suppressed.contains(target))
+        {
             continue;
         }
         lines.push(
@@ -126,23 +148,36 @@ pub(crate) fn export_embedded_store(data_dir: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Collects the stable IDs of records suppressed by an `eg forget` retraction
-/// (issue #231), so export never re-emits a transaction-time-retracted body.
+/// Collects the stable IDs of records suppressed by an active transaction-time
+/// retraction (`eg forget`, issue #231) OR eviction (`eg forget-repo`,
+/// issue #248), so export never re-emits a body those commands hid.
 ///
-/// Two independent signals, unioned so a partially-written retraction (event
-/// without tombstone, or vice versa) still fails closed:
+/// This is the JSONL analog of the serving read's liveness gate: a record
+/// hidden by a current tombstone is not re-surfaced, and (at the callsite) any
+/// surviving edge touching a suppressed id is dropped — so the export stays
+/// re-ingestable and round-trips `eg validate` clean while preserving the audit
+/// trail (the `Retraction` / eviction event nodes and the tombstones
+/// themselves, whose own IDs are never in the suppressed set).
 ///
-/// * a `Retraction` event node whose `source_handle` names the retracted
-///   record, and
+/// Signals, unioned so a partially-written retraction/eviction (event without
+/// tombstone, or vice versa) still fails closed:
+///
+/// * a `Retraction` event node whose `source_handle` names the retracted /
+///   evicted record (both #231 and #248 reuse `NodeKind::Retraction`),
 /// * a retraction tombstone, recognized by its deterministic
-///   [`crate::forget::retraction_tombstone_id`] identity over its `deleted_id`.
+///   [`crate::forget::retraction_tombstone_id`] identity over its `deleted_id`
+///   (issue #231), and
+/// * an eviction tombstone, recognized by its deterministic
+///   [`crate::repo_evict::eviction_tombstone_id`] identity over its `deleted_id`
+///   (issue #248).
 ///
-/// Valid-time (history-replay) tombstones carry neither signal — their IDs are
-/// not the retraction-tombstone hash and no `Retraction` event names them — so
-/// the removed historical nodes they mark are preserved.
+/// Valid-time (history-replay) tombstones carry none of these signals — their
+/// IDs are neither the retraction- nor the eviction-tombstone hash and no
+/// `Retraction` event names them — so the removed historical nodes they mark are
+/// preserved.
 #[cfg(feature = "embedded-aletheiadb")]
-fn forget_retracted_ids(records: &[GraphRecord]) -> std::collections::BTreeSet<String> {
-    let mut retracted = std::collections::BTreeSet::new();
+fn suppressed_record_ids(records: &[GraphRecord]) -> std::collections::BTreeSet<String> {
+    let mut suppressed = std::collections::BTreeSet::new();
     for record in records {
         match record {
             GraphRecord::Node {
@@ -150,17 +185,18 @@ fn forget_retracted_ids(records: &[GraphRecord]) -> std::collections::BTreeSet<S
                 source_handle: Some(handle),
                 ..
             } => {
-                retracted.insert(handle.clone());
+                suppressed.insert(handle.clone());
             }
             GraphRecord::Tombstone { id, deleted_id, .. }
-                if *id == crate::forget::retraction_tombstone_id(deleted_id).0 =>
+                if *id == crate::forget::retraction_tombstone_id(deleted_id).0
+                    || *id == crate::repo_evict::eviction_tombstone_id(deleted_id).0 =>
             {
-                retracted.insert(deleted_id.clone());
+                suppressed.insert(deleted_id.clone());
             }
             _ => {}
         }
     }
-    retracted
+    suppressed
 }
 
 /// Exports a definitions-only SCIP code-intelligence index (issue #233).
