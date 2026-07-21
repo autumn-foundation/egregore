@@ -100,6 +100,7 @@ mod repair;
 mod repo_scope;
 mod resolve_frames;
 mod review_coverage;
+mod route_registration;
 mod scan_coverage;
 mod scan_logs;
 mod schema_versioning;
