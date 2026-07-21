@@ -90,7 +90,7 @@ pub(crate) const DEBT_MARKER_DISCLAIMER: &str = "Rows are advisory debt-triage l
      with this note text exists at this span — never that the surrounding \
      code is correct or incorrect.";
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn query_debt_markers_cmd(
     records: &[GraphRecord],
     path_prefix: Option<&str>,

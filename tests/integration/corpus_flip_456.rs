@@ -12,9 +12,17 @@
 //!   * reject conflicting corpus/temporal flag pairs with an
 //!     `unsupported_combination` envelope (exit 1);
 //!   * agree byte-for-byte across `--graph` and `--data-dir`.
-#![allow(missing_docs, clippy::similar_names, clippy::doc_markdown)]
+#![allow(
+    missing_docs,
+    clippy::similar_names,
+    clippy::doc_markdown,
+    clippy::too_many_lines
+)]
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use aletheia_egregore::{
     EdgeLabel, GraphRecord, NodeKind, SnapshotHead, SourceSnapshotPayload, SourceSpan,
@@ -99,9 +107,7 @@ fn seed_snapshot() -> (tempfile::TempDir, PathBuf, Ids) {
             "Repository repo-456".to_owned(),
         )
         .with_source_snapshot(SourceSnapshotPayload {
-            head: SnapshotHead::Commit {
-                sha: C2.to_owned(),
-            },
+            head: SnapshotHead::Commit { sha: C2.to_owned() },
             dirty: false,
             repository_id: repo_id.clone(),
             scanned_at: T2.to_owned(),
@@ -317,7 +323,7 @@ fn assert_unsupported(args: &[&str]) {
     );
 }
 
-fn g(path: &PathBuf) -> String {
+fn g(path: &Path) -> String {
     path.to_str().unwrap().to_owned()
 }
 
@@ -464,7 +470,10 @@ fn subsystem_default_head_anchors() {
         .iter()
         .filter_map(|r| r["record_id"].as_str())
         .collect();
-    assert!(!facts.contains(&ids.gone.as_str()), "gone excluded: {facts:?}");
+    assert!(
+        !facts.contains(&ids.gone.as_str()),
+        "gone excluded: {facts:?}"
+    );
     assert!(
         facts.contains(&ids.staying.as_str()),
         "staying present: {facts:?}"
@@ -550,7 +559,11 @@ fn symbol_keeper_default_single_head_row() {
         .collect();
     // The union would return one row per commit (c1 + c2); head-anchoring keeps
     // only the HEAD version.
-    assert_eq!(rows.len(), 1, "head-anchored keeper is a single row: {text}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "head-anchored keeper is a single row: {text}"
+    );
     assert_eq!(rows[0]["corpus_mode"], "head_anchored");
     assert_eq!(rows[0]["corpus_mode_source"], "default");
     assert_eq!(rows[0]["git_commit"], C2);
@@ -772,7 +785,13 @@ fn unsafe_sites_default_head_anchors() {
 #[test]
 fn unsafe_sites_all_history_includes_deleted() {
     let (_t, path, ids) = seed_snapshot();
-    let env = run_ok_object(&["query", "unsafe-sites", "--graph", &g(&path), "--all-history"]);
+    let env = run_ok_object(&[
+        "query",
+        "unsafe-sites",
+        "--graph",
+        &g(&path),
+        "--all-history",
+    ]);
     assert_eq!(env["corpus_mode"], "union");
     let sites: Vec<&str> = env["sites"]
         .as_array()
@@ -830,7 +849,13 @@ fn unwrap_expect_default_reports_head_anchored() {
 #[test]
 fn unwrap_expect_all_history_is_union() {
     let (_t, path, _ids) = seed_snapshot();
-    let env = run_ok_object(&["query", "unwrap-expect", "--graph", &g(&path), "--all-history"]);
+    let env = run_ok_object(&[
+        "query",
+        "unwrap-expect",
+        "--graph",
+        &g(&path),
+        "--all-history",
+    ]);
     assert_eq!(env["corpus_mode"], "union");
 }
 
@@ -859,7 +884,13 @@ fn debt_markers_default_reports_head_anchored() {
 #[test]
 fn debt_markers_all_history_is_union() {
     let (_t, path, _ids) = seed_snapshot();
-    let env = run_ok_object(&["query", "debt-markers", "--graph", &g(&path), "--all-history"]);
+    let env = run_ok_object(&[
+        "query",
+        "debt-markers",
+        "--graph",
+        &g(&path),
+        "--all-history",
+    ]);
     assert_eq!(env["corpus_mode"], "union");
 }
 

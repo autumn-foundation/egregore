@@ -110,14 +110,14 @@ pub(crate) fn query_symbol_all(
                     .map(|t| t.valid_time.as_str())
                     .or(valid_time.as_deref())
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
-                let better = best.get(id.as_str()).is_none_or(|(prev_i, prev_vt)| {
-                    match (vt, *prev_vt) {
-                        (Some(a), Some(b)) => a > b || (a == b && i > *prev_i),
-                        (Some(_), None) => true,
-                        (None, Some(_)) => false,
-                        (None, None) => i > *prev_i,
-                    }
-                });
+                let better =
+                    best.get(id.as_str())
+                        .is_none_or(|(prev_i, prev_vt)| match (vt, *prev_vt) {
+                            (Some(a), Some(b)) => a > b || (a == b && i > *prev_i),
+                            (Some(_), None) => true,
+                            (None, Some(_)) => false,
+                            (None, None) => i > *prev_i,
+                        });
                 if better {
                     best.insert(id.as_str(), (i, vt));
                 }

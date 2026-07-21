@@ -88,7 +88,7 @@ pub(crate) const UNWRAP_EXPECT_DISCLAIMER: &str = "Rows are advisory panic-risk 
      extractor facts. Each row asserts only that an unwrap/expect call exists at \
      this span in this context — never a verdict on whether it is justified.";
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn query_unwrap_expect_cmd(
     records: &[GraphRecord],
     path_prefix: Option<&str>,

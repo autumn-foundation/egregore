@@ -4340,22 +4340,18 @@ pub(crate) fn resolve_current_state_corpus(
     Option<Vec<GraphRecord>>,
 )> {
     let has_snapshot = query::store_has_source_snapshot(records);
-    let (corpus_mode, corpus_mode_source) = match query::resolve_corpus_mode(
-        has_temporal_pin,
-        at_head,
-        all_history,
-        has_snapshot,
-    ) {
-        Ok(pair) => pair,
-        Err(message) => {
-            let envelope = serde_json::json!({
-                "ok": false,
-                "error": { "code": "unsupported_combination", "message": message },
-            });
-            println!("{}", serde_json::to_string(&envelope)?);
-            std::process::exit(1);
-        }
-    };
+    let (corpus_mode, corpus_mode_source) =
+        match query::resolve_corpus_mode(has_temporal_pin, at_head, all_history, has_snapshot) {
+            Ok(pair) => pair,
+            Err(message) => {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": { "code": "unsupported_combination", "message": message },
+                });
+                println!("{}", serde_json::to_string(&envelope)?);
+                std::process::exit(1);
+            }
+        };
     let filtered: Option<Vec<GraphRecord>> =
         if matches!(corpus_mode, query::CorpusMode::HeadAnchored) {
             let non_current = query::non_head_current_record_ids(records, index);
@@ -5241,8 +5237,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 || {
                     at.map_or_else(
                         || {
-                            let recs: &[GraphRecord] =
-                                filtered.as_deref().unwrap_or(&records);
+                            let recs: &[GraphRecord] = filtered.as_deref().unwrap_or(&records);
                             query_symbol_all(
                                 recs,
                                 &name,
@@ -5664,7 +5659,14 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &[graph.as_deref(), data_dir.as_deref()],
                 owner_hint.as_deref(),
             );
-            query_context_cmd(&records, &name, freshness, supersession, at_head, all_history)
+            query_context_cmd(
+                &records,
+                &name,
+                freshness,
+                supersession,
+                at_head,
+                all_history,
+            )
         }
         QuerySubcommand::Task {
             id_or_handle,
@@ -5795,7 +5797,14 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 std::process::exit(1);
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_subsystem_cmd(&records, &prefix, at_head, all_history, format, supersession)
+            query_subsystem_cmd(
+                &records,
+                &prefix,
+                at_head,
+                all_history,
+                format,
+                supersession,
+            )
         }
         QuerySubcommand::ChangeImpact {
             handle,

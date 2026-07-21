@@ -88,7 +88,7 @@ pub(crate) const UNSAFE_SITES_DISCLAIMER: &str = "Rows are an advisory unsafe-su
      unsound. A zero count is not a safety guarantee: macro-expanded, \
      build-script, and dependency unsafe are out of this slice.";
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn query_unsafe_sites_cmd(
     records: &[GraphRecord],
     path_prefix: Option<&str>,
