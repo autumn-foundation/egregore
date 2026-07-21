@@ -2536,10 +2536,10 @@ impl GraphRecord {
     /// ID composition. No-op on non-node records or an empty annotation list.
     #[must_use]
     pub fn with_route(mut self, annotations: Vec<RouteAnnotation>) -> Self {
-        if let Self::Node { route, .. } = &mut self {
-            if !annotations.is_empty() {
-                *route = Some(annotations);
-            }
+        if let Self::Node { route, .. } = &mut self
+            && !annotations.is_empty()
+        {
+            *route = Some(annotations);
         }
         self
     }

@@ -1040,15 +1040,11 @@ fn fixture_subsystem_tombstoned_frame_target() -> (tempfile::TempDir, PathBuf) {
     let sig_alpha_edge = frame_edge(sig_alpha_id, &alpha_sym_id, FrameResolution::Resolved, 0);
 
     let mut graph = Graph::new();
-    for r in [
-        alpha_file,
-        alpha_sym,
-        alpha_sym_tombstone,
-        sig_alpha,
-        sig_alpha_edge,
-    ] {
-        graph.push(r);
-    }
+    graph.push(alpha_file);
+    graph.push(alpha_sym);
+    graph.push(alpha_sym_tombstone);
+    graph.push(sig_alpha);
+    graph.push(sig_alpha_edge);
 
     let jsonl = graph.to_jsonl().expect("serialize graph");
     fs::write(&path, jsonl).expect("write fixture");
@@ -1130,15 +1126,11 @@ fn fixture_subsystem_tombstoned_frame_edge() -> (tempfile::TempDir, PathBuf) {
     };
 
     let mut graph = Graph::new();
-    for r in [
-        alpha_file,
-        alpha_sym,
-        sig_alpha,
-        sig_alpha_edge,
-        frame_edge_tombstone,
-    ] {
-        graph.push(r);
-    }
+    graph.push(alpha_file);
+    graph.push(alpha_sym);
+    graph.push(sig_alpha);
+    graph.push(sig_alpha_edge);
+    graph.push(frame_edge_tombstone);
 
     let jsonl = graph.to_jsonl().expect("serialize graph");
     fs::write(&path, jsonl).expect("write fixture");

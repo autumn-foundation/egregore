@@ -127,7 +127,7 @@ use crate::{
 /// 24 -> 25: #445 route-registration facts. The new
 /// `FileFacts.route_registration_sites` field and the route attributes captured
 /// on Symbol facts change the cached per-file fact shape, so per-file caches
-/// must rebuild to emit the REGISTERS_ROUTE edges and route annotations instead
+/// must rebuild to emit the `REGISTERS_ROUTE` edges and route annotations instead
 /// of replaying pre-#445 facts that carried none.
 ///
 /// Independent of this version, the cache records the writing binary's
