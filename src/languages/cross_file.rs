@@ -2575,7 +2575,12 @@ mod tests {
             ),
             (
                 "src/app.rs",
-                vec![definition("build", "function", "src/app.rs", &["app", "build"])],
+                vec![definition(
+                    "build",
+                    "function",
+                    "src/app.rs",
+                    &["app", "build"],
+                )],
                 vec![route_site("build", "list_contacts")],
             ),
         ]);
@@ -2591,7 +2596,10 @@ mod tests {
             .find(|record| {
                 matches!(
                     record,
-                    GraphRecord::Edge { label: EdgeLabel::RegistersRoute, .. }
+                    GraphRecord::Edge {
+                        label: EdgeLabel::RegistersRoute,
+                        ..
+                    }
                 )
             })
             .expect("REGISTERS_ROUTE edge present");
@@ -2618,17 +2626,32 @@ mod tests {
         let facts = facts_with_routes(&[
             (
                 "src/a.rs",
-                vec![definition("a_handler", "function", "src/a.rs", &["a", "handler"])],
+                vec![definition(
+                    "a_handler",
+                    "function",
+                    "src/a.rs",
+                    &["a", "handler"],
+                )],
                 vec![],
             ),
             (
                 "src/b.rs",
-                vec![definition("b_handler", "function", "src/b.rs", &["b", "handler"])],
+                vec![definition(
+                    "b_handler",
+                    "function",
+                    "src/b.rs",
+                    &["b", "handler"],
+                )],
                 vec![],
             ),
             (
                 "src/app.rs",
-                vec![definition("build", "function", "src/app.rs", &["app", "build"])],
+                vec![definition(
+                    "build",
+                    "function",
+                    "src/app.rs",
+                    &["app", "build"],
+                )],
                 vec![route_site("build", "handler")],
             ),
         ]);
@@ -2640,7 +2663,10 @@ mod tests {
         assert!(
             !records.iter().any(|record| matches!(
                 record,
-                GraphRecord::Node { kind: NodeKind::Diagnostic, .. }
+                GraphRecord::Node {
+                    kind: NodeKind::Diagnostic,
+                    ..
+                }
             )),
             "an ambiguous registration must mint no Diagnostic (no-wrong-edge)"
         );
@@ -2650,7 +2676,12 @@ mod tests {
     fn unresolvable_route_handler_stays_unresolved_with_no_edge() {
         let facts = facts_with_routes(&[(
             "src/app.rs",
-            vec![definition("build", "function", "src/app.rs", &["app", "build"])],
+            vec![definition(
+                "build",
+                "function",
+                "src/app.rs",
+                &["app", "build"],
+            )],
             vec![route_site("build", "does_not_exist")],
         )]);
         let records = cross_file_call_records("repo", &facts);
@@ -2673,7 +2704,12 @@ mod tests {
             ),
             (
                 "src/app.rs",
-                vec![definition("build", "function", "src/app.rs", &["app", "build"])],
+                vec![definition(
+                    "build",
+                    "function",
+                    "src/app.rs",
+                    &["app", "build"],
+                )],
                 vec![route_site("build", "a"), route_site("build", "b")],
             ),
         ]);

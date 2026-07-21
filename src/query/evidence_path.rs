@@ -160,8 +160,8 @@ const fn is_evidence_path_edge(label: EdgeLabel) -> bool {
         // (issue #445) are code-graph topology, same lane as
         // `Calls`/`References`/`Contains`.
         Contains | Defines | Imports | References | Calls | Implements | Mentions | ChangedIn
-        | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy | SessionOf | AuthoredBy | Constructs
-        | RegistersRoute => false,
+        | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy | SessionOf | AuthoredBy
+        | Constructs | RegistersRoute => false,
     }
 }
 
