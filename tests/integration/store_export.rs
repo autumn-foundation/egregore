@@ -510,7 +510,10 @@ const fn span(start_line: usize, end_line: usize) -> SourceSpan {
 }
 
 /// Stable handles of a fixture repository the eviction/forget tests assert on.
+// Every field is a stable record ID, so the shared `_id` postfix is meaningful
+// rather than the redundant naming `struct_field_names` targets.
 #[cfg(feature = "embedded-aletheiadb")]
+#[allow(clippy::struct_field_names)]
 struct RepoHandles {
     repo_id: String,
     file_id: String,
@@ -762,7 +765,7 @@ fn export_of_forgotten_record_with_edges_round_trips_validate_clean() {
     graph.push(GraphRecord::edge(
         EdgeLabel::Observes,
         obs_id.clone(),
-        repo.symbol_id.clone(),
+        repo.symbol_id,
         Some("0.9".to_owned()),
         "observation observes symbol".to_owned(),
     ));
