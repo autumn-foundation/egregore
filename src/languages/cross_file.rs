@@ -1054,7 +1054,113 @@ pub fn cross_file_call_records(
         );
     }
     records.extend(cross_file_construct_records(repository_id, facts_by_file));
+    records.extend(cross_file_route_records(repository_id, facts_by_file));
     records
+}
+
+/// Computes the cross-file route-registration `REGISTERS_ROUTE` records for one
+/// scanned tree (issue #445).
+///
+/// Each [`RouteRegistrationFact`] names a handler reference registered by a
+/// `routes![…]` macro; this pass resolves that reference to a UNIQUE handler
+/// definition Symbol via the repo-wide [`DefinitionIndex`] (the same callable
+/// index CALLS uses), so it inherits CALLS's free-function pool selection and
+/// crate-root confinement. A single-segment reference resolves as a `Direct`
+/// call, a path-qualified one as a `Path` call.
+///
+/// Only a UNIQUE resolution mints an edge; an ambiguous (2+ candidate) or
+/// unresolved/external reference mints NOTHING (no edge, no diagnostic) —
+/// ambiguity never silently picks one, mirroring the CONSTRUCTS pass
+/// (no-wrong-edge doctrine). The edge runs registration-owner → handler with
+/// resolution `Resolved` and confidence `"1.0"`. Sites are collapsed per
+/// `(owner, handler)` pair. Deterministic and byte-stable.
+#[must_use]
+pub fn cross_file_route_records(
+    _repository_id: &str,
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> Vec<GraphRecord> {
+    // Reassign auxiliary-target helper modules (`tests/common/mod.rs`) to the
+    // entry crate that `mod`-includes them, exactly as
+    // [`cross_file_construct_records`] does, so a `crate::…`-scoped registration
+    // in such a helper resolves against the including entry crate.
+    let remap = reassign_aux_helper_crate_roots(facts_by_file);
+    let remapped;
+    let facts_by_file: &BTreeMap<String, FileFacts> = if remap.is_empty() {
+        facts_by_file
+    } else {
+        remapped = apply_crate_root_remap(facts_by_file, &remap);
+        &remapped
+    };
+    let index = DefinitionIndex::build(facts_by_file);
+
+    // (owner_id, handler_symbol_id) -> summary, collapsing repeated
+    // registrations between the same pair.
+    let mut edges: BTreeMap<(String, String), String> = BTreeMap::new();
+    for (path, facts) in facts_by_file {
+        let caller_crate_root = remap
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| crate_root_id(path));
+        for site in &facts.route_registration_sites {
+            let Some(simple_name) = site.handler_segments.last() else {
+                continue;
+            };
+            // Synthesize a call fact so the shared DefinitionIndex resolver
+            // applies the same free-function pool selection and crate-root
+            // confinement calls use. A single-segment reference is `Direct`; a
+            // path-qualified one is a `Path`.
+            let call_kind = if site.handler_segments.len() <= 1 {
+                CallKind::Direct
+            } else {
+                CallKind::Path
+            };
+            let synthetic = CallSiteFact {
+                caller_id: site.owner_id.clone(),
+                caller_name: site.owner_name.clone(),
+                callee_display: site.handler_display.clone(),
+                callee_segments: site.handler_segments.clone(),
+                call_kind,
+                path_root: site.path_root.clone(),
+                receiver_owner: None,
+                receiver_type: None,
+                span: site.span,
+            };
+            let candidates = index.candidates(&synthetic, simple_name, &caller_crate_root);
+            // Unique resolution ONLY (no-wrong-edge): 0 or >=2 candidates mint
+            // nothing — no edge, no diagnostic.
+            if candidates.len() != 1 {
+                continue;
+            }
+            let target = candidates[0];
+            // A registration owner and its handler are distinct Symbols, so a
+            // self-edge is unreachable; guard anyway.
+            if target.id == site.owner_id {
+                continue;
+            }
+            edges
+                .entry((site.owner_id.clone(), target.id.clone()))
+                .or_insert_with(|| {
+                    format!(
+                        "{} registers route {}",
+                        site.owner_name, site.handler_display
+                    )
+                });
+        }
+    }
+
+    edges
+        .into_iter()
+        .map(|((source, target), summary)| {
+            GraphRecord::edge(
+                EdgeLabel::RegistersRoute,
+                source,
+                target,
+                Some("1.0".to_owned()),
+                summary,
+            )
+            .with_resolution(CallResolution::Resolved)
+        })
+        .collect()
 }
 
 /// Computes the cross-file struct-literal `CONSTRUCTS` records for one scanned
@@ -2407,6 +2513,174 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    // ── Route-registration resolver ladder (issue #445) ──────────────────────
+
+    fn route_site(owner: &str, handler: &str) -> RouteRegistrationFact {
+        RouteRegistrationFact {
+            owner_id: owner.to_owned(),
+            owner_name: owner.to_owned(),
+            handler_display: handler.to_owned(),
+            handler_segments: vec![handler.to_owned()],
+            path_root: CallPathRoot::Unqualified,
+            span: span(),
+        }
+    }
+
+    fn facts_with_routes(
+        entries: &[(&str, Vec<DefinitionFact>, Vec<RouteRegistrationFact>)],
+    ) -> BTreeMap<String, FileFacts> {
+        entries
+            .iter()
+            .map(|(path, definitions, routes)| {
+                (
+                    (*path).to_owned(),
+                    FileFacts {
+                        definitions: definitions.clone(),
+                        route_registration_sites: routes.clone(),
+                        ..FileFacts::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn registers_route_targets(records: &[GraphRecord]) -> Vec<String> {
+        records
+            .iter()
+            .filter_map(|record| match record {
+                GraphRecord::Edge {
+                    label: EdgeLabel::RegistersRoute,
+                    target,
+                    ..
+                } => Some(target.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn route_registration_resolves_cross_file_same_crate_and_mints_edge() {
+        let facts = facts_with_routes(&[
+            (
+                "src/handlers.rs",
+                vec![definition(
+                    "h_list",
+                    "function",
+                    "src/handlers.rs",
+                    &["handlers", "list_contacts"],
+                )],
+                vec![],
+            ),
+            (
+                "src/app.rs",
+                vec![definition("build", "function", "src/app.rs", &["app", "build"])],
+                vec![route_site("build", "list_contacts")],
+            ),
+        ]);
+        let records = cross_file_call_records("repo", &facts);
+        assert_eq!(
+            registers_route_targets(&records),
+            vec!["h_list".to_owned()],
+            "a routes! registration must resolve cross-file to the handler and mint one edge"
+        );
+        // The edge is Resolved, confidence 1.0, and runs owner -> handler.
+        let edge = records
+            .iter()
+            .find(|record| {
+                matches!(
+                    record,
+                    GraphRecord::Edge { label: EdgeLabel::RegistersRoute, .. }
+                )
+            })
+            .expect("REGISTERS_ROUTE edge present");
+        match edge {
+            GraphRecord::Edge {
+                source,
+                target,
+                confidence,
+                ..
+            } => {
+                assert_eq!(source, "build");
+                assert_eq!(target, "h_list");
+                assert_eq!(confidence.as_deref(), Some("1.0"));
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(edge.resolution(), Some(CallResolution::Resolved));
+    }
+
+    #[test]
+    fn ambiguous_route_handler_name_stays_unbound_with_no_edge_or_diagnostic() {
+        // Two distinct free functions share the simple name `handler`, so the
+        // reference is ambiguous: mint NOTHING (no edge, no diagnostic).
+        let facts = facts_with_routes(&[
+            (
+                "src/a.rs",
+                vec![definition("a_handler", "function", "src/a.rs", &["a", "handler"])],
+                vec![],
+            ),
+            (
+                "src/b.rs",
+                vec![definition("b_handler", "function", "src/b.rs", &["b", "handler"])],
+                vec![],
+            ),
+            (
+                "src/app.rs",
+                vec![definition("build", "function", "src/app.rs", &["app", "build"])],
+                vec![route_site("build", "handler")],
+            ),
+        ]);
+        let records = cross_file_call_records("repo", &facts);
+        assert!(
+            registers_route_targets(&records).is_empty(),
+            "an ambiguous handler name must mint no REGISTERS_ROUTE edge"
+        );
+        assert!(
+            !records.iter().any(|record| matches!(
+                record,
+                GraphRecord::Node { kind: NodeKind::Diagnostic, .. }
+            )),
+            "an ambiguous registration must mint no Diagnostic (no-wrong-edge)"
+        );
+    }
+
+    #[test]
+    fn unresolvable_route_handler_stays_unresolved_with_no_edge() {
+        let facts = facts_with_routes(&[(
+            "src/app.rs",
+            vec![definition("build", "function", "src/app.rs", &["app", "build"])],
+            vec![route_site("build", "does_not_exist")],
+        )]);
+        let records = cross_file_call_records("repo", &facts);
+        assert!(
+            registers_route_targets(&records).is_empty(),
+            "an unresolvable handler reference must mint no REGISTERS_ROUTE edge"
+        );
+    }
+
+    #[test]
+    fn route_registration_records_are_byte_deterministic() {
+        let facts = facts_with_routes(&[
+            (
+                "src/handlers.rs",
+                vec![
+                    definition("h_a", "function", "src/handlers.rs", &["handlers", "a"]),
+                    definition("h_b", "function", "src/handlers.rs", &["handlers", "b"]),
+                ],
+                vec![],
+            ),
+            (
+                "src/app.rs",
+                vec![definition("build", "function", "src/app.rs", &["app", "build"])],
+                vec![route_site("build", "a"), route_site("build", "b")],
+            ),
+        ]);
+        let first = cross_file_route_records("repo", &facts);
+        let second = cross_file_route_records("repo", &facts);
+        assert_eq!(first, second, "repeated resolution must be byte-identical");
+        assert_eq!(registers_route_targets(&first).len(), 2);
     }
 
     #[test]
