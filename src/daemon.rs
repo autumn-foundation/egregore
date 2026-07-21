@@ -7661,8 +7661,11 @@ const ACTION_DROP_DUPLICATE: &str = "dropped_redundant_duplicate";
 const ACTION_FINALIZE_PARTIAL: &str = "finalized_partial";
 const ACTION_REPORTED_MANUAL: &str = "reported_manual";
 
-/// Where the runtime idempotency file lives for a data dir (non-creating).
-fn idempotency_file_path(data_dir: &Path) -> PathBuf {
+/// Where the runtime idempotency (write-receipt) file lives for a data dir.
+///
+/// Non-creating: resolves the path without touching the filesystem.
+#[must_use]
+pub fn idempotency_file_path(data_dir: &Path) -> PathBuf {
     runtime_dir(data_dir).join(IDEMPOTENCY_FILE)
 }
 
@@ -7978,6 +7981,99 @@ fn refuse_if_store_owned(data_dir: &Path) -> std::result::Result<(), WriteReceip
     Ok(())
 }
 
+/// The stable skipped-reason for a non-repairable anomaly class.
+const fn manual_skip_reason(class: WriteReceiptAnomalyClass) -> &'static str {
+    match class {
+        WriteReceiptAnomalyClass::ConflictingCommitted => "conflicting_committed_manual_repair",
+        WriteReceiptAnomalyClass::DuplicateRecordIds => "ambiguous_duplicate_content",
+        WriteReceiptAnomalyClass::PartialCommitted => "partial_records_not_all_committed",
+    }
+}
+
+/// Applies the provably-safe repair for each detected anomaly (or projects the
+/// dry-run outcome when `confirm` is false). The caller must already hold the
+/// exclusive store lease. Returns the outcomes and whether the file was mutated.
+fn apply_receipt_repairs(
+    data_dir: &Path,
+    anomalies: &[WriteReceiptAnomaly],
+    confirm: bool,
+) -> std::result::Result<(Vec<WriteReceiptRepairOutcome>, bool), WriteReceiptRepairError> {
+    let mut outcomes = Vec::new();
+    let mut mutated = false;
+    if anomalies.is_empty() {
+        return Ok((outcomes, mutated));
+    }
+
+    // Reload the receipt file to mutate it through the durable write path.
+    let path = idempotency_file_path(data_dir);
+    let file = read_idempotency_file_direct(&path)?.unwrap_or_default();
+    let mut store = IdempotencyStore::load(path)
+        .map_err(|error| WriteReceiptRepairError::Persist(error.to_string()))?;
+
+    for anomaly in anomalies {
+        let Some(entry) = file.entries.get(&anomaly.idempotency_key) else {
+            continue;
+        };
+        let before_hash = receipt_entry_hash(entry);
+        let IdempotencyEntry::Pending {
+            payload_hash,
+            record_ids,
+            records,
+        } = entry
+        else {
+            continue;
+        };
+
+        if !anomaly.structurally_repairable {
+            outcomes.push(WriteReceiptRepairOutcome {
+                idempotency_key: anomaly.idempotency_key.clone(),
+                class: anomaly.class,
+                action: ACTION_REPORTED_MANUAL,
+                applied: false,
+                before_hash,
+                after_hash: None,
+                skipped_reason: Some(manual_skip_reason(anomaly.class)),
+            });
+            continue;
+        }
+
+        let (action, new_entry) = match anomaly.class {
+            WriteReceiptAnomalyClass::DuplicateRecordIds => (
+                ACTION_DROP_DUPLICATE,
+                deduplicated_entry(payload_hash, record_ids, records),
+            ),
+            WriteReceiptAnomalyClass::PartialCommitted => (
+                ACTION_FINALIZE_PARTIAL,
+                finalized_entry(payload_hash, record_ids),
+            ),
+            // Conflicting is never structurally_repairable, handled above.
+            WriteReceiptAnomalyClass::ConflictingCommitted => continue,
+        };
+        let after_hash = receipt_entry_hash(&new_entry);
+
+        let (applied, skipped_reason) = if confirm {
+            store
+                .set_entry_durably(anomaly.idempotency_key.clone(), new_entry)
+                .map_err(|error| WriteReceiptRepairError::Persist(error.to_string()))?;
+            mutated = true;
+            (true, None)
+        } else {
+            (false, Some("dry_run"))
+        };
+        outcomes.push(WriteReceiptRepairOutcome {
+            idempotency_key: anomaly.idempotency_key.clone(),
+            class: anomaly.class,
+            action,
+            applied,
+            before_hash,
+            after_hash: Some(after_hash),
+            skipped_reason,
+        });
+    }
+
+    Ok((outcomes, mutated))
+}
+
 /// Repairs write-receipt anomalies. LEASE-AWARE.
 ///
 /// Refuses (returns [`WriteReceiptRepairError::StoreContended`]) before any
@@ -8007,111 +8103,19 @@ pub fn repair_write_receipts(
 
     // Gate 1: crashed/stale holder. Gate 2: live holder (the lease itself).
     refuse_if_store_owned(data_dir)?;
-    let lease = match StoreLease::try_acquire(data_dir)
+    let Some(_lease) = StoreLease::try_acquire(data_dir)
         .map_err(|error| WriteReceiptRepairError::StoreUnreadable(error.to_string()))?
-    {
-        Some(lease) => lease,
-        None => {
-            let holder = live_daemon_holder_hint(data_dir)
-                .unwrap_or_else(|| "an active embedded store lease holder".to_owned());
-            return Err(WriteReceiptRepairError::StoreContended { holder });
-        }
+    else {
+        let holder = live_daemon_holder_hint(data_dir)
+            .unwrap_or_else(|| "an active embedded store lease holder".to_owned());
+        return Err(WriteReceiptRepairError::StoreContended { holder });
     };
-    // Hold the lease for the whole window.
-    let _lease = lease;
+    // `_lease` holds the exclusive lease for the whole window.
 
     // Before-scan against the LIVE store (safe: we hold the exclusive lease).
     let before = scan_under_held_lease(data_dir)?;
 
-    let mut outcomes = Vec::new();
-    let mut mutated = false;
-
-    if !before.anomalies.is_empty() {
-        // Reload the receipt file to mutate it through the durable write path.
-        let path = idempotency_file_path(data_dir);
-        let file = read_idempotency_file_direct(&path)?.unwrap_or_default();
-        let mut store = IdempotencyStore::load(path)
-            .map_err(|error| WriteReceiptRepairError::Persist(error.to_string()))?;
-
-        for anomaly in &before.anomalies {
-            let Some(entry) = file.entries.get(&anomaly.idempotency_key) else {
-                continue;
-            };
-            let before_hash = receipt_entry_hash(entry);
-            let IdempotencyEntry::Pending {
-                payload_hash,
-                record_ids,
-                records,
-            } = entry
-            else {
-                continue;
-            };
-
-            if !anomaly.structurally_repairable {
-                let skipped_reason = match anomaly.class {
-                    WriteReceiptAnomalyClass::ConflictingCommitted => {
-                        Some("conflicting_committed_manual_repair")
-                    }
-                    WriteReceiptAnomalyClass::DuplicateRecordIds => {
-                        Some("ambiguous_duplicate_content")
-                    }
-                    WriteReceiptAnomalyClass::PartialCommitted => {
-                        Some("partial_records_not_all_committed")
-                    }
-                };
-                outcomes.push(WriteReceiptRepairOutcome {
-                    idempotency_key: anomaly.idempotency_key.clone(),
-                    class: anomaly.class,
-                    action: ACTION_REPORTED_MANUAL,
-                    applied: false,
-                    before_hash,
-                    after_hash: None,
-                    skipped_reason,
-                });
-                continue;
-            }
-
-            let (action, new_entry) = match anomaly.class {
-                WriteReceiptAnomalyClass::DuplicateRecordIds => (
-                    ACTION_DROP_DUPLICATE,
-                    deduplicated_entry(payload_hash, record_ids, records),
-                ),
-                WriteReceiptAnomalyClass::PartialCommitted => (
-                    ACTION_FINALIZE_PARTIAL,
-                    finalized_entry(payload_hash, record_ids),
-                ),
-                // Conflicting is never structurally_repairable, handled above.
-                WriteReceiptAnomalyClass::ConflictingCommitted => continue,
-            };
-            let after_hash = receipt_entry_hash(&new_entry);
-
-            if opts.confirm {
-                store
-                    .set_entry_durably(anomaly.idempotency_key.clone(), new_entry)
-                    .map_err(|error| WriteReceiptRepairError::Persist(error.to_string()))?;
-                mutated = true;
-                outcomes.push(WriteReceiptRepairOutcome {
-                    idempotency_key: anomaly.idempotency_key.clone(),
-                    class: anomaly.class,
-                    action,
-                    applied: true,
-                    before_hash,
-                    after_hash: Some(after_hash),
-                    skipped_reason: None,
-                });
-            } else {
-                outcomes.push(WriteReceiptRepairOutcome {
-                    idempotency_key: anomaly.idempotency_key.clone(),
-                    class: anomaly.class,
-                    action,
-                    applied: false,
-                    before_hash,
-                    after_hash: Some(after_hash),
-                    skipped_reason: Some("dry_run"),
-                });
-            }
-        }
-    }
+    let (outcomes, mutated) = apply_receipt_repairs(data_dir, &before.anomalies, opts.confirm)?;
 
     let post_scan = if mutated {
         Some(scan_under_held_lease(data_dir)?)
@@ -14438,10 +14442,7 @@ mod tests {
         build_receipt_store(&data_dir, std::slice::from_ref(&node));
 
         let mut entries = BTreeMap::new();
-        entries.insert(
-            "key-partial-ok".to_owned(),
-            pending_entry(vec![node.clone()]),
-        );
+        entries.insert("key-partial-ok".to_owned(), pending_entry(vec![node]));
         write_receipt_file(&data_dir, entries);
 
         let path = idempotency_file_path(&data_dir);

@@ -38,8 +38,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::{
-    DAEMON_RUNTIME_SCHEMA_VERSION, DaemonMetadata, DaemonState, StoreLease, active_metadata,
-    runtime_dir_for_data_dir, runtime_metadata_is_stale_noncreating, try_read_raw_metadata,
+    DAEMON_RUNTIME_SCHEMA_VERSION, DaemonMetadata, DaemonState, StoreLease,
+    WriteReceiptRepairError, WriteReceiptRepairOptions, WriteReceiptRepairReport, active_metadata,
+    repair_write_receipts, runtime_dir_for_data_dir, runtime_metadata_is_stale_noncreating,
+    scan_write_receipts, try_read_raw_metadata,
 };
 
 /// Schema version for repair report records.
@@ -96,6 +98,12 @@ pub enum RepairAction {
     StaleMetadataQuarantine,
     /// Write a machine-readable recovery report to the runtime directory.
     RecoveryReportGeneration,
+    /// Enumerate write-receipt (idempotency) anomalies without mutating them
+    /// (issue #460 / #72 AC5).
+    WriteReceiptRepairEnumerate,
+    /// Apply the provably-safe write-receipt (idempotency) repairs
+    /// (issue #460 / #72 AC6).
+    WriteReceiptRepairApply,
 }
 
 /// Stable machine-readable result of a single manifest action.
@@ -143,6 +151,7 @@ pub struct RepairManifestEntry {
 
 /// Operator-selected options for [`run_repair_with`].
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)] // independent operator flags, not a state machine
 pub struct RepairOptions {
     /// Preview mode: plan the actions and return without any mutation.
     pub dry_run: bool,
@@ -153,6 +162,10 @@ pub struct RepairOptions {
     /// Fixed RFC 3339 action time for deterministic output (useful for tests).
     /// Defaults to the current wall-clock instant.
     pub transaction_time: Option<String>,
+    /// Run the write-receipt (idempotency) repair phase (issue #460 / #72
+    /// AC5/AC6) instead of the runtime-metadata repair. Enumerate by default;
+    /// apply under `confirm`.
+    pub receipts: bool,
 }
 
 /// Snapshot of daemon state for before/after comparison in repair reports.
@@ -300,6 +313,12 @@ pub struct RepairSessionReport {
     pub after_ownership_verdict: Option<OwnershipVerdict>,
     /// Stable refusal codes (empty when `result` is `success` or `dry_run`).
     pub refusal_reasons: Vec<RepairRefusalCode>,
+    /// Write-receipt (idempotency) repair report, present only for a
+    /// `--receipts` session (issue #460 / #72 AC5/AC6). Serialize-only: the
+    /// daemon receipt types carry `&'static str` fields, so the field is skipped
+    /// on deserialize (the report round-trips without it).
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub write_receipt_report: Option<WriteReceiptRepairReport>,
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +424,13 @@ pub fn run_repair(data_dir: &Path, dry_run: bool, confirm: bool) -> Result<Repai
 pub fn run_repair_with(data_dir: &Path, opts: &RepairOptions) -> Result<RepairSessionReport> {
     let started_at = resolve_action_time(opts.transaction_time.as_deref())?;
     let runtime_dir = runtime_dir_for_data_dir(data_dir);
+
+    // Write-receipt repair (issue #460 / #72 AC5/AC6) is a self-contained phase
+    // that gates on active store ownership itself; it does not run the
+    // runtime-metadata verdict branches below.
+    if opts.receipts {
+        return run_receipt_repair_phase(data_dir, opts, runtime_dir, started_at);
+    }
 
     let VerdictOutcome {
         verdict,
@@ -514,6 +540,192 @@ pub fn run_repair_with(data_dir: &Path, opts: &RepairOptions) -> Result<RepairSe
 }
 
 // ---------------------------------------------------------------------------
+// Write-receipt repair phase (issue #460 / #72 AC5/AC6)
+// ---------------------------------------------------------------------------
+
+/// Runs the write-receipt (idempotency) repair phase and folds its outcome into
+/// a [`RepairSessionReport`].
+///
+/// Enumerate (AC5) is the read-only default: it calls
+/// [`scan_write_receipts`](crate::daemon::scan_write_receipts) and previews the
+/// anomalies. Apply (AC6, under `confirm`) calls
+/// [`repair_write_receipts`](crate::daemon::repair_write_receipts), which gates
+/// on active store ownership and applies only the provably-safe structural
+/// subset. A contended store maps to a `Refused` result.
+fn run_receipt_repair_phase(
+    data_dir: &Path,
+    opts: &RepairOptions,
+    runtime_dir: PathBuf,
+    started_at: String,
+) -> Result<RepairSessionReport> {
+    let ownership_verdict = determine_verdict(data_dir)
+        .map(|outcome| outcome.verdict)
+        .unwrap_or(OwnershipVerdict::Ambiguous);
+    let ctx = ReceiptPhaseContext {
+        data_dir: data_dir.to_path_buf(),
+        runtime_dir,
+        ownership_verdict,
+        started_at,
+        idempotency_path: crate::daemon::idempotency_file_path(data_dir),
+    };
+    if opts.confirm {
+        receipt_apply_phase(data_dir, ctx)
+    } else {
+        receipt_enumerate_phase(data_dir, ctx)
+    }
+}
+
+/// Threaded context for the write-receipt repair phase.
+struct ReceiptPhaseContext {
+    data_dir: PathBuf,
+    runtime_dir: PathBuf,
+    ownership_verdict: OwnershipVerdict,
+    started_at: String,
+    idempotency_path: PathBuf,
+}
+
+/// Apply path (AC6): lease-aware, mutates only the provably-safe subset.
+fn receipt_apply_phase(data_dir: &Path, ctx: ReceiptPhaseContext) -> Result<RepairSessionReport> {
+    let report = match repair_write_receipts(data_dir, &WriteReceiptRepairOptions { confirm: true })
+    {
+        Ok(report) => report,
+        Err(WriteReceiptRepairError::StoreContended { .. }) => {
+            return Ok(receipt_report(ReceiptReport {
+                ctx,
+                dry_run: false,
+                result: RepairSessionResult::Refused,
+                attempted_actions: vec![],
+                manifest: vec![],
+                changed_file_paths: vec![],
+                refusal_reasons: vec![RepairRefusalCode::LiveDaemonActive],
+                receipt: None,
+            }));
+        }
+        Err(error) => return Err(anyhow::anyhow!("write-receipt repair failed: {error}")),
+    };
+
+    let manifest = report
+        .outcomes
+        .iter()
+        .map(|outcome| RepairManifestEntry {
+            action: RepairAction::WriteReceiptRepairApply,
+            action_time: ctx.started_at.clone(),
+            result: if outcome.applied {
+                RepairActionResult::Applied
+            } else {
+                RepairActionResult::Skipped
+            },
+            original_path: ctx.idempotency_path.clone(),
+            quarantine_path: None,
+            before_metadata_hash: Some(outcome.before_hash.clone()),
+            after_metadata_hash: outcome.after_hash.clone(),
+            skipped_reason: outcome.skipped_reason.map(str::to_owned),
+        })
+        .collect();
+    let mutated = report.mutated;
+    let changed_file_paths = if mutated {
+        vec![ctx.idempotency_path.clone()]
+    } else {
+        vec![]
+    };
+    let result = if mutated {
+        RepairSessionResult::Success
+    } else {
+        RepairSessionResult::NoRepairNeeded
+    };
+    Ok(receipt_report(ReceiptReport {
+        ctx,
+        dry_run: false,
+        result,
+        attempted_actions: vec![RepairAction::WriteReceiptRepairApply],
+        manifest,
+        changed_file_paths,
+        refusal_reasons: vec![],
+        receipt: Some(report),
+    }))
+}
+
+/// Enumerate path (AC5): read-only scan, zero mutation, no lease.
+fn receipt_enumerate_phase(
+    data_dir: &Path,
+    ctx: ReceiptPhaseContext,
+) -> Result<RepairSessionReport> {
+    let scan = scan_write_receipts(data_dir)
+        .map_err(|error| anyhow::anyhow!("write-receipt scan failed: {error}"))?;
+    let manifest = scan
+        .anomalies
+        .iter()
+        .map(|_| RepairManifestEntry {
+            action: RepairAction::WriteReceiptRepairEnumerate,
+            action_time: ctx.started_at.clone(),
+            result: RepairActionResult::Planned,
+            original_path: ctx.idempotency_path.clone(),
+            quarantine_path: None,
+            before_metadata_hash: None,
+            after_metadata_hash: None,
+            skipped_reason: None,
+        })
+        .collect();
+    let attempted_actions = if scan.anomalies.is_empty() {
+        vec![]
+    } else {
+        vec![RepairAction::WriteReceiptRepairEnumerate]
+    };
+    Ok(receipt_report(ReceiptReport {
+        ctx,
+        dry_run: true,
+        result: RepairSessionResult::DryRun,
+        attempted_actions,
+        manifest,
+        changed_file_paths: vec![],
+        refusal_reasons: vec![],
+        receipt: Some(WriteReceiptRepairReport {
+            scan,
+            outcomes: vec![],
+            mutated: false,
+            post_scan: None,
+        }),
+    }))
+}
+
+/// Inputs for a write-receipt-phase report.
+struct ReceiptReport {
+    ctx: ReceiptPhaseContext,
+    dry_run: bool,
+    result: RepairSessionResult,
+    attempted_actions: Vec<RepairAction>,
+    manifest: Vec<RepairManifestEntry>,
+    changed_file_paths: Vec<PathBuf>,
+    refusal_reasons: Vec<RepairRefusalCode>,
+    receipt: Option<WriteReceiptRepairReport>,
+}
+
+/// Builds a [`RepairSessionReport`] for the write-receipt repair phase.
+fn receipt_report(r: ReceiptReport) -> RepairSessionReport {
+    RepairSessionReport {
+        schema_version: REPAIR_SCHEMA_VERSION,
+        data_dir: r.ctx.data_dir,
+        runtime_dir: r.ctx.runtime_dir,
+        ownership_verdict: r.ctx.ownership_verdict,
+        dry_run: r.dry_run,
+        started_at: r.ctx.started_at.clone(),
+        ended_at: r.ctx.started_at,
+        result: r.result,
+        before_daemon_status: None,
+        after_daemon_status: None,
+        before_inspect_summary: None,
+        after_inspect_summary: None,
+        attempted_actions: r.attempted_actions,
+        skipped_actions: vec![],
+        changed_file_paths: r.changed_file_paths,
+        manifest: r.manifest,
+        after_ownership_verdict: None,
+        refusal_reasons: r.refusal_reasons,
+        write_receipt_report: r.receipt,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
 
@@ -580,6 +792,7 @@ fn non_mutating_report(r: NonMutatingReport) -> RepairSessionReport {
         manifest: r.manifest,
         after_ownership_verdict: r.after_ownership_verdict,
         refusal_reasons: vec![],
+        write_receipt_report: None,
     }
 }
 
@@ -607,6 +820,7 @@ fn refused_report(r: RefusedReport) -> RepairSessionReport {
         manifest: vec![],
         after_ownership_verdict: None,
         refusal_reasons: r.refusal_reasons,
+        write_receipt_report: None,
     }
 }
 
@@ -683,6 +897,7 @@ fn run_confirmed_repair(ctx: SessionContext) -> Result<RepairSessionReport> {
         manifest: manifest.clone(),
         after_ownership_verdict: Some(after_ownership_verdict),
         refusal_reasons: vec![],
+        write_receipt_report: None,
     };
 
     fs::create_dir_all(&runtime_dir).map_err(|e| {

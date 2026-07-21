@@ -3206,6 +3206,11 @@ pub(crate) enum RepairCliAction {
         /// deleting it.
         #[arg(long)]
         quarantine: bool,
+        /// Repair write-receipt (idempotency) anomalies instead of runtime
+        /// metadata (issue #460). Enumerates anomalies by default (read-only);
+        /// applies the provably-safe subset under `--confirm`.
+        #[arg(long)]
+        receipts: bool,
         /// Output format: `json` (default, machine-readable) or `text`.
         #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
         format: OutputFormat,
