@@ -151,7 +151,16 @@ pub(crate) fn query_change_impact_cmd(
     index: &query::RepositoryIndex,
     repo_scope: Option<&str>,
     depth: usize,
+    at_head: bool,
+    all_history: bool,
 ) -> Result<()> {
+    // Corpus-mode selection (issue #456): a current-state lane over a
+    // scan-history store defaults to HEAD-anchoring; `--all-history` opts into
+    // the union. The pre-filter drops off-HEAD records BEFORE traversal.
+    let (corpus_mode, corpus_mode_source, filtered) =
+        resolve_current_state_corpus(records, index, false, at_head, all_history)?;
+    let records: &[GraphRecord] = filtered.as_deref().unwrap_or(records);
+
     let target = match query::resolve_failure_handle(records, handle, index, repo_scope) {
         Ok(t) => t,
         Err(
@@ -269,9 +278,6 @@ pub(crate) fn query_change_impact_cmd(
         })
         .collect();
 
-    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
-        query::disclose_corpus(records, query::CorpusMode::Union);
-
     let response = ChangeImpactResponse {
         ok: true,
         handle,
@@ -281,7 +287,7 @@ pub(crate) fn query_change_impact_cmd(
         disclaimer: IMPACT_DISCLAIMER,
         corpus_mode: corpus_mode.as_str(),
         corpus_mode_source: corpus_mode_source.as_str(),
-        corpus_disclaimer,
+        corpus_disclaimer: corpus_mode.disclaimer().to_owned(),
         direct_callers: ctx
             .direct_callers
             .iter()

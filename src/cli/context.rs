@@ -155,7 +155,17 @@ pub(crate) fn query_context_cmd(
     symbol_name: &str,
     freshness: Option<(String, &'static str)>,
     supersession: crate::temporal_status::SupersessionMode,
+    at_head: bool,
+    all_history: bool,
 ) -> Result<()> {
+    // Corpus-mode selection (issue #456): head-anchor by default over a
+    // scan-history store; `--all-history` opts into the union. Pre-filter drops
+    // off-HEAD records BEFORE building the cross-domain context bundle.
+    let index = query::RepositoryIndex::build(records);
+    let (corpus_mode, corpus_mode_source, filtered) =
+        resolve_current_state_corpus(records, &index, false, at_head, all_history)?;
+    let records: &[GraphRecord] = filtered.as_deref().unwrap_or(records);
+
     let ctx = query::symbol_context(records, symbol_name);
 
     if ctx.is_no_match() {
@@ -191,8 +201,7 @@ pub(crate) fn query_context_cmd(
     let (observations, excluded) =
         apply_supersession(sections.observations, &resolver, supersession);
 
-    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
-        query::disclose_corpus(records, query::CorpusMode::Union);
+    let corpus_disclaimer = corpus_mode.disclaimer().to_owned();
 
     let response = ContextResponse {
         ok: true,
