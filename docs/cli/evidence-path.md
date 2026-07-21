@@ -185,11 +185,15 @@ byte-identical across runs.
   topology edges and walks the cross-domain evidence/provenance edges instead.
 ## Corpus scope
 
-This lane is designed as a current-state lane but today reads the **union of all
-commit snapshots** over a `scan-history` store. It discloses this honestly —
-`corpus_mode: "union"` (or `single_snapshot` over a snapshot-less store),
-`corpus_mode_source`, and `corpus_disclaimer` — and does **not** yet accept the
-`--at-head`/`--all-history` flags (an `--at`/`--as-of` selector, where offered,
-still pins a single commit as `commit_pinned`). Flipping it to the HEAD-anchored
-default and adding that flag pair, under the contract published in issue #427, is
-tracked in **issue #456**. See [Corpus scope for query lanes](corpus-modes.md).
+**Changed default (issue #456).** With **neither** a corpus flag nor (where
+offered) an `--at`/`--as-of` selector, over a `scan-history` store this lane now
+defaults to the **HEAD-anchored** corpus — records current at each repository's
+stamped HEAD commit — so a record removed before HEAD no longer appears. This
+flips the pre-#456 default, which read the **union** of all commit snapshots.
+Pass `--all-history` to opt back into that union; pass `--at-head` to force the
+HEAD-anchored view explicitly. Over a snapshot-less (plain `scan`) store the
+disclosure is `single_snapshot`. The envelope discloses `corpus_mode` /
+`corpus_mode_source` / `corpus_disclaimer`. `--at-head` and `--all-history` are
+mutually exclusive with each other (and, where offered, with `--at`/`--as-of`); a
+conflict exits `1` with `unsupported_combination`. See
+[Corpus scope for query lanes](corpus-modes.md).

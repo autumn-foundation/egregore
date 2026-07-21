@@ -215,10 +215,12 @@ Corpus scope (issue #427): every query lane discloses the corpus its answer was 
 via the envelope fields `corpus_mode` (`head_anchored`/`union`/`commit_pinned`/`single_snapshot`),
 `corpus_mode_source`, and `corpus_disclaimer`. Current-state code lanes default to HEAD-anchored
 over a `scan-history` store; the flipped lanes (`deps`, `transitive-callers`, `transitive-callees`,
-`path`, `who-imports`) expose `--all-history` (union) / `--at-head` (force head), mutually
-exclusive with each other and with `--at`/`--as-of` (exit 1 `unsupported_combination`).
-History-analysis lanes are union by design. The full contract is documented once in
-`docs/cli/corpus-modes.md`.
+`path`, `who-imports`, plus issue #456's `change-impact`, `cycles`, `evidence-path`, `context`,
+`subsystem`, `symbol`, `failures`, `unsafe-sites`, `unwrap-expect`, `debt-markers`) expose
+`--all-history` (union) / `--at-head` (force head), mutually exclusive with each other and with
+`--at`/`--as-of` where offered (exit 1 `unsupported_combination`); `symbol` discloses the corpus
+per NDJSON row rather than on an envelope. History-analysis lanes are union by design. The full
+contract is documented once in `docs/cli/corpus-modes.md`.
 
 ```powershell
 # Symbol-level cross-domain context
@@ -414,7 +416,12 @@ the existing `unresolved` section. Rows carry `trust_class: "runtime_observation
 LEADS, not proof — with a bounded redacted `template_excerpt` (never raw log text); an empty
 section means "no scanned source resolved here", not "no errors exist". `occurrence_count`
 reflects scanned sources only (#361), and `--graph` coalesces cross-scan duplicate-ID signatures
-while `--data-dir` retains one record per stable log ID (#363).
+while `--data-dir` retains one record per stable log ID (#363). Over a `scan-history` store this
+lane now defaults to the HEAD-anchored corpus (records current at each repository's stamped HEAD;
+a record removed before HEAD is excluded); `--all-history` opts into the union of all commit
+snapshots (the pre-#456 default) and `--at-head` forces head — mutually exclusive with each other
+(exit 1 `unsupported_combination`), and the envelope discloses
+`corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (issue #456; see `docs/cli/corpus-modes.md`).
 
 `eg query change-impact <handle>` returns graph-derived impact leads grouped by relation
 (`direct_callers`, `direct_callees`, `referencing_files`, `implementation_symbols`,
@@ -422,6 +429,11 @@ while `--data-dir` retains one record per stable log ID (#363).
 Rows are leads to inspect before editing, not proof of breakage. The response is deterministic
 and byte-identical across runs. Default depth is 1 (direct neighbors only); use `--depth 2`
 for a wider BFS neighborhood. Output is a JSON envelope with an always-present disclaimer.
+Over a `scan-history` store this lane now defaults to the HEAD-anchored corpus (records current
+at each repository's stamped HEAD; an impact lead removed before HEAD is excluded);
+`--all-history` opts into the union of all commit snapshots (the pre-#456 default) and `--at-head`
+forces head — mutually exclusive with each other (exit 1 `unsupported_combination`), disclosed via
+`corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (issue #456; see `docs/cli/corpus-modes.md`).
 
 `eg query transitive-callers <handle>` walks the transitive inbound `CALLS`/`REFERENCES`
 closure of a symbol (record ID or exact name) up to `--max-depth` (default 5) and returns
@@ -713,7 +725,13 @@ re-ingested with changed metadata over an append-only `--graph` resolves to its 
 (mirroring embedded `latest_edge_versions`), so both transports surface identical edge
 basis/confidence. Deleted records (tombstoned and
 non-temporal) and edges touching a deleted endpoint are excluded — a current-state view, no
-`--at`/`--as-of`. Endpoint/exit taxonomy: a witness path (>=1 hop) exits 0; `source_id ==
+`--at`/`--as-of`. Over a `scan-history` store this lane now defaults to the HEAD-anchored corpus
+(records/edges current at each repository's stamped HEAD; a witness edge removed before HEAD is
+excluded, so a path present only at an earlier commit yields `no_path`); `--all-history` opts into
+the union of all commit snapshots (the pre-#456 default) and `--at-head` forces head — mutually
+exclusive with each other (exit 1 `unsupported_combination`), disclosed via
+`corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (issue #456; see `docs/cli/corpus-modes.md`).
+Endpoint/exit taxonomy: a witness path (>=1 hop) exits 0; `source_id ==
 target_id` is `identical_endpoints` (exit 1); two live but disconnected endpoints yield a
 machine-readable `no_path` verdict (exit 1, never a silent empty list); an absent endpoint is
 `endpoint_not_found` and a tombstoned endpoint is `endpoint_tombstoned` (both exit 2,
@@ -782,8 +800,13 @@ Rows are an advisory inventory from deterministic extractor facts, never a sound
 a zero count is not a safety guarantee (macro-generated, build-script, and dependency `unsafe`
 are out of this slice). Accepts `--path` (subsystem prefix), `--repo`, and `--at <commit>`
 (valid-time pin). An empty scope reports `no_sites_in_scope`; an out-of-store scope is
-`scope_not_found` (exit 2). The kind set is closed for this slice. See
-`docs/cli/unsafe-sites.md`.
+`scope_not_found` (exit 2). The kind set is closed for this slice. Over a `scan-history` store
+this lane now defaults to the HEAD-anchored corpus (sites current at each repository's stamped
+HEAD; a site removed before HEAD is excluded); `--all-history` opts into the union of all commit
+snapshots (the pre-#456 default) and `--at-head` forces head — mutually exclusive with each other
+and with `--at` (exit 1 `unsupported_combination`), disclosed via
+`corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (issue #456; see `docs/cli/corpus-modes.md`).
+See `docs/cli/unsafe-sites.md`.
 
 `eg query at <path>:<line>` resolves a raw location (compiler diagnostic, backtrace frame,
 diff hunk, `git blame -L` output) to the smallest enclosing `Symbol` node whose recorded span
@@ -966,7 +989,12 @@ record ID, the repo-relative file/span handle, and the enclosing symbol handle (
 when top-level). Rows are advisory triage leads from deterministic extractor facts, never
 verdicts. Accepts `--path` (subsystem prefix), `--repo`, and `--at <commit>` (valid-time pin).
 An empty scope reports `no_sites_in_scope`; an out-of-store scope is `scope_not_found` (exit 2).
-The method set is closed for this slice. See `docs/cli/unwrap-expect.md`.
+The method set is closed for this slice. Over a `scan-history` store this lane now defaults to the
+HEAD-anchored corpus (sites current at each repository's stamped HEAD; a site removed before HEAD
+is excluded); `--all-history` opts into the union of all commit snapshots (the pre-#456 default)
+and `--at-head` forces head — mutually exclusive with each other and with `--at` (exit 1
+`unsupported_combination`), disclosed via `corpus_mode`/`corpus_mode_source`/`corpus_disclaimer`
+(issue #456; see `docs/cli/corpus-modes.md`). See `docs/cli/unwrap-expect.md`.
 
 `eg query debt-markers` inventories human-authored `TODO` / `FIXME` / `HACK` / `XXX`
 debt-comment markers detected inside Tree-sitter comment nodes (never text in string or
@@ -976,7 +1004,12 @@ file/span handle, and the enclosing symbol handle (explicit `null` at module top
 Rows are advisory triage leads from deterministic extractor facts, never verdicts. Accepts
 `--path` (subsystem prefix), `--repo`, and `--at <commit>` (valid-time pin). An empty scope
 reports `no_markers_in_scope`; an out-of-store scope is `scope_not_found` (exit 2). The
-marker set is closed for this slice. See `docs/cli/debt-markers.md`.
+marker set is closed for this slice. Over a `scan-history` store this lane now defaults to the
+HEAD-anchored corpus (markers current at each repository's stamped HEAD; a marker removed before
+HEAD is excluded); `--all-history` opts into the union of all commit snapshots (the pre-#456
+default) and `--at-head` forces head — mutually exclusive with each other and with `--at` (exit 1
+`unsupported_combination`), disclosed via `corpus_mode`/`corpus_mode_source`/`corpus_disclaimer`
+(issue #456; see `docs/cli/corpus-modes.md`). See `docs/cli/debt-markers.md`.
 
 `eg query unreferenced` lists code symbols with zero recorded inbound reference edges
 (`CALLS`/`IMPORTS`/`MENTIONS`, plus the extractor's `REFERENCES` and `IMPLEMENTS` usage
@@ -1059,7 +1092,12 @@ repo-relative handles, and the citable records behind every closing edge. Cycles
 canonical (rotated to the lexicographically smallest member, reported once, sorted by a
 stable key) and byte-identical across runs. The optional scope handle (symbol name/record ID
 or file path) filters to cycles through that node — the pre-refactor check. An acyclic graph
-is an explicit success (exit 0 with an `acyclic` diagnostic), not an error.
+is an explicit success (exit 0 with an `acyclic` diagnostic), not an error. Over a `scan-history`
+store this lane now defaults to the HEAD-anchored corpus (files/edges current at each repository's
+stamped HEAD; a cycle present only at an earlier commit is excluded); `--all-history` opts into the
+union of all commit snapshots (the pre-#456 default) and `--at-head` forces head — mutually
+exclusive with each other (exit 1 `unsupported_combination`), disclosed via
+`corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (issue #456; see `docs/cli/corpus-modes.md`).
 See `docs/cli/cycles.md`.
 
 `eg query verification-coverage [scope]` partitions the issue #213

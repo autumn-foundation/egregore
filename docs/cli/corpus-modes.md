@@ -75,11 +75,14 @@ Mutual exclusion (all violations exit `1` with a machine-readable
 
 | Category | Lanes | Corpus behavior |
 | --- | --- | --- |
-| **Flipped + flagged** | `deps`, `transitive-callers`, `transitive-callees`, `path`, `who-imports` | New default `head_anchored`; `--all-history` opts into `union`; `--at-head` forces head. |
+| **Flipped + flagged** | `deps`, `transitive-callers`, `transitive-callees`, `path`, `who-imports`, `change-impact`, `cycles`, `evidence-path`, `context`, `subsystem`, `symbol`, `failures`, `unsafe-sites`, `unwrap-expect`, `debt-markers` | New default `head_anchored`; `--all-history` opts into `union`; `--at-head` forces head. |
 | **Head-anchored (already)** | `public-api`, `unreferenced`, `at`, `locate`, `file`, `who` (who-changed), `undocumented`, `verification-coverage` | HEAD-anchor by default; disclose `head_anchored` (or `single_snapshot`); `--at`/`--as-of` pin a commit. |
 | **History-analysis (union by design)** | `churn`, `coupling`, `lifeline`, `deltas`, `public-api-deltas`, `ownership`, `recency`, `changes` | Union by design; disclose `union`. No corpus flags. |
-| **Latent Category-A (disclosure-only)** | `change-impact`, `cycles`, `evidence-path`, `context`, `subsystem`, `symbol`, `failures`, `unsafe-sites`, `unwrap-expect`, `debt-markers` | Currently read the **union** over a history store and disclose `union` honestly. Not yet flipped, and they do **not** accept `--at-head`/`--all-history` yet. |
 
-The latent Category-A lanes will be flipped to the `head_anchored` default and
-gain the `--at-head`/`--all-history` flag pair under this same published
-contract; that work is tracked in **issue #456**.
+With issue #456 the last latent Category-A lanes (`change-impact`, `cycles`,
+`evidence-path`, `context`, `subsystem`, `symbol`, `failures`, `unsafe-sites`,
+`unwrap-expect`, `debt-markers`) are flipped to the `head_anchored` default and
+gain the `--at-head`/`--all-history` flag pair under this published contract.
+`symbol` discloses the corpus per NDJSON row rather than on an envelope; the
+inventory lanes that already offered `--at` keep it as `commit_pinned` and reject
+`--at` combined with either corpus flag.
