@@ -1384,6 +1384,22 @@ store). `eg ingest --adapter embedded` additionally prints the machine-readable
 write lease; strictly read-only audits read a throwaway snapshot copy. See
 `docs/cli/embedded-concurrency.md`.
 
+Daemon operational status (issue #61): `eg daemon status` / `GET /v1/status`
+extends the machine-readable payload with `jobs_by_state` (job counts by the
+closed `{queued, running, completed, failed}` set — a job's free-string status
+canonicalizes into one bucket, unknown/`queued` → `queued`, and the counts sum to
+the scalar `jobs`), `oldest_active_job` (`start_time_unix_ms` + `age_ms` over
+queued/running jobs; `null` when none active), and `error_counts` — process-
+lifetime monotonic counters for four classes: `retryable_overload` (`queue_full`,
+counted at the single write-admission reject site so background job-path
+rejections count too), `timeout` (`query_timeout`), `auth` (`unauthorized`), and
+`schema_validation` (`unknown_schema_version`). The existing `pressure` block
+(#45) and scalar fields are unchanged; a status read is strictly read-only and
+never mutates jobs or counters. Every field is a count/age/timestamp/code — safe
+to paste into an issue. Use `/v1/health` for liveness, `eg daemon status` for
+operational triage. See `docs/cli/daemon-status.md` and
+`docs/schema/daemon-api.md`.
+
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
 
 ## Working Rules

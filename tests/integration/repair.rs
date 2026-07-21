@@ -10,7 +10,10 @@ use std::{
 
 use aletheia_egregore::{
     adapters::EmbeddedAletheiaSink,
-    daemon::{StoreLease, runtime_dir_for_data_dir, runtime_metadata_is_stale},
+    daemon::{
+        StoreLease, idempotency_file_path, runtime_dir_for_data_dir, runtime_metadata_is_stale,
+    },
+    ir::{GraphRecord, NodeKind},
     repair::{
         OwnershipVerdict, RepairAction, RepairActionResult, RepairOptions, RepairRefusalCode,
         RepairSessionResult, preflight, run_repair, run_repair_with,
@@ -1542,4 +1545,153 @@ fn wait_until_stopped(data_dir: &Path) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Write-receipt repair CLI (issue #460 / #72 AC5/AC6)
+// ---------------------------------------------------------------------------
+
+/// Writes a byte-identical-duplicate pending write-receipt into a store's
+/// runtime dir. The duplicate is detectable from the receipt alone, so the
+/// store only needs to be openable (it may be empty).
+fn write_duplicate_receipt(data_dir: &Path) {
+    let node = GraphRecord::node(
+        "codegraph:v1:dup".to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("sym".to_owned()),
+        "body".to_owned(),
+    );
+    let node_json = serde_json::to_value(&node).expect("serialize node");
+    let file = serde_json::json!({
+        "entries": {
+            "key-dup": {
+                "state": "pending",
+                "payload_hash": "hash-under-test",
+                "record_ids": ["codegraph:v1:dup", "codegraph:v1:dup"],
+                "records": [node_json, node_json],
+            }
+        }
+    });
+    let path = idempotency_file_path(data_dir);
+    fs::create_dir_all(path.parent().expect("runtime parent")).expect("create runtime dir");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&file).expect("serialize file"),
+    )
+    .expect("write receipts");
+}
+
+/// AC5: `eg repair run --receipts` enumerates anomalies read-only and defaults
+/// to JSON output carrying the write-receipt scan.
+#[test]
+fn write_receipt_enumerate_default_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_duplicate_receipt(&data_dir);
+
+    let path = idempotency_file_path(&data_dir);
+    let before = fs::read(&path).unwrap();
+
+    let output = Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("repair")
+        .arg("run")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--receipts")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output).expect("default receipt output is JSON");
+    assert_eq!(parsed["result"], "dry_run");
+    let anomalies = parsed["write_receipt_report"]["scan"]["anomalies"]
+        .as_array()
+        .expect("anomalies array");
+    assert_eq!(anomalies.len(), 1);
+    assert_eq!(anomalies[0]["class"], "duplicate_record_ids");
+    assert_eq!(anomalies[0]["idempotency_key"], "key-dup");
+    assert_eq!(
+        anomalies[0]["recommended_action"],
+        "dropped_redundant_duplicate"
+    );
+    assert_eq!(anomalies[0]["structurally_repairable"], true);
+
+    // Enumerate is read-only: the receipt file is untouched.
+    assert_eq!(
+        before,
+        fs::read(&path).unwrap(),
+        "enumerate must not mutate"
+    );
+}
+
+/// AC6: `eg repair run --receipts --confirm` applies the provably-safe subset
+/// and records per-action manifest rows plus outcomes with before/after hashes.
+#[test]
+fn write_receipt_apply_mutates_and_reports() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_duplicate_receipt(&data_dir);
+
+    let output = Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("repair")
+        .arg("run")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--receipts")
+        .arg("--confirm")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let parsed: serde_json::Value = serde_json::from_slice(&output).expect("apply output is JSON");
+    assert_eq!(parsed["result"], "success");
+    assert_eq!(parsed["write_receipt_report"]["mutated"], true);
+    let outcomes = parsed["write_receipt_report"]["outcomes"]
+        .as_array()
+        .expect("outcomes array");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["action"], "dropped_redundant_duplicate");
+    assert_eq!(outcomes[0]["applied"], true);
+    assert!(outcomes[0]["before_hash"].is_string());
+    assert!(outcomes[0]["after_hash"].is_string());
+
+    // The generic manifest carries one apply row.
+    let manifest = parsed["manifest"].as_array().expect("manifest array");
+    assert_eq!(manifest.len(), 1);
+    assert_eq!(manifest[0]["action"], "write_receipt_repair_apply");
+    assert_eq!(manifest[0]["result"], "applied");
+}
+
+/// `--receipts --format text` renders a human-readable receipt section.
+#[test]
+fn write_receipt_text_format() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_duplicate_receipt(&data_dir);
+
+    Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("repair")
+        .arg("run")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--receipts")
+        .arg("--format")
+        .arg("text")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("write_receipts:"))
+        .stdout(predicate::str::contains("anomaly: duplicate_record_ids"));
 }

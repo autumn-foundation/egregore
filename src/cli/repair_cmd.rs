@@ -27,6 +27,7 @@ pub(crate) fn repair_cmd(action: RepairCliAction) -> Result<()> {
             confirm,
             dry_run,
             quarantine,
+            receipts,
             format,
             transaction_time,
         } => {
@@ -37,6 +38,7 @@ pub(crate) fn repair_cmd(action: RepairCliAction) -> Result<()> {
                     confirm,
                     quarantine,
                     transaction_time,
+                    receipts,
                 },
             )?;
             match format {
@@ -117,6 +119,36 @@ fn render_run_text(report: &RepairSessionReport) -> String {
             enum_str(&entry.action),
             enum_str(&entry.result)
         );
+    }
+    if let Some(receipts) = &report.write_receipt_report {
+        let _ = writeln!(
+            out,
+            "  write_receipts: {} scanned, {} anomalies, mutated: {}",
+            receipts.scan.total_receipts,
+            receipts.scan.anomalies.len(),
+            receipts.mutated
+        );
+        for anomaly in &receipts.scan.anomalies {
+            let _ = writeln!(
+                out,
+                "  anomaly: {} key={} state={} repairable={} action={}",
+                enum_str(&anomaly.class),
+                anomaly.idempotency_key,
+                anomaly.receipt_state,
+                anomaly.structurally_repairable,
+                anomaly.recommended_action
+            );
+        }
+        for outcome in &receipts.outcomes {
+            let _ = writeln!(
+                out,
+                "  outcome: {} key={} action={} applied={}",
+                enum_str(&outcome.class),
+                outcome.idempotency_key,
+                outcome.action,
+                outcome.applied
+            );
+        }
     }
     if !report.refusal_reasons.is_empty() {
         let _ = writeln!(
