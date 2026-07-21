@@ -351,9 +351,9 @@ const fn is_evidence_edge(label: EdgeLabel) -> bool {
         EmittedDuring, ExplainsChange, ExternalHandle, FailedOn, FingerprintedAs, FrameResolvesTo,
         HasEvidence, Implements, Imports, MaterializedAs, MeasuredBy, Mentions, MentionsSymbol,
         MergedAs, Observes, OwnedByTask, ParentOf, ProducedEvidence, ProducedPatch, PromptedFor,
-        ProposedBy, References, ReferencesTask, RelatesTo, RequestedReviewFrom, ReviewedBy,
-        ReviewsCommit, RevokedBy, ScopedToRepo, SessionOf, Supersedes, TouchedFile, TouchesFile,
-        TransitionsReview, ValidatedBy,
+        ProposedBy, References, ReferencesTask, RegistersRoute, RelatesTo, RequestedReviewFrom,
+        ReviewedBy, ReviewsCommit, RevokedBy, ScopedToRepo, SessionOf, Supersedes, TouchedFile,
+        TouchesFile, TransitionsReview, ValidatedBy,
     };
     match label {
         // TRAVERSED — cross-domain evidence / provenance / grounding edges.
@@ -392,10 +392,9 @@ const fn is_evidence_edge(label: EdgeLabel) -> bool {
         | Aggregates => true,
         // EXCLUDED — code-graph topology (RepositoryIndex containment already
         // attributes these) and intra-agent-memory / semantic scaffolding.
-        Contains | Defines | Imports | References | Calls | Constructs | Implements | Mentions
-        | ChangedIn | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy | SessionOf | AuthoredBy => {
-            false
-        }
+        Contains | Defines | Imports | References | Calls | Constructs | RegistersRoute
+        | Implements | Mentions | ChangedIn | ParentOf | DriftsFrom | DriftsPrior | MeasuredBy
+        | SessionOf | AuthoredBy => false,
     }
 }
 

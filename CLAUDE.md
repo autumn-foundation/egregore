@@ -209,6 +209,34 @@ insertion order (documents sorted by path; entries by
 `(start_line, name, record_id)`). The bare `eg export` JSONL dump is unchanged.
 See `docs/cli/export-scip.md`.
 
+`eg scan` makes attribute-macro route registration visible to the graph (issue
+#445). A routing attribute on a handler (`#[get("/path")]`, `#[post(...)]`, …
+for the closed HTTP-method set get/post/put/delete/patch/head/options,
+case-insensitive) is captured as an additive optional `route` fact on the
+handler `Symbol` node — a `Vec<RouteAnnotation>` of `{method, path}` (method =
+uppercased attribute name, path = first string literal), read via the existing
+prev-sibling attribute walk with Tree-sitter node walking (never regex),
+`#[serde(default, skip_serializing_if)]` and never an identity input. A
+route-registration macro in the closed set (`routes![handler_a, handler_b]`,
+the Rocket/autumn shape) emits one new `REGISTERS_ROUTE` edge from the Symbol
+owning the invocation to each registered handler `Symbol`: the bare handler
+identifiers are pulled from the macro's token tree (all other macro token trees
+stay unwalked) and resolved repo-wide through the CALLS `DefinitionIndex`
+(free-function pool + #440 crate-root confinement), bound ONLY on a UNIQUE
+resolution — 0 or ≥2 candidates mint NOTHING (no edge, no diagnostic), the
+no-wrong-edge doctrine. `REGISTERS_ROUTE` is code-graph topology (excluded from
+evidence-path traversal, classified as codegraph domain) and counts toward a
+handler's inbound reference degree in `orientation`/`unreferenced`, so an
+attribute-routed handler is no longer misclassified as unreferenced/test-only.
+Edges are a route→handler chain lead, never proof of runtime dispatch.
+CAPTURED: Rocket/autumn-style method attributes + `routes![…]`. NOT in this
+slice: actix/axum method-call registration (`.route(...)`/`.service(...)`),
+combined `#[route(..., method = ...)]` attributes, path-qualified handler
+references inside the macro, dispatch-semantics modeling, synthetic route
+nodes, and URL matching. Bumps codegraph `SCHEMA_VERSION` 7→8 and
+`CACHE_SCHEMA_VERSION` 24→25. See `docs/schema/schema-versioning.md` and the
+`REGISTERS_ROUTE` row in `docs/prd/0001-codebase-knowledge-graph.md`.
+
 Query commands (local JSONL graph, no network):
 
 Corpus scope (issue #427): every query lane discloses the corpus its answer was computed over

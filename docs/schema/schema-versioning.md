@@ -64,7 +64,15 @@ edge label (constructing Symbol → constructed type's definition Symbol) plus a
 optional `is_exhaustive` marker field on edge records (the E0063 exhaustiveness
 of the collapsed construction sites). Both additions are additive; the optional
 `is_exhaustive` field is `#[serde(default, skip_serializing_if)]` so a legacy
-edge record without it still deserializes. Re-extraction from source
+edge record without it still deserializes. It was then bumped 7 → 8 by issue
+#445: the `REGISTERS_ROUTE` route-registration edge label (registration-site
+Symbol → registered handler Symbol) plus an optional `route` field on `Symbol`
+nodes (`Vec<RouteAnnotation>` of method + path, captured from routing attributes
+such as `#[get("/path")]`). Both additions are additive; the optional `route`
+field is `#[serde(default, skip_serializing_if = "Option::is_none")]` so a legacy
+node record without it still deserializes, and is never an identity input. The
+paired incremental `CACHE_SCHEMA_VERSION` bumped 24 → 25 for the new
+`FileFacts.route_registration_sites` cached fact shape. Re-extraction from source
 regenerates every codegraph record under the current version deterministically.
 
 Rationale: per-domain and per-kind scoping lets #6, #11, #13, #14, and #15 land
