@@ -7511,6 +7511,638 @@ fn complete_idempotency_entry(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Offline write-receipt / idempotency-store repair (issue #460)
+// ---------------------------------------------------------------------------
+//
+// Redaction-safe, lease-aware repair for a crashed daemon's dangling idempotency
+// receipts. Every public shape below carries only idempotency keys, record IDs,
+// payload HASHES, closed-vocabulary labels, counts, and the `*_present` flags —
+// never the private `records`/`response`/payload bytes.
+
+/// Closed set of write-receipt anomaly classes an offline repair can detect.
+///
+/// These mirror the three "manual repair is required" states the daemon's own
+/// `recover_pending_write` mints on a pending-retry.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteReceiptAnomalyClass {
+    /// Two records in a pending receipt collapse to one recovery key.
+    DuplicateRecordIds,
+    /// A pending receipt's record is committed in the store with different content.
+    ConflictingCommitted,
+    /// A pending receipt whose records are (some or all) committed but the receipt
+    /// was never finalized to `committed`.
+    PartialCommitted,
+}
+
+impl WriteReceiptAnomalyClass {
+    const fn sort_rank(self) -> u8 {
+        match self {
+            Self::DuplicateRecordIds => 0,
+            Self::ConflictingCommitted => 1,
+            Self::PartialCommitted => 2,
+        }
+    }
+}
+
+/// One detected write-receipt anomaly. Redaction-safe.
+#[derive(Debug, Clone, Serialize)]
+pub struct WriteReceiptAnomaly {
+    /// The anomaly class.
+    pub class: WriteReceiptAnomalyClass,
+    /// The idempotency key (the receipt map key).
+    pub idempotency_key: String,
+    /// The receipt's on-disk state: `pending` or `committed`.
+    pub receipt_state: &'static str,
+    /// The receipt's record IDs, sorted (safe handles only).
+    pub record_ids: Vec<String>,
+    /// The receipt's stored request-payload hash.
+    pub payload_hash: String,
+    /// True when a provably-safe structural repair exists for this anomaly.
+    pub structurally_repairable: bool,
+    /// The recommended action: `dropped_redundant_duplicate`, `finalized_partial`,
+    /// or `reported_manual`.
+    pub recommended_action: &'static str,
+}
+
+/// Read-only scan of a store's write-receipt (idempotency) file. Redaction-safe.
+#[derive(Debug, Clone, Serialize)]
+pub struct WriteReceiptScan {
+    /// True when the data directory exists.
+    pub data_dir_present: bool,
+    /// True when the runtime idempotency file exists.
+    pub idempotency_file_present: bool,
+    /// Total number of receipts (entries) in the file.
+    pub total_receipts: usize,
+    /// Detected anomalies, sorted by `(class, idempotency_key)`.
+    pub anomalies: Vec<WriteReceiptAnomaly>,
+}
+
+/// Operator-selected options for [`repair_write_receipts`].
+#[derive(Debug, Clone, Default)]
+pub struct WriteReceiptRepairOptions {
+    /// When false (the default), the call is a dry-run and mutates nothing.
+    pub confirm: bool,
+}
+
+/// One per-anomaly repair outcome. Redaction-safe.
+#[derive(Debug, Clone, Serialize)]
+pub struct WriteReceiptRepairOutcome {
+    /// The idempotency key acted on.
+    pub idempotency_key: String,
+    /// The anomaly class.
+    pub class: WriteReceiptAnomalyClass,
+    /// The action taken (or that would be taken): `dropped_redundant_duplicate`,
+    /// `finalized_partial`, or `reported_manual`.
+    pub action: &'static str,
+    /// True when the receipt file was actually mutated for this outcome.
+    pub applied: bool,
+    /// BLAKE3 hex of the receipt entry before the action.
+    pub before_hash: String,
+    /// BLAKE3 hex of the receipt entry after the action (projected in dry-run;
+    /// `None` for a reported-manual outcome that proposes no mutation).
+    pub after_hash: Option<String>,
+    /// Stable reason when nothing was applied (`dry_run`, or why it is manual).
+    pub skipped_reason: Option<&'static str>,
+}
+
+/// Full report of a write-receipt repair session. Redaction-safe.
+#[derive(Debug, Clone, Serialize)]
+pub struct WriteReceiptRepairReport {
+    /// The before-state scan the repair was planned from.
+    pub scan: WriteReceiptScan,
+    /// Per-anomaly outcomes.
+    pub outcomes: Vec<WriteReceiptRepairOutcome>,
+    /// True when the receipt file was mutated.
+    pub mutated: bool,
+    /// After-state re-verification scan; `Some` only when `mutated`.
+    pub post_scan: Option<WriteReceiptScan>,
+}
+
+/// Errors from the offline write-receipt repair surface.
+#[derive(Debug)]
+pub enum WriteReceiptRepairError {
+    /// The data directory does not exist.
+    DataDirMissing,
+    /// The idempotency file exists but could not be read or parsed.
+    IdempotencyFileUnreadable(String),
+    /// An active owner (live daemon, embedded peer, or crashed/stale holder)
+    /// holds the store; the repair refused before any mutation.
+    StoreContended {
+        /// A human-readable description of the holder / remedy.
+        holder: String,
+    },
+    /// The embedded store could not be opened for read inspection.
+    StoreUnreadable(String),
+    /// Persisting the repaired receipt file failed.
+    Persist(String),
+}
+
+impl std::fmt::Display for WriteReceiptRepairError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DataDirMissing => write!(f, "data directory does not exist"),
+            Self::IdempotencyFileUnreadable(msg) => {
+                write!(f, "idempotency file unreadable: {msg}")
+            }
+            Self::StoreContended { holder } => {
+                write!(f, "store_contended: {holder}")
+            }
+            Self::StoreUnreadable(msg) => write!(f, "embedded store unreadable: {msg}"),
+            Self::Persist(msg) => write!(f, "failed to persist repaired receipts: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for WriteReceiptRepairError {}
+
+const ACTION_DROP_DUPLICATE: &str = "dropped_redundant_duplicate";
+const ACTION_FINALIZE_PARTIAL: &str = "finalized_partial";
+const ACTION_REPORTED_MANUAL: &str = "reported_manual";
+
+/// Where the runtime idempotency file lives for a data dir (non-creating).
+fn idempotency_file_path(data_dir: &Path) -> PathBuf {
+    runtime_dir(data_dir).join(IDEMPOTENCY_FILE)
+}
+
+/// Reads and parses the idempotency file directly (never creating it).
+///
+/// Returns `Ok(None)` when the file does not exist.
+fn read_idempotency_file_direct(
+    path: &Path,
+) -> std::result::Result<Option<IdempotencyFile>, WriteReceiptRepairError> {
+    match fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str::<IdempotencyFile>(&contents)
+            .map(Some)
+            .map_err(|error| WriteReceiptRepairError::IdempotencyFileUnreadable(error.to_string())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(WriteReceiptRepairError::IdempotencyFileUnreadable(
+            error.to_string(),
+        )),
+    }
+}
+
+/// BLAKE3 hex of a receipt entry's canonical serialized bytes (internal only).
+fn receipt_entry_hash(entry: &IdempotencyEntry) -> String {
+    let bytes = serde_json::to_vec(entry).unwrap_or_default();
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+/// Classifies a single pending receipt against the store. `None` when the entry
+/// is not anomalous (a dangling pending with nothing committed is recoverable by
+/// normal daemon retry and is not flagged).
+fn classify_pending_receipt(
+    key: &str,
+    payload_hash: &str,
+    record_ids: &[String],
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> std::result::Result<Option<WriteReceiptAnomaly>, WriteReceiptRepairError> {
+    let mut sorted_ids = record_ids.to_vec();
+    sorted_ids.sort();
+
+    // 1. Duplicate/ambiguous recovery keys — detectable from the receipt alone.
+    if has_duplicate_recovery_keys(records) {
+        let repairable = !has_ambiguous_recovery_keys(records);
+        return Ok(Some(WriteReceiptAnomaly {
+            class: WriteReceiptAnomalyClass::DuplicateRecordIds,
+            idempotency_key: key.to_owned(),
+            receipt_state: "pending",
+            record_ids: sorted_ids,
+            payload_hash: payload_hash.to_owned(),
+            structurally_repairable: repairable,
+            recommended_action: if repairable {
+                ACTION_DROP_DUPLICATE
+            } else {
+                ACTION_REPORTED_MANUAL
+            },
+        }));
+    }
+
+    // 2. Store-state tally over the receipt's original records.
+    let mut matched = 0usize;
+    let mut mismatched = 0usize;
+    for record in records {
+        match sink
+            .expected_record_state(record)
+            .map_err(|error| WriteReceiptRepairError::StoreUnreadable(error.to_string()))?
+        {
+            ExpectedRecordState::Matched => matched += 1,
+            ExpectedRecordState::Mismatched => mismatched += 1,
+            ExpectedRecordState::Missing => {}
+        }
+    }
+
+    if mismatched > 0 {
+        return Ok(Some(WriteReceiptAnomaly {
+            class: WriteReceiptAnomalyClass::ConflictingCommitted,
+            idempotency_key: key.to_owned(),
+            receipt_state: "pending",
+            record_ids: sorted_ids,
+            payload_hash: payload_hash.to_owned(),
+            structurally_repairable: false,
+            recommended_action: ACTION_REPORTED_MANUAL,
+        }));
+    }
+
+    if matched == 0 {
+        // Nothing committed yet: the daemon would just redo the write on retry.
+        return Ok(None);
+    }
+
+    // Some records committed. Fully durable iff every original matched AND every
+    // synthesized edge id is present (mirrors recover_pending_write_pre_validation).
+    let original_ids: BTreeSet<&str> = records.iter().map(GraphRecord::id).collect();
+    let mut synthesized_present = true;
+    for id in record_ids {
+        if original_ids.contains(id.as_str()) {
+            continue;
+        }
+        let present = sink
+            .read_back(id)
+            .map_err(|error| WriteReceiptRepairError::StoreUnreadable(error.to_string()))?
+            .is_some();
+        if !present {
+            synthesized_present = false;
+            break;
+        }
+    }
+    let fully_durable = matched == records.len() && synthesized_present;
+
+    Ok(Some(WriteReceiptAnomaly {
+        class: WriteReceiptAnomalyClass::PartialCommitted,
+        idempotency_key: key.to_owned(),
+        receipt_state: "pending",
+        record_ids: sorted_ids,
+        payload_hash: payload_hash.to_owned(),
+        structurally_repairable: fully_durable,
+        recommended_action: if fully_durable {
+            ACTION_FINALIZE_PARTIAL
+        } else {
+            ACTION_REPORTED_MANUAL
+        },
+    }))
+}
+
+/// Classifies every entry in a receipt file against an open store sink.
+fn classify_all_receipts(
+    file: &IdempotencyFile,
+    sink: &EmbeddedAletheiaSink,
+) -> std::result::Result<Vec<WriteReceiptAnomaly>, WriteReceiptRepairError> {
+    let mut anomalies = Vec::new();
+    for (key, entry) in &file.entries {
+        if let IdempotencyEntry::Pending {
+            payload_hash,
+            record_ids,
+            records,
+        } = entry
+            && let Some(anomaly) =
+                classify_pending_receipt(key, payload_hash, record_ids, records, sink)?
+        {
+            anomalies.push(anomaly);
+        }
+    }
+    anomalies.sort_by(|a, b| {
+        a.class
+            .sort_rank()
+            .cmp(&b.class.sort_rank())
+            .then_with(|| a.idempotency_key.cmp(&b.idempotency_key))
+    });
+    Ok(anomalies)
+}
+
+/// True when a receipt file needs store inspection (has any pending entry).
+fn file_has_pending(file: &IdempotencyFile) -> bool {
+    file.entries
+        .values()
+        .any(|entry| matches!(entry, IdempotencyEntry::Pending { .. }))
+}
+
+/// Copies a directory tree (store snapshot for read-only inspection).
+fn copy_store_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_store_tree(&from, &to)?;
+        } else if file_type.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Builds a [`WriteReceiptScan`] from an already-read file plus a store view.
+///
+/// `open_sink` is invoked only when the file has at least one pending entry.
+fn build_receipt_scan(
+    data_dir_present: bool,
+    idempotency_file_present: bool,
+    file: Option<&IdempotencyFile>,
+    open_sink: impl FnOnce() -> std::result::Result<EmbeddedAletheiaSink, WriteReceiptRepairError>,
+) -> std::result::Result<WriteReceiptScan, WriteReceiptRepairError> {
+    let (total_receipts, anomalies) = match file {
+        Some(file) => {
+            let total = file.entries.len();
+            let anomalies = if file_has_pending(file) {
+                let sink = open_sink()?;
+                classify_all_receipts(file, &sink)?
+            } else {
+                Vec::new()
+            };
+            (total, anomalies)
+        }
+        None => (0, Vec::new()),
+    };
+    Ok(WriteReceiptScan {
+        data_dir_present,
+        idempotency_file_present,
+        total_receipts,
+        anomalies,
+    })
+}
+
+/// Scans a store's write-receipt (idempotency) file for anomalies. READ-ONLY.
+///
+/// Never takes the store lease. A missing data directory or a missing idempotency
+/// file is a successful typed result (see the `*_present` flags), not an error.
+/// When any pending receipt is present, the store is inspected through a throwaway
+/// read-only copy so the original store bytes are never touched.
+///
+/// # Errors
+///
+/// Returns [`WriteReceiptRepairError::IdempotencyFileUnreadable`] when the file
+/// exists but cannot be read or parsed, or [`WriteReceiptRepairError::StoreUnreadable`]
+/// when the store copy cannot be opened or inspected.
+pub fn scan_write_receipts(
+    data_dir: &Path,
+) -> std::result::Result<WriteReceiptScan, WriteReceiptRepairError> {
+    let data_dir_present = data_dir.exists();
+    if !data_dir_present {
+        return Ok(WriteReceiptScan {
+            data_dir_present: false,
+            idempotency_file_present: false,
+            total_receipts: 0,
+            anomalies: Vec::new(),
+        });
+    }
+    let path = idempotency_file_path(data_dir);
+    let file = read_idempotency_file_direct(&path)?;
+    let idempotency_file_present = file.is_some();
+
+    let (total_receipts, anomalies) = match file.as_ref() {
+        Some(file) => {
+            let total = file.entries.len();
+            let anomalies = if file_has_pending(file) {
+                // Inspect the store through a throwaway read-only copy so the
+                // original store bytes are never touched. The tempdir guard is
+                // held across classification, then dropped (no leak).
+                let temp = tempfile::tempdir()
+                    .map_err(|error| WriteReceiptRepairError::StoreUnreadable(error.to_string()))?;
+                let copy_root = temp.path().join("store");
+                copy_store_tree(data_dir, &copy_root)
+                    .map_err(|error| WriteReceiptRepairError::StoreUnreadable(error.to_string()))?;
+                let sink = EmbeddedAletheiaSink::open_unleased(&copy_root)
+                    .map_err(|error| WriteReceiptRepairError::StoreUnreadable(error.to_string()))?;
+                classify_all_receipts(file, &sink)?
+            } else {
+                Vec::new()
+            };
+            (total, anomalies)
+        }
+        None => (0, Vec::new()),
+    };
+
+    Ok(WriteReceiptScan {
+        data_dir_present: true,
+        idempotency_file_present,
+        total_receipts,
+        anomalies,
+    })
+}
+
+/// Builds the finalized `Committed` entry for a fully-durable pending receipt,
+/// mirroring `recover_pending_write`'s success tail.
+fn finalized_entry(payload_hash: &str, record_ids: &[String]) -> IdempotencyEntry {
+    IdempotencyEntry::Committed {
+        payload_hash: payload_hash.to_owned(),
+        response: DaemonIngestResponse {
+            attempted: record_ids.len(),
+            succeeded: record_ids.len(),
+            failed: 0,
+            failures: Vec::new(),
+            record_ids: record_ids.to_vec(),
+            idempotent: false,
+        },
+    }
+}
+
+/// Builds the de-duplicated `Pending` entry for a byte-identical-duplicate receipt.
+fn deduplicated_entry(
+    payload_hash: &str,
+    record_ids: &[String],
+    records: &[GraphRecord],
+) -> IdempotencyEntry {
+    let mut seen = BTreeSet::new();
+    let mut new_records = Vec::new();
+    let mut dropped_ids = Vec::new();
+    for record in records {
+        if seen.insert(recovery_key(record)) {
+            new_records.push(record.clone());
+        } else {
+            dropped_ids.push(record.id().to_owned());
+        }
+    }
+    let mut new_record_ids = record_ids.to_vec();
+    for id in dropped_ids {
+        if let Some(pos) = new_record_ids.iter().position(|existing| existing == &id) {
+            new_record_ids.remove(pos);
+        }
+    }
+    IdempotencyEntry::Pending {
+        payload_hash: payload_hash.to_owned(),
+        record_ids: new_record_ids,
+        records: new_records,
+    }
+}
+
+/// Refuses when an active owner (live, or crashed/stale) holds the store.
+fn refuse_if_store_owned(data_dir: &Path) -> std::result::Result<(), WriteReceiptRepairError> {
+    if let Some(msg) = crate::repair::embedded_open_repair_gate(data_dir) {
+        return Err(WriteReceiptRepairError::StoreContended { holder: msg });
+    }
+    Ok(())
+}
+
+/// Repairs write-receipt anomalies. LEASE-AWARE.
+///
+/// Refuses (returns [`WriteReceiptRepairError::StoreContended`]) before any
+/// mutation when a live daemon/embedded peer holds the lease, or when stale
+/// non-stopped daemon metadata indicates a crashed holder. Holds the exclusive
+/// store lease for the whole mutate window (released on return). With
+/// `confirm=false` this is a dry-run that mutates nothing; with `confirm=true`
+/// it applies only the provably-safe structural subset and re-scans into
+/// `post_scan`.
+///
+/// The repair is idempotent-convergent: exactly one provably-safe action is
+/// applied per anomaly detected in the before-scan. De-duplicating a byte-identical
+/// duplicate can leave a now-finalizable partial receipt, which a subsequent pass
+/// finalizes; repeated passes converge to a clean store.
+///
+/// # Errors
+///
+/// Returns [`WriteReceiptRepairError`] on contention, an unreadable receipt file,
+/// an unreadable store, or a persistence failure.
+pub fn repair_write_receipts(
+    data_dir: &Path,
+    opts: &WriteReceiptRepairOptions,
+) -> std::result::Result<WriteReceiptRepairReport, WriteReceiptRepairError> {
+    if !data_dir.exists() {
+        return Err(WriteReceiptRepairError::DataDirMissing);
+    }
+
+    // Gate 1: crashed/stale holder. Gate 2: live holder (the lease itself).
+    refuse_if_store_owned(data_dir)?;
+    let lease = match StoreLease::try_acquire(data_dir)
+        .map_err(|error| WriteReceiptRepairError::StoreUnreadable(error.to_string()))?
+    {
+        Some(lease) => lease,
+        None => {
+            let holder = live_daemon_holder_hint(data_dir)
+                .unwrap_or_else(|| "an active embedded store lease holder".to_owned());
+            return Err(WriteReceiptRepairError::StoreContended { holder });
+        }
+    };
+    // Hold the lease for the whole window.
+    let _lease = lease;
+
+    // Before-scan against the LIVE store (safe: we hold the exclusive lease).
+    let before = scan_under_held_lease(data_dir)?;
+
+    let mut outcomes = Vec::new();
+    let mut mutated = false;
+
+    if !before.anomalies.is_empty() {
+        // Reload the receipt file to mutate it through the durable write path.
+        let path = idempotency_file_path(data_dir);
+        let file = read_idempotency_file_direct(&path)?.unwrap_or_default();
+        let mut store = IdempotencyStore::load(path)
+            .map_err(|error| WriteReceiptRepairError::Persist(error.to_string()))?;
+
+        for anomaly in &before.anomalies {
+            let Some(entry) = file.entries.get(&anomaly.idempotency_key) else {
+                continue;
+            };
+            let before_hash = receipt_entry_hash(entry);
+            let IdempotencyEntry::Pending {
+                payload_hash,
+                record_ids,
+                records,
+            } = entry
+            else {
+                continue;
+            };
+
+            if !anomaly.structurally_repairable {
+                let skipped_reason = match anomaly.class {
+                    WriteReceiptAnomalyClass::ConflictingCommitted => {
+                        Some("conflicting_committed_manual_repair")
+                    }
+                    WriteReceiptAnomalyClass::DuplicateRecordIds => {
+                        Some("ambiguous_duplicate_content")
+                    }
+                    WriteReceiptAnomalyClass::PartialCommitted => {
+                        Some("partial_records_not_all_committed")
+                    }
+                };
+                outcomes.push(WriteReceiptRepairOutcome {
+                    idempotency_key: anomaly.idempotency_key.clone(),
+                    class: anomaly.class,
+                    action: ACTION_REPORTED_MANUAL,
+                    applied: false,
+                    before_hash,
+                    after_hash: None,
+                    skipped_reason,
+                });
+                continue;
+            }
+
+            let (action, new_entry) = match anomaly.class {
+                WriteReceiptAnomalyClass::DuplicateRecordIds => (
+                    ACTION_DROP_DUPLICATE,
+                    deduplicated_entry(payload_hash, record_ids, records),
+                ),
+                WriteReceiptAnomalyClass::PartialCommitted => (
+                    ACTION_FINALIZE_PARTIAL,
+                    finalized_entry(payload_hash, record_ids),
+                ),
+                // Conflicting is never structurally_repairable, handled above.
+                WriteReceiptAnomalyClass::ConflictingCommitted => continue,
+            };
+            let after_hash = receipt_entry_hash(&new_entry);
+
+            if opts.confirm {
+                store
+                    .set_entry_durably(anomaly.idempotency_key.clone(), new_entry)
+                    .map_err(|error| WriteReceiptRepairError::Persist(error.to_string()))?;
+                mutated = true;
+                outcomes.push(WriteReceiptRepairOutcome {
+                    idempotency_key: anomaly.idempotency_key.clone(),
+                    class: anomaly.class,
+                    action,
+                    applied: true,
+                    before_hash,
+                    after_hash: Some(after_hash),
+                    skipped_reason: None,
+                });
+            } else {
+                outcomes.push(WriteReceiptRepairOutcome {
+                    idempotency_key: anomaly.idempotency_key.clone(),
+                    class: anomaly.class,
+                    action,
+                    applied: false,
+                    before_hash,
+                    after_hash: Some(after_hash),
+                    skipped_reason: Some("dry_run"),
+                });
+            }
+        }
+    }
+
+    let post_scan = if mutated {
+        Some(scan_under_held_lease(data_dir)?)
+    } else {
+        None
+    };
+
+    Ok(WriteReceiptRepairReport {
+        scan: before,
+        outcomes,
+        mutated,
+        post_scan,
+    })
+}
+
+/// Scans receipts while the caller already holds the exclusive store lease.
+///
+/// Inspects the LIVE store via `open_unleased` (no second lease acquisition),
+/// which is safe precisely because the caller holds the exclusive lease.
+fn scan_under_held_lease(
+    data_dir: &Path,
+) -> std::result::Result<WriteReceiptScan, WriteReceiptRepairError> {
+    let path = idempotency_file_path(data_dir);
+    let file = read_idempotency_file_direct(&path)?;
+    let idempotency_file_present = file.is_some();
+    build_receipt_scan(true, idempotency_file_present, file.as_ref(), || {
+        EmbeddedAletheiaSink::open_unleased(data_dir)
+            .map_err(|error| WriteReceiptRepairError::StoreUnreadable(error.to_string()))
+    })
+}
+
 fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
     let response = match read_http_request(&mut stream, &state.token) {
         Ok(request) => handle_request(&request, &state),
@@ -13508,5 +14140,419 @@ mod tests {
             expect_reject(&batch, needle)?;
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-receipt / idempotency-store repair (issue #460)
+    // -----------------------------------------------------------------------
+
+    /// A simple content-addressable code node fixture.
+    fn receipt_node(id: &str, summary: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("sym".to_owned()),
+            summary.to_owned(),
+        )
+    }
+
+    /// Ingests records into a fresh embedded store at `data_dir`, then releases
+    /// the lease so the receipt-repair surface can inspect/mutate it.
+    fn build_receipt_store(data_dir: &Path, records: &[GraphRecord]) {
+        let mut sink =
+            EmbeddedAletheiaSink::open(data_dir).expect("fixture store should open with lease");
+        let report = ingest_records(records, &mut sink);
+        assert_eq!(
+            report.failed, 0,
+            "fixture ingest must succeed: {:?}",
+            report.failures
+        );
+        sink.persist_indexes().expect("fixture persist");
+        drop(sink);
+    }
+
+    /// Writes a hand-crafted idempotency file into the store's runtime dir.
+    fn write_receipt_file(data_dir: &Path, entries: BTreeMap<String, IdempotencyEntry>) {
+        let path = idempotency_file_path(data_dir);
+        fs::create_dir_all(path.parent().expect("runtime dir parent")).expect("create runtime dir");
+        let file = IdempotencyFile { entries };
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&file).expect("serialize receipts"),
+        )
+        .expect("write receipts");
+    }
+
+    fn pending_entry(records: Vec<GraphRecord>) -> IdempotencyEntry {
+        let record_ids = records.iter().map(|r| r.id().to_owned()).collect();
+        IdempotencyEntry::Pending {
+            payload_hash: "hash-under-test".to_owned(),
+            record_ids,
+            records,
+        }
+    }
+
+    fn only_anomaly(scan: &WriteReceiptScan) -> &WriteReceiptAnomaly {
+        assert_eq!(
+            scan.anomalies.len(),
+            1,
+            "expected exactly one anomaly, got {:?}",
+            scan.anomalies
+        );
+        &scan.anomalies[0]
+    }
+
+    /// (a) A byte-identical duplicate pending receipt is detected repairable and
+    /// finalized by dropping the redundant copy on confirm.
+    #[test]
+    fn byte_identical_duplicate_is_repaired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("store");
+        let node = receipt_node("codegraph:v1:dup", "same-body");
+        build_receipt_store(&data_dir, std::slice::from_ref(&node));
+
+        let mut entries = BTreeMap::new();
+        // Two byte-identical records => same recovery key, NOT ambiguous.
+        entries.insert(
+            "key-dup".to_owned(),
+            pending_entry(vec![node.clone(), node]),
+        );
+        write_receipt_file(&data_dir, entries);
+
+        let scan = scan_write_receipts(&data_dir).expect("scan");
+        let anomaly = only_anomaly(&scan);
+        assert_eq!(anomaly.class, WriteReceiptAnomalyClass::DuplicateRecordIds);
+        assert!(anomaly.structurally_repairable);
+        assert_eq!(anomaly.recommended_action, "dropped_redundant_duplicate");
+
+        let report = repair_write_receipts(&data_dir, &WriteReceiptRepairOptions { confirm: true })
+            .expect("repair");
+        assert!(report.mutated);
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(report.outcomes[0].applied);
+        assert_eq!(report.outcomes[0].action, "dropped_redundant_duplicate");
+        // Re-verification shows the DUPLICATE anomaly resolved. What remains is a
+        // now-finalizable partial (the de-duped record is durably committed): the
+        // repair is idempotent-convergent, one provably-safe action per anomaly.
+        let post = report.post_scan.expect("post scan present when mutated");
+        assert!(
+            !post
+                .anomalies
+                .iter()
+                .any(|a| a.class == WriteReceiptAnomalyClass::DuplicateRecordIds),
+            "duplicate class should be resolved, got {:?}",
+            post.anomalies
+        );
+        // A second repair pass converges the residual to a clean store.
+        let second = repair_write_receipts(&data_dir, &WriteReceiptRepairOptions { confirm: true })
+            .expect("second repair pass");
+        let final_scan = scan_write_receipts(&data_dir).expect("final scan");
+        assert!(
+            final_scan.anomalies.is_empty(),
+            "repair converges to a clean store, got {:?} after second pass {:?}",
+            final_scan.anomalies,
+            second.outcomes
+        );
+    }
+
+    /// (b) A differing-content duplicate (same recovery key, different bytes) is
+    /// reported, never merged.
+    #[test]
+    fn differing_content_duplicate_is_reported_not_merged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("store");
+        let a = receipt_node("codegraph:v1:ambig", "body-a");
+        let b = receipt_node("codegraph:v1:ambig", "body-b");
+        build_receipt_store(&data_dir, std::slice::from_ref(&a));
+
+        let mut entries = BTreeMap::new();
+        entries.insert("key-ambig".to_owned(), pending_entry(vec![a, b]));
+        write_receipt_file(&data_dir, entries);
+
+        let scan = scan_write_receipts(&data_dir).expect("scan");
+        let anomaly = only_anomaly(&scan);
+        assert_eq!(anomaly.class, WriteReceiptAnomalyClass::DuplicateRecordIds);
+        assert!(!anomaly.structurally_repairable);
+        assert_eq!(anomaly.recommended_action, "reported_manual");
+
+        let report = repair_write_receipts(&data_dir, &WriteReceiptRepairOptions { confirm: true })
+            .expect("repair");
+        assert!(!report.mutated, "ambiguous duplicate must not be merged");
+        assert_eq!(report.outcomes[0].action, "reported_manual");
+        assert!(!report.outcomes[0].applied);
+        assert_eq!(
+            report.outcomes[0].skipped_reason,
+            Some("ambiguous_duplicate_content")
+        );
+    }
+
+    /// (c) A conflicting-committed receipt (a record committed with different
+    /// content than the receipt) is reported, never overwritten.
+    #[test]
+    fn conflicting_committed_is_reported_never_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("store");
+        // Store holds version A; the receipt expects version B under the same id.
+        let committed = receipt_node("codegraph:v1:conflict", "committed-body");
+        let receipt_view = receipt_node("codegraph:v1:conflict", "receipt-body");
+        build_receipt_store(&data_dir, std::slice::from_ref(&committed));
+
+        let mut entries = BTreeMap::new();
+        entries.insert("key-conflict".to_owned(), pending_entry(vec![receipt_view]));
+        write_receipt_file(&data_dir, entries);
+
+        let scan = scan_write_receipts(&data_dir).expect("scan");
+        let anomaly = only_anomaly(&scan);
+        assert_eq!(
+            anomaly.class,
+            WriteReceiptAnomalyClass::ConflictingCommitted
+        );
+        assert!(!anomaly.structurally_repairable);
+
+        let report = repair_write_receipts(&data_dir, &WriteReceiptRepairOptions { confirm: true })
+            .expect("repair");
+        assert!(!report.mutated, "conflicting receipt must never be mutated");
+        assert_eq!(report.outcomes[0].action, "reported_manual");
+        assert_eq!(
+            report.outcomes[0].skipped_reason,
+            Some("conflicting_committed_manual_repair")
+        );
+    }
+
+    /// (d) A partial receipt whose records are ALL already durably committed is
+    /// finalized (a pure receipt flip pending -> committed).
+    #[test]
+    fn fully_durable_partial_is_finalized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("store");
+        let r1 = receipt_node("codegraph:v1:p1", "b1");
+        let r2 = receipt_node("codegraph:v1:p2", "b2");
+        build_receipt_store(&data_dir, &[r1.clone(), r2.clone()]);
+
+        let mut entries = BTreeMap::new();
+        entries.insert("key-partial-ok".to_owned(), pending_entry(vec![r1, r2]));
+        write_receipt_file(&data_dir, entries);
+
+        let scan = scan_write_receipts(&data_dir).expect("scan");
+        let anomaly = only_anomaly(&scan);
+        assert_eq!(anomaly.class, WriteReceiptAnomalyClass::PartialCommitted);
+        assert!(anomaly.structurally_repairable);
+        assert_eq!(anomaly.recommended_action, "finalized_partial");
+
+        let report = repair_write_receipts(&data_dir, &WriteReceiptRepairOptions { confirm: true })
+            .expect("repair");
+        assert!(report.mutated);
+        assert_eq!(report.outcomes[0].action, "finalized_partial");
+        assert!(report.outcomes[0].applied);
+        let post = report.post_scan.expect("post scan");
+        assert!(
+            post.anomalies.is_empty(),
+            "finalized receipt is no longer anomalous"
+        );
+    }
+
+    /// (e) A genuinely partial receipt (a record still missing from the store) is
+    /// reported manual — never a fabricated commit.
+    #[test]
+    fn truly_partial_missing_record_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("store");
+        let present = receipt_node("codegraph:v1:present", "b1");
+        let missing = receipt_node("codegraph:v1:missing", "b2");
+        // Only `present` is committed.
+        build_receipt_store(&data_dir, std::slice::from_ref(&present));
+
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "key-partial-bad".to_owned(),
+            pending_entry(vec![present, missing]),
+        );
+        write_receipt_file(&data_dir, entries);
+
+        let scan = scan_write_receipts(&data_dir).expect("scan");
+        let anomaly = only_anomaly(&scan);
+        assert_eq!(anomaly.class, WriteReceiptAnomalyClass::PartialCommitted);
+        assert!(!anomaly.structurally_repairable);
+        assert_eq!(anomaly.recommended_action, "reported_manual");
+
+        let report = repair_write_receipts(&data_dir, &WriteReceiptRepairOptions { confirm: true })
+            .expect("repair");
+        assert!(
+            !report.mutated,
+            "a truly-partial write must not be fabricated"
+        );
+        assert_eq!(
+            report.outcomes[0].skipped_reason,
+            Some("partial_records_not_all_committed")
+        );
+    }
+
+    /// (f) A clean store (only committed receipts) has no anomalies and no
+    /// mutation.
+    #[test]
+    fn clean_store_has_no_anomalies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("store");
+        let node = receipt_node("codegraph:v1:clean", "b");
+        build_receipt_store(&data_dir, std::slice::from_ref(&node));
+
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "key-committed".to_owned(),
+            IdempotencyEntry::Committed {
+                payload_hash: "h".to_owned(),
+                response: DaemonIngestResponse {
+                    attempted: 1,
+                    succeeded: 1,
+                    failed: 0,
+                    failures: Vec::new(),
+                    record_ids: vec!["codegraph:v1:clean".to_owned()],
+                    idempotent: false,
+                },
+            },
+        );
+        write_receipt_file(&data_dir, entries);
+
+        let scan = scan_write_receipts(&data_dir).expect("scan");
+        assert!(scan.data_dir_present);
+        assert!(scan.idempotency_file_present);
+        assert_eq!(scan.total_receipts, 1);
+        assert!(scan.anomalies.is_empty());
+
+        let report = repair_write_receipts(&data_dir, &WriteReceiptRepairOptions { confirm: true })
+            .expect("repair");
+        assert!(!report.mutated);
+        assert!(report.outcomes.is_empty());
+        assert!(report.post_scan.is_none());
+    }
+
+    /// (g) When an active owner holds the store lease, repair refuses with
+    /// `StoreContended` and mutates zero bytes.
+    #[test]
+    fn repair_refuses_while_store_leased() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("store");
+        let node = receipt_node("codegraph:v1:leased", "b");
+        build_receipt_store(&data_dir, std::slice::from_ref(&node));
+
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "key-partial-ok".to_owned(),
+            pending_entry(vec![node.clone()]),
+        );
+        write_receipt_file(&data_dir, entries);
+
+        let path = idempotency_file_path(&data_dir);
+        let before_bytes = fs::read(&path).expect("read before");
+
+        // Hold the exclusive lease as an "active owner".
+        let owner = StoreLease::acquire(&data_dir).expect("acquire lease");
+        let err = repair_write_receipts(&data_dir, &WriteReceiptRepairOptions { confirm: true })
+            .expect_err("repair must refuse while leased");
+        assert!(
+            matches!(err, WriteReceiptRepairError::StoreContended { .. }),
+            "expected StoreContended, got {err:?}"
+        );
+        drop(owner);
+
+        let after_bytes = fs::read(&path).expect("read after");
+        assert_eq!(before_bytes, after_bytes, "receipt file must be untouched");
+    }
+
+    /// (h) A dry-run mutates nothing — file bytes identical before and after.
+    #[test]
+    fn dry_run_mutates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("store");
+        let node = receipt_node("codegraph:v1:dry", "b");
+        build_receipt_store(&data_dir, std::slice::from_ref(&node));
+
+        let mut entries = BTreeMap::new();
+        entries.insert("key-partial-ok".to_owned(), pending_entry(vec![node]));
+        write_receipt_file(&data_dir, entries);
+
+        let path = idempotency_file_path(&data_dir);
+        let before_bytes = fs::read(&path).expect("read before");
+
+        let report =
+            repair_write_receipts(&data_dir, &WriteReceiptRepairOptions { confirm: false })
+                .expect("dry-run repair");
+        assert!(!report.mutated);
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(!report.outcomes[0].applied);
+        assert_eq!(report.outcomes[0].skipped_reason, Some("dry_run"));
+        // Dry-run still projects the intended after-hash.
+        assert!(report.outcomes[0].after_hash.is_some());
+
+        let after_bytes = fs::read(&path).expect("read after");
+        assert_eq!(before_bytes, after_bytes, "dry-run must not touch bytes");
+    }
+
+    /// (i) Scan output is byte-identical across two runs on an unchanged store.
+    #[test]
+    fn scan_is_byte_identical_across_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("store");
+        let r1 = receipt_node("codegraph:v1:d1", "b1");
+        let r2 = receipt_node("codegraph:v1:d2", "b2");
+        build_receipt_store(&data_dir, &[r1.clone(), r2.clone()]);
+
+        let mut entries = BTreeMap::new();
+        entries.insert("key-a".to_owned(), pending_entry(vec![r1.clone(), r1]));
+        entries.insert("key-b".to_owned(), pending_entry(vec![r2]));
+        write_receipt_file(&data_dir, entries);
+
+        let first = serde_json::to_vec(&scan_write_receipts(&data_dir).expect("scan 1")).unwrap();
+        let second = serde_json::to_vec(&scan_write_receipts(&data_dir).expect("scan 2")).unwrap();
+        assert_eq!(first, second, "scan output must be deterministic");
+    }
+
+    /// (j) No raw payload bytes appear in any serialized output.
+    #[test]
+    fn output_is_redaction_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("store");
+        // A distinctive marker only present in the record body / summary.
+        let marker = "SENSITIVE_PAYLOAD_MARKER_XYZ";
+        let node = receipt_node("codegraph:v1:redact", marker);
+        build_receipt_store(&data_dir, std::slice::from_ref(&node));
+
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "key-redact".to_owned(),
+            pending_entry(vec![node.clone(), node]),
+        );
+        write_receipt_file(&data_dir, entries);
+
+        let scan_json =
+            serde_json::to_string(&scan_write_receipts(&data_dir).expect("scan")).unwrap();
+        assert!(
+            !scan_json.contains(marker),
+            "scan output must not carry payload bytes"
+        );
+
+        let report_json = serde_json::to_string(
+            &repair_write_receipts(&data_dir, &WriteReceiptRepairOptions { confirm: true })
+                .expect("repair"),
+        )
+        .unwrap();
+        assert!(
+            !report_json.contains(marker),
+            "repair report must not carry payload bytes"
+        );
+    }
+
+    /// A missing data dir is a typed empty success, not an error.
+    #[test]
+    fn scan_missing_data_dir_is_empty_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("does-not-exist");
+        let scan = scan_write_receipts(&data_dir).expect("scan");
+        assert!(!scan.data_dir_present);
+        assert!(!scan.idempotency_file_present);
+        assert_eq!(scan.total_receipts, 0);
+        assert!(scan.anomalies.is_empty());
     }
 }
