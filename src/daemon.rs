@@ -441,6 +441,8 @@ struct ServerState {
     idempotency: Arc<Mutex<IdempotencyStore>>,
     shutdown: Arc<AtomicBool>,
     pressure: Arc<PressureTracker>,
+    /// Monotonic per-class error counters surfaced in `GET /v1/status` (#61).
+    error_counters: Arc<ErrorCounters>,
 }
 
 struct WriteCommand {
@@ -712,6 +714,91 @@ fn unix_ms_u64() -> u64 {
     u64::try_from(unix_ms()).unwrap_or(u64::MAX)
 }
 
+/// The closed set of job lifecycle states surfaced in `GET /v1/status` (issue
+/// #61). A `JobStatus.status` free-string is canonicalized into exactly one of
+/// these buckets for the status counts.
+///
+/// `running` / `completed` / `failed` map to themselves. Every other value —
+/// the initial `queued`, and any unknown or legacy string — maps to `queued`,
+/// the most conservative "not yet running, not yet terminal" bucket, so an
+/// unrecognized value can never be silently dropped from the totals.
+fn canonical_job_state(status: &str) -> &'static str {
+    match status {
+        "running" => "running",
+        "completed" => "completed",
+        "failed" => "failed",
+        _ => "queued",
+    }
+}
+
+/// Whether a canonical job state counts as active (queued or running) for the
+/// oldest-active-job age reported in `GET /v1/status`.
+fn job_state_is_active(canonical: &str) -> bool {
+    matches!(canonical, "queued" | "running")
+}
+
+/// Monotonic per-class error counters surfaced in `GET /v1/status` (issue #61).
+///
+/// Only the four operator-relevant error classes are aggregated; every other
+/// [`ErrorCode`] is deliberately not tracked. Counters are increment-only for
+/// the life of the process and are never reset by a status read — the status
+/// handler only ever *reads* them.
+#[derive(Debug, Default)]
+struct ErrorCounters {
+    /// `queue_full` retryable-overload rejections (issue #45 backpressure).
+    retryable_overload: AtomicU64,
+    /// `query_timeout` responses.
+    timeout: AtomicU64,
+    /// `unauthorized` responses.
+    auth: AtomicU64,
+    /// `unknown_schema_version` schema-validation rejections.
+    schema_validation: AtomicU64,
+}
+
+impl ErrorCounters {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one retryable-overload (`queue_full`) rejection. Called at the
+    /// single write-admission reject site so foreground ingest and background
+    /// job-path rejections — which never flow back through `handle_request` —
+    /// are each counted exactly once.
+    fn record_overload(&self) {
+        self.retryable_overload.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Records a request-path error response by its stable wire code. Counts
+    /// only the three synchronous request-path classes; `queue_full` is owned
+    /// by [`ErrorCounters::record_overload`] and is intentionally ignored here
+    /// so a foreground overload is never double-counted.
+    fn observe_response_code(&self, code: &str) {
+        if code == QUERY_TIMEOUT_CODE {
+            self.timeout.fetch_add(1, Ordering::SeqCst);
+        } else if code == UNAUTHORIZED_CODE {
+            self.auth.fetch_add(1, Ordering::SeqCst);
+        } else if code == UNKNOWN_SCHEMA_VERSION_CODE {
+            self.schema_validation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Machine-readable counter block embedded in `GET /v1/status`.
+    fn snapshot_json(&self) -> serde_json::Value {
+        json!({
+            "retryable_overload": self.retryable_overload.load(Ordering::SeqCst),
+            "timeout": self.timeout.load(Ordering::SeqCst),
+            "auth": self.auth.load(Ordering::SeqCst),
+            "schema_validation": self.schema_validation.load(Ordering::SeqCst),
+        })
+    }
+}
+
+/// Stable wire code strings for the error classes aggregated by
+/// [`ErrorCounters`]. These mirror [`ErrorCode::as_str`] and are the contract
+/// the status wrapper matches on; a change here must track `as_str`.
+const QUERY_TIMEOUT_CODE: &str = "query_timeout";
+const UNAUTHORIZED_CODE: &str = "unauthorized";
+
 type WriteResult<T = DaemonIngestResponse> = std::result::Result<T, ApiError>;
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -744,6 +831,14 @@ struct JobStatus {
     status: String,
     report: Option<DaemonIngestResponse>,
     events: Vec<String>,
+    /// Wall-clock creation instant in epoch milliseconds (issue #61). Enables a
+    /// deterministic `start_time_unix_ms` and the oldest-active-job age in
+    /// `GET /v1/status`. `#[serde(default)]` so a job without the field (legacy
+    /// or a rehydrate path that omits it) deserializes as `0`, which the status
+    /// handler treats as "no known start" and excludes from the oldest-age
+    /// computation rather than fabricating an age.
+    #[serde(default)]
+    created_at_unix_ms: u64,
     #[serde(skip)]
     payload_hash: String,
 }
@@ -1403,6 +1498,7 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
         idempotency: Arc::clone(&idempotency),
         shutdown: Arc::clone(&shutdown),
         pressure: Arc::clone(&pressure),
+        error_counters: Arc::new(ErrorCounters::new()),
     });
     let worker = spawn_write_worker(write_rx, sink, idempotency, pressure);
 
@@ -8159,7 +8255,23 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
     drop(state);
 }
 
+/// Top-level request entry point. Dispatches the request and then folds any
+/// error response into the operational error-code counters surfaced by
+/// `GET /v1/status` (issue #61). Counting happens here — after the response is
+/// rendered — so every synchronous request-path error of the tracked classes
+/// (`query_timeout`, `unauthorized`, `unknown_schema_version`) is observed
+/// exactly once regardless of which construction site produced it. `queue_full`
+/// is intentionally NOT counted here; it is owned by `enqueue_write` (which also
+/// sees background job-path rejections that never return through this path).
 fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
+    let response = dispatch_request(request, state);
+    if let Some(code) = response.body["error"]["code"].as_str() {
+        state.error_counters.observe_response_code(code);
+    }
+    response
+}
+
+fn dispatch_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     if request.method == "GET" && request.path == "/v1/health" {
         return HttpResponse::json(
             200,
@@ -8205,8 +8317,47 @@ fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
 }
 
 fn handle_status(state: &ServerState) -> HttpResponse {
-    let jobs = match state.jobs.lock() {
-        Ok(jobs) => jobs.len(),
+    // Snapshot the job map once (read-only) so the scalar count, the
+    // per-state counts, and the oldest-active-job age are all consistent with
+    // one another (issue #61). The status handler never mutates daemon state.
+    let (jobs, jobs_by_state, oldest_active_job) = match state.jobs.lock() {
+        Ok(jobs) => {
+            let mut queued: u64 = 0;
+            let mut running: u64 = 0;
+            let mut completed: u64 = 0;
+            let mut failed: u64 = 0;
+            let mut oldest_active_start: Option<u64> = None;
+            for job in jobs.values() {
+                let canonical = canonical_job_state(&job.status);
+                match canonical {
+                    "running" => running += 1,
+                    "completed" => completed += 1,
+                    "failed" => failed += 1,
+                    _ => queued += 1,
+                }
+                // Oldest active = smallest known creation stamp over queued or
+                // running jobs. A `0` stamp means "no known start" and is
+                // excluded rather than reported as an unbounded age.
+                if job_state_is_active(canonical) && job.created_at_unix_ms > 0 {
+                    oldest_active_start = Some(
+                        oldest_active_start.map_or(job.created_at_unix_ms, |current| {
+                            current.min(job.created_at_unix_ms)
+                        }),
+                    );
+                }
+            }
+            let jobs_by_state = json!({
+                "queued": queued,
+                "running": running,
+                "completed": completed,
+                "failed": failed,
+            });
+            let oldest_active_job = oldest_active_start.map_or(serde_json::Value::Null, |start| {
+                let age_ms = unix_ms_u64().saturating_sub(start);
+                json!({ "start_time_unix_ms": start, "age_ms": age_ms })
+            });
+            (jobs.len(), jobs_by_state, oldest_active_job)
+        }
         Err(_) => return HttpResponse::error(ApiError::internal("jobs lock poisoned")),
     };
     let agents = match state.agents.lock() {
@@ -8226,6 +8377,9 @@ fn handle_status(state: &ServerState) -> HttpResponse {
             "jobs": jobs,
             "agents": agents,
             "idempotency_store_size": idempotency_store_size,
+            "jobs_by_state": jobs_by_state,
+            "oldest_active_job": oldest_active_job,
+            "error_counts": state.error_counters.snapshot_json(),
             "pressure": state.pressure.snapshot_json(),
         }),
     )
@@ -10981,6 +11135,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         status: "queued".to_owned(),
         report: None,
         events: vec!["queued".to_owned()],
+        created_at_unix_ms: unix_ms_u64(),
         payload_hash: payload_hash.clone(),
     };
 
@@ -11014,6 +11169,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
                             "started".to_owned(),
                             "completed".to_owned(),
                         ],
+                        created_at_unix_ms: unix_ms_u64(),
                         payload_hash: payload_hash.clone(),
                     });
                 }
@@ -11025,6 +11181,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
                         status: "queued".to_owned(),
                         report: None,
                         events: vec!["queued".to_owned()],
+                        created_at_unix_ms: unix_ms_u64(),
                         payload_hash: payload_hash.clone(),
                     });
                 }
@@ -11201,6 +11358,12 @@ fn enqueue_write(
             state
                 .pressure
                 .on_reject_after_rollback("records/ingest", request_id);
+            // Count the retryable-overload rejection here (issue #61), the single
+            // admission reject site, so both foreground ingest and background
+            // job-path rejections are tallied exactly once. The `handle_request`
+            // status wrapper deliberately ignores `queue_full` to avoid
+            // double-counting a foreground rejection that also flows through it.
+            state.error_counters.record_overload();
             Err(ApiError::overloaded())
         }
         Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -12676,6 +12839,7 @@ mod tests {
             idempotency,
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
+            error_counters: Arc::new(ErrorCounters::new()),
         };
         let request = HttpRequest {
             method: "POST".to_owned(),
@@ -12787,6 +12951,7 @@ mod tests {
             idempotency,
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
+            error_counters: Arc::new(ErrorCounters::new()),
         };
 
         let read_response = handle_get_record(&record_id, &state);
@@ -12893,6 +13058,7 @@ mod tests {
             idempotency,
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
+            error_counters: Arc::new(ErrorCounters::new()),
         };
 
         // Direct lookup must not serve the retracted record's content.
@@ -13017,6 +13183,7 @@ mod tests {
             idempotency,
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
+            error_counters: Arc::new(ErrorCounters::new()),
         };
 
         let response = handle_get_all_records(&state);
@@ -13143,6 +13310,7 @@ mod tests {
             idempotency,
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
+            error_counters: Arc::new(ErrorCounters::new()),
         };
 
         let response = handle_get_all_records(&state);
@@ -13416,6 +13584,7 @@ mod tests {
             idempotency,
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(capacity)),
+            error_counters: Arc::new(ErrorCounters::new()),
         };
         // The caller keeps `write_rx` alive so the bounded channel reports
         // `Full` (not `Disconnected`) once its buffer fills.
@@ -13650,6 +13819,276 @@ mod tests {
         Ok(())
     }
 
+    // ---- Issue #61: operational status (jobs-by-state, oldest-job age, error counters) ----
+
+    /// Inserts a synthetic job into `state.jobs` for status-shape tests.
+    fn insert_status_job(state: &ServerState, job_id: &str, status: &str, created_at_unix_ms: u64) {
+        let mut jobs = state.jobs.lock().expect("jobs lock");
+        jobs.insert(
+            job_id.to_owned(),
+            JobStatus {
+                job_id: job_id.to_owned(),
+                status: status.to_owned(),
+                report: None,
+                events: vec![status.to_owned()],
+                created_at_unix_ms,
+                payload_hash: String::new(),
+            },
+        );
+    }
+
+    /// AC1/AC2 (a): the status payload counts jobs into the closed
+    /// {queued, running, completed, failed} bucket set, and an unknown status
+    /// string canonicalizes into `queued` rather than being dropped.
+    #[test]
+    fn status_reports_jobs_by_state_counts() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let (state, _tx, _rx) = build_pressure_test_state(temp.path(), 2)?;
+        insert_status_job(&state, "job-q", "queued", 1_000);
+        insert_status_job(&state, "job-r", "running", 1_100);
+        insert_status_job(&state, "job-c", "completed", 1_200);
+        insert_status_job(&state, "job-f", "failed", 1_300);
+        // An unrecognized status must fall into the conservative `queued` bucket.
+        insert_status_job(&state, "job-x", "some-unknown-state", 1_400);
+
+        let body = handle_status(&state).body;
+        assert_eq!(body["jobs_by_state"]["queued"], 2);
+        assert_eq!(body["jobs_by_state"]["running"], 1);
+        assert_eq!(body["jobs_by_state"]["completed"], 1);
+        assert_eq!(body["jobs_by_state"]["failed"], 1);
+        // Scalar `jobs` (pre-#61) stays intact and consistent with the buckets.
+        assert_eq!(body["jobs"], 5);
+        Ok(())
+    }
+
+    /// AC1 (b): the oldest active job (queued or running) reports a positive
+    /// start time and age; a store with only terminal jobs reports null.
+    #[test]
+    fn status_oldest_active_job_reported_only_when_active() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let (state, _tx, _rx) = build_pressure_test_state(temp.path(), 2)?;
+
+        // No jobs at all: null.
+        assert!(handle_status(&state).body["oldest_active_job"].is_null());
+
+        // Two active jobs: the smaller creation stamp wins.
+        insert_status_job(&state, "job-r", "running", 5_000);
+        insert_status_job(&state, "job-q", "queued", 2_000);
+        // A newer terminal job must not become the oldest-active anchor.
+        insert_status_job(&state, "job-c", "completed", 1);
+        let body = handle_status(&state).body;
+        assert_eq!(body["oldest_active_job"]["start_time_unix_ms"], 2_000);
+        assert!(
+            body["oldest_active_job"]["age_ms"].as_u64().is_some(),
+            "an active job must report an age_ms"
+        );
+
+        // Only terminal jobs remain active-free: null again (fresh store to
+        // avoid contending for the first store's exclusive write lease).
+        let temp2 = tempfile::tempdir().context("temp dir should be created")?;
+        let (state2, _tx2, _rx2) = build_pressure_test_state(temp2.path(), 2)?;
+        insert_status_job(&state2, "job-c", "completed", 2_000);
+        insert_status_job(&state2, "job-f", "failed", 3_000);
+        assert!(handle_status(&state2).body["oldest_active_job"].is_null());
+        Ok(())
+    }
+
+    /// AC3 (c): every one of the four error counters increments when its error
+    /// is produced and surfaces under `error_counts` in status. Auth and
+    /// overload are driven through their REAL production paths (`handle_request`
+    /// gate and `enqueue_write` admission control); timeout and schema are
+    /// driven through a REAL rendered error envelope so the `handle_request`
+    /// wrapper mapping is exercised over the true wire `code`.
+    #[test]
+    fn error_counters_increment_and_surface_in_status() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let capacity = 1;
+        let (state, write_tx, _write_rx) = build_pressure_test_state(temp.path(), capacity)?;
+
+        // (auth) A request with no bearer token flows through the real dispatcher.
+        let unauth = HttpRequest {
+            method: "GET".to_owned(),
+            path: "/v1/status".to_owned(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let resp = handle_request(&unauth, &state);
+        assert_eq!(resp.status, 401);
+        assert_eq!(resp.body["error"]["code"], "unauthorized");
+
+        // (overload) Fill the bounded queue, then a real write is rejected.
+        for _ in 0..capacity {
+            state.pressure.on_enqueue();
+            write_tx
+                .try_send(dummy_write_command())
+                .map_err(|_| anyhow!("queue filler should buffer"))?;
+        }
+        let rejection = enqueue_write(&state, "overflow-key".to_owned(), Vec::new(), "req-oflow")
+            .expect_err("overloaded write must be rejected");
+        assert_eq!(rejection.code, ErrorCode::QueueFull);
+
+        // (timeout) Real rendered envelope from the timeout constructor.
+        let timeout_resp = HttpResponse::error(ApiError::query_timeout());
+        state
+            .error_counters
+            .observe_response_code(timeout_resp.body["error"]["code"].as_str().unwrap());
+        assert_eq!(timeout_resp.body["error"]["code"], "query_timeout");
+
+        // (schema) Real rendered envelope carrying the schema-validation code.
+        let schema_resp = HttpResponse::error(ApiError::new(
+            ErrorCode::UnknownSchemaVersion,
+            "unsupported record schema version",
+        ));
+        state
+            .error_counters
+            .observe_response_code(schema_resp.body["error"]["code"].as_str().unwrap());
+        assert_eq!(
+            schema_resp.body["error"]["code"],
+            ErrorCode::UnknownSchemaVersion.as_str()
+        );
+
+        // The wrapper mapping matches the real wire strings from `as_str`.
+        assert_eq!(ErrorCode::QueryTimeout.as_str(), QUERY_TIMEOUT_CODE);
+        assert_eq!(ErrorCode::Unauthorized.as_str(), UNAUTHORIZED_CODE);
+
+        let counts = &handle_status(&state).body["error_counts"];
+        assert_eq!(counts["auth"], 1);
+        assert_eq!(counts["retryable_overload"], 1);
+        assert_eq!(counts["timeout"], 1);
+        assert_eq!(counts["schema_validation"], 1);
+        Ok(())
+    }
+
+    /// AC3 (d): repeated status reads are monotonic and non-mutating — five
+    /// reads over a fixed fixture keep the count/error blocks stable, and a
+    /// status call never alters the jobs map or the error counters.
+    #[test]
+    fn status_read_is_monotonic_and_nonmutating() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let (state, _tx, _rx) = build_pressure_test_state(temp.path(), 2)?;
+        insert_status_job(&state, "job-q", "queued", 1_000);
+        insert_status_job(&state, "job-c", "completed", 1_200);
+        // Seed one of each tracked error class deterministically.
+        state.error_counters.record_overload();
+        state.error_counters.observe_response_code("query_timeout");
+        state.error_counters.observe_response_code("unauthorized");
+        state
+            .error_counters
+            .observe_response_code(UNKNOWN_SCHEMA_VERSION_CODE);
+
+        let jobs_before = state.jobs.lock().expect("jobs lock").clone();
+        let counters_before = state.error_counters.snapshot_json();
+
+        let first = handle_status(&state).body;
+        for _ in 0..5 {
+            let again = handle_status(&state).body;
+            // The count/error blocks are deterministic across reads.
+            assert_eq!(again["jobs_by_state"], first["jobs_by_state"]);
+            assert_eq!(again["error_counts"], first["error_counts"]);
+        }
+
+        // A status read mutates nothing: jobs map and counters are unchanged.
+        let jobs_after = state.jobs.lock().expect("jobs lock").clone();
+        assert_eq!(jobs_before.len(), jobs_after.len());
+        for (id, before) in &jobs_before {
+            let after = jobs_after.get(id).expect("job preserved");
+            assert_eq!(before.status, after.status);
+            assert_eq!(before.created_at_unix_ms, after.created_at_unix_ms);
+        }
+        assert_eq!(counters_before, state.error_counters.snapshot_json());
+        assert_eq!(first["error_counts"], counters_before);
+        Ok(())
+    }
+
+    /// AC4 (e): every field the #61 status surface adds is a count, age,
+    /// timestamp, or code — never a payload, body, transcript, or secret. The
+    /// serialized status body's top-level keys are the exact allow-list, and the
+    /// new blocks carry integer-only values.
+    #[test]
+    fn status_fields_are_redaction_safe() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let (state, _tx, _rx) = build_pressure_test_state(temp.path(), 2)?;
+        // A job whose payload/text would be sensitive — none of it may surface.
+        insert_status_job(&state, "job-q", "queued", 4_242);
+
+        let body = handle_status(&state).body;
+        let obj = body.as_object().expect("status body is an object");
+        let mut keys: Vec<&String> = obj.keys().collect();
+        keys.sort();
+        let expected = [
+            "agents",
+            "api_version",
+            "data_dir",
+            "error_counts",
+            "idempotency_store_size",
+            "jobs",
+            "jobs_by_state",
+            "oldest_active_job",
+            "pressure",
+            "status",
+        ];
+        let actual: Vec<String> = keys.iter().map(|k| (*k).clone()).collect();
+        assert_eq!(
+            actual, expected,
+            "status top-level keys must be the allow-list"
+        );
+
+        // error_counts and jobs_by_state carry integer values only.
+        for block in ["error_counts", "jobs_by_state"] {
+            for (field, value) in body[block].as_object().expect("object block") {
+                assert!(
+                    value.is_u64() || value.is_i64(),
+                    "{block}.{field} must be an integer, got {value}"
+                );
+            }
+        }
+        // oldest_active_job is an object of integer fields (job is active here).
+        for (field, value) in body["oldest_active_job"]
+            .as_object()
+            .expect("oldest_active_job object")
+        {
+            assert!(
+                value.is_u64() || value.is_i64(),
+                "oldest_active_job.{field} must be an integer, got {value}"
+            );
+        }
+        Ok(())
+    }
+
+    /// AC1 composition: the new job/error fields coexist with the #45 pressure
+    /// block. After a real overload rejection the status body simultaneously
+    /// exposes non-zero pressure rejections, retry guidance, the incremented
+    /// retryable-overload counter, and the jobs-by-state block.
+    #[test]
+    fn status_composes_pressure_jobs_and_error_counters() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let capacity = 1;
+        let (state, write_tx, _write_rx) = build_pressure_test_state(temp.path(), capacity)?;
+        insert_status_job(&state, "job-r", "running", 7_000);
+
+        for _ in 0..capacity {
+            state.pressure.on_enqueue();
+            write_tx
+                .try_send(dummy_write_command())
+                .map_err(|_| anyhow!("queue filler should buffer"))?;
+        }
+        enqueue_write(&state, "compose-key".to_owned(), Vec::new(), "req-compose")
+            .expect_err("overloaded write must be rejected");
+
+        let body = handle_status(&state).body;
+        assert_eq!(body["pressure"]["state"], "saturated");
+        assert_eq!(body["pressure"]["total_rejections"], 1);
+        assert!(
+            body["pressure"]["retry_after_ms"]
+                .as_u64()
+                .is_some_and(|ms| ms > 0),
+            "saturated status must advertise retry guidance"
+        );
+        assert_eq!(body["error_counts"]["retryable_overload"], 1);
+        assert_eq!(body["jobs_by_state"]["running"], 1);
+        Ok(())
+    }
+
     // ---- Issue #331: daemon-side Retraction ingest validation ----
 
     /// Builds the exact `[observation, retraction event, tombstone]` records
@@ -13858,6 +14297,7 @@ mod tests {
             idempotency,
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
+            error_counters: Arc::new(ErrorCounters::new()),
         };
 
         let response = handle_get_record(&obs_id, &state);
