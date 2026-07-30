@@ -4663,6 +4663,7 @@ fn semantic_candidate_fetch_limits(limit: usize, total_nodes: usize) -> Vec<usiz
 /// the standalone binary never see it.
 #[cfg(test)]
 mod embedded_store_gate {
+    use std::cell::Cell;
     use std::sync::{Condvar, Mutex};
 
     /// Default ceiling on concurrently open embedded stores.
@@ -4674,25 +4675,60 @@ mod embedded_store_gate {
 
     static OPEN_STORES: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
 
+    thread_local! {
+        /// Number of gate permits the current thread already holds. A thread
+        /// that holds at least one permit is re-entrant (see [`acquire`]).
+        static PERMITS_HELD: Cell<usize> = const { Cell::new(0) };
+    }
+
     /// RAII permit; releases its slot when the owning store is dropped.
-    pub struct StorePermit;
+    pub struct StorePermit {
+        /// Whether this permit owns one of the global slots. Re-entrant permits
+        /// (a second store on a thread that already holds one) own none.
+        owns_slot: bool,
+    }
 
     impl Drop for StorePermit {
         fn drop(&mut self) {
+            PERMITS_HELD.with(|held| held.set(held.get().saturating_sub(1)));
+            if !self.owns_slot {
+                return;
+            }
             let (lock, cvar) = &OPEN_STORES;
             if let Ok(mut count) = lock.lock() {
                 *count = count.saturating_sub(1);
-                cvar.notify_one();
+                // `notify_all`, not `notify_one`: the ceiling is read per
+                // acquire and can differ between waiters (the low-disk probe),
+                // so a single notify can be consumed by a waiter whose own
+                // ceiling is still unmet — losing the wakeup for a waiter that
+                // could have proceeded.
+                cvar.notify_all();
             }
         }
     }
 
     /// Blocks until an embedded-store slot is available, then claims it.
     ///
-    /// No single in-crate test holds two stores at once (the exclusive store
-    /// lease forces sequential open/reopen on a data dir), so a permit can
-    /// never self-deadlock even at a limit of one.
+    /// Re-entrant per thread: a thread that already holds a permit takes a
+    /// second one WITHOUT claiming another slot and without blocking. Some
+    /// in-crate tests legitimately hold two stores at once on distinct data
+    /// dirs (comparing a write-path store against a CLI-path store, for
+    /// instance), and a blocking second acquire made the gate a hold-and-wait
+    /// cycle: one such test self-deadlocked outright at the low-disk ceiling of
+    /// one, and two of them deadlocked against each other at the default
+    /// ceiling of two. Because a thread only ever blocks while holding zero
+    /// slots, no wait cycle can form.
+    ///
+    /// The trade: the ceiling now bounds concurrently store-owning THREADS
+    /// rather than open stores, so a nesting thread can run more than one flush
+    /// thread against a single slot. That is the deliberate cost of making
+    /// deadlock impossible — an over-tight bound that hangs for the full CI job
+    /// timeout is worse than a slightly loose one.
     pub fn acquire() -> StorePermit {
+        if PERMITS_HELD.with(Cell::get) > 0 {
+            PERMITS_HELD.with(|held| held.set(held.get() + 1));
+            return StorePermit { owns_slot: false };
+        }
         let limit = if low_disk() {
             MAX_CONCURRENT_LOW_DISK
         } else {
@@ -4704,7 +4740,9 @@ mod embedded_store_gate {
             count = cvar.wait(count).expect("store gate condvar poisoned");
         }
         *count += 1;
-        StorePermit
+        drop(count);
+        PERMITS_HELD.with(|held| held.set(held.get() + 1));
+        StorePermit { owns_slot: true }
     }
 
     fn low_disk() -> bool {
@@ -4771,6 +4809,75 @@ mod embedded_store_gate {
         assert!(
             peak.load(Ordering::SeqCst) <= MAX_CONCURRENT,
             "gate must bound concurrently held permits to at most {MAX_CONCURRENT}"
+        );
+    }
+
+    /// Regression: nested acquires on ONE thread must never block, even past the
+    /// gate ceiling. Before the gate was made re-entrant, a test holding two
+    /// stores at once (distinct data dirs) formed a hold-and-wait cycle: it
+    /// self-deadlocked at the low-disk ceiling of one, and two such tests
+    /// deadlocked against each other at the default ceiling of two, hanging the
+    /// whole test binary until the CI job timeout killed it.
+    ///
+    /// The nesting depth deliberately exceeds `MAX_CONCURRENT`, so a
+    /// non-re-entrant gate cannot pass by luck. The work runs on a spawned
+    /// thread behind a channel deadline so a regression FAILS this test rather
+    /// than hanging the suite it is meant to protect.
+    #[test]
+    fn nested_acquires_on_one_thread_never_block() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let depth = MAX_CONCURRENT + 1;
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let permits: Vec<StorePermit> = (0..depth).map(|_| acquire()).collect();
+            // Report only after every nested permit is held simultaneously.
+            let _ = tx.send(permits.len());
+            drop(permits);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(held) => assert_eq!(
+                held, depth,
+                "every nested permit must be held at once, got {held} of {depth}"
+            ),
+            Err(error) => panic!(
+                "nested acquire past the ceiling of {MAX_CONCURRENT} must not block, \
+                 but {depth} nested permits were never all held: {error}"
+            ),
+        }
+        worker.join().expect("gate nesting thread should not panic");
+    }
+
+    /// Nesting depth must unwind exactly, so a thread that has released every
+    /// permit is once again a first-acquire thread that claims a real slot.
+    /// Asserted on the thread-local depth only: the global slot count is shared
+    /// with every concurrently running store test, so reading it here would be
+    /// racy.
+    #[test]
+    fn nested_permit_depth_unwinds_to_zero() {
+        assert_eq!(
+            PERMITS_HELD.with(Cell::get),
+            0,
+            "a fresh test thread must start at depth zero"
+        );
+        {
+            let _outer = acquire();
+            let inner = acquire();
+            assert_eq!(PERMITS_HELD.with(Cell::get), 2, "both permits held");
+            drop(inner);
+            assert_eq!(
+                PERMITS_HELD.with(Cell::get),
+                1,
+                "dropping the nested permit must leave the outer one held"
+            );
+        }
+        assert_eq!(
+            PERMITS_HELD.with(Cell::get),
+            0,
+            "thread-local permit depth must unwind to zero"
         );
     }
 }

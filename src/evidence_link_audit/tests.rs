@@ -90,7 +90,6 @@ fn edge(id: &str, label: EdgeLabel, source: &str, target: &str) -> GraphRecord {
         frame_index: None,
         is_exhaustive: None,
         basis: None,
-        is_exhaustive: None,
         temporal: None,
         summary: "SENTINEL_EDGE_SUMMARY".to_owned(),
         producer: None,

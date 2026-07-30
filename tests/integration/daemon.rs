@@ -2750,8 +2750,27 @@ fn http_json(
     )
 }
 
+/// Socket deadline for every daemon request a test issues.
+///
+/// Comfortably above any legitimate response — the daemon's own group-commit
+/// acknowledgement path gives up at ~10s — but bounded, which is the point. A
+/// daemon that accepts the connection and then stalls (a wedged write worker,
+/// a store whose flush thread is starved under parallel test load) used to
+/// block `read_to_string` forever: the enclosing poll loops all carry
+/// deadlines, but none of them can fire while the read itself never returns,
+/// so the whole test binary hung until the CI job timeout killed it an hour
+/// later with no failing test named. With a deadline the same stall fails
+/// fast, names the request, and leaves the other tests to finish.
+const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn http_request(address: &str, request: &str) -> String {
     let mut stream = TcpStream::connect(address).expect("daemon should accept connections");
+    stream
+        .set_read_timeout(Some(DAEMON_REQUEST_TIMEOUT))
+        .expect("read timeout should set");
+    stream
+        .set_write_timeout(Some(DAEMON_REQUEST_TIMEOUT))
+        .expect("write timeout should set");
     stream
         .write_all(request.as_bytes())
         .expect("request should write");
@@ -2759,7 +2778,13 @@ fn http_request(address: &str, request: &str) -> String {
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
-        .expect("response should read");
+        .unwrap_or_else(|error| {
+            let line = request.lines().next().unwrap_or("<empty request>");
+            panic!(
+                "daemon did not answer `{line}` within {}s: {error}",
+                DAEMON_REQUEST_TIMEOUT.as_secs()
+            )
+        });
     response
 }
 
