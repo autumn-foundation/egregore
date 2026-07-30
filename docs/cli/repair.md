@@ -143,14 +143,64 @@ eg daemon start --data-dir .egregore
 To keep the moved metadata recoverable rather than deleted, add `--quarantine`
 to step 4.
 
-## Deferred: write-receipt repair (AC5/AC6)
+## Write-receipt repair (issue #460 / #72 AC5/AC6)
 
-The write-receipt (idempotency) repair lane — classifying and normalizing a
-`idempotency.json` receipt state that public diagnostics flag as "manual repair
-required" — is **not yet implemented in this slice**. It requires a small `pub`
-read/repair surface over the daemon's private idempotency types and is tracked
-as a follow-up. Issue #72 stays open pending that follow-up. Until then, repair
-covers the daemon-ownership and stale-runtime-metadata classes above.
+`eg repair run --receipts` classifies and repairs the daemon's write-receipt
+(`idempotency.json`) state — the dangling receipts a crashed daemon leaves that
+public diagnostics flag as "manual repair required". It is a distinct phase from
+the runtime-metadata repair above: it gates on active store ownership itself and
+does not run the ownership-verdict branches.
+
+```
+eg repair run --data-dir <dir> --receipts               # AC5: enumerate (read-only)
+eg repair run --data-dir <dir> --receipts --confirm     # AC6: apply the safe subset
+```
+
+### Anomaly classes
+
+| Class                   | On-disk signal                                                        | Auto-repairable? |
+| ----------------------- | -------------------------------------------------------------------- | ---------------- |
+| `duplicate_record_ids`  | Two records in a pending receipt collapse to one recovery key.        | Only when the colliding records are **byte-identical** — the redundant copy is dropped (`dropped_redundant_duplicate`). Differing content is reported manual. |
+| `conflicting_committed` | A pending receipt's record is committed in the store with **different** content. | Never — always `reported_manual`. |
+| `partial_committed`     | A pending receipt's records are (some or all) committed but the receipt was never finalized. | Only when **all** target records are already durably committed — a pure receipt flip `pending → committed` (`finalized_partial`). A genuinely partial write (a record still missing) is reported manual; a commit is never fabricated. |
+
+Detection reuses the exact primitives the daemon's own crash-recovery uses
+(recovery-key multiplicity and per-record store-state comparison), so the
+offline verdict matches the daemon's runtime verdict.
+
+### Safety
+
+- **AC5 enumerate is strictly read-only**: no lease is taken, the store is
+  inspected through a throwaway copy, and the receipt file is never touched.
+- **AC6 apply is lease-aware**: it refuses (result `refused`,
+  `live_daemon_active`) before any mutation when a live daemon/embedded peer
+  holds the lease or a crashed holder left stale metadata, holds the exclusive
+  lease for the whole mutate window, and applies **only** the provably-safe
+  structural subset — never guessing content, never fabricating a commit, never
+  dropping committed bytes.
+- The repair is **idempotent-convergent**: exactly one provably-safe action per
+  anomaly. De-duplicating a byte-identical duplicate can leave a now-finalizable
+  partial receipt, which a subsequent pass finalizes; repeated passes converge to
+  a clean store.
+
+### Output
+
+The report carries a `write_receipt_report` object:
+
+| Field                       | Meaning |
+| --------------------------- | ------- |
+| `scan.total_receipts`       | Number of receipts in the file. |
+| `scan.anomalies[]`          | Per-anomaly rows: `class`, `idempotency_key`, `receipt_state`, sorted `record_ids`, `payload_hash`, `structurally_repairable`, `recommended_action`. |
+| `outcomes[]` (apply only)   | Per-action rows: `idempotency_key`, `class`, `action`, `applied`, `before_hash`, `after_hash`, `skipped_reason`. |
+| `mutated`                   | True when the receipt file was rewritten. |
+| `post_scan`                 | After-state re-verification scan (present only when `mutated`). |
+
+The generic `manifest` also carries one `write_receipt_repair_enumerate`
+(dry-run) or `write_receipt_repair_apply` row per action, with before/after
+hashes. Output is redaction-safe — only idempotency keys, record IDs, payload
+**hashes**, closed-vocabulary labels, counts, and paths escape; the private
+`records`/`response`/payload bytes never do. Scans are byte-identical across runs
+on an unchanged store.
 
 ## Out of scope
 

@@ -101,9 +101,10 @@ pub struct PreflightRefusal {
 //   * Counted per Node, one interned string per populated boxed/collection
 //     payload (the adapter serializes each to a single JSON property value):
 //     temporal, semantic_drift, evidence_links, repository_identity,
-//     source_snapshot, dependency, log, scan_coverage, body_handle, assignees,
-//     labels, target_files, patch_handle, arguments_handle, result_handle,
-//     stdout_handle, stderr_handle, diff_hunk_handle, user_context, producer.
+//     source_snapshot, dependency, log, scan_coverage, body_handle, route,
+//     assignees, labels, target_files, patch_handle, arguments_handle,
+//     result_handle, stdout_handle, stderr_handle, diff_hunk_handle,
+//     user_context, producer.
 //   * Counted per Edge: `id`, `summary`, `source`, `target`, and populated
 //     `confidence` plus the temporal / producer JSON payloads.
 //   * Counted per Tombstone: `id`, `summary`, `deleted_id`, producer JSON.
@@ -144,6 +145,7 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                 call_context,
                 note,
                 content_signature,
+                route,
                 temporal,
                 semantic_drift,
                 evidence_links,
@@ -350,6 +352,7 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                 insert_json(&mut values, log.as_deref());
                 insert_json(&mut values, scan_coverage.as_deref());
                 insert_json(&mut values, body_handle.as_deref());
+                insert_json(&mut values, route.as_ref());
                 insert_json(&mut values, assignees.as_ref());
                 insert_json(&mut values, labels.as_ref());
                 insert_json(&mut values, target_files.as_ref());

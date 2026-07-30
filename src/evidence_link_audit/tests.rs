@@ -88,6 +88,7 @@ fn edge(id: &str, label: EdgeLabel, source: &str, target: &str) -> GraphRecord {
         resolution: None,
         frame_resolution: None,
         frame_index: None,
+        is_exhaustive: None,
         basis: None,
         is_exhaustive: None,
         temporal: None,
@@ -323,7 +324,8 @@ fn all_targets_live_reports_clean() {
     );
     let calls_tomb = tombstone("codegraph:v1:tomb_removed", "codegraph:v1:removed");
 
-    let report = run_evidence_link_audit(&[sym, obs, removed, calls, calls_tomb]);
+    let records = vec![sym, obs, removed, calls, calls_tomb];
+    let report = run_evidence_link_audit(&records);
     assert!(report.ok);
     assert_eq!(report.broken_edge_count, 0);
     assert!(report.broken_edges.is_empty());

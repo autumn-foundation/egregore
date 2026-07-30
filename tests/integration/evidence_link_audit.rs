@@ -104,6 +104,7 @@ fn edge(id: &str, label: EdgeLabel, source: &str, target: &str) -> GraphRecord {
         resolution: None,
         frame_resolution: None,
         frame_index: None,
+        is_exhaustive: None,
         basis: None,
         is_exhaustive: None,
         temporal: None,

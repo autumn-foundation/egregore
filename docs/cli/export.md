@@ -63,40 +63,50 @@ before/after test proves the on-disk store is byte-for-byte unchanged.
 The store is fully read into memory before the output file is written, so a
 mid-read failure never leaves a partial `--out` file behind.
 
-### The forget exception
+### The forget / forget-repo exception
 
 There is exactly **one** deliberate departure from "every physical record":
-a record hidden by an `eg forget` retraction (issue #231) is never re-emitted.
-Re-exporting its body would resurface exactly the bytes `forget` was invoked to
-hide — a redaction leak — so export drops it.
+a record hidden by an `eg forget` retraction (issue #231) OR an `eg forget-repo`
+eviction (issue #248) is never re-emitted. Re-exporting its body would resurface
+exactly the bytes those commands were invoked to hide — a redaction / eviction
+leak — so export drops it.
 
 What is dropped and what is kept:
 
-* **Dropped:** every physical version of the retracted stable ID (the original
+* **Dropped:** every physical version of the suppressed stable ID (the original
   record and any superseded prior versions). Suppression is by stable ID and
   fails closed on privacy, so a forget-then-re-observe record is over-suppressed
-  rather than leaked.
-* **Kept:** the audit trail — the `Retraction` event node (which names the
-  retracted record via its `source_handle`) and the retraction `Tombstone`. The
-  fact that a retraction happened round-trips; only the retracted body does not.
+  rather than leaked. **Also dropped:** any surviving edge whose source or target
+  endpoint is a suppressed id — the JSONL analog of the serving read's liveness
+  gate — so no live edge strands on a vanished node. This covers intra-evicted-
+  repo edges and surviving cross-repo citations into an evicted repository's
+  records.
+* **Kept:** the audit trail — the `Retraction` / eviction event node (which names
+  the suppressed record via its `source_handle`) and the retraction / eviction
+  `Tombstone`. The fact that a retraction or eviction happened round-trips; only
+  the suppressed body does not.
 
-A forget retraction is recognized by two independent signals, unioned so a
-partially-written retraction still fails closed: the `Retraction` event node
-whose `source_handle` names the record, and the deterministic
-`retraction_tombstone_id` identity of the retraction tombstone. Valid-time
-tombstones from history replay carry neither signal, so the legitimate
-historical nodes they mark are preserved and round-trip normally.
+Suppression is recognized by independent signals, unioned so a partially-written
+retraction / eviction still fails closed: the `Retraction` event node whose
+`source_handle` names the record (both #231 and #248 reuse `NodeKind::Retraction`),
+the deterministic `retraction_tombstone_id` identity of a retraction tombstone
+(#231), and the deterministic `eviction_tombstone_id` identity of an eviction
+tombstone (#248). Valid-time tombstones from history replay carry none of these
+signals, so the legitimate historical nodes they mark are preserved and
+round-trip normally.
 
 This is why export is **not identical** to `eg inspect --data-dir`'s physical
-inventory — export deliberately subtracts retracted bodies while inspect (a raw
+inventory — export deliberately subtracts suppressed bodies while inspect (a raw
 physical count) still counts their versions. This is intentional export behavior
-and changes nothing about `inspect`. `eg validate` on a re-ingested
-forget-export is referentially clean (0 defects): the surviving Retraction and
-Tombstone records leave no dangling edges.
+and changes nothing about `inspect`. `eg validate` on a re-ingested export of a
+store containing retractions and/or evictions is referentially clean (0 defects):
+the surviving Retraction / eviction and Tombstone records leave no dangling
+edges, because every edge into a suppressed record is dropped.
 
 The count-parity contract in the round-trip loop above therefore holds for
-**stores without retractions**. A store carrying a `forget` retraction exports
-fewer records than inspect counts, by design.
+**stores without retractions or evictions**. A store carrying a `forget`
+retraction or a `forget-repo` eviction exports fewer records than inspect counts,
+by design.
 
 ### Unknown schema versions
 

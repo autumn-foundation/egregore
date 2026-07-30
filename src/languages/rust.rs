@@ -10,7 +10,7 @@ use tree_sitter::{Node, Parser};
 use crate::{
     error::{CodegraphError, Result},
     fs::SourceFile,
-    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, SourceSpan, stable_id},
+    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, RouteAnnotation, SourceSpan, stable_id},
     languages::{
         common::{
             SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, node_name,
@@ -19,7 +19,7 @@ use crate::{
         cross_file::{
             CallKind, CallPathRoot, CallSiteFact, ConstructSiteFact, DefinitionFact, FileFacts,
             ImplTargetFact, ImplTraitRelationFact, OutOfLineModFact, PendingImplFact,
-            UseImportFact, crate_root_id,
+            RouteRegistrationFact, UseImportFact, crate_root_id,
         },
     },
     redaction::REDACTION_POLICY_VERSION,
@@ -761,8 +761,17 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
         for child in children {
             match child.kind() {
-                "function_item" | "impl_item" | "trait_item" | "mod_item" | "macro_definition"
-                | "macro_invocation" => {}
+                "function_item" | "impl_item" | "trait_item" | "mod_item" | "macro_definition" => {}
+                "macro_invocation" => {
+                    // Macro token trees are otherwise never walked (Tree-sitter
+                    // parses none of their contents as `call_expression`). A
+                    // NARROW exception (issue #445): a route-registration macro
+                    // in the closed set (`routes![…]`) contributes one
+                    // route-registration reference per bare handler identifier.
+                    // Every other macro is still skipped — no recursion into the
+                    // token tree, no arbitrary-macro parsing.
+                    self.collect_route_registrations(child, caller_id, caller_name);
+                }
                 "call_expression" => {
                     if let Some(fact) = self.call_site_fact(child, caller_id, caller_name) {
                         self.facts.call_sites.push(fact);
@@ -1356,6 +1365,104 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         false
     }
 
+    /// Collects routing attributes (`#[get("/path")]`, `#[post("/path")]`, …)
+    /// on the item preceding `node`, walking prev-siblings exactly like
+    /// [`Self::has_test_attribute`] (issue #445). Each attribute whose name is
+    /// in the closed HTTP-method set and which carries a string-literal path
+    /// yields one [`RouteAnnotation`]. Extraction is Tree-sitter node walking —
+    /// never regex. Results are in source order (the prev-sibling walk visits
+    /// nearest-first, then reverses), so a handler with several method
+    /// attributes records them deterministically.
+    fn route_annotations(&self, node: Node<'_>) -> Vec<RouteAnnotation> {
+        let mut collected: Vec<RouteAnnotation> = Vec::new();
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "attribute_item" => {
+                    if let Some(annotation) = self.route_annotation_from_attribute(sibling) {
+                        collected.push(annotation);
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        collected.reverse();
+        collected
+    }
+
+    /// Parses one `attribute_item` into a [`RouteAnnotation`] when it is a
+    /// routing attribute: its name identifier is in the closed HTTP-method set
+    /// (case-insensitive) and its token tree carries at least one string
+    /// literal (the route path is the first such literal). Returns `None` for
+    /// every other attribute. Tree-sitter node walking only.
+    fn route_annotation_from_attribute(&self, attribute_item: Node<'_>) -> Option<RouteAnnotation> {
+        let attribute = first_descendant_of_kind(attribute_item, "attribute")?;
+        // The attribute's name path is its first named child (`identifier` for
+        // `#[get(...)]`, `scoped_identifier` for `#[rocket::get(...)]`); reduce
+        // it to its trailing segment before matching the method set.
+        let name_node = attribute.named_child(0)?;
+        let raw_name = self.node_text(name_node).trim().to_owned();
+        let leaf = raw_name.rsplit("::").next().unwrap_or(&raw_name).trim();
+        let method = http_method_from_attribute_name(leaf)?;
+        let literal = first_descendant_of_kind(attribute, "string_literal")?;
+        let path = string_literal_text(self.node_text(literal).trim())?;
+        Some(RouteAnnotation {
+            method: method.to_owned(),
+            path,
+        })
+    }
+
+    /// Collects route-registration references from a `macro_invocation` when its
+    /// macro name is in the closed registration set (`routes`) (issue #445).
+    /// Each bare `identifier` token inside the macro's `token_tree` is recorded
+    /// as one unqualified handler reference to be resolved cross-file to a
+    /// handler Symbol. Every other macro contributes nothing (the token tree is
+    /// not walked). Path-qualified handler references (`module::handler` inside
+    /// the token tree) are out of this slice's scope — a raw token tree does not
+    /// parse `::` paths, and the fixture registers imported bare names.
+    fn collect_route_registrations(&mut self, node: Node<'_>, caller_id: &str, caller_name: &str) {
+        let Some(macro_node) = node.child_by_field_name("macro") else {
+            return;
+        };
+        let raw = self.node_text(macro_node).trim().to_owned();
+        let leaf = raw.rsplit("::").next().unwrap_or(&raw).trim();
+        if !is_route_registration_macro(leaf) {
+            return;
+        }
+        // The `token_tree` child carries no Tree-sitter field name, so locate it
+        // by kind among the macro invocation's direct children.
+        let mut macro_cursor = node.walk();
+        let Some(token_tree) = node
+            .children(&mut macro_cursor)
+            .find(|child| child.kind() == "token_tree")
+        else {
+            return;
+        };
+        let mut cursor = token_tree.walk();
+        let idents: Vec<Node<'_>> = token_tree
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "identifier")
+            .collect();
+        for ident in idents {
+            let name = self.node_text(ident).trim().to_owned();
+            if name.is_empty() || !is_simple_ident(&name) {
+                continue;
+            }
+            self.facts
+                .route_registration_sites
+                .push(RouteRegistrationFact {
+                    owner_id: caller_id.to_owned(),
+                    owner_name: caller_name.to_owned(),
+                    handler_display: name.clone(),
+                    handler_segments: vec![name],
+                    path_root: CallPathRoot::Unqualified,
+                    span: span(ident),
+                });
+        }
+    }
+
     /// `true` when the item is annotated with exactly `#[cfg(test)]` in the
     /// attribute items immediately preceding it (comments are skipped).
     fn has_cfg_test_attribute(&self, node: Node<'_>) -> bool {
@@ -1533,6 +1640,10 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             if doc_present {
                 record = record.with_redaction_policy_version(REDACTION_POLICY_VERSION);
             }
+        }
+        let route = self.route_annotations(node);
+        if !route.is_empty() {
+            record = record.with_route(route);
         }
         self.graph.push(record);
         self.add_edge(
@@ -3075,6 +3186,45 @@ fn attribute_is_test(text: &str) -> bool {
     name == "test" || name.ends_with("::test")
 }
 
+/// Maps a routing-attribute name onto its uppercased HTTP method when the name
+/// is in the closed method set (case-insensitive), else `None` (issue #445).
+/// The set is deliberately closed — a generic attribute shape, no
+/// framework-specific hardcoding beyond the method vocabulary.
+fn http_method_from_attribute_name(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "get" => Some("GET"),
+        "post" => Some("POST"),
+        "put" => Some("PUT"),
+        "delete" => Some("DELETE"),
+        "patch" => Some("PATCH"),
+        "head" => Some("HEAD"),
+        "options" => Some("OPTIONS"),
+        _ => None,
+    }
+}
+
+/// `true` when a macro name is in the closed route-registration set (issue
+/// #445). Only `routes` today (the Rocket/autumn `routes![…]` shape); the set is
+/// closed — no arbitrary-macro parsing.
+fn is_route_registration_macro(name: &str) -> bool {
+    name == "routes"
+}
+
+/// Returns the first descendant of `node` (pre-order, source order) whose kind
+/// equals `kind`, or `None`. Deterministic first match.
+fn first_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == kind {
+            return Some(child);
+        }
+        if let Some(found) = first_descendant_of_kind(child, kind) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn macro_invocation_name(text: &str) -> String {
     let trimmed = text.trim();
     trimmed
@@ -3927,6 +4077,115 @@ mod tests {
             ImplTargetDecision::Resolve(name) => Some(name),
             ImplTargetDecision::Verbatim | ImplTargetDecision::NoEdge => None,
         }
+    }
+
+    /// Parses `source` and returns its root node's tree (issue #445 route tests).
+    fn parse_tree(source: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load rust grammar");
+        parser.parse(source, None).expect("parse source")
+    }
+
+    /// Reconstructs `route_annotation_from_attribute` over a real parse using
+    /// the same free helpers the extractor method uses, so the Tree-sitter
+    /// walking path is exercised without a full `RustExtractor` instance.
+    fn route_attr(source: &str) -> Option<(String, String)> {
+        let tree = parse_tree(source);
+        let attribute = first_descendant_of_kind(tree.root_node(), "attribute")?;
+        let name_node = attribute.named_child(0)?;
+        let raw = source[name_node.byte_range()].trim().to_owned();
+        let leaf = raw.rsplit("::").next().unwrap_or(&raw).trim();
+        let method = http_method_from_attribute_name(leaf)?;
+        let literal = first_descendant_of_kind(attribute, "string_literal")?;
+        let path = string_literal_text(source[literal.byte_range()].trim())?;
+        Some((method.to_owned(), path))
+    }
+
+    /// Collects the bare handler identifiers a route-registration macro would
+    /// register, gated by `is_route_registration_macro`, mirroring
+    /// `collect_route_registrations`.
+    fn route_macro_idents(source: &str) -> Option<Vec<String>> {
+        let tree = parse_tree(source);
+        let macro_node = first_descendant_of_kind(tree.root_node(), "macro_invocation")?;
+        let name_node = macro_node.child_by_field_name("macro")?;
+        let raw = source[name_node.byte_range()].trim().to_owned();
+        let leaf = raw.rsplit("::").next().unwrap_or(&raw).trim();
+        if !is_route_registration_macro(leaf) {
+            return None;
+        }
+        let mut macro_cursor = macro_node.walk();
+        let token_tree = macro_node
+            .children(&mut macro_cursor)
+            .find(|child| child.kind() == "token_tree")?;
+        let mut cursor = token_tree.walk();
+        Some(
+            token_tree
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "identifier")
+                .map(|child| source[child.byte_range()].trim().to_owned())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn http_method_attribute_name_maps_closed_set_case_insensitively() {
+        assert_eq!(http_method_from_attribute_name("get"), Some("GET"));
+        assert_eq!(http_method_from_attribute_name("POST"), Some("POST"));
+        assert_eq!(http_method_from_attribute_name("Put"), Some("PUT"));
+        assert_eq!(http_method_from_attribute_name("delete"), Some("DELETE"));
+        assert_eq!(http_method_from_attribute_name("patch"), Some("PATCH"));
+        assert_eq!(http_method_from_attribute_name("head"), Some("HEAD"));
+        assert_eq!(http_method_from_attribute_name("options"), Some("OPTIONS"));
+        // Not an HTTP method — no route fact.
+        assert_eq!(http_method_from_attribute_name("inline"), None);
+        assert_eq!(http_method_from_attribute_name("test"), None);
+    }
+
+    #[test]
+    fn route_registration_macro_set_is_closed() {
+        assert!(is_route_registration_macro("routes"));
+        assert!(!is_route_registration_macro("vec"));
+        assert!(!is_route_registration_macro("println"));
+    }
+
+    #[test]
+    fn route_attribute_parses_to_method_and_path() {
+        assert_eq!(
+            route_attr("#[get(\"/api/v1/contacts\")]\nfn list() {}\n"),
+            Some(("GET".to_owned(), "/api/v1/contacts".to_owned()))
+        );
+        assert_eq!(
+            route_attr("#[post(\"/api/v1/contacts\")]\nfn create() {}\n"),
+            Some(("POST".to_owned(), "/api/v1/contacts".to_owned()))
+        );
+    }
+
+    #[test]
+    fn non_method_attribute_yields_no_route_fact() {
+        assert_eq!(route_attr("#[inline]\nfn plain() {}\n"), None);
+        assert_eq!(route_attr("#[cfg(test)]\nfn gated() {}\n"), None);
+    }
+
+    #[test]
+    fn routes_macro_yields_registered_handler_identifier_set() {
+        assert_eq!(
+            route_macro_idents("fn build() { let _ = routes![list, get_one, create]; }"),
+            Some(vec![
+                "list".to_owned(),
+                "get_one".to_owned(),
+                "create".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn non_routes_macro_yields_no_registrations() {
+        assert_eq!(
+            route_macro_idents("fn build() { let _ = vec![list, create]; }"),
+            None
+        );
     }
 
     #[test]

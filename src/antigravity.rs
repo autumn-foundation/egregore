@@ -198,6 +198,7 @@ fn make_node(
         call_context: None,
         note: None,
         content_signature: None,
+        route: None,
         temporal: None,
         semantic_drift: None,
         evidence_links: None,

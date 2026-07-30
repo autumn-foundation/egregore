@@ -222,6 +222,22 @@ Any request including `tx_as_of` or `tx_since` fields must receive a
   "jobs": <integer>,
   "agents": <integer>,
   "idempotency_store_size": <integer>,
+  "jobs_by_state": {
+    "queued": <integer>,
+    "running": <integer>,
+    "completed": <integer>,
+    "failed": <integer>
+  },
+  "oldest_active_job": {
+    "start_time_unix_ms": <integer>,
+    "age_ms": <integer>
+  },
+  "error_counts": {
+    "retryable_overload": <integer>,
+    "timeout": <integer>,
+    "auth": <integer>,
+    "schema_validation": <integer>
+  },
   "pressure": {
     "state": "idle",
     "alive": true,
@@ -241,6 +257,30 @@ The `pressure` block is the machine-readable write-admission pressure contract.
 It is the stable surface that clients and SDKs read; the `eg daemon status` CLI
 renders the same data for humans but is not a contract. See
 [§ 10 — Write-admission pressure](#10--write-admission-pressure).
+
+The `jobs_by_state`, `oldest_active_job`, and `error_counts` blocks (issue #61)
+are the operational-status surface. Their fields, canonicalization rules, and the
+liveness-vs-operational distinction are documented for operators in
+[`docs/cli/daemon-status.md`](../cli/daemon-status.md):
+
+- `jobs_by_state` — job counts by the closed lifecycle set
+  `{queued, running, completed, failed}`. A job's free-string status is
+  canonicalized: `running`/`completed`/`failed` map to themselves, and every
+  other value (the initial `queued`, plus any unknown/legacy string) maps to
+  `queued`, so no job is dropped from the totals. The counts always sum to the
+  scalar `jobs`.
+- `oldest_active_job` — over active (queued or running) jobs, the earliest
+  creation stamp: `start_time_unix_ms` and its `age_ms`
+  (`now − start_time`, floored at 0). `null` when no job is active.
+- `error_counts` — process-lifetime **monotonic** counters for four error
+  classes: `retryable_overload` (`queue_full` write-admission rejections, #45),
+  `timeout` (`query_timeout`), `auth` (`unauthorized`), and `schema_validation`
+  (`unknown_schema_version`). Counters only ever increase; a status read never
+  resets or mutates them.
+
+Every field on this endpoint is a count, age, timestamp, or stable code — no
+payload, record body, transcript, command output, or secret. All of it is safe
+to paste into a bug report.
 
 ### `POST /v1/records/ingest` — synchronous write
 

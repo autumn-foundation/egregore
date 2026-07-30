@@ -174,10 +174,13 @@ reproduces the `eg inspect` totals and per-domain/kind/schema-version counts
 (parity holds for stores without retractions). Lines are sorted and `\n`-joined
 as `Graph::to_jsonl` does, so repeated exports of an unchanged store are
 byte-identical. The one deliberate deviation from "every physical record": a
-record hidden by `eg forget` (#231) is never re-emitted (every physical version
-of the retracted id is dropped, fail-closed on privacy), while its `Retraction`
-event and tombstone audit trail are preserved — so a re-ingested forget-export
-is `eg validate`-clean. Unknown `(domain, kind, schema_version)` records (only
+record hidden by `eg forget` (#231) OR `eg forget-repo` eviction (#248) is never
+re-emitted (every physical version of the suppressed id is dropped, fail-closed
+on privacy, AND any surviving edge whose source/target endpoint is a suppressed
+id is dropped — the JSONL analog of the serving read's liveness, so no live edge
+strands on a vanished node), while its `Retraction`/eviction event and tombstone
+audit trail are preserved — so a re-ingested export of a store containing
+retractions and/or evictions is `eg validate`-clean. Unknown `(domain, kind, schema_version)` records (only
 bumped versions of known kinds, since ingest rejects unknown kinds at the write
 path) re-emit their reconstructed canonical line verbatim; a record that cannot
 be reconstructed (a required prop absent — only reachable via artificial raw
@@ -208,6 +211,34 @@ fully local (no network/upload), byte-identical across runs and independent of
 insertion order (documents sorted by path; entries by
 `(start_line, name, record_id)`). The bare `eg export` JSONL dump is unchanged.
 See `docs/cli/export-scip.md`.
+
+`eg scan` makes attribute-macro route registration visible to the graph (issue
+#445). A routing attribute on a handler (`#[get("/path")]`, `#[post(...)]`, …
+for the closed HTTP-method set get/post/put/delete/patch/head/options,
+case-insensitive) is captured as an additive optional `route` fact on the
+handler `Symbol` node — a `Vec<RouteAnnotation>` of `{method, path}` (method =
+uppercased attribute name, path = first string literal), read via the existing
+prev-sibling attribute walk with Tree-sitter node walking (never regex),
+`#[serde(default, skip_serializing_if)]` and never an identity input. A
+route-registration macro in the closed set (`routes![handler_a, handler_b]`,
+the Rocket/autumn shape) emits one new `REGISTERS_ROUTE` edge from the Symbol
+owning the invocation to each registered handler `Symbol`: the bare handler
+identifiers are pulled from the macro's token tree (all other macro token trees
+stay unwalked) and resolved repo-wide through the CALLS `DefinitionIndex`
+(free-function pool + #440 crate-root confinement), bound ONLY on a UNIQUE
+resolution — 0 or ≥2 candidates mint NOTHING (no edge, no diagnostic), the
+no-wrong-edge doctrine. `REGISTERS_ROUTE` is code-graph topology (excluded from
+evidence-path traversal, classified as codegraph domain) and counts toward a
+handler's inbound reference degree in `orientation`/`unreferenced`, so an
+attribute-routed handler is no longer misclassified as unreferenced/test-only.
+Edges are a route→handler chain lead, never proof of runtime dispatch.
+CAPTURED: Rocket/autumn-style method attributes + `routes![…]`. NOT in this
+slice: actix/axum method-call registration (`.route(...)`/`.service(...)`),
+combined `#[route(..., method = ...)]` attributes, path-qualified handler
+references inside the macro, dispatch-semantics modeling, synthetic route
+nodes, and URL matching. Bumps codegraph `SCHEMA_VERSION` 7→8 and
+`CACHE_SCHEMA_VERSION` 24→25. See `docs/schema/schema-versioning.md` and the
+`REGISTERS_ROUTE` row in `docs/prd/0001-codebase-knowledge-graph.md`.
 
 Query commands (local JSONL graph, no network):
 
@@ -272,6 +303,12 @@ cargo run -- query who-imports foo::bar --graph graph.jsonl           # segment-
 cargo run -- query who-imports mycrate::foo --crate mycrate --graph graph.jsonl  # unify crate:: with mycrate::
 cargo run -- query who-imports nonexistent::module --graph graph.jsonl  # exit 2 (no_match)
 cargo run -- query who-imports "" --graph graph.jsonl                 # exit 1 (malformed_module_path)
+
+# Symbols that construct a type via a `Type { … }` literal (issue #471)
+cargo run -- query who-constructs Deal --graph graph.jsonl            # exit 0 (>=1 constructor)
+cargo run -- query who-constructs Deal --graph history.graph.jsonl --all-history  # union of all snapshots
+cargo run -- query who-constructs Lonely --graph graph.jsonl          # exit 2 (no_match: zero constructors)
+cargo run -- query who-constructs "" --graph graph.jsonl             # exit 1 (malformed_type_handle)
 
 # Symbol- and file-level deltas across a commit range (issue #118)
 cargo run -- query deltas <base_sha> <head_sha> --graph history.graph.jsonl  # exit 0 on match
@@ -555,6 +592,41 @@ path, start line, then record ID and byte-identical across runs and across `--gr
 importers, exit 1 (`malformed_module_path`) for an empty/leading-or-trailing-`::`/empty-
 interior-segment/whitespace-bearing path. Rows are import-site leads, never proof the
 imported item is used. See `docs/cli/who-imports.md`.
+
+`eg query who-constructs <Type>` lists the symbols that construct a type via a
+`Type { … }` struct/enum literal — a read-only lookup over the extractor-minted
+`CONSTRUCTS` edges (PR #467 / issue #443), the inbound type-anchored mirror of
+`deps` and the symmetric partner to `who-imports`. It is the dedicated,
+first-class form of the `construction_sites` group `eg query change-impact`
+already surfaces: both read the same edges and expose the same `e0063_risk`
+signal. The `<Type>` handle resolves as an exact type NAME or a canonical record
+ID via the shared symbol resolver (a file/task/other non-symbol handle is
+unsupported, exit 1; an empty handle is `malformed_type_handle`, exit 1; a name
+matching more than one live type is ambiguous, exit 1 with all candidate record
+IDs). Each row cites the constructing symbol's stable `record_id` +
+`repo_relative_path`/`span` + the producing `edge_record_id`, plus `e0063_risk`
+(`true` when at least one collapsed site uses the exhaustive, non-`..base`
+literal form that fails to compile — rustc E0063 — when a required field is
+added; `false` when every site used struct-update `..base`/FRU, which stays
+valid; derived as `is_exhaustive.unwrap_or(true)`, so a legacy edge with no
+marker is conservatively risky) and the raw `is_exhaustive` marker. Construction
+is caller-granularity: per-site spans collapse to the constructing symbol, same
+as `CALLS`, and a constructor that builds the type more than once appears once.
+Liveness is the shared latest-write-wins `Liveness` gate (tombstoned
+constructors excluded, revived ones included, latest edge version supplies the
+row), so `--graph` and `--data-dir` agree and are byte-identical. Over a
+`scan-history` store the corpus DEFAULTS to HEAD-anchored (sites current at each
+repository's stamped HEAD); `--all-history` opts into the union and `--at-head`
+makes the default explicit — mutually exclusive with each other and with
+`--at`/`--as-of` (exit 1 `unsupported_combination`), and the envelope discloses
+`corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (issue #427; see
+`docs/cli/corpus-modes.md`). Output is a deterministic NDJSON envelope
+(`handle`, resolved `target`, `total_constructors`, disclaimer) then one
+`source_fact` row per constructor, sorted by path, start line, then record ID.
+Exit 0 on a match, exit 2 (`no_match`) for a well-formed type with zero live
+constructors. Rows are construction-site LEADS and `e0063_risk` an actionable
+signal, never proof a specific field addition breaks. See
+`docs/cli/who-constructs.md`.
 
 `eg query deltas <base> <head>` returns the observed structural deltas between two commit
 handles (full SHA or unique prefix) from a `scan-history` graph or embedded store, grouped by
@@ -1380,6 +1452,22 @@ store). `eg ingest --adapter embedded` additionally prints the machine-readable
 `{"ok": false, "error": {...}}` envelope on stdout. Read-only commands never take the
 write lease; strictly read-only audits read a throwaway snapshot copy. See
 `docs/cli/embedded-concurrency.md`.
+
+Daemon operational status (issue #61): `eg daemon status` / `GET /v1/status`
+extends the machine-readable payload with `jobs_by_state` (job counts by the
+closed `{queued, running, completed, failed}` set — a job's free-string status
+canonicalizes into one bucket, unknown/`queued` → `queued`, and the counts sum to
+the scalar `jobs`), `oldest_active_job` (`start_time_unix_ms` + `age_ms` over
+queued/running jobs; `null` when none active), and `error_counts` — process-
+lifetime monotonic counters for four classes: `retryable_overload` (`queue_full`,
+counted at the single write-admission reject site so background job-path
+rejections count too), `timeout` (`query_timeout`), `auth` (`unauthorized`), and
+`schema_validation` (`unknown_schema_version`). The existing `pressure` block
+(#45) and scalar fields are unchanged; a status read is strictly read-only and
+never mutates jobs or counters. Every field is a count/age/timestamp/code — safe
+to paste into an issue. Use `/v1/health` for liveness, `eg daemon status` for
+operational triage. See `docs/cli/daemon-status.md` and
+`docs/schema/daemon-api.md`.
 
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
 
