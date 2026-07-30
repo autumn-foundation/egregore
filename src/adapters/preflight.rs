@@ -1,21 +1,33 @@
-//! Ingest capacity preflight (issue #439).
+//! Ingest capacity preflight (issue #439, relaxed for `AletheiaDB` 0.2.0).
 //!
-//! `AletheiaDB` 0.1.1 caps its process-global string interner at a
-//! non-overridable `MAX_STRING_COUNT` of `100_000` entries
-//! (`src/storage/index_persistence/mod.rs`). At WRITE time only node/edge
-//! labels and property KEYS are interned (a small bounded set), so tens of
-//! thousands of records write without complaint. At index-PERSIST time the
-//! serializer interns every per-record property VALUE string (record id, path,
-//! name, summary, signature, doc, boxed-payload JSON, ...). A large graph mints
-//! far more than `100_000` distinct value strings and overflows the cap, and the
-//! store's background persistence thread then hot-loops on the resulting
-//! `CapacityExceeded` error forever — the observed "ingest hangs" symptom.
+//! At WRITE time only node/edge labels and property KEYS are interned (a small
+//! bounded set), so tens of thousands of records write without complaint. At
+//! index-PERSIST time the serializer interns every per-record property VALUE
+//! string (record id, path, name, summary, signature, doc, boxed-payload JSON,
+//! ...). A large graph mints far more distinct value strings than records, so
+//! the interner — not the record count — is the binding limit on ingest size.
 //!
-//! The published crate cannot be patched (project rule: no fork, no path dep),
-//! so the primary defense is to REFUSE before opening the store: estimate the
-//! distinct interned value strings a graph would produce and, when the estimate
-//! reaches the cap, fail fast with a machine-readable diagnostic instead of
-//! spawning a doomed writer.
+//! WHAT CHANGED IN 0.2.0. Two upstream fixes retire the acute failure mode this
+//! module was built for:
+//!
+//!   * The cap is no longer hardcoded at `100_000`. `PersistenceConfig` gained
+//!     `max_interned_strings`, defaulting to `10_000_000` — a 100x relaxation.
+//!     The embedded adapter sets it EXPLICITLY from [`MAX_INTERNED_STRINGS`]
+//!     below rather than inheriting the upstream default, so this estimate and
+//!     the store's real cap are the same number by construction and cannot
+//!     drift apart across an upstream default change.
+//!   * The background-persist infinite retry loop is gone. On 0.1.1 an overflow
+//!     made the persistence thread hot-loop on `CapacityExceeded` forever — the
+//!     observed "ingest hangs" symptom, and the reason a pre-open refusal was
+//!     the only safe defense. An overflow now surfaces as an error instead of a
+//!     hang.
+//!
+//! The preflight is therefore no longer load-bearing against a hang, but it is
+//! RETAINED as a fast, honest refusal: at the 10M cap a graph large enough to
+//! overflow would otherwise spend a long time writing before failing at persist
+//! time, and a refusal naming the estimate is a better answer than a late error.
+//! `--force` still bypasses the estimate, and a real overflow during
+//! write/persist is still fatal.
 //!
 //! This module is feature-INDEPENDENT: it operates purely on [`GraphRecord`]s
 //! and pulls in no `AletheiaDB` types, so it compiles and is unit-tested in
@@ -25,16 +37,24 @@ use std::collections::HashSet;
 
 use crate::ir::GraphRecord;
 
-/// The `AletheiaDB` 0.1.1 string-interner capacity, mirrored here so the
-/// preflight can refuse before the store's own persist-time check fires.
+/// The string-interner capacity Egregore configures on every embedded store,
+/// mirrored here so the preflight can refuse before the store's own
+/// persist-time check fires.
 ///
-/// Upstream this is `MAX_STRING_COUNT` in
-/// `src/storage/index_persistence/mod.rs`: `pub const MAX_STRING_COUNT: u64 =
-/// 100_000;`. It is a DoS-protection limit on a process-global,
-/// monotonic/append-only interner and is NOT overridable through any public
-/// `AletheiaDB` API in 0.1.1, so a workload that would cross it must be split
-/// or routed away from the embedded store rather than tuned up.
-pub const MAX_INTERNED_STRINGS: u64 = 100_000;
+/// This is the value the embedded adapter passes to
+/// `PersistenceConfig.max_interned_strings` at open (see
+/// `adapters::aletheiadb::EmbeddedAletheiaSink::open_inner`), NOT merely a copy
+/// of an upstream default — the same constant configures the store and bounds
+/// this estimate, so the two cannot disagree.
+///
+/// It matches `AletheiaDB` 0.2.0's own
+/// `PersistenceConfig::DEFAULT_MAX_INTERNED_STRINGS` (and its `MAX_STRING_COUNT`
+/// load-path floor) of `10_000_000`, raised there from 0.1.1's hardcoded
+/// `100_000`. The interner is process-global, monotonic/append-only, and read
+/// once at open, so this is a per-PROCESS budget shared by every store the
+/// process opens — not a per-store one. Raising it costs roughly 100 bytes of
+/// resident memory per interned string (~1 GB at 10M).
+pub const MAX_INTERNED_STRINGS: u64 = 10_000_000;
 
 /// The estimate of distinct value strings a graph would intern at persist time.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -121,7 +141,7 @@ pub struct PreflightRefusal {
 //   bias is toward inclusion. One acknowledged minor under-count: `temporal`
 //   and `semantic_drift` are each folded into a single JSON string here even
 //   though the adapter expands them into several individual interned values;
-//   these records are rare relative to the 100_000 cap and their commit-shared
+//   these records are rare relative to the cap and their commit-shared
 //   substrings dedup heavily, so the effect is negligible.
 #[must_use]
 #[allow(clippy::too_many_lines)] // Exhaustive per-field enumeration by design.
@@ -442,13 +462,34 @@ pub fn check_ingest_capacity(
     records: &[GraphRecord],
     force: bool,
 ) -> Result<InternEstimate, PreflightRefusal> {
+    check_ingest_capacity_against(records, force, MAX_INTERNED_STRINGS)
+}
+
+/// [`check_ingest_capacity`] against an explicit `limit`.
+///
+/// Exists so the refusal/bypass logic stays unit-testable after the 0.2.0
+/// upgrade raised [`MAX_INTERNED_STRINGS`] to `10_000_000`: synthesizing a graph
+/// that genuinely clears 10M distinct strings would need millions of records and
+/// gigabytes of allocation, which is not a unit test. Tests drive the threshold
+/// behaviour through this function with a small limit and separately assert that
+/// the public wrapper passes [`MAX_INTERNED_STRINGS`].
+///
+/// # Errors
+///
+/// Returns [`PreflightRefusal`] when the estimate reaches `limit` and `force` is
+/// not set.
+fn check_ingest_capacity_against(
+    records: &[GraphRecord],
+    force: bool,
+    limit: u64,
+) -> Result<InternEstimate, PreflightRefusal> {
     let estimate = estimate_interned_strings(records);
-    if force || estimate.distinct_string_count < MAX_INTERNED_STRINGS {
+    if force || estimate.distinct_string_count < limit {
         Ok(estimate)
     } else {
         Err(PreflightRefusal {
             estimate: estimate.distinct_string_count,
-            limit: MAX_INTERNED_STRINGS,
+            limit,
             record_count: estimate.record_count,
         })
     }
@@ -524,26 +565,72 @@ mod tests {
 
     #[test]
     fn check_refuses_at_or_above_threshold() {
-        let records = synthesize_above_threshold();
-        let refusal = check_ingest_capacity(&records, false)
+        let records = synthesize_above(TEST_LIMIT);
+        let refusal = check_ingest_capacity_against(&records, false, TEST_LIMIT)
             .expect_err("above-threshold graph must be refused");
-        assert!(refusal.estimate >= MAX_INTERNED_STRINGS);
-        assert_eq!(refusal.limit, MAX_INTERNED_STRINGS);
+        assert!(refusal.estimate >= TEST_LIMIT);
+        assert_eq!(refusal.limit, TEST_LIMIT);
         assert_eq!(refusal.record_count, records.len());
     }
 
     #[test]
     fn force_bypasses_refusal_even_above_threshold() {
-        let records = synthesize_above_threshold();
-        let estimate = check_ingest_capacity(&records, true).expect("force bypasses the estimate");
-        assert!(estimate.distinct_string_count >= MAX_INTERNED_STRINGS);
+        let records = synthesize_above(TEST_LIMIT);
+        let estimate = check_ingest_capacity_against(&records, true, TEST_LIMIT)
+            .expect("force bypasses the estimate");
+        assert!(estimate.distinct_string_count >= TEST_LIMIT);
     }
 
-    /// Builds a cheap in-memory graph whose estimate exceeds the cap: each node
+    /// The public wrapper must gate on [`MAX_INTERNED_STRINGS`], not on some
+    /// other constant — this is what ties the tests above (which use a small
+    /// injected limit) to the cap the adapter actually configures.
+    #[test]
+    fn public_check_gates_on_the_configured_cap() {
+        let records = synthesize_above(TEST_LIMIT);
+        let refusal = check_ingest_capacity_against(&records, false, TEST_LIMIT)
+            .expect_err("refused against the small test limit");
+        // The very same graph passes the public check, because the real cap is
+        // two orders of magnitude higher.
+        let estimate =
+            check_ingest_capacity(&records, false).expect("must pass under the configured cap");
+        assert_eq!(estimate.distinct_string_count, refusal.estimate);
+        assert!(estimate.distinct_string_count < MAX_INTERNED_STRINGS);
+    }
+
+    /// `AletheiaDB` 0.2.0 upgrade: the cap is the value Egregore configures on the
+    /// store (`PersistenceConfig.max_interned_strings`), raised from 0.1.1's
+    /// hardcoded `100_000` to `10_000_000`.
+    #[test]
+    fn configured_cap_is_ten_million() {
+        assert_eq!(MAX_INTERNED_STRINGS, 10_000_000);
+    }
+
+    /// Regression the upgrade exists to fix: a graph in the 100k–10M band was
+    /// refused outright on 0.1.1 and must now ingest without `--force`. ~34k
+    /// nodes estimate well past the old `100_000` cap.
+    #[test]
+    fn graph_over_the_old_100k_cap_is_no_longer_refused() {
+        const OLD_CAP: u64 = 100_000;
+        let records = synthesize_above(OLD_CAP);
+        let estimate = check_ingest_capacity(&records, false)
+            .expect("a graph over the retired 100k cap must ingest without --force");
+        assert!(
+            estimate.distinct_string_count >= OLD_CAP,
+            "fixture must actually clear the old cap to be a regression test"
+        );
+        assert!(estimate.distinct_string_count < MAX_INTERNED_STRINGS);
+    }
+
+    /// A small stand-in for the real cap, so the refusal path is exercised
+    /// without allocating the millions of records `MAX_INTERNED_STRINGS` would
+    /// now require.
+    const TEST_LIMIT: u64 = 1_000;
+
+    /// Builds a cheap in-memory graph whose estimate exceeds `limit`: each node
     /// contributes a distinct id + name + summary + the per-write seq term, so
-    /// ~34k nodes clears `100_000`. Pure allocation, well under a second, no store.
-    fn synthesize_above_threshold() -> Vec<GraphRecord> {
-        let count = 34_000usize;
+    /// roughly `limit / 3` nodes clears it. Pure allocation, no store.
+    fn synthesize_above(limit: u64) -> Vec<GraphRecord> {
+        let count = usize::try_from(limit).unwrap_or(usize::MAX) / 3 + 64;
         let mut records = Vec::with_capacity(count);
         for index in 0..count {
             records.push(node(

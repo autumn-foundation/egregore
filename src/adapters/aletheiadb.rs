@@ -250,10 +250,19 @@ impl EmbeddedAletheiaSink {
         if is_fresh_data_dir(data_dir) {
             config.persistence.load_on_startup = false;
         }
+        // Pin the string-interner cap to Egregore's own constant rather than
+        // inheriting AletheiaDB's default (issue #439). `MAX_INTERNED_STRINGS`
+        // also bounds the ingest preflight estimate, so configuring the store
+        // from the same constant makes "what we refuse" and "what the store
+        // actually enforces" the same number by construction — an upstream
+        // default change can no longer silently desync them. The interner is
+        // process-global and read once at open, so this is a per-process budget.
+        config.persistence.max_interned_strings =
+            usize::try_from(super::preflight::MAX_INTERNED_STRINGS).unwrap_or(usize::MAX);
         let db = ::aletheiadb::AletheiaDB::with_unified_config(config).map_err(|error| {
             AdapterError::Rejected {
                 record_id: "embedded-store".to_owned(),
-                message: error.to_string(),
+                message: classify_open_error(data_dir, &error.to_string()),
             }
         })?;
         let mut sink = Self {
@@ -391,9 +400,15 @@ impl EmbeddedAletheiaSink {
 
         let mut results = Vec::with_capacity(limit);
         for raw_limit in candidate_limits {
+            // `similarity_search` is AletheiaDB 0.2.0's unified vector-search
+            // entry point; an embedding-sourced query with no label/time filter
+            // dispatches to exactly the `find_similar_by_embedding` path this
+            // call used before the upgrade, so ranking and scores are unchanged.
             let raw = self
                 .db
-                .find_similar_by_embedding(query_vector, raw_limit)
+                .similarity_search(
+                    ::aletheiadb::SimilarityQuery::from_embedding(query_vector).k(raw_limit),
+                )
                 .map_err(|error| AdapterError::ReadBack {
                     record_id: "semantic-search".to_owned(),
                     message: error.to_string(),
@@ -4375,6 +4390,47 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
     }
 }
 
+/// Marker text `AletheiaDB` 0.2.0 emits when it refuses to open a data
+/// directory holding an unreplayed pre-v13 WAL tail.
+///
+/// Upstream this is `StorageError::PreV13WalTailRequiresMigration`, whose
+/// `Display` is `"pre-v13 (0.1.x) WAL tail cannot be replayed safely: {reason}"`.
+/// Matched on the stable leading phrase rather than the variable `reason`.
+const PRE_V13_WAL_TAIL_MARKER: &str = "pre-v13";
+
+/// Augments an embedded-store OPEN failure with Egregore-specific remediation.
+///
+/// The case that matters is `AletheiaDB` 0.2.0's refusal to replay a pre-v13
+/// WAL tail. Upstream's own message is accurate but speaks in `AletheiaDB`
+/// terms; an Egregore operator hitting it has a concrete cause — the data dir
+/// was last written by an `eg` binary linked against `AletheiaDB` 0.1.x and was
+/// not shut down cleanly — and a concrete remedy, so the raw string is prefixed
+/// with both rather than passed through bare.
+///
+/// This is a refusal, not corruption: 0.1.x stored WAL labels as process-local
+/// interner ids, and replaying them under 0.2.0's differently-ordered interner
+/// would resolve them to unrelated strings. Upstream refuses instead of
+/// silently corrupting every entity recovered from the tail. Nothing in the
+/// directory is modified by the failed open.
+///
+/// Any other open error passes through verbatim.
+fn classify_open_error(data_dir: &Path, message: &str) -> String {
+    if message.contains(PRE_V13_WAL_TAIL_MARKER) {
+        return format!(
+            "embedded store {} was written by an older Egregore build (AletheiaDB 0.1.x) and \
+             still holds an unreplayed write-ahead-log tail, which AletheiaDB 0.2.0 refuses to \
+             replay because doing so would silently corrupt every recovered record's labels; \
+             nothing was modified. Remedy: re-open the directory once with the previous `eg` \
+             build so it drains its own WAL and shuts down cleanly, then re-run this command; \
+             if that build is unavailable, re-ingest from JSONL into a FRESH --data-dir \
+             (`eg export` against the old store still requires the old build). Upstream detail: \
+             {message}",
+            data_dir.display()
+        );
+    }
+    message.to_owned()
+}
+
 /// Classifies a store write/persist error string, mapping the `AletheiaDB`
 /// string-interner capacity overflow (issue #439) to the fatal
 /// [`AdapterError::CapacityExceeded`] and everything else to
@@ -4910,9 +4966,12 @@ mod tests {
     /// Display maps through `classify_store_error` to the fatal
     /// `CapacityExceeded` variant, while an unrelated error stays `Rejected`.
     /// This exercises the exact mapping the `create_node` / `persist_indexes`
-    /// sites use, without needing a real >100k-distinct ingest (too slow for
-    /// CI). The end-to-end overflow-through-a-live-store path is therefore
-    /// covered only at this boundary; see `docs/cli/ingest.md`.
+    /// sites use, without needing a real cap-clearing ingest (millions of
+    /// distinct strings since the 0.2.0 upgrade — far too slow for CI). The
+    /// end-to-end overflow-through-a-live-store path is therefore covered only
+    /// at this boundary; see `docs/cli/ingest.md`. The sample Display below is
+    /// upstream's verbatim format; its numbers are illustrative, and the
+    /// classifier matches on the message shape, not the values.
     #[test]
     fn classify_store_error_maps_interner_overflow_to_capacity_exceeded() {
         let upstream =
@@ -7232,6 +7291,60 @@ mod tests {
         }
         panic!(
             "node {record_id} with valid_time {valid_time} observed_at {observed_at} should exist"
+        );
+    }
+
+    /// `AletheiaDB` 0.2.0 upgrade: the adapter must actually APPLY
+    /// `PersistenceConfig.max_interned_strings` at open, not merely inherit the
+    /// upstream default. Asserted against the process-global interner's real
+    /// capacity, so an accidental removal of the config line fails here rather
+    /// than silently reverting the cap to whatever upstream defaults to next.
+    #[test]
+    fn opening_a_store_configures_the_interner_cap() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("interner-cap-store");
+        let _sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+        let expected = usize::try_from(crate::adapters::preflight::MAX_INTERNED_STRINGS)
+            .expect("cap fits in usize on supported targets");
+        assert_eq!(
+            ::aletheiadb::core::interning::GLOBAL_INTERNER.max_capacity(),
+            expected,
+            "open must configure the interner from MAX_INTERNED_STRINGS"
+        );
+    }
+
+    /// A pre-v13 WAL-tail refusal (new in `AletheiaDB` 0.2.0) must be re-framed in
+    /// Egregore terms: name the data dir, say nothing was modified, and give the
+    /// drain-on-the-old-build remedy — while preserving the upstream detail.
+    #[test]
+    fn classify_open_error_explains_pre_v13_wal_tail_refusal() {
+        let upstream = "pre-v13 (0.1.x) WAL tail cannot be replayed safely: 3 unreplayed entries";
+        let message = classify_open_error(Path::new("/srv/.egregore"), upstream);
+
+        assert!(message.contains("/srv/.egregore"), "must name the data dir");
+        assert!(
+            message.contains("nothing was modified"),
+            "must state the failed open changed nothing"
+        );
+        assert!(
+            message.contains("Remedy:"),
+            "must carry an actionable remedy"
+        );
+        assert!(
+            message.contains(upstream),
+            "must preserve the upstream detail verbatim"
+        );
+    }
+
+    /// Every other open failure passes through untouched — the classifier must
+    /// not editorialise errors it does not understand.
+    #[test]
+    fn classify_open_error_passes_through_unrelated_failures() {
+        let upstream = "I/O error: permission denied";
+        assert_eq!(
+            classify_open_error(Path::new("/srv/.egregore"), upstream),
+            upstream
         );
     }
 

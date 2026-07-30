@@ -36,20 +36,38 @@ the re-ingest workflow are in
 
 ## Capacity preflight and fatal capacity classification (issue #439)
 
-`AletheiaDB` 0.1.1 caps its **process-global string interner** at a
-non-overridable `MAX_STRING_COUNT` of **100 000** entries
-(`src/storage/index_persistence/mod.rs`, a DoS-protection limit on a
-monotonic/append-only interner). At write time only node/edge labels and
-property *keys* are interned, so tens of thousands of records write without
+`AletheiaDB` bounds its **process-global string interner** — a DoS-protection
+limit on a monotonic/append-only structure. At write time only node/edge labels
+and property *keys* are interned, so tens of thousands of records write without
 complaint. At index-**persist** time the serializer interns every per-record
 property *value* string (record id, path, name, summary, signature, doc,
-boxed-payload JSON, ...). A large graph mints far more than 100 000 distinct
-value strings, overflows the cap, and the store's background persistence thread
-then hot-loops on the resulting `CapacityExceeded` error forever — the observed
-"ingest hangs" symptom. The published crate cannot be patched (no fork, no path
-dependency), so Egregore defends at the CLI boundary.
+boxed-payload JSON, ...). The interner, not the record count, is therefore the
+binding limit on how large a graph one embedded store can hold.
 
-### Preflight refusal (primary defense)
+Since the `AletheiaDB` 0.2.0 upgrade the cap is **10 000 000** entries. Egregore
+sets it **explicitly** on every embedded store open via
+`PersistenceConfig.max_interned_strings`, from the same
+`adapters::preflight::MAX_INTERNED_STRINGS` constant that bounds the preflight
+estimate below — so the number Egregore refuses at and the number the store
+enforces are the same by construction, and an upstream default change cannot
+silently desync them. The interner is process-global and read once at open, so
+this is a per-**process** budget shared by every store the process opens, not a
+per-store one. Roughly 100 bytes of resident memory per interned string (~1 GB
+at the cap).
+
+**What this changed.** On `AletheiaDB` 0.1.1 the cap was a hardcoded
+`MAX_STRING_COUNT` of **100 000**, overridable only by an environment variable,
+and an overflow made the store's background persistence thread hot-loop on
+`CapacityExceeded` forever — the observed "ingest hangs" symptom, and the reason
+a pre-open refusal was the only safe defense. 0.2.0 raised the cap 100× *and*
+removed that retry loop. Graphs in the 100 000–10 000 000 band that 0.1.1
+refused outright now ingest normally, with no `--force`.
+
+### Preflight refusal
+
+The preflight is retained, but it is no longer load-bearing against a hang: it
+is now an early, well-diagnosed refusal in place of a long write that would fail
+at persist time.
 
 For `--adapter embedded`, before the store is opened, `eg ingest` estimates the
 distinct value strings the graph would intern and **refuses fast** when that
@@ -62,7 +80,7 @@ On refusal, `eg ingest` prints a machine-readable envelope on stdout, a
 one-line human summary on stderr, and exits with code **2**:
 
 ```json
-{"ok":false,"error":{"code":"ingest_capacity_exceeded","estimated_distinct_strings":123456,"limit":100000,"record_count":41000,"message":"...","workaround":"...","data_dir":".egregore"}}
+{"ok":false,"error":{"code":"ingest_capacity_exceeded","estimated_distinct_strings":12345678,"limit":10000000,"record_count":4100000,"message":"...","workaround":"...","data_dir":".egregore"}}
 ```
 
 ### Runtime refusal (fatal backstop)
@@ -102,4 +120,4 @@ case, and `--force` is the escape hatch for a false refusal.
 |---|---|
 | 0 | Every record ingested (and, for `embedded`, indexes persisted). |
 | 1 | A generic per-record ingest failure (surfaced through `anyhow`). |
-| 2 | Fatal capacity refusal — the preflight estimate reached, or a real write/persist overflow hit, `AletheiaDB`'s non-overridable 100 000 string-interner cap (issue #439). |
+| 2 | Fatal capacity refusal — the preflight estimate reached, or a real write/persist overflow hit, the configured `AletheiaDB` string-interner cap of 10 000 000 (issue #439). |

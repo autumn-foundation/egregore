@@ -1,7 +1,7 @@
 use super::*;
 
-/// Fatal-refusal exit code for an ingest that would (or did) overflow
-/// `AletheiaDB`'s non-overridable 100k string-interner cap (issue #439).
+/// Fatal-refusal exit code for an ingest that would (or did) overflow the
+/// configured `AletheiaDB` string-interner cap (issue #439).
 ///
 /// `eg ingest` otherwise uses only 0 (every record ingested) and 1 (a generic
 /// per-record failure, surfaced via `anyhow` through `main`). 2 has no prior
@@ -19,9 +19,10 @@ pub(crate) const INGEST_CAPACITY_EXCEEDED_CODE: &str = "ingest_capacity_exceeded
 /// capacity refusals: names the upstream cap and the workarounds.
 #[cfg(feature = "embedded-aletheiadb")]
 const INGEST_CAPACITY_MESSAGE: &str = "ingest would overflow AletheiaDB's process-global string-interner cap of \
-     100000 entries (non-overridable in the published crate); the embedded \
-     store's background persistence would otherwise hot-loop on the capacity \
-     error and hang";
+     10000000 entries (the cap Egregore configures on every embedded store via \
+     PersistenceConfig.max_interned_strings); the interner is process-global and \
+     read once at open, so the budget is shared by every store this process \
+     opens";
 
 #[cfg(feature = "embedded-aletheiadb")]
 const INGEST_CAPACITY_WORKAROUND: &str = "split the graph into smaller per-crate / per-subsystem ingests, or query \
@@ -142,12 +143,15 @@ pub(crate) fn ingest(
         #[cfg(feature = "embedded-aletheiadb")]
         IngestAdapter::Embedded => {
             let data_dir = data_dir.map_or_else(|| PathBuf::from(".egregore"), Path::to_path_buf);
-            // Capacity preflight (issue #439), the primary defense: refuse fast
-            // BEFORE opening the store, so a graph estimated to overflow
-            // AletheiaDB's 100k string-interner cap never spawns the background
-            // persistence thread that would otherwise hot-loop and hang. Skipped
-            // under `--force`; a real overflow during write/persist is still
-            // fatal below.
+            // Capacity preflight (issue #439): refuse fast BEFORE opening the
+            // store when a graph is estimated to overflow the configured
+            // string-interner cap, rather than writing for a long time and
+            // failing at persist. On AletheiaDB 0.1.1 this was the only safe
+            // defense — an overflow made the background persistence thread
+            // hot-loop forever. 0.2.0 raised the cap 100x AND removed that retry
+            // loop, so this is now an early, better-diagnosed refusal rather
+            // than hang avoidance. Skipped under `--force`; a real overflow
+            // during write/persist is still fatal below.
             if let Err(refusal) = check_ingest_capacity(&records, force) {
                 let PreflightRefusal {
                     estimate,
