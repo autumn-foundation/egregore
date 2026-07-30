@@ -129,6 +129,8 @@ egregore ingest graph.jsonl --adapter embedded --data-dir .egregore-semantic --e
 
 The `--embed` flag generates a 384-dimensional dense vector for every file and symbol node and stores it in AletheiaDB's HNSW vector index. The store at `.egregore-semantic/` supports both structural and semantic queries.
 
+`--embed` also records **which model produced the index** (provider, name, version, dimension, content hash). `eg query semantic` refuses to answer when the query embedder's identity does not match it — two different models can share a dimension, so a dimension check alone would let a model swap or a version bump return a cosine ranking computed across incompatible vector spaces as a confident answer. Read the recorded identity with `eg inspect --data-dir .egregore-semantic`; the refusal contract and the re-ingest workflow are in [`docs/cli/semantic-index-identity.md`](docs/cli/semantic-index-identity.md).
+
 > **Tip:** Use a separate `--data-dir` for the embedded store so you can keep a fast structural-only store alongside the larger semantic one.
 
 ### 8. Query

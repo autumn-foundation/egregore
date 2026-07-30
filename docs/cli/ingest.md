@@ -14,6 +14,26 @@ eg ingest graph.jsonl --adapter daemon --data-dir .egregore --idempotency-key <k
 through a running daemon). Concurrency rules for the embedded/daemon writers are
 in [`embedded-concurrency.md`](embedded-concurrency.md).
 
+## `--embed` and the vector-index model identity (issue #104)
+
+`--embed` (embedded adapter only) generates dense embeddings and enables the
+store's queryable vector index. It also writes **one extra record**: a
+semantic-domain `EmbeddingModel` node recording the identity of the model that
+produced the index (provider, name, version, dimension, content hash). That
+record is what lets `eg query semantic` prove the query embedder shares the
+index's vector space instead of silently ranking across incompatible ones — two
+different models can share a dimension, so a dimension check alone is not enough.
+
+Because the record ID is derived from the identity tuple, re-running the same
+`--embed` ingest is idempotent (one record), while embedding the same store with
+a *different* model leaves a second record and makes the mixed vector space
+detectable at query time rather than silently ranked. The identity therefore adds
+`+1` to `attempted`/`succeeded` counts on an `--embed` ingest.
+
+Read the identity back with `eg inspect --data-dir <DIR>`; the full contract and
+the re-ingest workflow are in
+[`semantic-index-identity.md`](semantic-index-identity.md).
+
 ## Capacity preflight and fatal capacity classification (issue #439)
 
 `AletheiaDB` 0.1.1 caps its **process-global string interner** at a

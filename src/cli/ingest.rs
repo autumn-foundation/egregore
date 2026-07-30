@@ -131,7 +131,8 @@ pub(crate) fn ingest(
 
     let jsonl = fs::read_to_string(graph)
         .with_context(|| format!("failed to read graph JSONL from {}", graph.display()))?;
-    let records = records_from_jsonl(&jsonl).context("failed to parse graph JSONL")?;
+    #[cfg_attr(not(feature = "embeddings"), allow(unused_mut))]
+    let mut records = records_from_jsonl(&jsonl).context("failed to parse graph JSONL")?;
 
     let report = match adapter {
         IngestAdapter::DryRun => {
@@ -157,9 +158,21 @@ pub(crate) fn ingest(
             }
             #[cfg(feature = "embeddings")]
             let mut sink = if embed {
-                let (vectors, dimensions) = generate_embeddings(&records)?;
-                EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, dimensions)
-                    .map_err(|error| embedded_write_open_error(&data_dir, error))?
+                let (vectors, dimensions, model) = generate_embeddings(&records)?;
+                let sink =
+                    EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, dimensions)
+                        .map_err(|error| embedded_write_open_error(&data_dir, error))?;
+                // Refuse before writing anything when the index was built by a
+                // different model (issue #104): embedding into it again would
+                // blend two vector spaces that no ranking can compare.
+                refuse_conflicting_index_identity(&sink, &model)?;
+                // Record which model produced the queryable vector index so
+                // `eg query semantic` can prove the query embedder shares the
+                // index's vector space instead of ranking silently across
+                // incompatible ones. Keyed on a fixed ID, so a repeated ingest
+                // supersedes rather than accumulating a second identity.
+                records.push(crate::embeddings::embedding_index_identity_record(&model));
+                sink
             } else {
                 EmbeddedAletheiaSink::open(&data_dir)
                     .map_err(|error| embedded_write_open_error(&data_dir, error))?

@@ -7036,23 +7036,34 @@ pub(crate) fn exit_ambiguous_repository(groups: &std::collections::BTreeSet<Opti
 
 /// Generates dense embeddings for all file and symbol candidates in `records`.
 ///
-/// Returns a `(record_id → vector, dimension)` map ready for
-/// `EmbeddedAletheiaSink::open_with_embeddings`.
+/// Returns a `(record_id → vector, dimension, model identity)` triple ready for
+/// `EmbeddedAletheiaSink::open_with_embeddings`. The identity is returned
+/// alongside the vectors — rather than recomputed at each call site — so a write
+/// path structurally cannot create a queryable vector index without also
+/// recording which model produced it (issue #104).
 #[cfg(feature = "embeddings")]
 pub(crate) fn generate_embeddings(
     records: &[GraphRecord],
-) -> Result<(crate::embeddings::EmbeddingVectorMap, usize)> {
+) -> Result<(
+    crate::embeddings::EmbeddingVectorMap,
+    usize,
+    crate::ir::EmbeddingModel,
+)> {
     use crate::embeddings::{
         DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_DIMENSIONS,
         DEFAULT_EMBEDDING_MODEL_NAME, EmbeddingVectorKey, EmbeddingVectorMap, aletheia_embeddings,
-        embedding_candidates,
+        default_embedding_model_identity, embedding_candidates,
     };
 
     let candidates = embedding_candidates(records);
     if candidates.is_empty() {
+        // Zero candidates still creates a queryable (empty) vector index, so it
+        // still needs an identity: the dimension is the model's declared one,
+        // since the model was never loaded to report a measured dimension.
         return Ok((
             EmbeddingVectorMap::new(),
             DEFAULT_EMBEDDING_MODEL_DIMENSIONS,
+            default_embedding_model_identity(DEFAULT_EMBEDDING_MODEL_DIMENSIONS),
         ));
     }
 
@@ -7091,7 +7102,79 @@ pub(crate) fn generate_embeddings(
         .map(|(candidate, vector)| (EmbeddingVectorKey::from_candidate(&candidate), vector))
         .collect();
 
-    Ok((map, dimensions))
+    // The identity records the MEASURED dimension the model actually produced,
+    // not the declared constant, so a model whose real dimension drifts from the
+    // constant is still described honestly.
+    Ok((
+        map,
+        dimensions,
+        default_embedding_model_identity(dimensions),
+    ))
+}
+
+/// Renders one embedding-model identity as the allow-listed, bounded JSON object
+/// used by the `--embed` write-path refusal (issue #104).
+#[cfg(feature = "embeddings")]
+fn identity_envelope_json(model: &crate::ir::EmbeddingModel) -> serde_json::Value {
+    use crate::embeddings::bounded_identity_field;
+    serde_json::json!({
+        "provider": bounded_identity_field(&model.provider),
+        "name": bounded_identity_field(&model.name),
+        "version": bounded_identity_field(&model.version),
+        "dim": model.dim,
+        "content_hash": bounded_identity_field(&model.content_hash),
+    })
+}
+
+/// Refuses an `--embed` write that would mix a second model's vectors into a
+/// store's existing vector index (issue #104).
+///
+/// `open_with_embeddings` already refuses a DIMENSION change on an existing
+/// index, but two different models can share a dimension — so without this check
+/// a second `--embed` write with a different model would silently leave the index
+/// holding vectors from BOTH in one un-rankable blend, while the identity record
+/// (fixed ID, latest-write-wins) claimed only the newest.
+///
+/// Refuse-and-instruct, never mutate: the remedy is a fresh `--data-dir`, because
+/// the prior model's vectors are already in the index and Egregore does not
+/// re-embed a store on mismatch. Refusing here is what keeps the store in the
+/// clean, actionable mismatch state instead of a silently blended one — and it is
+/// why the natural in-place "fix" after an `eg` upgrade (`eg refresh --embed`)
+/// reports a clear refusal rather than quietly making things worse.
+///
+/// # Errors
+///
+/// Returns an error when the store already records a different model identity.
+#[cfg(feature = "embeddings")]
+pub(crate) fn refuse_conflicting_index_identity(
+    sink: &EmbeddedAletheiaSink,
+    model: &crate::ir::EmbeddingModel,
+) -> Result<()> {
+    let records = sink
+        .read_all_records()
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    let existing = crate::embeddings::indexed_identities(&records);
+    if existing.is_empty() || (existing.len() == 1 && existing[0] == *model) {
+        return Ok(());
+    }
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "embedding_index_identity_conflict",
+            "message": "this store's semantic vector index was built by a different embedding \
+                        model; embedding into it again would leave the index holding vectors from \
+                        both models, which no ranking can compare",
+            "remedy": crate::embeddings::EMBEDDING_IDENTITY_REMEDY,
+            "indexed_models": existing.iter().map(identity_envelope_json).collect::<Vec<_>>(),
+            "producing_model": identity_envelope_json(model),
+        }
+    });
+    println!("{}", serde_json::to_string(&envelope)?);
+    anyhow::bail!(
+        "--embed refused: this store's semantic vector index was built by a different embedding \
+         model; {}",
+        crate::embeddings::EMBEDDING_IDENTITY_REMEDY
+    )
 }
 
 // ---------------------------------------------------------------------------

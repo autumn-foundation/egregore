@@ -470,6 +470,7 @@ fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
         dependency: None,
         log: None,
         scan_coverage: None,
+        embedding_model: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
     }
@@ -600,6 +601,7 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
         dependency: None,
         log: None,
         scan_coverage: None,
+        embedding_model: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
     }
@@ -940,6 +942,7 @@ pub fn build_observation_records(
         dependency: None,
         log: None,
         scan_coverage: None,
+        embedding_model: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };
@@ -1185,6 +1188,7 @@ pub fn build_command_evidence_records(
         dependency: None,
         log: None,
         scan_coverage: None,
+        embedding_model: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };
@@ -1437,6 +1441,7 @@ pub fn build_artifact_records(
         dependency: None,
         log: None,
         scan_coverage: None,
+        embedding_model: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };
@@ -1667,6 +1672,7 @@ pub fn build_verification_records(
         dependency: None,
         log: None,
         scan_coverage: None,
+        embedding_model: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };

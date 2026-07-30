@@ -89,11 +89,21 @@ fn derive_stable_session_id(path: &Path, agent_type: AgentType) -> String {
 fn ingest_batch(data_dir: &Path, records: &[crate::ir::GraphRecord], embed: bool) -> Result<()> {
     use crate::adapters::{EmbeddedAletheiaSink, ingest_records};
 
+    #[cfg_attr(not(feature = "embeddings"), allow(unused_mut))]
+    let mut records = records.to_vec();
+
     #[cfg(feature = "embeddings")]
     let mut sink = if embed {
-        let (vectors, dimensions) = crate::cli::generate_embeddings(records)?;
-        EmbeddedAletheiaSink::open_with_embeddings(data_dir, vectors, dimensions)
-            .context("failed to open embedded store with embeddings")?
+        let (vectors, dimensions, model) = crate::cli::generate_embeddings(&records)?;
+        let sink = EmbeddedAletheiaSink::open_with_embeddings(data_dir, vectors, dimensions)
+            .context("failed to open embedded store with embeddings")?;
+        // Refuse before writing when the index was built by a different model
+        // (issue #104) rather than blending two vector spaces.
+        crate::cli::refuse_conflicting_index_identity(&sink, &model)?;
+        // The watch loop maintains the same vector index the `--embed` ingest
+        // creates, so it maintains the same identity record too.
+        records.push(crate::embeddings::embedding_index_identity_record(&model));
+        sink
     } else {
         EmbeddedAletheiaSink::open(data_dir).context("failed to open embedded store")?
     };
@@ -103,7 +113,7 @@ fn ingest_batch(data_dir: &Path, records: &[crate::ir::GraphRecord], embed: bool
 
     let _ = embed; // silence unused warning if feature disabled
 
-    let report = ingest_records(records, &mut sink);
+    let report = ingest_records(&records, &mut sink);
     if report.is_success() {
         sink.persist_indexes()
             .context("failed to persist indexes")?;

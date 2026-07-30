@@ -70,6 +70,14 @@ contacted.
 |-----------|------|
 | Results found | `0` |
 | No memory recalled (no embeddings, or all hits filtered) | `2` |
+| Query embedder does not match the indexed embedding model (issue #104) | `7` / `8` / `9` / `10` |
+
+Memory recall reads the **same shared vector index** code search does, so it
+carries the same cross-vector-space hazard and applies the same
+[vector-space compatibility gate](semantic-index-identity.md): a mismatched
+embedder is refused with a stable machine-readable envelope on stdout and a
+distinct nonzero exit code, before the query is embedded and before any row is
+returned.
 
 ## Response shape
 

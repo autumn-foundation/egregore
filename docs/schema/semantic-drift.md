@@ -28,12 +28,12 @@ inputs, or changing metric semantics requires `semantic:v2:` records.
 measurement subjects; semantic records describe derived measurements over
 those subjects.
 
-Reserved semantic node kinds:
+Semantic node kinds:
 
 | Kind | Status | Notes |
 |------|--------|-------|
 | `SemanticDrift` | active | Drift measurement between a prior code graph observation and a later target. |
-| `EmbeddingModel` | reserved | Optional persisted model identity record for `MEASURED_BY`. |
+| `EmbeddingModel` | active | Persisted identity of the model that produced a store's queryable vector index (issue #104), carrying the full `EmbeddingModel` identity in an additive `embedding_model` node payload. Written by every `--embed` path (`eg ingest`, `eg refresh`, `eg watch`); read by the `eg query semantic` vector-space compatibility gate and reported by `eg inspect --data-dir`. The record ID is derived from the identity tuple, so the same model collapses onto one record while a different model leaves a second — which is what makes a mixed-space index detectable. Repo-agnostic, edge-less by design (not an orphan-checked kind), and refused by `eg forget` like every other semantic-domain record: the remedy for a wrong identity is re-ingest, never mutation. Still also reserved as the `MEASURED_BY` target. See [`docs/cli/semantic-index-identity.md`](../cli/semantic-index-identity.md). |
 | `EmbeddingVector` | reserved | Optional persisted vector record if vectors become first-class records. |
 
 ## 2 - Trust Class

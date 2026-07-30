@@ -3025,6 +3025,7 @@ fn validate_semantic_drift_node(
         kind,
         schema_version,
         semantic_drift,
+        embedding_model,
         valid_time,
         valid_time_source,
         ingested_at,
@@ -3049,6 +3050,23 @@ fn validate_semantic_drift_node(
         return Err(ApiError::bad_request(format!(
             "semantic node '{id}' must carry domain 'semantic'"
         )));
+    }
+    // Vector-index identity nodes (issue #104) are semantic-domain records that
+    // are NOT drift measurements: they carry an `embedding_model` payload instead
+    // of a `semantic_drift` one and are deliberately non-temporal (they describe a
+    // store's live index, not a commit-anchored observation). Without this arm the
+    // documented `eg export --data-dir <embed store>` →
+    // `eg ingest --adapter daemon` round trip would 400 the whole batch.
+    if *kind == NodeKind::EmbeddingModel {
+        if embedding_model.is_none() {
+            return Err(ApiError::missing_field("embedding_model"));
+        }
+        if semantic_drift.is_some() {
+            return Err(ApiError::bad_request(format!(
+                "EmbeddingModel node '{id}' must not carry a semantic_drift payload"
+            )));
+        }
+        return Ok(());
     }
     if *kind != NodeKind::SemanticDrift {
         return Err(ApiError::bad_request(format!(

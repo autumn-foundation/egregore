@@ -30,6 +30,92 @@ pub(crate) fn embed_query_text(query: &str) -> Result<Vec<f32>> {
         .map(|dense| dense.embedding)
 }
 
+/// Refuses a semantic query whose embedder does not share the store's vector
+/// space (issue #104).
+///
+/// Runs BEFORE the query is embedded, so an incompatible store costs an operator
+/// a refusal rather than a model load.
+///
+/// On a refusal this prints the stable machine-readable envelope on stdout, a
+/// one-line human summary on stderr, and exits with the verdict's distinct
+/// nonzero code. It never returns a ranked result list.
+///
+/// Otherwise it returns the verdict, which is one of the two non-refusal cases:
+/// [`crate::embeddings::IndexCompatibility::Compatible`], or `IndexAbsent` for a
+/// store that was never `--embed`ed and so has nothing to be incompatible with.
+/// `IndexAbsent` is returned rather than handled here because each lane words its
+/// own no-index outcome; the caller MUST handle it before searching, since a
+/// vector search against a store with no index surfaces an opaque engine error
+/// instead of the documented no-embeddings outcome.
+///
+/// The comparison is the whole point of the gate: the semantic index stores only
+/// vectors plus a dimension, and two different models can share a dimension, so
+/// a dimension check alone lets a model swap, cache change, or version bump
+/// produce a cosine ranking computed across incompatible vector spaces and
+/// return it as a confident answer.
+#[cfg(feature = "embeddings")]
+pub(crate) fn enforce_index_compatibility(
+    sink: &EmbeddedAletheiaSink,
+    records: &[GraphRecord],
+) -> Result<crate::embeddings::IndexCompatibility> {
+    use crate::embeddings::{
+        DEFAULT_EMBEDDING_MODEL_DIMENSIONS, classify_index_compatibility,
+        default_embedding_model_identity, indexed_identities,
+    };
+
+    let verdict = classify_index_compatibility(
+        sink.embedding_index_dimensions(),
+        &indexed_identities(records),
+        &default_embedding_model_identity(DEFAULT_EMBEDDING_MODEL_DIMENSIONS),
+    );
+    refuse_verdict(&verdict)?;
+    Ok(verdict)
+}
+
+/// Prints and exits on a refusing verdict; returns `Ok(())` for a non-refusal.
+///
+/// The `Result` is a serialization-failure channel only.
+#[cfg(feature = "embeddings")]
+fn refuse_verdict(verdict: &crate::embeddings::IndexCompatibility) -> Result<()> {
+    let (Some(envelope), Some(exit_code)) = (verdict.to_error_envelope(), verdict.exit_code())
+    else {
+        return Ok(());
+    };
+    println!("{}", serde_json::to_string(&envelope)?);
+    eprintln!("semantic query refused: {}", verdict.message());
+    std::process::exit(exit_code);
+}
+
+/// Embeds the query text, then re-checks the ACTUAL vector length against the
+/// index (issue #104).
+///
+/// [`enforce_index_compatibility`] runs before the model loads and can therefore
+/// only compare the embedder's DECLARED dimension constant. The vector the model
+/// actually returns is the ground truth, and the two could disagree if the
+/// resolved weights ever differ from the constant — so the real length is
+/// verified here, once, before it is used to rank anything. Cheap (one integer
+/// comparison) and fail-closed: a disagreement refuses with the same stable
+/// `embedding_dimension_mismatch` contract rather than ranking across spaces.
+#[cfg(feature = "embeddings")]
+pub(crate) fn embed_query_checked(
+    query: &str,
+    sink: &EmbeddedAletheiaSink,
+    records: &[GraphRecord],
+) -> Result<Vec<f32>> {
+    use crate::embeddings::{
+        classify_index_compatibility, default_embedding_model_identity, indexed_identities,
+    };
+
+    let vector = embed_query_text(query)?;
+    let verdict = classify_index_compatibility(
+        sink.embedding_index_dimensions(),
+        &indexed_identities(records),
+        &default_embedding_model_identity(vector.len()),
+    );
+    refuse_verdict(&verdict)?;
+    Ok(vector)
+}
+
 /// Applies subsystem-path scoping (issue #198), then deterministic ranking, then
 /// the top-N cap to a raw code-hit match set.
 ///
@@ -101,6 +187,62 @@ pub(crate) const fn classify_empty_semantic_result(
     }
 }
 
+/// Stable diagnostic code for a store that carries no semantic vector index at
+/// all — it was never ingested with `--embed` (issue #104).
+///
+/// Distinct from [`SEMANTIC_NO_MATCHES_CODE`]: "never embedded" and "embedded
+/// but nothing matched" are different operator problems, and an agent must be
+/// able to tell them apart. Both keep exit `2`, so the documented exit-code
+/// contract is unchanged — the codes ride the stderr line because `eg query`
+/// lanes leave stdout empty on exit `2`.
+#[cfg(feature = "embeddings")]
+pub(crate) const SEMANTIC_INDEX_ABSENT_CODE: &str = "semantic_index_absent";
+
+/// Stable diagnostic code for a store whose vector index exists but returned no
+/// match for this query.
+#[cfg(feature = "embeddings")]
+pub(crate) const SEMANTIC_NO_MATCHES_CODE: &str = "no_semantic_matches";
+
+/// Stable diagnostic code for a valid `--under` scope that selected nothing from
+/// a store that does carry a live semantic index (issue #198).
+#[cfg(feature = "embeddings")]
+pub(crate) const SEMANTIC_SCOPED_NO_MATCH_CODE: &str = "scoped_no_match";
+
+/// Reports the empty-result outcome of `eg query semantic` and exits `2`.
+///
+/// Shared by the two places an empty result is decided — the pre-search
+/// no-vector-index gate (issue #104) and the post-filter empty match set (issue
+/// #198) — so both emit exactly the same documented wording for the same
+/// classified outcome. `index_absent` distinguishes "this store was never
+/// `--embed`ed" from "the index exists but nothing matched"; the two share exit
+/// `2` but carry distinct stable codes.
+#[cfg(feature = "embeddings")]
+fn report_empty_semantic_result(
+    under_prefix: Option<&str>,
+    index_has_hits: bool,
+    index_absent: bool,
+) -> ! {
+    match classify_empty_semantic_result(under_prefix, index_has_hits) {
+        EmptySemanticOutcome::ScopedNoMatch => {
+            let prefix = under_prefix.unwrap_or_default();
+            eprintln!(
+                "{SEMANTIC_SCOPED_NO_MATCH_CODE}: scoped to '{prefix}', no matches — the store has a semantic index but no embedded File/Symbol node falls under this prefix"
+            );
+        }
+        EmptySemanticOutcome::NoSemanticIndex => {
+            let code = if index_absent {
+                SEMANTIC_INDEX_ABSENT_CODE
+            } else {
+                SEMANTIC_NO_MATCHES_CODE
+            };
+            eprintln!(
+                "{code}: no results — store may not have embeddings (re-run ingest with --embed)"
+            );
+        }
+    }
+    std::process::exit(2);
+}
+
 /// Semantic similarity search against an embedded store.
 ///
 /// `under` optionally scopes results to a repo-relative path prefix (issue #198,
@@ -156,7 +298,17 @@ pub(crate) fn query_semantic(
     let index = query::RepositoryIndex::build(&records);
     let selected = resolve_repo_scope(&index, repo);
 
-    let query_vector = embed_query_text(query)?;
+    // Vector-space compatibility gate (issue #104), before the model is loaded.
+    // A store with no vector index at all is not an identity failure: report the
+    // documented no-embeddings outcome here rather than letting the vector search
+    // below surface an opaque engine error at exit 1.
+    if enforce_index_compatibility(&sink, &records)?
+        == crate::embeddings::IndexCompatibility::IndexAbsent
+    {
+        report_empty_semantic_result(under_prefix, false, true);
+    }
+
+    let query_vector = embed_query_checked(query, &sink, &records)?;
 
     // Over-fetch the whole index, not just `limit` raw hits: the shared vector
     // index now also embeds agent-memory nodes (issue #91), so a query whose top
@@ -195,21 +347,7 @@ pub(crate) fn query_semantic(
     scope_and_rank_semantic_matches(&mut matches, under_prefix, limit);
 
     if matches.is_empty() {
-        match classify_empty_semantic_result(under_prefix, index_has_hits) {
-            EmptySemanticOutcome::ScopedNoMatch => {
-                let prefix = under_prefix.unwrap_or_default();
-                eprintln!(
-                    "scoped to '{prefix}', no matches — the store has a semantic index but no embedded File/Symbol node falls under this prefix"
-                );
-                std::process::exit(2);
-            }
-            EmptySemanticOutcome::NoSemanticIndex => {
-                eprintln!(
-                    "no results — store may not have embeddings (re-run ingest with --embed)"
-                );
-                std::process::exit(2);
-            }
-        }
+        report_empty_semantic_result(under_prefix, index_has_hits, false);
     }
 
     for m in &matches {
@@ -473,7 +611,18 @@ pub(crate) fn query_semantic_memory(
     let resolver = crate::temporal_status::TemporalResolver::build(&records);
     let mut excluded_recall_diagnostics = Vec::new();
 
-    let query_vector = embed_query_text(query)?;
+    // Memory recall reads the SAME shared vector index code search does, so it
+    // carries the same cross-vector-space hazard and the same gate (issue #104).
+    if enforce_index_compatibility(&sink, &records)?
+        == crate::embeddings::IndexCompatibility::IndexAbsent
+    {
+        eprintln!(
+            "no memory results — store may lack embedded memory (re-run ingest with --embed) or all hits were filtered"
+        );
+        std::process::exit(2);
+    }
+
+    let query_vector = embed_query_checked(query, &sink, &records)?;
 
     // The shared vector index holds both code and memory; fetch a generous pool
     // and filter to memory so the `limit` bounds recalled memory, not the blend.
@@ -692,6 +841,17 @@ pub(crate) fn query_semantic_via_daemon(
     let client = DaemonClient::from_data_dir(data_dir)
         .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
 
+    // The daemon owns the store, so the local lane cannot inspect its vector
+    // index; wiring the compatibility gate into the daemon verb is #59/#53's
+    // scope, not this slice's. Disclose the gap rather than let an agent that
+    // fell back to `--daemon` silently receive an answer the local lane would
+    // have refused (issue #104).
+    eprintln!(
+        "note: --daemon does not apply the embedding-model compatibility gate (issue #104); \
+         results are not verified to share the index's vector space — re-run without --daemon \
+         for a verified answer"
+    );
+
     let query_vector = embed_query_text(query)?;
     let mut params = serde_json::json!({
         "query_vector": query_vector,
@@ -740,6 +900,31 @@ pub(crate) fn print_daemon_semantic_record(
     Ok(())
 }
 
+/// Emits the `eg query semantic-context` no-match envelope and exits `2`.
+///
+/// Shared by the two places a no-match is decided — the pre-search
+/// no-vector-index gate (issue #104) and an all-below-`min_score` bundle (issue
+/// #90) — so both emit exactly the same documented envelope.
+///
+/// The `Result` return is a serialization-failure channel only; on success this
+/// never returns.
+#[cfg(feature = "embeddings")]
+fn report_semantic_context_no_match(
+    query: &str,
+    min_score: f32,
+) -> Result<std::convert::Infallible> {
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "no_match",
+            "query": query,
+            "min_score": min_score,
+        }
+    });
+    println!("{}", serde_json::to_string(&envelope)?);
+    std::process::exit(2);
+}
+
 /// Natural-language query → evidence-backed context for the top-N semantic
 /// matches, in a single read-only call (issue #90).
 ///
@@ -768,7 +953,14 @@ pub(crate) fn query_semantic_context(
     let index = query::RepositoryIndex::build(&records);
     let selected = resolve_repo_scope(&index, repo);
 
-    let query_vector = embed_query_text(query)?;
+    // Same shared vector index, same gate (issue #104).
+    if enforce_index_compatibility(&sink, &records)?
+        == crate::embeddings::IndexCompatibility::IndexAbsent
+    {
+        report_semantic_context_no_match(query, min_score)?;
+    }
+
+    let query_vector = embed_query_checked(query, &sink, &records)?;
 
     // Over-fetch the whole index, not just `limit` raw hits: the shared vector
     // index also embeds agent-memory nodes (issue #91), so a query whose top
@@ -830,16 +1022,7 @@ pub(crate) fn query_semantic_context(
     let resolver = crate::temporal_status::TemporalResolver::build(&records);
 
     if bundle.is_no_match() {
-        let envelope = serde_json::json!({
-            "ok": false,
-            "error": {
-                "code": "no_match",
-                "query": query,
-                "min_score": min_score,
-            }
-        });
-        println!("{}", serde_json::to_string(&envelope)?);
-        std::process::exit(2);
+        report_semantic_context_no_match(query, min_score)?;
     }
 
     let match_rows: Vec<SemanticContextMatch<'_>> = bundle
