@@ -191,8 +191,10 @@ pub(crate) fn inspect(
 ///
 /// JSON output is a single deterministic line (newline-delimited JSON) that is
 /// byte-identical across runs on an unchanged store; it carries no timestamp
-/// and no raw record payloads — counts, domains, kinds, schema versions, and
-/// repository handles only. The shape is documented in `docs/cli/inspect.md`.
+/// and no raw record payloads — counts, domains, kinds, schema versions,
+/// repository handles, scan-coverage tallies, and the semantic vector index's
+/// bounded embedding-model identity fields (issue #104) only. The shape is
+/// documented in `docs/cli/inspect.md`.
 #[cfg(feature = "embedded-aletheiadb")]
 pub(crate) fn inspect_embedded_store(data_dir: &Path, format: OutputFormat) -> Result<()> {
     let (store_root, _readonly_guard) = readonly_audit_store(data_dir)?;

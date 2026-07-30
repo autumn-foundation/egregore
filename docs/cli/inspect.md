@@ -148,8 +148,11 @@ Field notes:
   with `index_present: true` is a legacy store whose compatibility is
   unverifiable; `indexed_models` with more than one entry means the index was
   written by several models. A `--graph` JSONL carries no vector index, so the
-  block is absent there. Allow-list only — identity fields, dimensions, and flags;
-  never vectors or model bytes. See
+  block is absent there, as it is on a binary built without the `embeddings`
+  feature (the vector index is that feature's surface). Allow-list only — identity
+  fields, dimensions, and flags; never vectors or model bytes, and every identity
+  value is control-character-sanitized and length-capped before rendering, since
+  values read back from a store are operator-controlled. See
   [`docs/cli/semantic-index-identity.md`](semantic-index-identity.md).
 
 JSONL-file and daemon inspection keep their existing pretty-printed JSON

@@ -116,7 +116,7 @@ Initial edge labels:
 | `PARENT_OF` | Commit -> Commit | Git commit ancestry |
 | `DRIFTS_FROM` | SemanticDrift -> File/Symbol | Semantic-domain edge; see [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md). |
 | `DRIFTS_PRIOR` | SemanticDrift -> File/Symbol | Semantic-domain prior edge; see [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md). |
-| `MEASURED_BY` | SemanticDrift -> EmbeddingModel | Reserved semantic-domain model edge; see [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md). |
+| `MEASURED_BY` | SemanticDrift -> EmbeddingModel | Reserved semantic-domain model edge; see [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md). The `EmbeddingModel` node kind itself is active as of issue #104: every `--embed` write records the vector index's producing model identity so `eg query semantic` can refuse a cross-vector-space ranking. |
 
 > **`MENTIONS` is reserved, not emitted (issue #442).** The `MENTIONS` edge
 > label is defined, parsed, and serialized, but no current Rust / Python /

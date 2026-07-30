@@ -516,6 +516,60 @@ fn re_embedding_with_the_same_model_supersedes_rather_than_accumulates() {
     assert_eq!(indexed_identities(&records), vec![mine]);
 }
 
+/// Re-ingesting an EXPORT that carries a foreign identity into a fresh dir with
+/// `--embed` leaves exactly ONE identity — the model that actually produced the
+/// vectors — and the store stays queryable.
+///
+/// `eg export` re-emits the identity node as ordinary graph data, so a graph
+/// exported from another store can carry a stale identity. With an
+/// identity-derived record ID that stale record would coexist with the real one
+/// and refuse every query forever, with the documented remedy ("re-ingest into a
+/// fresh --data-dir") reproducing the very state it claims to fix. The fixed ID
+/// makes the real write supersede it.
+#[test]
+fn re_ingesting_an_export_with_a_foreign_identity_keeps_only_the_real_one() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph_path = temp.path().join("with-foreign-identity.graph.jsonl");
+    let data_dir = temp.path().join("store");
+
+    let mut foreign = default_embedding_model_identity(DEFAULT_EMBEDDING_MODEL_DIMENSIONS);
+    foreign.name = "some-other/384-dim-encoder".to_owned();
+    let mut graph = Graph::new();
+    graph.push(GraphRecord::node(
+        stable_id(&["repository", "operator-override", "roundtrip-repo"]),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("roundtrip-repo".to_owned()),
+        "Repository roundtrip-repo".to_owned(),
+    ));
+    graph.push(embedding_index_identity_record(&foreign));
+    fs::write(&graph_path, graph.to_jsonl().expect("graph serializes")).expect("graph written");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("embedded")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--embed")
+        .assert()
+        .success();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("store reopens");
+    let records = sink.read_all_records().expect("store reads back");
+    assert_eq!(
+        indexed_identities(&records),
+        vec![default_embedding_model_identity(
+            DEFAULT_EMBEDDING_MODEL_DIMENSIONS
+        )],
+        "the real producing model must supersede a stale exported identity, not \
+         coexist with it in an unrecoverable ambiguity"
+    );
+}
+
 // ── AC7: a crafted identity cannot poison the diagnostic ────────────────────
 
 /// A hand-authored identity carrying control characters and megabytes of text

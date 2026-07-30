@@ -17,6 +17,15 @@ Daemon-backed results are still **retrieval leads, not proof**: each row carries
 
 Stable diagnostics make failures actionable rather than silent: a missing daemon or stale runtime metadata is reported by daemon discovery before the query runs; an un-embedded store returns `missing_semantic_index`; a mismatched vector returns `incompatible_embedding_dimension`; an empty result is a clean no-match, never a fallback to a direct embedded read. The full verb contract is in [`docs/schema/daemon-query.md`](../schema/daemon-query.md).
 
+> **`--daemon` does not apply the vector-space compatibility gate (issue #104).**
+> The daemon path checks vector *dimension* only, and two different models can
+> share a dimension — so a store whose index was built by a different model
+> returns a confident ranking over `--daemon` that the embedded lane would
+> refuse. The daemon path prints a one-line stderr disclosure saying so. Daemon
+> verb wiring is owned by #59/#53; until then, prefer the embedded lane when the
+> answer's trustworthiness matters more than shared-store coordination, and see
+> [`semantic-index-identity.md`](semantic-index-identity.md).
+
 ### Relationship to issue #58 (relevance gate)
 
 This workflow makes daemon-backed semantic search **available and deterministic** — it does not decide whether the results are *good enough to trust*. Issue **#58** owns relevance calibration: the checked-in corpus and the `eg eval-semantic` top-3 recall gate measure retrieval quality. Use the corpus gate to judge accuracy; use this guidance to choose the transport and to remember that a high score is a lead to confirm, not an answer.
