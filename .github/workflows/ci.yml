@@ -53,5 +53,14 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: hf-all-MiniLM-L6-v2-v1
+      # Two threads, not four. Much of this suite drives real embedded
+      # AletheiaDB stores — in-process and through spawned `eg` subprocesses —
+      # and each store runs a background group-commit flush thread whose
+      # acknowledgement path gives up after ~10s. Four-way parallelism put
+      # enough concurrent fsync pressure on a shared runner to surface as
+      # spurious store corruption on reopen (interner-index and version-chain
+      # mismatches) in tests that pass reliably in isolation. The in-crate
+      # store gate already caps concurrent in-process stores at two; this
+      # matches the subprocess-driven tests to the same bound.
       - name: test
-        run: cargo test --all-targets ${{ matrix.flags }} -- --test-threads=4
+        run: cargo test --all-targets ${{ matrix.flags }} -- --test-threads=2
