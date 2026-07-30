@@ -43,7 +43,7 @@ pedantic = "warn"
 nursery = "warn"
 
 [dependencies]
-aletheiadb = { version = "0.1.1", default-features = false, optional = true }
+aletheiadb = { version = "0.2.0", default-features = false, optional = true }
 anyhow = "1.0.102"
 blake3 = "1.8.3"
 chrono = { version = "0.4.42", default-features = false, features = ["std", "clock"] }

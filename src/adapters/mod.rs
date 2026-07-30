@@ -123,7 +123,7 @@ pub enum AdapterError {
 /// Classifies a backing-store error message as an `AletheiaDB` string-interner
 /// capacity overflow (issue #439).
 ///
-/// `AletheiaDB` 0.1.1 raises `StorageError::CapacityExceeded` from its
+/// `AletheiaDB` raises `StorageError::CapacityExceeded` from its
 /// process-global interner (`core/interning.rs`) with the fixed Display
 /// `"Capacity exceeded for {resource}: current={current}, limit={limit} (DoS
 /// protection)"` and `resource == "string interner"`. This matcher returns

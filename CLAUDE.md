@@ -1531,6 +1531,37 @@ operational triage. See `docs/cli/daemon-status.md` and
 
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
 
+Egregore links **`AletheiaDB` 0.2.0** (up from 0.1.1). The upgrade is a storage-substrate
+change only: record IDs, schema versions, the JSONL contract, query output, and determinism
+are all unaffected, and a graph exported before the upgrade re-ingests byte-identically after
+it. Two operator-visible effects:
+
+- **String-interner headroom, 100k → 10M (issue #439).** 0.1.1 hardcoded a process-global
+  interner cap of `100_000`; 0.2.0 makes it `PersistenceConfig.max_interned_strings` and the
+  embedded adapter now sets it EXPLICITLY at every open from
+  `adapters::preflight::MAX_INTERNED_STRINGS` — the SAME constant that bounds the ingest
+  preflight estimate, so "what Egregore refuses at" and "what the store enforces" are one
+  number by construction and an upstream default change cannot silently desync them. The cap
+  is per-PROCESS (read once at open, shared by every store the process opens), not per-store.
+  0.2.0 also removed the background-persist retry loop that turned an overflow into the
+  observed "ingest hangs" symptom, so the preflight is no longer load-bearing against a hang —
+  it is RETAINED as an early, well-diagnosed refusal in place of a long write that would fail
+  at persist time. Graphs in the 100k–10M band that 0.1.1 refused outright now ingest with no
+  `--force`. Exit code 2 and the `ingest_capacity_exceeded` envelope are unchanged.
+- **Pre-v13 WAL-tail refusal.** 0.2.0 REFUSES to open a data dir holding an unreplayed
+  pre-v13 write-ahead-log tail — reachable only when a 0.1.x-linked `eg` was hard-killed
+  before draining. This is fail-closed, not corruption (0.1.x wrote WAL labels as
+  process-local interner ids that 0.2.0 would resolve to unrelated strings); the failed open
+  modifies nothing. `classify_open_error` re-frames it in Egregore terms — names the data dir,
+  states nothing was modified, gives the remedy (re-open once with the previous `eg` build to
+  drain, else re-ingest into a FRESH `--data-dir`), and preserves the upstream detail. There
+  is no in-place repair and no backup/restore off-ramp (`.albk` did not exist in 0.1.x). Only
+  0.1.x-era directories are exposed; 0.2.0 writes string-labelled WAL segments that replay
+  correctly after a hard kill. See `docs/cli/store-upgrade.md`.
+
+0.2.0's new opt-in subsystems (namespaces, schema constraints, property indexes, changefeed,
+encryption, replication, multi-tenancy) are INERT — none is enabled in this slice.
+
 ## Working Rules
 
 - Use SPEC-PROOF-RED-GREEN-REFACTOR for implementation work.

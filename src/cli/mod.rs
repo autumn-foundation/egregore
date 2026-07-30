@@ -617,10 +617,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         embed: bool,
         /// Bypass the ingest capacity preflight (issue #439). The preflight
-        /// refuses fast when a graph is estimated to overflow `AletheiaDB`'s
-        /// non-overridable 100k string-interner cap; `--force` skips that
-        /// estimate. A real capacity overflow during the write/persist remains
-        /// fatal even with `--force`.
+        /// refuses fast when a graph is estimated to overflow the configured
+        /// `AletheiaDB` string-interner cap (10M since the 0.2.0 upgrade);
+        /// `--force` skips that estimate. A real capacity overflow during the
+        /// write/persist remains fatal even with `--force`.
         #[cfg(feature = "embedded-aletheiadb")]
         #[arg(long)]
         force: bool,

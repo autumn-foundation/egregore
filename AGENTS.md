@@ -22,6 +22,8 @@ cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
 
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
 
+Egregore links `AletheiaDB` 0.2.0. Storage-substrate change only — record IDs, schema versions, the JSONL contract, and query output are unaffected. Two operator-visible effects: the string-interner cap rose 100k → 10M (the adapter sets it explicitly at open, from the same constant that bounds the ingest preflight), and a data dir left by a hard-killed pre-0.2.0 build is refused on open until drained. See `docs/cli/store-upgrade.md`; 0.2.0's opt-in subsystems (namespaces, schema constraints, property indexes) are not enabled.
+
 ## Working Rules
 
 - Use SPEC-PROOF-RED-GREEN-REFACTOR for implementation work.

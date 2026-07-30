@@ -50,6 +50,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -111,12 +112,13 @@ dependencies = [
 
 [[package]]
 name = "aletheiadb"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8aa7088d9848bbb80186b05f9db0ceeeff32512426e60b9d1a43ec5243e3f539"
+checksum = "e905efaa187e9d1048b82b373928e4d078607d0f8852349ad184e0edf3810fba"
 dependencies = [
  "aes-gcm",
  "arc-swap",
+ "argon2",
  "bitcode",
  "bytemuck",
  "candle-core 0.9.1",
@@ -124,22 +126,30 @@ dependencies = [
  "candle-transformers 0.10.2",
  "chacha20poly1305",
  "chrono",
+ "clap",
+ "clap_complete",
  "comfy-table",
  "crc32fast",
  "crossbeam-channel",
  "crossterm",
  "dashmap",
  "embed_anything",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "hkdf",
+ "libc",
  "memmap2",
  "parking_lot",
+ "pbkdf2",
  "quick_cache",
  "rand 0.8.6",
  "rayon",
  "redb",
  "serde_json",
+ "sha2 0.10.9",
  "sha2 0.11.0",
  "smallvec",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -279,6 +289,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures 0.2.17",
+ "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -986,6 +1009,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "blake3"
 version = "1.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1356,6 +1388,15 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+]
+
+[[package]]
+name = "clap_complete"
+version = "4.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f84a88507dbd05c695f2cb5e8558e747179134005e9893882dec964190ed89"
+dependencies = [
+ "clap",
 ]
 
 [[package]]
@@ -4470,6 +4511,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4486,6 +4538,16 @@ name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+ "hmac 0.12.1",
+]
 
 [[package]]
 name = "pdf-extract"
