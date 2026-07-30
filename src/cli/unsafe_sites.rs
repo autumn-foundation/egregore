@@ -88,15 +88,26 @@ pub(crate) const UNSAFE_SITES_DISCLAIMER: &str = "Rows are an advisory unsafe-su
      unsound. A zero count is not a safety guarantee: macro-expanded, \
      build-script, and dependency unsafe are out of this slice.";
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn query_unsafe_sites_cmd(
     records: &[GraphRecord],
     path_prefix: Option<&str>,
     at: Option<&str>,
     index: &query::RepositoryIndex,
     repo_scope: Option<&str>,
+    at_head: bool,
+    all_history: bool,
     format: OutputFormat,
 ) -> Result<()> {
+    // Corpus-mode selection (issue #456): head-anchor by default over a
+    // scan-history store; `--all-history` opts into the union and `--at` pins a
+    // commit (handled by the pure fn). The HEAD-anchor pre-filter runs BEFORE
+    // the pure fn — whose own #468 latest-write-per-id coalescing then applies
+    // over the narrowed slice, so the surviving coalesced record is the HEAD one.
+    let (corpus_mode, corpus_mode_source, filtered) =
+        resolve_current_state_corpus(records, index, at.is_some(), at_head, all_history)?;
+    let records: &[GraphRecord] = filtered.as_deref().unwrap_or(records);
+
     let inventory = match query::unsafe_sites(records, path_prefix, at, index, repo_scope) {
         Ok(inventory) => inventory,
         Err(err) => {
@@ -222,7 +233,7 @@ pub(crate) fn query_unsafe_sites_cmd(
         return Ok(());
     }
 
-    let (corpus_mode, corpus_mode_source, corpus_disclaimer) = disclose_scoped_corpus(records, at);
+    let corpus_disclaimer = corpus_mode.disclaimer().to_owned();
 
     let response = UnsafeSitesResponse {
         ok: true,
@@ -244,8 +255,8 @@ pub(crate) fn query_unsafe_sites_cmd(
         },
         sites: rows,
         diagnostics: Vec::new(),
-        corpus_mode,
-        corpus_mode_source,
+        corpus_mode: corpus_mode.as_str(),
+        corpus_mode_source: corpus_mode_source.as_str(),
         corpus_disclaimer,
     };
 

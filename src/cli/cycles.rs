@@ -133,8 +133,17 @@ pub(crate) fn query_cycles_cmd(
     scope_handle: Option<&str>,
     index: &query::RepositoryIndex,
     repo_scope: Option<&str>,
+    at_head: bool,
+    all_history: bool,
     format: OutputFormat,
 ) -> Result<()> {
+    // Corpus-mode selection (issue #456): head-anchor by default over a
+    // scan-history store; `--all-history` opts into the union. Pre-filter drops
+    // off-HEAD records BEFORE cycle detection.
+    let (corpus_mode, corpus_mode_source, filtered) =
+        resolve_current_state_corpus(records, index, false, at_head, all_history)?;
+    let records: &[GraphRecord] = filtered.as_deref().unwrap_or(records);
+
     // Resolve the optional scope handle through the shared handle-resolution
     // contract (mirrors `query change-impact`): unsupported/ambiguous handles
     // exit 1 with machine-readable stderr JSON; a handle resolving to nothing
@@ -195,8 +204,7 @@ pub(crate) fn query_cycles_cmd(
 
     let ctx = query::dependency_cycles(records, index, repo_scope, scope_target.as_ref());
 
-    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
-        query::disclose_corpus(records, query::CorpusMode::Union);
+    let corpus_disclaimer = corpus_mode.disclaimer().to_owned();
 
     match format {
         OutputFormat::Json => {

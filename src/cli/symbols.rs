@@ -65,6 +65,7 @@ pub(crate) fn print_daemon_symbol_record(
 // query symbol (all matching)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn query_symbol_all(
     records: &[GraphRecord],
     name: &str,
@@ -72,11 +73,64 @@ pub(crate) fn query_symbol_all(
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
     freshness_code: Option<&(String, &'static str)>,
+    corpus_mode: query::CorpusMode,
+    corpus_mode_source: query::CorpusModeSource,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
+    // HEAD-anchor keep-last coalescing (issue #456): the ID-level HEAD-anchor
+    // pre-filter (`non_head_current_record_ids`, applied by the CLI dispatch)
+    // drops symbol IDs whose EVERY version is off-HEAD (`gone`), but retains a
+    // multi-version ID whose HEAD version is current (`keeper` at both c1 and
+    // HEAD c2). Mirroring the deps pure fn's own keep-last, emit only the latest
+    // version per record ID when head-anchored so `keeper` is one HEAD row, not
+    // one row per commit; the `union` corpus keeps every version.
+    let latest_by_id: std::collections::HashMap<&str, usize> =
+        if matches!(corpus_mode, query::CorpusMode::HeadAnchored) {
+            let mut best: std::collections::HashMap<
+                &str,
+                (usize, Option<chrono::DateTime<chrono::FixedOffset>>),
+            > = std::collections::HashMap::new();
+            for (i, r) in records.iter().enumerate() {
+                let GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    id,
+                    name: node_name,
+                    temporal,
+                    valid_time,
+                    ..
+                } = r
+                else {
+                    continue;
+                };
+                if node_name.as_deref() != Some(name) {
+                    continue;
+                }
+                let vt = temporal
+                    .as_ref()
+                    .map(|t| t.valid_time.as_str())
+                    .or(valid_time.as_deref())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+                let better =
+                    best.get(id.as_str())
+                        .is_none_or(|(prev_i, prev_vt)| match (vt, *prev_vt) {
+                            (Some(a), Some(b)) => a > b || (a == b && i > *prev_i),
+                            (Some(_), None) => true,
+                            (None, Some(_)) => false,
+                            (None, None) => i > *prev_i,
+                        });
+                if better {
+                    best.insert(id.as_str(), (i, vt));
+                }
+            }
+            best.into_iter().map(|(k, (i, _))| (k, i)).collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+    let head_anchored = matches!(corpus_mode, query::CorpusMode::HeadAnchored);
     let mut results: Vec<SymbolResult<'_>> = records
         .iter()
-        .filter(|r| {
+        .enumerate()
+        .filter(|(_, r)| {
             if let GraphRecord::Node {
                 id, temporal: None, ..
             } = r
@@ -86,7 +140,11 @@ pub(crate) fn query_symbol_all(
                 true
             }
         })
-        .filter_map(|r| symbol_result(r, name, index, records, &deleted))
+        .filter(|(i, r)| {
+            // Keep only the latest version per id under the head-anchored corpus.
+            !head_anchored || latest_by_id.get(r.id()).is_none_or(|latest| latest == i)
+        })
+        .filter_map(|(_, r)| symbol_result(r, name, index, records, &deleted))
         .collect();
     if let Some(repo) = selected_repo {
         results.retain(|r| r.repository_id == Some(repo));
@@ -99,12 +157,10 @@ pub(crate) fn query_symbol_all(
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
     stamp_freshness(&mut results, freshness_code);
-    // Disclosure-only (issue #427): `query symbol` with no `--at`/`--as-of`
-    // returns every matching Symbol node across the store — the UNION of all
-    // commit snapshots over a scan-history store, or the single snapshot over a
-    // plain `scan`. Disclose that honestly on each row.
-    let (corpus_mode, corpus_mode_source, _) =
-        query::disclose_corpus(records, query::CorpusMode::Union);
+    // Corpus disclosure (issue #456): the caller resolved the effective corpus
+    // (HEAD-anchored by default over a scan-history store, `union` under
+    // `--all-history`, `single_snapshot` over a plain scan) and pre-filtered the
+    // record slice accordingly; stamp that resolution on each row.
     stamp_symbol_corpus(&mut results, corpus_mode, corpus_mode_source);
     for result in &results {
         print_result(result, format)?;

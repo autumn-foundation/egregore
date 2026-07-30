@@ -1162,6 +1162,19 @@ pub(crate) enum QuerySubcommand {
         /// downgrade trust in the cited handle. Omitted → no freshness field.
         #[arg(long)]
         repo_path: Option<PathBuf>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, so a symbol removed at HEAD does not
+        /// appear. This is the DEFAULT when a source snapshot exists; the flag
+        /// makes it explicit. Mutually exclusive with --all-history/--at/--as-of
+        /// (enforced at runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): return the UNION of all commit
+        /// snapshots so a symbol present only at an earlier commit still
+        /// appears. Mutually exclusive with --at-head/--at/--as-of (enforced at
+        /// runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -1424,6 +1437,19 @@ pub(crate) enum QuerySubcommand {
         /// freshness field. See `eg query symbol --help`.
         #[arg(long)]
         repo_path: Option<PathBuf>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history (enforced at runtime
+        /// with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a record removed at a later commit still appears. Mutually
+        /// exclusive with --at-head (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Supersession resolution mode for memory/observations.
         #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
         supersession: crate::temporal_status::SupersessionMode,
@@ -1562,6 +1588,19 @@ pub(crate) enum QuerySubcommand {
         /// Restrict symbol/file handle resolution to one repository (issue #67).
         #[arg(long)]
         repo: Option<String>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history (enforced at runtime
+        /// with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a record removed at a later commit still appears. Mutually
+        /// exclusive with --at-head (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
     },
     /// Flag agent observations whose cited code has drifted since recording (issue #85).
     ///
@@ -1611,6 +1650,19 @@ pub(crate) enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history (enforced at runtime
+        /// with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a record removed at a later commit still appears. Mutually
+        /// exclusive with --at-head (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -1654,6 +1706,19 @@ pub(crate) enum QuerySubcommand {
         /// silently dropping relationship classes.
         #[arg(long, default_value_t = 1)]
         depth: usize,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history (enforced at runtime
+        /// with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a record removed at a later commit still appears. Mutually
+        /// exclusive with --at-head (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -2197,6 +2262,19 @@ pub(crate) enum QuerySubcommand {
         /// Restrict the dependency graph to one repository.
         #[arg(long)]
         repo: Option<String>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history (enforced at runtime
+        /// with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a record removed at a later commit still appears. Mutually
+        /// exclusive with --at-head (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -2384,6 +2462,19 @@ pub(crate) enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history (enforced at runtime
+        /// with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a record removed at a later commit still appears. Mutually
+        /// exclusive with --at-head (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -2501,6 +2592,19 @@ pub(crate) enum QuerySubcommand {
         /// Restrict results to one repository (see `eg query symbol --help`).
         #[arg(long)]
         repo: Option<String>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history and --at (enforced at
+        /// runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a record removed at a later commit still appears. Mutually
+        /// exclusive with --at-head and --at (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -2550,6 +2654,19 @@ pub(crate) enum QuerySubcommand {
         /// Restrict results to one repository (see `eg query symbol --help`).
         #[arg(long)]
         repo: Option<String>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history and --at (enforced at
+        /// runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a record removed at a later commit still appears. Mutually
+        /// exclusive with --at-head and --at (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -2599,6 +2716,19 @@ pub(crate) enum QuerySubcommand {
         /// Restrict results to one repository (see `eg query symbol --help`).
         #[arg(long)]
         repo: Option<String>,
+        /// Corpus selector (issue #456): head-anchor the current-state view to
+        /// each repository's stamped HEAD, excluding records removed at HEAD.
+        /// This is the DEFAULT when a source snapshot exists; the flag makes it
+        /// explicit. Mutually exclusive with --all-history and --at (enforced at
+        /// runtime with an `unsupported_combination` envelope).
+        #[arg(long)]
+        at_head: bool,
+        /// Corpus selector (issue #456): read the UNION of all commit snapshots
+        /// so a record removed at a later commit still appears. Mutually
+        /// exclusive with --at-head and --at (enforced at runtime with an
+        /// `unsupported_combination` envelope).
+        #[arg(long)]
+        all_history: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -4245,25 +4375,61 @@ pub(crate) struct SymbolResult<'a> {
     corpus_disclaimer: Option<String>,
 }
 
-/// Resolves the corpus-disclosure triple for a lane whose only temporal
-/// selector is `--at` (issue #427): `commit_pinned` + `selector` when `at` is
-/// set, otherwise the [`query::disclose_corpus`] default (`union` over a
-/// scan-history store, `single_snapshot` over a plain scan).
-pub(crate) fn disclose_scoped_corpus(
+/// Resolves the effective corpus mode for a current-state code lane and,
+/// when the mode is [`query::CorpusMode::HeadAnchored`], returns the
+/// head-anchored record slice to traverse (issue #456).
+///
+/// This is the shared CLI-layer wiring the flipped lanes call: it composes
+/// [`query::resolve_corpus_mode`] (flag/selector precedence + mutual-exclusion)
+/// with [`query::non_head_current_record_ids`] (the HEAD-anchor pre-filter).
+/// The returned `Vec` — when `Some` — is the narrowed record set with every
+/// record NOT current at its owning repository's stamped HEAD dropped BEFORE the
+/// lane's pure query fn runs (whose own #468 liveness gate then applies over the
+/// narrowed slice; the two filters are orthogonal). `None` means "traverse the
+/// full slice unchanged" — [`query::CorpusMode::Union`],
+/// [`query::CorpusMode::SingleSnapshot`], and [`query::CorpusMode::CommitPinned`]
+/// (a temporal pin is handled by the lane's own `--at`/`--as-of` machinery).
+///
+/// On a conflicting flag combination, prints the machine-readable
+/// `unsupported_combination` envelope on stdout and exits 1 — never returns.
+pub(crate) fn resolve_current_state_corpus(
     records: &[GraphRecord],
-    at: Option<&str>,
-) -> (&'static str, &'static str, String) {
-    if at.is_some() {
-        let mode = query::CorpusMode::CommitPinned;
-        (
-            mode.as_str(),
-            query::CorpusModeSource::Selector.as_str(),
-            mode.disclaimer().to_owned(),
-        )
-    } else {
-        let (mode, source, disclaimer) = query::disclose_corpus(records, query::CorpusMode::Union);
-        (mode.as_str(), source.as_str(), disclaimer)
-    }
+    index: &query::RepositoryIndex,
+    has_temporal_pin: bool,
+    at_head: bool,
+    all_history: bool,
+) -> Result<(
+    query::CorpusMode,
+    query::CorpusModeSource,
+    Option<Vec<GraphRecord>>,
+)> {
+    let has_snapshot = query::store_has_source_snapshot(records);
+    let (corpus_mode, corpus_mode_source) =
+        match query::resolve_corpus_mode(has_temporal_pin, at_head, all_history, has_snapshot) {
+            Ok(pair) => pair,
+            Err(message) => {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": { "code": "unsupported_combination", "message": message },
+                });
+                println!("{}", serde_json::to_string(&envelope)?);
+                std::process::exit(1);
+            }
+        };
+    let filtered: Option<Vec<GraphRecord>> =
+        if matches!(corpus_mode, query::CorpusMode::HeadAnchored) {
+            let non_current = query::non_head_current_record_ids(records, index);
+            Some(
+                records
+                    .iter()
+                    .filter(|r| !non_current.contains(r.id()))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            None
+        };
+    Ok((corpus_mode, corpus_mode_source, filtered))
 }
 
 /// Resolves the corpus-disclosure triple for a lane that HEAD-anchors its
@@ -4998,6 +5164,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             tx_as_of,
             repo,
             repo_path,
+            at_head,
+            all_history,
             format,
         } => {
             if let Some(tx) = tx_as_of.as_deref() {
@@ -5115,17 +5283,34 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &[graph.as_deref(), data_dir.as_deref()],
                 selected,
             );
+            // Corpus-mode selection (issue #456): the default `query symbol`
+            // (no `--at`/`--as-of`) now HEAD-anchors over a scan-history store;
+            // `--all-history` opts into the union. `--at`/`--as-of` stay
+            // CommitPinned (handled by query_symbol_at/as_of, which stamp their
+            // own row-level disclosure). This call also enforces the mutual
+            // exclusion of --at-head/--all-history with each other and with any
+            // temporal selector.
+            let (corpus_mode, corpus_mode_source, filtered) = resolve_current_state_corpus(
+                &records,
+                &index,
+                at.is_some() || as_of.is_some(),
+                at_head,
+                all_history,
+            )?;
             as_of.map_or_else(
                 || {
                     at.map_or_else(
                         || {
+                            let recs: &[GraphRecord] = filtered.as_deref().unwrap_or(&records);
                             query_symbol_all(
-                                &records,
+                                recs,
                                 &name,
                                 format,
                                 &index,
                                 selected,
                                 freshness_code.as_ref(),
+                                corpus_mode,
+                                corpus_mode_source,
                             )
                         },
                         |prefix| {
@@ -5496,6 +5681,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             graph,
             data_dir,
             repo_path,
+            at_head,
+            all_history,
             supersession,
         } => {
             // Sidecar-index fast path (issue #447): the plain context bundle is a
@@ -5536,7 +5723,14 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &[graph.as_deref(), data_dir.as_deref()],
                 owner_hint.as_deref(),
             );
-            query_context_cmd(&records, &name, freshness, supersession)
+            query_context_cmd(
+                &records,
+                &name,
+                freshness,
+                supersession,
+                at_head,
+                all_history,
+            )
         }
         QuerySubcommand::Task {
             id_or_handle,
@@ -5614,11 +5808,20 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             graph,
             data_dir,
             repo,
+            at_head,
+            all_history,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
-            query_failures_cmd(&records, &handle, &index, selected.as_deref())
+            query_failures_cmd(
+                &records,
+                &handle,
+                &index,
+                selected.as_deref(),
+                at_head,
+                all_history,
+            )
         }
         QuerySubcommand::EvidenceFreshness {
             graph,
@@ -5638,6 +5841,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             prefix,
             graph,
             data_dir,
+            at_head,
+            all_history,
             format,
             supersession,
         } => {
@@ -5656,7 +5861,14 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 std::process::exit(1);
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_subsystem_cmd(&records, &prefix, format, supersession)
+            query_subsystem_cmd(
+                &records,
+                &prefix,
+                at_head,
+                all_history,
+                format,
+                supersession,
+            )
         }
         QuerySubcommand::ChangeImpact {
             handle,
@@ -5664,12 +5876,22 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             data_dir,
             repo,
             depth,
+            at_head,
+            all_history,
             format: _format,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
-            query_change_impact_cmd(&records, &handle, &index, selected.as_deref(), depth)
+            query_change_impact_cmd(
+                &records,
+                &handle,
+                &index,
+                selected.as_deref(),
+                depth,
+                at_head,
+                all_history,
+            )
         }
         QuerySubcommand::TransitiveCallers {
             handle,
@@ -5956,6 +6178,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             graph,
             data_dir,
             repo,
+            at_head,
+            all_history,
             format,
         } => {
             // Strictly read-only lane (issue #138): opening the embedded
@@ -5977,6 +6201,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 scope.as_deref(),
                 &index,
                 selected.as_deref(),
+                at_head,
+                all_history,
                 format,
             )
         }
@@ -6139,6 +6365,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             target,
             graph,
             data_dir,
+            at_head,
+            all_history,
             format,
         } => {
             // Strictly read-only lane (AC7): opening the embedded engine in place
@@ -6153,7 +6381,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 }
                 (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
             };
-            query_evidence_path_cmd(&records, &source, &target, format)
+            query_evidence_path_cmd(&records, &source, &target, at_head, all_history, format)
         }
         QuerySubcommand::Coupling {
             path,
@@ -6233,6 +6461,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             data_dir,
             at,
             repo,
+            at_head,
+            all_history,
             format,
         } => {
             // Strictly read-only lane (issue #223): opening the embedded
@@ -6255,6 +6485,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 at.as_deref(),
                 &index,
                 selected.as_deref(),
+                at_head,
+                all_history,
                 format,
             )
         }
@@ -6264,6 +6496,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             data_dir,
             at,
             repo,
+            at_head,
+            all_history,
             format,
         } => {
             // Strictly read-only lane (issue #218): same throwaway-copy
@@ -6284,6 +6518,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 at.as_deref(),
                 &index,
                 selected.as_deref(),
+                at_head,
+                all_history,
                 format,
             )
         }
@@ -6293,6 +6529,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             data_dir,
             at,
             repo,
+            at_head,
+            all_history,
             format,
         } => {
             // Strictly read-only lane (issue #222): opening the embedded
@@ -6315,6 +6553,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 at.as_deref(),
                 &index,
                 selected.as_deref(),
+                at_head,
+                all_history,
                 format,
             )
         }

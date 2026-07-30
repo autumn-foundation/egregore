@@ -13,18 +13,23 @@ pub(crate) fn query_evidence_path_cmd(
     records: &[GraphRecord],
     source_id: &str,
     target_id: &str,
+    at_head: bool,
+    all_history: bool,
     format: OutputFormat,
 ) -> Result<()> {
-    // Disclosure-only (issue #427): evidence-path is a current-state view over
-    // the live evidence-edge subgraph, but over a scan-history store it walks the
-    // UNION of all commit snapshots (no head anchoring; temporal versions are not
-    // pinned to a HEAD). Disclose that honestly.
-    let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
-        query::disclose_corpus(records, query::CorpusMode::Union);
+    // Corpus-mode selection (issue #456): evidence-path is a current-state view
+    // over the live evidence-edge subgraph. Over a scan-history store it now
+    // HEAD-anchors by default (records current at each repository's stamped
+    // HEAD); `--all-history` opts into the union of all commit snapshots. The
+    // pre-filter drops off-HEAD records BEFORE the witness-path traversal.
+    let index = query::RepositoryIndex::build(records);
+    let (corpus_mode, corpus_mode_source, filtered) =
+        resolve_current_state_corpus(records, &index, false, at_head, all_history)?;
+    let records: &[GraphRecord] = filtered.as_deref().unwrap_or(records);
     let corpus = Corpus {
         mode: corpus_mode.as_str(),
         source: corpus_mode_source.as_str(),
-        disclaimer: corpus_disclaimer,
+        disclaimer: corpus_mode.disclaimer().to_owned(),
     };
 
     match query::evidence_path(records, source_id, target_id) {

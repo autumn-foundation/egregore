@@ -225,9 +225,10 @@ fn unsafe_sites_returns_real_sites_and_never_decoys() {
         "results must state they are an inventory, not a soundness verdict"
     );
 
-    // Corpus disclosure (issue #427): a real `eg scan` git store carries a
-    // source_snapshot, so with no `--at` this lane discloses the union it reads.
-    assert_eq!(envelope["corpus_mode"], "union");
+    // Corpus disclosure (issue #456): a real `eg scan` git store carries a
+    // source_snapshot, so with no `--at`/`--all-history` this lane now
+    // HEAD-anchors by default (a single-snapshot scan's head == its whole view).
+    assert_eq!(envelope["corpus_mode"], "head_anchored");
     assert_eq!(envelope["corpus_mode_source"], "default");
     assert!(
         envelope["corpus_disclaimer"]

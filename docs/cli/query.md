@@ -213,12 +213,17 @@ flag pair, and the per-category defaults — is documented once in
   **HEAD-anchored** by default (they disclose `head_anchored`, or
   `single_snapshot` over a snapshot-less store); an `--at`/`--as-of` selector
   pins a single commit (`commit_pinned`).
-- **`eg query subsystem`, `eg query symbol`, `eg query context`** are latent
-  current-state lanes that today read the **union of all commit snapshots** over
-  a `scan-history` store and disclose `corpus_mode: "union"` honestly. They do
-  **not** yet accept `--at-head`/`--all-history`; flipping them to the
-  HEAD-anchored default and adding that flag pair, under the contract published
-  in issue #427, is tracked in **issue #456**.
+- **`eg query subsystem`, `eg query symbol`, `eg query context`** are now
+  **HEAD-anchored** by default too (issue #456): over a `scan-history` store they
+  read the records current at each repository's stamped HEAD (a record removed
+  before HEAD no longer appears), disclosing `head_anchored` / `default` (or
+  `single_snapshot` over a snapshot-less store). Pass `--all-history` for the
+  **union of all commit snapshots** (`union` / `explicit_flag`) — the pre-#456
+  default — or `--at-head` to force the HEAD-anchored view explicitly. The two
+  flags are mutually exclusive with each other and, on `eg query symbol`, with
+  its `--at`/`--as-of` selector (a conflict exits `1` with
+  `unsupported_combination`). `eg query symbol` discloses the corpus per row
+  (it emits bare NDJSON rows); `subsystem`/`context` disclose it on the envelope.
 
 ---
 
