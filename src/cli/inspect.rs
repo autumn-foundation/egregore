@@ -72,6 +72,29 @@ pub(crate) fn print_counts_text(counts: &InspectCounts) {
         }
         println!("  indexed languages: {}", cov.indexed_languages.join(", "));
     }
+    // Semantic vector-index identity (issue #104): the human-readable form of
+    // the `semantic_index` JSON block.
+    #[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+    if let Some(index) = &counts.semantic_index {
+        match index.index_dimensions {
+            None => println!("semantic index: absent (store never ingested with --embed)"),
+            Some(dim) => {
+                println!("semantic index: {dim}-dimensional vectors");
+                if index.indexed_models.is_empty() {
+                    println!(
+                        "  embedding model: NOT RECORDED — compatibility with a query embedder \
+                         is unverifiable; re-ingest with --embed to record it"
+                    );
+                }
+                for model in &index.indexed_models {
+                    println!(
+                        "  embedding model: {}/{}@{} dim={} hash={}",
+                        model.provider, model.name, model.version, model.dim, model.content_hash
+                    );
+                }
+            }
+        }
+    }
     for (kind, count) in &counts.producer_kinds {
         println!("producer_kind {kind}: {count}");
     }
@@ -199,14 +222,33 @@ pub(crate) fn inspect_embedded_store(data_dir: &Path, format: OutputFormat) -> R
     // output is deterministic regardless of physical store iteration order.
     counts.repositories.sort_by(|a, b| a.id.cmp(&b.id));
 
-    // The coverage detail block must reflect the transaction-time-current
-    // version of each ScanCoverage stable ID. `inspect_all_records` returns
-    // EVERY physical version (including superseded ones) so the record/node
-    // totals stay accurate, but a store re-ingested after files changed then
-    // holds multiple equal-ID coverage versions; resolving the block through
-    // the current serving view guarantees the latest coverage is reported,
-    // never a stale earlier one (issue #135).
-    counts.coverage = current_coverage_summaries(&sink, data_dir)?;
+    // Both detail blocks below must reflect the transaction-time-CURRENT version
+    // of each stable ID. `inspect_all_records` above returns EVERY physical
+    // version (including superseded ones) so the record/node totals stay
+    // accurate, but a re-ingested store then holds several equal-ID versions;
+    // resolving the blocks through the current serving view guarantees the
+    // latest is reported, never a stale earlier one. Read ONCE and shared, so
+    // adding the second block did not add a third full deserialization of the
+    // store (issues #135 / #104).
+    let current = sink.inspect_current_records().map_err(|error| {
+        anyhow::anyhow!(
+            "failed to read current records from embedded store {}: {error}",
+            data_dir.display()
+        )
+    })?;
+    counts.coverage = current_coverage_summaries(&current.records);
+
+    // Semantic-index identity block (issue #104): the documented `eg` workflow
+    // for reading which embedding model produced a store's queryable vector
+    // index, so an operator can see WHY a semantic query was refused and decide
+    // to re-ingest.
+    #[cfg(feature = "embeddings")]
+    {
+        counts.semantic_index = Some(SemanticIndexSummary {
+            index_dimensions: sink.embedding_index_dimensions(),
+            indexed_models: crate::embeddings::indexed_identities(&current.records),
+        });
+    }
 
     match format {
         OutputFormat::Json => {
@@ -216,6 +258,21 @@ pub(crate) fn inspect_embedded_store(data_dir: &Path, format: OutputFormat) -> R
         OutputFormat::Text => print_counts_text(&counts),
     }
     Ok(())
+}
+
+/// Semantic vector-index identity block reported by `eg inspect --data-dir`
+/// (issue #104).
+///
+/// Allow-list only: dimensions, the identity-recorded flag, and the bounded
+/// `EmbeddingModel` identity fields. Never vectors, model bytes, or payloads.
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SemanticIndexSummary {
+    /// Dimensionality of the persisted vector index; `None` when the store has
+    /// no semantic index (never ingested with `--embed`).
+    index_dimensions: Option<usize>,
+    /// Distinct live embedding-model identities recorded for the index.
+    indexed_models: Vec<crate::ir::EmbeddingModel>,
 }
 
 /// Resolves the transaction-time-current `ScanCoverage` summary for each stable
@@ -230,23 +287,14 @@ pub(crate) fn inspect_embedded_store(data_dir: &Path, format: OutputFormat) -> R
 /// it is safe on any store the totals path can inspect. Ordering by record ID
 /// keeps the block byte-identical across runs.
 #[cfg(feature = "embedded-aletheiadb")]
-fn current_coverage_summaries(
-    sink: &EmbeddedAletheiaSink,
-    data_dir: &Path,
-) -> Result<Vec<CoverageSummary>> {
-    let report = sink.inspect_current_records().map_err(|error| {
-        anyhow::anyhow!(
-            "failed to read current records from embedded store {}: {error}",
-            data_dir.display()
-        )
-    })?;
+fn current_coverage_summaries(current_records: &[GraphRecord]) -> Vec<CoverageSummary> {
     let mut latest: BTreeMap<String, CoverageSummary> = BTreeMap::new();
-    for record in &report.records {
+    for record in current_records {
         if let Some(summary) = coverage_summary_from_record(record) {
             latest.insert(summary.id.clone(), summary);
         }
     }
-    Ok(latest.into_values().collect())
+    latest.into_values().collect()
 }
 
 /// Feature-off stub: `--data-dir` inspection needs the embedded adapter.
@@ -375,6 +423,11 @@ pub(crate) struct InspectCounts {
     /// Scan-coverage summaries, one per `ScanCoverage` node (issue #135),
     /// sorted by record ID for deterministic output.
     coverage: Vec<CoverageSummary>,
+    /// Semantic vector-index identity block (issue #104). Only populated on the
+    /// `--data-dir` path, where the physical vector index is inspectable; a
+    /// `--graph` JSONL carries no index.
+    #[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+    semantic_index: Option<SemanticIndexSummary>,
     /// Per-`producer_kind` breakdown; legacy records use key `"legacy_pre_v1"`.
     producer_kinds: BTreeMap<String, usize>,
     /// Per-`egregore_version` breakdown; legacy records use key `"legacy_pre_v1"`.
@@ -544,6 +597,27 @@ impl InspectCounts {
             "mode": "embedded",
             "data_dir": data_dir,
         });
+        // Semantic vector-index identity (issue #104). Allow-list only, and
+        // deterministic: identities arrive already deduplicated and sorted.
+        #[cfg(feature = "embeddings")]
+        if let Some(index) = &self.semantic_index {
+            json_val["semantic_index"] = serde_json::json!({
+                "index_present": index.index_dimensions.is_some(),
+                "index_dimensions": index.index_dimensions,
+                "identity_recorded": !index.indexed_models.is_empty(),
+                "indexed_models": index
+                    .indexed_models
+                    .iter()
+                    .map(|m| serde_json::json!({
+                        "provider": m.provider,
+                        "name": m.name,
+                        "version": m.version,
+                        "dim": m.dim,
+                        "content_hash": m.content_hash,
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+        }
         json_val
     }
 

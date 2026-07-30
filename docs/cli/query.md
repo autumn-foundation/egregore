@@ -864,6 +864,42 @@ The query string is embedded with the same model used during ingest and compared
 
 The embedded store **must** have been populated with `eg ingest --embed`. A store created without `--embed` contains no embedding vectors and returns no results.
 
+### Vector-space compatibility gate (issue #104)
+
+**BREAKING CHANGE (issue #104):** every `--embed` store created before this
+change carries no recorded embedding-model identity, so semantic queries against
+it now refuse with `embedding_identity_unrecorded` (exit `7`) instead of
+returning results whose vector-space compatibility was never verified. Re-ingest
+with `--embed` to record the identity. See
+[`semantic-index-identity.md`](semantic-index-identity.md).
+
+Before the query is embedded, `eg query semantic` verifies that the query
+embedder's model identity matches the identity recorded for the store's vector
+index. Two different models can share a dimension, so a dimension check alone
+would let a model swap, cache change, or version bump produce a cosine ranking
+computed **across incompatible vector spaces** and return it as a confident
+answer.
+
+When the identities match, results are returned **exactly as before**: the check
+adds no change to ranking, scores, ordering, or the output schema. When they do
+not, the query is refused with a stable machine-readable envelope on stdout and a
+distinct nonzero exit code — never a ranked result list:
+
+| Exit | `code` | Condition |
+|------|--------|-----------|
+| `7` | `embedding_identity_unrecorded` | Index exists but records no model identity (legacy store); compatibility is unverifiable. |
+| `8` | `embedding_identity_ambiguous` | Index records more than one distinct producing model. |
+| `9` | `embedding_dimension_mismatch` | Index and query embedder produce different dimensionalities. |
+| `10` | `embedding_model_mismatch` | Same dimension, different model. |
+
+`eg query semantic-memory` and `eg query semantic-context` read the same shared
+vector index and apply the same gate. The daemon path (`--daemon`) does not —
+daemon/MCP exposure is owned by #59/#53.
+
+Read the indexed identity with `eg inspect --data-dir <DIR>`. The full contract,
+envelope shape, and the re-ingest workflow are documented in
+[`docs/cli/semantic-index-identity.md`](semantic-index-identity.md).
+
 ### Arguments
 
 | Argument | Required | Description |
@@ -895,7 +931,9 @@ Machine consumers must depend only on the fields listed above. Additional fields
 | Condition | Exit code | Stderr message | Operator action |
 |-----------|-----------|----------------|-----------------|
 | Store directory does not exist | `1` | `embedded store not found … run ingest` | Create the store: `eg ingest --adapter embedded --data-dir <DIR> [--embed]`. |
+| Store has no vector index at all (never `--embed`ed) | `2` | `no results — store may not have embeddings (re-run ingest with --embed)` | Re-run ingest: `eg ingest --adapter embedded --data-dir <DIR> --embed`. Reported by the issue #104 gate before the model is loaded. |
 | `semantic_search` returns no matches | `2` | `no results — store may not have embeddings (re-run ingest with --embed)` | Re-run ingest: `eg ingest --adapter embedded --data-dir <DIR> --embed`. |
+| Query embedder does not match the indexed model | `7` / `8` / `9` / `10` | `semantic query refused: …` plus a machine-readable envelope on stdout | See [`docs/cli/semantic-index-identity.md`](semantic-index-identity.md); the remedy is always re-ingest, never editing the store. |
 
 Exit code `2` is also returned when the query produced no cosine-similar results above the search threshold. This is semantically equivalent to "no match" in other query subcommands.
 

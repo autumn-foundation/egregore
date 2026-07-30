@@ -40,6 +40,66 @@ diagnostic on stdout; a valid prefix matching zero embedded nodes exits 2 with a
 index" message. `--under` is a local-CLI surface and cannot be combined with
 `--daemon`. See `docs/cli/query.md`.
 
+`eg query semantic` REFUSES to answer when the query embedder does not
+demonstrably share the store's vector space (issue #104). The semantic index
+stores only vectors plus a dimension, and two different models can share a
+dimension, so a dimension check alone lets a model swap, cache change, or version
+bump produce a cosine ranking computed ACROSS INCOMPATIBLE VECTOR SPACES and
+return it as a confident answer. Every `--embed` write path (`eg ingest`,
+`eg refresh`, `eg watch`) now persists ONE semantic-domain `EmbeddingModel` node
+carrying the producing model's full identity (provider/name/version/dim/
+content_hash) — the EXISTING semantic-drift `EmbeddingModel` vocabulary and node
+kind, in an additive `embedding_model` node payload; no new node kind, edge
+label, or trust class. The record ID is FIXED (one store = one vector index = one
+identity), so re-embedding SUPERSEDES it rather than accumulating a second,
+unremovable record (`eg forget` refuses every semantic-domain record and
+`eg forget-repo` never evicts a repo-agnostic one, so an accumulated second
+identity would be UNRECOVERABLE). What prevents a mixed-model index is instead a
+WRITE-TIME refusal: `--embed` into a store whose index was built by a DIFFERENT
+model exits nonzero with `embedding_index_identity_conflict` BEFORE writing
+anything, so the natural in-place fix after a version bump (`eg refresh --embed`)
+reports a clear refusal instead of quietly blending two vector spaces and
+reporting success. Same-model re-embedding is allowed and idempotent (`+1` to the
+ingest counts on a first `--embed`). The gate
+runs BEFORE the query is embedded (a refusal costs no model load), and applies to
+all three local embedded lanes (`semantic`, `semantic-memory`,
+`semantic-context`); the `--daemon` path and MCP are out of scope (#59/#53).
+Verdicts are a closed set with distinct stable codes and distinct nonzero exit
+codes: `embedding_identity_unrecorded` (7 — index present but no recorded
+identity, reported UNVERIFIABLE, never assumed compatible),
+`embedding_identity_ambiguous` (8 — several distinct recorded models),
+`embedding_dimension_mismatch` (9), and `embedding_model_mismatch` (10 — SAME
+dim, different model, the silent-failure case). A matching identity returns
+results EXACTLY as before (no change to ranking, scores, ordering, or output
+schema); a store with NO vector index at all is NOT an identity failure and keeps
+the documented exit-2 "no embeddings" outcome — which the gate now emits before
+the model loads, replacing a pre-existing opaque engine error at exit 1. The
+three exit-2 empty outcomes carry distinct stable codes prefixing the stderr line
+(`semantic_index_absent:` / `no_semantic_matches:` / `scoped_no_match:`), since
+`eg query` lanes leave stdout empty on exit 2. Refusal output is allow-list only
+(provider/name/version/dim/content_hash, dimensions, `query_dimensions`,
+`indexed_models`, `differing_fields`, code, remedy) — never model bytes, vectors,
+indexed source text, or the query string — and every identity VALUE is
+control-character-sanitized and length-capped
+(`IDENTITY_FIELD_MAX_CHARS`) before rendering, because values read back from a
+store are operator/attacker-controlled even though the field NAMES are
+allow-listed. A dimension mismatch discloses EVERY recorded identity, never a
+silent first pick. Output is byte-identical across runs. The remedy always names
+re-ingest into a FRESH `--data-dir`, never editing the store; Egregore never
+chooses, downloads, switches, or auto-upgrades a model, and never re-embeds on
+mismatch. HONEST LIMIT: `content_hash` is always the literal `unknown` (the
+provider boundary does not expose model bytes to this crate), so a Hugging Face
+CACHE CHANGE that resolves the same model id to different weights produces a
+byte-identical identity and is NOT detected; `provider`/`name` are compile-time
+constants, so the field that varies in practice is `version`, which pins the
+PRODUCING BINARY — upgrading `eg` therefore requires re-ingesting `--embed`
+stores, deliberate per the issue's "any identity field" contract. `--daemon`
+does NOT apply the gate (#59/#53 own daemon wiring) and prints a one-line stderr
+disclosure saying so. Read the indexed identity with `eg inspect --data-dir` (new
+`semantic_index` block: `index_present`, `index_dimensions`,
+`identity_recorded`, `indexed_models`). See
+`docs/cli/semantic-index-identity.md`.
+
 `eg scan-logs <log> --repo-path <repo>` extracts runtime log signatures from one
 captured log file (issues #319/#320): a `LogSource`, one `ErrorSignature` per
 `template-v1` fingerprint (a 1000×-repeated error collapses to one signature with

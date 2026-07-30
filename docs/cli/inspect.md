@@ -139,6 +139,19 @@ Field notes:
 * `producer_kinds` / `egregore_versions` — provenance breakdown; records that
   predate producer stamping count under `legacy_pre_v1`.
 
+* `semantic_index` — **`--data-dir` only** (issue #104), the store's vector-index
+  identity: `index_present`, `index_dimensions`, `identity_recorded`, and
+  `indexed_models` (an array of `{provider, name, version, dim, content_hash}`
+  identities, deduplicated and sorted). This is the documented `eg` workflow for
+  reading which embedding model produced a store's queryable index, and therefore
+  for understanding why `eg query semantic` refused. `identity_recorded: false`
+  with `index_present: true` is a legacy store whose compatibility is
+  unverifiable; `indexed_models` with more than one entry means the index was
+  written by several models. A `--graph` JSONL carries no vector index, so the
+  block is absent there. Allow-list only — identity fields, dimensions, and flags;
+  never vectors or model bytes. See
+  [`docs/cli/semantic-index-identity.md`](semantic-index-identity.md).
+
 JSONL-file and daemon inspection keep their existing pretty-printed JSON
 envelope, which additionally carries a `snapshot_timestamp`.
 

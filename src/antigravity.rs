@@ -301,6 +301,7 @@ fn make_node(
         dependency: None,
         log: None,
         scan_coverage: None,
+        embedding_model: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
     }

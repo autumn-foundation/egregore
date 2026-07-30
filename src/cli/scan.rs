@@ -271,14 +271,24 @@ pub(crate) fn scan_refresh_cmd(
     )
     .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
 
-    let records = scan.graph.records().to_vec();
+    #[cfg_attr(not(feature = "embeddings"), allow(unused_mut))]
+    let mut records = scan.graph.records().to_vec();
 
     // Open the embedded store and ingest the incremental graph.
     #[cfg(feature = "embeddings")]
     let mut sink = if embed {
-        let (vectors, dimensions) = generate_embeddings(&records)?;
-        EmbeddedAletheiaSink::open_with_embeddings(data_dir, vectors, dimensions)
-            .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?
+        let (vectors, dimensions, model) = generate_embeddings(&records)?;
+        let sink = EmbeddedAletheiaSink::open_with_embeddings(data_dir, vectors, dimensions)
+            .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+        // Refuse before writing anything when the index was built by a different
+        // model (issue #104). This is the path an operator reaches for after an
+        // `eg` upgrade, and it must not quietly blend two vector spaces.
+        refuse_conflicting_index_identity(&sink, &model)?;
+        // A refresh maintains the same vector index a full `--embed` ingest
+        // creates, so it maintains the same identity record — otherwise a
+        // refreshed store would look "unverifiable" at query time.
+        records.push(crate::embeddings::embedding_index_identity_record(&model));
+        sink
     } else {
         EmbeddedAletheiaSink::open(data_dir)
             .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?

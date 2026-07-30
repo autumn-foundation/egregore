@@ -1235,6 +1235,13 @@ pub enum GraphRecord {
         /// coverage stamping.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scan_coverage: Option<Box<ScanCoveragePayload>>,
+        /// Embedding-model identity for the semantic `EmbeddingModel` node that
+        /// records which model produced a store's queryable vector index (issue
+        /// #104); absent on all other kinds and on stores embedded before
+        /// identity stamping. Reuses the [`EmbeddingModel`] vocabulary the
+        /// semantic-drift schema already defines — no new identity type.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        embedding_model: Option<Box<EmbeddingModel>>,
         // ── Agent-memory provenance fields (absent for code-graph nodes) ─────
         /// Observation body text (Observation nodes).
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1830,6 +1837,7 @@ impl GraphRecord {
             dependency: None,
             log: None,
             scan_coverage: None,
+            embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1957,6 +1965,7 @@ impl GraphRecord {
             dependency: None,
             log: None,
             scan_coverage: None,
+            embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -2083,6 +2092,7 @@ impl GraphRecord {
             dependency: None,
             log: None,
             scan_coverage: None,
+            embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -2214,6 +2224,7 @@ impl GraphRecord {
             dependency: None,
             log: None,
             scan_coverage: None,
+            embedding_model: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -2673,6 +2684,31 @@ impl GraphRecord {
     pub fn scan_coverage(&self) -> Option<&ScanCoveragePayload> {
         match self {
             Self::Node { scan_coverage, .. } => scan_coverage.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Stamps the queryable vector index's [`EmbeddingModel`] identity on an
+    /// `EmbeddingModel` node (issue #104). No-op on non-node records.
+    #[must_use]
+    pub fn with_embedding_model(mut self, model: EmbeddingModel) -> Self {
+        if let Self::Node {
+            embedding_model, ..
+        } = &mut self
+        {
+            *embedding_model = Some(Box::new(model));
+        }
+        self
+    }
+
+    /// Returns the embedding-model identity when this record is an
+    /// `EmbeddingModel` node carrying one; `None` otherwise (issue #104).
+    #[must_use]
+    pub fn embedding_model(&self) -> Option<&EmbeddingModel> {
+        match self {
+            Self::Node {
+                embedding_model, ..
+            } => embedding_model.as_deref(),
             Self::Edge { .. } | Self::Tombstone { .. } => None,
         }
     }

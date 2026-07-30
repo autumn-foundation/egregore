@@ -214,6 +214,7 @@ fn make_agent_memory_node(
         dependency: None,
         log: None,
         scan_coverage: None,
+        embedding_model: None,
         user_context: aletheia_egregore::UserContextFields::empty(),
         producer: None,
     }

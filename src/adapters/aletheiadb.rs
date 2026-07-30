@@ -2205,6 +2205,7 @@ impl EmbeddedAletheiaSink {
             dependency,
             log,
             scan_coverage,
+            embedding_model,
             text,
             superseded_by,
             agent_id,
@@ -2414,6 +2415,14 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(payload.as_ref())
         {
             builder = builder.insert("scan_coverage_json", json.as_str());
+        }
+        // Vector-index embedding-model identity (issue #104): the queryable
+        // index's producing model, persisted so `eg query semantic` can prove
+        // the query embedder shares the index's vector space.
+        if let Some(payload) = embedding_model
+            && let Ok(json) = serde_json::to_string(payload.as_ref())
+        {
+            builder = builder.insert("embedding_model_json", json.as_str());
         }
         builder = insert_optional(builder, "text", text.as_deref());
         builder = insert_optional(builder, "superseded_by", superseded_by.as_deref());
@@ -3180,6 +3189,16 @@ impl EmbeddedAletheiaSink {
             .map(serde_json::from_str::<crate::ir::ScanCoveragePayload>)
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("scan_coverage_json invalid: {e}")))?
+            .map(Box::new),
+            embedding_model: optional_str_property(
+                record_id,
+                "embedding_model_json",
+                node.get_property("embedding_model_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<EmbeddingModel>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("embedding_model_json invalid: {e}")))?
             .map(Box::new),
             valid_time: optional_str_property(
                 record_id,
