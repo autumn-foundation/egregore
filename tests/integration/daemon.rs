@@ -12364,6 +12364,63 @@ fn daemon_semantic_search_reports_missing_index() {
     );
 }
 
+// ── #489: a skipped (corrupt) index must not report as a missing one ──────────
+/// `AletheiaDB` 0.2.0 SKIPS a corrupted vector index at load instead of failing
+/// the open, so a damaged index reaches the verb looking exactly like a store
+/// that was never embedded. Answering it with `missing_semantic_index`
+/// ("re-ingest with --embed") would report a data-loss condition as a benign
+/// configuration one, so the verb reports its own stable code instead.
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_reports_an_unreadable_index_distinctly() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-corrupt-store");
+    build_semantic_fixture_store(&data_dir, 8);
+
+    // Corrupt the metadata file upstream's loader requires, which is exactly
+    // the condition it skips the index for.
+    let meta = data_dir
+        .join("indexes")
+        .join("indexes")
+        .join("vector")
+        .join("embedding")
+        .join("meta.idx");
+    assert!(meta.is_file(), "fixture must persist {}", meta.display());
+    std::fs::write(&meta, b"not a valid meta file").expect("corruption writes");
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sem-unreadable",
+            "verb": "semantic_search",
+            "params": { "query_vector": semantic_vec_at(0.0) }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 422"),
+        "an unreadable semantic index should be 422, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], false, "must be ok:false, got {body}");
+    assert_eq!(
+        body["error"]["code"], "semantic_index_unreadable",
+        "a skipped index must not be reported as a missing one, got {body}"
+    );
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("message is a string");
+    assert!(
+        message.contains("NOT absent"),
+        "the message must refuse the absent framing: {message}"
+    );
+}
+
 // ── AC5: incompatible embedding dimension → stable diagnostic ─────────────────
 #[cfg(feature = "embeddings")]
 #[test]
@@ -12621,7 +12678,11 @@ fn daemon_query_doc_documents_semantic_search_verb() {
         text.contains("query_vector"),
         "daemon-query.md must document the query_vector param"
     );
-    for code in ["missing_semantic_index", "incompatible_embedding_dimension"] {
+    for code in [
+        "missing_semantic_index",
+        "semantic_index_unreadable",
+        "incompatible_embedding_dimension",
+    ] {
         assert!(
             text.contains(code),
             "daemon-query.md must document the {code} diagnostic"

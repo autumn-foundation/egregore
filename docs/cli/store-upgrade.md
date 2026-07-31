@@ -58,6 +58,33 @@ background-persistence retry loop that turned an overflow into a hang.
 Full contract — the preflight estimate, `--force`, and the exit-2 capacity
 class — is in [`ingest.md`](ingest.md#capacity-preflight-and-fatal-capacity-classification-issue-439).
 
+## Vector indexes now fail quietly — and Egregore makes that loud again
+
+0.2.0 loads per-property vector indexes in parallel **with error isolation**: a
+corrupted or unreadable one is skipped with a warning instead of aborting the
+load of every remaining index. 0.1.1 would have failed the open outright, so an
+operator with a damaged semantic index used to find out immediately.
+
+A skipped index is absent from the engine's index list, which is exactly how a
+never-embedded store looks — so without help, `eg query semantic` would have
+reported `semantic_index_absent` ("re-run ingest with `--embed`") about a store
+whose embeddings exist and are **corrupt**. Egregore therefore probes the
+store's persisted index directory when the engine reports no index, and reports
+the two states apart:
+
+* `semantic_index_unreadable` (exit `11`) — the index files are on disk and the
+  engine skipped them.
+* `semantic_index_absent` (exit `2`) — genuinely never embedded. Unchanged.
+
+`eg inspect --data-dir` carries the same three-way state as
+`semantic_index.index_status` (`loaded` / `unreadable` / `absent`), and
+`eg ingest --embed` **refuses** a store in the unreadable state rather than
+enabling an index over the skipped files — upstream documents that doing so
+creates an empty index whose next persistence cycle overwrites them,
+permanently losing the indexed vectors. The remedy is a fresh `--data-dir`;
+Egregore performs no automatic repair. Full contract in
+[`semantic-index-identity.md`](semantic-index-identity.md#a-corrupt-index-is-not-an-absent-one-issue-489).
+
 ## What did not change
 
 Record IDs, schema versions, the JSONL contract, query output, and determinism

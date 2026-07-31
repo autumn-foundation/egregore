@@ -96,9 +96,53 @@ PRODUCING BINARY — upgrading `eg` therefore requires re-ingesting `--embed`
 stores, deliberate per the issue's "any identity field" contract. `--daemon`
 does NOT apply the gate (#59/#53 own daemon wiring) and prints a one-line stderr
 disclosure saying so. Read the indexed identity with `eg inspect --data-dir` (new
-`semantic_index` block: `index_present`, `index_dimensions`,
-`identity_recorded`, `indexed_models`). See
+`semantic_index` block: `index_present`, `index_status`, `index_artifacts`,
+`index_dimensions`, `identity_recorded`, `indexed_models`). See
 `docs/cli/semantic-index-identity.md`.
+
+A CORRUPT vector index is no longer indistinguishable from an ABSENT one (issue
+#489). `AletheiaDB` 0.2.0 loads per-property vector indexes in parallel WITH
+ERROR ISOLATION — a corrupted or unreadable index is SKIPPED with a warning
+instead of aborting the load — and a skipped index is simply missing from
+`list_vector_indexes()`, so "never `--embed`ed" and "embedded, and the index is
+damaged" reached the #104 gate looking identical and both answered
+`semantic_index_absent` ("re-run ingest with --embed"). That is a data-loss
+condition reported as a benign configuration one — the same dishonesty
+`embedding_identity_unrecorded` exists to prevent. The fix is an ON-DISK PROBE:
+when the engine reports no `embedding` index, Egregore checks the store's own
+persisted index directory (derived from the SAME `durable_config_for_data_dir`
+call the store is opened with; the nested and flattened `vector/<property>`
+layouts are both probed, so an upstream layout change degrades to the old
+"absent" answer rather than a wrong one). A surviving property directory is
+PROVABLY the skip condition (upstream's loader requires `meta.idx`), so the
+three-way `VectorIndexState` (`Loaded`/`Unreadable`/`Absent`) replaces the
+`Option<usize>` dimension probe throughout. `eg query semantic` (and
+`semantic-memory`/`semantic-context`) REFUSE an unreadable index with the stable
+code `semantic_index_unreadable` at a NEW distinct exit code 11 — an ADDED case,
+never a renumbering: 7/8/9/10 and the exit-2 `semantic_index_absent` outcome are
+unchanged, and a genuinely never-embedded store still exits 2. The refusal
+discloses `index_artifacts` (matched against a FIXED table of AletheiaDB index
+filenames — `meta.idx`/`mappings.idx`/`current.usearch`/`current.usearch.mappings`
+— so `&'static str` by construction and no operator-controlled filename can ride
+into a diagnostic) plus the recorded `indexed_models` that built the lost index;
+output stays allow-list only and byte-identical across runs. `eg inspect
+--data-dir` reports the same state as `index_status` (`loaded`/`unreadable`/
+`absent`), with `index_present: true` and `index_dimensions: null` for an
+unreadable index (a skipped index reports no dimension; that null is NOT evidence
+of absence), and the text view never says "absent" for it. The daemon
+`semantic_search` verb gets a matching 422 `semantic_index_unreadable` distinct
+from `missing_semantic_index`. The `--embed` WRITE path also refuses this store
+BEFORE enabling anything: upstream documents that `enable_vector_index` over
+skipped index files creates an EMPTY index whose next persistence cycle
+OVERWRITES them, permanently losing the indexed vectors (only
+`rebuild_vector_index` is a safe recovery, and Egregore never calls
+`enable_vector_index` on a skipped index), so refusing leaves the damaged store
+byte-identical and still repairable. HONEST LIMITS: the signal is on-disk
+EVIDENCE, so a store whose index directory was deleted outright still reports
+`absent`; upstream's skip warning is a plain stderr `eprintln!`, not an
+installable observability seam, so the engine's own reason cannot be quoted; and
+there is NO automatic repair — the remedy is a fresh `--data-dir`. See
+`docs/cli/semantic-index-identity.md` and `docs/cli/store-upgrade.md`.
 
 `eg scan-logs <log> --repo-path <repo>` extracts runtime log signatures from one
 captured log file (issues #319/#320): a `LogSource`, one `ErrorSignature` per

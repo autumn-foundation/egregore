@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     time::Instant,
 };
 
@@ -30,6 +30,27 @@ use ::aletheiadb::api::transaction::WriteOps;
 const SEMANTIC_INITIAL_CANDIDATE_MULTIPLIER: usize = 8;
 #[cfg(feature = "embeddings")]
 const SEMANTIC_MAX_CANDIDATE_MULTIPLIER: usize = 64;
+
+/// Node property the semantic vector index is built over. One store has exactly
+/// one such index, so this name is the whole vocabulary.
+#[cfg(feature = "embeddings")]
+const EMBEDDING_INDEX_PROPERTY: &str = "embedding";
+
+/// `AletheiaDB`'s persisted per-property vector-index files, in the fixed order
+/// they are reported (issue #489).
+///
+/// Named upstream in `AletheiaDB::rebuild_vector_index`'s contract as exactly
+/// the files whose corruption causes an index to be SKIPPED at load. Matching
+/// against this fixed table (rather than listing the directory) is what lets a
+/// probe result be `&'static str` and therefore reach a diagnostic without any
+/// operator-controlled filename riding along.
+#[cfg(feature = "embeddings")]
+const VECTOR_INDEX_ARTIFACT_FILES: [&str; 4] = [
+    "meta.idx",
+    "mappings.idx",
+    "current.usearch",
+    "current.usearch.mappings",
+];
 
 /// A single result from a semantic similarity search.
 #[cfg(feature = "embeddings")]
@@ -68,6 +89,11 @@ pub struct EmbeddedAletheiaSink {
     /// `egregore_seq` system was introduced (i.e., they have no `egregore_seq` property).
     /// Used as a fallback staleness check when both the edge and tombstone lack sequence metadata.
     legacy_edge_counts: BTreeMap<String, usize>,
+    /// Root the store was opened from, retained so the vector-index state probe
+    /// (issue #489) can tell a skipped-at-load index from one that never
+    /// existed. Read-only: never written through, never re-persisted.
+    #[cfg_attr(not(feature = "embeddings"), allow(dead_code))]
+    data_dir: PathBuf,
     _lease: Option<StoreLease>,
     #[cfg(feature = "embeddings")]
     embedding_vectors: EmbeddingVectorMap,
@@ -274,6 +300,7 @@ impl EmbeddedAletheiaSink {
             edge_seqs: BTreeMap::new(),
             tombstone_node_seqs: BTreeMap::new(),
             legacy_edge_counts: BTreeMap::new(),
+            data_dir: data_dir.to_path_buf(),
             _lease: lease,
             #[cfg(feature = "embeddings")]
             embedding_vectors: BTreeMap::new(),
@@ -291,7 +318,8 @@ impl EmbeddedAletheiaSink {
     /// # Errors
     ///
     /// Returns an error if the store cannot be opened, the existing embedding
-    /// index is incompatible, or the vector index fails to initialise.
+    /// index is incompatible, the store's persisted vector index exists but was
+    /// skipped at load (issue #489), or the vector index fails to initialise.
     #[cfg(feature = "embeddings")]
     pub fn open_with_embeddings(
         data_dir: impl AsRef<std::path::Path>,
@@ -322,7 +350,7 @@ impl EmbeddedAletheiaSink {
             .db
             .list_vector_indexes()
             .into_iter()
-            .find(|index| index.property_name == "embedding")
+            .find(|index| index.property_name == EMBEDDING_INDEX_PROPERTY)
         {
             if existing.dimensions != dimensions {
                 return Err(AdapterError::Rejected {
@@ -343,13 +371,40 @@ impl EmbeddedAletheiaSink {
                 });
             }
         } else {
+            // The store holds persisted index files the engine skipped at load
+            // (issue #489). Enabling the index here would register an EMPTY one
+            // whose next persistence cycle OVERWRITES those files, permanently
+            // destroying vectors that upstream's `rebuild_vector_index` could
+            // otherwise have recovered — upstream documents this exact footgun.
+            // So refuse before enabling anything: nothing is registered, so
+            // nothing is persisted, and the damaged store stays repairable.
+            if let crate::embeddings::VectorIndexState::Unreadable { artifacts } =
+                probe_persisted_vector_index(data_dir, EMBEDDING_INDEX_PROPERTY)
+            {
+                return Err(AdapterError::Rejected {
+                    record_id: "embedded-store".to_owned(),
+                    message: format!(
+                        "semantic_index_unreadable: this store's persisted `{EMBEDDING_INDEX_PROPERTY}` vector index \
+                         exists on disk ({}) but was skipped at load as corrupted or unreadable; \
+                         refusing to embed into it because enabling a fresh index over those files \
+                         would overwrite them and permanently lose the indexed vectors. {}",
+                        if artifacts.is_empty() {
+                            "its index directory is present but holds none of the expected files"
+                                .to_owned()
+                        } else {
+                            format!("persisted index files: {}", artifacts.join(", "))
+                        },
+                        crate::embeddings::SEMANTIC_INDEX_UNREADABLE_REMEDY
+                    ),
+                });
+            }
             let hnsw = ::aletheiadb::index::vector::hnsw::HnswConfig {
                 dimensions,
                 metric,
                 ..Default::default()
             };
             sink.db
-                .enable_vector_index("embedding", hnsw)
+                .enable_vector_index(EMBEDDING_INDEX_PROPERTY, hnsw)
                 .map_err(|error| AdapterError::Rejected {
                     record_id: "embedded-store".to_owned(),
                     message: error.to_string(),
@@ -358,21 +413,40 @@ impl EmbeddedAletheiaSink {
         Ok(sink)
     }
 
-    /// Returns the dimensionality of the persisted `"embedding"` vector index,
-    /// or `None` when the store has no semantic index.
+    /// Returns what the store's `"embedding"` vector index actually IS: loaded,
+    /// present-on-disk-but-unreadable, or absent (issue #489).
     ///
-    /// Used by daemon-backed semantic search to distinguish a store that was
-    /// never ingested with embeddings (missing index) from a query whose vector
-    /// dimensionality disagrees with the index (incompatible dimension), without
-    /// leaking raw `AletheiaDB` internals to callers.
+    /// `AletheiaDB` 0.2.0 loads per-property vector indexes with error
+    /// isolation — a corrupted or unreadable index is SKIPPED with a warning
+    /// rather than aborting the load — and a skipped index is simply missing
+    /// from `list_vector_indexes()`. So the engine handle alone cannot tell
+    /// "never `--embed`ed" from "embedded, and the index is damaged"; the
+    /// on-disk probe below supplies the missing bit. The upstream skip warning
+    /// goes to the process's stderr as plain text, not through an installable
+    /// observability seam, so it is not capturable here.
+    ///
+    /// This REPLACED a bare `embedding_index_dimensions() -> Option<usize>`
+    /// accessor. The `Option` was the bug's shape: every caller had to invent a
+    /// meaning for `None`, and all of them chose "never embedded". Callers that
+    /// only need "can I search this?" use
+    /// [`crate::embeddings::VectorIndexState::dimensions`]; callers that report
+    /// to an operator must match the state.
     #[cfg(feature = "embeddings")]
     #[must_use]
-    pub fn embedding_index_dimensions(&self) -> Option<usize> {
-        self.db
+    pub fn embedding_index_state(&self) -> crate::embeddings::VectorIndexState {
+        use crate::embeddings::VectorIndexState;
+
+        if let Some(index) = self
+            .db
             .list_vector_indexes()
             .into_iter()
-            .find(|index| index.property_name == "embedding")
-            .map(|index| index.dimensions)
+            .find(|index| index.property_name == EMBEDDING_INDEX_PROPERTY)
+        {
+            return VectorIndexState::Loaded {
+                dimensions: index.dimensions,
+            };
+        }
+        probe_persisted_vector_index(&self.data_dir, EMBEDDING_INDEX_PROPERTY)
     }
 
     /// Searches for nodes whose stored embedding is most similar to `query_vector`.
@@ -4687,6 +4761,68 @@ fn write_lease_contention_message(data_dir: &Path) -> String {
     )
 }
 
+/// Candidate on-disk directories holding a persisted vector index for
+/// `property`, most-likely first (issue #489).
+///
+/// The `indexes/` segment comes from `durable_config_for_data_dir` — the SAME
+/// call `open_inner` configures the store with, so the probe and the engine
+/// cannot disagree about which root they are talking about. The inner
+/// `indexes/vector/<property>` layout is `IndexPersistenceManager`'s, which is
+/// not public API; both the nested and the flattened form are probed so an
+/// upstream layout change degrades this to the pre-#489 behavior (report
+/// `absent`) rather than to a wrong answer.
+#[cfg(feature = "embeddings")]
+fn persisted_vector_index_dirs(data_dir: &Path, property: &str) -> Vec<PathBuf> {
+    let persistence_root = ::aletheiadb::config::durable_config_for_data_dir(data_dir)
+        .persistence
+        .data_dir;
+    vec![
+        persistence_root
+            .join("indexes")
+            .join("vector")
+            .join(property),
+        persistence_root.join("vector").join(property),
+    ]
+}
+
+/// Classifies a store's vector index for `property` when the engine did NOT
+/// register it (issue #489).
+///
+/// A registered index is `Loaded` and never reaches here. What is left is the
+/// pair `AletheiaDB` 0.2.0's skip-on-load made indistinguishable through the
+/// engine handle: persisted index state present (the index was built and then
+/// corrupted, truncated, or made unreadable) versus nothing there at all (the
+/// store was never `--embed`ed).
+///
+/// The property DIRECTORY existing is the deciding signal, not any single file:
+/// upstream's loader requires `meta.idx`, so a property directory that survives
+/// with any subset of the artifacts — including none — is exactly a directory
+/// the loader skipped. Only a store with no such directory is honestly `Absent`.
+///
+/// Strictly read-only, and deterministic: artifacts are reported in the fixed
+/// [`VECTOR_INDEX_ARTIFACT_FILES`] order, never in directory-iteration order.
+#[cfg(feature = "embeddings")]
+fn probe_persisted_vector_index(
+    data_dir: &Path,
+    property: &str,
+) -> crate::embeddings::VectorIndexState {
+    use crate::embeddings::VectorIndexState;
+
+    for dir in persisted_vector_index_dirs(data_dir, property) {
+        if !dir.is_dir() {
+            continue;
+        }
+        return VectorIndexState::Unreadable {
+            artifacts: VECTOR_INDEX_ARTIFACT_FILES
+                .iter()
+                .copied()
+                .filter(|name| dir.join(name).exists())
+                .collect(),
+        };
+    }
+    VectorIndexState::Absent
+}
+
 fn is_fresh_data_dir(data_dir: &Path) -> bool {
     match fs::read_dir(data_dir) {
         Ok(mut entries) => entries.next().is_none(),
@@ -4961,6 +5097,77 @@ mod embedded_store_gate {
 mod tests {
     use super::*;
     use crate::ir::{GraphRecord, SourceSpan, TemporalMetadata, stable_id};
+
+    /// Issue #489: a data dir with no persisted vector-index directory is the
+    /// honest "never `--embed`ed" case. Absence must stay absence — inventing
+    /// an unreadable-index diagnostic for a store that simply has no index
+    /// would be the mirror-image dishonesty of the bug being fixed.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn probe_reports_absent_when_no_vector_index_directory_exists() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        assert_eq!(
+            probe_persisted_vector_index(temp.path(), EMBEDDING_INDEX_PROPERTY),
+            crate::embeddings::VectorIndexState::Absent
+        );
+        // A store directory that exists but was never embedded is also absent.
+        fs::create_dir_all(temp.path().join("indexes").join("indexes").join("vector"))
+            .expect("vector root");
+        assert_eq!(
+            probe_persisted_vector_index(temp.path(), EMBEDDING_INDEX_PROPERTY),
+            crate::embeddings::VectorIndexState::Absent
+        );
+    }
+
+    /// Issue #489: a per-property index directory that the engine did not
+    /// register is exactly the skip condition, and the surviving artifacts are
+    /// reported in the fixed declared order — never in directory-iteration
+    /// order, which would make the diagnostic non-deterministic.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn probe_reports_surviving_artifacts_in_fixed_order() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp
+            .path()
+            .join("indexes")
+            .join("indexes")
+            .join("vector")
+            .join(EMBEDDING_INDEX_PROPERTY);
+        fs::create_dir_all(&dir).expect("index dir");
+        // Written in reverse declared order, plus a file outside the table.
+        fs::write(dir.join("current.usearch"), b"x").expect("write");
+        fs::write(dir.join("meta.idx"), b"x").expect("write");
+        fs::write(dir.join("something-else.bin"), b"x").expect("write");
+        assert_eq!(
+            probe_persisted_vector_index(temp.path(), EMBEDDING_INDEX_PROPERTY),
+            crate::embeddings::VectorIndexState::Unreadable {
+                artifacts: vec!["meta.idx", "current.usearch"],
+            },
+            "artifacts follow the declared table order, and unknown filenames never leak"
+        );
+    }
+
+    /// Issue #489: upstream's loader requires `meta.idx`, so a property
+    /// directory that survives with none of the expected files is still a
+    /// directory the loader skipped — reported as unreadable with an empty
+    /// artifact list rather than degraded back to "absent".
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn probe_reports_an_empty_index_directory_as_unreadable() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(
+            temp.path()
+                .join("indexes")
+                .join("indexes")
+                .join("vector")
+                .join(EMBEDDING_INDEX_PROPERTY),
+        )
+        .expect("index dir");
+        assert_eq!(
+            probe_persisted_vector_index(temp.path(), EMBEDDING_INDEX_PROPERTY),
+            crate::embeddings::VectorIndexState::Unreadable { artifacts: vec![] }
+        );
+    }
 
     /// Issue #439: a store error carrying `AletheiaDB`'s real interner-overflow
     /// Display maps through `classify_store_error` to the fatal

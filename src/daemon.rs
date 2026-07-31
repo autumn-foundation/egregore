@@ -909,6 +909,13 @@ enum ErrorCode {
     /// Added by #59 (daemon semantic search): the store has no embedding vector
     /// index, so `semantic_search` cannot run. Re-ingest with `--embed`.
     MissingSemanticIndex,
+    /// Added by #489: the store's embedding vector index EXISTS on disk but
+    /// the engine skipped it at load as corrupted or unreadable. Distinct from
+    /// [`Self::MissingSemanticIndex`] — "never embedded" and "embedded, and the
+    /// index is damaged" are different operator problems, and reporting the
+    /// second as the first answers a data-loss condition with a configuration
+    /// one.
+    UnreadableSemanticIndex,
     /// Added by #59 (daemon semantic search): the query vector dimensionality
     /// disagrees with the store's embedding index dimensionality.
     IncompatibleEmbeddingDimension,
@@ -953,6 +960,7 @@ impl ErrorCode {
             Self::InsufficientPromotionEvidence => "insufficient_promotion_evidence",
             Self::UnapprovedDurableUserContext => "unapproved_durable_user_context",
             Self::MissingSemanticIndex => "missing_semantic_index",
+            Self::UnreadableSemanticIndex => "semantic_index_unreadable",
             Self::IncompatibleEmbeddingDimension => "incompatible_embedding_dimension",
             Self::UnknownRepositorySelector => "unknown_repository_selector",
             Self::AmbiguousRepositorySelector => "ambiguous_repository_selector",
@@ -989,6 +997,7 @@ impl ErrorCode {
             | Self::InsufficientPromotionEvidence
             | Self::UnapprovedDurableUserContext
             | Self::MissingSemanticIndex
+            | Self::UnreadableSemanticIndex
             | Self::IncompatibleEmbeddingDimension => 422,
         }
     }
@@ -1138,6 +1147,31 @@ impl ApiError {
         Self::new(
             ErrorCode::MissingSemanticIndex,
             "store has no semantic embedding index; re-ingest with --embed to enable semantic search",
+        )
+    }
+
+    /// The store's embedding vector index exists on disk but was skipped at
+    /// load as corrupted or unreadable (issue #489).
+    ///
+    /// Reported instead of [`Self::missing_semantic_index`] so the client is
+    /// never told "this store was never embedded" about a store that was. The
+    /// remedy names a fresh `--data-dir` and warns against re-embedding in
+    /// place, because enabling an index over the skipped files would overwrite
+    /// them.
+    #[cfg(feature = "embeddings")]
+    fn unreadable_semantic_index(artifacts: &[&'static str]) -> Self {
+        Self::new(
+            ErrorCode::UnreadableSemanticIndex,
+            format!(
+                "the store's semantic embedding index exists on disk ({}) but was skipped at load \
+                 as corrupted or unreadable — it is present-but-unreadable, NOT absent; {}",
+                if artifacts.is_empty() {
+                    "its index directory is present but holds none of the expected files".to_owned()
+                } else {
+                    artifacts.join(", ")
+                },
+                crate::embeddings::SEMANTIC_INDEX_UNREADABLE_REMEDY
+            ),
         )
     }
 
@@ -9962,17 +9996,30 @@ fn handle_verb_semantic_search(
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
 
-    match sink.embedding_index_dimensions() {
-        None => {
+    // Three-way, not two-way (issue #489): AletheiaDB 0.2.0 SKIPS a corrupted
+    // vector index at load instead of failing the open, so a damaged index and
+    // a never-embedded store both present as "no index" through the engine
+    // handle. Answering the first with `missing_semantic_index` would report a
+    // data-loss condition as a benign configuration one.
+    match sink.embedding_index_state() {
+        crate::embeddings::VectorIndexState::Absent => {
             return HttpResponse::error_with_id(request_id, ApiError::missing_semantic_index());
         }
-        Some(dim) if dim != query_vector.len() => {
+        crate::embeddings::VectorIndexState::Unreadable { artifacts } => {
             return HttpResponse::error_with_id(
                 request_id,
-                ApiError::incompatible_embedding_dimension(dim, query_vector.len()),
+                ApiError::unreadable_semantic_index(&artifacts),
             );
         }
-        Some(_) => {}
+        crate::embeddings::VectorIndexState::Loaded { dimensions }
+            if dimensions != query_vector.len() =>
+        {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::incompatible_embedding_dimension(dimensions, query_vector.len()),
+            );
+        }
+        crate::embeddings::VectorIndexState::Loaded { .. } => {}
     }
 
     // Over-fetch the whole index, not just `effective_limit` raw hits: the

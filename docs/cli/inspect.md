@@ -140,14 +140,23 @@ Field notes:
   predate producer stamping count under `legacy_pre_v1`.
 
 * `semantic_index` — **`--data-dir` only** (issue #104), the store's vector-index
-  identity: `index_present`, `index_dimensions`, `identity_recorded`, and
+  identity: `index_present`, `index_status`, `index_artifacts`,
+  `index_dimensions`, `identity_recorded`, and
   `indexed_models` (an array of `{provider, name, version, dim, content_hash}`
   identities, deduplicated and sorted). This is the documented `eg` workflow for
   reading which embedding model produced a store's queryable index, and therefore
   for understanding why `eg query semantic` refused. `identity_recorded: false`
   with `index_present: true` is a legacy store whose compatibility is
   unverifiable; `indexed_models` with more than one entry means the index was
-  written by several models. A `--graph` JSONL carries no vector index, so the
+  written by several models. `index_status` is the three-way index state (issue
+  #489): `loaded` (queryable, `index_dimensions` set), `unreadable` (the index
+  files EXIST on disk but the engine skipped them at load as corrupted —
+  `index_present` stays `true`, `index_dimensions` is `null` because a skipped
+  index reports none, and `index_artifacts` lists the found files from a fixed
+  filename table), or `absent` (never ingested with `--embed`). An unreadable
+  index is never reported as absent: "your embeddings were never built" about a
+  store whose embeddings exist and are damaged is a data-loss condition dressed
+  as a configuration one. A `--graph` JSONL carries no vector index, so the
   block is absent there, as it is on a binary built without the `embeddings`
   feature (the vector index is that feature's surface). Allow-list only — identity
   fields, dimensions, and flags; never vectors or model bytes, and every identity

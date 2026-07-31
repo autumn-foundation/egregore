@@ -109,6 +109,7 @@ mod scip_export;
 mod semantic_drift;
 mod semantic_drift_calibration;
 mod semantic_index_identity;
+mod semantic_index_unreadable;
 mod semantic_relevance;
 mod semantic_relevance_gate;
 mod store_contention;

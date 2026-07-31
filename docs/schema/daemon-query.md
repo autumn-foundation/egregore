@@ -126,6 +126,7 @@ Error responses follow the standard envelope in
 | `unknown_repository_selector` | 400 | `params.repo` matches no repository identity in the store (issue #67) |
 | `ambiguous_repository_selector` | 400 | `params.repo` matches more than one repository identity; ambiguity is never resolved implicitly. The error object carries a `candidates` array with every matching repository record ID so callers can retry with an exact selector (issue #67) |
 | `missing_semantic_index` | 422 | `semantic_search` against a store with no embedding index (re-ingest with `--embed`) |
+| `semantic_index_unreadable` | 422 | `semantic_search` against a store whose embedding index EXISTS on disk but was skipped at load as corrupted or unreadable (issue #489). Distinct from `missing_semantic_index`: the store WAS embedded, so reporting it as never-embedded would answer a data-loss condition with a configuration one. The message names the index files found and points at a fresh `--data-dir` — re-embedding in place would overwrite them |
 | `incompatible_embedding_dimension` | 422 | `semantic_search` query vector width disagrees with the store's index |
 | `not_implemented`       | 501  | Reserved verb; `as_of.transaction_time` set on a verb other than `symbol_by_name`; `as_of.since` set; or `semantic_search` on a daemon built without the `embeddings` feature |
 | `query_timeout`         | 408  | Budget `timeout_ms` elapsed |
@@ -451,6 +452,7 @@ the same persisted index, so scores agree within a tight tolerance (≤ 1e-4).
 | `params.query_vector` absent | `missing_field` | 400 |
 | `query_vector` not an array / empty / non-finite; `limit` not an integer | `bad_request` | 400 |
 | Store has no embedding index | `missing_semantic_index` | 422 |
+| Embedding index present on disk but skipped at load | `semantic_index_unreadable` | 422 |
 | `query_vector` width ≠ index dimensionality | `incompatible_embedding_dimension` | 422 |
 | Budget `timeout_ms` elapsed | `query_timeout` | 408 |
 | Missing/invalid bearer token | `unauthorized` | 401 |

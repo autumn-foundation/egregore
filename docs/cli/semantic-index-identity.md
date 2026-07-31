@@ -99,6 +99,8 @@ The JSON report carries a `semantic_index` block:
 {
   "semantic_index": {
     "index_present": true,
+    "index_status": "loaded",
+    "index_artifacts": null,
     "index_dimensions": 384,
     "identity_recorded": true,
     "indexed_models": [
@@ -119,6 +121,23 @@ vectors` followed by one `embedding model: …` line per recorded identity. The
 block is deterministic: identities are deduplicated and sorted, so repeated
 `eg inspect` runs over an unchanged store are byte-identical.
 
+`index_status` is the three-way state (issue #489):
+
+| `index_status` | `index_present` | `index_dimensions` | Meaning |
+|----------------|-----------------|--------------------|---------|
+| `loaded` | `true` | the index's dimension | Queryable. |
+| `unreadable` | `true` | `null` | Index files exist on disk; the engine skipped them at load. `index_artifacts` lists the files found. `null` dimensions is **not** evidence of absence — a skipped index never reports one. |
+| `absent` | `false` | `null` | The store was never ingested with `--embed`. |
+
+`--format text` says the same in words, and never calls an unreadable index
+absent:
+
+```text
+semantic index: PRESENT BUT UNREADABLE — persisted index files exist on disk but the engine skipped them at load as corrupted or unreadable; this store WAS embedded, so this is not the never-embedded case
+  index files: meta.idx, mappings.idx
+  remedy: re-ingest the graph into a FRESH --data-dir …
+```
+
 `identity_recorded: false` with `index_present: true` means a **legacy** store —
 embedded before identity stamping. Its compatibility is unverifiable, and
 semantic queries against it are refused (see below).
@@ -136,6 +155,7 @@ embedded, so a refusal costs no model load.
 | `8` | `embedding_identity_ambiguous` | The index records **more than one** distinct producing model, so its vectors span several spaces and no single ranking is meaningful. |
 | `9` | `embedding_dimension_mismatch` | The index holds vectors of a different dimensionality than the query embedder produces. |
 | `10` | `embedding_model_mismatch` | **Same dimension, different model** — the silent-failure case this gate exists for. |
+| `11` | `semantic_index_unreadable` | The vector index **exists on disk** but the engine skipped it at load as corrupted or unreadable (issue #489). Present-but-unreadable, never "absent". |
 
 Unchanged outcomes:
 
@@ -171,6 +191,74 @@ Envelope shape for the same-dimension mismatch:
 `differing_fields` names exactly which identity fields disagree, in a fixed
 declared order (`provider`, `name`, `version`, `content_hash`), so the diagnostic
 is byte-identical across runs and the operator never has to guess *why*.
+
+## A corrupt index is not an absent one (issue #489)
+
+`AletheiaDB` 0.2.0 loads per-property vector indexes in parallel **with error
+isolation**: a corrupted or unreadable index is *skipped with a warning* instead
+of aborting the load of every remaining index. For a server that is the right
+call — one bad index should not take down the rest. For Egregore it converts a
+**loud** failure into a **quiet** one, because a skipped index is simply missing
+from the engine's index list. Before this was handled, the two states below were
+indistinguishable:
+
+| On disk | Engine reports | Pre-#489 answer |
+|---------|----------------|-----------------|
+| No index — never `--embed`ed | no `embedding` index | `semantic_index_absent`, exit `2` ✅ |
+| Index present but corrupt | no `embedding` index (skipped) | `semantic_index_absent`, exit `2` ❌ |
+
+"Your embeddings were never built" about a store whose embeddings **exist and
+are damaged** is a data-loss condition reported as a benign configuration one —
+the same class of failure `embedding_identity_unrecorded` exists to prevent. An
+operator told the index is absent re-runs `eg ingest --embed` and never learns
+that something corrupted the store.
+
+So Egregore probes the store's own persisted index directory when the engine
+reports no index. If `AletheiaDB`'s per-property index state
+(`meta.idx`, `mappings.idx`, `current.usearch`, `current.usearch.mappings`) is
+present on disk while the property is unregistered, that is *provably*
+"present but skipped", and the query is refused with `semantic_index_unreadable`
+at exit `11`:
+
+```json
+{"ok":false,"error":{
+  "code":"semantic_index_unreadable",
+  "message":"this store's semantic vector index EXISTS on disk (persisted index files: meta.idx, mappings.idx) but the engine did not load it — it was skipped as corrupted or unreadable, so the index is present-but-unreadable, NOT absent; it was built by …",
+  "remedy":"re-ingest the graph into a FRESH --data-dir …",
+  "index_artifacts":["meta.idx","mappings.idx"],
+  "indexed_models":[{"provider":"…","name":"…","version":"…","dim":384,"content_hash":"…"}],
+  "query_model":{"provider":"…","name":"…","version":"…","dim":384,"content_hash":"…"}
+}}
+```
+
+`index_artifacts` is matched against a **fixed table** of `AletheiaDB` index
+filenames, so no operator-controlled filename can ride into a diagnostic through
+it, and the order is the declared one — the refusal is byte-identical across
+runs. The recorded identity is disclosed too: knowing *which model* built the
+index you just lost is what tells you whether re-ingesting reproduces it.
+
+The `--embed` **write path refuses the same store**, before enabling anything.
+This is not politeness — upstream documents the footgun explicitly: enabling a
+vector index over skipped index files creates an **empty** index whose next
+persistence cycle **overwrites the on-disk files, permanently losing the indexed
+vectors**. Only `rebuild_vector_index` is a safe recovery, and Egregore never
+calls `enable_vector_index` on a skipped index. Refusing leaves the damaged
+store byte-identical and therefore still repairable.
+
+**Limits of the detection**, stated plainly:
+
+- The signal is **on-disk evidence**, not a recorded claim. A store whose index
+  directory was deleted outright reports `absent` — correctly, in the sense that
+  there is nothing left to read, but it cannot distinguish that from never
+  having embedded.
+- Upstream's skip warning goes to the process's stderr as plain text, not
+  through an installable observability seam, so Egregore cannot quote the
+  engine's own reason for the skip.
+- No automatic repair. `eg` does not call `rebuild_vector_index` for you; the
+  remedy is a fresh `--data-dir`.
+
+The three-way state is also readable without running a query — see
+`index_status` in the `semantic_index` block below.
 
 **Output is allow-list only**: provider, name, version, dimension, content hash,
 dimensions, field labels, the stable code, and the remedy. Never model bytes,
