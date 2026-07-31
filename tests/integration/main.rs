@@ -61,6 +61,7 @@ mod memory_audit;
 mod memory_health;
 mod memory_recall;
 mod memory_recall_corpus;
+mod namespace_evaluation;
 mod phantom_call_edges;
 mod preference_approval;
 mod producer_drift;

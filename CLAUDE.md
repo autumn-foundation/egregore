@@ -1606,6 +1606,22 @@ it. Two operator-visible effects:
 0.2.0's new opt-in subsystems (namespaces, schema constraints, property indexes, changefeed,
 encryption, replication, multi-tenancy) are INERT — none is enabled in this slice.
 
+NAMESPACES were evaluated for per-repository scoping in shared multi-repo stores and are
+**NOT ADOPTED** (issue #485; `docs/adr/0006-aletheiadb-namespaces-evaluation.md`). Three
+reasons, each locked by an executable test in `tests/integration/namespace_evaluation.rs`:
+a namespace is DECLARED at write time and IMMUTABLE, while `--repo` attribution is DERIVED
+at read time from graph closure and can be established by a LATER edge write; a namespace
+holds exactly one value per entity, while `eg forget-repo` already models records owned by
+TWO repositories (`shared_cross_repo`) and by NONE (`unattributable`); and only `--data-dir`
+has namespaces, so an engine-enforced boundary could never be the source of truth for an
+answer that must stay byte-identical with `--graph`. Repo-agnostic records (the #104
+`EmbeddingModel` vector-index identity) have no natural namespace, and a namespace-scoped
+bulk read would make the deliberately repo-agnostic `eg query evidence-path` report a real
+cross-repo witness chain as `endpoint_not_found`. `delete_namespace` removes the
+REGISTRATION, not the entities, so namespaces are **not a route to physical eviction** and
+do not close #472. The ADR lists the revisit triggers; do not reach for
+`create_*_in_namespace` or `NamespaceScope` without reopening it.
+
 ## Working Rules
 
 - Use SPEC-PROOF-RED-GREEN-REFACTOR for implementation work.
