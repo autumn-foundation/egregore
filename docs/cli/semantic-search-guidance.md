@@ -15,7 +15,7 @@ Both embed the query text locally with the same model and run the same vector se
 
 Daemon-backed results are still **retrieval leads, not proof**: each row carries a `record_id`, `score`, `repo_relative_path`, and `span` (omitted when the node has none), and nothing else. They are not verification evidence, task completion, source truth beyond deterministic code facts, or agent memory.
 
-Stable diagnostics make failures actionable rather than silent: a missing daemon or stale runtime metadata is reported by daemon discovery before the query runs; an un-embedded store returns `missing_semantic_index`; a mismatched vector returns `incompatible_embedding_dimension`; an empty result is a clean no-match, never a fallback to a direct embedded read. The full verb contract is in [`docs/schema/daemon-query.md`](../schema/daemon-query.md).
+Stable diagnostics make failures actionable rather than silent: a missing daemon or stale runtime metadata is reported by daemon discovery before the query runs; an un-embedded store returns `missing_semantic_index`; a store whose index exists on disk but was skipped at load as corrupted returns the distinct `semantic_index_unreadable` (issue #489 — a damaged index is never reported as a never-built one); a mismatched vector returns `incompatible_embedding_dimension`; an empty result is a clean no-match, never a fallback to a direct embedded read. The full verb contract is in [`docs/schema/daemon-query.md`](../schema/daemon-query.md).
 
 > **`--daemon` does not apply the vector-space compatibility gate (issue #104).**
 > The daemon path checks vector *dimension* only, and two different models can

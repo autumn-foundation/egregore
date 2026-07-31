@@ -48,6 +48,13 @@ pub(crate) fn embed_query_text(query: &str) -> Result<Vec<f32>> {
 /// vector search against a store with no index surfaces an opaque engine error
 /// instead of the documented no-embeddings outcome.
 ///
+/// A store whose index EXISTS on disk but was skipped at load is refused here
+/// (`semantic_index_unreadable`, exit `11`) rather than returned as
+/// `IndexAbsent` — issue #489: since `AletheiaDB` 0.2.0 skips a corrupted vector
+/// index instead of failing the load, "absent" and "damaged" reach this gate
+/// looking identical through the engine handle, and reporting the second as the
+/// first would answer a data-loss condition with "you never ran `--embed`".
+///
 /// The comparison is the whole point of the gate: the semantic index stores only
 /// vectors plus a dimension, and two different models can share a dimension, so
 /// a dimension check alone lets a model swap, cache change, or version bump
@@ -64,7 +71,7 @@ pub(crate) fn enforce_index_compatibility(
     };
 
     let verdict = classify_index_compatibility(
-        sink.embedding_index_dimensions(),
+        &sink.embedding_index_state(),
         &indexed_identities(records),
         &default_embedding_model_identity(DEFAULT_EMBEDDING_MODEL_DIMENSIONS),
     );
@@ -108,7 +115,7 @@ pub(crate) fn embed_query_checked(
 
     let vector = embed_query_text(query)?;
     let verdict = classify_index_compatibility(
-        sink.embedding_index_dimensions(),
+        &sink.embedding_index_state(),
         &indexed_identities(records),
         &default_embedding_model_identity(vector.len()),
     );

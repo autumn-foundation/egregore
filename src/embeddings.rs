@@ -484,6 +484,13 @@ pub const EMBEDDING_DIMENSION_MISMATCH_EXIT_CODE: i32 = 9;
 /// Exit code for `embedding_model_mismatch` — same dimension, different model.
 pub const EMBEDDING_MODEL_MISMATCH_EXIT_CODE: i32 = 10;
 
+/// Exit code for `semantic_index_unreadable` — the store holds persisted
+/// vector-index files the engine did not load (issue #489).
+///
+/// A NEW case, not a renumbering: `7`/`8`/`9`/`10` and the exit-`2`
+/// `semantic_index_absent` outcome all keep their meanings.
+pub const SEMANTIC_INDEX_UNREADABLE_EXIT_CODE: i32 = 11;
+
 /// Operator remedy carried by every identity refusal.
 ///
 /// Points at re-ingest, never at editing the store: the store is the record of
@@ -492,6 +499,19 @@ pub const EMBEDDING_MODEL_MISMATCH_EXIT_CODE: i32 = 10;
 pub const EMBEDDING_IDENTITY_REMEDY: &str = "re-ingest the graph into a fresh --data-dir with `eg ingest <graph> --adapter embedded \
      --data-dir <NEW_DIR> --embed` so the index and the query embedder share one vector space; \
      do not edit the store by hand";
+
+/// Operator remedy carried by the unreadable-index refusal (issue #489).
+///
+/// Distinct from [`EMBEDDING_IDENTITY_REMEDY`] because this state carries an
+/// extra hazard the identity refusals do not: re-embedding into THIS store would
+/// enable a fresh, EMPTY vector index over the skipped files, and the next
+/// persistence cycle would overwrite them — permanently destroying the vectors
+/// a repair could otherwise have rebuilt. `eg ingest --embed` therefore refuses
+/// this store rather than performing that overwrite.
+pub const SEMANTIC_INDEX_UNREADABLE_REMEDY: &str = "re-ingest the graph into a FRESH --data-dir with `eg ingest <graph> --adapter embedded \
+     --data-dir <NEW_DIR> --embed`; do not re-embed into this store and do not edit it by hand — \
+     enabling a vector index over skipped index files creates an EMPTY index whose next \
+     persistence cycle overwrites them, permanently losing the indexed vectors";
 
 /// The identity fields compared by the compatibility gate, in the fixed order
 /// they are reported. `dim` is handled separately because a dimension mismatch
@@ -653,6 +673,75 @@ pub fn differing_identity_fields(
         .collect()
 }
 
+/// What a store's `"embedding"` vector index actually IS, as observed at open
+/// time (issue #489).
+///
+/// `AletheiaDB` 0.2.0 loads per-property vector indexes in parallel WITH ERROR
+/// ISOLATION: a corrupted or unreadable index is skipped with a warning instead
+/// of aborting the load of the remaining indexes. A skipped index is simply
+/// absent from `list_vector_indexes()`, so a dimension probe alone cannot tell
+/// "this store was never `--embed`ed" from "this store's index exists on disk
+/// and failed to load" — and reporting the second as the first is a data-loss
+/// condition dressed up as a benign configuration one. This three-way state is
+/// what keeps the two apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorIndexState {
+    /// The index loaded and is queryable, holding `dimensions`-wide vectors.
+    Loaded {
+        /// Physical dimensionality of the loaded index.
+        dimensions: usize,
+    },
+    /// Persisted vector-index state for the property EXISTS on disk but the
+    /// engine did not register the property — it was skipped at load as
+    /// corrupted or unreadable. Present-but-unreadable, never "absent".
+    Unreadable {
+        /// The known index artifacts found on disk, in a fixed declared order.
+        ///
+        /// `&'static str` by construction: these are matched against a fixed
+        /// table of `AletheiaDB` index filenames, so no operator-controlled
+        /// filename can ever reach a diagnostic through this field. May be
+        /// empty when the property directory exists but holds none of them —
+        /// which is itself the skip condition, since the loader requires
+        /// `meta.idx`.
+        artifacts: Vec<&'static str>,
+    },
+    /// The store has no vector index for the property and no persisted state
+    /// for one — it was never ingested with `--embed`.
+    Absent,
+}
+
+impl VectorIndexState {
+    /// Physical dimensionality of the index, or `None` when it did not load.
+    ///
+    /// `None` deliberately conflates [`Self::Unreadable`] and [`Self::Absent`]:
+    /// callers that only need "can I search this?" get one answer, while the
+    /// callers that must report WHY match on the state itself.
+    #[must_use]
+    pub const fn dimensions(&self) -> Option<usize> {
+        match self {
+            Self::Loaded { dimensions } => Some(*dimensions),
+            Self::Unreadable { .. } | Self::Absent => None,
+        }
+    }
+
+    /// Stable machine-readable status label for the three-way state.
+    #[must_use]
+    pub const fn status(&self) -> &'static str {
+        match self {
+            Self::Loaded { .. } => "loaded",
+            Self::Unreadable { .. } => "unreadable",
+            Self::Absent => "absent",
+        }
+    }
+
+    /// Whether the store holds a semantic index at all — loaded or merely
+    /// present on disk.
+    #[must_use]
+    pub const fn is_present(&self) -> bool {
+        matches!(self, Self::Loaded { .. } | Self::Unreadable { .. })
+    }
+}
+
 /// Verdict of the query-time vector-space compatibility gate (issue #104).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexCompatibility {
@@ -664,6 +753,22 @@ pub enum IndexCompatibility {
     /// identity is unverifiable when they simply never embedded would be a false
     /// refusal, so this keeps the pre-existing "no semantic index" outcome.
     IndexAbsent,
+    /// The vector index EXISTS on disk but the engine skipped it at load as
+    /// corrupted or unreadable (issue #489).
+    ///
+    /// Refused rather than reported as [`Self::IndexAbsent`]: "your embeddings
+    /// were never built" when in fact they exist and are damaged is a data-loss
+    /// condition reported as a benign configuration one — the same class of
+    /// dishonesty [`Self::IdentityUnrecorded`] exists to prevent.
+    IndexUnreadable {
+        /// Known index artifacts found on disk, in a fixed declared order.
+        artifacts: Vec<&'static str>,
+        /// Every recorded index identity (possibly empty), deterministically
+        /// ordered — which model built the index that no longer loads.
+        indexed: Vec<EmbeddingModel>,
+        /// The query embedder's identity.
+        query: EmbeddingModel,
+    },
     /// The vector index exists but records no model identity (a legacy store
     /// embedded before identity stamping). Compatibility is UNVERIFIABLE — never
     /// silently assumed compatible.
@@ -717,6 +822,7 @@ impl IndexCompatibility {
     pub const fn code(&self) -> Option<&'static str> {
         match self {
             Self::Compatible | Self::IndexAbsent => None,
+            Self::IndexUnreadable { .. } => Some("semantic_index_unreadable"),
             Self::IdentityUnrecorded { .. } => Some("embedding_identity_unrecorded"),
             Self::IdentityAmbiguous { .. } => Some("embedding_identity_ambiguous"),
             Self::DimensionMismatch { .. } => Some("embedding_dimension_mismatch"),
@@ -730,6 +836,7 @@ impl IndexCompatibility {
     pub const fn exit_code(&self) -> Option<i32> {
         match self {
             Self::Compatible | Self::IndexAbsent => None,
+            Self::IndexUnreadable { .. } => Some(SEMANTIC_INDEX_UNREADABLE_EXIT_CODE),
             Self::IdentityUnrecorded { .. } => Some(EMBEDDING_IDENTITY_UNRECORDED_EXIT_CODE),
             Self::IdentityAmbiguous { .. } => Some(EMBEDDING_IDENTITY_AMBIGUOUS_EXIT_CODE),
             Self::DimensionMismatch { .. } => Some(EMBEDDING_DIMENSION_MISMATCH_EXIT_CODE),
@@ -741,6 +848,28 @@ impl IndexCompatibility {
     #[must_use]
     pub const fn is_refusal(&self) -> bool {
         self.code().is_some()
+    }
+
+    /// Operator remedy carried by this verdict's refusal envelope.
+    ///
+    /// Every identity refusal points at a fresh-`--data-dir` re-ingest; the
+    /// unreadable-index verdict points at the same re-ingest PLUS the explicit
+    /// warning that re-embedding into the damaged store would overwrite the
+    /// skipped index files (issue #489).
+    ///
+    /// Spelled out rather than wildcarded so a future verdict must choose its
+    /// remedy explicitly.
+    #[must_use]
+    pub const fn remedy(&self) -> &'static str {
+        match self {
+            Self::IndexUnreadable { .. } => SEMANTIC_INDEX_UNREADABLE_REMEDY,
+            Self::Compatible
+            | Self::IndexAbsent
+            | Self::IdentityUnrecorded { .. }
+            | Self::IdentityAmbiguous { .. }
+            | Self::DimensionMismatch { .. }
+            | Self::ModelMismatch { .. } => EMBEDDING_IDENTITY_REMEDY,
+        }
     }
 
     /// Renders the refusal as a stable machine-readable envelope, or `None` for
@@ -757,12 +886,23 @@ impl IndexCompatibility {
         let mut map = serde_json::Map::new();
         map.insert("code".to_owned(), code.into());
         map.insert("message".to_owned(), self.message().into());
-        map.insert("remedy".to_owned(), EMBEDDING_IDENTITY_REMEDY.into());
+        map.insert("remedy".to_owned(), self.remedy().into());
         match self {
             // `code()` already returned `None` for these, so this arm is dead;
             // it is spelled out rather than wildcarded so a future verdict must
             // be classified here explicitly.
             Self::Compatible | Self::IndexAbsent => return None,
+            Self::IndexUnreadable {
+                artifacts,
+                indexed,
+                query,
+            } => {
+                // `&'static str` values drawn from a fixed filename table, so
+                // no operator-controlled text reaches the envelope here.
+                map.insert("index_artifacts".to_owned(), serde_json::json!(artifacts));
+                map.insert("indexed_models".to_owned(), identities_json(indexed));
+                map.insert("query_model".to_owned(), identity_json(query));
+            }
             Self::IdentityUnrecorded {
                 index_dimensions,
                 query,
@@ -812,6 +952,23 @@ impl IndexCompatibility {
         match self {
             Self::Compatible => "query embedder matches the indexed embedding model".to_owned(),
             Self::IndexAbsent => "store has no semantic vector index".to_owned(),
+            Self::IndexUnreadable {
+                artifacts, indexed, ..
+            } => format!(
+                "this store's semantic vector index EXISTS on disk ({}) but the engine did not \
+                 load it — it was skipped as corrupted or unreadable, so the index is \
+                 present-but-unreadable, NOT absent{}",
+                if artifacts.is_empty() {
+                    "its index directory is present but holds none of the expected files".to_owned()
+                } else {
+                    format!("persisted index files: {}", artifacts.join(", "))
+                },
+                if indexed.is_empty() {
+                    String::new()
+                } else {
+                    format!("; it was built by {}", describe_identities(indexed))
+                }
+            ),
             Self::IdentityUnrecorded {
                 index_dimensions,
                 query,
@@ -970,30 +1127,41 @@ fn describe_identities(models: &[EmbeddingModel]) -> String {
 /// Decides whether a semantic query may proceed against a store's vector index
 /// (issue #104).
 ///
-/// `index_dimensions` is the PHYSICAL dimensionality of the persisted vector
-/// index (`None` when the store has no index at all); `indexed` is the set of
-/// distinct live recorded identities from [`indexed_identities`]; `query` is the
-/// identity of the embedder the query will be embedded with.
+/// `state` is what the store's vector index actually is (issue #489); `indexed`
+/// is the set of distinct live recorded identities from [`indexed_identities`];
+/// `query` is the identity of the embedder the query will be embedded with.
 ///
 /// Precedence is deliberate:
-/// 1. no index at all → [`IndexCompatibility::IndexAbsent`] (not an identity
+/// 1. index files present but not loaded →
+///    [`IndexCompatibility::IndexUnreadable`], checked FIRST because a skipped
+///    index has no dimension to compare and must never fall through to the
+///    "never embedded" outcome;
+/// 2. no index at all → [`IndexCompatibility::IndexAbsent`] (not an identity
 ///    failure — the store was simply never `--embed`ed);
-/// 2. the physical index dimension disagrees with the query embedder → a
+/// 3. the physical index dimension disagrees with the query embedder → a
 ///    dimension mismatch, checked against the vectors themselves because that is
 ///    the ground truth a recorded identity could contradict;
-/// 3. no recorded identity → unverifiable;
-/// 4. several recorded identities → ambiguous;
-/// 5. a recorded `dim` disagreeing with the physical index → still a dimension
+/// 4. no recorded identity → unverifiable;
+/// 5. several recorded identities → ambiguous;
+/// 6. a recorded `dim` disagreeing with the physical index → still a dimension
 ///    problem, never silently compatible;
-/// 6. any other identity field differing → the same-dimension model mismatch.
+/// 7. any other identity field differing → the same-dimension model mismatch.
 #[must_use]
 pub fn classify_index_compatibility(
-    index_dimensions: Option<usize>,
+    state: &VectorIndexState,
     indexed: &[EmbeddingModel],
     query: &EmbeddingModel,
 ) -> IndexCompatibility {
-    let Some(index_dimensions) = index_dimensions else {
-        return IndexCompatibility::IndexAbsent;
+    let index_dimensions = match state {
+        VectorIndexState::Loaded { dimensions } => *dimensions,
+        VectorIndexState::Unreadable { artifacts } => {
+            return IndexCompatibility::IndexUnreadable {
+                artifacts: artifacts.clone(),
+                indexed: indexed.to_vec(),
+                query: query.clone(),
+            };
+        }
+        VectorIndexState::Absent => return IndexCompatibility::IndexAbsent,
     };
     let query_dimensions = query.dim as usize;
     if index_dimensions != query_dimensions {
@@ -1054,12 +1222,24 @@ mod index_identity_tests {
         }
     }
 
+    /// A queryable vector index holding `dim`-wide vectors.
+    const fn loaded(dim: usize) -> VectorIndexState {
+        VectorIndexState::Loaded { dimensions: dim }
+    }
+
+    /// An index whose files are on disk but which the engine skipped at load.
+    fn unreadable() -> VectorIndexState {
+        VectorIndexState::Unreadable {
+            artifacts: vec!["meta.idx", "mappings.idx"],
+        }
+    }
+
     /// AC5: matching identities proceed untouched.
     #[test]
     fn matching_identity_is_compatible() {
         let q = model("m", 384);
         assert_eq!(
-            classify_index_compatibility(Some(384), std::slice::from_ref(&q), &q),
+            classify_index_compatibility(&loaded(384), std::slice::from_ref(&q), &q),
             IndexCompatibility::Compatible
         );
     }
@@ -1070,7 +1250,7 @@ mod index_identity_tests {
         let indexed = model("model-a", 384);
         let query = model("model-b", 384);
         let verdict =
-            classify_index_compatibility(Some(384), std::slice::from_ref(&indexed), &query);
+            classify_index_compatibility(&loaded(384), std::slice::from_ref(&indexed), &query);
         match verdict {
             IndexCompatibility::ModelMismatch {
                 indexed: got,
@@ -1120,7 +1300,7 @@ mod index_identity_tests {
         ];
         for (field, query) in cases {
             let verdict =
-                classify_index_compatibility(Some(384), std::slice::from_ref(&base), &query);
+                classify_index_compatibility(&loaded(384), std::slice::from_ref(&base), &query);
             match verdict {
                 IndexCompatibility::ModelMismatch {
                     differing_fields, ..
@@ -1152,7 +1332,7 @@ mod index_identity_tests {
     fn physical_index_dimension_mismatch_is_its_own_verdict() {
         let indexed = model("m", 4);
         let query = model("m", 384);
-        match classify_index_compatibility(Some(4), &[indexed], &query) {
+        match classify_index_compatibility(&loaded(4), &[indexed], &query) {
             IndexCompatibility::DimensionMismatch {
                 index_dimensions,
                 query_dimensions,
@@ -1172,7 +1352,7 @@ mod index_identity_tests {
         let indexed = model("m", 512);
         let query = model("m", 384);
         assert!(matches!(
-            classify_index_compatibility(Some(384), &[indexed], &query),
+            classify_index_compatibility(&loaded(384), &[indexed], &query),
             IndexCompatibility::DimensionMismatch { .. }
         ));
     }
@@ -1182,7 +1362,7 @@ mod index_identity_tests {
     #[test]
     fn index_without_recorded_identity_is_unverifiable() {
         let query = model("m", 384);
-        match classify_index_compatibility(Some(384), &[], &query) {
+        match classify_index_compatibility(&loaded(384), &[], &query) {
             IndexCompatibility::IdentityUnrecorded {
                 index_dimensions, ..
             } => {
@@ -1198,7 +1378,7 @@ mod index_identity_tests {
     fn multiple_recorded_identities_are_ambiguous() {
         let query = model("model-a", 384);
         let other = model("model-b", 384);
-        match classify_index_compatibility(Some(384), &[query.clone(), other], &query) {
+        match classify_index_compatibility(&loaded(384), &[query.clone(), other], &query) {
             IndexCompatibility::IdentityAmbiguous { indexed, .. } => {
                 assert_eq!(indexed.len(), 2);
             }
@@ -1214,13 +1394,143 @@ mod index_identity_tests {
     fn store_without_a_vector_index_is_index_absent() {
         let query = model("m", 384);
         assert_eq!(
-            classify_index_compatibility(None, &[], &query),
+            classify_index_compatibility(&VectorIndexState::Absent, &[], &query),
             IndexCompatibility::IndexAbsent
         );
         assert_eq!(
-            classify_index_compatibility(None, std::slice::from_ref(&query), &query),
+            classify_index_compatibility(
+                &VectorIndexState::Absent,
+                std::slice::from_ref(&query),
+                &query
+            ),
             IndexCompatibility::IndexAbsent
         );
+    }
+
+    // ── Issue #489: a skipped index is not an absent one ────────────────────
+
+    /// An index whose files exist on disk but which the engine skipped at load
+    /// is REFUSED, never reported as `IndexAbsent`. `AletheiaDB` 0.2.0 skips a
+    /// corrupted index instead of aborting the load, so the two states reach
+    /// this classifier looking alike through the engine handle — and reporting
+    /// a data-loss condition as "you never ran `--embed`" is exactly the class
+    /// of dishonesty the identity gate exists to prevent.
+    #[test]
+    fn unreadable_index_is_refused_not_reported_absent() {
+        let query = model("m", 384);
+        let verdict = classify_index_compatibility(&unreadable(), &[], &query);
+        assert_eq!(verdict.code(), Some("semantic_index_unreadable"));
+        assert_eq!(
+            verdict.exit_code(),
+            Some(SEMANTIC_INDEX_UNREADABLE_EXIT_CODE)
+        );
+        assert!(verdict.is_refusal());
+        assert_ne!(verdict, IndexCompatibility::IndexAbsent);
+    }
+
+    /// The unreadable check precedes every identity check: a skipped index has
+    /// no dimension to compare, so it must never fall through to a dimension,
+    /// unrecorded-identity, or model verdict — nor to `IndexAbsent`.
+    #[test]
+    fn unreadable_index_takes_precedence_over_every_identity_verdict() {
+        let query = model("m", 384);
+        for indexed in [
+            vec![],
+            vec![model("m", 384)],
+            vec![model("other", 384)],
+            vec![model("m", 4)],
+            vec![model("m", 384), model("n", 384)],
+        ] {
+            assert_eq!(
+                classify_index_compatibility(&unreadable(), &indexed, &query).code(),
+                Some("semantic_index_unreadable"),
+                "an unreadable index outranks every identity verdict"
+            );
+        }
+    }
+
+    /// The refusal discloses the on-disk evidence and the model that built the
+    /// now-unreadable index, and points at a FRESH data dir with the overwrite
+    /// warning — never at re-embedding in place, which would destroy the files.
+    #[test]
+    fn unreadable_refusal_discloses_evidence_and_the_overwrite_hazard() {
+        let query = model("m", 384);
+        let indexed = model("builder", 384);
+        let verdict = classify_index_compatibility(&unreadable(), &[indexed], &query);
+        let envelope = verdict
+            .to_error_envelope()
+            .expect("an unreadable index refuses");
+        let error = &envelope["error"];
+        assert_eq!(error["code"], "semantic_index_unreadable");
+        assert_eq!(
+            error["index_artifacts"],
+            serde_json::json!(["meta.idx", "mappings.idx"])
+        );
+        assert_eq!(error["indexed_models"][0]["name"], "builder");
+        assert_eq!(error["query_model"]["name"], "m");
+        assert_eq!(error["remedy"], SEMANTIC_INDEX_UNREADABLE_REMEDY);
+        assert_eq!(verdict.remedy(), SEMANTIC_INDEX_UNREADABLE_REMEDY);
+        // Allow-list only: nothing beyond the declared keys reaches the wire.
+        let keys: Vec<&str> = error
+            .as_object()
+            .expect("error object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "code",
+                "index_artifacts",
+                "indexed_models",
+                "message",
+                "query_model",
+                "remedy",
+            ]
+        );
+        let message = verdict.message();
+        assert!(
+            message.contains("NOT absent"),
+            "the message must refuse the absent framing: {message}"
+        );
+    }
+
+    /// An index directory that survives with none of the expected files is
+    /// still the skip condition (upstream's loader requires `meta.idx`), so it
+    /// is reported honestly rather than degraded back to "absent".
+    #[test]
+    fn unreadable_with_no_surviving_artifacts_is_still_unreadable() {
+        let query = model("m", 384);
+        let state = VectorIndexState::Unreadable { artifacts: vec![] };
+        let verdict = classify_index_compatibility(&state, &[], &query);
+        assert_eq!(verdict.code(), Some("semantic_index_unreadable"));
+        assert!(
+            verdict
+                .message()
+                .contains("holds none of the expected files"),
+            "the message must say what was and was not found: {}",
+            verdict.message()
+        );
+    }
+
+    /// The three-way state maps to exactly one status label and one dimension
+    /// answer each, and only a loaded index is queryable.
+    #[test]
+    fn vector_index_state_reports_status_presence_and_dimensions() {
+        assert_eq!(loaded(384).status(), "loaded");
+        assert_eq!(loaded(384).dimensions(), Some(384));
+        assert!(loaded(384).is_present());
+
+        assert_eq!(unreadable().status(), "unreadable");
+        assert_eq!(unreadable().dimensions(), None);
+        assert!(
+            unreadable().is_present(),
+            "a skipped index is still an index the store HAS"
+        );
+
+        assert_eq!(VectorIndexState::Absent.status(), "absent");
+        assert_eq!(VectorIndexState::Absent.dimensions(), None);
+        assert!(!VectorIndexState::Absent.is_present());
     }
 
     /// Every refusal verdict carries a distinct stable machine code and a
@@ -1229,10 +1539,11 @@ mod index_identity_tests {
     fn refusal_codes_and_exit_codes_are_distinct_and_nonzero() {
         let q = model("m", 384);
         let verdicts = [
-            classify_index_compatibility(Some(384), &[], &q),
-            classify_index_compatibility(Some(384), &[model("m", 384), model("n", 384)], &q),
-            classify_index_compatibility(Some(4), &[model("m", 4)], &q),
-            classify_index_compatibility(Some(384), &[model("n", 384)], &q),
+            classify_index_compatibility(&loaded(384), &[], &q),
+            classify_index_compatibility(&loaded(384), &[model("m", 384), model("n", 384)], &q),
+            classify_index_compatibility(&loaded(4), &[model("m", 4)], &q),
+            classify_index_compatibility(&loaded(384), &[model("n", 384)], &q),
+            classify_index_compatibility(&unreadable(), &[model("m", 384)], &q),
         ];
         let mut codes: Vec<&str> = verdicts
             .iter()
@@ -1242,14 +1553,14 @@ mod index_identity_tests {
             .iter()
             .filter_map(IndexCompatibility::exit_code)
             .collect();
-        assert_eq!(codes.len(), 4, "all four verdicts must be refusals");
+        assert_eq!(codes.len(), 5, "all five verdicts must be refusals");
         assert!(exits.iter().all(|c| *c != 0), "exit codes must be nonzero");
         codes.sort_unstable();
         codes.dedup();
         exits.sort_unstable();
         exits.dedup();
-        assert_eq!(codes.len(), 4, "codes must be pairwise distinct");
-        assert_eq!(exits.len(), 4, "exit codes must be pairwise distinct");
+        assert_eq!(codes.len(), 5, "codes must be pairwise distinct");
+        assert_eq!(exits.len(), 5, "exit codes must be pairwise distinct");
         // `Compatible` and `IndexAbsent` are not identity refusals.
         assert!(IndexCompatibility::Compatible.code().is_none());
         assert!(IndexCompatibility::IndexAbsent.code().is_none());
@@ -1261,7 +1572,7 @@ mod index_identity_tests {
     fn refusal_envelope_is_allow_list_only() {
         let indexed = model("model-a", 384);
         let query = model("model-b", 384);
-        let verdict = classify_index_compatibility(Some(384), &[indexed], &query);
+        let verdict = classify_index_compatibility(&loaded(384), &[indexed], &query);
         let envelope = verdict
             .to_error_envelope()
             .expect("a refusal must produce an envelope");
@@ -1320,7 +1631,7 @@ mod index_identity_tests {
         let query = model("model-b", 384);
         let render = || {
             let verdict =
-                classify_index_compatibility(Some(384), std::slice::from_ref(&indexed), &query);
+                classify_index_compatibility(&loaded(384), std::slice::from_ref(&indexed), &query);
             serde_json::to_string(&verdict.to_error_envelope().expect("refusal envelope"))
                 .expect("envelope serializes")
         };
@@ -1450,7 +1761,7 @@ mod index_identity_tests {
         };
         let query = model("mine", 384);
         let verdict =
-            classify_index_compatibility(Some(384), std::slice::from_ref(&hostile), &query);
+            classify_index_compatibility(&loaded(384), std::slice::from_ref(&hostile), &query);
         let envelope = verdict.to_error_envelope().expect("refusal envelope");
         let rendered = serde_json::to_string(&envelope).expect("serializes");
         assert!(
@@ -1479,7 +1790,7 @@ mod index_identity_tests {
     fn dimension_mismatch_discloses_every_recorded_identity() {
         let query = model("mine", 384);
         let verdict =
-            classify_index_compatibility(Some(4), &[model("a", 4), model("b", 4)], &query);
+            classify_index_compatibility(&loaded(4), &[model("a", 4), model("b", 4)], &query);
         let envelope = verdict.to_error_envelope().expect("refusal envelope");
         let listed = envelope["error"]["indexed_models"]
             .as_array()
@@ -1499,7 +1810,7 @@ mod index_identity_tests {
     #[test]
     fn recorded_identity_contradicting_the_index_is_worded_distinctly() {
         let query = model("mine", 384);
-        let verdict = classify_index_compatibility(Some(384), &[model("mine", 512)], &query);
+        let verdict = classify_index_compatibility(&loaded(384), &[model("mine", 512)], &query);
         let message = verdict.message();
         assert!(
             message.contains("contradicts the physical semantic index"),

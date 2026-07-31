@@ -76,24 +76,7 @@ pub(crate) fn print_counts_text(counts: &InspectCounts) {
     // the `semantic_index` JSON block.
     #[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
     if let Some(index) = &counts.semantic_index {
-        match index.index_dimensions {
-            None => println!("semantic index: absent (store never ingested with --embed)"),
-            Some(dim) => {
-                println!("semantic index: {dim}-dimensional vectors");
-                if index.indexed_models.is_empty() {
-                    println!(
-                        "  embedding model: NOT RECORDED — compatibility with a query embedder \
-                         is unverifiable; re-ingest with --embed to record it"
-                    );
-                }
-                for model in &index.indexed_models {
-                    println!(
-                        "  embedding model: {}/{}@{} dim={} hash={}",
-                        model.provider, model.name, model.version, model.dim, model.content_hash
-                    );
-                }
-            }
-        }
+        print_semantic_index_text(index);
     }
     for (kind, count) in &counts.producer_kinds {
         println!("producer_kind {kind}: {count}");
@@ -247,7 +230,7 @@ pub(crate) fn inspect_embedded_store(data_dir: &Path, format: OutputFormat) -> R
     #[cfg(feature = "embeddings")]
     {
         counts.semantic_index = Some(SemanticIndexSummary {
-            index_dimensions: sink.embedding_index_dimensions(),
+            index_state: sink.embedding_index_state(),
             indexed_models: crate::embeddings::indexed_identities(&current.records),
         });
     }
@@ -262,17 +245,77 @@ pub(crate) fn inspect_embedded_store(data_dir: &Path, format: OutputFormat) -> R
     Ok(())
 }
 
+/// Prints the human-readable form of the `semantic_index` JSON block (issues
+/// #104 / #489).
+///
+/// The three index states are worded distinctly on purpose: an index that
+/// EXISTS on disk and failed to load is a data-loss condition, and calling it
+/// "absent" would report it as the benign never-embedded configuration one.
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+fn print_semantic_index_text(index: &SemanticIndexSummary) {
+    use crate::embeddings::VectorIndexState;
+    match &index.index_state {
+        VectorIndexState::Absent => {
+            println!("semantic index: absent (store never ingested with --embed)");
+        }
+        VectorIndexState::Unreadable { artifacts } => {
+            println!(
+                "semantic index: PRESENT BUT UNREADABLE — persisted index files exist on disk but \
+                 the engine skipped them at load as corrupted or unreadable; this store WAS \
+                 embedded, so this is not the never-embedded case"
+            );
+            println!(
+                "  index files: {}",
+                if artifacts.is_empty() {
+                    "(index directory present, none of the expected files found)".to_owned()
+                } else {
+                    artifacts.join(", ")
+                }
+            );
+            println!(
+                "  remedy: {}",
+                crate::embeddings::SEMANTIC_INDEX_UNREADABLE_REMEDY
+            );
+            print_indexed_models(&index.indexed_models);
+        }
+        VectorIndexState::Loaded { dimensions } => {
+            println!("semantic index: {dimensions}-dimensional vectors");
+            if index.indexed_models.is_empty() {
+                println!(
+                    "  embedding model: NOT RECORDED — compatibility with a query embedder is \
+                     unverifiable; re-ingest with --embed to record it"
+                );
+            }
+            print_indexed_models(&index.indexed_models);
+        }
+    }
+}
+
+/// Prints one `embedding model:` line per recorded identity, in the order
+/// [`crate::embeddings::indexed_identities`] already deduplicated and sorted
+/// them, so the text block stays byte-identical across runs.
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+fn print_indexed_models(models: &[crate::ir::EmbeddingModel]) {
+    for model in models {
+        println!(
+            "  embedding model: {}/{}@{} dim={} hash={}",
+            model.provider, model.name, model.version, model.dim, model.content_hash
+        );
+    }
+}
+
 /// Semantic vector-index identity block reported by `eg inspect --data-dir`
 /// (issue #104).
 ///
-/// Allow-list only: dimensions, the identity-recorded flag, and the bounded
-/// `EmbeddingModel` identity fields. Never vectors, model bytes, or payloads.
+/// Allow-list only: the index status, dimensions, the fixed index-artifact
+/// filenames, the identity-recorded flag, and the bounded `EmbeddingModel`
+/// identity fields. Never vectors, model bytes, or payloads.
 #[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct SemanticIndexSummary {
-    /// Dimensionality of the persisted vector index; `None` when the store has
-    /// no semantic index (never ingested with `--embed`).
-    index_dimensions: Option<usize>,
+    /// What the store's vector index actually is: loaded, present-on-disk but
+    /// skipped at load (issue #489), or absent (never ingested with `--embed`).
+    index_state: crate::embeddings::VectorIndexState,
     /// Distinct live embedding-model identities recorded for the index.
     indexed_models: Vec<crate::ir::EmbeddingModel>,
 }
@@ -603,9 +646,25 @@ impl InspectCounts {
         // deterministic: identities arrive already deduplicated and sorted.
         #[cfg(feature = "embeddings")]
         if let Some(index) = &self.semantic_index {
+            // `index_present` stays "does this store have a semantic index",
+            // which an index skipped at load still does — the three-way
+            // `index_status` is what separates `loaded` from `unreadable`
+            // (issue #489). `index_dimensions` is null for a skipped index
+            // because a skipped index never reports one; it is NOT evidence of
+            // absence.
             json_val["semantic_index"] = serde_json::json!({
-                "index_present": index.index_dimensions.is_some(),
-                "index_dimensions": index.index_dimensions,
+                "index_present": index.index_state.is_present(),
+                "index_status": index.index_state.status(),
+                // Spelled out rather than wildcarded, so a future index state
+                // must be classified here explicitly.
+                "index_artifacts": match &index.index_state {
+                    crate::embeddings::VectorIndexState::Unreadable { artifacts } => {
+                        serde_json::json!(artifacts)
+                    }
+                    crate::embeddings::VectorIndexState::Loaded { .. }
+                    | crate::embeddings::VectorIndexState::Absent => serde_json::Value::Null,
+                },
+                "index_dimensions": index.index_state.dimensions(),
                 "identity_recorded": !index.indexed_models.is_empty(),
                 "indexed_models": index
                     .indexed_models
