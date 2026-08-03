@@ -330,7 +330,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
         }
     }
 
-    context_from_seeds(records, symbol_name, source_facts, &symbol_ids)
+    context_from_seeds(records, symbol_name, source_facts, &symbol_ids, true)
 }
 
 /// Resolves the trust-separated context sections from a frozen set of
@@ -346,6 +346,14 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
 /// convergence, and per-section sort are identical regardless of how the seeds
 /// were chosen, so both entry points share one implementation and one set of
 /// determinism guarantees.
+///
+/// `compute_drift_history` gates the `drift_history` section's O(N) scan
+/// (issue #497 Codex review): only [`symbol_context`] (`eg query context`)
+/// renders it, per CLAUDE.md's documented scope — `eg query locate` and
+/// `eg query semantic-context` (both routed through [`record_context`], the
+/// latter once per retrieval lead) never surface it. `record_context` passes
+/// `false` so those callers skip the scan entirely rather than compute and
+/// immediately discard it; `symbol_context` passes `true`.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 fn context_from_seeds<'a>(
@@ -353,6 +361,7 @@ fn context_from_seeds<'a>(
     symbol_name: &str,
     source_facts: BTreeSet<&'a str>,
     symbol_ids: &BTreeSet<&'a str>,
+    compute_drift_history: bool,
 ) -> SymbolContext<'a> {
     // Recompute the prelim lookups the core needs. These are cheap O(n) scans
     // and are derived deterministically from `records`, so computing them here
@@ -911,62 +920,73 @@ fn context_from_seeds<'a>(
     // the first one encountered — matching `drift_target_record_id`'s
     // `find_map` (which returns on the first match) so this map can never
     // resolve a drift to a different target than `eg query drift` does.
-    let mut drifts_from_target: std::collections::BTreeMap<&str, &str> =
-        std::collections::BTreeMap::new();
-    for r in records {
-        if let GraphRecord::Edge {
-            label: EdgeLabel::DriftsFrom,
-            source,
-            target,
-            ..
-        } = r
-        {
-            drifts_from_target
-                .entry(source.as_str())
-                .or_insert(target.as_str());
-        }
-    }
-    let mut drift_history: Vec<(&'a GraphRecord, f64)> = records
-        .iter()
-        .filter_map(|record| {
-            let GraphRecord::Node {
-                id,
-                kind,
-                semantic_drift: Some(drift),
-                temporal,
+    //
+    // Skipped entirely when `compute_drift_history` is false (issue #497 Codex
+    // review): `record_context`'s callers (`eg query locate`,
+    // `eg query semantic-context` — the latter once per retrieval lead — and
+    // `error_context`'s once-per-frame-target loop) never read this section,
+    // so computing and immediately discarding it would waste an O(N) scan per
+    // call/lead with no observable effect.
+    let drift_history: Vec<&'a GraphRecord> = if compute_drift_history {
+        let mut drifts_from_target: std::collections::BTreeMap<&str, &str> =
+            std::collections::BTreeMap::new();
+        for r in records {
+            if let GraphRecord::Edge {
+                label: EdgeLabel::DriftsFrom,
+                source,
+                target,
                 ..
-            } = record
-            else {
-                return None;
-            };
-            // Require the SemanticDrift kind, matching `semantic_drift()`'s
-            // own check: the field is a general optional slot on every Node
-            // variant, so a malformed graph could carry it on some other
-            // kind. Without this a non-drift node would surface here (and
-            // now in the citation audit via drive_context) while
-            // `largest_semantic_drifts`/`eg query drift` correctly reject it.
-            if *kind != NodeKind::SemanticDrift {
-                return None;
+            } = r
+            {
+                drifts_from_target
+                    .entry(source.as_str())
+                    .or_insert(target.as_str());
             }
-            if temporal.is_none() && tombstoned_ids.contains(id.as_str()) {
-                return None;
-            }
-            let target_id = drifts_from_target
-                .get(id.as_str())
-                .copied()
-                .unwrap_or(drift.target_record_id.as_str());
-            symbol_ids
-                .contains(target_id)
-                .then_some((record, drift.score))
-        })
-        .collect();
-    drift_history.sort_by(|(left_record, left_score), (right_record, right_score)| {
-        right_score
-            .partial_cmp(left_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left_record.id().cmp(right_record.id()))
-    });
-    let drift_history: Vec<&'a GraphRecord> = drift_history.into_iter().map(|(r, _)| r).collect();
+        }
+        let mut drift_history: Vec<(&'a GraphRecord, f64)> = records
+            .iter()
+            .filter_map(|record| {
+                let GraphRecord::Node {
+                    id,
+                    kind,
+                    semantic_drift: Some(drift),
+                    temporal,
+                    ..
+                } = record
+                else {
+                    return None;
+                };
+                // Require the SemanticDrift kind, matching `semantic_drift()`'s
+                // own check: the field is a general optional slot on every Node
+                // variant, so a malformed graph could carry it on some other
+                // kind. Without this a non-drift node would surface here (and
+                // now in the citation audit via drive_context) while
+                // `largest_semantic_drifts`/`eg query drift` correctly reject it.
+                if *kind != NodeKind::SemanticDrift {
+                    return None;
+                }
+                if temporal.is_none() && tombstoned_ids.contains(id.as_str()) {
+                    return None;
+                }
+                let target_id = drifts_from_target
+                    .get(id.as_str())
+                    .copied()
+                    .unwrap_or(drift.target_record_id.as_str());
+                symbol_ids
+                    .contains(target_id)
+                    .then_some((record, drift.score))
+            })
+            .collect();
+        drift_history.sort_by(|(left_record, left_score), (right_record, right_score)| {
+            right_score
+                .partial_cmp(left_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left_record.id().cmp(right_record.id()))
+        });
+        drift_history.into_iter().map(|(r, _)| r).collect()
+    } else {
+        Vec::new()
+    };
 
     // Resolve ID sets → sorted record slices.
     //
@@ -1265,7 +1285,10 @@ pub fn record_context<'a>(records: &'a [GraphRecord], anchor_id: &str) -> Symbol
         })
         .unwrap_or_else(|| anchor_id.to_owned());
 
-    context_from_seeds(records, &label, source_facts, &primary)
+    // `record_context`'s callers (`locate`, `semantic_context_bundle`,
+    // `error_context`) never read `drift_history` — see the parameter's
+    // doc comment on `context_from_seeds`.
+    context_from_seeds(records, &label, source_facts, &primary, false)
 }
 
 // ── semantic → context bridge (issue #90) ──────────────────────────────────
@@ -1664,5 +1687,44 @@ mod drift_history_tests {
                 .collect();
             assert_eq!(again, first, "drift_history must be byte-stable");
         }
+    }
+
+    /// Issue #497 Codex review: `record_context` (used by `eg query locate`,
+    /// `eg query semantic-context`, and `error_context`, none of which render
+    /// `drift_history`) must skip the drift scan entirely rather than compute
+    /// and discard it — `context_from_seeds`'s `compute_drift_history` gate.
+    /// `symbol_context`, over the identical record set, must still populate
+    /// the section, proving the gate is scoped to `record_context` only and
+    /// doesn't silently disable drift resolution everywhere.
+    #[test]
+    fn record_context_never_populates_drift_history() {
+        let target = sym("gated");
+        let target_id = target.id().to_owned();
+        let drift_rec = drift_node("semantic:v1:gated-drift", &target_id, 0.6);
+        let edge = drifts_from_edge("semantic:v1:gated-drift", &target_id);
+        let records = vec![target, drift_rec, edge];
+
+        let via_record_context = record_context(&records, &target_id);
+        assert!(
+            via_record_context.drift_history.is_empty(),
+            "record_context must never populate drift_history, even when a \
+             drift record targets the anchor: {:?}",
+            via_record_context
+                .drift_history
+                .iter()
+                .map(|r| r.id())
+                .collect::<Vec<_>>()
+        );
+
+        let via_symbol_context = symbol_context(&records, "gated");
+        assert_eq!(
+            via_symbol_context
+                .drift_history
+                .iter()
+                .map(|r| r.id())
+                .collect::<Vec<_>>(),
+            vec!["semantic:v1:gated-drift"],
+            "symbol_context must still populate drift_history over the same records"
+        );
     }
 }
