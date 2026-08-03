@@ -11399,6 +11399,7 @@ fn observations_for_symbol_returns_cross_domain_context() {
 /// `drift_history` section as `eg query context`, ordered score descending,
 /// so daemon and CLI answers stay at parity.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn observations_for_symbol_includes_drift_history() {
     const SYMBOL_ID: &str = "codegraph:v4:ofs-drift-symbol0000001";
     const DRIFT_SMALL_ID: &str = "semantic:v1:ofs-drift-small00000001";
