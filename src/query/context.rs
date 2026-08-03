@@ -931,6 +931,7 @@ fn context_from_seeds<'a>(
         .filter_map(|record| {
             let GraphRecord::Node {
                 id,
+                kind,
                 semantic_drift: Some(drift),
                 temporal,
                 ..
@@ -938,6 +939,15 @@ fn context_from_seeds<'a>(
             else {
                 return None;
             };
+            // Require the SemanticDrift kind, matching `semantic_drift()`'s
+            // own check: the field is a general optional slot on every Node
+            // variant, so a malformed graph could carry it on some other
+            // kind. Without this a non-drift node would surface here (and
+            // now in the citation audit via drive_context) while
+            // `largest_semantic_drifts`/`eg query drift` correctly reject it.
+            if *kind != NodeKind::SemanticDrift {
+                return None;
+            }
             if temporal.is_none() && tombstoned_ids.contains(id.as_str()) {
                 return None;
             }
@@ -1589,6 +1599,27 @@ mod drift_history_tests {
         let records = vec![foo, other, unrelated_drift];
         let ctx = symbol_context(&records, "foo");
         assert!(ctx.drift_history.is_empty());
+    }
+
+    /// A node of some OTHER kind that happens to carry a `semantic_drift`
+    /// payload (the field is a general optional slot on every `Node`
+    /// variant, not exclusive to `NodeKind::SemanticDrift`) must never
+    /// surface in `drift_history` — matching `semantic_drift()`'s own
+    /// kind check, the same gate `largest_semantic_drifts`/`eg query drift`
+    /// apply.
+    #[test]
+    fn symbol_context_drift_history_requires_semantic_drift_kind() {
+        let target = sym("kind_gated_target");
+        let target_id = target.id().to_owned();
+        let mut mislabeled = sym("not_actually_drift");
+        mislabeled = mislabeled.with_semantic_drift(drift_metadata(&target_id, 0.99));
+        let records = vec![target, mislabeled];
+        let ctx = symbol_context(&records, "kind_gated_target");
+        assert!(
+            ctx.drift_history.is_empty(),
+            "a non-SemanticDrift-kind node must never appear in drift_history: {:?}",
+            ctx.drift_history.iter().map(|r| r.id()).collect::<Vec<_>>()
+        );
     }
 
     /// AC5: a `SemanticDrift` record is deterministic source-derived
