@@ -512,3 +512,78 @@ fn resolve_drift_targets_batch_matches_per_row_resolution() {
     assert_eq!(batched[0].0, Some("src/first_old.rs"));
     assert_eq!(batched[1].0, Some("src/second_new.rs"));
 }
+
+/// Issue #497 Codex review (follow-up): `resolve_drift_target`'s `rfind`
+/// stops at the LAST record (of any variant) sharing `target_id`, then tries
+/// to destructure it as a `Node` — if that last match is a non-Node (e.g. an
+/// `Edge` whose ID coincidentally collides with the target, a case only a
+/// hand-crafted graph could produce), the destructure fails and the function
+/// falls back to the drift's own handle; it never continues searching for an
+/// earlier matching `Node`. The batch resolver's first draft used
+/// `find_map`, which returns `None` for a non-Node and keeps searching
+/// backward — silently resolving through that earlier `Node` where the
+/// per-row resolver would have fallen back. Both must agree.
+#[test]
+fn resolve_drift_targets_falls_back_on_trailing_non_node_id_collision() {
+    use aletheia_egregore::ir::SourceSpan;
+    use aletheia_egregore::query::{resolve_drift_target, resolve_drift_targets};
+
+    let target_id = "codegraph:v4:collision-target";
+    let symbol_node = GraphRecord::node(
+        target_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/real.rs".to_owned()),
+        Some(SourceSpan {
+            start_byte: 0,
+            end_byte: 100,
+            start_line: 5,
+            end_line: 15,
+        }),
+        Some("symbol".to_owned()),
+        "Summary".to_owned(),
+    );
+
+    // An edge whose ID coincidentally collides with `target_id`, placed AFTER
+    // the symbol node in the record slice — realistic ID namespaces never
+    // collide like this, but both resolvers must agree on the outcome
+    // (fallback) regardless.
+    let mut colliding_edge = GraphRecord::edge(
+        EdgeLabel::Calls,
+        "codegraph:v4:some-caller".to_owned(),
+        "codegraph:v4:some-callee".to_owned(),
+        None,
+        "unrelated call edge".to_owned(),
+    );
+    if let GraphRecord::Edge { id, .. } = &mut colliding_edge {
+        *id = target_id.to_owned();
+    }
+
+    let drift_id = "semantic:v1:collision-drift";
+    let drift_node = drift_targeting(drift_id, target_id, "commit_after");
+    let GraphRecord::Node {
+        semantic_drift: Some(drift),
+        ..
+    } = &drift_node
+    else {
+        unreachable!("drift_targeting always builds a SemanticDrift node")
+    };
+
+    let records = vec![symbol_node, colliding_edge, drift_node.clone()];
+
+    let expected = resolve_drift_target(&records, drift_id, drift, None, None);
+    assert_eq!(
+        expected,
+        (None, None, None),
+        "sanity: the per-row resolver must fall back when rfind stops on the \
+         trailing non-Node id collision"
+    );
+
+    let batched = resolve_drift_targets(&records, &[&drift_node]);
+    assert_eq!(
+        batched,
+        vec![expected],
+        "the batch resolver must match resolve_drift_target's fallback \
+         exactly, not resolve through an earlier Node the per-row rfind \
+         never reaches"
+    );
+}

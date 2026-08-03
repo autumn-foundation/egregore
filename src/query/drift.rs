@@ -183,32 +183,39 @@ pub fn resolve_drift_targets<'a>(
                 .unwrap_or(drift.target_record_id.as_str());
             let has_temporal = has_temporal_ids.contains(target_id);
 
+            // Mirrors `resolve_drift_target`'s `rfind` exactly: find the LAST
+            // record (of any variant) matching `target_id` whose predicate
+            // holds, THEN attempt to destructure it as a Node — rather than
+            // skipping past a matching non-Node record (e.g. an Edge sharing
+            // `target_id` by coincidence) to keep searching earlier ones.
+            // `rfind` stops at that last match and fails the outer `Node`
+            // destructure, falling back to the drift's own handle; a
+            // `find_map` that returns `None` for a non-Node instead continues
+            // to an earlier Node, silently diverging from the per-row
+            // resolver (issue #497 Codex review).
             let resolved = by_id.get(target_id).and_then(|versions| {
-                versions.iter().rev().find_map(|r| match r {
-                    GraphRecord::Node {
-                        temporal: Some(t),
-                        repo_relative_path,
-                        name,
-                        span,
-                        ..
-                    } => (t.git_commit == drift.after_git_commit).then_some((
-                        repo_relative_path.as_deref(),
-                        name.as_deref(),
-                        *span,
-                    )),
-                    GraphRecord::Node {
-                        temporal: None,
-                        repo_relative_path,
-                        name,
-                        span,
-                        ..
-                    } => (!has_temporal).then_some((
-                        repo_relative_path.as_deref(),
-                        name.as_deref(),
-                        *span,
-                    )),
-                    _ => None,
-                })
+                versions
+                    .iter()
+                    .rev()
+                    .find(|r| match r {
+                        GraphRecord::Node {
+                            temporal: Some(t), ..
+                        } => t.git_commit == drift.after_git_commit,
+                        _ => !has_temporal,
+                    })
+                    .and_then(|r| {
+                        if let GraphRecord::Node {
+                            repo_relative_path,
+                            name,
+                            span,
+                            ..
+                        } = r
+                        {
+                            Some((repo_relative_path.as_deref(), name.as_deref(), *span))
+                        } else {
+                            None
+                        }
+                    })
             });
             resolved.unwrap_or((drift_path.as_deref(), drift_name.as_deref(), None))
         })
