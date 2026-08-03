@@ -201,11 +201,13 @@ pub(crate) fn query_context_cmd(
     let (observations, excluded) =
         apply_supersession(sections.observations, &resolver, supersession);
 
+    let resolved_drift_targets = query::resolve_drift_targets(records, &ctx.drift_history);
     let drift_history: Vec<ContextDrift<'_>> = ctx
         .drift_history
         .iter()
         .copied()
-        .filter_map(|record| context_drift(records, record))
+        .zip(resolved_drift_targets)
+        .filter_map(|(record, resolved)| context_drift(record, resolved))
         .collect();
 
     let corpus_disclaimer = corpus_mode.disclaimer().to_owned();
@@ -233,37 +235,35 @@ pub(crate) fn query_context_cmd(
     Ok(())
 }
 
-/// Builds one `drift_history` row from a `SemanticDrift` record (issue #108).
-///
-/// Resolves the target `repo_relative_path`/`span` the same way `eg query
-/// drift` does, via `query::resolve_drift_target` — the citation audit
-/// classifies this row by that resolved handle, so it must actually be part
-/// of the rendered output, not just internal-only resolution.
+/// Builds one `drift_history` row from a `SemanticDrift` record (issue #108),
+/// given its already-resolved target `(repo_relative_path, name, span)` — the
+/// same shape `query::resolve_drift_target`/`resolve_drift_targets` return —
+/// so the citation audit's classification of this row matches what actually
+/// gets rendered. Callers resolve targets for the whole `drift_history` slice
+/// in one batched pass via `query::resolve_drift_targets` (issue #497 Codex
+/// review: resolving one row at a time made rendering O(D×N)) rather than
+/// calling `resolve_drift_target` here per row.
 ///
 /// Returns `None` for a non-drift record — defensive against a future caller
 /// passing the wrong slice; `ctx.drift_history` only ever contains
 /// `SemanticDrift` nodes by construction.
 pub(crate) fn context_drift<'a>(
-    records: &'a [GraphRecord],
     record: &'a GraphRecord,
+    resolved: (
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<crate::ir::SourceSpan>,
+    ),
 ) -> Option<ContextDrift<'a>> {
     let GraphRecord::Node {
         id,
         semantic_drift: Some(drift),
-        repo_relative_path,
-        name,
         ..
     } = record
     else {
         return None;
     };
-    let (resolved_path, _resolved_name, resolved_span) = query::resolve_drift_target(
-        records,
-        id,
-        drift,
-        repo_relative_path.as_deref(),
-        name.as_deref(),
-    );
+    let (resolved_path, _resolved_name, resolved_span) = resolved;
     Some(ContextDrift {
         record_id: id,
         score: drift.score,

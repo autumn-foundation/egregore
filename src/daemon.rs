@@ -10129,35 +10129,32 @@ fn context_linked_item_to_json(record: &GraphRecord) -> serde_json::Value {
 }
 
 /// Builds one `drift_history` row from a `SemanticDrift` record (issue #108),
-/// matching the field set `eg query context`'s `ContextDrift` emits,
-/// including the resolved `repo_relative_path`/`span` (via
-/// `graph_query::resolve_drift_target`) so the citation audit's
-/// classification of this row matches what actually gets rendered. Returns
-/// `None` for a non-drift record, mirroring the CLI's `context_drift`
-/// `filter_map` — `ctx.drift_history` only ever contains `SemanticDrift`
-/// nodes by construction, but a stub row would otherwise silently diverge
-/// from the CLI's shape if that invariant were ever broken.
+/// matching the field set `eg query context`'s `ContextDrift` emits, given its
+/// already-resolved target `(repo_relative_path, name, span)` — the same
+/// shape `graph_query::resolve_drift_target`/`resolve_drift_targets` return —
+/// so the citation audit's classification of this row matches what actually
+/// gets rendered. Callers resolve targets for the whole `drift_history` slice
+/// in one batched pass via `graph_query::resolve_drift_targets` (issue #497
+/// Codex review: resolving one row at a time made serialization O(D×N),
+/// enough to exceed the daemon's query budget on a large drift history)
+/// rather than calling `resolve_drift_target` here per row. Returns `None`
+/// for a non-drift record, mirroring the CLI's `context_drift` `filter_map` —
+/// `ctx.drift_history` only ever contains `SemanticDrift` nodes by
+/// construction, but a stub row would otherwise silently diverge from the
+/// CLI's shape if that invariant were ever broken.
 fn context_drift_to_json(
-    records: &[GraphRecord],
     record: &GraphRecord,
+    resolved: (Option<&str>, Option<&str>, Option<crate::ir::SourceSpan>),
 ) -> Option<serde_json::Value> {
     let GraphRecord::Node {
         id,
         semantic_drift: Some(drift),
-        repo_relative_path,
-        name,
         ..
     } = record
     else {
         return None;
     };
-    let (resolved_path, _resolved_name, resolved_span) = graph_query::resolve_drift_target(
-        records,
-        id,
-        drift,
-        repo_relative_path.as_deref(),
-        name.as_deref(),
-    );
+    let (resolved_path, _resolved_name, resolved_span) = resolved;
     let mut obj = serde_json::Map::new();
     obj.insert("record_id".to_owned(), json!(id.as_str()));
     obj.insert("score".to_owned(), json!(drift.score));
@@ -10267,11 +10264,14 @@ fn build_context_sections(
         .collect();
     rem = rem.saturating_sub(verification_evidence.len());
 
-    let drift_history: Vec<_> = ctx
-        .drift_history
+    let drift_history_records: Vec<&GraphRecord> =
+        ctx.drift_history.iter().take(rem).copied().collect();
+    let resolved_drift_targets =
+        graph_query::resolve_drift_targets(records, &drift_history_records);
+    let drift_history: Vec<_> = drift_history_records
         .iter()
-        .take(rem)
-        .filter_map(|r| context_drift_to_json(records, r))
+        .zip(resolved_drift_targets)
+        .filter_map(|(r, resolved)| context_drift_to_json(r, resolved))
         .collect();
     rem = rem.saturating_sub(drift_history.len());
 
@@ -15167,8 +15167,12 @@ mod tests {
         )
         .with_semantic_drift(drift);
         let records = vec![drift_record.clone()];
+        let resolved = graph_query::resolve_drift_targets(&records, &[&drift_record])
+            .into_iter()
+            .next()
+            .expect("one resolved entry");
 
-        let value = context_drift_to_json(&records, &drift_record).expect("drift row");
+        let value = context_drift_to_json(&drift_record, resolved).expect("drift row");
         let obj = value.as_object().expect("object");
         assert!(
             !obj.contains_key("repo_relative_path"),

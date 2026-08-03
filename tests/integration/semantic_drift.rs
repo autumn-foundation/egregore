@@ -367,3 +367,148 @@ fn test_resolve_drift_target_temporal_fallback() {
     assert_eq!(path3, Some("src/nontemporal.rs"));
     assert_eq!(span3.unwrap().start_line, 50);
 }
+
+fn versioned_symbol(
+    id: &str,
+    path: &str,
+    line: usize,
+    commit: &str,
+    valid_time: &str,
+) -> GraphRecord {
+    use aletheia_egregore::ir::SourceSpan;
+    GraphRecord::node(
+        id.to_owned(),
+        NodeKind::Symbol,
+        Some(path.to_owned()),
+        Some(SourceSpan {
+            start_byte: 0,
+            end_byte: 100,
+            start_line: line,
+            end_line: line + 10,
+        }),
+        Some("symbol".to_owned()),
+        "Summary".to_owned(),
+    )
+    .with_temporal(temporal(commit, valid_time))
+}
+
+fn drift_targeting(drift_id: &str, target_id: &str, after_commit: &str) -> GraphRecord {
+    use aletheia_egregore::ir::{SEMANTIC_SCHEMA_VERSION, SemanticDriftMetadata};
+    let drift = SemanticDriftMetadata {
+        before_git_commit: "commit_before".to_owned(),
+        after_git_commit: after_commit.to_owned(),
+        before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+        embedding_model: EmbeddingModel {
+            provider: "provider".to_owned(),
+            name: "model".to_owned(),
+            version: "version".to_owned(),
+            dim: 128,
+            content_hash: "hash".to_owned(),
+        },
+        metric_kind: MetricKind::CosineDistance,
+        prior_record_id: target_id.to_owned(),
+        target_record_id: target_id.to_owned(),
+        score: 0.5,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
+    };
+    GraphRecord::node(
+        drift_id.to_owned(),
+        NodeKind::SemanticDrift,
+        None,
+        None,
+        None,
+        "Drift summary".to_owned(),
+    )
+    .with_domain("semantic", SEMANTIC_SCHEMA_VERSION)
+    .with_semantic_drift(drift)
+}
+
+/// Issue #497 Codex review: rendering a symbol's full `drift_history` called
+/// `resolve_drift_target` once per row, each doing its own O(N) scan of
+/// `records` — O(D×N) for D drift rows. `resolve_drift_targets` batches this
+/// into one O(N) pass. It must return EXACTLY what looping
+/// `resolve_drift_target` per row would — including correctly distinguishing
+/// two unrelated drift records that resolve to two different targets, so the
+/// shared index built once cannot cross-contaminate rows.
+#[test]
+fn resolve_drift_targets_batch_matches_per_row_resolution() {
+    use aletheia_egregore::query::{resolve_drift_target, resolve_drift_targets};
+
+    // Two unrelated symbols, each with two temporal versions.
+    let first_symbol_id = "codegraph:v4:first-symbol";
+    let second_symbol_id = "codegraph:v4:second-symbol";
+    let first_old = versioned_symbol(
+        first_symbol_id,
+        "src/first_old.rs",
+        1,
+        "commit_1a",
+        "2026-01-01T00:00:00Z",
+    );
+    let first_new = versioned_symbol(
+        first_symbol_id,
+        "src/first_new.rs",
+        2,
+        "commit_1b",
+        "2026-01-02T00:00:00Z",
+    );
+    let second_old = versioned_symbol(
+        second_symbol_id,
+        "src/second_old.rs",
+        3,
+        "commit_2a",
+        "2026-01-01T00:00:00Z",
+    );
+    let second_new = versioned_symbol(
+        second_symbol_id,
+        "src/second_new.rs",
+        4,
+        "commit_2b",
+        "2026-01-02T00:00:00Z",
+    );
+
+    // Two drift records: one targets the first symbol's old snapshot, the
+    // other targets the second symbol's new snapshot.
+    let first_drift_id = "semantic:v1:first-drift";
+    let second_drift_id = "semantic:v1:second-drift";
+    let first_drift_node = drift_targeting(first_drift_id, first_symbol_id, "commit_1a");
+    let second_drift_node = drift_targeting(second_drift_id, second_symbol_id, "commit_2b");
+    let GraphRecord::Node {
+        semantic_drift: Some(first_drift),
+        ..
+    } = &first_drift_node
+    else {
+        unreachable!("drift_targeting always builds a SemanticDrift node")
+    };
+    let GraphRecord::Node {
+        semantic_drift: Some(second_drift),
+        ..
+    } = &second_drift_node
+    else {
+        unreachable!("drift_targeting always builds a SemanticDrift node")
+    };
+
+    let records = vec![
+        first_old,
+        first_new,
+        second_old,
+        second_new,
+        first_drift_node.clone(),
+        second_drift_node.clone(),
+    ];
+
+    let expected_first = resolve_drift_target(&records, first_drift_id, first_drift, None, None);
+    let expected_second = resolve_drift_target(&records, second_drift_id, second_drift, None, None);
+
+    let batched = resolve_drift_targets(&records, &[&first_drift_node, &second_drift_node]);
+    assert_eq!(
+        batched,
+        vec![expected_first, expected_second],
+        "batched resolution must match per-row resolve_drift_target exactly, \
+         with no cross-contamination between unrelated drift rows"
+    );
+    // Sanity: the two rows really do resolve to their OWN distinct targets.
+    assert_eq!(batched[0].0, Some("src/first_old.rs"));
+    assert_eq!(batched[1].0, Some("src/second_new.rs"));
+}

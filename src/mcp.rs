@@ -401,10 +401,12 @@ pub fn tool_symbol_context_from_records(records: &[GraphRecord], symbol_name: &s
         .iter()
         .filter_map(|r| record_to_topology_edge(r))
         .collect();
+    let resolved_drift_targets = query::resolve_drift_targets(records, &ctx.drift_history);
     let drift_history: Vec<Value> = ctx
         .drift_history
         .iter()
-        .filter_map(|r| record_to_drift(records, r))
+        .zip(resolved_drift_targets)
+        .filter_map(|(r, resolved)| record_to_drift(r, resolved))
         .collect();
     let unresolved: Vec<Value> = ctx.unresolved.iter().map(unresolved_to_json).collect();
 
@@ -788,30 +790,29 @@ fn record_to_topology_edge(record: &GraphRecord) -> Option<Value> {
 
 /// Builds one `drift_history` row from a `SemanticDrift` record (issue #108),
 /// matching the field set the CLI's `ContextDrift` and the daemon's
-/// `context_drift_to_json` both emit, including the resolved
-/// `repo_relative_path`/`span` (via `query::resolve_drift_target`) so a row
-/// carries the same citable handle across every transport. Returns `None` for
+/// `context_drift_to_json` both emit, given its already-resolved target
+/// `(repo_relative_path, name, span)` — the same shape
+/// `query::resolve_drift_target`/`resolve_drift_targets` return — so a row
+/// carries the same citable handle across every transport. Callers resolve
+/// targets for the whole `drift_history` slice in one batched pass via
+/// `query::resolve_drift_targets` (issue #497 Codex review: resolving one row
+/// at a time made serialization O(D×N) for D drift rows). Returns `None` for
 /// a non-drift record — `ctx.drift_history` only ever contains `SemanticDrift`
 /// nodes by construction, but a stub row would otherwise silently diverge from
 /// the CLI/daemon shape if that invariant were ever broken.
-fn record_to_drift(records: &[GraphRecord], record: &GraphRecord) -> Option<Value> {
+fn record_to_drift(
+    record: &GraphRecord,
+    resolved: (Option<&str>, Option<&str>, Option<crate::ir::SourceSpan>),
+) -> Option<Value> {
     let GraphRecord::Node {
         id,
         semantic_drift: Some(drift),
-        repo_relative_path,
-        name,
         ..
     } = record
     else {
         return None;
     };
-    let (resolved_path, _resolved_name, resolved_span) = query::resolve_drift_target(
-        records,
-        id,
-        drift,
-        repo_relative_path.as_deref(),
-        name.as_deref(),
-    );
+    let (resolved_path, _resolved_name, resolved_span) = resolved;
     let mut obj = serde_json::Map::new();
     obj.insert("record_id".to_owned(), json!(id.as_str()));
     obj.insert("score".to_owned(), json!(drift.score));
