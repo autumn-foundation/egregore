@@ -565,19 +565,28 @@ snapshots (the pre-#456 default) and `--at-head` forces head — mutually exclus
 `corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (issue #456; see `docs/cli/corpus-modes.md`).
 
 `eg query context <name>` gains a `drift_history` section (issue #108): the queried symbol's
-own `SemanticDrift` records — score, before/after commit + valid time, and the full
+own `SemanticDrift` records — score, before/after commit + valid time, the full
 `embedding_model` identity block (the same provider/name/version/dim/content_hash values `eg
 query drift` discloses, nested under one `embedding_model` key rather than that command's
-flattened `embedding_model_*` fields) — resolved via the record's `DriftsFrom` edge, falling
-back to the drift's own `target_record_id` when no edge is present. Ordering reuses
-`largest_semantic_drifts` verbatim (score descending, then record ID)
-so `drift_history` and `eg query drift` agree byte-for-byte; `drift_history` is always present
-(`[]`, never omitted, when the symbol has no drift), never changes the existing no-match
-verdict, and is deterministic source-derived evidence that is never mixed into `observations`.
-The shared `symbol_context`/`record_context` core computes the section once, so the
+flattened `embedding_model_*` fields), and the same resolved `repo_relative_path`/`span`
+target handle `eg query drift`'s `DriftResult` carries (present when the target resolves,
+omitted otherwise) — resolved via the record's `DriftsFrom` edge, falling back to the drift's
+own `target_record_id` when no edge is present. The resolved handle is not cosmetic: the
+citation audit (`eg audit citations`) classifies each `drift_history` row by it, so it must
+actually be part of the rendered output, not just internal-only resolution. Ordering reuses
+`largest_semantic_drifts`'s exact comparator (score descending, then record ID) — filtering to
+the matched symbol's own drift records before sorting the small result, not sorting every
+drift record in the store on every call — so `drift_history` and `eg query drift` agree
+byte-for-byte; `drift_history` is always present (`[]`, never omitted, when the symbol has no
+drift), never changes the existing no-match verdict, excludes a tombstoned non-temporal drift
+record and one carrying a mistyped `semantic_drift` payload on a non-`SemanticDrift`-kind node,
+and is deterministic source-derived evidence that is never mixed into `observations`. The
+shared `symbol_context`/`record_context` core computes the section once, so the
 `observations_for_symbol` daemon verb (issue #86) returns the identical section, keeping CLI
 and daemon answers at parity; `eg query locate` and `eg query semantic-context` are out of
-scope for this issue and keep their existing five sections.
+scope for this issue and keep their existing five sections. `eg audit citations`' `context`
+workflow shares one drift-classification cache with the `subsystem` workflow so every
+`SemanticDrift` record is resolved once per audit run, not once per workflow.
 
 `eg query change-impact <handle>` returns graph-derived impact leads grouped by relation
 (`direct_callers`, `direct_callees`, `referencing_files`, `implementation_symbols`,
