@@ -899,22 +899,27 @@ fn context_from_seeds<'a>(
     // `drift_target_record_id` does, since it also serves `eg query drift`'s
     // once-per-row callers): with D drift records over N total records this
     // keeps the section O(D log N + N) instead of O(D * N).
-    let drifts_from_target: std::collections::BTreeMap<&str, &str> = records
-        .iter()
-        .filter_map(|r| {
-            if let GraphRecord::Edge {
-                label: EdgeLabel::DriftsFrom,
-                source,
-                target,
-                ..
-            } = r
-            {
-                Some((source.as_str(), target.as_str()))
-            } else {
-                None
-            }
-        })
-        .collect();
+    //
+    // First-edge-wins: if a malformed/hand-crafted graph carries more than one
+    // DriftsFrom edge for the same drift source, `entry().or_insert()` keeps
+    // the first one encountered — matching `drift_target_record_id`'s
+    // `find_map` (which returns on the first match) so this map can never
+    // resolve a drift to a different target than `eg query drift` does.
+    let mut drifts_from_target: std::collections::BTreeMap<&str, &str> =
+        std::collections::BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Edge {
+            label: EdgeLabel::DriftsFrom,
+            source,
+            target,
+            ..
+        } = r
+        {
+            drifts_from_target
+                .entry(source.as_str())
+                .or_insert(target.as_str());
+        }
+    }
     let drift_history: Vec<&'a GraphRecord> = super::largest_semantic_drifts(records, usize::MAX)
         .into_iter()
         .filter(|record| {
@@ -1470,6 +1475,57 @@ mod drift_history_tests {
         let ctx = symbol_context(&records, "nonexistent");
         assert!(ctx.is_no_match(), "no live Symbol named this must no-match");
         assert!(ctx.drift_history.is_empty());
+    }
+
+    /// When a malformed/hand-crafted graph carries more than one `DriftsFrom`
+    /// edge for the same drift source, the first one encountered must win —
+    /// matching `drift_target_record_id`'s `find_map` semantics (the shared
+    /// resolver `eg query drift` uses) — so the precomputed lookup here can
+    /// never attach a drift to a different target than `eg query drift` does.
+    #[test]
+    fn symbol_context_drift_history_first_drifts_from_edge_wins_on_duplicate_source() {
+        let first_target = sym("first_target");
+        let first_target_id = first_target.id().to_owned();
+        let second_target = sym("second_target");
+        let second_target_id = second_target.id().to_owned();
+
+        let drift_rec = drift_node("semantic:v1:dup-source-drift", &first_target_id, 0.5);
+        let edge_to_first = GraphRecord::edge(
+            EdgeLabel::DriftsFrom,
+            "semantic:v1:dup-source-drift".to_owned(),
+            first_target_id,
+            Some("1.0".to_owned()),
+            "first edge".to_owned(),
+        );
+        let edge_to_second = GraphRecord::edge(
+            EdgeLabel::DriftsFrom,
+            "semantic:v1:dup-source-drift".to_owned(),
+            second_target_id,
+            Some("1.0".to_owned()),
+            "second edge".to_owned(),
+        );
+
+        let records = vec![
+            first_target,
+            second_target,
+            drift_rec,
+            edge_to_first,
+            edge_to_second,
+        ];
+
+        let ctx_first = symbol_context(&records, "first_target");
+        let ids: Vec<&str> = ctx_first.drift_history.iter().map(|r| r.id()).collect();
+        assert_eq!(
+            ids,
+            vec!["semantic:v1:dup-source-drift"],
+            "drift must resolve to the first DriftsFrom edge's target"
+        );
+
+        let ctx_second = symbol_context(&records, "second_target");
+        assert!(
+            ctx_second.drift_history.is_empty(),
+            "drift must not also attach to the second edge's target"
+        );
     }
 
     /// A retracted (tombstoned) current-state `SemanticDrift` record must not
