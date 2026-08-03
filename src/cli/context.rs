@@ -205,7 +205,7 @@ pub(crate) fn query_context_cmd(
         .drift_history
         .iter()
         .copied()
-        .filter_map(context_drift)
+        .filter_map(|record| context_drift(records, record))
         .collect();
 
     let corpus_disclaimer = corpus_mode.disclaimer().to_owned();
@@ -235,18 +235,35 @@ pub(crate) fn query_context_cmd(
 
 /// Builds one `drift_history` row from a `SemanticDrift` record (issue #108).
 ///
+/// Resolves the target `repo_relative_path`/`span` the same way `eg query
+/// drift` does, via `query::resolve_drift_target` — the citation audit
+/// classifies this row by that resolved handle, so it must actually be part
+/// of the rendered output, not just internal-only resolution.
+///
 /// Returns `None` for a non-drift record — defensive against a future caller
 /// passing the wrong slice; `ctx.drift_history` only ever contains
 /// `SemanticDrift` nodes by construction.
-pub(crate) fn context_drift(record: &GraphRecord) -> Option<ContextDrift<'_>> {
+pub(crate) fn context_drift<'a>(
+    records: &'a [GraphRecord],
+    record: &'a GraphRecord,
+) -> Option<ContextDrift<'a>> {
     let GraphRecord::Node {
         id,
         semantic_drift: Some(drift),
+        repo_relative_path,
+        name,
         ..
     } = record
     else {
         return None;
     };
+    let (resolved_path, _resolved_name, resolved_span) = query::resolve_drift_target(
+        records,
+        id,
+        drift,
+        repo_relative_path.as_deref(),
+        name.as_deref(),
+    );
     Some(ContextDrift {
         record_id: id,
         score: drift.score,
@@ -255,6 +272,8 @@ pub(crate) fn context_drift(record: &GraphRecord) -> Option<ContextDrift<'_>> {
         before_valid_time: &drift.before_valid_time,
         after_valid_time: &drift.after_valid_time,
         embedding_model: &drift.embedding_model,
+        repo_relative_path: resolved_path,
+        span: resolved_span,
     })
 }
 

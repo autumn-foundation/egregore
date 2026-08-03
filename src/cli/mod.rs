@@ -4677,6 +4677,9 @@ pub(crate) struct ContextTopologyEdge<'a> {
 /// One item in the `drift_history` section: a `SemanticDrift` record whose
 /// resolved target is one of the queried symbol's own records (issue #108).
 /// Deterministic source-derived evidence — never mixed into `observations`.
+/// Carries the same resolved-target citation handle `eg query drift`'s
+/// `DriftResult` does, so the citation audit's classification of this row
+/// (via `resolve_drift_target`) matches what this command actually renders.
 #[derive(Serialize)]
 pub(crate) struct ContextDrift<'a> {
     record_id: &'a str,
@@ -4686,6 +4689,10 @@ pub(crate) struct ContextDrift<'a> {
     before_valid_time: &'a str,
     after_valid_time: &'a str,
     embedding_model: &'a EmbeddingModel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
 }
 
 /// One record excluded by a filter or temporal constraint.

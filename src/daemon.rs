@@ -10129,20 +10129,35 @@ fn context_linked_item_to_json(record: &GraphRecord) -> serde_json::Value {
 }
 
 /// Builds one `drift_history` row from a `SemanticDrift` record (issue #108),
-/// matching the field set `eg query context`'s `ContextDrift` emits. Returns
+/// matching the field set `eg query context`'s `ContextDrift` emits,
+/// including the resolved `repo_relative_path`/`span` (via
+/// `graph_query::resolve_drift_target`) so the citation audit's
+/// classification of this row matches what actually gets rendered. Returns
 /// `None` for a non-drift record, mirroring the CLI's `context_drift`
 /// `filter_map` — `ctx.drift_history` only ever contains `SemanticDrift`
 /// nodes by construction, but a stub row would otherwise silently diverge
 /// from the CLI's shape if that invariant were ever broken.
-fn context_drift_to_json(record: &GraphRecord) -> Option<serde_json::Value> {
+fn context_drift_to_json(
+    records: &[GraphRecord],
+    record: &GraphRecord,
+) -> Option<serde_json::Value> {
     let GraphRecord::Node {
         id,
         semantic_drift: Some(drift),
+        repo_relative_path,
+        name,
         ..
     } = record
     else {
         return None;
     };
+    let (resolved_path, _resolved_name, resolved_span) = graph_query::resolve_drift_target(
+        records,
+        id,
+        drift,
+        repo_relative_path.as_deref(),
+        name.as_deref(),
+    );
     Some(json!({
         "record_id": id,
         "score": drift.score,
@@ -10151,6 +10166,8 @@ fn context_drift_to_json(record: &GraphRecord) -> Option<serde_json::Value> {
         "before_valid_time": drift.before_valid_time,
         "after_valid_time": drift.after_valid_time,
         "embedding_model": &drift.embedding_model,
+        "repo_relative_path": resolved_path,
+        "span": resolved_span,
     }))
 }
 
@@ -10165,7 +10182,11 @@ struct ContextSections {
     unresolved: Vec<serde_json::Value>,
 }
 
-fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) -> ContextSections {
+fn build_context_sections(
+    records: &[GraphRecord],
+    ctx: &graph_query::SymbolContext<'_>,
+    limit: usize,
+) -> ContextSections {
     let mut rem = limit;
 
     let source_facts: Vec<_> = ctx
@@ -10240,7 +10261,7 @@ fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) ->
         .drift_history
         .iter()
         .take(rem)
-        .filter_map(|r| context_drift_to_json(r))
+        .filter_map(|r| context_drift_to_json(records, r))
         .collect();
     rem = rem.saturating_sub(drift_history.len());
 
@@ -10471,7 +10492,7 @@ fn handle_verb_observations_for_symbol(
         );
     }
 
-    let s = build_context_sections(&ctx, limit);
+    let s = build_context_sections(&records, &ctx, limit);
 
     let resolver = crate::temporal_status::TemporalResolver::build(&records);
     let (observations, excluded) = apply_supersession_json(s.observations, &resolver, supersession);

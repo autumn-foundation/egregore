@@ -11535,6 +11535,13 @@ fn observations_for_symbol_includes_drift_history() {
     assert_eq!(drift_history[0]["before_commit"], "aaaaaaaa");
     assert_eq!(drift_history[0]["after_commit"], "bbbbbbbb");
 
+    // The row must carry the same resolved target handle `eg query drift`
+    // renders, matching the CLI (Codex review: the citation audit classifies
+    // this row by its resolved path/span, so it must actually be rendered).
+    assert_eq!(drift_history[0]["repo_relative_path"], "src/lib.rs");
+    assert_eq!(drift_history[0]["span"]["start_line"], 10);
+    assert_eq!(drift_history[0]["span"]["end_line"], 15);
+
     daemon.stop();
 }
 

@@ -1908,6 +1908,14 @@ fn query_context_includes_drift_history_ordered_by_score_desc() {
     assert_eq!(embedding_model["version"], "v1");
     assert_eq!(embedding_model["dim"], 384);
     assert_eq!(embedding_model["content_hash"], "fixture");
+
+    // The row must carry the same resolved target handle `eg query drift`
+    // renders (Codex review: the citation audit classifies this row by its
+    // resolved path/span, so that handle must actually be part of the
+    // rendered output, not just internal resolution).
+    assert_eq!(large["repo_relative_path"], "src/lib.rs");
+    assert_eq!(large["span"]["start_line"], 10);
+    assert_eq!(large["span"]["end_line"], 20);
 }
 
 /// AC5: drift entries must never be mixed into `observations`.
