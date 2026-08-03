@@ -564,6 +564,19 @@ snapshots (the pre-#456 default) and `--at-head` forces head — mutually exclus
 (exit 1 `unsupported_combination`), and the envelope discloses
 `corpus_mode`/`corpus_mode_source`/`corpus_disclaimer` (issue #456; see `docs/cli/corpus-modes.md`).
 
+`eg query context <name>` gains a `drift_history` section (issue #108): the queried symbol's
+own `SemanticDrift` records — score, before/after commit + valid time, and the full
+`embedding_model` identity block, matching `eg query drift`'s field parity — resolved via the
+record's `DriftsFrom` edge, falling back to the drift's own `target_record_id` when no edge is
+present. Ordering reuses `largest_semantic_drifts` verbatim (score descending, then record ID)
+so `drift_history` and `eg query drift` agree byte-for-byte; `drift_history` is always present
+(`[]`, never omitted, when the symbol has no drift), never changes the existing no-match
+verdict, and is deterministic source-derived evidence that is never mixed into `observations`.
+The shared `symbol_context`/`record_context` core computes the section once, so the
+`observations_for_symbol` daemon verb (issue #86) returns the identical section, keeping CLI
+and daemon answers at parity; `eg query locate` and `eg query semantic-context` are out of
+scope for this issue and keep their existing five sections.
+
 `eg query change-impact <handle>` returns graph-derived impact leads grouped by relation
 (`direct_callers`, `direct_callees`, `referencing_files`, `implementation_symbols`,
 `containing_context`) for a symbol name, canonical record ID, or repo-relative file path.
