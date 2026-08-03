@@ -566,9 +566,11 @@ snapshots (the pre-#456 default) and `--at-head` forces head — mutually exclus
 
 `eg query context <name>` gains a `drift_history` section (issue #108): the queried symbol's
 own `SemanticDrift` records — score, before/after commit + valid time, and the full
-`embedding_model` identity block, matching `eg query drift`'s field parity — resolved via the
-record's `DriftsFrom` edge, falling back to the drift's own `target_record_id` when no edge is
-present. Ordering reuses `largest_semantic_drifts` verbatim (score descending, then record ID)
+`embedding_model` identity block (the same provider/name/version/dim/content_hash values `eg
+query drift` discloses, nested under one `embedding_model` key rather than that command's
+flattened `embedding_model_*` fields) — resolved via the record's `DriftsFrom` edge, falling
+back to the drift's own `target_record_id` when no edge is present. Ordering reuses
+`largest_semantic_drifts` verbatim (score descending, then record ID)
 so `drift_history` and `eg query drift` agree byte-for-byte; `drift_history` is always present
 (`[]`, never omitted, when the symbol has no drift), never changes the existing no-match
 verdict, and is deterministic source-derived evidence that is never mixed into `observations`.

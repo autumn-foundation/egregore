@@ -1425,10 +1425,12 @@ fn fixture_context_seeded() -> (tempfile::TempDir, PathBuf) {
 }
 
 /// Extends [`fixture_context_seeded`] with two `SemanticDrift` records
-/// targeting `my_function` via `DriftsFrom` edges, for issue #108's
+/// targeting `my_function` via `DriftsFrom` edges, plus one unrelated
+/// `SemanticDrift` targeting a sibling symbol, for issue #108's
 /// `drift_history` section. Returns `(temp_dir, graph_path, small_drift_id,
-/// large_drift_id)`.
-fn fixture_context_seeded_with_drift() -> (tempfile::TempDir, PathBuf, String, String) {
+/// large_drift_id, unrelated_drift_id)`.
+#[allow(clippy::too_many_lines)]
+fn fixture_context_seeded_with_drift() -> (tempfile::TempDir, PathBuf, String, String, String) {
     let temp = tempfile::tempdir().expect("temp dir");
     let path = temp.path().join("context_seeded_drift.jsonl");
 
@@ -1521,16 +1523,78 @@ fn fixture_context_seeded_with_drift() -> (tempfile::TempDir, PathBuf, String, S
         "drifts from edge".to_owned(),
     );
 
+    // An unrelated sibling symbol with its own drift record — proves
+    // drift_history never leaks across symbols at the CLI level, not just
+    // the query::context unit-test level.
+    let other_sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "unrelated_function"]);
+    let other_sym = GraphRecord::symbol(
+        other_sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 100,
+            end_byte: 150,
+            start_line: 30,
+            end_line: 40,
+        },
+        "unrelated_function".to_owned(),
+        "Rust fn unrelated_function at src/lib.rs:30".to_owned(),
+    );
+    let unrelated_drift_id = stable_id(&["node", "SemanticDrift", "ctx_unrelated"]);
+    let unrelated_drift = GraphRecord::node(
+        unrelated_drift_id.clone(),
+        NodeKind::SemanticDrift,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("unrelated_function".to_owned()),
+        "unrelated drift".to_owned(),
+    )
+    .with_semantic_drift(SemanticDriftMetadata {
+        embedding_model: EmbeddingModel {
+            provider: "test".to_owned(),
+            name: "test-model-v1".to_owned(),
+            version: "v1".to_owned(),
+            dim: 384,
+            content_hash: "fixture".to_owned(),
+        },
+        target_record_id: other_sym_id.clone(),
+        prior_record_id: other_sym_id.clone(),
+        before_git_commit: "dddddddd".to_owned(),
+        after_git_commit: "eeeeeeee".to_owned(),
+        before_valid_time: "2026-01-04T00:00:00Z".to_owned(),
+        after_valid_time: "2026-01-05T00:00:00Z".to_owned(),
+        metric_kind: MetricKind::CosineDistance,
+        score: 0.99,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
+    });
+    let unrelated_edge = GraphRecord::edge(
+        EdgeLabel::DriftsFrom,
+        unrelated_drift_id.clone(),
+        other_sym_id,
+        Some("1.0".to_owned()),
+        "drifts from edge".to_owned(),
+    );
+
     let mut graph = Graph::new();
     graph.push(sym);
     graph.push(drift_small);
     graph.push(drift_large);
     graph.push(edge_small);
     graph.push(edge_large);
+    graph.push(other_sym);
+    graph.push(unrelated_drift);
+    graph.push(unrelated_edge);
     let jsonl = graph.to_jsonl().expect("serialize");
     fs::write(&path, jsonl).expect("write");
 
-    (temp, path, drift_small_id, drift_large_id)
+    (
+        temp,
+        path,
+        drift_small_id,
+        drift_large_id,
+        unrelated_drift_id,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1791,7 +1855,8 @@ fn query_context_stable_ordering_across_repeated_calls() {
 /// records, score descending, each carrying the full documented field set.
 #[test]
 fn query_context_includes_drift_history_ordered_by_score_desc() {
-    let (_temp, graph, drift_small_id, drift_large_id) = fixture_context_seeded_with_drift();
+    let (_temp, graph, drift_small_id, drift_large_id, unrelated_drift_id) =
+        fixture_context_seeded_with_drift();
 
     let output = egregore()
         .args(["query", "context", "my_function", "--graph"])
@@ -1811,6 +1876,16 @@ fn query_context_includes_drift_history_ordered_by_score_desc() {
         .expect("drift_history array");
     assert_eq!(drift_history.len(), 2, "both drift records must surface");
 
+    // Drift targeting a sibling symbol must never leak in, even though it
+    // has the highest score of all three fixture drift records (proves
+    // exclusion isn't accidentally masked by ordering/truncation).
+    assert!(
+        !drift_history
+            .iter()
+            .any(|d| d["record_id"] == unrelated_drift_id),
+        "drift targeting a different symbol must not appear in drift_history"
+    );
+
     // AC3: score descending, then record ID.
     assert_eq!(drift_history[0]["record_id"], drift_large_id);
     assert_eq!(drift_history[1]["record_id"], drift_small_id);
@@ -1819,7 +1894,9 @@ fn query_context_includes_drift_history_ordered_by_score_desc() {
     );
 
     // AC2: each entry carries the documented field set, including the
-    // embedding_model identity block (parity with `eg query drift`).
+    // embedding_model identity block (same provider/name/version/dim/
+    // content_hash values `eg query drift` discloses, nested here rather
+    // than flattened as `embedding_model_*`).
     let large = &drift_history[0];
     assert_eq!(large["before_commit"], "bbbbbbbb");
     assert_eq!(large["after_commit"], "cccccccc");
@@ -1836,7 +1913,8 @@ fn query_context_includes_drift_history_ordered_by_score_desc() {
 /// AC5: drift entries must never be mixed into `observations`.
 #[test]
 fn query_context_drift_history_never_appears_in_observations() {
-    let (_temp, graph, drift_small_id, drift_large_id) = fixture_context_seeded_with_drift();
+    let (_temp, graph, drift_small_id, drift_large_id, _unrelated) =
+        fixture_context_seeded_with_drift();
 
     let output = egregore()
         .args(["query", "context", "my_function", "--graph"])
@@ -1865,7 +1943,7 @@ fn query_context_drift_history_never_appears_in_observations() {
 /// calls, the same guarantee already held for the other five sections.
 #[test]
 fn query_context_drift_history_stable_ordering_across_repeated_calls() {
-    let (_temp, graph, _small, _large) = fixture_context_seeded_with_drift();
+    let (_temp, graph, _small, _large, _unrelated) = fixture_context_seeded_with_drift();
 
     let run = || {
         let output = egregore()

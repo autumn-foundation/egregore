@@ -10129,17 +10129,21 @@ fn context_linked_item_to_json(record: &GraphRecord) -> serde_json::Value {
 }
 
 /// Builds one `drift_history` row from a `SemanticDrift` record (issue #108),
-/// matching the field set `eg query context`'s `ContextDrift` emits.
-fn context_drift_to_json(record: &GraphRecord) -> serde_json::Value {
+/// matching the field set `eg query context`'s `ContextDrift` emits. Returns
+/// `None` for a non-drift record, mirroring the CLI's `context_drift`
+/// `filter_map` — `ctx.drift_history` only ever contains `SemanticDrift`
+/// nodes by construction, but a stub row would otherwise silently diverge
+/// from the CLI's shape if that invariant were ever broken.
+fn context_drift_to_json(record: &GraphRecord) -> Option<serde_json::Value> {
     let GraphRecord::Node {
         id,
         semantic_drift: Some(drift),
         ..
     } = record
     else {
-        return json!({ "record_id": record.id() });
+        return None;
     };
-    json!({
+    Some(json!({
         "record_id": id,
         "score": drift.score,
         "before_commit": drift.before_git_commit,
@@ -10147,7 +10151,7 @@ fn context_drift_to_json(record: &GraphRecord) -> serde_json::Value {
         "before_valid_time": drift.before_valid_time,
         "after_valid_time": drift.after_valid_time,
         "embedding_model": &drift.embedding_model,
-    })
+    }))
 }
 
 struct ContextSections {
@@ -10236,7 +10240,7 @@ fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) ->
         .drift_history
         .iter()
         .take(rem)
-        .map(|r| context_drift_to_json(r))
+        .filter_map(|r| context_drift_to_json(r))
         .collect();
     rem = rem.saturating_sub(drift_history.len());
 

@@ -1420,6 +1420,22 @@ mod drift_history_tests {
         assert!(!ctx.is_no_match());
     }
 
+    /// AC4: a `SemanticDrift` record whose target references a symbol name
+    /// that does not exist in the slice must not fabricate a match — the
+    /// query for that name stays a genuine no-match, drift and all.
+    #[test]
+    fn symbol_context_drift_referencing_nonexistent_symbol_stays_no_match() {
+        let drift_rec = drift_node(
+            "semantic:v1:orphan-drift",
+            "codegraph:v5:sym-nonexistent",
+            0.9,
+        );
+        let records = vec![drift_rec];
+        let ctx = symbol_context(&records, "nonexistent");
+        assert!(ctx.is_no_match(), "no live Symbol named this must no-match");
+        assert!(ctx.drift_history.is_empty());
+    }
+
     /// AC1: resolution falls back to `target_record_id` when no `DriftsFrom`
     /// edge is present in the slice.
     #[test]
