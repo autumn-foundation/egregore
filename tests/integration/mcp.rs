@@ -250,6 +250,78 @@ fn symbol_context_with_empty_name_returns_no_match() {
     );
 }
 
+/// Codex review on PR #497: `tool_symbol_context_from_records` dropped every
+/// row in `ctx.drift_history` (issue #108), so a symbol's semantic-drift
+/// history was visible through the CLI and daemon but never through the MCP
+/// surface agents call. `drift_history` must now appear with the resolved
+/// `repo_relative_path`/`span` handle, matching the CLI's `ContextDrift` and
+/// the daemon's `context_drift_to_json`.
+#[test]
+fn symbol_context_includes_drift_history() {
+    let sym_id = "codegraph:v4:sym001";
+    let drift_id = "semantic:v1:drift001";
+    let mut records = fixture_records();
+    records.push(
+        GraphRecord::node(
+            drift_id.to_owned(),
+            NodeKind::SemanticDrift,
+            None,
+            None,
+            None,
+            "drift".to_owned(),
+        )
+        .with_semantic_drift(aletheia_egregore::SemanticDriftMetadata {
+            embedding_model: aletheia_egregore::EmbeddingModel {
+                provider: "test".to_owned(),
+                name: "test-model".to_owned(),
+                version: "v1".to_owned(),
+                dim: 8,
+                content_hash: "unknown".to_owned(),
+            },
+            target_record_id: sym_id.to_owned(),
+            prior_record_id: sym_id.to_owned(),
+            before_git_commit: "aaaaaaa".to_owned(),
+            after_git_commit: "bbbbbbb".to_owned(),
+            before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+            metric_kind: aletheia_egregore::MetricKind::CosineDistance,
+            score: 0.75,
+            selection_threshold: 0.2,
+            selection_basis: aletheia_egregore::SelectionBasis::ThresholdOnly,
+        }),
+    );
+    records.push(GraphRecord::edge(
+        aletheia_egregore::EdgeLabel::DriftsFrom,
+        drift_id.to_owned(),
+        sym_id.to_owned(),
+        Some("1.0".to_owned()),
+        "drift edge".to_owned(),
+    ));
+
+    let result = tool_symbol_context_from_records(&records, "my_function");
+
+    assert!(
+        result["ok"].as_bool().unwrap_or(false),
+        "ok must be true; got {result}"
+    );
+    let drift_rows = result["drift_history"]
+        .as_array()
+        .expect("drift_history must be an array");
+    assert_eq!(
+        drift_rows.len(),
+        1,
+        "expected exactly one drift row; got {result}"
+    );
+    let row = &drift_rows[0];
+    assert_eq!(row["record_id"].as_str(), Some(drift_id));
+    assert_eq!(row["repo_relative_path"].as_str(), Some("src/lib.rs"));
+    assert!(
+        row["span"].is_object(),
+        "resolved drift row must carry the target's span; got {row}"
+    );
+    assert_eq!(row["score"].as_f64(), Some(0.75));
+}
+
 // ── AC5: task_evidence ────────────────────────────────────────────────────────
 
 /// task_evidence for an unknown id must return ok:false with no_match.
