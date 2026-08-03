@@ -887,17 +887,27 @@ fn context_from_seeds<'a>(
     // preserves that order. Deliberately NOT run through `classify_node`/the
     // BFS above: `SemanticDrift` is not one of the five trust-separated
     // sections and must never be mixed into `observations` (AC5).
+    //
+    // A tombstoned non-temporal drift node is excluded — the same liveness
+    // exception used everywhere else in this function (the `resolve` closure
+    // below) and by `subsystem.rs`'s own `semantic_drift` section: a temporal
+    // (scan-history) drift record survives its current-state tombstone, but a
+    // retracted current-state one must not reappear as live evidence.
     let drift_history: Vec<&'a GraphRecord> = super::largest_semantic_drifts(records, usize::MAX)
         .into_iter()
         .filter(|record| {
             let GraphRecord::Node {
                 id,
                 semantic_drift: Some(drift),
+                temporal,
                 ..
             } = record
             else {
                 return false;
             };
+            if temporal.is_none() && tombstoned_ids.contains(id.as_str()) {
+                return false;
+            }
             symbol_ids.contains(super::drift_target_record_id(records, id, drift))
         })
         .collect();
@@ -1434,6 +1444,28 @@ mod drift_history_tests {
         let ctx = symbol_context(&records, "nonexistent");
         assert!(ctx.is_no_match(), "no live Symbol named this must no-match");
         assert!(ctx.drift_history.is_empty());
+    }
+
+    /// A retracted (tombstoned) current-state `SemanticDrift` record must not
+    /// reappear as live evidence, mirroring the liveness exception every
+    /// other section in this function applies and the one `subsystem.rs`'s
+    /// own `semantic_drift` section already applies.
+    #[test]
+    fn symbol_context_drift_history_excludes_tombstoned_current_state_drift() {
+        let target = sym("tombstoned_target");
+        let target_id = target.id().to_owned();
+        let drift_rec = drift_node("semantic:v1:tombstoned-drift", &target_id, 0.5);
+        let tombstone = GraphRecord::Tombstone {
+            id: "tombstone:test:1".to_owned(),
+            schema_version: 1,
+            deleted_id: "semantic:v1:tombstoned-drift".to_owned(),
+            summary: "retracted via forget-repo".to_owned(),
+            producer: None,
+        };
+        let records = vec![target, drift_rec, tombstone];
+        let ctx = symbol_context(&records, "tombstoned_target");
+        let ids: Vec<&str> = ctx.drift_history.iter().map(|r| r.id()).collect();
+        assert!(ids.is_empty(), "tombstoned drift must not surface: {ids:?}");
     }
 
     /// AC1: resolution falls back to `target_record_id` when no `DriftsFrom`
