@@ -881,12 +881,18 @@ fn context_from_seeds<'a>(
 
     // Drift history (issue #108): SemanticDrift records whose resolved target
     // (DriftsFrom edge, falling back to target_record_id) is one of the
-    // primary query nodes. Reusing `largest_semantic_drifts` — rather than
-    // re-deriving the ranking here — guarantees the exact same score-descending,
-    // record-ID-tiebreak order as `eg query drift` (AC3), and filtering it
-    // preserves that order. Deliberately NOT run through `classify_node`/the
-    // BFS above: `SemanticDrift` is not one of the five trust-separated
-    // sections and must never be mixed into `observations` (AC5).
+    // primary query nodes. Ordered score descending, then record ID — the
+    // exact same comparator `largest_semantic_drifts` uses for `eg query
+    // drift` (AC3) — but applied only to the (typically tiny) subset that
+    // survives filtering, not to every drift record in the store: filtering
+    // FIRST and sorting the small result, rather than sorting every drift via
+    // `largest_semantic_drifts` and filtering afterward, avoids resorting all
+    // D drift records on every one of the many `symbol_context` calls
+    // `eg audit citations` makes (one call per distinct symbol name — an
+    // O(D log D) resort per call adds up to O(S * D log D) across S symbols).
+    // Deliberately NOT run through `classify_node`/the BFS above:
+    // `SemanticDrift` is not one of the five trust-separated sections and
+    // must never be mixed into `observations` (AC5).
     //
     // A tombstoned non-temporal drift node is excluded — the same liveness
     // exception used everywhere else in this function (the `resolve` closure
@@ -898,7 +904,7 @@ fn context_from_seeds<'a>(
     // pass rather than re-scanning `records` per drift record (which
     // `drift_target_record_id` does, since it also serves `eg query drift`'s
     // once-per-row callers): with D drift records over N total records this
-    // keeps the section O(D log N + N) instead of O(D * N).
+    // keeps the section O(N) instead of O(D * N).
     //
     // First-edge-wins: if a malformed/hand-crafted graph carries more than one
     // DriftsFrom edge for the same drift source, `entry().or_insert()` keeps
@@ -920,9 +926,9 @@ fn context_from_seeds<'a>(
                 .or_insert(target.as_str());
         }
     }
-    let drift_history: Vec<&'a GraphRecord> = super::largest_semantic_drifts(records, usize::MAX)
-        .into_iter()
-        .filter(|record| {
+    let mut drift_history: Vec<(&'a GraphRecord, f64)> = records
+        .iter()
+        .filter_map(|record| {
             let GraphRecord::Node {
                 id,
                 semantic_drift: Some(drift),
@@ -930,18 +936,27 @@ fn context_from_seeds<'a>(
                 ..
             } = record
             else {
-                return false;
+                return None;
             };
             if temporal.is_none() && tombstoned_ids.contains(id.as_str()) {
-                return false;
+                return None;
             }
             let target_id = drifts_from_target
                 .get(id.as_str())
                 .copied()
                 .unwrap_or(drift.target_record_id.as_str());
-            symbol_ids.contains(target_id)
+            symbol_ids
+                .contains(target_id)
+                .then_some((record, drift.score))
         })
         .collect();
+    drift_history.sort_by(|(left_record, left_score), (right_record, right_score)| {
+        right_score
+            .partial_cmp(left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left_record.id().cmp(right_record.id()))
+    });
+    let drift_history: Vec<&'a GraphRecord> = drift_history.into_iter().map(|(r, _)| r).collect();
 
     // Resolve ID sets → sorted record slices.
     //
