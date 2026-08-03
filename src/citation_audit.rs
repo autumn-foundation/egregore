@@ -1513,6 +1513,14 @@ fn drive_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
             builder.push_record(record);
             builder.note_redaction(record);
         }
+        // Drift rows must be classified by their resolved target handle, exactly
+        // as `eg query context`/`eg query drift` render them — not credited by
+        // their own ID (mirrors `drive_subsystem`'s `semantic_drift` handling).
+        for drift_rec in &ctx.drift_history {
+            if let Some((classified, tk)) = classify_drift_row(records, drift_rec) {
+                builder.push_classified(classified, tk);
+            }
+        }
         for unresolved in &ctx.unresolved {
             builder.add_diagnostic(
                 "unresolved_evidence_link".to_owned(),

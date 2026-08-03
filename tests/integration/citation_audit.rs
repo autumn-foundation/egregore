@@ -1599,6 +1599,110 @@ fn subsystem_drift_classified_by_target_handle() {
     );
 }
 
+// Issue #108 code review: `eg query context`'s new drift_history section must
+// be visible to the citation audit too, classified by its resolved target
+// handle exactly like `drive_subsystem`'s semantic_drift rows.
+#[test]
+fn context_drift_classified_by_target_handle() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("context_drift.jsonl");
+    let mut graph = Graph::new();
+
+    let file_id = stable_id(&["node", "File", "src/ctx/lib.rs"]);
+    graph.push(GraphRecord::syntax_node(
+        file_id.clone(),
+        NodeKind::File,
+        "src/ctx/lib.rs".to_owned(),
+        span(1, 50),
+        "lib.rs".to_owned(),
+        "rust",
+        "file".to_owned(),
+    ));
+    let symbol_id = stable_id(&["node", "Symbol", "src/ctx/lib.rs", "baz"]);
+    graph.push(GraphRecord::syntax_node(
+        symbol_id.clone(),
+        NodeKind::Symbol,
+        "src/ctx/lib.rs".to_owned(),
+        span(10, 20),
+        "baz".to_owned(),
+        "rust",
+        "symbol baz".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id,
+        symbol_id.clone(),
+        None,
+        "defines baz".to_owned(),
+    ));
+
+    let drift_id = semantic_stable_id(&["drift", "baz"]);
+    let mut drift = GraphRecord::node(
+        drift_id.clone(),
+        NodeKind::SemanticDrift,
+        None,
+        None,
+        None,
+        "drift on baz".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        domain,
+        semantic_drift,
+        ..
+    } = &mut drift
+    {
+        *schema_version = SEMANTIC_SCHEMA_VERSION;
+        *domain = Some("semantic".to_owned());
+        *semantic_drift = Some(Box::new(SemanticDriftMetadata {
+            embedding_model: EmbeddingModel {
+                provider: "aletheiadb_re_export".to_owned(),
+                name: "m".to_owned(),
+                version: "0.1.0".to_owned(),
+                dim: 384,
+                content_hash: "unknown".to_owned(),
+            },
+            target_record_id: symbol_id.clone(),
+            prior_record_id: symbol_id.clone(),
+            before_git_commit: "aaaa".to_owned(),
+            after_git_commit: "bbbb".to_owned(),
+            before_valid_time: "2026-06-01T00:00:00Z".to_owned(),
+            after_valid_time: "2026-06-02T00:00:00Z".to_owned(),
+            metric_kind: MetricKind::CosineDistance,
+            score: 0.8,
+            selection_threshold: 0.4,
+            selection_basis: SelectionBasis::ThresholdOnly,
+        }));
+    }
+    graph.push(drift);
+    graph.push(GraphRecord::edge(
+        EdgeLabel::DriftsFrom,
+        drift_id.clone(),
+        symbol_id,
+        None,
+        "drifts from baz".to_owned(),
+    ));
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let (report, ok) = audit_report(&path);
+    assert!(ok, "gate should pass: {report:#}");
+    let context = workflow(&report, "context");
+    let drift_row = context["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["record_id"] == drift_id)
+        .expect("context workflow should classify the drift row");
+    assert_eq!(
+        drift_row["trust_class"], "source_fact",
+        "drift row must be classified by its target handle, not as `other`"
+    );
+    assert_eq!(
+        drift_row["primary_handle"], "src/ctx/lib.rs:10-20",
+        "drift row should carry its resolved target file/span"
+    );
+}
+
 // Review #3: scan-history graphs carry multiple temporal versions sharing one
 // stable record_id; a later span-less version must be counted, not hidden by an
 // earlier cited version, so the gate fails.

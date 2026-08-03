@@ -893,6 +893,28 @@ fn context_from_seeds<'a>(
     // below) and by `subsystem.rs`'s own `semantic_drift` section: a temporal
     // (scan-history) drift record survives its current-state tombstone, but a
     // retracted current-state one must not reappear as live evidence.
+    //
+    // The DriftsFrom source->target lookup is built once in a single O(n)
+    // pass rather than re-scanning `records` per drift record (which
+    // `drift_target_record_id` does, since it also serves `eg query drift`'s
+    // once-per-row callers): with D drift records over N total records this
+    // keeps the section O(D log N + N) instead of O(D * N).
+    let drifts_from_target: std::collections::BTreeMap<&str, &str> = records
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Edge {
+                label: EdgeLabel::DriftsFrom,
+                source,
+                target,
+                ..
+            } = r
+            {
+                Some((source.as_str(), target.as_str()))
+            } else {
+                None
+            }
+        })
+        .collect();
     let drift_history: Vec<&'a GraphRecord> = super::largest_semantic_drifts(records, usize::MAX)
         .into_iter()
         .filter(|record| {
@@ -908,7 +930,11 @@ fn context_from_seeds<'a>(
             if temporal.is_none() && tombstoned_ids.contains(id.as_str()) {
                 return false;
             }
-            symbol_ids.contains(super::drift_target_record_id(records, id, drift))
+            let target_id = drifts_from_target
+                .get(id.as_str())
+                .copied()
+                .unwrap_or(drift.target_record_id.as_str());
+            symbol_ids.contains(target_id)
         })
         .collect();
 
