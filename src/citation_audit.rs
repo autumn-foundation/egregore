@@ -1144,17 +1144,26 @@ fn classify_drift_row(
 }
 
 /// Precomputes every `SemanticDrift` record's classification once, keyed by
-/// its own record ID. `resolve_drift_target` (called via `classify_drift_row`)
-/// scans `records` internally, so calling it once per drift here — instead of
-/// once per drift from EACH of `drive_context` and `drive_subsystem` — halves
-/// the audit's total drift-resolution work: every drift record is classified
+/// `(record_id, temporal_key)` rather than record ID alone — a history/imported
+/// graph can carry several physical `SemanticDrift` versions sharing one stable
+/// record ID (issue #421 versioning), and `WorkflowBuilder` itself keys rows the
+/// same way to keep each version a distinct row. Keying this cache by ID only
+/// would let the last-iterated version's classification silently stand in for
+/// every other version's row, collapsing them together (or worse, deciding an
+/// earlier row is cited/uncited based on a later, unrelated version's target
+/// resolution). `resolve_drift_target` (called via `classify_drift_row`) scans
+/// `records` internally, so calling it once per drift here — instead of once
+/// per drift from EACH of `drive_context` and `drive_subsystem` — halves the
+/// audit's total drift-resolution work: every drift version is classified
 /// exactly once for the whole run, shared by both workflows.
 fn build_drift_classification_cache(
     records: &[GraphRecord],
-) -> BTreeMap<&str, (Classified, String)> {
+) -> BTreeMap<(&str, String), Classified> {
     records
         .iter()
-        .filter_map(|r| classify_drift_row(records, r).map(|entry| (r.id(), entry)))
+        .filter_map(|r| {
+            classify_drift_row(records, r).map(|(classified, tk)| ((r.id(), tk), classified))
+        })
         .collect()
 }
 
@@ -1515,7 +1524,7 @@ fn drive_semantic<'a>(records: &'a [GraphRecord], config: &AuditConfig) -> Workf
 
 fn drive_context<'a>(
     records: &'a [GraphRecord],
-    drift_cache: &BTreeMap<&str, (Classified, String)>,
+    drift_cache: &BTreeMap<(&str, String), Classified>,
 ) -> WorkflowBuilder<'a> {
     let mut builder = WorkflowBuilder::new("context", "source_fact", records);
     for name in symbol_names(records) {
@@ -1537,10 +1546,13 @@ fn drive_context<'a>(
         // their own ID (mirrors `drive_subsystem`'s `semantic_drift` handling).
         // Looked up from the shared `drift_cache` (built once for the whole
         // audit run) rather than re-resolved here, since `resolve_drift_target`
-        // scans `records` internally.
+        // scans `records` internally. Keyed by `(id, temporal_key)`, not id
+        // alone, so a physical version is matched to its OWN cached entry
+        // rather than whichever version the cache happened to build last.
         for drift_rec in &ctx.drift_history {
-            if let Some((classified, tk)) = drift_cache.get(drift_rec.id()) {
-                builder.push_classified(classified.clone(), tk.clone());
+            let tk = temporal_key(drift_rec);
+            if let Some(classified) = drift_cache.get(&(drift_rec.id(), tk.clone())) {
+                builder.push_classified(classified.clone(), tk);
             }
         }
         for unresolved in &ctx.unresolved {
@@ -1557,7 +1569,7 @@ fn drive_context<'a>(
 
 fn drive_subsystem<'a>(
     records: &'a [GraphRecord],
-    drift_cache: &BTreeMap<&str, (Classified, String)>,
+    drift_cache: &BTreeMap<(&str, String), Classified>,
 ) -> WorkflowBuilder<'a> {
     let mut builder = WorkflowBuilder::new("subsystem", "source_fact", records);
     for prefix in subsystem_prefixes(records) {
@@ -1580,8 +1592,9 @@ fn drive_subsystem<'a>(
         // as `eg query subsystem` renders them — not credited by their own ID.
         // Looked up from the shared `drift_cache`; see `drive_context`.
         for drift_rec in &ctx.semantic_drift {
-            if let Some((classified, tk)) = drift_cache.get(drift_rec.id()) {
-                builder.push_classified(classified.clone(), tk.clone());
+            let tk = temporal_key(drift_rec);
+            if let Some(classified) = drift_cache.get(&(drift_rec.id(), tk.clone())) {
+                builder.push_classified(classified.clone(), tk);
             }
         }
         for unresolved in &ctx.unresolved {
