@@ -1424,6 +1424,115 @@ fn fixture_context_seeded() -> (tempfile::TempDir, PathBuf) {
     (temp, path)
 }
 
+/// Extends [`fixture_context_seeded`] with two `SemanticDrift` records
+/// targeting `my_function` via `DriftsFrom` edges, for issue #108's
+/// `drift_history` section. Returns `(temp_dir, graph_path, small_drift_id,
+/// large_drift_id)`.
+fn fixture_context_seeded_with_drift() -> (tempfile::TempDir, PathBuf, String, String) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("context_seeded_drift.jsonl");
+
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "my_function"]);
+    let sym = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 80,
+            start_line: 10,
+            end_line: 20,
+        },
+        "my_function".to_owned(),
+        "Rust fn my_function at src/lib.rs:10".to_owned(),
+    );
+
+    let drift_small_id = stable_id(&["node", "SemanticDrift", "ctx_small"]);
+    let drift_large_id = stable_id(&["node", "SemanticDrift", "ctx_large"]);
+
+    let drift_small = GraphRecord::node(
+        drift_small_id.clone(),
+        NodeKind::SemanticDrift,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("my_function".to_owned()),
+        "small drift".to_owned(),
+    )
+    .with_semantic_drift(SemanticDriftMetadata {
+        embedding_model: EmbeddingModel {
+            provider: "test".to_owned(),
+            name: "test-model-v1".to_owned(),
+            version: "v1".to_owned(),
+            dim: 384,
+            content_hash: "fixture".to_owned(),
+        },
+        target_record_id: sym_id.clone(),
+        prior_record_id: sym_id.clone(),
+        before_git_commit: "aaaaaaaa".to_owned(),
+        after_git_commit: "bbbbbbbb".to_owned(),
+        before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+        metric_kind: MetricKind::CosineDistance,
+        score: 0.25,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
+    });
+
+    let drift_large = GraphRecord::node(
+        drift_large_id.clone(),
+        NodeKind::SemanticDrift,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("my_function".to_owned()),
+        "large drift".to_owned(),
+    )
+    .with_semantic_drift(SemanticDriftMetadata {
+        embedding_model: EmbeddingModel {
+            provider: "test".to_owned(),
+            name: "test-model-v1".to_owned(),
+            version: "v1".to_owned(),
+            dim: 384,
+            content_hash: "fixture".to_owned(),
+        },
+        target_record_id: sym_id.clone(),
+        prior_record_id: sym_id.clone(),
+        before_git_commit: "bbbbbbbb".to_owned(),
+        after_git_commit: "cccccccc".to_owned(),
+        before_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+        after_valid_time: "2026-01-03T00:00:00Z".to_owned(),
+        metric_kind: MetricKind::CosineDistance,
+        score: 0.9,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
+    });
+
+    let edge_small = GraphRecord::edge(
+        EdgeLabel::DriftsFrom,
+        drift_small_id.clone(),
+        sym_id.clone(),
+        Some("1.0".to_owned()),
+        "drifts from edge".to_owned(),
+    );
+    let edge_large = GraphRecord::edge(
+        EdgeLabel::DriftsFrom,
+        drift_large_id.clone(),
+        sym_id,
+        Some("1.0".to_owned()),
+        "drifts from edge".to_owned(),
+    );
+
+    let mut graph = Graph::new();
+    graph.push(sym);
+    graph.push(drift_small);
+    graph.push(drift_large);
+    graph.push(edge_small);
+    graph.push(edge_large);
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    (temp, path, drift_small_id, drift_large_id)
+}
+
 // ---------------------------------------------------------------------------
 // query context — happy path: structured JSON with all sections
 // ---------------------------------------------------------------------------
@@ -1486,6 +1595,16 @@ fn query_context_returns_structured_json_with_all_sections() {
         .as_array()
         .expect("verification_evidence array");
     assert!(!ver.is_empty(), "verification_evidence must not be empty");
+
+    // AC4 (issue #108): drift_history is always present, empty (not absent,
+    // not an error) when the fixture carries no SemanticDrift records.
+    let drift_history = parsed["drift_history"]
+        .as_array()
+        .expect("drift_history array");
+    assert!(
+        drift_history.is_empty(),
+        "drift_history must be empty when no drift records exist"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1661,6 +1780,108 @@ fn query_context_stable_ordering_across_repeated_calls() {
     assert_eq!(
         first, second,
         "context query output must be identical for repeated calls on the same fixture"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// query context — drift_history section (issue #108)
+// ---------------------------------------------------------------------------
+
+/// AC1 + AC2 + AC3: `drift_history` lists the symbol's own `SemanticDrift`
+/// records, score descending, each carrying the full documented field set.
+#[test]
+fn query_context_includes_drift_history_ordered_by_score_desc() {
+    let (_temp, graph, drift_small_id, drift_large_id) = fixture_context_seeded_with_drift();
+
+    let output = egregore()
+        .args(["query", "context", "my_function", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    let drift_history = parsed["drift_history"]
+        .as_array()
+        .expect("drift_history array");
+    assert_eq!(drift_history.len(), 2, "both drift records must surface");
+
+    // AC3: score descending, then record ID.
+    assert_eq!(drift_history[0]["record_id"], drift_large_id);
+    assert_eq!(drift_history[1]["record_id"], drift_small_id);
+    assert!(drift_history[0]["score"].as_f64().unwrap() > drift_history[1]["score"].as_f64().unwrap());
+
+    // AC2: each entry carries the documented field set, including the
+    // embedding_model identity block (parity with `eg query drift`).
+    let large = &drift_history[0];
+    assert_eq!(large["before_commit"], "bbbbbbbb");
+    assert_eq!(large["after_commit"], "cccccccc");
+    assert_eq!(large["before_valid_time"], "2026-01-02T00:00:00Z");
+    assert_eq!(large["after_valid_time"], "2026-01-03T00:00:00Z");
+    let embedding_model = &large["embedding_model"];
+    assert_eq!(embedding_model["provider"], "test");
+    assert_eq!(embedding_model["name"], "test-model-v1");
+    assert_eq!(embedding_model["version"], "v1");
+    assert_eq!(embedding_model["dim"], 384);
+    assert_eq!(embedding_model["content_hash"], "fixture");
+}
+
+/// AC5: drift entries must never be mixed into `observations`.
+#[test]
+fn query_context_drift_history_never_appears_in_observations() {
+    let (_temp, graph, drift_small_id, drift_large_id) = fixture_context_seeded_with_drift();
+
+    let output = egregore()
+        .args(["query", "context", "my_function", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    let observations = parsed["observations"]
+        .as_array()
+        .expect("observations array");
+    assert!(
+        !observations
+            .iter()
+            .any(|o| o["record_id"] == drift_small_id || o["record_id"] == drift_large_id),
+        "drift records must never appear in observations (AC5): {observations:?}"
+    );
+}
+
+/// AC3 / AC7 parity: `drift_history` ordering is byte-stable across repeated
+/// calls, the same guarantee already held for the other five sections.
+#[test]
+fn query_context_drift_history_stable_ordering_across_repeated_calls() {
+    let (_temp, graph, _small, _large) = fixture_context_seeded_with_drift();
+
+    let run = || {
+        let output = egregore()
+            .args(["query", "context", "my_function", "--graph"])
+            .arg(&graph)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(output).expect("utf8")
+    };
+
+    let first = run();
+    let second = run();
+    assert_eq!(
+        first, second,
+        "context query output (including drift_history) must be identical across repeated calls"
     );
 }
 

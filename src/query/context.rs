@@ -54,6 +54,12 @@ pub struct SymbolContext<'a> {
     /// `Verification`, `TestRun`, `CommandRun`, and `CommandEvidence` nodes
     /// linked to the symbol.
     pub verification_evidence: Vec<&'a GraphRecord>,
+    /// `SemanticDrift` records whose resolved target (via a `DriftsFrom` edge,
+    /// falling back to `target_record_id`) is one of the matched symbol's own
+    /// records (issue #108). Deterministic source-derived evidence — never
+    /// mixed into `observations`. Ordered score descending, then record ID,
+    /// matching [`super::largest_semantic_drifts`].
+    pub drift_history: Vec<&'a GraphRecord>,
     /// Evidence link targets referenced by agent-memory nodes that are absent
     /// from this store slice. Surfaced explicitly per AC5.
     pub unresolved: Vec<UnresolvedRef>,
@@ -873,6 +879,29 @@ fn context_from_seeds<'a>(
         verification_evidence.remove(sid);
     }
 
+    // Drift history (issue #108): SemanticDrift records whose resolved target
+    // (DriftsFrom edge, falling back to target_record_id) is one of the
+    // primary query nodes. Reusing `largest_semantic_drifts` — rather than
+    // re-deriving the ranking here — guarantees the exact same score-descending,
+    // record-ID-tiebreak order as `eg query drift` (AC3), and filtering it
+    // preserves that order. Deliberately NOT run through `classify_node`/the
+    // BFS above: `SemanticDrift` is not one of the five trust-separated
+    // sections and must never be mixed into `observations` (AC5).
+    let drift_history: Vec<&'a GraphRecord> = super::largest_semantic_drifts(records, usize::MAX)
+        .into_iter()
+        .filter(|record| {
+            let GraphRecord::Node {
+                id,
+                semantic_drift: Some(drift),
+                ..
+            } = record
+            else {
+                return false;
+            };
+            symbol_ids.contains(super::drift_target_record_id(records, id, drift))
+        })
+        .collect();
+
     // Resolve ID sets → sorted record slices.
     //
     // Using records.iter() (not by_id) captures ALL records matching each ID,
@@ -945,6 +974,7 @@ fn context_from_seeds<'a>(
         project_state: resolve(&project_state),
         artifacts: resolve(&artifacts),
         verification_evidence: resolve(&verification_evidence),
+        drift_history,
         unresolved: {
             let mut u = unresolved;
             u.sort_by(|a, b| {
@@ -1292,6 +1322,171 @@ mod reviewer_identity_tests {
             let again = symbol_context(&records, "foo");
             let ids: Vec<&str> = again.project_state.iter().map(|r| r.id()).collect();
             assert_eq!(ids, project_ids, "project_state must be byte-stable");
+        }
+    }
+}
+
+#[cfg(test)]
+mod drift_history_tests {
+    use super::*;
+    use crate::ir::{EmbeddingModel, MetricKind, SelectionBasis, SemanticDriftMetadata};
+
+    fn sym(name: &str) -> GraphRecord {
+        GraphRecord::node(
+            format!("codegraph:v5:sym-{name}"),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some(name.to_owned()),
+            format!("symbol {name}"),
+        )
+    }
+
+    fn drift_metadata(target_id: &str, score: f64) -> SemanticDriftMetadata {
+        SemanticDriftMetadata {
+            embedding_model: EmbeddingModel {
+                provider: "test".to_owned(),
+                name: "test-model".to_owned(),
+                version: "v1".to_owned(),
+                dim: 8,
+                content_hash: "unknown".to_owned(),
+            },
+            target_record_id: target_id.to_owned(),
+            prior_record_id: target_id.to_owned(),
+            before_git_commit: "aaaaaaa".to_owned(),
+            after_git_commit: "bbbbbbb".to_owned(),
+            before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+            metric_kind: MetricKind::CosineDistance,
+            score,
+            selection_threshold: 0.2,
+            selection_basis: SelectionBasis::ThresholdOnly,
+        }
+    }
+
+    fn drift_node(drift_id: &str, target_id: &str, score: f64) -> GraphRecord {
+        GraphRecord::node(
+            drift_id.to_owned(),
+            NodeKind::SemanticDrift,
+            None,
+            None,
+            None,
+            "drift".to_owned(),
+        )
+        .with_semantic_drift(drift_metadata(target_id, score))
+    }
+
+    fn drifts_from_edge(drift_id: &str, target_id: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::DriftsFrom,
+            drift_id.to_owned(),
+            target_id.to_owned(),
+            Some("1.0".to_owned()),
+            "drift edge".to_owned(),
+        )
+    }
+
+    /// AC1 + AC3: drift records whose resolved target is the matched symbol
+    /// surface in `drift_history`, ordered score descending then record ID.
+    #[test]
+    fn symbol_context_includes_drift_history_ordered_by_score_desc() {
+        let target = sym("foo");
+        let target_id = target.id().to_owned();
+
+        let small = drift_node("semantic:v1:small", &target_id, 0.2);
+        let large = drift_node("semantic:v1:large", &target_id, 0.9);
+        let edge_small = drifts_from_edge("semantic:v1:small", &target_id);
+        let edge_large = drifts_from_edge("semantic:v1:large", &target_id);
+
+        let records = vec![target, small, large, edge_small, edge_large];
+        let ctx = symbol_context(&records, "foo");
+
+        let ids: Vec<&str> = ctx.drift_history.iter().map(|r| r.id()).collect();
+        assert_eq!(
+            ids,
+            vec!["semantic:v1:large", "semantic:v1:small"],
+            "drift_history must be ordered score-descending: {ids:?}"
+        );
+    }
+
+    /// AC4: a symbol with no drift records returns an empty `drift_history`,
+    /// not an error, and does not change the no-match verdict.
+    #[test]
+    fn symbol_context_drift_history_empty_when_no_drift_records() {
+        let target = sym("bar");
+        let records = vec![target];
+        let ctx = symbol_context(&records, "bar");
+        assert!(ctx.drift_history.is_empty());
+        assert!(!ctx.is_no_match());
+    }
+
+    /// AC1: resolution falls back to `target_record_id` when no `DriftsFrom`
+    /// edge is present in the slice.
+    #[test]
+    fn symbol_context_drift_history_falls_back_to_target_record_id_without_edge() {
+        let target = sym("baz");
+        let target_id = target.id().to_owned();
+        let drift_rec = drift_node("semantic:v1:baz-drift", &target_id, 0.5);
+        let records = vec![target, drift_rec];
+        let ctx = symbol_context(&records, "baz");
+        let ids: Vec<&str> = ctx.drift_history.iter().map(|r| r.id()).collect();
+        assert_eq!(ids, vec!["semantic:v1:baz-drift"]);
+    }
+
+    /// Drift targeting an unrelated symbol must never bleed into this
+    /// symbol's `drift_history`.
+    #[test]
+    fn symbol_context_drift_history_excludes_drift_targeting_other_symbols() {
+        let foo = sym("foo");
+        let other = sym("other");
+        let other_id = other.id().to_owned();
+        let unrelated_drift = drift_node("semantic:v1:unrelated", &other_id, 0.99);
+        let records = vec![foo, other, unrelated_drift];
+        let ctx = symbol_context(&records, "foo");
+        assert!(ctx.drift_history.is_empty());
+    }
+
+    /// AC5: a `SemanticDrift` record is deterministic source-derived
+    /// evidence — it must never be classified into `observations`.
+    #[test]
+    fn symbol_context_drift_history_never_classified_as_observation() {
+        let target = sym("qux");
+        let target_id = target.id().to_owned();
+        let drift_rec = drift_node("semantic:v1:qux-drift", &target_id, 0.7);
+        let records = vec![target, drift_rec];
+        let ctx = symbol_context(&records, "qux");
+        assert!(!ctx.drift_history.is_empty());
+        assert!(
+            !ctx.observations
+                .iter()
+                .any(|r| r.id() == "semantic:v1:qux-drift"),
+            "drift record must never appear in observations (AC5)"
+        );
+    }
+
+    /// AC3 / AC7 parity: repeated calls return byte-identical ordering.
+    #[test]
+    fn symbol_context_drift_history_stable_ordering_across_repeated_calls() {
+        let target = sym("stable");
+        let target_id = target.id().to_owned();
+        let small = drift_node("semantic:v1:stable-small", &target_id, 0.3);
+        let large = drift_node("semantic:v1:stable-large", &target_id, 0.8);
+        let edge_small = drifts_from_edge("semantic:v1:stable-small", &target_id);
+        let edge_large = drifts_from_edge("semantic:v1:stable-large", &target_id);
+        let records = vec![target, small, large, edge_small, edge_large];
+
+        let first: Vec<&str> = symbol_context(&records, "stable")
+            .drift_history
+            .iter()
+            .map(|r| r.id())
+            .collect();
+        for _ in 0..5 {
+            let again: Vec<&str> = symbol_context(&records, "stable")
+                .drift_history
+                .iter()
+                .map(|r| r.id())
+                .collect();
+            assert_eq!(again, first, "drift_history must be byte-stable");
         }
     }
 }

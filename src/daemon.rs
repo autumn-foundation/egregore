@@ -10128,6 +10128,28 @@ fn context_linked_item_to_json(record: &GraphRecord) -> serde_json::Value {
         .unwrap_or_else(|| json!({ "record_id": record.id() }))
 }
 
+/// Builds one `drift_history` row from a `SemanticDrift` record (issue #108),
+/// matching the field set `eg query context`'s `ContextDrift` emits.
+fn context_drift_to_json(record: &GraphRecord) -> serde_json::Value {
+    let GraphRecord::Node {
+        id,
+        semantic_drift: Some(drift),
+        ..
+    } = record
+    else {
+        return json!({ "record_id": record.id() });
+    };
+    json!({
+        "record_id": id,
+        "score": drift.score,
+        "before_commit": drift.before_git_commit,
+        "after_commit": drift.after_git_commit,
+        "before_valid_time": drift.before_valid_time,
+        "after_valid_time": drift.after_valid_time,
+        "embedding_model": &drift.embedding_model,
+    })
+}
+
 struct ContextSections {
     source_facts: Vec<serde_json::Value>,
     topology_edges: Vec<serde_json::Value>,
@@ -10135,6 +10157,7 @@ struct ContextSections {
     project_state: Vec<serde_json::Value>,
     artifacts: Vec<serde_json::Value>,
     verification_evidence: Vec<serde_json::Value>,
+    drift_history: Vec<serde_json::Value>,
     unresolved: Vec<serde_json::Value>,
 }
 
@@ -10209,6 +10232,14 @@ fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) ->
         .collect();
     rem = rem.saturating_sub(verification_evidence.len());
 
+    let drift_history: Vec<_> = ctx
+        .drift_history
+        .iter()
+        .take(rem)
+        .map(|r| context_drift_to_json(r))
+        .collect();
+    rem = rem.saturating_sub(drift_history.len());
+
     let unresolved: Vec<_> = ctx
         .unresolved
         .iter()
@@ -10231,6 +10262,7 @@ fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) ->
         project_state,
         artifacts,
         verification_evidence,
+        drift_history,
         unresolved,
     }
 }
@@ -10453,6 +10485,7 @@ fn handle_verb_observations_for_symbol(
             "project_state": s.project_state,
             "artifacts": s.artifacts,
             "verification_evidence": s.verification_evidence,
+            "drift_history": s.drift_history,
             "unresolved": s.unresolved,
             "excluded": excluded,
         }),

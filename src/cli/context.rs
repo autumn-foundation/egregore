@@ -201,6 +201,13 @@ pub(crate) fn query_context_cmd(
     let (observations, excluded) =
         apply_supersession(sections.observations, &resolver, supersession);
 
+    let drift_history: Vec<ContextDrift<'_>> = ctx
+        .drift_history
+        .iter()
+        .copied()
+        .filter_map(context_drift)
+        .collect();
+
     let corpus_disclaimer = corpus_mode.disclaimer().to_owned();
 
     let response = ContextResponse {
@@ -213,6 +220,7 @@ pub(crate) fn query_context_cmd(
         project_state: sections.project_state,
         artifacts: sections.artifacts,
         verification_evidence: sections.verification_evidence,
+        drift_history,
         unresolved: sections.unresolved,
         excluded,
         corpus_mode: corpus_mode.as_str(),
@@ -223,6 +231,31 @@ pub(crate) fn query_context_cmd(
     let output = serde_json::to_string_pretty(&response).context("failed to serialize context")?;
     println!("{output}");
     Ok(())
+}
+
+/// Builds one `drift_history` row from a `SemanticDrift` record (issue #108).
+///
+/// Returns `None` for a non-drift record — defensive against a future caller
+/// passing the wrong slice; `ctx.drift_history` only ever contains
+/// `SemanticDrift` nodes by construction.
+pub(crate) fn context_drift(record: &GraphRecord) -> Option<ContextDrift<'_>> {
+    let GraphRecord::Node {
+        id,
+        semantic_drift: Some(drift),
+        ..
+    } = record
+    else {
+        return None;
+    };
+    Some(ContextDrift {
+        record_id: id,
+        score: drift.score,
+        before_commit: &drift.before_git_commit,
+        after_commit: &drift.after_git_commit,
+        before_valid_time: &drift.before_valid_time,
+        after_valid_time: &drift.after_valid_time,
+        embedding_model: &drift.embedding_model,
+    })
 }
 
 pub(crate) fn context_source_fact(record: &GraphRecord) -> Option<ContextSourceFact<'_>> {

@@ -23,20 +23,17 @@ pub fn largest_semantic_drifts(records: &[GraphRecord], limit: usize) -> Vec<&Gr
         .collect()
 }
 
-/// Resolves the repo relative path, name, and span of a drift target.
+/// Resolves the target record ID of a drift entry: a `DriftsFrom` edge whose
+/// source is `drift_id` takes precedence over the drift's own recorded
+/// `target_record_id` (which can go stale when the target is re-identified;
+/// see `query_drift_resolves_target_via_drifts_from_edge_when_target_record_id_is_stale`).
 #[must_use]
-pub fn resolve_drift_target<'a>(
+pub(super) fn drift_target_record_id<'a>(
     records: &'a [GraphRecord],
     drift_id: &str,
     drift: &'a SemanticDriftMetadata,
-    drift_path: Option<&'a str>,
-    drift_name: Option<&'a str>,
-) -> (
-    Option<&'a str>,
-    Option<&'a str>,
-    Option<crate::ir::SourceSpan>,
-) {
-    let target_id = records
+) -> &'a str {
+    records
         .iter()
         .find_map(|r| {
             let GraphRecord::Edge {
@@ -54,7 +51,23 @@ pub fn resolve_drift_target<'a>(
                 None
             }
         })
-        .unwrap_or(drift.target_record_id.as_str());
+        .unwrap_or(drift.target_record_id.as_str())
+}
+
+/// Resolves the repo relative path, name, and span of a drift target.
+#[must_use]
+pub fn resolve_drift_target<'a>(
+    records: &'a [GraphRecord],
+    drift_id: &str,
+    drift: &'a SemanticDriftMetadata,
+    drift_path: Option<&'a str>,
+    drift_name: Option<&'a str>,
+) -> (
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<crate::ir::SourceSpan>,
+) {
+    let target_id = drift_target_record_id(records, drift_id, drift);
 
     let has_temporal = records.iter().any(|r| {
         r.id() == target_id

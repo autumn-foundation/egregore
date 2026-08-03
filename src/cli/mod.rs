@@ -180,8 +180,8 @@ use crate::{
     freshness::{self, Freshness},
     identity,
     ir::{
-        CallResolution, EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SnapshotHead,
-        SourceSpan,
+        CallResolution, EdgeLabel, EmbeddingModel, EvidenceLink, Graph, GraphRecord, NodeKind,
+        SnapshotHead, SourceSpan,
     },
     link_evidence::{self, LinkOptions},
     local_project, query, scan_repository_history_with_override, scan_repository_with_exclusions,
@@ -4674,6 +4674,20 @@ pub(crate) struct ContextTopologyEdge<'a> {
     valid_time: Option<&'a str>,
 }
 
+/// One item in the `drift_history` section: a `SemanticDrift` record whose
+/// resolved target is one of the queried symbol's own records (issue #108).
+/// Deterministic source-derived evidence — never mixed into `observations`.
+#[derive(Serialize)]
+pub(crate) struct ContextDrift<'a> {
+    record_id: &'a str,
+    score: f64,
+    before_commit: &'a str,
+    after_commit: &'a str,
+    before_valid_time: &'a str,
+    after_valid_time: &'a str,
+    embedding_model: &'a EmbeddingModel,
+}
+
 /// One record excluded by a filter or temporal constraint.
 #[derive(Serialize)]
 pub(crate) struct ExcludedDiagnostic<'a> {
@@ -4704,6 +4718,10 @@ pub(crate) struct ContextResponse<'a> {
     project_state: Vec<ContextLinkedItem<'a>>,
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
+    /// `SemanticDrift` records targeting this symbol, score descending
+    /// (issue #108). Always present — an empty array, not an omitted field,
+    /// signals "no drift recorded" (AC4).
+    drift_history: Vec<ContextDrift<'a>>,
     unresolved: Vec<ContextUnresolved<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     excluded: Vec<ExcludedDiagnostic<'a>>,
