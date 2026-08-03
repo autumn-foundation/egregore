@@ -1814,7 +1814,9 @@ fn query_context_includes_drift_history_ordered_by_score_desc() {
     // AC3: score descending, then record ID.
     assert_eq!(drift_history[0]["record_id"], drift_large_id);
     assert_eq!(drift_history[1]["record_id"], drift_small_id);
-    assert!(drift_history[0]["score"].as_f64().unwrap() > drift_history[1]["score"].as_f64().unwrap());
+    assert!(
+        drift_history[0]["score"].as_f64().unwrap() > drift_history[1]["score"].as_f64().unwrap()
+    );
 
     // AC2: each entry carries the documented field set, including the
     // embedding_model identity block (parity with `eg query drift`).
