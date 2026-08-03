@@ -2057,3 +2057,100 @@ fn changes_range_picks_a_connected_pair() {
         "expected a parent-connected in-chain pair, got ({base}, {head})"
     );
 }
+
+// PR #497 Codex review: `build_drift_classification_cache` keyed its entries by
+// record ID alone. A history/imported graph can carry multiple physical
+// `SemanticDrift` versions sharing one stable record ID (issue #421
+// versioning); with an ID-only cache, both `drive_context` and
+// `drive_subsystem` looked up the SAME single cached classification/temporal
+// key for every physical version, so `WorkflowBuilder` — which keys rows by
+// `(record_id, temporal_key)` specifically to keep versions distinct — folded
+// every version into one row and let a later version's resolved handle stand
+// in for an earlier version's row.
+#[test]
+fn context_drift_history_keeps_distinct_temporal_versions_as_separate_rows() {
+    let sym_id = "codegraph:v1:sym_foo";
+    let drift_id = "semantic:v1:drift_foo";
+
+    let sym_v1 = symbol_version(sym_id, Some("src/lib.rs"), "c1");
+    let sym_v2 = symbol_version(sym_id, Some("src/lib2.rs"), "c2");
+
+    let drift_metadata = |after_commit: &str, score: f64| crate::ir::SemanticDriftMetadata {
+        embedding_model: crate::ir::EmbeddingModel {
+            provider: "test".to_owned(),
+            name: "test-model".to_owned(),
+            version: "v1".to_owned(),
+            dim: 8,
+            content_hash: "unknown".to_owned(),
+        },
+        target_record_id: sym_id.to_owned(),
+        prior_record_id: sym_id.to_owned(),
+        before_git_commit: "c0".to_owned(),
+        after_git_commit: after_commit.to_owned(),
+        before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+        metric_kind: crate::ir::MetricKind::CosineDistance,
+        score,
+        selection_threshold: 0.2,
+        selection_basis: crate::ir::SelectionBasis::ThresholdOnly,
+    };
+    let drift_temporal = |git_commit: &str, valid_time: &str| crate::ir::TemporalMetadata {
+        git_commit: git_commit.to_owned(),
+        git_parent_commits: Vec::new(),
+        valid_time: valid_time.to_owned(),
+        author_time: Some(valid_time.to_owned()),
+        observed_at: valid_time.to_owned(),
+        valid_time_source: None,
+    };
+
+    let drift_v1 = GraphRecord::node(
+        drift_id.to_owned(),
+        NodeKind::SemanticDrift,
+        None,
+        None,
+        None,
+        "drift".to_owned(),
+    )
+    .with_semantic_drift(drift_metadata("c1", 0.4))
+    .with_temporal(drift_temporal("c1", "2026-01-01T00:00:00Z"));
+    let drift_v2 = GraphRecord::node(
+        drift_id.to_owned(),
+        NodeKind::SemanticDrift,
+        None,
+        None,
+        None,
+        "drift".to_owned(),
+    )
+    .with_semantic_drift(drift_metadata("c2", 0.9))
+    .with_temporal(drift_temporal("c2", "2026-01-02T00:00:00Z"));
+
+    let records = vec![sym_v1, sym_v2, drift_v1, drift_v2];
+    let report = run_citation_audit(&records, &AuditConfig::default());
+    let context = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == "context")
+        .expect("context workflow present");
+
+    let drift_rows: Vec<&RowClassification> = context
+        .rows
+        .iter()
+        .filter(|r| r.record_id == drift_id)
+        .collect();
+    assert_eq!(
+        drift_rows.len(),
+        2,
+        "both physical SemanticDrift versions must be classified as distinct \
+         rows, never collapsed by an ID-only cache: {drift_rows:?}"
+    );
+    let handles: std::collections::BTreeSet<Option<String>> = drift_rows
+        .iter()
+        .map(|r| r.primary_handle.clone())
+        .collect();
+    assert_eq!(
+        handles.len(),
+        2,
+        "each version must keep its OWN resolved target handle, not borrow the \
+         other version's: {drift_rows:?}"
+    );
+}

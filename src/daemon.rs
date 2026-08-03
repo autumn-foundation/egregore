@@ -10128,6 +10128,56 @@ fn context_linked_item_to_json(record: &GraphRecord) -> serde_json::Value {
         .unwrap_or_else(|| json!({ "record_id": record.id() }))
 }
 
+/// Builds one `drift_history` row from a `SemanticDrift` record (issue #108),
+/// matching the field set `eg query context`'s `ContextDrift` emits, given its
+/// already-resolved target `(repo_relative_path, name, span)` — the same
+/// shape `graph_query::resolve_drift_target`/`resolve_drift_targets` return —
+/// so the citation audit's classification of this row matches what actually
+/// gets rendered. Callers resolve targets for the whole `drift_history` slice
+/// in one batched pass via `graph_query::resolve_drift_targets` (issue #497
+/// Codex review: resolving one row at a time made serialization O(D×N),
+/// enough to exceed the daemon's query budget on a large drift history)
+/// rather than calling `resolve_drift_target` here per row. Returns `None`
+/// for a non-drift record, mirroring the CLI's `context_drift` `filter_map` —
+/// `ctx.drift_history` only ever contains `SemanticDrift` nodes by
+/// construction, but a stub row would otherwise silently diverge from the
+/// CLI's shape if that invariant were ever broken.
+fn context_drift_to_json(
+    record: &GraphRecord,
+    resolved: (Option<&str>, Option<&str>, Option<crate::ir::SourceSpan>),
+) -> Option<serde_json::Value> {
+    let GraphRecord::Node {
+        id,
+        semantic_drift: Some(drift),
+        ..
+    } = record
+    else {
+        return None;
+    };
+    let (resolved_path, _resolved_name, resolved_span) = resolved;
+    let mut obj = serde_json::Map::new();
+    obj.insert("record_id".to_owned(), json!(id.as_str()));
+    obj.insert("score".to_owned(), json!(drift.score));
+    obj.insert("before_commit".to_owned(), json!(&drift.before_git_commit));
+    obj.insert("after_commit".to_owned(), json!(&drift.after_git_commit));
+    obj.insert(
+        "before_valid_time".to_owned(),
+        json!(&drift.before_valid_time),
+    );
+    obj.insert(
+        "after_valid_time".to_owned(),
+        json!(&drift.after_valid_time),
+    );
+    obj.insert("embedding_model".to_owned(), json!(&drift.embedding_model));
+    if let Some(p) = resolved_path {
+        obj.insert("repo_relative_path".to_owned(), json!(p));
+    }
+    if let Some(s) = resolved_span {
+        obj.insert("span".to_owned(), json!(s));
+    }
+    Some(serde_json::Value::Object(obj))
+}
+
 struct ContextSections {
     source_facts: Vec<serde_json::Value>,
     topology_edges: Vec<serde_json::Value>,
@@ -10135,10 +10185,15 @@ struct ContextSections {
     project_state: Vec<serde_json::Value>,
     artifacts: Vec<serde_json::Value>,
     verification_evidence: Vec<serde_json::Value>,
+    drift_history: Vec<serde_json::Value>,
     unresolved: Vec<serde_json::Value>,
 }
 
-fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) -> ContextSections {
+fn build_context_sections(
+    records: &[GraphRecord],
+    ctx: &graph_query::SymbolContext<'_>,
+    limit: usize,
+) -> ContextSections {
     let mut rem = limit;
 
     let source_facts: Vec<_> = ctx
@@ -10209,6 +10264,17 @@ fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) ->
         .collect();
     rem = rem.saturating_sub(verification_evidence.len());
 
+    let drift_history_records: Vec<&GraphRecord> =
+        ctx.drift_history.iter().take(rem).copied().collect();
+    let resolved_drift_targets =
+        graph_query::resolve_drift_targets(records, &drift_history_records);
+    let drift_history: Vec<_> = drift_history_records
+        .iter()
+        .zip(resolved_drift_targets)
+        .filter_map(|(r, resolved)| context_drift_to_json(r, resolved))
+        .collect();
+    rem = rem.saturating_sub(drift_history.len());
+
     let unresolved: Vec<_> = ctx
         .unresolved
         .iter()
@@ -10231,6 +10297,7 @@ fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) ->
         project_state,
         artifacts,
         verification_evidence,
+        drift_history,
         unresolved,
     }
 }
@@ -10435,7 +10502,7 @@ fn handle_verb_observations_for_symbol(
         );
     }
 
-    let s = build_context_sections(&ctx, limit);
+    let s = build_context_sections(&records, &ctx, limit);
 
     let resolver = crate::temporal_status::TemporalResolver::build(&records);
     let (observations, excluded) = apply_supersession_json(s.observations, &resolver, supersession);
@@ -10453,6 +10520,7 @@ fn handle_verb_observations_for_symbol(
             "project_state": s.project_state,
             "artifacts": s.artifacts,
             "verification_evidence": s.verification_evidence,
+            "drift_history": s.drift_history,
             "unresolved": s.unresolved,
             "excluded": excluded,
         }),
@@ -15060,5 +15128,61 @@ mod tests {
         assert!(!scan.idempotency_file_present);
         assert_eq!(scan.total_receipts, 0);
         assert!(scan.anomalies.is_empty());
+    }
+
+    /// `context_drift_to_json` (issue #108's daemon-side `drift_history` row
+    /// builder) must omit `repo_relative_path`/`span` rather than serialize
+    /// them as JSON `null` when the drift's target cannot be resolved to a
+    /// path/span — matching the CLI's `ContextDrift`
+    /// (`#[serde(skip_serializing_if = "Option::is_none")]`) so the two
+    /// transports agree byte-for-byte, including on absence.
+    #[test]
+    fn context_drift_to_json_omits_unresolved_path_and_span() {
+        let drift = crate::ir::SemanticDriftMetadata {
+            embedding_model: crate::ir::EmbeddingModel {
+                provider: "test".to_owned(),
+                name: "test-model".to_owned(),
+                version: "v1".to_owned(),
+                dim: 8,
+                content_hash: "unknown".to_owned(),
+            },
+            target_record_id: "codegraph:v5:does-not-exist".to_owned(),
+            prior_record_id: "codegraph:v5:does-not-exist".to_owned(),
+            before_git_commit: "aaaaaaa".to_owned(),
+            after_git_commit: "bbbbbbb".to_owned(),
+            before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+            metric_kind: crate::ir::MetricKind::CosineDistance,
+            score: 0.5,
+            selection_threshold: 0.2,
+            selection_basis: crate::ir::SelectionBasis::ThresholdOnly,
+        };
+        let drift_record = GraphRecord::node(
+            "semantic:v1:unresolved".to_owned(),
+            NodeKind::SemanticDrift,
+            None,
+            None,
+            None,
+            "drift".to_owned(),
+        )
+        .with_semantic_drift(drift);
+        let records = vec![drift_record.clone()];
+        let resolved = graph_query::resolve_drift_targets(&records, &[&drift_record])
+            .into_iter()
+            .next()
+            .expect("one resolved entry");
+
+        let value = context_drift_to_json(&drift_record, resolved).expect("drift row");
+        let obj = value.as_object().expect("object");
+        assert!(
+            !obj.contains_key("repo_relative_path"),
+            "unresolved path must be omitted, not null: {value}"
+        );
+        assert!(
+            !obj.contains_key("span"),
+            "unresolved span must be omitted, not null: {value}"
+        );
+        assert_eq!(obj["record_id"], "semantic:v1:unresolved");
+        assert_eq!(obj["score"], 0.5);
     }
 }

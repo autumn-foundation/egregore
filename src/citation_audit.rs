@@ -382,6 +382,7 @@ pub fn classify_record_external_with_provenance(
 // ---------------------------------------------------------------------------
 
 /// Outcome of classifying one record: the row plus an optional diagnostic.
+#[derive(Clone)]
 struct Classified {
     row: RowClassification,
     diagnostic: Option<(String, Option<String>)>,
@@ -1142,6 +1143,30 @@ fn classify_drift_row(
     Some((classified, temporal_key(drift_rec)))
 }
 
+/// Precomputes every `SemanticDrift` record's classification once, keyed by
+/// `(record_id, temporal_key)` rather than record ID alone — a history/imported
+/// graph can carry several physical `SemanticDrift` versions sharing one stable
+/// record ID (issue #421 versioning), and `WorkflowBuilder` itself keys rows the
+/// same way to keep each version a distinct row. Keying this cache by ID only
+/// would let the last-iterated version's classification silently stand in for
+/// every other version's row, collapsing them together (or worse, deciding an
+/// earlier row is cited/uncited based on a later, unrelated version's target
+/// resolution). `resolve_drift_target` (called via `classify_drift_row`) scans
+/// `records` internally, so calling it once per drift here — instead of once
+/// per drift from EACH of `drive_context` and `drive_subsystem` — halves the
+/// audit's total drift-resolution work: every drift version is classified
+/// exactly once for the whole run, shared by both workflows.
+fn build_drift_classification_cache(
+    records: &[GraphRecord],
+) -> BTreeMap<(&str, String), Classified> {
+    records
+        .iter()
+        .filter_map(|r| {
+            classify_drift_row(records, r).map(|(classified, tk)| ((r.id(), tk), classified))
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Input derivation (deterministic, from the record set)
 // ---------------------------------------------------------------------------
@@ -1497,7 +1522,10 @@ fn drive_semantic<'a>(records: &'a [GraphRecord], config: &AuditConfig) -> Workf
     }
 }
 
-fn drive_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+fn drive_context<'a>(
+    records: &'a [GraphRecord],
+    drift_cache: &BTreeMap<(&str, String), Classified>,
+) -> WorkflowBuilder<'a> {
     let mut builder = WorkflowBuilder::new("context", "source_fact", records);
     for name in symbol_names(records) {
         let ctx = symbol_context(records, name);
@@ -1513,6 +1541,20 @@ fn drive_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
             builder.push_record(record);
             builder.note_redaction(record);
         }
+        // Drift rows must be classified by their resolved target handle, exactly
+        // as `eg query context`/`eg query drift` render them — not credited by
+        // their own ID (mirrors `drive_subsystem`'s `semantic_drift` handling).
+        // Looked up from the shared `drift_cache` (built once for the whole
+        // audit run) rather than re-resolved here, since `resolve_drift_target`
+        // scans `records` internally. Keyed by `(id, temporal_key)`, not id
+        // alone, so a physical version is matched to its OWN cached entry
+        // rather than whichever version the cache happened to build last.
+        for drift_rec in &ctx.drift_history {
+            let tk = temporal_key(drift_rec);
+            if let Some(classified) = drift_cache.get(&(drift_rec.id(), tk.clone())) {
+                builder.push_classified(classified.clone(), tk);
+            }
+        }
         for unresolved in &ctx.unresolved {
             builder.add_diagnostic(
                 "unresolved_evidence_link".to_owned(),
@@ -1525,7 +1567,10 @@ fn drive_context(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
     builder
 }
 
-fn drive_subsystem(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
+fn drive_subsystem<'a>(
+    records: &'a [GraphRecord],
+    drift_cache: &BTreeMap<(&str, String), Classified>,
+) -> WorkflowBuilder<'a> {
     let mut builder = WorkflowBuilder::new("subsystem", "source_fact", records);
     for prefix in subsystem_prefixes(records) {
         let Ok(ctx) = subsystem_context(records, &prefix) else {
@@ -1545,9 +1590,11 @@ fn drive_subsystem(records: &[GraphRecord]) -> WorkflowBuilder<'_> {
         }
         // Drift rows must be classified by their resolved target handle, exactly
         // as `eg query subsystem` renders them — not credited by their own ID.
+        // Looked up from the shared `drift_cache`; see `drive_context`.
         for drift_rec in &ctx.semantic_drift {
-            if let Some((classified, tk)) = classify_drift_row(records, drift_rec) {
-                builder.push_classified(classified, tk);
+            let tk = temporal_key(drift_rec);
+            if let Some(classified) = drift_cache.get(&(drift_rec.id(), tk.clone())) {
+                builder.push_classified(classified.clone(), tk);
             }
         }
         for unresolved in &ctx.unresolved {
@@ -2371,12 +2418,15 @@ const NON_CODE_GATED: &[&str] = &[
 pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> CitationAuditReport {
     let repo_index = RepositoryIndex::build(records);
     let freshness_records = config.freshness_records.as_deref().unwrap_or(records);
+    // Shared by drive_context and drive_subsystem so every SemanticDrift
+    // record is resolved once for the whole audit run, not once per workflow.
+    let drift_cache = build_drift_classification_cache(records);
 
     let builders = vec![
         drive_candidates(records),
         drive_change_impact(records, &repo_index),
         drive_changes(records),
-        drive_context(records),
+        drive_context(records, &drift_cache),
         drive_drift(records),
         drive_error_context(records),
         drive_evidence_freshness(freshness_records),
@@ -2388,7 +2438,7 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         drive_memory(records),
         drive_policy(records),
         drive_semantic(records, config),
-        drive_subsystem(records),
+        drive_subsystem(records, &drift_cache),
         drive_symbol(records),
         drive_task(records),
         drive_who_imports(records),

@@ -11395,6 +11395,156 @@ fn observations_for_symbol_returns_cross_domain_context() {
     daemon.stop();
 }
 
+/// AC6 (issue #108): `observations_for_symbol` returns the same
+/// `drift_history` section as `eg query context`, ordered score descending,
+/// so daemon and CLI answers stay at parity.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn observations_for_symbol_includes_drift_history() {
+    const SYMBOL_ID: &str = "codegraph:v4:ofs-drift-symbol0000001";
+    const DRIFT_SMALL_ID: &str = "semantic:v1:ofs-drift-small00000001";
+    const DRIFT_LARGE_ID: &str = "semantic:v1:ofs-drift-large00000001";
+
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // ── seed codegraph: one Symbol ───────────────────────────────────────────
+    let cg_ingest = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ofs-drift-cg-ingest",
+            "agent_id": "ofs-test-agent",
+            "session_id": "ofs-test-session",
+            "idempotency_key": "ofs-drift-cg-key",
+            "domain": "codegraph",
+            "created_at": "2026-05-30T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": SYMBOL_ID,
+                    "kind": "Symbol",
+                    "schema_version": SCHEMA_VERSION,
+                    "repo_relative_path": "src/lib.rs",
+                    "name": "ofs_drift_fn",
+                    "symbol_kind": "fn",
+                    "span": {"start_byte": 0, "end_byte": 50,
+                             "start_line": 10, "end_line": 15},
+                    "summary": "fn ofs_drift_fn in src/lib.rs"
+                }]
+            }
+        }),
+    );
+    assert!(
+        cg_ingest.starts_with("HTTP/1.1 200"),
+        "codegraph symbol ingest must succeed, got {cg_ingest}"
+    );
+
+    // ── seed semantic: two SemanticDrift records + DriftsFrom edges ─────────
+    let sem_ingest = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ofs-drift-sem-ingest",
+            "agent_id": "ofs-test-agent",
+            "session_id": "ofs-test-session",
+            "idempotency_key": "ofs-drift-sem-key",
+            "domain": "semantic",
+            "created_at": "2026-05-30T00:00:00Z",
+            "payload": {
+                "records": [
+                    semantic_drift_json(DRIFT_SMALL_ID, SYMBOL_ID, SYMBOL_ID, 0.2),
+                    semantic_drift_json(DRIFT_LARGE_ID, SYMBOL_ID, SYMBOL_ID, 0.9),
+                    semantic_edge_json(
+                        "semantic:v1:ofs-drift-small-edge01",
+                        "DRIFTS_FROM",
+                        DRIFT_SMALL_ID,
+                        SYMBOL_ID
+                    ),
+                    semantic_edge_json(
+                        "semantic:v1:ofs-drift-large-edge01",
+                        "DRIFTS_FROM",
+                        DRIFT_LARGE_ID,
+                        SYMBOL_ID
+                    ),
+                    semantic_edge_json(
+                        "semantic:v1:ofs-drift-small-prior01",
+                        "DRIFTS_PRIOR",
+                        DRIFT_SMALL_ID,
+                        SYMBOL_ID
+                    ),
+                    semantic_edge_json(
+                        "semantic:v1:ofs-drift-large-prior01",
+                        "DRIFTS_PRIOR",
+                        DRIFT_LARGE_ID,
+                        SYMBOL_ID
+                    ),
+                ]
+            }
+        }),
+    );
+    assert!(
+        sem_ingest.starts_with("HTTP/1.1 200"),
+        "semantic drift ingest must succeed, got {sem_ingest}"
+    );
+
+    // ── call observations_for_symbol ──────────────────────────────────────────
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "ofs-drift-query",
+            "agent_id": "ofs-test-agent",
+            "verb": "observations_for_symbol",
+            "params": {"name": "ofs_drift_fn"}
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "observations_for_symbol must return 200, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], true, "response must be ok:true, got {body}");
+    let result = &body["result"];
+
+    let drift_history = result["drift_history"]
+        .as_array()
+        .expect("drift_history is array");
+    assert_eq!(
+        drift_history.len(),
+        2,
+        "both drift records must surface: {drift_history:?}"
+    );
+    assert_eq!(
+        drift_history[0]["record_id"], DRIFT_LARGE_ID,
+        "AC3: drift_history must be ordered score-descending"
+    );
+    assert_eq!(drift_history[1]["record_id"], DRIFT_SMALL_ID);
+    assert_eq!(drift_history[0]["embedding_model"]["provider"], "test");
+    assert_eq!(drift_history[0]["embedding_model"]["name"], "fixture-model");
+    assert_eq!(drift_history[0]["embedding_model"]["dim"], 384);
+    assert_eq!(
+        drift_history[0]["embedding_model"]["content_hash"],
+        "fixture-hash"
+    );
+    assert_eq!(drift_history[0]["before_commit"], "aaaaaaaa");
+    assert_eq!(drift_history[0]["after_commit"], "bbbbbbbb");
+
+    // The row must carry the same resolved target handle `eg query drift`
+    // renders, matching the CLI (Codex review: the citation audit classifies
+    // this row by its resolved path/span, so it must actually be rendered).
+    assert_eq!(drift_history[0]["repo_relative_path"], "src/lib.rs");
+    assert_eq!(drift_history[0]["span"]["start_line"], 10);
+    assert_eq!(drift_history[0]["span"]["end_line"], 15);
+
+    daemon.stop();
+}
+
 #[test]
 fn test_daemon_inspect_get_records_endpoint() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
