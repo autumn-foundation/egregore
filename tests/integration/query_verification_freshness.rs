@@ -15,7 +15,7 @@
 use std::{fs, path::PathBuf};
 
 use aletheia_egregore::{
-    EdgeLabel, EmbeddingModel, GraphRecord, MetricKind, NodeKind, SelectionBasis,
+    EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, MetricKind, NodeKind, SelectionBasis,
     SemanticDriftMetadata, SourceSpan, TemporalMetadata,
     ir::{Graph, VERIFICATION_SCHEMA_VERSION, stable_id, verification_stable_id},
 };
@@ -150,6 +150,21 @@ fn cite_edge(label: EdgeLabel, source: &str, target: &str) -> GraphRecord {
         None,
         "cites".to_owned(),
     )
+}
+
+/// A node-carried `EvidenceLink` (the second citation representation, as
+/// opposed to a standalone `GraphRecord::Edge`) citing `target` by relation.
+fn evidence_link(relation: &str, target: &str) -> EvidenceLink {
+    EvidenceLink {
+        target_record_id: Some(target.to_owned()),
+        target_domain: "codegraph".to_owned(),
+        relation: relation.to_owned(),
+        confidence: "1.0".to_owned(),
+        as_of_commit: None,
+        target_repo_relative_path: None,
+        target_span: None,
+        target_git_commit: None,
+    }
 }
 
 fn repo_node(name: &str) -> (String, GraphRecord) {
@@ -2392,4 +2407,93 @@ fn in_scope_artifact_fifo_is_refused_not_read() {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+#[test]
+fn node_carried_evidence_link_citation_is_classified_like_a_standalone_edge() {
+    // v1 cites src/a.rs ONLY via a node-carried EvidenceLink (no standalone
+    // GraphRecord::Edge) -- the second citation representation
+    // `query::verification_coverage` already reads (both graph edges and
+    // EvidenceLinks carried on a node). The file changed after the anchor
+    // commit, so the citation must be classified `stale` exactly as it
+    // would via a standalone TOUCHED_FILE edge; a graph carrying only this
+    // representation must not look like it has zero code citations.
+    let file_id = stable_id(&["node", "File", "src/a.rs"]);
+    let f1 = file_version(
+        &file_id,
+        "src/a.rs",
+        "v1 body",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let f2 = file_version(
+        &file_id,
+        "src/a.rs",
+        "v2 body",
+        "c2",
+        "2026-01-05T00:00:00Z",
+    );
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let ver = ver.with_evidence_links(vec![evidence_link("TOUCHED_FILE", &file_id)]);
+    let (_temp, path) = write_graph(vec![f1, f2, ver]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a node-carried EvidenceLink citation must be classified just like \
+         a standalone edge citation, not silently skipped"
+    );
+    assert_eq!(rows[0]["verdict"], "stale");
+    assert_eq!(rows[0]["cited_handle"]["relation"], "TOUCHED_FILE");
+}
+
+#[test]
+fn path_scope_matches_a_deleted_files_retained_handle() {
+    // src/deleted.rs existed, was cited by a verification record, and was
+    // later deleted (tombstoned). Scoping to its retained path must still
+    // resolve -- not report `scope_not_found` -- so its citation's
+    // `unresolved` verdict remains discoverable, e.g. via `--stale-only`.
+    let file_id = stable_id(&["node", "File", "src/deleted.rs"]);
+    let file = file_version(
+        &file_id,
+        "src/deleted.rs",
+        "body",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let tomb = tombstone_of(&file_id, "removed");
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::CIStatus,
+        Some("ci_status"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::TouchedFile, &v1, &file_id);
+    let (_temp, path) = write_graph(vec![file, tomb, ver, edge]);
+
+    let report = run(&path, &["src/deleted.rs", "--stale-only"]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a path scope for a deleted file must still surface its retained \
+         unresolved citation, not report scope_not_found"
+    );
+    assert_eq!(rows[0]["verdict"], "unresolved");
+    assert_eq!(rows[0]["triggering_handle"]["kind"], "handle_removed");
 }

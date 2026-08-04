@@ -69,16 +69,23 @@ enum ScopeResolution {
 /// and a name that exists only outside the selected repository would wrongly
 /// resolve at all.
 ///
-/// Name and path-prefix matching are further restricted to the SAME live
-/// code-handle set the core module's own citation classification uses
+/// Name matching is further restricted to the SAME live code-handle set the
+/// core module's own citation classification uses
 /// (`freshness::live_code_handle_ids`): the history-inclusive store this
 /// lane always reads can retain a tombstoned/superseded handle alongside a
 /// live one that happens to share a name, and without this a scope that
-/// uniquely names the LIVE handle would be wrongly reported `ambiguous_scope`
-/// (or match a dead handle no citation can ever target). An explicit record
-/// ID is deliberately exempt from this filter: it must keep resolving a
-/// historical/tombstoned handle directly, so scoping to it still surfaces
-/// that citation's `unresolved` verdict.
+/// uniquely names the LIVE handle would be wrongly reported `ambiguous_scope`.
+/// An explicit record ID is deliberately exempt from this filter: it must
+/// keep resolving a historical/tombstoned handle directly, so scoping to it
+/// still surfaces that citation's `unresolved` verdict. Path-prefix matching
+/// is exempt too, for the same reason record ID is: a path scope is
+/// inherently many-to-one (it can match several files/symbols at once), so
+/// there is no analogous "ambiguous name" failure mode to guard against, and
+/// gating it on liveness would hide a genuinely retained `unresolved`
+/// citation to a now-deleted file behind a false `scope_not_found` —
+/// `eg query verification-freshness src/deleted.rs --stale-only` must still
+/// surface that the deleted file's evidence went stale, not report the scope
+/// as unknown.
 fn resolve_scope(
     records: &[GraphRecord],
     repo_scope: Option<&str>,
@@ -122,12 +129,13 @@ fn resolve_scope(
         if id == scope {
             by_id.insert(id.clone());
         }
-        let is_live = live_ids.contains(id.as_str());
-        if is_live && name.as_deref() == Some(scope) {
+        if live_ids.contains(id.as_str()) && name.as_deref() == Some(scope) {
             by_name.insert(id.clone());
         }
-        if is_live
-            && let Some(path) = repo_relative_path
+        // No liveness gate here (see doc comment above): a path prefix must
+        // still find a now-deleted file's retained handle so its citation's
+        // `unresolved` verdict can surface under `--stale-only`.
+        if let Some(path) = repo_relative_path
             && query::path_is_under_prefix(path, scope)
         {
             by_path_prefix.insert(id.clone());

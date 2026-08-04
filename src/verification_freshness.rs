@@ -846,28 +846,57 @@ pub fn verification_freshness(
     let is_multi_repo_store = repo_index.repository_ids().len() > 1;
     let mut entries: Vec<VerificationFreshnessEntry> = Vec::new();
 
-    // Every code-citation edge whose source is a verification record,
-    // deduplicated to one (relation, target) pair per source: a re-ingested
-    // or history-inclusive-store-duplicated physical copy of the SAME edge
+    // Every code-citation relation whose source is a verification record,
+    // from BOTH representations (mirroring `query::verification_coverage`'s
+    // own dual-representation read, since this lane draws on the same
+    // evidence-link edge/citation registry #109 established): a standalone
+    // `GraphRecord::Edge`, and an `EvidenceLink` carried directly on the
+    // verification node's `evidence_links` field. A writer that mints one
+    // representation but not the other (or a manually-authored/agent
+    // graph using only node-carried links, with no synthesized edge) must
+    // still be evaluated -- otherwise its verification record looks like it
+    // has zero code citations and is silently skipped. Deduplicated to one
+    // (relation, target) pair per source: a re-ingested or
+    // history-inclusive-store-duplicated physical copy of the SAME edge
     // (same label/source/target ⇒ same stable edge ID, per
     // `GraphRecord::edge`) must classify as exactly one citation, never one
     // row per physical copy.
     let mut citations_by_source: BTreeMap<&str, BTreeSet<(&'static str, &str)>> = BTreeMap::new();
     for record in records {
-        if let GraphRecord::Edge {
-            id,
-            label,
-            source,
-            target,
-            ..
-        } = record
-            && is_code_citation_label(*label)
-            && !index.tombstone_by_deleted.contains_key(id.as_str())
-        {
-            citations_by_source
-                .entry(source.as_str())
-                .or_default()
-                .insert((label.as_str(), target.as_str()));
+        match record {
+            GraphRecord::Edge {
+                id,
+                label,
+                source,
+                target,
+                ..
+            } if is_code_citation_label(*label)
+                && !index.tombstone_by_deleted.contains_key(id.as_str()) =>
+            {
+                citations_by_source
+                    .entry(source.as_str())
+                    .or_default()
+                    .insert((label.as_str(), target.as_str()));
+            }
+            GraphRecord::Node {
+                id, evidence_links, ..
+            } if !index.tombstone_by_deleted.contains_key(id.as_str()) => {
+                for link in evidence_links.iter().flatten() {
+                    let Some(target) = link.target_record_id.as_deref() else {
+                        continue;
+                    };
+                    let Some(label) = EdgeLabel::from_relation(&link.relation) else {
+                        continue;
+                    };
+                    if is_code_citation_label(label) {
+                        citations_by_source
+                            .entry(id.as_str())
+                            .or_default()
+                            .insert((label.as_str(), target));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
