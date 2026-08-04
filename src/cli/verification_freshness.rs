@@ -217,34 +217,30 @@ pub(crate) fn query_verification_freshness_cmd(
     }
 
     let all = freshness::verification_freshness(records, repo_path);
-    // Repository scope: keep only records/citations attributable to the
-    // selected repository (or unattributable, matching the verification-coverage
-    // convention of treating unattributed verification records as in-scope).
+    // Repository scope: keep only rows with POSITIVE evidence of belonging
+    // to the selected repository. Never a lenient "we don't know, so show
+    // it under every scope" default: for a freshness verdict (unlike
+    // `verification_coverage`'s presence/absence partition, where hiding an
+    // unattributed record could hide real coverage) an unrelated repo's
+    // dangling/artifact/unattributed row showing up under every `--repo`
+    // scope is not conservative disclosure, it is actively misleading --
+    // and for the synthetic `source_artifact` row specifically it lets
+    // `--repo-path` hash the wrong repository's checkout outright.
     let all = match repo_scope {
         None => all,
         Some(repo_id) => {
             // A row whose OWN cited handle resolves to a definitive owner
             // (the common case: MENTIONS_SYMBOL/TOUCHED_FILE/FAILED_ON to a
             // live, attributed code node) is scoped precisely by that owner.
-            // Two row shapes carry NO definitive owner of their own and must
-            // borrow attribution from the SAME record's other citations
-            // instead of passing through under every `--repo` scope:
-            //   - the synthetic `source_artifact` citation (no
-            //     `target_record_id` at all; its owning verification record
-            //     is typically unattributed too, since no writer links a
-            //     TestRun/CIStatus node to a Repository) -- unhandled, this
-            //     would let `--repo-path` hash one repository's checkout
-            //     against another repository's TestRun;
-            //   - an `unresolved`/`unanchored` row whose target is absent or
-            //     itself unattributed -- unhandled, this attributes an
-            //     unrelated repository's dangling reference to every scope.
-            // Borrowed attribution requires a UNIQUE owner: a record citing
-            // code in two repositories must not resolve its ownerless rows
-            // to EITHER one (that would let each scope hash a different
-            // repository's checkout, or falsely narrow an ambiguous
-            // reference to one repo). With zero attributable citations
-            // anywhere, fall back to the record's own (usually absent)
-            // direct attribution -- the original lenient pass-through.
+            // Every other row shape -- the synthetic `source_artifact`
+            // citation (no `target_record_id` of its own), and an
+            // `unresolved`/`unanchored` row whose target is absent or
+            // itself unattributed -- borrows attribution from the SAME
+            // record's other citations instead, requiring a UNIQUE owner (a
+            // record citing code in two repositories must not resolve its
+            // ownerless rows to EITHER one). With no attributable citation
+            // anywhere -- an artifact-only or dangling-only record -- the
+            // row is excluded from scoped output entirely, never guessed.
             let mut ver_repo_owners: std::collections::BTreeMap<String, BTreeSet<String>> =
                 std::collections::BTreeMap::new();
             for e in &all {
@@ -264,26 +260,12 @@ pub(crate) fn query_verification_freshness_cmd(
                     {
                         return owner == repo_id;
                     }
-                    let owners = ver_repo_owners.get(e.verification_record_id.as_str());
-                    // A `source_artifact` row is NEVER let through on the
-                    // lenient "no attribution anywhere" default below: an
-                    // artifact-only record (e.g. `capture-tests` run
-                    // without `--graph`, carrying zero code citations) would
-                    // otherwise pass under EVERY `--repo` scope, letting
-                    // `--repo-path` hash an unrelated repository's checkout
-                    // and fabricate a verdict. Without a unique borrowed
-                    // owner, exclude it outright.
-                    if e.cited_handle.relation == "source_artifact" {
-                        return owners.is_some_and(|o| o.len() == 1 && o.contains(repo_id));
+                    if let Some(owner) = index.owner_of(&e.verification_record_id) {
+                        return owner == repo_id;
                     }
-                    if let Some(owners) = owners
-                        && !owners.is_empty()
-                    {
-                        return owners.len() == 1 && owners.contains(repo_id);
-                    }
-                    index
-                        .owner_of(&e.verification_record_id)
-                        .is_none_or(|o| o == repo_id)
+                    ver_repo_owners
+                        .get(e.verification_record_id.as_str())
+                        .is_some_and(|owners| owners.len() == 1 && owners.contains(repo_id))
                 })
                 .collect()
         }

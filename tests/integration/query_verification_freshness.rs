@@ -2004,3 +2004,41 @@ fn content_change_then_revert_is_still_detected_as_stale() {
     assert_eq!(rows[0]["triggering_handle"]["kind"], "content_change");
     assert_eq!(rows[0]["triggering_handle"]["after_git_commit"], "c2");
 }
+
+#[test]
+fn dangling_only_citation_with_no_attribution_excluded_from_every_repo_scope() {
+    // v1's ONLY citation targets an ID absent from the store entirely (no
+    // owner anywhere), and v1 itself carries no other citation to borrow
+    // attribution from. Under a --repo scope this row must never surface
+    // under ANY repository -- there is no positive evidence connecting it
+    // to one, so guessing "it belongs to whichever repo was asked for"
+    // would attribute the same dangling reference to every repository.
+    let (repo_a, repo_a_node) = repo_node("repo-a");
+    let missing_id = stable_id(&["node", "Symbol", "src/gone.rs", "ghost"]);
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "fail",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        None,
+        None,
+    );
+    let dangling_edge = cite_edge(EdgeLabel::FailedOn, &v1, &missing_id);
+    let (_temp, path) = write_graph(vec![repo_a_node, ver, dangling_edge]);
+
+    // Unscoped: the dangling citation appears normally.
+    let unscoped = run(&path, &[]);
+    assert_eq!(verdicts_for(&unscoped, &v1).len(), 1);
+
+    // Scoped to repo-a, with which this record has no relationship at all.
+    let scoped = run(&path, &["--repo", &repo_a]);
+    assert_eq!(
+        verdicts_for(&scoped, &v1).len(),
+        0,
+        "a dangling citation with zero attribution anywhere must never \
+         surface under any --repo scope"
+    );
+}
