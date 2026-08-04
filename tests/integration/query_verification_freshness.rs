@@ -3010,3 +3010,75 @@ fn commit_anchor_uses_the_target_commits_own_time_not_the_runs_recording_time() 
          is hidden and reported current"
     );
 }
+
+#[test]
+fn restoration_is_detected_by_producer_time_not_sorted_array_position() {
+    // widget is deleted (tombstoned) and then RESTORED (re-emitted as a
+    // live node) with a LATER producer_started_at. Because
+    // `record_type: "tombstone"` always sorts after `record_type: "node"`
+    // under Graph::to_jsonl's lexicographic sort ('n' < 't'), the tombstone
+    // physically lands AFTER the restoring node in the loaded slice
+    // regardless of true write order -- so array position alone would
+    // always misreport the handle as still deleted. The tombstone's/node's
+    // respective producer_started_at must correctly identify the
+    // restoration instead.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let deleted =
+        tombstone_of(&sym_id, "removed").with_producer(producer_at("2026-01-05T00:00:00Z"));
+    let restored = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    )
+    .with_producer(producer_at("2026-01-10T00:00:00Z"));
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![deleted, restored, ver, edge]);
+
+    // Sanity: confirm the JSONL really does sort the tombstone line AFTER
+    // the restoring node line -- otherwise this test wouldn't actually
+    // exercise the position-based-restoration bug the fix closes.
+    let contents = fs::read_to_string(&path).expect("read graph");
+    let lines: Vec<&str> = contents.lines().collect();
+    let tombstone_line = lines
+        .iter()
+        .position(|l| {
+            l.contains("\"record_type\":\"tombstone\"")
+                && l.contains(&format!("\"deleted_id\":\"{sym_id}\""))
+        })
+        .expect("tombstone line present");
+    let node_line = lines
+        .iter()
+        .position(|l| {
+            l.contains("\"record_type\":\"node\"") && l.contains(&format!("\"id\":\"{sym_id}\""))
+        })
+        .expect("restoring node line present");
+    assert!(
+        tombstone_line > node_line,
+        "expected the tombstone line to sort after the restoring node \
+         line, or this test doesn't exercise the bug: {lines:?}"
+    );
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["verdict"], "current",
+        "a delete-then-restore must be detected via producer time, not \
+         array position, so the restored handle is not reported unresolved"
+    );
+}

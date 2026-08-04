@@ -287,31 +287,44 @@ impl<'a> VerificationFreshnessIndex<'a> {
     fn build(records: &'a [GraphRecord]) -> Self {
         // First pass: restoration-aware tombstones (mirrors
         // `crate::evidence_freshness`: a delete followed by a later
-        // re-ingest of the same stable ID restores the handle).
+        // re-ingest of the same stable ID restores the handle). Both the
+        // "latest node/edge occurrence" and "latest tombstone occurrence"
+        // per ID, AND the final node-vs-tombstone restoration comparison,
+        // go through `producer_wins` -- never raw array position alone, or
+        // a genuinely restored handle over `--graph` would always compare
+        // as still-deleted (`"tombstone"` sorts after every `"node"` line
+        // by construction, so the tombstone's index would always beat the
+        // restoring node's).
         let mut last_record_idx: BTreeMap<&str, usize> = BTreeMap::new();
         let mut last_tombstone: BTreeMap<&str, (usize, &str)> = BTreeMap::new();
         for (idx, record) in records.iter().enumerate() {
             match record {
                 GraphRecord::Node { id, .. } | GraphRecord::Edge { id, .. } => {
-                    last_record_idx.insert(id.as_str(), idx);
+                    let wins = last_record_idx.get(id.as_str()).is_none_or(|&held_idx| {
+                        producer_wins(record, idx, &records[held_idx], held_idx)
+                    });
+                    if wins {
+                        last_record_idx.insert(id.as_str(), idx);
+                    }
                 }
                 GraphRecord::Tombstone { id, deleted_id, .. } => {
-                    last_tombstone
-                        .entry(deleted_id.as_str())
-                        .and_modify(|e| {
-                            if idx > e.0 {
-                                *e = (idx, id.as_str());
-                            }
-                        })
-                        .or_insert((idx, id.as_str()));
+                    let wins =
+                        last_tombstone
+                            .get(deleted_id.as_str())
+                            .is_none_or(|&(held_idx, _)| {
+                                producer_wins(record, idx, &records[held_idx], held_idx)
+                            });
+                    if wins {
+                        last_tombstone.insert(deleted_id.as_str(), (idx, id.as_str()));
+                    }
                 }
             }
         }
         let mut tombstone_by_deleted: BTreeMap<&str, &str> = BTreeMap::new();
         for (deleted_id, (t_idx, t_id)) in &last_tombstone {
-            let restored = last_record_idx
-                .get(deleted_id)
-                .is_some_and(|n_idx| n_idx > t_idx);
+            let restored = last_record_idx.get(deleted_id).is_some_and(|&n_idx| {
+                producer_wins(&records[n_idx], n_idx, &records[*t_idx], *t_idx)
+            });
             if !restored {
                 tombstone_by_deleted.insert(deleted_id, t_id);
             }
@@ -596,6 +609,32 @@ impl<'a> VerificationFreshnessIndex<'a> {
                     )
                 })
             })
+    }
+}
+
+/// True when `candidate` (at `candidate_idx`) should replace `held` (at
+/// `held_idx`) as the "latest" occurrence of some stable ID. Prefers
+/// `producer.producer_started_at` when BOTH sides carry one (a genuine
+/// content-derived ordering signal); falls back to array position
+/// (`candidate_idx > held_idx`) only when producer info isn't comparable on
+/// one or both sides.
+///
+/// Array position is NOT a valid ordering signal on its own for `--graph`:
+/// `Graph::to_jsonl` sorts serialized lines lexicographically by
+/// `record_type` first (`"edge"` < `"node"` < `"tombstone"`), so it reflects
+/// that content sort, never write chronology.
+fn producer_wins(
+    candidate: &GraphRecord,
+    candidate_idx: usize,
+    held: &GraphRecord,
+    held_idx: usize,
+) -> bool {
+    match (
+        candidate.producer().map(|p| p.producer_started_at.as_str()),
+        held.producer().map(|p| p.producer_started_at.as_str()),
+    ) {
+        (Some(cand_ts), Some(held_ts)) => time_cmp(cand_ts, held_ts) != std::cmp::Ordering::Less,
+        _ => candidate_idx > held_idx,
     }
 }
 
