@@ -152,6 +152,65 @@ fn cite_edge(label: EdgeLabel, source: &str, target: &str) -> GraphRecord {
     )
 }
 
+fn repo_node(name: &str) -> (String, GraphRecord) {
+    let id = stable_id(&["repository", "operator-override", name]);
+    let rec = GraphRecord::node(
+        id.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some(name.to_owned()),
+        format!("Repository {name}"),
+    );
+    (id, rec)
+}
+
+fn contains(source: &str, target: &str) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::Contains,
+        source.to_owned(),
+        target.to_owned(),
+        None,
+        "contains".to_owned(),
+    )
+}
+
+fn defines(source: &str, target: &str) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::Defines,
+        source.to_owned(),
+        target.to_owned(),
+        None,
+        "defines".to_owned(),
+    )
+}
+
+fn plain_file(path: &str) -> (String, GraphRecord) {
+    let id = stable_id(&["node", "File", path]);
+    let rec = GraphRecord::node(
+        id.clone(),
+        NodeKind::File,
+        Some(path.to_owned()),
+        Some(span(1, 100)),
+        Some(path.to_owned()),
+        format!("Source file {path}"),
+    );
+    (id, rec)
+}
+
+fn plain_symbol(path: &str, name: &str) -> (String, GraphRecord) {
+    let id = stable_id(&["node", "Symbol", path, name]);
+    let rec = GraphRecord::node(
+        id.clone(),
+        NodeKind::Symbol,
+        Some(path.to_owned()),
+        Some(span(1, 5)),
+        Some(name.to_owned()),
+        format!("Symbol {name}"),
+    );
+    (id, rec)
+}
+
 fn tombstone_of(deleted_id: &str, marker: &str) -> GraphRecord {
     GraphRecord::Tombstone {
         id: stable_id(&["tombstone", deleted_id, marker]),
@@ -1324,4 +1383,239 @@ fn graph_and_data_dir_are_mutually_exclusive() {
         .arg(&path)
         .assert()
         .failure();
+}
+
+// ---------------------------------------------------------------------------
+// External review regressions (Codex review on PR #498)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn symbol_absent_from_newest_scan_without_tombstone_is_unresolved() {
+    // A repeated current-tree `scan`/`refresh` never tombstones a deleted
+    // symbol; it simply stops appearing in the newest scan. `widget` exists
+    // only in the OLDER (non-temporal) snapshot; a later `Repository`
+    // snapshot proves a newer scan happened without re-emitting `widget`.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let widget_at_older_scan = GraphRecord::node(
+        sym_id.clone(),
+        NodeKind::Symbol,
+        Some("src/a.rs".to_owned()),
+        Some(span(10, 20)),
+        Some("widget".to_owned()),
+        "fn widget() {}".to_owned(),
+    )
+    .with_valid_time("2026-01-01T00:00:00Z", "test");
+    let (repo_id, _) = repo_node("solo");
+    let repo_at_newer_scan = GraphRecord::node(
+        repo_id,
+        NodeKind::Repository,
+        None,
+        None,
+        Some("solo".to_owned()),
+        "Repository solo".to_owned(),
+    )
+    .with_valid_time("2026-02-01T00:00:00Z", "test");
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![widget_at_older_scan, repo_at_newer_scan, ver, edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["verdict"], "unresolved",
+        "a symbol missing from the newest scan (no tombstone) must not be reported current/stale"
+    );
+}
+
+#[test]
+fn symbol_present_in_newest_scan_stays_resolvable() {
+    // Companion to the above: `widget` survives into the newer scan too, so
+    // the frontier logic must not over-prune a still-present symbol.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let widget_at_older_scan = GraphRecord::node(
+        sym_id.clone(),
+        NodeKind::Symbol,
+        Some("src/a.rs".to_owned()),
+        Some(span(10, 20)),
+        Some("widget".to_owned()),
+        "fn widget() {}".to_owned(),
+    )
+    .with_valid_time("2026-01-01T00:00:00Z", "test");
+    let widget_at_newer_scan = GraphRecord::node(
+        sym_id.clone(),
+        NodeKind::Symbol,
+        Some("src/a.rs".to_owned()),
+        Some(span(10, 20)),
+        Some("widget".to_owned()),
+        "fn widget() {}".to_owned(),
+    )
+    .with_valid_time("2026-02-01T00:00:00Z", "test");
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![widget_at_older_scan, widget_at_newer_scan, ver, edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["verdict"], "current");
+}
+
+#[test]
+fn artifact_row_excluded_from_repo_scope_without_attributable_citation() {
+    let (repo_a, repo_a_node) = repo_node("repo-a");
+    let (repo_b, repo_b_node) = repo_node("repo-b");
+    let (file_b, file_b_node) = plain_file("src/b.rs");
+
+    let temp_repo = tempfile::tempdir().expect("repo dir");
+    let artifact_rel = "ci/config.yml";
+    let artifact_abs = temp_repo.path().join(artifact_rel);
+    fs::create_dir_all(artifact_abs.parent().unwrap()).unwrap();
+    fs::write(&artifact_abs, b"bytes").unwrap();
+    let recorded_hash = blake3::hash(b"bytes").to_hex().to_string();
+
+    // v1 belongs to repo-b (its only real citation targets file_b, which
+    // repo-b contains) and also carries a source_artifact_hash/path.
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::CIStatus,
+        Some("ci_status"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        Some(artifact_rel),
+        Some(&recorded_hash),
+    );
+    let touched = cite_edge(EdgeLabel::TouchedFile, &v1, &file_b);
+    let (_temp, path) = write_graph(vec![
+        repo_a_node,
+        repo_b_node,
+        file_b_node,
+        contains(&repo_b, &file_b),
+        ver,
+        touched,
+    ]);
+
+    // Scoped to repo-a (the WRONG repository, but the one whose checkout is
+    // supplied via --repo-path): the artifact row must NOT appear -- it
+    // must never hash repo-a's filesystem for a TestRun that belongs to
+    // repo-b.
+    let report_a = run(
+        &path,
+        &[
+            "--repo",
+            &repo_a,
+            "--repo-path",
+            temp_repo.path().to_str().unwrap(),
+        ],
+    );
+    let artifact_rows_a: Vec<&Value> = verdicts_for(&report_a, &v1)
+        .into_iter()
+        .filter(|r| r["cited_handle"]["relation"] == "source_artifact")
+        .collect();
+    assert_eq!(
+        artifact_rows_a.len(),
+        0,
+        "an artifact row must never surface under an unrelated repository's scope"
+    );
+
+    // Scoped to repo-b (the record's real repository): the artifact row is
+    // correctly included.
+    let report_b = run(
+        &path,
+        &[
+            "--repo",
+            &repo_b,
+            "--repo-path",
+            temp_repo.path().to_str().unwrap(),
+        ],
+    );
+    let artifact_rows_b: Vec<&Value> = verdicts_for(&report_b, &v1)
+        .into_iter()
+        .filter(|r| r["cited_handle"]["relation"] == "source_artifact")
+        .collect();
+    assert_eq!(artifact_rows_b.len(), 1);
+}
+
+#[test]
+fn scope_resolution_is_confined_to_the_selected_repository() {
+    let (repo_a, repo_a_node) = repo_node("repo-a");
+    let (repo_b, repo_b_node) = repo_node("repo-b");
+    let (file_a, file_a_node) = plain_file("src/a.rs");
+    let (file_b, file_b_node) = plain_file("src/b.rs");
+    // Same symbol NAME in both repositories.
+    let (sym_a, sym_a_node) = plain_symbol("src/a.rs", "run");
+    let (sym_b, sym_b_node) = plain_symbol("src/b.rs", "run");
+
+    let (v1, ver1) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        None,
+        None,
+    );
+    let e1 = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_a);
+    let (v2, ver2) = ver_node(
+        "v2",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        None,
+        None,
+    );
+    let e2 = cite_edge(EdgeLabel::MentionsSymbol, &v2, &sym_b);
+
+    let (_temp, path) = write_graph(vec![
+        repo_a_node,
+        repo_b_node,
+        file_a_node,
+        file_b_node,
+        sym_a_node,
+        sym_b_node,
+        contains(&repo_a, &file_a),
+        defines(&file_a, &sym_a),
+        contains(&repo_b, &file_b),
+        defines(&file_b, &sym_b),
+        ver1,
+        e1,
+        ver2,
+        e2,
+    ]);
+
+    // Without a --repo scope, "run" is genuinely ambiguous (exists in both
+    // repositories).
+    run_raw(&path, &["run"]).failure().code(1);
+
+    // Scoped to repo-a, "run" is UNIQUE within that repository and must
+    // resolve -- not be rejected as ambiguous just because a same-named
+    // symbol exists elsewhere.
+    let report = run(&path, &["run", "--repo", &repo_a]);
+    let rows: Vec<&Value> = report["verdicts"].as_array().unwrap().iter().collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["verification_record_id"], v1);
 }

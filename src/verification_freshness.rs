@@ -70,9 +70,11 @@
 //! # Known limitations
 //!
 //! Liveness (for the `unresolved` verdict) uses a store-wide tip-commit
-//! frontier, not the per-repository scoping issue #85 built up over several
-//! follow-up rounds (#203/#204/#454/#559). In a shared multi-repository store
-//! where two repositories' histories share a commit SHA, this can
+//! frontier AND a store-wide non-temporal scan frontier, not the
+//! per-repository scoping issue #85 built up over several follow-up rounds
+//! (#203/#204/#454/#559). In a shared multi-repository store where two
+//! repositories' histories share a commit SHA, or where two repositories'
+//! current-tree scans were taken at different times, this can
 //! under/over-prune; scope a query with `--repo` to a single repository to
 //! avoid it. Staleness ordering compares recorded valid-time instants, not a
 //! commit-ancestry DAG walk, so a rebase that backdates a descendant commit
@@ -364,6 +366,34 @@ impl<'a> VerificationFreshnessIndex<'a> {
         }
         let tips: BTreeSet<&str> = all_commits.difference(&parent_commits).copied().collect();
 
+        // Store-wide non-temporal SCAN frontier (documented limitation: not
+        // per-repository scoped, mirroring the tip-commit frontier above).
+        // A repeated current-tree `scan`/`refresh` re-emits every current
+        // handle with a node-level `valid_time` but no commit and no
+        // `Tombstone` when a handle is deleted between two scans, so
+        // WITHOUT this a citation to code deleted in a later scan would be
+        // reported `current`/`stale` instead of `unresolved`. The newest
+        // valid_time among non-temporal code handles AND `Repository` node
+        // snapshots is the frontier (folding in the repository node's own
+        // valid_time so an empty latest scan -- the last handle deleted --
+        // still advances it).
+        let mut scan_frontier: Option<&str> = None;
+        for record in records {
+            if let GraphRecord::Node {
+                temporal: None,
+                kind,
+                ..
+            } = record
+                && (is_code_handle_kind(*kind) || matches!(kind, NodeKind::Repository))
+                && let Some(vt) = version_valid(record)
+            {
+                scan_frontier = Some(match scan_frontier {
+                    Some(cur) if time_cmp(vt, cur) != std::cmp::Ordering::Greater => cur,
+                    _ => vt,
+                });
+            }
+        }
+
         let mut live_code_by_id: BTreeMap<&str, Vec<&GraphRecord>> = BTreeMap::new();
         for record in records {
             if let GraphRecord::Node { id, kind, .. } = record
@@ -374,20 +404,23 @@ impl<'a> VerificationFreshnessIndex<'a> {
                 live_code_by_id.entry(id.as_str()).or_default().push(record);
             }
         }
-        // Prune to the frontier: a purely commit-anchored handle is live
-        // only when it has a version at a tip commit; a non-temporal
-        // (current-tree) version always keeps the handle live. With no tip
-        // information at all there is nothing to prune against.
-        if !tips.is_empty() {
-            live_code_by_id.retain(|_, versions| {
-                versions.iter().any(|r| match r {
-                    GraphRecord::Node {
-                        temporal: Some(t), ..
-                    } => tips.contains(t.git_commit.as_str()),
-                    _ => true,
-                })
-            });
-        }
+        // Prune to the frontier on each version's OWN axis: a
+        // commit-anchored version is live only at a tip commit (empty tips
+        // ⇒ nothing to prune against on that axis); a non-temporal version
+        // is live only at the newest scan (no scan_frontier ⇒ nothing to
+        // prune against on that axis). A handle with EITHER axis satisfied
+        // by any of its versions stays live.
+        live_code_by_id.retain(|_, versions| {
+            versions.iter().any(|r| match r {
+                GraphRecord::Node {
+                    temporal: Some(t), ..
+                } => tips.is_empty() || tips.contains(t.git_commit.as_str()),
+                _ => scan_frontier.is_none_or(|frontier| {
+                    version_valid(r)
+                        .is_some_and(|vt| time_cmp(vt, frontier) == std::cmp::Ordering::Equal)
+                }),
+            })
+        });
 
         let mut drifts_by_prior: BTreeMap<&str, Vec<(&str, &SemanticDriftMetadata)>> =
             BTreeMap::new();

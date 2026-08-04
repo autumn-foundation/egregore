@@ -60,7 +60,20 @@ enum ScopeResolution {
 /// Resolves an optional `scope` handle (record ID, exact `Symbol`/`File`
 /// name, or a segment-aware repo-relative path prefix) against the code
 /// handles present in `records`.
-fn resolve_scope(records: &[GraphRecord], scope: Option<&str>) -> ScopeResolution {
+///
+/// When `repo_scope` is set, candidates are pre-filtered to that repository
+/// (mirroring `verification_coverage`'s strict `code_in_scope` convention: no
+/// unattributed-code fallback, since code handles ARE normally attributed) —
+/// otherwise a symbol name unique within the selected repository but
+/// duplicated in another repository would be wrongly reported `ambiguous`,
+/// and a name that exists only outside the selected repository would wrongly
+/// resolve at all.
+fn resolve_scope(
+    records: &[GraphRecord],
+    repo_scope: Option<&str>,
+    index: &query::RepositoryIndex,
+    scope: Option<&str>,
+) -> ScopeResolution {
     let Some(scope) = scope else {
         return ScopeResolution::None;
     };
@@ -89,6 +102,9 @@ fn resolve_scope(records: &[GraphRecord], scope: Option<&str>) -> ScopeResolutio
             kind,
             crate::ir::NodeKind::Symbol | crate::ir::NodeKind::File
         ) {
+            continue;
+        }
+        if repo_scope.is_some_and(|r| index.owner_of(id) != Some(r)) {
             continue;
         }
         if id == scope {
@@ -151,7 +167,8 @@ pub(crate) fn query_verification_freshness_cmd(
     limit: Option<usize>,
     format: OutputFormat,
 ) -> Result<()> {
-    let scope_resolution = resolve_scope(records, scope);
+    let index = query::RepositoryIndex::build(records);
+    let scope_resolution = resolve_scope(records, repo_scope, &index, scope);
     let scope_error_code = match &scope_resolution {
         ScopeResolution::NotFoundPath => Some("scope_not_found"),
         ScopeResolution::NoMatch => Some("no_match"),
@@ -192,9 +209,35 @@ pub(crate) fn query_verification_freshness_cmd(
     let all = match repo_scope {
         None => all,
         Some(repo_id) => {
-            let index = query::RepositoryIndex::build(records);
+            // The synthetic `source_artifact` citation carries no
+            // `target_record_id` of its own, and its owning verification
+            // record is typically unattributed too (no writer links a
+            // TestRun/CIStatus node to a Repository) -- so neither of the
+            // ordinary attribution checks below can place it. Left
+            // unhandled, EVERY repository's artifact row would pass through
+            // under every `--repo` scope, letting `--repo-path` hash one
+            // repository's checkout against another repository's TestRun.
+            // Attribute it instead via the SAME record's other (real) code
+            // citations; with none available, exclude it rather than guess.
+            let mut ver_repo_owners: std::collections::BTreeMap<String, BTreeSet<String>> =
+                std::collections::BTreeMap::new();
+            for e in &all {
+                if let Some(target) = e.cited_handle.target_record_id.as_deref()
+                    && let Some(owner) = index.owner_of(target)
+                {
+                    ver_repo_owners
+                        .entry(e.verification_record_id.clone())
+                        .or_default()
+                        .insert(owner.to_owned());
+                }
+            }
             all.into_iter()
                 .filter(|e| {
+                    if e.cited_handle.relation == "source_artifact" {
+                        return ver_repo_owners
+                            .get(e.verification_record_id.as_str())
+                            .is_some_and(|owners| owners.contains(repo_id));
+                    }
                     let ver_ok = index
                         .owner_of(&e.verification_record_id)
                         .is_none_or(|o| o == repo_id);
