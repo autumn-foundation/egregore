@@ -113,6 +113,8 @@ pub mod token_cost;
 pub mod traj;
 /// Pre-ingest referential-integrity validation for graph JSONL (issue #103).
 pub mod validate;
+/// Evidence-freshness verdicts for verification records (issue #111).
+pub mod verification_freshness;
 /// Transcripts watcher.
 pub mod watch;
 

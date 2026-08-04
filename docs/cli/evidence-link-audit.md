@@ -5,8 +5,10 @@ record. Local-first, read-only, no network, no embeddings, no daemon.
 
 > A clean gate proves every cross-domain evidence edge resolves to a **live**
 > record; it is NOT proof the cited code still matches current source (that is
-> drift — #111/#160), and NOT proof the store is otherwise correct. "Broken" here
-> means the target is **absent** or **tombstoned**, never "drifted".
+> drift — see `eg query verification-freshness`, issue #111, and the on-demand
+> single-handle verdict tracked in #160), and NOT proof the store is otherwise
+> correct. "Broken" here means the target is **absent** or **tombstoned**,
+> never "drifted".
 
 Egregore's value is that evidence links connect code, agent memory, tasks,
 artifacts, and verification *without letting guesses masquerade as source truth*.

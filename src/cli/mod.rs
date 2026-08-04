@@ -70,6 +70,7 @@ mod unsafe_sites;
 mod unwrap_expect;
 mod validate;
 mod verification_coverage;
+mod verification_freshness;
 mod watch;
 mod who;
 // Appended (issue #225); kept at the end to minimize cross-lane merge conflicts.
@@ -148,6 +149,7 @@ pub(crate) use unsafe_sites::*;
 pub(crate) use unwrap_expect::*;
 pub(crate) use validate::*;
 pub(crate) use verification_coverage::*;
+pub(crate) use verification_freshness::*;
 pub(crate) use watch::*;
 // Appended (issue #225); kept at the end to minimize cross-lane merge conflicts.
 pub(crate) use path::*;
@@ -2990,6 +2992,60 @@ pub(crate) enum QuerySubcommand {
         #[arg(long)]
         at: Option<String>,
         /// Maximum rows per bucket; excess rows are truncated (deterministic
+        /// sort order preserved) with a `results_truncated` diagnostic.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Flag verification records whose cited code has drifted since the run (issue #111).
+    ///
+    /// For every `TestRun` / `CIStatus` / `BenchmarkRun` / `CoverageReport` /
+    /// `ProofResult` record citing code via `FAILED_ON` / `MENTIONS_SYMBOL` /
+    /// `TOUCHED_FILE`, returns a per-citation **freshness verdict**: `current`,
+    /// `stale`, `unresolved`, or `unanchored`. A `stale` / `unresolved` verdict
+    /// is a **freshness lead, never a re-judgment of pass/fail** — it states
+    /// only that the verified basis moved, never that the recorded `status` is
+    /// now wrong. Strictly read-only and deterministic; reuses existing drift
+    /// records, content hashes, and temporal anchors. Never rewrites,
+    /// hides, or re-stamps a code fact or a verification record's `status`.
+    ///
+    /// Distinct from `eg query evidence-freshness` (issue #85), which ages
+    /// agent-memory observations, not verification evidence.
+    ///
+    /// Exit codes:
+    ///   0 — verdicts returned (including the explicit "nothing stale" /
+    ///       "no verification records" diagnostics -- never a silent empty
+    ///       success).
+    ///   1 — invalid --limit, ambiguous --repo or scope selector, or
+    ///       --graph/--data-dir usage errors.
+    ///   2 — scope handle matches no in-store code item.
+    ///
+    /// Documented in `docs/cli/verification-freshness.md`.
+    VerificationFreshness {
+        /// Optional scope handle: record ID, exact symbol name, or a
+        /// repo-relative path prefix (segment-aware).
+        scope: Option<String>,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict verdicts to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Working-tree root to re-hash a record's `source_artifact_path`
+        /// against its recorded `source_artifact_hash` (AC2). Read-only;
+        /// omitted entirely when not supplied -- never assumed to match.
+        #[arg(long)]
+        repo_path: Option<PathBuf>,
+        /// Return only stale/unresolved records. An empty result is reported
+        /// with a stable diagnostic, never silently (AC7).
+        #[arg(long)]
+        stale_only: bool,
+        /// Maximum verdict rows; excess rows are truncated (deterministic
         /// sort order preserved) with a `results_truncated` diagnostic.
         #[arg(long)]
         limit: Option<usize>,
@@ -6805,6 +6861,55 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 scope.as_deref(),
                 limit,
                 at.is_some(),
+                format,
+            )
+        }
+        QuerySubcommand::VerificationFreshness {
+            scope,
+            graph,
+            data_dir,
+            repo,
+            repo_path,
+            stale_only,
+            limit,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic.
+            if let Some(limit) = limit
+                && (limit == 0
+                    || limit > crate::verification_freshness::VERIFICATION_FRESHNESS_MAX_LIMIT)
+            {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": crate::verification_freshness::VERIFICATION_FRESHNESS_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {}",
+                        crate::verification_freshness::VERIFICATION_FRESHNESS_MAX_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            // The comparison needs the code version current AT the anchor
+            // (possibly superseded), so this lane always reads the
+            // history-inclusive view -- like `eg query evidence-freshness`
+            // (issue #85) and unlike the corpus-mode-flipped lanes, since a
+            // superseded pre-drift version must stay in scope to diff
+            // against. `--data-dir` reads a throwaway copy (strictly
+            // read-only, AC9).
+            let records = load_evidence_freshness_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_verification_freshness_cmd(
+                &records,
+                selected.as_deref(),
+                scope.as_deref(),
+                repo_path.as_deref(),
+                stale_only,
+                limit,
                 format,
             )
         }
