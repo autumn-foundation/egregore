@@ -373,6 +373,109 @@ fn drift_record_after_anchor_is_stale_with_drift_trigger() {
 }
 
 #[test]
+fn drifts_prior_edge_recovers_drift_with_stale_prior_record_id_field() {
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let unrelated_id = stable_id(&["node", "Symbol", "src/other.rs", "unrelated"]);
+    let drift_id = "semantic:v1:drift2".to_owned();
+    // The metadata's own `prior_record_id` is stale/mismatched -- points at
+    // an unrelated symbol -- so only the DRIFTS_PRIOR edge (drift -> widget)
+    // can recover this as a trigger for `widget`'s citation.
+    let drift = drift_record(
+        &drift_id,
+        &unrelated_id,
+        &sym_id,
+        "c1",
+        "c2",
+        "2026-01-01T00:00:00Z",
+        "2026-01-10T00:00:00Z",
+    );
+    let drifts_prior_edge = GraphRecord::edge(
+        EdgeLabel::DriftsPrior,
+        drift_id.clone(),
+        sym_id.clone(),
+        None,
+        "drifts prior".to_owned(),
+    );
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![symbol, drift, drifts_prior_edge, ver, edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["verdict"], "stale",
+        "the DRIFTS_PRIOR edge must recover the trigger even though \
+         prior_record_id points elsewhere"
+    );
+    assert_eq!(rows[0]["triggering_handle"]["kind"], "drift_record");
+    assert_eq!(rows[0]["triggering_handle"]["drift_record_id"], drift_id);
+}
+
+#[test]
+fn retracted_supersedes_source_never_hides_a_still_live_target() {
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let superseder_id = "agent_memory:v1:superseder".to_owned();
+    let supersedes_edge = GraphRecord::edge(
+        EdgeLabel::Supersedes,
+        superseder_id.clone(),
+        sym_id.clone(),
+        None,
+        "supersedes".to_owned(),
+    );
+    // The superseding node itself is later retracted -- its SUPERSEDES claim
+    // must not survive it, so `widget` stays live.
+    let retraction = tombstone_of(&superseder_id, "retracted");
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![symbol, supersedes_edge, retraction, ver, edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["verdict"], "current",
+        "a retracted SUPERSEDES source must not hide a still-live target as unresolved"
+    );
+}
+
+#[test]
 fn tombstoned_target_is_unresolved_with_handle_removed_trigger() {
     let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
     let symbol = symbol_version(
@@ -738,6 +841,73 @@ fn artifact_hash_never_checked_without_repo_path() {
     // record contributes zero rows -- never a fabricated verdict.
     let report = run(&path, &[]);
     assert_eq!(verdicts_for(&report, &v1).len(), 0);
+}
+
+#[test]
+fn artifact_path_escaping_repo_root_via_dotdot_is_never_read() {
+    let repo_root = tempfile::tempdir().expect("repo root");
+    // A file OUTSIDE repo_root, as a sibling directory entry.
+    let secret_name = format!("secret-{}.txt", std::process::id());
+    let secret_path = repo_root.path().parent().unwrap().join(&secret_name);
+    fs::write(&secret_path, b"outside-secret-bytes").unwrap();
+    let recorded_hash = blake3::hash(b"outside-secret-bytes").to_hex().to_string();
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::CIStatus,
+        Some("ci_status"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        Some(&format!("../{secret_name}")),
+        Some(&recorded_hash),
+    );
+    let (_temp, path) = write_graph(vec![ver]);
+
+    let report = run(&path, &["--repo-path", repo_root.path().to_str().unwrap()]);
+    // The escape must be rejected outright -- no row at all, never a
+    // fabricated `current`/`stale` verdict built from a file outside the
+    // repo root.
+    assert_eq!(
+        verdicts_for(&report, &v1).len(),
+        0,
+        "a source_artifact_path escaping --repo-path via .. must never be read"
+    );
+    let _ = fs::remove_file(&secret_path);
+}
+
+#[test]
+fn artifact_path_as_absolute_path_is_never_read() {
+    let repo_root = tempfile::tempdir().expect("repo root");
+    let secret_name = format!("secret-abs-{}.txt", std::process::id());
+    let secret_path = repo_root.path().parent().unwrap().join(&secret_name);
+    fs::write(&secret_path, b"outside-secret-bytes-abs").unwrap();
+    let recorded_hash = blake3::hash(b"outside-secret-bytes-abs")
+        .to_hex()
+        .to_string();
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::CIStatus,
+        Some("ci_status"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        Some(secret_path.to_str().unwrap()),
+        Some(&recorded_hash),
+    );
+    let (_temp, path) = write_graph(vec![ver]);
+
+    let report = run(&path, &["--repo-path", repo_root.path().to_str().unwrap()]);
+    // `Path::join` discards the base for an absolute second operand -- must
+    // still be rejected, not silently read.
+    assert_eq!(
+        verdicts_for(&report, &v1).len(),
+        0,
+        "an absolute source_artifact_path must never be read, even though \
+         Path::join would otherwise honor it verbatim"
+    );
+    let _ = fs::remove_file(&secret_path);
 }
 
 // ---------------------------------------------------------------------------

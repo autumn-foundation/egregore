@@ -264,6 +264,10 @@ struct VerificationFreshnessIndex<'a> {
     /// Tombstone record ID, keyed by the deleted record ID (restoration-aware:
     /// a later re-emitted node clears an earlier tombstone).
     tombstone_by_deleted: BTreeMap<&'a str, &'a str>,
+    /// Record IDs superseded by a newer version (via `superseded_by` or a
+    /// live `SUPERSEDES` edge) -- applies to code handles, drift records,
+    /// AND verification records themselves, matching `crate::evidence_freshness`.
+    superseded_ids: BTreeSet<&'a str>,
     /// Drift metadata keyed by the prior (cited-side) record ID.
     drifts_by_prior: BTreeMap<&'a str, Vec<(&'a str, &'a SemanticDriftMetadata)>>,
 }
@@ -321,9 +325,17 @@ impl<'a> VerificationFreshnessIndex<'a> {
                 GraphRecord::Edge {
                     id,
                     label: EdgeLabel::Supersedes,
+                    source,
                     target,
                     ..
-                } if !tombstone_by_deleted.contains_key(id.as_str()) => {
+                } if !tombstone_by_deleted.contains_key(id.as_str())
+                    && !tombstone_by_deleted.contains_key(source.as_str()) =>
+                {
+                    // Honor a standalone SUPERSEDES edge only when neither the
+                    // edge nor its superseding source node has been retracted
+                    // (mirrors `crate::evidence_freshness`) -- otherwise a
+                    // retracted supersession would wrongly hide a still-live
+                    // target as `unresolved`.
                     superseded_ids.insert(target.as_str());
                 }
                 _ => {}
@@ -379,6 +391,10 @@ impl<'a> VerificationFreshnessIndex<'a> {
 
         let mut drifts_by_prior: BTreeMap<&str, Vec<(&str, &SemanticDriftMetadata)>> =
             BTreeMap::new();
+        // Drift metadata keyed by the drift record's OWN id, so a
+        // `DRIFTS_PRIOR` edge (below) can recover a drift whose
+        // `prior_record_id` field is stale relative to the edge.
+        let mut drift_meta_by_id: BTreeMap<&str, &SemanticDriftMetadata> = BTreeMap::new();
         for record in records {
             if let GraphRecord::Node {
                 id,
@@ -389,16 +405,39 @@ impl<'a> VerificationFreshnessIndex<'a> {
                 && !tombstone_by_deleted.contains_key(id.as_str())
                 && !superseded_ids.contains(id.as_str())
             {
+                drift_meta_by_id.insert(id.as_str(), drift);
                 drifts_by_prior
                     .entry(drift.prior_record_id.as_str())
                     .or_default()
                     .push((id.as_str(), drift));
             }
         }
+        // A `DRIFTS_PRIOR` edge (drift -> cited handle) recovers a drift
+        // trigger a stale/mismatched `prior_record_id` field would otherwise
+        // miss (mirrors `crate::evidence_freshness`) -- never a sibling's
+        // drift, since the edge target IS the cited-side record.
+        for record in records {
+            if let GraphRecord::Edge {
+                id,
+                label: EdgeLabel::DriftsPrior,
+                source,
+                target,
+                ..
+            } = record
+                && !tombstone_by_deleted.contains_key(id.as_str())
+                && let Some(drift) = drift_meta_by_id.get(source.as_str())
+            {
+                let entry = drifts_by_prior.entry(target.as_str()).or_default();
+                if !entry.iter().any(|(id, _)| *id == source.as_str()) {
+                    entry.push((source.as_str(), drift));
+                }
+            }
+        }
 
         Self {
             live_code_by_id,
             tombstone_by_deleted,
+            superseded_ids,
             drifts_by_prior,
         }
     }
@@ -492,6 +531,25 @@ const fn is_code_citation_label(label: EdgeLabel) -> bool {
         label,
         EdgeLabel::FailedOn | EdgeLabel::MentionsSymbol | EdgeLabel::TouchedFile
     )
+}
+
+/// Reads `artifact_path` (a `source_artifact_path` value read back from the
+/// store — producer-controlled, never trusted) joined onto `root`, but only
+/// when the resolved path stays contained under `root`. `source_artifact_path`
+/// is documented as repo-relative, but nothing upstream enforces that, so an
+/// absolute path (`Path::join` discards `root` entirely for an absolute
+/// second operand) or a `..`-escaping relative path must never be honored —
+/// this lane must never become a local file-read/existence oracle for
+/// arbitrary paths. Returns `None` (never claiming a verdict) when the path
+/// escapes `root`, does not exist, or is otherwise unreadable.
+fn read_contained_artifact(root: &Path, artifact_path: &str) -> Option<Vec<u8>> {
+    let joined = root.join(artifact_path);
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    let canonical_joined = std::fs::canonicalize(&joined).ok()?;
+    if !canonical_joined.starts_with(&canonical_root) {
+        return None;
+    }
+    std::fs::read(&canonical_joined).ok()
 }
 
 /// The record's own anchor: `temporal.git_commit`/`temporal.valid_time` when
@@ -700,7 +758,9 @@ pub fn verification_freshness(
         if !is_verification_kind(*kind) {
             continue;
         }
-        if index.tombstone_by_deleted.contains_key(id.as_str()) {
+        if index.tombstone_by_deleted.contains_key(id.as_str())
+            || index.superseded_ids.contains(id.as_str())
+        {
             continue;
         }
         let anchor = record_anchor(record);
@@ -734,7 +794,7 @@ pub fn verification_freshness(
             repo_path,
         ) && !recorded_hash.is_empty()
             && !artifact_path.is_empty()
-            && let Ok(bytes) = std::fs::read(root.join(artifact_path))
+            && let Some(bytes) = read_contained_artifact(root, artifact_path)
         {
             let current_hash = blake3::hash(&bytes).to_hex().to_string();
             let cited_handle = CitedHandle {

@@ -78,6 +78,13 @@ fn resolve_scope(records: &[GraphRecord], scope: Option<&str>) -> ScopeResolutio
         else {
             continue;
         };
+        // Deliberately narrower than the core module's shared
+        // `is_code_handle_kind` (which also allows Module/Import for issue
+        // #85's broader domain): `docs/schema/verification.md` §6 closes
+        // FAILED_ON/MENTIONS_SYMBOL/TOUCHED_FILE targets to Symbol/File only,
+        // so a Module/Import scope handle can never match an actual citation
+        // in this lane -- reporting it `no_match`/`scope_not_found` here is
+        // more honest than a silently-empty `Matched`.
         if !matches!(
             kind,
             crate::ir::NodeKind::Symbol | crate::ir::NodeKind::File
