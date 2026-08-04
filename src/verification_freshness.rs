@@ -613,14 +613,26 @@ const fn is_code_citation_label(label: EdgeLabel) -> bool {
 /// this lane must never become a local file-read/existence oracle for
 /// arbitrary paths. Returns `None` (never claiming a verdict) when the path
 /// escapes `root`, does not exist, or is otherwise unreadable.
-fn read_contained_artifact(root: &Path, artifact_path: &str) -> Option<Vec<u8>> {
+///
+/// Beyond containment, the actual read goes through
+/// `crate::protected::hash_source_streaming`: an `O_NOFOLLOW | O_NONBLOCK`
+/// open (Unix) that `fstat`s the opened descriptor and requires a REGULAR
+/// file, closing the TOCTOU window between this function's `canonicalize`
+/// calls and the read -- a `source_artifact_path` that resolves to a FIFO or
+/// other special file (whether at containment-check time or swapped in
+/// after) is refused rather than opened, which would otherwise block
+/// indefinitely or read unbounded device data. The hash is streamed, never
+/// buffering the whole file in memory.
+fn hash_contained_artifact(root: &Path, artifact_path: &str) -> Option<String> {
     let joined = root.join(artifact_path);
     let canonical_root = std::fs::canonicalize(root).ok()?;
     let canonical_joined = std::fs::canonicalize(&joined).ok()?;
     if !canonical_joined.starts_with(&canonical_root) {
         return None;
     }
-    std::fs::read(&canonical_joined).ok()
+    crate::protected::hash_source_streaming(&canonical_joined)
+        .ok()
+        .map(|(hex_hash, _len)| hex_hash)
 }
 
 /// The record's own anchor: `temporal.git_commit`/`temporal.valid_time` when
@@ -825,7 +837,13 @@ pub fn verification_freshness(
     repo_scope: Option<&str>,
 ) -> Vec<VerificationFreshnessEntry> {
     let index = VerificationFreshnessIndex::build(records);
-    let repo_index = repo_scope.map(|_| crate::query::RepositoryIndex::build(records));
+    // Built unconditionally (not just under `repo_scope`): even an UNSCOPED
+    // query needs to know whether the store is multi-repository, since
+    // `--repo-path` names exactly one filesystem root and evaluating an
+    // artifact against it is only unambiguous when there is at most one
+    // repository for that root to possibly mean.
+    let repo_index = crate::query::RepositoryIndex::build(records);
+    let is_multi_repo_store = repo_index.repository_ids().len() > 1;
     let mut entries: Vec<VerificationFreshnessEntry> = Vec::new();
 
     // Every code-citation edge whose source is a verification record,
@@ -948,11 +966,17 @@ pub fn verification_freshness(
         // fields. Never claimed `current` without actually reading the file.
         // Skipped up front for a record with no relationship to a supplied
         // `repo_scope`, so an out-of-scope repository's `source_artifact_path`
-        // is never even opened.
-        let in_repo_scope = match (repo_scope, repo_index.as_ref()) {
-            (Some(repo_id), Some(ri)) => relates_to_repo(ri, id.as_str(), repo_id),
-            _ => true,
-        };
+        // is never even opened. With NO `--repo` given, `--repo-path` still
+        // names exactly one filesystem root: in a store spanning more than
+        // one repository there is no way to know which repository that root
+        // is FOR, so evaluating any record's artifact against it would be a
+        // guess (repo B's `source_artifact_path` re-hashed under repo A's
+        // checkout can coincidentally match or differ, either way
+        // meaningless) -- skip entirely rather than guess. A single-
+        // repository (or repository-less) store has no such ambiguity.
+        let in_repo_scope = repo_scope.map_or(!is_multi_repo_store, |repo_id| {
+            relates_to_repo(&repo_index, id.as_str(), repo_id)
+        });
         if in_repo_scope
             && let (Some(recorded_hash), Some(artifact_path), Some(root)) = (
                 source_artifact_hash.as_deref(),
@@ -961,9 +985,8 @@ pub fn verification_freshness(
             )
             && !recorded_hash.is_empty()
             && !artifact_path.is_empty()
-            && let Some(bytes) = read_contained_artifact(root, artifact_path)
+            && let Some(current_hash) = hash_contained_artifact(root, artifact_path)
         {
-            let current_hash = blake3::hash(&bytes).to_hex().to_string();
             let cited_handle = CitedHandle {
                 target_record_id: None,
                 repo_relative_path: Some(artifact_path.to_owned()),

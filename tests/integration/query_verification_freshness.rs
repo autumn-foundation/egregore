@@ -2265,3 +2265,131 @@ fn ambiguous_multi_repo_record_artifact_fifo_is_never_read() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+#[test]
+fn unscoped_query_over_multi_repo_store_skips_artifact_evaluation() {
+    // Two repositories share one store. v1 carries a source_artifact_path
+    // and a matching hash, but its cited symbol belongs to repo-b while
+    // --repo-path is handed repo-a's checkout. With NO --repo selector,
+    // evaluating the artifact against repo-a's tree would be a guess (the
+    // recorded path could coincidentally exist under repo-a's root too, or
+    // not) -- a multi-repository store must skip artifact evaluation
+    // entirely rather than fabricate a current/stale verdict from the wrong
+    // checkout. v1 still gets a row (via its symbol citation), just never
+    // one carrying an artifact-hash-based verdict.
+    let (_repo_a, repo_a_node) = repo_node("repo-a");
+    let (repo_b, repo_b_node) = repo_node("repo-b");
+    let (file_b, file_b_node) = plain_file("src/b.rs");
+
+    let temp_repo_a = tempfile::tempdir().expect("repo dir");
+    let artifact_rel = "ci/config.yml";
+    let artifact_abs = temp_repo_a.path().join(artifact_rel);
+    fs::create_dir_all(artifact_abs.parent().unwrap()).unwrap();
+    fs::write(&artifact_abs, b"same bytes").unwrap();
+    let recorded_hash = blake3::hash(b"same bytes").to_hex().to_string();
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::CIStatus,
+        Some("ci_status"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        Some(artifact_rel),
+        Some(&recorded_hash),
+    );
+    let touched = cite_edge(EdgeLabel::TouchedFile, &v1, &file_b);
+    let (_temp, path) = write_graph(vec![
+        repo_a_node,
+        repo_b_node,
+        file_b_node,
+        contains(&repo_b, &file_b),
+        ver,
+        touched,
+    ]);
+
+    let report = run(
+        &path,
+        &["--repo-path", temp_repo_a.path().to_str().unwrap()],
+    );
+    let rows = verdicts_for(&report, &v1);
+    assert!(
+        !rows.is_empty(),
+        "v1 must still surface via its symbol citation"
+    );
+    assert!(
+        rows.iter()
+            .all(|r| r["cited_handle"]["relation"] != "source_artifact"),
+        "a multi-repository store with no --repo selector must never evaluate \
+         a source_artifact_path -- there is no way to know which repository \
+         --repo-path names, so guessing would misattribute the checkout"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn in_scope_artifact_fifo_is_refused_not_read() {
+    // v1 is UNAMBIGUOUSLY in scope (single-repository store, matching
+    // --repo, live citation into that repo's file) so the read-avoidance
+    // gate lets it through to the actual hashing step. Its
+    // source_artifact_path resolves to a FIFO with no writer. The read must
+    // go through the same O_NOFOLLOW/regular-file-only guard the rest of
+    // the codebase uses for operator-controlled paths (`hash_source_streaming`)
+    // rather than a plain `std::fs::read`, so the query completes promptly
+    // (reporting the row without an artifact-based verdict) instead of
+    // blocking forever on the FIFO.
+    let (repo_a, repo_a_node) = repo_node("repo-a");
+    let (file_a, file_a_node) = plain_file("src/a.rs");
+
+    let temp_repo = tempfile::tempdir().expect("repo dir");
+    let fifo_path = temp_repo.path().join("blocking.fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("mkfifo command must be available on Unix");
+    assert!(status.success(), "mkfifo failed");
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::CIStatus,
+        Some("ci_status"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        Some("blocking.fifo"),
+        Some(&"a".repeat(64)),
+    );
+    let touched = cite_edge(EdgeLabel::TouchedFile, &v1, &file_a);
+    let (_temp, path) = write_graph(vec![
+        repo_a_node,
+        file_a_node,
+        contains(&repo_a, &file_a),
+        ver,
+        touched,
+    ]);
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("egregore"))
+        .args(["query", "verification-freshness", "--graph"])
+        .arg(&path)
+        .args(["--repo", &repo_a, "--repo-path"])
+        .arg(temp_repo.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn egregore");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!(
+                "query hung -- an in-scope record's source_artifact_path resolved \
+                 to a FIFO and was opened with a plain read instead of the \
+                 regular-file-only streaming guard"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
