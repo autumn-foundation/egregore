@@ -3082,3 +3082,59 @@ fn restoration_is_detected_by_producer_time_not_sorted_array_position() {
          array position, so the restored handle is not reported unresolved"
     );
 }
+
+#[test]
+fn supersession_restoration_is_detected_by_producer_time_not_sorted_array_position() {
+    // widget is marked `superseded_by` and then RESTORED (re-emitted with no
+    // `superseded_by` marker) with a LATER producer_started_at. Regardless
+    // of how the two physical rows happen to sort under Graph::to_jsonl's
+    // lexicographic order, the row with the LATER producer_started_at must
+    // win -- an unconditional last-occurrence overwrite would let whichever
+    // row happens to sort last in the JSONL decide supersession, which is
+    // pure content-sort coincidence, not write chronology.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let superseded_version = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    )
+    .with_superseded_by("agent_memory:v1:corrected-fact")
+    .with_producer(producer_at("2026-01-05T00:00:00Z"));
+    let restored_version = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    )
+    .with_producer(producer_at("2026-01-15T00:00:00Z"));
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![superseded_version, restored_version, ver, edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["verdict"], "current",
+        "a later, un-superseded write must win over an earlier \
+         superseded_by-carrying write by producer time, not by whichever \
+         row happens to sort last in the JSONL"
+    );
+}

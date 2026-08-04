@@ -333,17 +333,30 @@ impl<'a> VerificationFreshnessIndex<'a> {
         // Superseded code handles: the node's own `superseded_by` marker
         // (latest physical row wins, so a restored row without the marker
         // clears an earlier supersession) plus a live `SUPERSEDES` edge.
+        // "Latest physical row" is decided by `producer_wins`, same as the
+        // tombstone-restoration pass above: an unconditional last-occurrence
+        // overwrite would let an OLDER `superseded_by`-carrying row (which
+        // can sort AFTER a later, un-superseded restoration under
+        // `Graph::to_jsonl`'s lexicographic order) win purely by array
+        // position, wrongly re-superseding a handle a later write restored.
         let mut superseded_ids: BTreeSet<&str> = BTreeSet::new();
-        let mut last_node_superseded: BTreeMap<&str, bool> = BTreeMap::new();
-        for record in records {
+        let mut last_node_superseded: BTreeMap<&str, (usize, bool)> = BTreeMap::new();
+        for (idx, record) in records.iter().enumerate() {
             match record {
                 GraphRecord::Node {
                     id, superseded_by, ..
                 } => {
-                    last_node_superseded.insert(
-                        id.as_str(),
-                        superseded_by.as_deref().is_some_and(|s| !s.is_empty()),
-                    );
+                    let candidate_superseded =
+                        superseded_by.as_deref().is_some_and(|s| !s.is_empty());
+                    let wins =
+                        last_node_superseded
+                            .get(id.as_str())
+                            .is_none_or(|&(held_idx, _)| {
+                                producer_wins(record, idx, &records[held_idx], held_idx)
+                            });
+                    if wins {
+                        last_node_superseded.insert(id.as_str(), (idx, candidate_superseded));
+                    }
                 }
                 GraphRecord::Edge {
                     id,
@@ -364,7 +377,7 @@ impl<'a> VerificationFreshnessIndex<'a> {
                 _ => {}
             }
         }
-        for (id, superseded) in &last_node_superseded {
+        for (id, (_, superseded)) in &last_node_superseded {
             if *superseded {
                 superseded_ids.insert(id);
             }
