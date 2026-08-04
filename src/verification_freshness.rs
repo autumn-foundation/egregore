@@ -69,16 +69,17 @@
 //!
 //! # Known limitations
 //!
-//! Liveness (for the `unresolved` verdict) uses a store-wide tip-commit
-//! frontier AND a store-wide non-temporal scan frontier, not the
-//! per-repository scoping issue #85 built up over several follow-up rounds
-//! (#203/#204/#454/#559). In a shared multi-repository store where two
-//! repositories' histories share a commit SHA, or where two repositories'
-//! current-tree scans were taken at different times, this can
-//! under/over-prune; scope a query with `--repo` to a single repository to
-//! avoid it. Staleness ordering compares recorded valid-time instants, not a
-//! commit-ancestry DAG walk, so a rebase that backdates a descendant commit
-//! is not detected — a known, documented gap, not a silent wrong answer.
+//! Liveness (for the `unresolved` verdict) uses the tip-commit and
+//! non-temporal-scan frontiers PER REPOSITORY (mirroring issue #85's
+//! #203/#204 pattern via `crate::query::RepositoryIndex`), so a shared
+//! multi-repository store where two repositories were scanned/committed at
+//! different times does not cross-prune. This does not extend to #85's
+//! later refinements: the current-tree "mixed handle" axis (#405, a single
+//! record ID carrying BOTH scan-history and current-tree versions) is not
+//! specially handled here. Staleness ordering compares recorded valid-time
+//! instants, not a commit-ancestry DAG walk, so a rebase that backdates a
+//! descendant commit is not detected — a known, documented gap, not a
+//! silent wrong answer.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -349,37 +350,67 @@ impl<'a> VerificationFreshnessIndex<'a> {
             }
         }
 
-        // Store-wide tip-commit frontier (documented limitation: not
-        // per-repository scoped — see module docs).
-        let mut all_commits: BTreeSet<&str> = BTreeSet::new();
-        let mut parent_commits: BTreeSet<&str> = BTreeSet::new();
+        // Per-repository tip-commit and non-temporal scan frontiers (mirrors
+        // `crate::evidence_freshness`'s #203/#204 pattern). A shared
+        // multi-repository store can hold repository A scanned/committed at
+        // a later time than repository B; a STORE-WIDE frontier would prune
+        // B's still-current code as if it were stale relative to A's newer
+        // timestamps. Each frontier is instead computed PER owning
+        // repository (via `RepositoryIndex`'s CONTAINS/DEFINES/IMPORTS
+        // containment walk) and a handle is pruned against its OWN
+        // repository's frontier, not the store-wide one. An unattributable
+        // handle (no reachable owning `Repository` node — including every
+        // handle in a legacy/single-repository store with no `Repository`
+        // node at all) falls back to the store-wide union, so single-repo
+        // stores are unaffected.
+        let repo_index = crate::query::RepositoryIndex::build(records);
+
+        let mut per_repo_all: BTreeMap<Option<&str>, BTreeSet<&str>> = BTreeMap::new();
+        let mut per_repo_parents: BTreeMap<Option<&str>, BTreeSet<&str>> = BTreeMap::new();
         for record in records {
             if let GraphRecord::Node {
-                temporal: Some(t), ..
+                id,
+                temporal: Some(t),
+                ..
             } = record
             {
-                all_commits.insert(t.git_commit.as_str());
+                let owner = repo_index.owner_of(id.as_str());
+                per_repo_all
+                    .entry(owner)
+                    .or_default()
+                    .insert(t.git_commit.as_str());
                 for parent in &t.git_parent_commits {
-                    parent_commits.insert(parent.as_str());
+                    per_repo_parents
+                        .entry(owner)
+                        .or_default()
+                        .insert(parent.as_str());
                 }
             }
         }
-        let tips: BTreeSet<&str> = all_commits.difference(&parent_commits).copied().collect();
+        let empty_commits: BTreeSet<&str> = BTreeSet::new();
+        let mut per_repo_tips: BTreeMap<Option<&str>, BTreeSet<&str>> = BTreeMap::new();
+        let mut tips: BTreeSet<&str> = BTreeSet::new();
+        for (owner, all) in &per_repo_all {
+            let parents = per_repo_parents.get(owner).unwrap_or(&empty_commits);
+            let repo_tips: BTreeSet<&str> = all.difference(parents).copied().collect();
+            tips.extend(repo_tips.iter().copied());
+            per_repo_tips.insert(*owner, repo_tips);
+        }
 
-        // Store-wide non-temporal SCAN frontier (documented limitation: not
-        // per-repository scoped, mirroring the tip-commit frontier above).
-        // A repeated current-tree `scan`/`refresh` re-emits every current
-        // handle with a node-level `valid_time` but no commit and no
-        // `Tombstone` when a handle is deleted between two scans, so
-        // WITHOUT this a citation to code deleted in a later scan would be
-        // reported `current`/`stale` instead of `unresolved`. The newest
-        // valid_time among non-temporal code handles AND `Repository` node
-        // snapshots is the frontier (folding in the repository node's own
-        // valid_time so an empty latest scan -- the last handle deleted --
-        // still advances it).
-        let mut scan_frontier: Option<&str> = None;
+        // Non-temporal SCAN frontier, computed the same way: a repeated
+        // current-tree `scan`/`refresh` re-emits every current handle with a
+        // node-level `valid_time` but no commit and no `Tombstone` when a
+        // handle is deleted between two scans, so WITHOUT this a citation to
+        // code deleted in a later scan would be reported `current`/`stale`
+        // instead of `unresolved`. The newest valid_time among a
+        // repository's own non-temporal code handles AND its `Repository`
+        // node snapshots is that repository's frontier (folding in the
+        // repository node's own valid_time so an empty latest scan -- the
+        // last handle deleted -- still advances it).
+        let mut per_repo_frontier: BTreeMap<Option<&str>, &str> = BTreeMap::new();
         for record in records {
             if let GraphRecord::Node {
+                id,
                 temporal: None,
                 kind,
                 ..
@@ -387,10 +418,11 @@ impl<'a> VerificationFreshnessIndex<'a> {
                 && (is_code_handle_kind(*kind) || matches!(kind, NodeKind::Repository))
                 && let Some(vt) = version_valid(record)
             {
-                scan_frontier = Some(match scan_frontier {
-                    Some(cur) if time_cmp(vt, cur) != std::cmp::Ordering::Greater => cur,
-                    _ => vt,
-                });
+                let owner = repo_index.owner_of(id.as_str());
+                let cur = per_repo_frontier.entry(owner).or_insert(vt);
+                if time_cmp(vt, cur) == std::cmp::Ordering::Greater {
+                    *cur = vt;
+                }
             }
         }
 
@@ -404,20 +436,26 @@ impl<'a> VerificationFreshnessIndex<'a> {
                 live_code_by_id.entry(id.as_str()).or_default().push(record);
             }
         }
-        // Prune to the frontier on each version's OWN axis: a
-        // commit-anchored version is live only at a tip commit (empty tips
-        // ⇒ nothing to prune against on that axis); a non-temporal version
-        // is live only at the newest scan (no scan_frontier ⇒ nothing to
+        // Prune to the frontier on each version's OWN axis, scoped to the
+        // HANDLE'S OWN repository: a commit-anchored version is live only at
+        // a tip commit of its own repository (empty repo-tips ⇒ nothing to
+        // prune against on that axis); a non-temporal version is live only
+        // at its own repository's newest scan (no repo frontier ⇒ nothing to
         // prune against on that axis). A handle with EITHER axis satisfied
         // by any of its versions stays live.
-        live_code_by_id.retain(|_, versions| {
+        live_code_by_id.retain(|id, versions| {
+            let owner = repo_index.owner_of(id);
+            let repo_tips = per_repo_tips
+                .get(&owner)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&tips);
+            let frontier = per_repo_frontier.get(&owner).copied();
             versions.iter().any(|r| match r {
                 GraphRecord::Node {
                     temporal: Some(t), ..
-                } => tips.is_empty() || tips.contains(t.git_commit.as_str()),
-                _ => scan_frontier.is_none_or(|frontier| {
-                    version_valid(r)
-                        .is_some_and(|vt| time_cmp(vt, frontier) == std::cmp::Ordering::Equal)
+                } => repo_tips.is_empty() || repo_tips.contains(t.git_commit.as_str()),
+                _ => frontier.is_none_or(|f| {
+                    version_valid(r).is_some_and(|vt| time_cmp(vt, f) == std::cmp::Ordering::Equal)
                 }),
             })
         });

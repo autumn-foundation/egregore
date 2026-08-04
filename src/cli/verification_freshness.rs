@@ -209,16 +209,28 @@ pub(crate) fn query_verification_freshness_cmd(
     let all = match repo_scope {
         None => all,
         Some(repo_id) => {
-            // The synthetic `source_artifact` citation carries no
-            // `target_record_id` of its own, and its owning verification
-            // record is typically unattributed too (no writer links a
-            // TestRun/CIStatus node to a Repository) -- so neither of the
-            // ordinary attribution checks below can place it. Left
-            // unhandled, EVERY repository's artifact row would pass through
-            // under every `--repo` scope, letting `--repo-path` hash one
-            // repository's checkout against another repository's TestRun.
-            // Attribute it instead via the SAME record's other (real) code
-            // citations; with none available, exclude it rather than guess.
+            // A row whose OWN cited handle resolves to a definitive owner
+            // (the common case: MENTIONS_SYMBOL/TOUCHED_FILE/FAILED_ON to a
+            // live, attributed code node) is scoped precisely by that owner.
+            // Two row shapes carry NO definitive owner of their own and must
+            // borrow attribution from the SAME record's other citations
+            // instead of passing through under every `--repo` scope:
+            //   - the synthetic `source_artifact` citation (no
+            //     `target_record_id` at all; its owning verification record
+            //     is typically unattributed too, since no writer links a
+            //     TestRun/CIStatus node to a Repository) -- unhandled, this
+            //     would let `--repo-path` hash one repository's checkout
+            //     against another repository's TestRun;
+            //   - an `unresolved`/`unanchored` row whose target is absent or
+            //     itself unattributed -- unhandled, this attributes an
+            //     unrelated repository's dangling reference to every scope.
+            // Borrowed attribution requires a UNIQUE owner: a record citing
+            // code in two repositories must not resolve its ownerless rows
+            // to EITHER one (that would let each scope hash a different
+            // repository's checkout, or falsely narrow an ambiguous
+            // reference to one repo). With zero attributable citations
+            // anywhere, fall back to the record's own (usually absent)
+            // direct attribution -- the original lenient pass-through.
             let mut ver_repo_owners: std::collections::BTreeMap<String, BTreeSet<String>> =
                 std::collections::BTreeMap::new();
             for e in &all {
@@ -233,20 +245,19 @@ pub(crate) fn query_verification_freshness_cmd(
             }
             all.into_iter()
                 .filter(|e| {
-                    if e.cited_handle.relation == "source_artifact" {
-                        return ver_repo_owners
-                            .get(e.verification_record_id.as_str())
-                            .is_some_and(|owners| owners.contains(repo_id));
+                    if let Some(target) = e.cited_handle.target_record_id.as_deref()
+                        && let Some(owner) = index.owner_of(target)
+                    {
+                        return owner == repo_id;
                     }
-                    let ver_ok = index
+                    if let Some(owners) = ver_repo_owners.get(e.verification_record_id.as_str())
+                        && !owners.is_empty()
+                    {
+                        return owners.len() == 1 && owners.contains(repo_id);
+                    }
+                    index
                         .owner_of(&e.verification_record_id)
-                        .is_none_or(|o| o == repo_id);
-                    let cited_ok = e
-                        .cited_handle
-                        .target_record_id
-                        .as_deref()
-                        .is_none_or(|id| index.owner_of(id).is_none_or(|o| o == repo_id));
-                    ver_ok && cited_ok
+                        .is_none_or(|o| o == repo_id)
                 })
                 .collect()
         }

@@ -1407,7 +1407,7 @@ fn symbol_absent_from_newest_scan_without_tombstone_is_unresolved() {
     .with_valid_time("2026-01-01T00:00:00Z", "test");
     let (repo_id, _) = repo_node("solo");
     let repo_at_newer_scan = GraphRecord::node(
-        repo_id,
+        repo_id.clone(),
         NodeKind::Repository,
         None,
         None,
@@ -1415,6 +1415,11 @@ fn symbol_absent_from_newest_scan_without_tombstone_is_unresolved() {
         "Repository solo".to_owned(),
     )
     .with_valid_time("2026-02-01T00:00:00Z", "test");
+    // A real `eg scan` always wires Repository -> File/Symbol via CONTAINS;
+    // without it the symbol would be genuinely unattributable (a different,
+    // already-covered case) rather than "attributed to a repository whose
+    // newest scan moved past it".
+    let contains_widget = contains(&repo_id, &sym_id);
 
     let (v1, ver) = ver_node(
         "v1",
@@ -1427,7 +1432,13 @@ fn symbol_absent_from_newest_scan_without_tombstone_is_unresolved() {
         None,
     );
     let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
-    let (_temp, path) = write_graph(vec![widget_at_older_scan, repo_at_newer_scan, ver, edge]);
+    let (_temp, path) = write_graph(vec![
+        widget_at_older_scan,
+        repo_at_newer_scan,
+        contains_widget,
+        ver,
+        edge,
+    ]);
 
     let report = run(&path, &[]);
     let rows = verdicts_for(&report, &v1);
@@ -1618,4 +1629,175 @@ fn scope_resolution_is_confined_to_the_selected_repository() {
     let rows: Vec<&Value> = report["verdicts"].as_array().unwrap().iter().collect();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["verification_record_id"], v1);
+}
+
+#[test]
+fn repositories_scanned_at_different_times_do_not_cross_prune() {
+    // Repo A's newest scan is LATER than repo B's newest (and only) scan.
+    // A store-wide frontier would prune B's still-current symbol as if it
+    // had been deleted in a scan that never touched B at all.
+    let (_repo_a, repo_a_node) = repo_node("repo-a");
+    let (repo_b, repo_b_node) = repo_node("repo-b");
+    let repo_a_node = repo_a_node.with_valid_time("2026-03-01T00:00:00Z", "test");
+    let repo_b_node = repo_b_node.with_valid_time("2026-01-01T00:00:00Z", "test");
+
+    let sym_b = stable_id(&["node", "Symbol", "src/b.rs", "widget"]);
+    let widget_b = GraphRecord::node(
+        sym_b.clone(),
+        NodeKind::Symbol,
+        Some("src/b.rs".to_owned()),
+        Some(span(10, 20)),
+        Some("widget".to_owned()),
+        "fn widget() {}".to_owned(),
+    )
+    .with_valid_time("2026-01-01T00:00:00Z", "test");
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_b);
+    let (_temp, path) = write_graph(vec![
+        repo_a_node,
+        repo_b_node,
+        widget_b,
+        contains(&repo_b, &sym_b),
+        ver,
+        edge,
+    ]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["verdict"], "current",
+        "repo B's own (only) scan must not be pruned by repo A's LATER scan"
+    );
+}
+
+#[test]
+fn artifact_row_excluded_when_record_cites_multiple_repositories() {
+    // v1 cites code in BOTH repo A and repo B and also carries a
+    // source_artifact_hash/path. Ownership is genuinely ambiguous for the
+    // artifact row -- it must not resolve under EITHER repository's scope.
+    let (repo_a, repo_a_node) = repo_node("repo-a");
+    let (repo_b, repo_b_node) = repo_node("repo-b");
+    let (file_a, file_a_node) = plain_file("src/a.rs");
+    let (file_b, file_b_node) = plain_file("src/b.rs");
+
+    let temp_repo = tempfile::tempdir().expect("repo dir");
+    let artifact_rel = "ci/config.yml";
+    let artifact_abs = temp_repo.path().join(artifact_rel);
+    fs::create_dir_all(artifact_abs.parent().unwrap()).unwrap();
+    fs::write(&artifact_abs, b"bytes").unwrap();
+    let recorded_hash = blake3::hash(b"bytes").to_hex().to_string();
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::CIStatus,
+        Some("ci_status"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        Some(artifact_rel),
+        Some(&recorded_hash),
+    );
+    let touched_a = cite_edge(EdgeLabel::TouchedFile, &v1, &file_a);
+    let touched_b = cite_edge(EdgeLabel::TouchedFile, &v1, &file_b);
+    let (_temp, path) = write_graph(vec![
+        repo_a_node,
+        repo_b_node,
+        file_a_node,
+        file_b_node,
+        contains(&repo_a, &file_a),
+        contains(&repo_b, &file_b),
+        ver,
+        touched_a,
+        touched_b,
+    ]);
+
+    for repo in [&repo_a, &repo_b] {
+        let report = run(
+            &path,
+            &[
+                "--repo",
+                repo,
+                "--repo-path",
+                temp_repo.path().to_str().unwrap(),
+            ],
+        );
+        let artifact_rows: Vec<&Value> = verdicts_for(&report, &v1)
+            .into_iter()
+            .filter(|r| r["cited_handle"]["relation"] == "source_artifact")
+            .collect();
+        assert_eq!(
+            artifact_rows.len(),
+            0,
+            "a record citing two repositories must not resolve its ambiguous \
+             artifact row under either repository's scope"
+        );
+        // The record's real, unambiguous citation rows still appear.
+        let real_rows: Vec<&Value> = verdicts_for(&report, &v1)
+            .into_iter()
+            .filter(|r| r["cited_handle"]["relation"] == "TOUCHED_FILE")
+            .collect();
+        assert_eq!(real_rows.len(), 1);
+    }
+}
+
+#[test]
+fn unresolved_row_with_no_owner_excluded_from_unrelated_repo_scope() {
+    // v1 cites a live symbol in repo B AND a target that is entirely absent
+    // from the store (unresolved, no owner of its own). Scoped to an
+    // UNRELATED repo A, only B's row is truly in scope; the ownerless
+    // unresolved row must not be attributed to repo A just because neither
+    // side has a direct RepositoryIndex owner.
+    let (repo_a, repo_a_node) = repo_node("repo-a");
+    let (repo_b, repo_b_node) = repo_node("repo-b");
+    let (file_b, file_b_node) = plain_file("src/b.rs");
+    let missing_id = stable_id(&["node", "Symbol", "src/gone.rs", "ghost"]);
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "fail",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        None,
+        None,
+    );
+    let live_edge = cite_edge(EdgeLabel::TouchedFile, &v1, &file_b);
+    let dangling_edge = cite_edge(EdgeLabel::FailedOn, &v1, &missing_id);
+    let (_temp, path) = write_graph(vec![
+        repo_a_node,
+        repo_b_node,
+        file_b_node,
+        contains(&repo_b, &file_b),
+        ver,
+        live_edge,
+        dangling_edge,
+    ]);
+
+    let report_a = run(&path, &["--repo", &repo_a]);
+    let rows_a = verdicts_for(&report_a, &v1);
+    assert_eq!(
+        rows_a.len(),
+        0,
+        "neither of repo B's citations (live or dangling) belongs under repo A's scope"
+    );
+
+    let report_b = run(&path, &["--repo", &repo_b]);
+    let rows_b = verdicts_for(&report_b, &v1);
+    assert_eq!(
+        rows_b.len(),
+        2,
+        "both of repo B's own citations (live and dangling) belong under repo B's scope"
+    );
 }
