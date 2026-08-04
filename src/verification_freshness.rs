@@ -927,18 +927,29 @@ pub fn verification_freshness(
     // supplied `--executed-at`, which two genuinely different invocations
     // could share. No signal in the graph disambiguates that case; a
     // producer-stamped edge is always kept unless PROVABLY older.
-    let mut ver_first_write: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
+    // Compared via `with_cleared_producer_started_at` -- the SAME
+    // idempotency-comparison convention the embedded adapter already uses
+    // (`src/adapters/aletheiadb.rs`) -- so a re-ingest that changes only the
+    // non-identity producer envelope (a fresh wall-clock
+    // `producer_started_at` from an otherwise byte-identical re-ingest,
+    // or, per `with_cleared_producer_started_at`'s own contract, a store
+    // write that happens to re-stamp it) is never mistaken for a genuine
+    // rewrite. `producer.egregore_version`/`producer_components` are still
+    // compared (only `producer_started_at` is cleared), so an actual
+    // extractor-version change still counts.
+    let mut ver_first_write: BTreeMap<&str, GraphRecord> = BTreeMap::new();
     let mut ver_has_multiple_writes: BTreeSet<&str> = BTreeSet::new();
     for record in records {
         if let GraphRecord::Node { id, kind, .. } = record
             && is_verification_kind(*kind)
         {
+            let cleared = record.with_cleared_producer_started_at();
             match ver_first_write.entry(id.as_str()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(record);
+                    entry.insert(cleared);
                 }
                 std::collections::btree_map::Entry::Occupied(entry) => {
-                    if *entry.get() != record {
+                    if *entry.get() != cleared {
                         ver_has_multiple_writes.insert(id.as_str());
                     }
                 }
@@ -973,6 +984,15 @@ pub fn verification_freshness(
                 ..
             } if is_code_citation_label(*label)
                 && !index.tombstone_by_deleted.contains_key(id.as_str())
+                // A citation edge can itself be the target of a live
+                // `SUPERSEDES` edge (or carry its own `superseded_by`
+                // marker) -- the same liveness signal already applied to
+                // code handles (`live_code_by_id`), `SemanticDrift` records,
+                // and the verification node itself in the classification
+                // loop below. An edge no writer currently supersedes today
+                // is unaffected; one that IS superseded must not keep
+                // contributing its now-corrected-away target.
+                && !index.superseded_ids.contains(id.as_str())
                 // Mirrors the node-carried branch below: a re-written
                 // verification record's OLDER citation edges must not
                 // survive alongside its latest write's edges. Excluded on

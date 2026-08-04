@@ -2746,3 +2746,129 @@ fn producerless_standalone_edge_is_dropped_when_source_has_multiple_writes() {
     assert_eq!(rows[0]["cited_handle"]["target_record_id"], sym_id);
     assert_eq!(rows[0]["verdict"], "current");
 }
+
+#[test]
+fn producer_only_difference_between_writes_is_not_treated_as_a_rewrite() {
+    // v1 is physically written TWICE with logically IDENTICAL content --
+    // same status, same anchor -- differing ONLY in `producer` (a fresh
+    // `producer_started_at`, as an idempotent re-ingest of the same facts
+    // would naturally produce; `producer` is documented as a non-identity
+    // envelope). This must NOT be treated as a genuine rewrite: a
+    // producerless standalone citation edge stays classifiable, since
+    // there is no real ambiguity about which write it belongs to when
+    // both writes say the same thing.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+
+    let (v1, ver_a) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let ver_a = ver_a.with_producer(producer_at("2026-01-10T00:00:00Z"));
+    let (v1_again, ver_b) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    assert_eq!(v1, v1_again, "both writes must share the same stable ID");
+    let ver_b = ver_b.with_producer(producer_at("2026-01-20T00:00:00Z"));
+    assert_ne!(
+        ver_a, ver_b,
+        "the two raw records must differ (different producer timestamps)"
+    );
+
+    // No producer on the edge -- if the producer-only difference above were
+    // wrongly treated as a rewrite, this edge would be dropped as
+    // uncorrelatable.
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![symbol, ver_a, ver_b, edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a producer-only difference between two writes must not make a \
+         producerless edge look uncorrelatable"
+    );
+    assert_eq!(rows[0]["cited_handle"]["target_record_id"], sym_id);
+    assert_eq!(rows[0]["verdict"], "current");
+}
+
+#[test]
+fn superseded_standalone_citation_edge_is_skipped() {
+    // v1's original MENTIONS_SYMBOL edge cited a handle that resolves
+    // nowhere -- a mistake later corrected by a live SUPERSEDES edge
+    // targeting that citation edge's own record ID (mirrors
+    // `retracted_supersedes_source_never_hides_a_still_live_target`'s
+    // SUPERSEDES construction, but targeting an EDGE rather than a code
+    // node). The superseded edge must not keep contributing its
+    // now-corrected-away target; a second, un-superseded edge citing a
+    // live symbol survives untouched.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let stale_target_id = stable_id(&["node", "Symbol", "src/gone.rs", "ghost"]);
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let stale_edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &stale_target_id);
+    let stale_edge_id = match &stale_edge {
+        GraphRecord::Edge { id, .. } => id.clone(),
+        _ => unreachable!("cite_edge always returns an Edge record"),
+    };
+    let supersedes_edge = GraphRecord::edge(
+        EdgeLabel::Supersedes,
+        "agent_memory:v1:corrected-citation".to_owned(),
+        stale_edge_id,
+        None,
+        "corrects the mis-cited edge".to_owned(),
+    );
+    let current_edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![symbol, ver, stale_edge, supersedes_edge, current_edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a superseded standalone citation edge must not keep contributing \
+         its now-corrected-away target"
+    );
+    assert_eq!(rows[0]["cited_handle"]["target_record_id"], sym_id);
+    assert_eq!(rows[0]["verdict"], "current");
+}
