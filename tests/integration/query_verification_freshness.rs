@@ -2497,3 +2497,54 @@ fn path_scope_matches_a_deleted_files_retained_handle() {
     assert_eq!(rows[0]["verdict"], "unresolved");
     assert_eq!(rows[0]["triggering_handle"]["kind"], "handle_removed");
 }
+
+#[test]
+fn verification_records_own_anchor_commit_never_pollutes_the_code_tip_frontier() {
+    // Code was scanned only at c1 (one Symbol version, no parents -- the
+    // repository's sole indexed commit). A TestRun is then recorded
+    // targeting c2 with git_parent_commits=[c1] -- c2 is the RUN's own
+    // anchor commit, a fact about when the test executed, never a code
+    // snapshot. Folding the verification record's temporal metadata into
+    // the code-graph tip-commit frontier would make c1 look like an
+    // INTERIOR commit (something else "descends" from it) and prune the
+    // still-current c1 symbol as unresolved, purely because evidence was
+    // recorded -- not because the code moved.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let (v1, mut ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c2"),
+        None,
+        None,
+    );
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = &mut ver
+    {
+        t.git_parent_commits = vec!["c1".to_owned()];
+    }
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![symbol, ver, edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["verdict"], "current",
+        "a verification record's own anchor commit must never be folded \
+         into the code-graph tip-commit frontier -- the cited symbol's only \
+         version, at c1, is still current, not an interior commit"
+    );
+}

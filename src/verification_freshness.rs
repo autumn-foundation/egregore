@@ -370,9 +370,23 @@ impl<'a> VerificationFreshnessIndex<'a> {
         for record in records {
             if let GraphRecord::Node {
                 id,
+                kind,
                 temporal: Some(t),
                 ..
             } = record
+                // The commit DAG the tip frontier is built from is a
+                // codegraph-domain fact (`Commit`/`File`/`Symbol`/`Module`/
+                // `Import`). A verification record's own `temporal.git_commit`
+                // means something entirely different -- the run's TARGET
+                // commit, with `git_parent_commits` naming that commit's own
+                // parent -- and is not itself a code snapshot. Left
+                // unfiltered, a TestRun recorded at a commit with no matching
+                // code snapshot (or whose parent happens to equal a real code
+                // tip) pollutes `per_repo_all`/`per_repo_parents` and can
+                // demote a genuinely current code handle to "interior commit"
+                // -- reported `unresolved` solely because evidence was
+                // recorded, never because the code itself moved.
+                && is_codegraph_temporal_kind(*kind)
             {
                 let owner = repo_index.owner_of(id.as_str());
                 per_repo_all
@@ -581,6 +595,22 @@ fn node_path_span(record: &GraphRecord) -> (Option<String>, Option<SourceSpan>) 
         } => (repo_relative_path.clone(), *span),
         _ => (None, None),
     }
+}
+
+/// Codegraph-domain node kinds whose `temporal.git_commit`/`git_parent_commits`
+/// describe an actual position in the repository's commit DAG: the four
+/// citable code-handle kinds (`is_code_handle_kind`) plus `Commit` itself.
+/// `Commit` is included even though it is never a citable handle -- history
+/// replay mints one `Commit` node per commit regardless of whether any code
+/// changed there (issue #438), so it is often the ONLY record carrying that
+/// commit's parent pointer when a commit touches no source file (a doc-only
+/// or empty commit). Excluding it would silently break tip detection across
+/// exactly those commits. Deliberately narrower than "any temporal node":
+/// a verification record's `temporal.git_commit` names the run's OWN target
+/// commit, a different fact entirely, and must never be read as a code
+/// snapshot when building this frontier.
+const fn is_codegraph_temporal_kind(kind: NodeKind) -> bool {
+    matches!(kind, NodeKind::Commit) || is_code_handle_kind(kind)
 }
 
 /// The five verification-domain kinds this issue's AC names explicitly.
