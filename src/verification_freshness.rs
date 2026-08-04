@@ -866,11 +866,21 @@ pub fn verification_freshness(
             if let Some(owner) = ri.owner_of(ver_id) {
                 return owner == repo_id;
             }
-            citations_by_source
+            // Mirrors the CLI's own unique-owner requirement exactly (not
+            // merely "any citation owned by repo_id"): a record citing code
+            // in BOTH repo_id and another repository can never survive the
+            // CLI's final filter (ownership isn't unique), so gating on the
+            // weaker "any" check would still open its source_artifact_path
+            // under repo_id for a row that can never be returned -- the
+            // exact FIFO/large-file availability risk this gate exists to
+            // avoid.
+            let owners: BTreeSet<&str> = citations_by_source
                 .get(ver_id)
                 .into_iter()
                 .flatten()
-                .any(|(_, target)| ri.owner_of(target) == Some(repo_id))
+                .filter_map(|(_, target)| ri.owner_of(target))
+                .collect();
+            owners.len() == 1 && owners.contains(repo_id)
         };
 
     // Coalesce repeated physical writes of the same verification record

@@ -2193,3 +2193,75 @@ fn out_of_scope_repository_artifact_fifo_is_never_read() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn ambiguous_multi_repo_record_artifact_fifo_is_never_read() {
+    // v1 cites code in BOTH repo-a and repo-b, so its artifact row can never
+    // be unique-owner-attributed to either one and is therefore excluded
+    // from every single-repository scope (per the CLI's own filter). A
+    // permissive "does this record relate AT ALL to repo-a" read-avoidance
+    // gate would still open the FIFO (v1 DOES cite something in repo-a) even
+    // though the row can never be returned; the gate must require the SAME
+    // unique-owner condition the CLI's final filter does.
+    let (repo_a, repo_a_node) = repo_node("repo-a");
+    let (repo_b, repo_b_node) = repo_node("repo-b");
+    let (file_a, file_a_node) = plain_file("src/a.rs");
+    let (file_b, file_b_node) = plain_file("src/b.rs");
+
+    let temp_repo = tempfile::tempdir().expect("repo dir");
+    let fifo_path = temp_repo.path().join("blocking.fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("mkfifo command must be available on Unix");
+    assert!(status.success(), "mkfifo failed");
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::CIStatus,
+        Some("ci_status"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        Some("blocking.fifo"),
+        Some(&"a".repeat(64)),
+    );
+    let touched_a = cite_edge(EdgeLabel::TouchedFile, &v1, &file_a);
+    let touched_b = cite_edge(EdgeLabel::TouchedFile, &v1, &file_b);
+    let (_temp, path) = write_graph(vec![
+        repo_a_node,
+        repo_b_node,
+        file_a_node,
+        file_b_node,
+        contains(&repo_a, &file_a),
+        contains(&repo_b, &file_b),
+        ver,
+        touched_a,
+        touched_b,
+    ]);
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("egregore"))
+        .args(["query", "verification-freshness", "--graph"])
+        .arg(&path)
+        .args(["--repo", &repo_a, "--repo-path"])
+        .arg(temp_repo.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn egregore");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!(
+                "query hung -- an ambiguously-owned record's artifact FIFO was read \
+                 even though it can never survive the unique-owner filter"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
