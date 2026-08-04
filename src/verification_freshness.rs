@@ -893,6 +893,27 @@ pub fn verification_freshness(
             latest_ver_write.insert(id.as_str(), idx);
         }
     }
+    // The `producer.producer_started_at` of each verification id's LATEST
+    // write (per `latest_ver_write` above), when recorded. `eg capture-tests`
+    // -- the one real trunk writer -- stamps every record in one invocation's
+    // batch (the `TestRun` node AND its citation edges) with the SAME
+    // `producer_started_at` (`--executed-at`), so this is a genuine,
+    // content-derived correlation between a write batch and its citation
+    // edges. Physical array POSITION cannot be used for this: for `--graph`,
+    // `records` reflects `Graph::to_jsonl`'s lexicographic STRING sort (edge
+    // records sort before node records by construction, since
+    // `record_type: "edge"` < `"node"`), not write chronology, so "index of
+    // the edge vs. index of the latest node write" carries no ordering
+    // information at all.
+    let latest_ver_producer_started_at: BTreeMap<&str, &str> = latest_ver_write
+        .iter()
+        .filter_map(|(&id, &idx)| match &records[idx] {
+            GraphRecord::Node {
+                producer: Some(p), ..
+            } => Some((id, p.producer_started_at.as_str())),
+            _ => None,
+        })
+        .collect();
 
     // Every code-citation relation whose source is a verification record,
     // from BOTH representations (mirroring `query::verification_coverage`'s
@@ -917,9 +938,27 @@ pub fn verification_freshness(
                 label,
                 source,
                 target,
+                producer,
                 ..
             } if is_code_citation_label(*label)
-                && !index.tombstone_by_deleted.contains_key(id.as_str()) =>
+                && !index.tombstone_by_deleted.contains_key(id.as_str())
+                // Mirrors the node-carried branch below: a re-written
+                // verification record's OLDER citation edges must not
+                // survive alongside its latest write's edges. Excluded only
+                // on POSITIVE evidence this edge predates the source's
+                // latest write -- both sides must carry a comparable
+                // `producer_started_at` (see above) and the edge's must sort
+                // strictly earlier. Missing producer info on either side
+                // (manually-authored graphs, or any producer predating the
+                // envelope) never excludes the edge -- absence of ordering
+                // evidence means "keep", never "drop".
+                && !producer
+                    .as_ref()
+                    .zip(latest_ver_producer_started_at.get(source.as_str()))
+                    .is_some_and(|(p, &latest)| {
+                        time_cmp(p.producer_started_at.as_str(), latest)
+                            == std::cmp::Ordering::Less
+                    }) =>
             {
                 citations_by_source
                     .entry(source.as_str())

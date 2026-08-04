@@ -15,8 +15,8 @@
 use std::{fs, path::PathBuf};
 
 use aletheia_egregore::{
-    EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, MetricKind, NodeKind, SelectionBasis,
-    SemanticDriftMetadata, SourceSpan, TemporalMetadata,
+    EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, MetricKind, NodeKind, Producer,
+    ProducerKind, SelectionBasis, SemanticDriftMetadata, SourceSpan, TemporalMetadata,
     ir::{Graph, VERIFICATION_SCHEMA_VERSION, stable_id, verification_stable_id},
 };
 use assert_cmd::Command;
@@ -164,6 +164,19 @@ fn evidence_link(relation: &str, target: &str) -> EvidenceLink {
         target_repo_relative_path: None,
         target_span: None,
         target_git_commit: None,
+    }
+}
+
+/// A `Producer` envelope stamped with `producer_started_at`, matching how
+/// `eg capture-tests` stamps every record in one write batch (mirrors
+/// `test_capture_producer` in `src/test_capture.rs`).
+fn producer_at(started_at: &str) -> Producer {
+    Producer {
+        egregore_version: "0.0.0-test".to_owned(),
+        egregore_git: None,
+        producer_kind: ProducerKind::ObservationWriter,
+        producer_components: std::collections::BTreeMap::new(),
+        producer_started_at: started_at.to_owned(),
     }
 }
 
@@ -2606,6 +2619,60 @@ fn stale_inline_citations_from_an_older_write_are_dropped_on_rewrite() {
         1,
         "only the latest write's inline citation may be classified, not \
          both the older write's stale citation and the newer one"
+    );
+    assert_eq!(rows[0]["cited_handle"]["target_record_id"], sym_id);
+    assert_eq!(rows[0]["verdict"], "current");
+}
+
+#[test]
+fn stale_standalone_edge_from_an_earlier_producer_write_is_dropped() {
+    // v1's own record has ONE physical write, stamped with the CURRENT
+    // producer_started_at. Two standalone citation edges from v1 exist: one
+    // stamped with an EARLIER producer_started_at (a leftover from a prior
+    // `capture-tests` invocation whose citation set has since changed,
+    // citing a handle that resolves nowhere), and one stamped with the SAME
+    // timestamp as the record's own write (the current, still-valid
+    // citation). Only the latter may be classified -- array position
+    // carries no ordering information for `--graph` (records are sorted by
+    // `Graph::to_jsonl`, not chronology), so this can only work via the
+    // `producer_started_at` comparison.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let stale_target_id = stable_id(&["node", "Symbol", "src/gone.rs", "ghost"]);
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let ver = ver.with_producer(producer_at("2026-02-01T00:00:00Z"));
+    let stale_edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &stale_target_id)
+        .with_producer(producer_at("2026-01-15T00:00:00Z"));
+    let current_edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id)
+        .with_producer(producer_at("2026-02-01T00:00:00Z"));
+    let (_temp, path) = write_graph(vec![symbol, ver, stale_edge, current_edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(
+        rows.len(),
+        1,
+        "an edge whose producer_started_at predates the record's own \
+         latest write must be dropped, not classified alongside the \
+         current edge"
     );
     assert_eq!(rows[0]["cited_handle"]["target_record_id"], sym_id);
     assert_eq!(rows[0]["verdict"], "current");
