@@ -2677,3 +2677,72 @@ fn stale_standalone_edge_from_an_earlier_producer_write_is_dropped() {
     assert_eq!(rows[0]["cited_handle"]["target_record_id"], sym_id);
     assert_eq!(rows[0]["verdict"], "current");
 }
+
+#[test]
+fn producerless_standalone_edge_is_dropped_when_source_has_multiple_writes() {
+    // v1 is genuinely re-written: two DIFFERENT physical node versions
+    // (different `status`) under the same stable ID, mirroring a
+    // `capture-tests` re-run whose test outcome changed. One standalone
+    // citation edge -- to a handle that resolves nowhere -- carries NO
+    // producer stamp at all. With the source KNOWN to have multiple writes,
+    // there is no basis to assume this producerless edge belongs to the
+    // latest one, so it must be dropped rather than kept by default. A
+    // second edge, citing a live symbol, DOES carry a producer stamp and
+    // survives untouched.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let stale_target_id = stable_id(&["node", "Symbol", "src/gone.rs", "ghost"]);
+
+    let (v1, older_ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let (v1_again, newer_ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "fail",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    assert_eq!(v1, v1_again, "both writes must share the same stable ID");
+    assert_ne!(
+        older_ver, newer_ver,
+        "the two writes must be genuinely content-different"
+    );
+
+    // No producer on either write -- `latest_ver_producer_started_at` has
+    // no entry for v1, so the stale edge can only be excluded via the
+    // producerless/multi-write rule, not the timestamp comparison.
+    let stale_edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &stale_target_id);
+    let current_edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id)
+        .with_producer(producer_at("2026-02-01T00:00:00Z"));
+    let (_temp, path) = write_graph(vec![symbol, older_ver, newer_ver, stale_edge, current_edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a producerless edge on a genuinely multi-write source cannot be \
+         correlated to any write and must be dropped"
+    );
+    assert_eq!(rows[0]["cited_handle"]["target_record_id"], sym_id);
+    assert_eq!(rows[0]["verdict"], "current");
+}
