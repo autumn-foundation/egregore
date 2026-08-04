@@ -264,7 +264,19 @@ pub(crate) fn query_verification_freshness_cmd(
                     {
                         return owner == repo_id;
                     }
-                    if let Some(owners) = ver_repo_owners.get(e.verification_record_id.as_str())
+                    let owners = ver_repo_owners.get(e.verification_record_id.as_str());
+                    // A `source_artifact` row is NEVER let through on the
+                    // lenient "no attribution anywhere" default below: an
+                    // artifact-only record (e.g. `capture-tests` run
+                    // without `--graph`, carrying zero code citations) would
+                    // otherwise pass under EVERY `--repo` scope, letting
+                    // `--repo-path` hash an unrelated repository's checkout
+                    // and fabricate a verdict. Without a unique borrowed
+                    // owner, exclude it outright.
+                    if e.cited_handle.relation == "source_artifact" {
+                        return owners.is_some_and(|o| o.len() == 1 && o.contains(repo_id));
+                    }
+                    if let Some(owners) = owners
                         && !owners.is_empty()
                     {
                         return owners.len() == 1 && owners.contains(repo_id);

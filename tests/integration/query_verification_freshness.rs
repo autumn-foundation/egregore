@@ -1893,3 +1893,114 @@ fn repeated_verification_write_is_classified_once() {
         "a repeated physical write of the same record/edge must classify once, not per copy"
     );
 }
+
+#[test]
+fn artifact_only_record_excluded_from_every_repo_scope() {
+    // v1 has ZERO code citations (e.g. `capture-tests` run without
+    // `--graph`) -- only a source_artifact_hash/path. With no attributable
+    // citation anywhere, and the verification record itself unattributed,
+    // the artifact row must be excluded from a scoped response entirely --
+    // never passed through under an unrelated repository's --repo-path.
+    let (repo_a, repo_a_node) = repo_node("repo-a");
+
+    let temp_repo = tempfile::tempdir().expect("repo dir");
+    let artifact_rel = "ci/config.yml";
+    let artifact_abs = temp_repo.path().join(artifact_rel);
+    fs::create_dir_all(artifact_abs.parent().unwrap()).unwrap();
+    fs::write(&artifact_abs, b"bytes").unwrap();
+    let recorded_hash = blake3::hash(b"bytes").to_hex().to_string();
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::CIStatus,
+        Some("ci_status"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        Some(artifact_rel),
+        Some(&recorded_hash),
+    );
+    let (_temp, path) = write_graph(vec![repo_a_node, ver]);
+
+    // Unscoped: the artifact row appears normally.
+    let report = run(&path, &["--repo-path", temp_repo.path().to_str().unwrap()]);
+    assert_eq!(verdicts_for(&report, &v1).len(), 1);
+
+    // Scoped to repo-a (a repository this record has no relationship to
+    // whatsoever): the artifact row must be excluded, not passed through.
+    let scoped = run(
+        &path,
+        &[
+            "--repo",
+            &repo_a,
+            "--repo-path",
+            temp_repo.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        verdicts_for(&scoped, &v1).len(),
+        0,
+        "an artifact-only record with no attributable citation must never \
+         surface under any --repo scope"
+    );
+}
+
+#[test]
+fn content_change_then_revert_is_still_detected_as_stale() {
+    // widget changes after the anchor (c1 -> c2) and then reverts back to
+    // byte-identical content at c3. Comparing only the anchor against the
+    // LATEST version would miss this (c1 == c3), but the code genuinely
+    // drifted at c2 -- the documented trigger is ANY later differing
+    // version, not just the final one.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let v_anchor = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() { 1 }",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let v_changed = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() { 2 }",
+        "c2",
+        "2026-01-05T00:00:00Z",
+    );
+    let v_reverted = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() { 1 }",
+        "c3",
+        "2026-01-10T00:00:00Z",
+    );
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![v_anchor, v_changed, v_reverted, ver, edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["verdict"], "stale",
+        "a change-then-revert must still be detected -- the code drifted at \
+         c2 even though the LATEST version happens to match the anchor again"
+    );
+    assert_eq!(rows[0]["triggering_handle"]["kind"], "content_change");
+    assert_eq!(rows[0]["triggering_handle"]["after_git_commit"], "c2");
+}

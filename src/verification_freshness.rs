@@ -653,6 +653,7 @@ fn record_anchor(record: &GraphRecord) -> Option<VerificationAnchor> {
 }
 
 /// Classifies one citation edge from a verification record to a code handle.
+#[allow(clippy::too_many_lines)]
 fn classify_citation(
     index: &VerificationFreshnessIndex<'_>,
     anchor: Option<&VerificationAnchor>,
@@ -738,34 +739,55 @@ fn classify_citation(
         }
     }
 
-    // Trigger 2: a later live version of the same handle whose content
-    // differs from the version current at the anchor.
-    if let Some(anchor_version) = index.version_at_anchor(target_id, anchor_time)
-        && let Some(later_time) = version_valid(latest)
-        && time_cmp(later_time, anchor_time) == std::cmp::Ordering::Greater
-        && content_differs(anchor_version, latest)
-    {
-        // Content differs relative to the version current at the anchor —
-        // update the cited handle to the ANCHOR version's own path/span (the
-        // identity the citation named), not the drifted frontier version.
-        let (anchor_path, anchor_span) = node_path_span(anchor_version);
-        handle.repo_relative_path = anchor_path.or(handle.repo_relative_path);
-        handle.span = anchor_span.or(handle.span);
-        let after_git_commit = match latest {
-            GraphRecord::Node {
-                temporal: Some(t), ..
-            } => Some(t.git_commit.clone()),
-            _ => None,
-        };
-        return (
-            VerificationFreshnessVerdict::Stale,
-            handle,
-            Some(TriggeringHandle::ContentChange {
-                after_git_commit,
-                after_valid_time: later_time.to_owned(),
-                content_hash: content_hash(latest),
-            }),
-        );
+    // Trigger 2: ANY later live version of the same handle whose content
+    // differs from the version current at the anchor -- not just the latest
+    // (frontier) version. A body that changed after the anchor and later
+    // reverted to byte-identical content would otherwise compare equal to
+    // the anchor via `latest` alone and hide a real intervening drift; the
+    // documented trigger is "a later version... whose content hash differs",
+    // not "the latest version differs" (mirrors `crate::evidence_freshness`,
+    // which walks every post-anchor version for the same reason).
+    if let Some(anchor_version) = index.version_at_anchor(target_id, anchor_time) {
+        let differing_after = index
+            .live_code_by_id
+            .get(target_id)
+            .into_iter()
+            .flatten()
+            .filter(|v| {
+                version_valid(v)
+                    .is_some_and(|vt| time_cmp(vt, anchor_time) == std::cmp::Ordering::Greater)
+            })
+            .filter(|v| content_differs(anchor_version, v))
+            .max_by(|a, b| {
+                time_cmp(
+                    version_valid(a).unwrap_or_default(),
+                    version_valid(b).unwrap_or_default(),
+                )
+            });
+        if let Some(after) = differing_after {
+            // Content differs relative to the version current at the anchor
+            // — update the cited handle to the ANCHOR version's own
+            // path/span (the identity the citation named), not the drifted
+            // version.
+            let (anchor_path, anchor_span) = node_path_span(anchor_version);
+            handle.repo_relative_path = anchor_path.or(handle.repo_relative_path);
+            handle.span = anchor_span.or(handle.span);
+            let after_git_commit = match after {
+                GraphRecord::Node {
+                    temporal: Some(t), ..
+                } => Some(t.git_commit.clone()),
+                _ => None,
+            };
+            return (
+                VerificationFreshnessVerdict::Stale,
+                handle,
+                Some(TriggeringHandle::ContentChange {
+                    after_git_commit,
+                    after_valid_time: version_valid(after).unwrap_or_default().to_owned(),
+                    content_hash: content_hash(after),
+                }),
+            );
+        }
     }
 
     (VerificationFreshnessVerdict::Current, handle, None)
