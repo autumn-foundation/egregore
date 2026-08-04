@@ -2872,3 +2872,141 @@ fn superseded_standalone_citation_edge_is_skipped() {
     assert_eq!(rows[0]["cited_handle"]["target_record_id"], sym_id);
     assert_eq!(rows[0]["verdict"], "current");
 }
+
+#[test]
+fn latest_write_is_selected_by_producer_time_not_sorted_array_position() {
+    // v1 is genuinely rewritten from status "pass" to status "fail". Because
+    // "fail" < "pass" lexicographically and `status` serializes BEFORE
+    // `producer` in GraphRecord::Node's field order, the rewritten (newer)
+    // write's JSON line sorts BEFORE the older write's line under
+    // Graph::to_jsonl's lexicographic sort -- so picking "latest" by array
+    // position alone would select the OLDER "pass" write. The newer write's
+    // LATER producer_started_at must correctly identify it as the true
+    // latest write regardless of where it lands in the sorted file.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+
+    let (v1, older_ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let older_ver = older_ver.with_producer(producer_at("2026-01-10T00:00:00Z"));
+    let (v1_again, newer_ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "fail",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    assert_eq!(v1, v1_again, "both writes must share the same stable ID");
+    let newer_ver = newer_ver.with_producer(producer_at("2026-01-20T00:00:00Z"));
+
+    // Producer-stamped (matching the newer write's own timestamp) so this
+    // edge survives the separate "producerless edge on a multi-write
+    // source" rule (round 15) untouched -- this test is exercising which
+    // WRITE is picked as latest, not edge correlation.
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id)
+        .with_producer(producer_at("2026-01-20T00:00:00Z"));
+    let (_temp, path) = write_graph(vec![symbol, older_ver, newer_ver, edge]);
+
+    // Sanity: confirm the JSONL really does sort the newer ("fail") write
+    // BEFORE the older ("pass") write -- otherwise this test wouldn't
+    // actually exercise the position-based-selection bug the fix closes.
+    let contents = fs::read_to_string(&path).expect("read graph");
+    let ver_lines: Vec<&str> = contents
+        .lines()
+        .filter(|l| l.contains("\"test_run\""))
+        .collect();
+    assert_eq!(ver_lines.len(), 2, "expected exactly two TestRun lines");
+    assert!(
+        ver_lines[0].contains("\"fail\"") && ver_lines[1].contains("\"pass\""),
+        "expected the newer write to sort before the older one in the \
+         JSONL, or this test doesn't exercise the bug: {ver_lines:?}"
+    );
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["status"], "fail",
+        "the LATEST write (by producer_started_at) must be classified, \
+         never whichever write happens to sort first in the JSONL"
+    );
+}
+
+#[test]
+fn commit_anchor_uses_the_target_commits_own_time_not_the_runs_recording_time() {
+    // The cited symbol changed TWICE: at c1 (Jan, what the run actually
+    // tested) and again at c2 (Feb, a real code change). The TestRun
+    // targets c1 but its own recorded valid_time is much LATER (March) --
+    // postdating c2's change entirely, simulating a delayed
+    // completion/import. Anchoring on the run's own recording time would
+    // make c2's version look "already current at anchor" and hide the real
+    // drift between c1 (what was actually tested) and c2 (now current);
+    // anchoring on c1's OWN committer time must correctly detect it.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let at_c1 = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() { 1 }",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let at_c2 = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() { 2 }",
+        "c2",
+        "2026-02-01T00:00:00Z",
+    );
+
+    let (v1, mut ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = &mut ver
+    {
+        t.valid_time = "2026-03-01T00:00:00Z".to_owned();
+    }
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![at_c1, at_c2, ver, edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["verdict"], "stale",
+        "the anchor must use commit c1's OWN committer time, not the \
+         run's much-later recording time, or the drift between c1 and c2 \
+         is hidden and reported current"
+    );
+}

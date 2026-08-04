@@ -273,6 +273,13 @@ struct VerificationFreshnessIndex<'a> {
     superseded_ids: BTreeSet<&'a str>,
     /// Drift metadata keyed by the prior (cited-side) record ID.
     drifts_by_prior: BTreeMap<&'a str, Vec<(&'a str, &'a SemanticDriftMetadata)>>,
+    /// Each commit SHA's own committer `valid_time`, read from ANY temporal
+    /// code-graph node version stamped at that commit (every node touched at
+    /// a commit carries the SAME committer date, so the first one found is
+    /// as good as any). Used by `record_anchor` to resolve a verification
+    /// record's `temporal.git_commit` to the TARGET commit's own timeline,
+    /// never the run's own recording time.
+    commit_valid_time: BTreeMap<&'a str, &'a str>,
 }
 
 impl<'a> VerificationFreshnessIndex<'a> {
@@ -519,11 +526,34 @@ impl<'a> VerificationFreshnessIndex<'a> {
             }
         }
 
+        // Each commit's own committer valid_time, from codegraph-domain
+        // temporal nodes ONLY (`is_codegraph_temporal_kind`, the same
+        // predicate the tip-commit frontier above uses to keep a
+        // verification record's own `temporal.git_commit`/`valid_time` --
+        // the run's target commit and recording time, a different fact --
+        // out of this lookup entirely).
+        let mut commit_valid_time: BTreeMap<&str, &str> = BTreeMap::new();
+        for record in records {
+            if let GraphRecord::Node {
+                kind,
+                temporal: Some(t),
+                ..
+            } = record
+                && is_codegraph_temporal_kind(*kind)
+                && !t.git_commit.is_empty()
+            {
+                commit_valid_time
+                    .entry(t.git_commit.as_str())
+                    .or_insert(t.valid_time.as_str());
+            }
+        }
+
         Self {
             live_code_by_id,
             tombstone_by_deleted,
             superseded_ids,
             drifts_by_prior,
+            commit_valid_time,
         }
     }
 
@@ -665,9 +695,25 @@ fn hash_contained_artifact(root: &Path, artifact_path: &str) -> Option<String> {
         .map(|(hex_hash, _len)| hex_hash)
 }
 
-/// The record's own anchor: `temporal.git_commit`/`temporal.valid_time` when
-/// present, else `executed_at`. `None` when neither is usable (`unanchored`).
-fn record_anchor(record: &GraphRecord) -> Option<VerificationAnchor> {
+/// The record's own anchor: `temporal.git_commit` (resolved to the TARGET
+/// commit's own committer time via `commit_valid_time`) when present, else
+/// `executed_at`. `None` when neither is usable (`unanchored`).
+///
+/// `docs/schema/verification.md` §5 documents `temporal.valid_time` and
+/// `temporal.git_commit` on a verification record as DISTINCT facts:
+/// `valid_time` is "when the run actually occurred" (its own wall-clock
+/// recording time), `git_commit` is "the commit SHA the run targeted" (what
+/// code state it verified) -- not the commit's own committer time. A run
+/// that completes or is imported LATER than a subsequent code change (e.g.
+/// targets c1, but is recorded/imported after c2 changed the cited handle)
+/// would, if anchored on its own `valid_time`, make c2's version look
+/// "already current at anchor" and hide a real drift between c1 (what was
+/// actually tested) and c2. Resolving through `commit_valid_time` anchors on
+/// the target commit's OWN timeline instead.
+fn record_anchor(
+    record: &GraphRecord,
+    commit_valid_time: &BTreeMap<&str, &str>,
+) -> Option<VerificationAnchor> {
     let GraphRecord::Node {
         temporal,
         executed_at,
@@ -679,9 +725,17 @@ fn record_anchor(record: &GraphRecord) -> Option<VerificationAnchor> {
     if let Some(t) = temporal
         && !t.git_commit.is_empty()
     {
+        // HONEST DEGRADE: the target commit has no codegraph-domain
+        // presence in this graph slice (e.g. a `--graph` combining only a
+        // current-tree scan with verification records, no commit history)
+        // -- fall back to the run's own recorded valid_time, the best
+        // available signal, rather than refusing to anchor at all.
+        let anchor_instant = commit_valid_time
+            .get(t.git_commit.as_str())
+            .map_or_else(|| t.valid_time.clone(), |vt| (*vt).to_owned());
         return Some(VerificationAnchor {
             git_commit: Some(t.git_commit.clone()),
-            executed_at: Some(t.valid_time.clone()),
+            executed_at: Some(anchor_instant),
         });
     }
     let executed_at = executed_at.as_deref().filter(|s| !s.is_empty())?;
@@ -885,12 +939,48 @@ pub fn verification_freshness(
     // re-ingested `TestRun` whose inline `evidence_links` were changed or
     // removed must not have its OLDER version's citations bleed into the
     // latest write's classification.
+    //
+    // "Latest" is picked by `producer_started_at` whenever BOTH the current
+    // holder and the candidate carry one -- NEVER by array position alone.
+    // For `--graph`, `records` reflects `Graph::to_jsonl`'s lexicographic
+    // STRING sort of the serialized lines, not write chronology (a rewrite
+    // from `status: pass` to `status: fail` can sort either way depending on
+    // incidental byte content), so "last occurrence in the loaded slice"
+    // carries no ordering information on its own. When a comparable producer
+    // timestamp isn't available on one or both sides (manually-authored
+    // graphs, or any write predating the producer envelope), this falls back
+    // to "last physical occurrence wins" -- the same convention already
+    // established and exercised by every pre-existing test in this suite.
     let mut latest_ver_write: BTreeMap<&str, usize> = BTreeMap::new();
     for (idx, record) in records.iter().enumerate() {
-        if let GraphRecord::Node { id, kind, .. } = record
+        if let GraphRecord::Node {
+            id, kind, producer, ..
+        } = record
             && is_verification_kind(*kind)
         {
-            latest_ver_write.insert(id.as_str(), idx);
+            match latest_ver_write.entry(id.as_str()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(idx);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let held_producer_ts = match &records[*entry.get()] {
+                        GraphRecord::Node {
+                            producer: Some(p), ..
+                        } => Some(p.producer_started_at.as_str()),
+                        _ => None,
+                    };
+                    let candidate_ts = producer.as_ref().map(|p| p.producer_started_at.as_str());
+                    let candidate_wins = match (candidate_ts, held_producer_ts) {
+                        (Some(cand), Some(held)) => {
+                            time_cmp(cand, held) != std::cmp::Ordering::Less
+                        }
+                        _ => true,
+                    };
+                    if candidate_wins {
+                        entry.insert(idx);
+                    }
+                }
+            }
         }
     }
     // The `producer.producer_started_at` of each verification id's LATEST
@@ -1108,7 +1198,7 @@ pub fn verification_freshness(
         {
             continue;
         }
-        let anchor = record_anchor(record);
+        let anchor = record_anchor(record, &index.commit_valid_time);
         let reported_kind = verification_kind
             .clone()
             .unwrap_or_else(|| kind.as_str().to_owned());
