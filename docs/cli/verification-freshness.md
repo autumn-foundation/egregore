@@ -64,11 +64,19 @@ agent observation.
 # 1. Build a code graph (with history, so drift signals exist).
 eg scan-history . --out history.graph.jsonl
 
-# 2. Capture test runs as citable TestRun records (issue #165).
-eg capture-tests --graph history.graph.jsonl --out history.graph.jsonl ...
+# 2. Capture test runs as citable TestRun records (issue #165), into a
+#    SEPARATE output file. `--out` overwrites its target with only the new
+#    TestRun/edge batch (`--graph` is read-only input, used solely to
+#    resolve symbol anchors) -- writing `--out` back onto history.graph.jsonl
+#    would truncate the whole history graph the next step needs.
+eg capture-tests --graph history.graph.jsonl --out testrun.graph.jsonl ...
 
-# 3. Which of my recorded passes now stand on moved ground?
-eg query verification-freshness --graph history.graph.jsonl --stale-only
+# 3. Union the two JSONL files before querying (mirrors `eg query log-deltas`'s
+#    combined-graph pattern).
+cat history.graph.jsonl testrun.graph.jsonl > combined.graph.jsonl
+
+# 4. Which of my recorded passes now stand on moved ground?
+eg query verification-freshness --graph combined.graph.jsonl --stale-only
 ```
 
 `--stale-only` returns only `stale` + `unresolved` records. When nothing is
