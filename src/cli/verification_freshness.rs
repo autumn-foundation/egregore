@@ -318,6 +318,16 @@ pub(crate) fn query_verification_freshness_cmd(
     };
 
     let counts = freshness::verdict_counts(&all);
+    // Captured BEFORE the `--stale-only` filter below discards the
+    // distinction: an EMPTY `all` means no citation was evaluable at all
+    // (no code/artifact citation to classify), a capability-absent
+    // situation -- never "checked and found nothing stale", which is what
+    // an empty POST-filter `verdicts` under `--stale-only` would otherwise
+    // look like. Conflating the two let `--stale-only` on a store with zero
+    // evaluable citations (e.g. `capture-tests` without `--graph` and no
+    // `--repo-path`) report the misleadingly clean `no_stale_verification_records`
+    // instead of the honest `no_verification_code_citations`.
+    let no_citations_evaluated = all.is_empty();
     let verdicts = if stale_only {
         freshness::stale_only(all)
     } else {
@@ -345,7 +355,7 @@ pub(crate) fn query_verification_freshness_cmd(
                  ProofResult nodes; verification freshness cannot be assessed"
                 .to_owned(),
         });
-    } else if verdicts.is_empty() && !stale_only {
+    } else if no_citations_evaluated {
         diagnostics.push(VerificationFreshnessDiagnosticJson {
             code: NO_VERIFICATION_CODE_CITATIONS_DIAGNOSTIC,
             detail: "verification records exist but none cite a code handle via \

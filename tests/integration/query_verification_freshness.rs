@@ -3138,3 +3138,43 @@ fn supersession_restoration_is_detected_by_producer_time_not_sorted_array_positi
          row happens to sort last in the JSONL"
     );
 }
+
+#[test]
+fn stale_only_with_zero_evaluable_citations_reports_no_citations_not_no_stale() {
+    // v1 has ZERO evaluable citations: no code-citation edge/evidence_link
+    // and no --repo-path artifact evaluation (mirrors `capture-tests` run
+    // without --graph). Under --stale-only this must report the honest
+    // `no_verification_code_citations` diagnostic -- never the misleadingly
+    // clean `no_stale_verification_records`, which would make a
+    // capability-absent situation (nothing was actually checked) look like
+    // a verified-clean pass to a CI script gating on it.
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        None,
+        None,
+    );
+    let (_temp, path) = write_graph(vec![ver]);
+
+    let report = run(&path, &["--stale-only"]);
+    assert_eq!(verdicts_for(&report, &v1).len(), 0);
+    let codes: Vec<&str> = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .map(|d| d["code"].as_str().expect("code"))
+        .collect();
+    assert!(
+        codes.contains(&"no_verification_code_citations"),
+        "expected no_verification_code_citations, got: {codes:?}"
+    );
+    assert!(
+        !codes.contains(&"no_stale_verification_records"),
+        "must not report the misleadingly clean no_stale_verification_records \
+         when nothing was actually evaluable: {codes:?}"
+    );
+}
