@@ -806,13 +806,26 @@ fn classify_citation(
 /// and the same `repo_path` contents yield byte-identical output across runs
 /// (AC9). No records are created, modified, or deleted; `repo_path`, when
 /// given, is only ever read.
+///
+/// `repo_scope`, when given, is used ONLY to skip the `source_artifact_path`
+/// filesystem read for a record with no provable relationship to that
+/// repository -- reading a file named by an OUT-OF-SCOPE record before the
+/// caller discards its row anyway would let an unrelated repository's
+/// `source_artifact_path` (special file, FIFO, oversized file) affect a
+/// scoped query's I/O even though its row could never survive the final
+/// repo filter. This is a read-avoidance optimization only, not the
+/// authoritative scope decision -- the CLI's own repo-scope filter (which
+/// this deliberately mirrors a permissive subset of) remains the sole
+/// authority on which rows the response actually contains.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn verification_freshness(
     records: &[GraphRecord],
     repo_path: Option<&Path>,
+    repo_scope: Option<&str>,
 ) -> Vec<VerificationFreshnessEntry> {
     let index = VerificationFreshnessIndex::build(records);
+    let repo_index = repo_scope.map(|_| crate::query::RepositoryIndex::build(records));
     let mut entries: Vec<VerificationFreshnessEntry> = Vec::new();
 
     // Every code-citation edge whose source is a verification record,
@@ -839,6 +852,26 @@ pub fn verification_freshness(
                 .insert((label.as_str(), target.as_str()));
         }
     }
+
+    // True when `ver_id` has ANY provable relationship to `repo_id`: direct
+    // attribution, or a citation targeting code owned by `repo_id`.
+    // Deliberately permissive (unlike the CLI's stricter unique-owner
+    // requirement for an ambiguous multi-repository record) -- this only
+    // gates whether the artifact file gets READ, never whether the row
+    // survives; reading slightly more often than the CLI would ultimately
+    // keep is harmless, reading less would risk silently skipping a row the
+    // CLI actually wanted.
+    let relates_to_repo =
+        |ri: &crate::query::RepositoryIndex, ver_id: &str, repo_id: &str| -> bool {
+            if let Some(owner) = ri.owner_of(ver_id) {
+                return owner == repo_id;
+            }
+            citations_by_source
+                .get(ver_id)
+                .into_iter()
+                .flatten()
+                .any(|(_, target)| ri.owner_of(target) == Some(repo_id))
+        };
 
     // Coalesce repeated physical writes of the same verification record
     // (append-only `--graph` re-ingest, or a `--data-dir` history-inclusive
@@ -903,11 +936,20 @@ pub fn verification_freshness(
         // Synthetic source-artifact citation: only evaluated with an
         // explicit `repo_path`, and only when the record carries both
         // fields. Never claimed `current` without actually reading the file.
-        if let (Some(recorded_hash), Some(artifact_path), Some(root)) = (
-            source_artifact_hash.as_deref(),
-            source_artifact_path.as_deref(),
-            repo_path,
-        ) && !recorded_hash.is_empty()
+        // Skipped up front for a record with no relationship to a supplied
+        // `repo_scope`, so an out-of-scope repository's `source_artifact_path`
+        // is never even opened.
+        let in_repo_scope = match (repo_scope, repo_index.as_ref()) {
+            (Some(repo_id), Some(ri)) => relates_to_repo(ri, id.as_str(), repo_id),
+            _ => true,
+        };
+        if in_repo_scope
+            && let (Some(recorded_hash), Some(artifact_path), Some(root)) = (
+                source_artifact_hash.as_deref(),
+                source_artifact_path.as_deref(),
+                repo_path,
+            )
+            && !recorded_hash.is_empty()
             && !artifact_path.is_empty()
             && let Some(bytes) = read_contained_artifact(root, artifact_path)
         {
@@ -921,7 +963,18 @@ pub fn verification_freshness(
                 target_domain: "verification".to_owned(),
             };
             let (verdict, triggering_handle) = if current_hash == recorded_hash {
-                (VerificationFreshnessVerdict::Current, None)
+                // A mismatch is `stale` regardless of anchor (AC2), but a
+                // MATCH proves only "unchanged right now" -- it says
+                // nothing about "since the anchor" when there IS no anchor
+                // to compare against. Per the documented precedence
+                // (unresolved > unanchored > stale > current), an anchorless
+                // record stays `unanchored` even when its artifact hash
+                // happens to match.
+                if anchor.is_some() {
+                    (VerificationFreshnessVerdict::Current, None)
+                } else {
+                    (VerificationFreshnessVerdict::Unanchored, None)
+                }
             } else {
                 (
                     VerificationFreshnessVerdict::Stale,

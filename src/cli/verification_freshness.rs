@@ -216,7 +216,7 @@ pub(crate) fn query_verification_freshness_cmd(
         std::process::exit(1);
     }
 
-    let all = freshness::verification_freshness(records, repo_path);
+    let all = freshness::verification_freshness(records, repo_path, repo_scope);
     // Repository scope: keep only rows with POSITIVE evidence of belonging
     // to the selected repository. Never a lenient "we don't know, so show
     // it under every scope" default: for a freshness verdict (unlike
@@ -255,13 +255,27 @@ pub(crate) fn query_verification_freshness_cmd(
             }
             all.into_iter()
                 .filter(|e| {
+                    // When the verification record itself is definitively
+                    // attributed to a DIFFERENT repository, no citation of
+                    // its ever belongs in this scope -- both endpoints must
+                    // agree, not just the cited target. (No writer
+                    // currently attributes a verification node directly, so
+                    // this is a correctness backstop rather than a live
+                    // case today; it must still hold if one ever does.)
+                    let ver_owner = index.owner_of(&e.verification_record_id);
+                    if let Some(o) = ver_owner
+                        && o != repo_id
+                    {
+                        return false;
+                    }
                     if let Some(target) = e.cited_handle.target_record_id.as_deref()
                         && let Some(owner) = index.owner_of(target)
                     {
                         return owner == repo_id;
                     }
-                    if let Some(owner) = index.owner_of(&e.verification_record_id) {
-                        return owner == repo_id;
+                    if ver_owner.is_some() {
+                        // Matched repo_id in the check above.
+                        return true;
                     }
                     ver_repo_owners
                         .get(e.verification_record_id.as_str())

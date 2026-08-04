@@ -2042,3 +2042,154 @@ fn dangling_only_citation_with_no_attribution_excluded_from_every_repo_scope() {
          surface under any --repo scope"
     );
 }
+
+#[test]
+fn artifact_hash_match_without_anchor_is_unanchored_not_current() {
+    // A CIStatus with a matching source_artifact_hash but NEITHER
+    // temporal.git_commit NOR executed_at. A hash MATCH proves only
+    // "unchanged right now" -- it says nothing about "since the anchor"
+    // when there is no anchor to compare against, so this must stay
+    // unanchored, not be overstated as current.
+    let temp_repo = tempfile::tempdir().expect("repo dir");
+    let artifact_rel = "ci/config.yml";
+    let artifact_abs = temp_repo.path().join(artifact_rel);
+    fs::create_dir_all(artifact_abs.parent().unwrap()).unwrap();
+    fs::write(&artifact_abs, b"same bytes").unwrap();
+    let recorded_hash = blake3::hash(b"same bytes").to_hex().to_string();
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::CIStatus,
+        Some("ci_status"),
+        "pass",
+        None, // no executed_at
+        None, // no git_commit
+        Some(artifact_rel),
+        Some(&recorded_hash),
+    );
+    let (_temp, path) = write_graph(vec![ver]);
+
+    let report = run(&path, &["--repo-path", temp_repo.path().to_str().unwrap()]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["verdict"], "unanchored",
+        "a matching hash on an anchorless record must not be overstated as current"
+    );
+}
+
+#[test]
+fn verification_record_directly_attributed_to_one_repo_excluded_from_anothers_scope() {
+    // A hypothetical future writer directly attributes v1 to repo-a (via
+    // CONTAINS -- no current writer does this, but the filter must not
+    // assume it never will). v1 cites a symbol owned by repo-b. Both
+    // endpoints must agree with the requested scope for a row to survive:
+    // this is a genuinely cross-repository citation, so it must be excluded
+    // from BOTH single-repository scopes -- never guessed into either one.
+    let (repo_a, repo_a_node) = repo_node("repo-a");
+    let (repo_b, repo_b_node) = repo_node("repo-b");
+    let (file_b, file_b_node) = plain_file("src/b.rs");
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        None,
+        None,
+    );
+    let touched = cite_edge(EdgeLabel::TouchedFile, &v1, &file_b);
+    let (_temp, path) = write_graph(vec![
+        repo_a_node,
+        repo_b_node,
+        file_b_node,
+        contains(&repo_a, &v1), // v1 itself directly attributed to repo-a
+        contains(&repo_b, &file_b),
+        ver,
+        touched,
+    ]);
+
+    let scoped_to_b = run(&path, &["--repo", &repo_b]);
+    assert_eq!(
+        verdicts_for(&scoped_to_b, &v1).len(),
+        0,
+        "a record attributed to repo-a must never surface under repo-b's scope, \
+         even when its cited target belongs to repo-b"
+    );
+
+    let scoped_to_a = run(&path, &["--repo", &repo_a]);
+    assert_eq!(
+        verdicts_for(&scoped_to_a, &v1).len(),
+        0,
+        "a citation into repo-b must not surface under repo-a's scope either -- \
+         both endpoints must agree, so a genuinely cross-repository citation is \
+         excluded from every single-repository scope"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn out_of_scope_repository_artifact_fifo_is_never_read() {
+    // v1's source_artifact_path points at a FIFO with no writer -- opening
+    // it for reading would block forever. v1 has a live citation into
+    // repo-b and none into repo-a. Scoped to the UNRELATED repo-a, the
+    // query must complete promptly, proving the artifact file is never even
+    // opened for an out-of-scope record.
+    let (repo_a, repo_a_node) = repo_node("repo-a");
+    let (repo_b, repo_b_node) = repo_node("repo-b");
+    let (file_b, file_b_node) = plain_file("src/b.rs");
+
+    let temp_repo = tempfile::tempdir().expect("repo dir");
+    let fifo_path = temp_repo.path().join("blocking.fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("mkfifo command must be available on Unix");
+    assert!(status.success(), "mkfifo failed");
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::CIStatus,
+        Some("ci_status"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        Some("blocking.fifo"),
+        Some(&"a".repeat(64)),
+    );
+    let touched = cite_edge(EdgeLabel::TouchedFile, &v1, &file_b);
+    let (_temp, path) = write_graph(vec![
+        repo_a_node,
+        repo_b_node,
+        file_b_node,
+        contains(&repo_b, &file_b),
+        ver,
+        touched,
+    ]);
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("egregore"))
+        .args(["query", "verification-freshness", "--graph"])
+        .arg(&path)
+        .args(["--repo", &repo_a, "--repo-path"])
+        .arg(temp_repo.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn egregore");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!(
+                "query hung -- an out-of-scope repository's artifact FIFO was read \
+                 before the repo-scope filter excluded its row"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
