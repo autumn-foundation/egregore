@@ -876,6 +876,24 @@ pub fn verification_freshness(
     let is_multi_repo_store = repo_index.repository_ids().len() > 1;
     let mut entries: Vec<VerificationFreshnessEntry> = Vec::new();
 
+    // Coalesce repeated physical writes of the same verification record
+    // (append-only `--graph` re-ingest, or a `--data-dir` history-inclusive
+    // read) to the LATEST write per stable ID -- an earlier physical version
+    // could expose an obsolete `status`/anchor/citation set. Computed BEFORE
+    // `citations_by_source` below (not just before the classification loop
+    // further down) so the node-carried-link branch can filter on it too: a
+    // re-ingested `TestRun` whose inline `evidence_links` were changed or
+    // removed must not have its OLDER version's citations bleed into the
+    // latest write's classification.
+    let mut latest_ver_write: BTreeMap<&str, usize> = BTreeMap::new();
+    for (idx, record) in records.iter().enumerate() {
+        if let GraphRecord::Node { id, kind, .. } = record
+            && is_verification_kind(*kind)
+        {
+            latest_ver_write.insert(id.as_str(), idx);
+        }
+    }
+
     // Every code-citation relation whose source is a verification record,
     // from BOTH representations (mirroring `query::verification_coverage`'s
     // own dual-representation read, since this lane draws on the same
@@ -892,7 +910,7 @@ pub fn verification_freshness(
     // `GraphRecord::edge`) must classify as exactly one citation, never one
     // row per physical copy.
     let mut citations_by_source: BTreeMap<&str, BTreeSet<(&'static str, &str)>> = BTreeMap::new();
-    for record in records {
+    for (idx, record) in records.iter().enumerate() {
         match record {
             GraphRecord::Edge {
                 id,
@@ -910,7 +928,16 @@ pub fn verification_freshness(
             }
             GraphRecord::Node {
                 id, evidence_links, ..
-            } if !index.tombstone_by_deleted.contains_key(id.as_str()) => {
+            } if !index.tombstone_by_deleted.contains_key(id.as_str())
+                // Only the LATEST physical write of a verification node
+                // contributes its inline citations (see `latest_ver_write`
+                // above); a non-verification node has no entry here and is
+                // unaffected, since `citations_by_source` entries keyed by a
+                // non-verification-record ID are never looked up below.
+                && latest_ver_write
+                    .get(id.as_str())
+                    .is_none_or(|&latest| latest == idx) =>
+            {
                 for link in evidence_links.iter().flatten() {
                     let Some(target) = link.target_record_id.as_deref() else {
                         continue;
@@ -959,20 +986,6 @@ pub fn verification_freshness(
                 .collect();
             owners.len() == 1 && owners.contains(repo_id)
         };
-
-    // Coalesce repeated physical writes of the same verification record
-    // (append-only `--graph` re-ingest, or a `--data-dir` history-inclusive
-    // read) to the LATEST write per stable ID before classifying -- an
-    // earlier physical version could expose an obsolete `status` or anchor,
-    // and classifying every version would duplicate every citation row.
-    let mut latest_ver_write: BTreeMap<&str, usize> = BTreeMap::new();
-    for (idx, record) in records.iter().enumerate() {
-        if let GraphRecord::Node { id, kind, .. } = record
-            && is_verification_kind(*kind)
-        {
-            latest_ver_write.insert(id.as_str(), idx);
-        }
-    }
 
     for (idx, record) in records.iter().enumerate() {
         let GraphRecord::Node {

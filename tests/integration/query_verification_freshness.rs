@@ -2548,3 +2548,65 @@ fn verification_records_own_anchor_commit_never_pollutes_the_code_tip_frontier()
          version, at c1, is still current, not an interior commit"
     );
 }
+
+#[test]
+fn stale_inline_citations_from_an_older_write_are_dropped_on_rewrite() {
+    // v1 is re-ingested TWICE under the SAME stable ID, each time carrying
+    // its citation ONLY as a node-carried EvidenceLink (no standalone edge).
+    // The OLDER physical write cites a handle that resolves nowhere in the
+    // store; the LATEST physical write cites a live symbol instead. Only the
+    // latest write's inline citations may be classified -- the older
+    // write's now-superseded citation must never bleed through and produce
+    // a spurious extra `unresolved` row.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let stale_target_id = stable_id(&["node", "Symbol", "src/gone.rs", "ghost"]);
+
+    let (v1, older_ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let older_ver =
+        older_ver.with_evidence_links(vec![evidence_link("MENTIONS_SYMBOL", &stale_target_id)]);
+    let (v1_again, newer_ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    assert_eq!(v1, v1_again, "both writes must share the same stable ID");
+    let newer_ver = newer_ver.with_evidence_links(vec![evidence_link("MENTIONS_SYMBOL", &sym_id)]);
+
+    // Older write first, latest write last -- `latest_ver_write` picks the
+    // highest-index physical occurrence of each stable ID.
+    let (_temp, path) = write_graph(vec![symbol, older_ver, newer_ver]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the latest write's inline citation may be classified, not \
+         both the older write's stale citation and the newer one"
+    );
+    assert_eq!(rows[0]["cited_handle"]["target_record_id"], sym_id);
+    assert_eq!(rows[0]["verdict"], "current");
+}
