@@ -68,6 +68,17 @@ enum ScopeResolution {
 /// duplicated in another repository would be wrongly reported `ambiguous`,
 /// and a name that exists only outside the selected repository would wrongly
 /// resolve at all.
+///
+/// Name and path-prefix matching are further restricted to the SAME live
+/// code-handle set the core module's own citation classification uses
+/// (`freshness::live_code_handle_ids`): the history-inclusive store this
+/// lane always reads can retain a tombstoned/superseded handle alongside a
+/// live one that happens to share a name, and without this a scope that
+/// uniquely names the LIVE handle would be wrongly reported `ambiguous_scope`
+/// (or match a dead handle no citation can ever target). An explicit record
+/// ID is deliberately exempt from this filter: it must keep resolving a
+/// historical/tombstoned handle directly, so scoping to it still surfaces
+/// that citation's `unresolved` verdict.
 fn resolve_scope(
     records: &[GraphRecord],
     repo_scope: Option<&str>,
@@ -77,6 +88,7 @@ fn resolve_scope(
     let Some(scope) = scope else {
         return ScopeResolution::None;
     };
+    let live_ids = freshness::live_code_handle_ids(records);
     let mut by_id: BTreeSet<String> = BTreeSet::new();
     let mut by_name: BTreeSet<String> = BTreeSet::new();
     let mut by_path_prefix: BTreeSet<String> = BTreeSet::new();
@@ -110,10 +122,12 @@ fn resolve_scope(
         if id == scope {
             by_id.insert(id.clone());
         }
-        if name.as_deref() == Some(scope) {
+        let is_live = live_ids.contains(id.as_str());
+        if is_live && name.as_deref() == Some(scope) {
             by_name.insert(id.clone());
         }
-        if let Some(path) = repo_relative_path
+        if is_live
+            && let Some(path) = repo_relative_path
             && query::path_is_under_prefix(path, scope)
         {
             by_path_prefix.insert(id.clone());

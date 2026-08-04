@@ -793,8 +793,13 @@ pub fn verification_freshness(
     let index = VerificationFreshnessIndex::build(records);
     let mut entries: Vec<VerificationFreshnessEntry> = Vec::new();
 
-    // Every code-citation edge whose source is a verification record.
-    let mut citations_by_source: BTreeMap<&str, Vec<(&'static str, &str)>> = BTreeMap::new();
+    // Every code-citation edge whose source is a verification record,
+    // deduplicated to one (relation, target) pair per source: a re-ingested
+    // or history-inclusive-store-duplicated physical copy of the SAME edge
+    // (same label/source/target ⇒ same stable edge ID, per
+    // `GraphRecord::edge`) must classify as exactly one citation, never one
+    // row per physical copy.
+    let mut citations_by_source: BTreeMap<&str, BTreeSet<(&'static str, &str)>> = BTreeMap::new();
     for record in records {
         if let GraphRecord::Edge {
             id,
@@ -809,11 +814,25 @@ pub fn verification_freshness(
             citations_by_source
                 .entry(source.as_str())
                 .or_default()
-                .push((label.as_str(), target.as_str()));
+                .insert((label.as_str(), target.as_str()));
         }
     }
 
-    for record in records {
+    // Coalesce repeated physical writes of the same verification record
+    // (append-only `--graph` re-ingest, or a `--data-dir` history-inclusive
+    // read) to the LATEST write per stable ID before classifying -- an
+    // earlier physical version could expose an obsolete `status` or anchor,
+    // and classifying every version would duplicate every citation row.
+    let mut latest_ver_write: BTreeMap<&str, usize> = BTreeMap::new();
+    for (idx, record) in records.iter().enumerate() {
+        if let GraphRecord::Node { id, kind, .. } = record
+            && is_verification_kind(*kind)
+        {
+            latest_ver_write.insert(id.as_str(), idx);
+        }
+    }
+
+    for (idx, record) in records.iter().enumerate() {
         let GraphRecord::Node {
             id,
             kind,
@@ -827,6 +846,9 @@ pub fn verification_freshness(
             continue;
         };
         if !is_verification_kind(*kind) {
+            continue;
+        }
+        if latest_ver_write.get(id.as_str()) != Some(&idx) {
             continue;
         }
         if index.tombstone_by_deleted.contains_key(id.as_str())
@@ -940,4 +962,23 @@ pub fn has_verification_records(records: &[GraphRecord]) -> bool {
     records
         .iter()
         .any(|r| matches!(r, GraphRecord::Node { kind, .. } if is_verification_kind(*kind)))
+}
+
+/// Stable record IDs of every code handle this module considers live.
+///
+/// Covers `Symbol`/`File` handles surviving this module's own liveness rules
+/// (tombstone/supersession/per-repository frontier) -- exposed so scope
+/// resolution can filter a by-NAME candidate set to live handles before
+/// deciding ambiguity, using the SAME liveness this module's own citation
+/// classification relies on (never a second, independently-drifting notion
+/// of "live"). An explicit record-ID scope is deliberately NOT filtered
+/// through this: it must keep resolving a tombstoned/historical handle
+/// directly, so a citation to it still shows its `unresolved` verdict.
+#[must_use]
+pub fn live_code_handle_ids(records: &[GraphRecord]) -> BTreeSet<&str> {
+    VerificationFreshnessIndex::build(records)
+        .live_code_by_id
+        .keys()
+        .copied()
+        .collect()
 }

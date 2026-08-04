@@ -1801,3 +1801,95 @@ fn unresolved_row_with_no_owner_excluded_from_unrelated_repo_scope() {
         "both of repo B's own citations (live and dangling) belong under repo B's scope"
     );
 }
+
+#[test]
+fn retracted_same_named_symbol_never_causes_false_ambiguity() {
+    // A history-inclusive store retains a tombstoned "run" (in file A)
+    // alongside a live "run" (in file B). Scoping to the live one by name
+    // must resolve, not be rejected as ambiguous by the dead one.
+    let dead_id = stable_id(&["node", "Symbol", "src/a.rs", "run"]);
+    let dead_run = symbol_version(
+        &dead_id,
+        "src/a.rs",
+        "run",
+        span(1, 5),
+        "fn run() { 1 }",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let dead_tombstone = tombstone_of(&dead_id, "removed");
+
+    let live_id = stable_id(&["node", "Symbol", "src/b.rs", "run"]);
+    let live_run = symbol_version(
+        &live_id,
+        "src/b.rs",
+        "run",
+        span(1, 5),
+        "fn run() { 2 }",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &live_id);
+    let (_temp, path) = write_graph(vec![dead_run, dead_tombstone, live_run, ver, edge]);
+
+    // Scoping by the live name must succeed, not report ambiguous_scope.
+    let report = run(&path, &["run"]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["cited_handle"]["target_record_id"], live_id);
+
+    // An explicit reference to the DEAD record ID still resolves directly
+    // (never filtered by liveness) -- it simply matches nothing here since
+    // no citation targets it, an ordinary well-formed empty result.
+    run_raw(&path, &[&dead_id]).success();
+}
+
+#[test]
+fn repeated_verification_write_is_classified_once() {
+    // Simulates a re-ingested / history-inclusive-store-duplicated physical
+    // copy of the SAME TestRun and the SAME citation edge (both keyed by
+    // stable ID, so two byte-identical physical rows share one ID). Must
+    // classify to exactly one row, never two.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    // The same TestRun node and the same citation edge, each written TWICE.
+    let (_temp, path) = write_graph(vec![symbol, ver.clone(), ver, edge.clone(), edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a repeated physical write of the same record/edge must classify once, not per copy"
+    );
+}
