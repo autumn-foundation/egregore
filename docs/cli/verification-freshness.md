@@ -64,18 +64,33 @@ agent observation.
 # 1. Build a code graph (with history, so drift signals exist).
 eg scan-history . --out history.graph.jsonl
 
-# 2. Capture test runs as citable TestRun records (issue #165), into a
-#    SEPARATE output file. `--out` overwrites its target with only the new
-#    TestRun/edge batch (`--graph` is read-only input, used solely to
-#    resolve symbol anchors) -- writing `--out` back onto history.graph.jsonl
-#    would truncate the whole history graph the next step needs.
-eg capture-tests --graph history.graph.jsonl --out testrun.graph.jsonl ...
+# 2. Also build a CURRENT-STATE snapshot to resolve test-name anchors
+#    against. `capture-tests` (issue #165) resolves a test's final `::`
+#    segment to exactly one matching Symbol record in whatever `--graph` it
+#    is given; a `scan-history` graph carries one Symbol record PER COMMIT a
+#    symbol changed at, so any symbol touched more than once in history
+#    resolves AMBIGUOUSLY there and mints no citation edges at all -- the
+#    freshness query would then see no code citations to classify.
+#    `eg scan`'s single current-tree snapshot has exactly one record per
+#    live symbol, so resolution against it is unambiguous.
+eg scan . --out current.graph.jsonl
 
-# 3. Union the two JSONL files before querying (mirrors `eg query log-deltas`'s
-#    combined-graph pattern).
+# 3. Capture test runs as citable TestRun records, resolved against the
+#    CURRENT snapshot, into a SEPARATE output file. `--out` overwrites its
+#    target with only the new TestRun/edge batch (`--graph` is read-only
+#    input, used solely to resolve symbol anchors) -- writing `--out` back
+#    onto either scan file would truncate the graph the next step needs.
+eg capture-tests --graph current.graph.jsonl --out testrun.graph.jsonl ...
+
+# 4. Union the HISTORY graph and the new TestRun batch before querying
+#    (mirrors `eg query log-deltas`'s combined-graph pattern).
+#    `current.graph.jsonl` itself is not needed in the union: ADR-0004
+#    identity keys a Symbol by (path, kind, qualified name, disambiguator),
+#    never by commit, so the IDs `capture-tests` resolved against the
+#    current snapshot already exist in history.graph.jsonl at HEAD.
 cat history.graph.jsonl testrun.graph.jsonl > combined.graph.jsonl
 
-# 4. Which of my recorded passes now stand on moved ground?
+# 5. Which of my recorded passes now stand on moved ground?
 eg query verification-freshness --graph combined.graph.jsonl --stale-only
 ```
 
