@@ -347,6 +347,13 @@ impl<'a> VerificationFreshnessIndex<'a> {
         // OLDER `SUPERSEDES` link outlive a later rewrite that dropped it.
         let mut superseded_ids: BTreeSet<&str> = BTreeSet::new();
         let mut last_node_superseded: BTreeMap<&str, (usize, bool)> = BTreeMap::new();
+        // Standalone SUPERSEDES edges are collected here rather than applied
+        // inline: an edge can itself be the TARGET of another live SUPERSEDES
+        // marker (a correction retracting a previous, wrong supersession), so
+        // whether THIS edge's claim should be honored is not decidable until
+        // every node-level marker (below) and every sibling edge (further
+        // below) has been seen.
+        let mut supersedes_edge_candidates: Vec<(&str, &str)> = Vec::new();
         for (idx, record) in records.iter().enumerate() {
             match record {
                 GraphRecord::Node {
@@ -373,12 +380,10 @@ impl<'a> VerificationFreshnessIndex<'a> {
                 } if !tombstone_by_deleted.contains_key(id.as_str())
                     && !tombstone_by_deleted.contains_key(source.as_str()) =>
                 {
-                    // Honor a standalone SUPERSEDES edge only when neither the
-                    // edge nor its superseding source node has been retracted
-                    // (mirrors `crate::evidence_freshness`) -- otherwise a
-                    // retracted supersession would wrongly hide a still-live
-                    // target as `unresolved`.
-                    superseded_ids.insert(target.as_str());
+                    // Neither the edge nor its superseding source node has
+                    // been retracted (mirrors `crate::evidence_freshness`).
+                    // Whether it is ALSO superseded is decided below.
+                    supersedes_edge_candidates.push((id.as_str(), target.as_str()));
                 }
                 _ => {}
             }
@@ -408,6 +413,25 @@ impl<'a> VerificationFreshnessIndex<'a> {
                     }
                 }
             }
+        }
+        // A standalone SUPERSEDES edge whose OWN record ID has itself been
+        // superseded -- by a node-level marker (`superseded_by` or an inline
+        // `SUPERSEDES` evidence link, both folded into `superseded_ids`
+        // above) or by ANOTHER live standalone SUPERSEDES edge -- must not
+        // contribute its now-retracted target. One level of indirection: an
+        // edge superseding this edge is treated as live for this purpose
+        // without checking whether IT was, in turn, superseded by a THIRD
+        // edge -- the same bounded depth every other supersession check in
+        // this module applies.
+        let edge_ids_targeted_by_an_edge: BTreeSet<&str> = supersedes_edge_candidates
+            .iter()
+            .map(|&(_, target)| target)
+            .collect();
+        for &(edge_id, target) in &supersedes_edge_candidates {
+            if superseded_ids.contains(edge_id) || edge_ids_targeted_by_an_edge.contains(edge_id) {
+                continue;
+            }
+            superseded_ids.insert(target);
         }
 
         // Per-repository tip-commit and non-temporal scan frontiers (mirrors

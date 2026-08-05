@@ -866,6 +866,73 @@ fn retracted_supersedes_source_never_hides_a_still_live_target() {
 }
 
 #[test]
+fn superseded_supersedes_edge_does_not_hide_its_original_target() {
+    // A first SUPERSEDES edge (superseder1 -> widget) claims widget was
+    // superseded -- but that claim was itself WRONG, so a second, live
+    // SUPERSEDES edge targets the FIRST edge's own record ID (never
+    // tombstoning it -- mirrors how a node-carried SUPERSEDES evidence link
+    // can target an edge, per `superseded_standalone_citation_edge_is_skipped`,
+    // but here the superseding side is itself another standalone edge).
+    // The first edge's claim must not survive the correction, so widget
+    // stays live/current.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let first_supersedes_edge = GraphRecord::edge(
+        EdgeLabel::Supersedes,
+        "agent_memory:v1:superseder1".to_owned(),
+        sym_id.clone(),
+        None,
+        "wrongly supersedes widget".to_owned(),
+    );
+    let first_edge_id = match &first_supersedes_edge {
+        GraphRecord::Edge { id, .. } => id.clone(),
+        _ => unreachable!("GraphRecord::edge always returns an Edge record"),
+    };
+    let correcting_edge = GraphRecord::edge(
+        EdgeLabel::Supersedes,
+        "agent_memory:v1:corrector".to_owned(),
+        first_edge_id,
+        None,
+        "corrects the wrong supersession".to_owned(),
+    );
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![
+        symbol,
+        first_supersedes_edge,
+        correcting_edge,
+        ver,
+        edge,
+    ]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["verdict"], "current",
+        "a SUPERSEDES edge that was itself superseded by another live \
+         SUPERSEDES edge must not keep hiding its original target"
+    );
+}
+
+#[test]
 fn tombstoned_target_is_unresolved_with_handle_removed_trigger() {
     let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
     let symbol = symbol_version(
