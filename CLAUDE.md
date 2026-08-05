@@ -1331,6 +1331,57 @@ scoped repository), `--at <sha>` pins a single-commit surface snapshot, and
 payloads), deterministic and byte-identical across runs. See
 `docs/cli/verification-coverage.md`.
 
+`eg query verification-freshness [scope]` ages the verification evidence
+`verification-coverage` finds (issue #111): for every `TestRun`/`CIStatus`/
+`BenchmarkRun`/`CoverageReport`/`ProofResult` record citing code via
+`FAILED_ON`/`MENTIONS_SYMBOL`/`TOUCHED_FILE`, it returns a per-citation
+freshness verdict — `current`/`stale`/`unresolved`/`unanchored` — so a
+`TestRun status=pass` recorded 40 commits ago whose cited symbol has since
+drifted is never handed back as authoritative green with no signal it moved.
+Distinct from `eg query evidence-freshness` (#85, which ages agent-memory
+`Observation`/`Decision` citations, a different domain and trust class) —
+the command name differs precisely to avoid colliding with that existing
+lane. A verdict is a FRESHNESS LEAD, never a re-judgment of pass/fail: a
+`stale`/`unresolved` row states only that the verified basis moved, never
+that the recorded `status` is now wrong, that the code is broken, or that it
+is correct/safe; the verification record's own `status` is echoed verbatim,
+never rewritten. The anchor is `temporal.git_commit` (paired with its
+`temporal.valid_time`) when present, else `executed_at` — a deliberate
+precedence decision, since the one real trunk writer (`eg capture-tests`,
+issue #165) populates only `executed_at` today. Triggers are REUSED, never
+re-derived: a `SemanticDrift` record whose `prior_record_id` matches the
+cited handle and postdates the anchor (`drift_record`); a later code-graph
+version of the SAME cited record ID with a different content hash
+(`content_change`, sharing `eg query evidence-freshness`'s `content_hash`/
+`content_differs` signal); and, only with `--repo-path <dir>` supplied, a
+live BLAKE3 re-hash of the artefact at `source_artifact_path` against the
+recorded `source_artifact_hash` (`artifact_hash_changed`) — a mismatch is
+`stale` regardless of anchor, and this trigger is simply NOT evaluated
+without `--repo-path` (never assumed to match). No false staleness from
+neighbors (AC5): every trigger matches the exact cited record ID, never the
+containing file blob, so a sibling symbol's drift never leaks onto an
+unrelated citation. A verification record with multiple citations gets one
+row per citation, never collapsed. This lane always reads the
+history-inclusive store view (like #85, unlike the corpus-mode-flipped
+lanes) since the anchor comparison needs the code version current AT the
+anchor, which can be a superseded pre-drift version; it does not participate
+in the `--all-history`/`--at-head` contract. The optional scope handle
+resolves as record ID, exact symbol name, or segment-aware repo-relative
+path prefix; a scope matching no in-store code item exits 2
+(`scope_not_found`/`no_match`), and a name matching more than one live code
+item exits 1 (`ambiguous_scope`). `--repo` scopes both the verification
+record and its cited handle; `--stale-only` returns only `stale`+`unresolved`
+rows, with an empty result reported via the stable diagnostic
+`no_stale_verification_records` — never silently; a store with zero
+verification records reports `no_verification_records_in_store` (exit 0, not
+an error). `--limit` (default 500, max 1000) truncates with a
+`results_truncated` diagnostic. Known limitation: liveness uses a
+store-wide (not per-repository) tip-commit frontier, unlike #85's
+multi-round #203/#204/#454/#559 scoping — scope with `--repo` in a
+multi-repo store to avoid it. Read-only, allow-list-only output (never raw
+stdout/stderr/summary text), deterministic and byte-identical across runs.
+See `docs/cli/verification-freshness.md`.
+
 Protected raw-artifact commands (issue #60):
 
 ```powershell

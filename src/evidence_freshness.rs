@@ -1059,7 +1059,7 @@ const fn record_semantic_drift(record: &GraphRecord) -> Option<&SemanticDriftMet
 }
 
 /// Code-graph node kinds that can be cited as a code handle.
-const fn is_code_handle_kind(kind: NodeKind) -> bool {
+pub(crate) const fn is_code_handle_kind(kind: NodeKind) -> bool {
     matches!(
         kind,
         NodeKind::File | NodeKind::Symbol | NodeKind::Module | NodeKind::Import
@@ -1664,7 +1664,7 @@ fn at_or_before<'a>(versions: &[&'a GraphRecord], anchor_vt: &str) -> Option<&'a
         })
 }
 
-const fn version_commit(record: &GraphRecord) -> Option<&str> {
+pub(crate) const fn version_commit(record: &GraphRecord) -> Option<&str> {
     match record {
         GraphRecord::Node {
             temporal: Some(t), ..
@@ -1677,7 +1677,7 @@ const fn version_commit(record: &GraphRecord) -> Option<&str> {
 /// `temporal.valid_time`; falls back to the node-level `valid_time` stamped on
 /// current-tree `scan`/`refresh` records so repeated current-tree snapshots are
 /// still ordered and comparable.
-const fn version_valid(record: &GraphRecord) -> Option<&str> {
+pub(crate) const fn version_valid(record: &GraphRecord) -> Option<&str> {
     match record {
         GraphRecord::Node {
             temporal: Some(t), ..
@@ -1708,7 +1708,7 @@ fn version_parents(record: &GraphRecord) -> &[String] {
 /// normalized body, folded in here so a body edit flips the hash. The field is
 /// mixed in ONLY when present, so every record without it (every other kind)
 /// hashes byte-identically to before.
-fn content_hash(record: &GraphRecord) -> String {
+pub(crate) fn content_hash(record: &GraphRecord) -> String {
     let (summary, content_signature) = match record {
         GraphRecord::Node {
             summary,
@@ -1751,7 +1751,7 @@ fn summary_and_signature(record: &GraphRecord) -> (&str, Option<&str>) {
 ///   pre-#206 (summary-only) decision;
 /// - exactly one carries one (a pre-/post-upgrade pair) → compare the summary
 ///   only, so the field's mere presence never manufactures drift.
-fn content_differs(anchor: &GraphRecord, record: &GraphRecord) -> bool {
+pub(crate) fn content_differs(anchor: &GraphRecord, record: &GraphRecord) -> bool {
     let (anchor_summary, anchor_sig) = summary_and_signature(anchor);
     let (record_summary, record_sig) = summary_and_signature(record);
     if anchor_sig.is_some() && record_sig.is_some() {
@@ -1770,7 +1770,7 @@ fn time_after(later: &str, anchor: &str) -> bool {
 /// Orders two RFC 3339 instants by parsed value so mixed UTC offsets compare
 /// correctly (`scan-history` preserves Git's committer offset). Falls back to
 /// byte ordering only when either value fails to parse.
-fn time_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn time_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     match (
         chrono::DateTime::parse_from_rfc3339(a),
         chrono::DateTime::parse_from_rfc3339(b),

@@ -89,6 +89,7 @@ mod query_unreferenced;
 mod query_unsafe_sites;
 mod query_unwrap_expect;
 mod query_verification_coverage;
+mod query_verification_freshness;
 mod query_who;
 mod query_who_constructs;
 mod query_who_imports;

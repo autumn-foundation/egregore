@@ -669,8 +669,11 @@ pub(crate) fn read_capped_regular_file(path: &Path, cap: u64) -> io::Result<Stri
 
 /// Streams `source` through a BLAKE3 hasher without buffering the whole file,
 /// returning its `(hex_hash, byte_len)`.  Used by the capture preview path,
-/// which must not write anything to disk.
-fn hash_source_streaming(source: &Path) -> io::Result<(String, u64)> {
+/// which must not write anything to disk, and by
+/// `crate::verification_freshness`'s `source_artifact_hash` re-hash (which
+/// needs the same no-follow/regular-file-only/non-blocking-open guarantees
+/// against an operator/attacker-controlled path read back from the store).
+pub(crate) fn hash_source_streaming(source: &Path) -> io::Result<(String, u64)> {
     let mut src = open_source_checked(source)?;
     // blake3::Hasher implements io::Write, so io::copy streams the file through
     // it in bounded-size chunks and returns the byte count.

@@ -22,9 +22,10 @@
 //!
 //! Scope boundary (issue #217 Out of Scope): this slice only *reports*. It never
 //! repairs (that is #72), never renders a drift verdict on a still-live target
-//! (that is #111/#160 — "broken" here means absent or tombstoned, not drifted),
-//! and never resolves a single handle on demand (#160) or audits one answer's
-//! completeness (#65).
+//! ("broken" here means absent or tombstoned, not drifted — verification-record
+//! drift verdicts are `crate::verification_freshness`, issue #111; a similar
+//! on-demand single-handle verdict is #160), and never resolves a single handle
+//! on demand (#160) or audits one answer's completeness (#65).
 
 use std::collections::{BTreeMap, BTreeSet};
 
