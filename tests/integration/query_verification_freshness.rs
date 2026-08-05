@@ -555,6 +555,120 @@ fn command_run_and_umbrella_verification_kinds_are_classified_too() {
 }
 
 #[test]
+fn agent_memory_domain_command_run_is_not_classified_as_verification() {
+    // `CommandRun`/`Verification` are ALSO used by the trajectory importers
+    // (traj.rs/antigravity.rs/codex.rs) to record agent tool-call activity
+    // under `domain: "agent_memory"` (an `agent_memory:v1:` ID prefix) --
+    // reusing the same `NodeKind` variants for a DIFFERENT semantic meaning
+    // (an agent activity log entry, never a verification claim). Gating on
+    // `NodeKind` alone (round 30's fix) would wrongly sweep these into the
+    // verification-freshness lane; the id-prefix/domain check must exclude
+    // them, mirroring the daemon's own write-time validator.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let v_early = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() { 1 }",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let v_later = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() { 2 }",
+        "c2",
+        "2026-01-05T00:00:00Z",
+    );
+
+    let agent_cmd_id = "agent_memory:v1:cmdrun1".to_owned();
+    let mut agent_cmd_run = GraphRecord::node(
+        agent_cmd_id.clone(),
+        NodeKind::CommandRun,
+        None,
+        None,
+        None,
+        "agent-memory command run".to_owned(),
+    )
+    .with_domain("agent_memory", 1);
+    if let GraphRecord::Node {
+        status,
+        executed_at,
+        temporal: temporal_field,
+        ..
+    } = &mut agent_cmd_run
+    {
+        *status = Some("pass".to_owned());
+        *executed_at = Some("2026-01-02T00:00:00Z".to_owned());
+        *temporal_field = Some(temporal("c1", "2026-01-02T00:00:00Z"));
+    }
+    let agent_cmd_edge = cite_edge(EdgeLabel::MentionsSymbol, &agent_cmd_id, &sym_id);
+
+    let (_temp, path) = write_graph(vec![v_early, v_later, agent_cmd_run, agent_cmd_edge]);
+
+    let report = run(&path, &[]);
+    assert_eq!(
+        verdicts_for(&report, &agent_cmd_id).len(),
+        0,
+        "an agent-memory-domain CommandRun must not be classified as \
+         verification evidence"
+    );
+    let codes: Vec<&str> = report["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["code"].as_str().unwrap())
+        .collect();
+    assert!(
+        codes.contains(&"no_verification_records_in_store"),
+        "the store's only CommandRun-kind node is agent-memory-domain, so it \
+         must report no verification records, not silently classify it"
+    );
+}
+
+#[test]
+fn artifact_hash_recorded_under_a_different_algorithm_is_never_compared() {
+    // `eg write verification` accepts an entirely free-text
+    // `--source-artifact-hash`, so a caller can record a hash under a
+    // DIFFERENT algorithm than the BLAKE3 digest this module always
+    // computes when re-hashing a live artifact. Comparing across algorithms
+    // would compare unrelated digests; a `sha256:`-tagged recorded hash must
+    // never be compared against a BLAKE3 re-hash, even when the live file's
+    // bytes are completely unrelated to the recorded value (which would
+    // otherwise look like an obvious, confident `stale` mismatch).
+    let temp_repo = tempfile::tempdir().expect("repo dir");
+    let artifact_rel = "ci/config.yml";
+    let artifact_abs = temp_repo.path().join(artifact_rel);
+    fs::create_dir_all(artifact_abs.parent().unwrap()).unwrap();
+    fs::write(&artifact_abs, b"current bytes").unwrap();
+    // Not a BLAKE3 digest, and unrelated to the live file's actual BLAKE3 hash.
+    let recorded_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::CIStatus,
+        Some("ci_status"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        Some(artifact_rel),
+        Some(recorded_hash),
+    );
+    let (_temp, path) = write_graph(vec![ver]);
+
+    let report = run(&path, &["--repo-path", temp_repo.path().to_str().unwrap()]);
+    assert_eq!(
+        verdicts_for(&report, &v1).len(),
+        0,
+        "a source_artifact_hash recorded under a non-BLAKE3 algorithm must \
+         never be compared against a BLAKE3 re-hash of the live file"
+    );
+}
+
+#[test]
 fn drift_record_after_anchor_is_stale_with_drift_trigger() {
     let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
     let symbol = symbol_version(

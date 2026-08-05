@@ -804,17 +804,25 @@ const fn is_codegraph_temporal_kind(kind: NodeKind) -> bool {
 
 /// The full verification-domain node-kind set, matching `docs/schema/verification.md`
 /// §2 and the daemon's own `VERIFICATION_NODE_KINDS` write-time validator
-/// (`src/daemon.rs`) exactly -- the authoritative, already-enforced
-/// definition of "verification-domain record" in this codebase. This issue's
-/// AC names only the five specialized run-kinds as illustrative examples,
-/// but `CommandRun` and the umbrella `Verification` kind are equally
-/// verification-domain per the schema (§6 documents `MENTIONS_SYMBOL`/
-/// `TOUCHED_FILE` as valid FROM "any verification" kind, not just the five
-/// specialized ones) and are genuinely written by real producers today (the
-/// daemon write path plus the `traj.rs`/`antigravity.rs`/`codex.rs`
-/// trajectory importers) -- excluding them left real evidence silently
-/// unaged, contradicting this issue's own problem statement.
-const fn is_verification_kind(kind: NodeKind) -> bool {
+/// (`src/daemon.rs`) exactly. This issue's AC names only the five
+/// specialized run-kinds as illustrative examples, but `CommandRun` and the
+/// umbrella `Verification` kind are equally verification-domain per the
+/// schema (§6 documents `MENTIONS_SYMBOL`/`TOUCHED_FILE` as valid FROM "any
+/// verification" kind, not just the five specialized ones) and are
+/// genuinely written by the real `eg write verification` / `eg write
+/// command-evidence` paths (issue #107, `src/evidence.rs`).
+///
+/// `CommandRun` and `Verification` are ALSO used by an entirely different
+/// writer family -- the `traj.rs`/`antigravity.rs`/`codex.rs` trajectory
+/// importers -- to record agent tool-call activity under `domain:
+/// "agent_memory"` (an `agent_memory:v1:` ID prefix), reusing the same
+/// `NodeKind` variants for a DIFFERENT semantic meaning (an agent activity
+/// log entry, never a verification claim). `NodeKind` alone cannot
+/// distinguish the two, so this also requires the SAME id-prefix/domain
+/// check the daemon's own write-time validator applies
+/// (`validate_verification_domain_records`): `id.starts_with("verification:v1:")
+/// || domain == Some("verification")`.
+fn is_verification_kind(id: &str, kind: NodeKind, domain: Option<&str>) -> bool {
     matches!(
         kind,
         NodeKind::CommandRun
@@ -824,7 +832,7 @@ const fn is_verification_kind(kind: NodeKind) -> bool {
             | NodeKind::BenchmarkRun
             | NodeKind::CoverageReport
             | NodeKind::ProofResult
-    )
+    ) && (id.starts_with("verification:v1:") || domain == Some("verification"))
 }
 
 /// Cross-domain edge labels that cite a code handle from a verification
@@ -855,6 +863,26 @@ const fn is_code_citation_label(label: EdgeLabel) -> bool {
 /// after) is refused rather than opened, which would otherwise block
 /// indefinitely or read unbounded device data. The hash is streamed, never
 /// buffering the whole file in memory.
+/// The bare-hex BLAKE3 digest `recorded` represents, when it is one this
+/// module can directly compare against a live re-hash -- `None` when it is
+/// recorded under a DIFFERENT, explicitly-tagged algorithm.
+/// `hash_contained_artifact` always returns a bare BLAKE3 hex digest with no
+/// prefix (matching the real `capture-tests` trunk writer's convention:
+/// `blake3::hash(&raw_bytes).to_hex().to_string()`), so bare hex and an
+/// explicit `blake3:` prefix are both comparable. `eg write verification`
+/// (issue #107) accepts an entirely free-text `--source-artifact-hash`, so a
+/// caller can legitimately record a hash under another algorithm (e.g.
+/// `sha256:<digest>`); this module has no way to compute that algorithm, so
+/// any OTHER explicit `<algorithm>:` prefix is treated as not comparable
+/// rather than compared against unrelated bytes.
+fn blake3_comparable_hash(recorded: &str) -> Option<&str> {
+    match recorded.split_once(':') {
+        Some(("blake3", hex)) => Some(hex),
+        Some((_other_algorithm, _)) => None,
+        None => Some(recorded),
+    }
+}
+
 fn hash_contained_artifact(root: &Path, artifact_path: &str) -> Option<String> {
     // `PathBuf::join` DISCARDS `root` entirely when `artifact_path` is
     // absolute (it "replaces the current path", per the standard library
@@ -1153,8 +1181,10 @@ pub fn verification_freshness(
     let mut latest_ver_write: BTreeMap<&str, usize> = BTreeMap::new();
     let mut ambiguous_ver_write: BTreeSet<&str> = BTreeSet::new();
     for (idx, record) in records.iter().enumerate() {
-        if let GraphRecord::Node { id, kind, .. } = record
-            && is_verification_kind(*kind)
+        if let GraphRecord::Node {
+            id, kind, domain, ..
+        } = record
+            && is_verification_kind(id.as_str(), *kind, domain.as_deref())
         {
             match latest_ver_write.entry(id.as_str()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -1339,6 +1369,7 @@ pub fn verification_freshness(
         let GraphRecord::Node {
             id,
             kind,
+            domain,
             verification_kind,
             status,
             source_artifact_hash,
@@ -1348,7 +1379,7 @@ pub fn verification_freshness(
         else {
             continue;
         };
-        if !is_verification_kind(*kind) {
+        if !is_verification_kind(id.as_str(), *kind, domain.as_deref()) {
             continue;
         }
         if latest_ver_write.get(id.as_str()) != Some(&idx) {
@@ -1405,6 +1436,19 @@ pub fn verification_freshness(
             )
             && !recorded_hash.is_empty()
             && !artifact_path.is_empty()
+            // `eg write verification` (issue #107) accepts an entirely
+            // free-text `--source-artifact-hash`, so a caller can record a
+            // hash under a DIFFERENT algorithm than the BLAKE3 digest this
+            // re-hash always computes (`hash_contained_artifact`, matching
+            // the real `capture-tests` trunk writer's bare-hex convention).
+            // Comparing across algorithms would compare unrelated digests
+            // and could report a false `stale` for an unchanged file; skip
+            // (never read/hash the file at all) when the recorded value
+            // isn't BLAKE3-comparable. The ORIGINAL `recorded_hash` string
+            // (algorithm prefix and all) is still what gets echoed in the
+            // triggering handle below -- only the comparison uses the
+            // stripped digest.
+            && let Some(recorded_comparable_hash) = blake3_comparable_hash(recorded_hash)
             && let Some(current_hash) = hash_contained_artifact(root, artifact_path)
         {
             let cited_handle = CitedHandle {
@@ -1415,7 +1459,7 @@ pub fn verification_freshness(
                 relation: "source_artifact".to_owned(),
                 target_domain: "verification".to_owned(),
             };
-            let (verdict, triggering_handle) = if current_hash == recorded_hash {
+            let (verdict, triggering_handle) = if current_hash == recorded_comparable_hash {
                 // A mismatch is `stale` regardless of anchor (AC2), but a
                 // MATCH proves only "unchanged right now" -- it says
                 // nothing about "since the anchor" when there IS no anchor
@@ -1492,13 +1536,17 @@ pub fn verdict_counts(entries: &[VerificationFreshnessEntry]) -> BTreeMap<&'stat
     counts
 }
 
-/// `true` when the record slice contains at least one of the five
-/// verification-domain kinds this lane covers.
+/// `true` when the record slice contains at least one genuinely
+/// verification-domain record (see `is_verification_kind`).
 #[must_use]
 pub fn has_verification_records(records: &[GraphRecord]) -> bool {
-    records
-        .iter()
-        .any(|r| matches!(r, GraphRecord::Node { kind, .. } if is_verification_kind(*kind)))
+    records.iter().any(|r| {
+        matches!(
+            r,
+            GraphRecord::Node { id, kind, domain, .. }
+                if is_verification_kind(id.as_str(), *kind, domain.as_deref())
+        )
+    })
 }
 
 /// Stable record IDs of every code handle this module considers live.
