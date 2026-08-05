@@ -3296,6 +3296,67 @@ fn latest_write_is_selected_by_producer_time_not_sorted_array_position() {
 }
 
 #[test]
+fn equal_producer_timestamp_rewrite_with_different_content_is_excluded_not_guessed() {
+    // Two writes to the SAME verification record ID share the EXACT SAME
+    // `producer_started_at` (a `capture-tests` rerun that reused
+    // `--executed-at`, per the Codex finding) but recorded a genuinely
+    // DIFFERENT outcome ("pass" vs "fail"). `--graph` transport carries no
+    // transaction-time field, so there is no honest way to decide which
+    // physical row is truly latest -- picking either by incidental JSONL
+    // sort position would silently echo a possibly-obsolete status. The
+    // record must be excluded from classification entirely rather than
+    // guessed (mirrors the codebase's "ambiguity mints nothing" doctrine).
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+
+    let (v1, pass_ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let pass_ver = pass_ver.with_producer(producer_at("2026-01-10T00:00:00Z"));
+    let (v1_again, fail_ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "fail",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    assert_eq!(v1, v1_again, "both writes must share the same stable ID");
+    // Same producer_started_at as `pass_ver` -- a genuine tie.
+    let fail_ver = fail_ver.with_producer(producer_at("2026-01-10T00:00:00Z"));
+
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id)
+        .with_producer(producer_at("2026-01-10T00:00:00Z"));
+    let (_temp, path) = write_graph(vec![symbol, pass_ver, fail_ver, edge]);
+
+    let report = run(&path, &[]);
+    assert_eq!(
+        verdicts_for(&report, &v1).len(),
+        0,
+        "an equal-producer-timestamp rewrite with genuinely different \
+         content must be excluded from classification, never guessed by \
+         incidental JSONL sort position"
+    );
+}
+
+#[test]
 fn commit_anchor_uses_the_target_commits_own_time_not_the_runs_recording_time() {
     // The cited symbol changed TWICE: at c1 (Jan, what the run actually
     // tested) and again at c2 (Feb, a real code change). The TestRun

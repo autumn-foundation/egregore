@@ -736,6 +736,28 @@ fn producer_wins(
     }
 }
 
+/// True when `a` and `b` are the same record content, ignoring the
+/// `producer` envelope entirely (producer metadata is documented elsewhere
+/// in this module as non-identity: an otherwise-byte-identical rewrite that
+/// only changes producer bookkeeping is not a genuine content change). Used
+/// to distinguish an idempotent republish (safe to pick either occurrence)
+/// from a genuine two-write ambiguity when `producer_started_at` ties.
+fn records_equal_ignoring_producer(a: &GraphRecord, b: &GraphRecord) -> bool {
+    let mut a = a.clone();
+    let mut b = b.clone();
+    match &mut a {
+        GraphRecord::Node { producer, .. }
+        | GraphRecord::Edge { producer, .. }
+        | GraphRecord::Tombstone { producer, .. } => *producer = None,
+    }
+    match &mut b {
+        GraphRecord::Node { producer, .. }
+        | GraphRecord::Edge { producer, .. }
+        | GraphRecord::Tombstone { producer, .. } => *producer = None,
+    }
+    a == b
+}
+
 /// Valid-time of a code-graph node version: `temporal.valid_time` when
 /// present, else the node-level `valid_time` (current-tree `scan`/`refresh`).
 const fn version_valid(record: &GraphRecord) -> Option<&str> {
@@ -1100,11 +1122,25 @@ pub fn verification_freshness(
     // graphs, or any write predating the producer envelope), this falls back
     // to "last physical occurrence wins" -- the same convention already
     // established and exercised by every pre-existing test in this suite.
+    //
+    // A genuine TIE (both sides carry a `producer_started_at` and they are
+    // EQUAL) is resolved only when the two occurrences are otherwise
+    // content-identical (an idempotent republish -- picking either is a
+    // no-op). When their content genuinely differs (e.g. a `capture-tests`
+    // rerun that reused `--executed-at` but recorded a different outcome),
+    // there is no ordering signal left in `--graph` transport to say which
+    // is truly latest -- no transaction-time field reaches JSONL -- so the
+    // id is EXCLUDED from `latest_ver_write` entirely rather than guessed
+    // (mirrors the codebase's established "ambiguity mints nothing"
+    // doctrine, e.g. CALLS-edge resolution). A later, strictly-newer write
+    // (or the position-based fallback, when timestamps aren't comparable)
+    // resolves any prior tie unambiguously and clears the flag, since by
+    // transitivity it is also strictly newer than everything the tie was
+    // compared against.
     let mut latest_ver_write: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut ambiguous_ver_write: BTreeSet<&str> = BTreeSet::new();
     for (idx, record) in records.iter().enumerate() {
-        if let GraphRecord::Node {
-            id, kind, producer, ..
-        } = record
+        if let GraphRecord::Node { id, kind, .. } = record
             && is_verification_kind(*kind)
         {
             match latest_ver_write.entry(id.as_str()) {
@@ -1112,26 +1148,31 @@ pub fn verification_freshness(
                     entry.insert(idx);
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    let held_producer_ts = match &records[*entry.get()] {
-                        GraphRecord::Node {
-                            producer: Some(p), ..
-                        } => Some(p.producer_started_at.as_str()),
-                        _ => None,
-                    };
-                    let candidate_ts = producer.as_ref().map(|p| p.producer_started_at.as_str());
-                    let candidate_wins = match (candidate_ts, held_producer_ts) {
-                        (Some(cand), Some(held)) => {
-                            time_cmp(cand, held) != std::cmp::Ordering::Less
+                    let held = &records[*entry.get()];
+                    let held_producer_ts = held.producer().map(|p| p.producer_started_at.as_str());
+                    let candidate_ts = record.producer().map(|p| p.producer_started_at.as_str());
+                    if let (Some(cand), Some(held_ts)) = (candidate_ts, held_producer_ts) {
+                        match time_cmp(cand, held_ts) {
+                            std::cmp::Ordering::Greater => {
+                                entry.insert(idx);
+                                ambiguous_ver_write.remove(id.as_str());
+                            }
+                            std::cmp::Ordering::Less => {}
+                            std::cmp::Ordering::Equal => {
+                                if !records_equal_ignoring_producer(record, held) {
+                                    ambiguous_ver_write.insert(id.as_str());
+                                }
+                            }
                         }
-                        _ => true,
-                    };
-                    if candidate_wins {
+                    } else {
                         entry.insert(idx);
+                        ambiguous_ver_write.remove(id.as_str());
                     }
                 }
             }
         }
     }
+    latest_ver_write.retain(|id, _| !ambiguous_ver_write.contains(id));
     // The `producer.producer_started_at` of each verification id's LATEST
     // write (per `latest_ver_write` above), when recorded. `eg capture-tests`
     // -- the one real trunk writer -- stamps every record in one invocation's
@@ -1153,7 +1194,6 @@ pub fn verification_freshness(
             _ => None,
         })
         .collect();
-    // Verification IDs with more than one genuinely CONTENT-DIFFERENT
     // Every code-citation relation whose source is a verification record,
     // from BOTH representations (mirroring `query::verification_coverage`'s
     // own dual-representation read, since this lane draws on the same
