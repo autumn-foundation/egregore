@@ -518,6 +518,129 @@ fn drifts_prior_edge_recovers_drift_with_stale_prior_record_id_field() {
 }
 
 #[test]
+fn superseded_drifts_prior_edge_no_longer_triggers_its_old_target() {
+    // A drift's DRIFTS_PRIOR edge originally pointed at `widget` (a mistake
+    // later corrected to `gadget`, mirroring
+    // `superseded_standalone_citation_edge_is_skipped`'s SUPERSEDES
+    // construction but targeting the DRIFTS_PRIOR edge's own record ID
+    // instead of a citation edge). The drift metadata's own
+    // `prior_record_id` field is deliberately unrelated, so only the two
+    // DRIFTS_PRIOR edges can supply a trigger. The superseded edge must not
+    // keep triggering staleness for `widget`; the live, corrected edge must
+    // still trigger staleness for `gadget`.
+    let widget_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let widget = symbol_version(
+        &widget_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let gadget_id = stable_id(&["node", "Symbol", "src/b.rs", "gadget"]);
+    let gadget = symbol_version(
+        &gadget_id,
+        "src/b.rs",
+        "gadget",
+        span(10, 20),
+        "fn gadget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let unrelated_id = stable_id(&["node", "Symbol", "src/other.rs", "unrelated"]);
+    let drift_id = "semantic:v1:drift3".to_owned();
+    let drift = drift_record(
+        &drift_id,
+        &unrelated_id,
+        &gadget_id,
+        "c1",
+        "c2",
+        "2026-01-01T00:00:00Z",
+        "2026-01-10T00:00:00Z",
+    );
+    let old_edge = GraphRecord::edge(
+        EdgeLabel::DriftsPrior,
+        drift_id.clone(),
+        widget_id.clone(),
+        None,
+        "drifts prior (superseded)".to_owned(),
+    );
+    let old_edge_id = match &old_edge {
+        GraphRecord::Edge { id, .. } => id.clone(),
+        _ => unreachable!("GraphRecord::edge always returns an Edge record"),
+    };
+    let supersedes_edge = GraphRecord::edge(
+        EdgeLabel::Supersedes,
+        "agent_memory:v1:corrected-drift-target".to_owned(),
+        old_edge_id,
+        None,
+        "corrects the drift's prior-record edge".to_owned(),
+    );
+    let new_edge = GraphRecord::edge(
+        EdgeLabel::DriftsPrior,
+        drift_id,
+        gadget_id.clone(),
+        None,
+        "drifts prior".to_owned(),
+    );
+
+    let (v_widget, ver_widget) = ver_node(
+        "v-widget",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let widget_edge = cite_edge(EdgeLabel::MentionsSymbol, &v_widget, &widget_id);
+    let (v_gadget, ver_gadget) = ver_node(
+        "v-gadget",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let gadget_edge = cite_edge(EdgeLabel::MentionsSymbol, &v_gadget, &gadget_id);
+
+    let (_temp, path) = write_graph(vec![
+        widget,
+        gadget,
+        drift,
+        old_edge,
+        supersedes_edge,
+        new_edge,
+        ver_widget,
+        widget_edge,
+        ver_gadget,
+        gadget_edge,
+    ]);
+
+    let report = run(&path, &[]);
+
+    let widget_rows = verdicts_for(&report, &v_widget);
+    assert_eq!(widget_rows.len(), 1);
+    assert_eq!(
+        widget_rows[0]["verdict"], "current",
+        "the DRIFTS_PRIOR edge to widget was superseded by the corrected \
+         edge to gadget, so it must not keep triggering staleness for widget"
+    );
+
+    let gadget_rows = verdicts_for(&report, &v_gadget);
+    assert_eq!(gadget_rows.len(), 1);
+    assert_eq!(
+        gadget_rows[0]["verdict"], "stale",
+        "the live, corrected DRIFTS_PRIOR edge must still trigger staleness \
+         for gadget"
+    );
+}
+
+#[test]
 fn retracted_supersedes_source_never_hides_a_still_live_target() {
     let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
     let symbol = symbol_version(

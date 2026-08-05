@@ -560,7 +560,13 @@ impl<'a> VerificationFreshnessIndex<'a> {
         // A `DRIFTS_PRIOR` edge (drift -> cited handle) recovers a drift
         // trigger a stale/mismatched `prior_record_id` field would otherwise
         // miss (mirrors `crate::evidence_freshness`) -- never a sibling's
-        // drift, since the edge target IS the cited-side record.
+        // drift, since the edge target IS the cited-side record. Also
+        // excluded when the edge ITSELF has been superseded (mirrors the
+        // citation-edge check below): a correction that re-points a drift's
+        // prior-record edge from symbol A to symbol B via a live `SUPERSEDES`
+        // marker on the OLD edge must drop that old edge, or a verification
+        // citation to A would keep tripping a drift trigger that now applies
+        // to B.
         for record in records {
             if let GraphRecord::Edge {
                 id,
@@ -570,6 +576,7 @@ impl<'a> VerificationFreshnessIndex<'a> {
                 ..
             } = record
                 && !tombstone_by_deleted.contains_key(id.as_str())
+                && !superseded_ids.contains(id.as_str())
                 && let Some(drift) = drift_meta_by_id.get(source.as_str())
             {
                 let entry = drifts_by_prior.entry(target.as_str()).or_default();
