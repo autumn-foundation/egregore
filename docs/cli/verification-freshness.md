@@ -6,8 +6,10 @@
 
 ## Overview
 
-`eg query verification-freshness` flags each **verification record**
-(`TestRun`, `CIStatus`, `BenchmarkRun`, `CoverageReport`, `ProofResult`) by
+`eg query verification-freshness` flags each **verification record** — all
+seven verification-domain node kinds per `docs/schema/verification.md` §2:
+`TestRun`, `CIStatus`, `BenchmarkRun`, `CoverageReport`, `ProofResult`,
+`CommandRun`, and the umbrella `Verification` kind — by
 whether the code it cites has **drifted** since the run's anchor. For every
 citation via `FAILED_ON` / `MENTIONS_SYMBOL` / `TOUCHED_FILE`, it returns a
 per-citation **freshness verdict** — so a `TestRun status=pass` recorded 40
@@ -47,7 +49,7 @@ The two commands look similar and share verdict machinery, but age
 
 | | `eg query evidence-freshness` (#85) | `eg query verification-freshness` (#111) |
 |---|---|---|
-| Ages | Agent-memory `Observation` / `Decision` citations | Verification-domain `TestRun`/`CIStatus`/`BenchmarkRun`/`CoverageReport`/`ProofResult` citations |
+| Ages | Agent-memory `Observation` / `Decision` citations | Verification-domain `TestRun`/`CIStatus`/`BenchmarkRun`/`CoverageReport`/`ProofResult`/`CommandRun`/`Verification` citations |
 | Trust class | `agent_authored` | `deterministic-but-runtime-derived` |
 | Anchor | Evidence-link `as_of_commit`/`target_git_commit`, else the observation's `valid_time`/`observed_at`/`ingested_at` | The record's own `temporal.git_commit`, else `executed_at` |
 | Verdict names | `current` / `drifted` / `unresolved` / `untemporal` | `current` / `stale` / `unresolved` / `unanchored` |

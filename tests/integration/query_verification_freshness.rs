@@ -471,6 +471,90 @@ fn later_content_change_is_stale_with_content_change_trigger() {
 }
 
 #[test]
+fn command_run_and_umbrella_verification_kinds_are_classified_too() {
+    // `docs/schema/verification.md` §2 documents SEVEN verification-domain
+    // node kinds, not just the five specialized run-kinds this issue's AC
+    // names as examples -- `CommandRun` and the umbrella `Verification` kind
+    // are equally verification-domain, and the daemon's own
+    // `VERIFICATION_NODE_KINDS` write-time validator (src/daemon.rs) already
+    // treats all seven identically. Real production writers (the daemon
+    // write path, plus the traj.rs/antigravity.rs/codex.rs trajectory
+    // importers) emit `CommandRun`/`Verification` records citing code via
+    // MENTIONS_SYMBOL, per schema §6's "any verification" FROM-kind rule.
+    // Both must be classified, not silently invisible to this lane.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let v_early = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() { 1 }",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let v_later = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() { 2 }",
+        "c2",
+        "2026-01-05T00:00:00Z",
+    );
+
+    let (cr_id, cr_ver) = ver_node(
+        "cr1",
+        NodeKind::CommandRun,
+        Some("command_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let cr_edge = cite_edge(EdgeLabel::MentionsSymbol, &cr_id, &sym_id);
+
+    let (umbrella_id, umbrella_ver) = ver_node(
+        "umbrella1",
+        NodeKind::Verification,
+        Some("verification"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let umbrella_edge = cite_edge(EdgeLabel::MentionsSymbol, &umbrella_id, &sym_id);
+
+    let (_temp, path) = write_graph(vec![
+        v_early,
+        v_later,
+        cr_ver,
+        cr_edge,
+        umbrella_ver,
+        umbrella_edge,
+    ]);
+
+    let report = run(&path, &[]);
+
+    let cr_rows = verdicts_for(&report, &cr_id);
+    assert_eq!(
+        cr_rows.len(),
+        1,
+        "a CommandRun's citation must be classified"
+    );
+    assert_eq!(cr_rows[0]["verdict"], "stale");
+
+    let umbrella_rows = verdicts_for(&report, &umbrella_id);
+    assert_eq!(
+        umbrella_rows.len(),
+        1,
+        "an umbrella Verification record's citation must be classified"
+    );
+    assert_eq!(umbrella_rows[0]["verdict"], "stale");
+}
+
+#[test]
 fn drift_record_after_anchor_is_stale_with_drift_trigger() {
     let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
     let symbol = symbol_version(

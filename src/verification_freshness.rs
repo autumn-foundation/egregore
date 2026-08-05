@@ -802,11 +802,24 @@ const fn is_codegraph_temporal_kind(kind: NodeKind) -> bool {
     matches!(kind, NodeKind::Commit) || is_code_handle_kind(kind)
 }
 
-/// The five verification-domain kinds this issue's AC names explicitly.
+/// The full verification-domain node-kind set, matching `docs/schema/verification.md`
+/// §2 and the daemon's own `VERIFICATION_NODE_KINDS` write-time validator
+/// (`src/daemon.rs`) exactly -- the authoritative, already-enforced
+/// definition of "verification-domain record" in this codebase. This issue's
+/// AC names only the five specialized run-kinds as illustrative examples,
+/// but `CommandRun` and the umbrella `Verification` kind are equally
+/// verification-domain per the schema (§6 documents `MENTIONS_SYMBOL`/
+/// `TOUCHED_FILE` as valid FROM "any verification" kind, not just the five
+/// specialized ones) and are genuinely written by real producers today (the
+/// daemon write path plus the `traj.rs`/`antigravity.rs`/`codex.rs`
+/// trajectory importers) -- excluding them left real evidence silently
+/// unaged, contradicting this issue's own problem statement.
 const fn is_verification_kind(kind: NodeKind) -> bool {
     matches!(
         kind,
-        NodeKind::TestRun
+        NodeKind::CommandRun
+            | NodeKind::Verification
+            | NodeKind::TestRun
             | NodeKind::CIStatus
             | NodeKind::BenchmarkRun
             | NodeKind::CoverageReport
