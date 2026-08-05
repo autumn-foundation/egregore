@@ -797,6 +797,18 @@ const fn is_code_citation_label(label: EdgeLabel) -> bool {
 /// indefinitely or read unbounded device data. The hash is streamed, never
 /// buffering the whole file in memory.
 fn hash_contained_artifact(root: &Path, artifact_path: &str) -> Option<String> {
+    // `PathBuf::join` DISCARDS `root` entirely when `artifact_path` is
+    // absolute (it "replaces the current path", per the standard library
+    // contract) -- so an absolute path that happens to resolve to somewhere
+    // UNDER `root` would still pass the `starts_with` containment check
+    // below purely by physical coincidence, letting a producer-controlled
+    // absolute path through despite the documented "never honored"
+    // contract. Reject absolute paths outright, before any join/canonicalize,
+    // so containment is never a function of where the operator's checkout
+    // happens to live.
+    if Path::new(artifact_path).is_absolute() {
+        return None;
+    }
     let joined = root.join(artifact_path);
     let canonical_root = std::fs::canonicalize(root).ok()?;
     let canonical_joined = std::fs::canonicalize(&joined).ok()?;

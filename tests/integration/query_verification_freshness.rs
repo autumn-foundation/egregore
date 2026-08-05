@@ -1300,6 +1300,48 @@ fn artifact_path_as_absolute_path_is_never_read() {
     let _ = fs::remove_file(&secret_path);
 }
 
+#[test]
+fn artifact_path_as_absolute_path_inside_root_is_still_never_read() {
+    // Unlike `artifact_path_as_absolute_path_is_never_read` (whose absolute
+    // path resolves OUTSIDE --repo-path, so the containment check alone
+    // already rejects it), this absolute path physically resolves INSIDE
+    // --repo-path. `PathBuf::join` discards the base for an absolute second
+    // operand, so `root.join(absolute_artifact_path)` is just the absolute
+    // path itself; canonicalizing it lands under `canonical_root` purely by
+    // coincidence, so the containment check alone would wrongly PASS.
+    // Absolute paths must be rejected outright, regardless of where they
+    // happen to resolve, or the verdict becomes a function of the operator's
+    // checkout layout rather than the recorded (documented-as-relative)
+    // artifact path.
+    let temp_repo = tempfile::tempdir().expect("repo dir");
+    let artifact_rel = "ci/config.yml";
+    let artifact_abs = temp_repo.path().join(artifact_rel);
+    fs::create_dir_all(artifact_abs.parent().unwrap()).unwrap();
+    fs::write(&artifact_abs, b"same bytes").unwrap();
+    let recorded_hash = blake3::hash(b"same bytes").to_hex().to_string();
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::CIStatus,
+        Some("ci_status"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        None,
+        Some(artifact_abs.to_str().unwrap()),
+        Some(&recorded_hash),
+    );
+    let (_temp, path) = write_graph(vec![ver]);
+
+    let report = run(&path, &["--repo-path", temp_repo.path().to_str().unwrap()]);
+    assert_eq!(
+        verdicts_for(&report, &v1).len(),
+        0,
+        "an absolute source_artifact_path must never be read even when it \
+         happens to resolve inside --repo-path -- containment alone is not \
+         a substitute for rejecting absolute paths outright"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC7: stale-only mode + empty-result diagnostics
 // ---------------------------------------------------------------------------
