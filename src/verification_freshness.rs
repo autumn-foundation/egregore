@@ -551,10 +551,37 @@ impl<'a> VerificationFreshnessIndex<'a> {
                 && !superseded_ids.contains(id.as_str())
             {
                 drift_meta_by_id.insert(id.as_str(), drift);
+            }
+        }
+        // Drift ids that carry at least one LIVE `DRIFTS_PRIOR` edge: when a
+        // producer corrects a drift's prior-record target via an edge rather
+        // than rewriting the node, that edge is authoritative and the node's
+        // own (now stale) `prior_record_id` field must not ALSO contribute a
+        // trigger for its old target. A drift with no live edge at all keeps
+        // relying on its metadata field below -- the edge-recovery mechanism
+        // is additive, never a replacement, for the common case where a
+        // producer never emits `DRIFTS_PRIOR` edges.
+        let mut drift_ids_with_live_edge: BTreeSet<&str> = BTreeSet::new();
+        for record in records {
+            if let GraphRecord::Edge {
+                id,
+                label: EdgeLabel::DriftsPrior,
+                source,
+                ..
+            } = record
+                && !tombstone_by_deleted.contains_key(id.as_str())
+                && !superseded_ids.contains(id.as_str())
+                && drift_meta_by_id.contains_key(source.as_str())
+            {
+                drift_ids_with_live_edge.insert(source.as_str());
+            }
+        }
+        for (id, drift) in &drift_meta_by_id {
+            if !drift_ids_with_live_edge.contains(id) {
                 drifts_by_prior
                     .entry(drift.prior_record_id.as_str())
                     .or_default()
-                    .push((id.as_str(), drift));
+                    .push((id, drift));
             }
         }
         // A `DRIFTS_PRIOR` edge (drift -> cited handle) recovers a drift

@@ -641,6 +641,132 @@ fn superseded_drifts_prior_edge_no_longer_triggers_its_old_target() {
 }
 
 #[test]
+fn stale_prior_record_id_metadata_is_suppressed_by_a_live_corrected_drifts_prior_edge() {
+    // Same correction scenario as
+    // `superseded_drifts_prior_edge_no_longer_triggers_its_old_target`, but
+    // this time the drift metadata's OWN `prior_record_id` field still names
+    // `widget` (the stale, uncorrected value) rather than an unrelated
+    // symbol. The metadata-derived indexing pass ran unconditionally, ahead
+    // of the edge-supersession guard, so it kept indexing `widget` as a
+    // trigger target even though the correction moved the drift to `gadget`
+    // via a live edge. A verification citation to `widget` must not be
+    // reported stale from this stale metadata; `gadget` must still trigger
+    // via the live, corrected edge.
+    let widget_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let widget = symbol_version(
+        &widget_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let gadget_id = stable_id(&["node", "Symbol", "src/b.rs", "gadget"]);
+    let gadget = symbol_version(
+        &gadget_id,
+        "src/b.rs",
+        "gadget",
+        span(10, 20),
+        "fn gadget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let drift_id = "semantic:v1:drift4".to_owned();
+    // `prior_record_id` is `widget_id` -- the STALE, uncorrected value.
+    let drift = drift_record(
+        &drift_id,
+        &widget_id,
+        &gadget_id,
+        "c1",
+        "c2",
+        "2026-01-01T00:00:00Z",
+        "2026-01-10T00:00:00Z",
+    );
+    let old_edge = GraphRecord::edge(
+        EdgeLabel::DriftsPrior,
+        drift_id.clone(),
+        widget_id.clone(),
+        None,
+        "drifts prior (superseded)".to_owned(),
+    );
+    let old_edge_id = match &old_edge {
+        GraphRecord::Edge { id, .. } => id.clone(),
+        _ => unreachable!("GraphRecord::edge always returns an Edge record"),
+    };
+    let supersedes_edge = GraphRecord::edge(
+        EdgeLabel::Supersedes,
+        "agent_memory:v1:corrected-drift-target-2".to_owned(),
+        old_edge_id,
+        None,
+        "corrects the drift's prior-record edge".to_owned(),
+    );
+    let new_edge = GraphRecord::edge(
+        EdgeLabel::DriftsPrior,
+        drift_id,
+        gadget_id.clone(),
+        None,
+        "drifts prior".to_owned(),
+    );
+
+    let (v_widget, ver_widget) = ver_node(
+        "v-widget-meta",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let widget_edge = cite_edge(EdgeLabel::MentionsSymbol, &v_widget, &widget_id);
+    let (v_gadget, ver_gadget) = ver_node(
+        "v-gadget-meta",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let gadget_edge = cite_edge(EdgeLabel::MentionsSymbol, &v_gadget, &gadget_id);
+
+    let (_temp, path) = write_graph(vec![
+        widget,
+        gadget,
+        drift,
+        old_edge,
+        supersedes_edge,
+        new_edge,
+        ver_widget,
+        widget_edge,
+        ver_gadget,
+        gadget_edge,
+    ]);
+
+    let report = run(&path, &[]);
+
+    let widget_rows = verdicts_for(&report, &v_widget);
+    assert_eq!(widget_rows.len(), 1);
+    assert_eq!(
+        widget_rows[0]["verdict"], "current",
+        "the drift's stale prior_record_id metadata still names widget, but \
+         a live corrected DRIFTS_PRIOR edge moved the drift to gadget -- the \
+         metadata-derived entry must be suppressed, not just the superseded \
+         edge"
+    );
+
+    let gadget_rows = verdicts_for(&report, &v_gadget);
+    assert_eq!(gadget_rows.len(), 1);
+    assert_eq!(
+        gadget_rows[0]["verdict"], "stale",
+        "the live, corrected DRIFTS_PRIOR edge must still trigger staleness \
+         for gadget"
+    );
+}
+
+#[test]
 fn retracted_supersedes_source_never_hides_a_still_live_target() {
     let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
     let symbol = symbol_version(
