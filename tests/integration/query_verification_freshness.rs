@@ -2679,16 +2679,19 @@ fn stale_standalone_edge_from_an_earlier_producer_write_is_dropped() {
 }
 
 #[test]
-fn producerless_standalone_edge_is_dropped_when_source_has_multiple_writes() {
-    // v1 is genuinely re-written: two DIFFERENT physical node versions
-    // (different `status`) under the same stable ID, mirroring a
-    // `capture-tests` re-run whose test outcome changed. One standalone
-    // citation edge -- to a handle that resolves nowhere -- carries NO
-    // producer stamp at all. With the source KNOWN to have multiple writes,
-    // there is no basis to assume this producerless edge belongs to the
-    // latest one, so it must be dropped rather than kept by default. A
-    // second edge, citing a live symbol, DOES carry a producer stamp and
-    // survives untouched.
+fn producerless_standalone_edges_survive_a_capture_tests_style_rewrite() {
+    // v1 is genuinely re-captured: two DIFFERENT physical node versions
+    // (different `status`) under the same stable ID -- mirrors the real
+    // `eg capture-tests` writer, which stamps a producer on the TestRun
+    // node itself but NEVER on its MENTIONS_SYMBOL/TOUCHED_FILE/FAILED_ON
+    // edges (`build_test_run_records` in src/test_capture.rs always calls
+    // the producerless `GraphRecord::edge` constructor). An earlier,
+    // stricter rule that dropped every producerless edge on a multi-write
+    // source was reverted precisely because it broke this real path: it
+    // would drop the CURRENT capture's own edges too, since they carry no
+    // producer either, leaving `no_verification_code_citations` instead of
+    // the current freshness rows. Both edges here are producerless; both
+    // must survive.
     let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
     let symbol = symbol_version(
         &sym_id,
@@ -2699,13 +2702,12 @@ fn producerless_standalone_edge_is_dropped_when_source_has_multiple_writes() {
         "c1",
         "2026-01-01T00:00:00Z",
     );
-    let stale_target_id = stable_id(&["node", "Symbol", "src/gone.rs", "ghost"]);
 
     let (v1, older_ver) = ver_node(
         "v1",
         NodeKind::TestRun,
         Some("test_run"),
-        "pass",
+        "fail",
         Some("2026-01-02T00:00:00Z"),
         Some("c1"),
         None,
@@ -2715,7 +2717,7 @@ fn producerless_standalone_edge_is_dropped_when_source_has_multiple_writes() {
         "v1",
         NodeKind::TestRun,
         Some("test_run"),
-        "fail",
+        "pass",
         Some("2026-01-02T00:00:00Z"),
         Some("c1"),
         None,
@@ -2727,88 +2729,18 @@ fn producerless_standalone_edge_is_dropped_when_source_has_multiple_writes() {
         "the two writes must be genuinely content-different"
     );
 
-    // No producer on either write -- `latest_ver_producer_started_at` has
-    // no entry for v1, so the stale edge can only be excluded via the
-    // producerless/multi-write rule, not the timestamp comparison.
-    let stale_edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &stale_target_id);
-    let current_edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id)
-        .with_producer(producer_at("2026-02-01T00:00:00Z"));
-    let (_temp, path) = write_graph(vec![symbol, older_ver, newer_ver, stale_edge, current_edge]);
-
-    let report = run(&path, &[]);
-    let rows = verdicts_for(&report, &v1);
-    assert_eq!(
-        rows.len(),
-        1,
-        "a producerless edge on a genuinely multi-write source cannot be \
-         correlated to any write and must be dropped"
-    );
-    assert_eq!(rows[0]["cited_handle"]["target_record_id"], sym_id);
-    assert_eq!(rows[0]["verdict"], "current");
-}
-
-#[test]
-fn producer_only_difference_between_writes_is_not_treated_as_a_rewrite() {
-    // v1 is physically written TWICE with logically IDENTICAL content --
-    // same status, same anchor -- differing ONLY in `producer` (a fresh
-    // `producer_started_at`, as an idempotent re-ingest of the same facts
-    // would naturally produce; `producer` is documented as a non-identity
-    // envelope). This must NOT be treated as a genuine rewrite: a
-    // producerless standalone citation edge stays classifiable, since
-    // there is no real ambiguity about which write it belongs to when
-    // both writes say the same thing.
-    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
-    let symbol = symbol_version(
-        &sym_id,
-        "src/a.rs",
-        "widget",
-        span(10, 20),
-        "fn widget() {}",
-        "c1",
-        "2026-01-01T00:00:00Z",
-    );
-
-    let (v1, ver_a) = ver_node(
-        "v1",
-        NodeKind::TestRun,
-        Some("test_run"),
-        "pass",
-        Some("2026-01-02T00:00:00Z"),
-        Some("c1"),
-        None,
-        None,
-    );
-    let ver_a = ver_a.with_producer(producer_at("2026-01-10T00:00:00Z"));
-    let (v1_again, ver_b) = ver_node(
-        "v1",
-        NodeKind::TestRun,
-        Some("test_run"),
-        "pass",
-        Some("2026-01-02T00:00:00Z"),
-        Some("c1"),
-        None,
-        None,
-    );
-    assert_eq!(v1, v1_again, "both writes must share the same stable ID");
-    let ver_b = ver_b.with_producer(producer_at("2026-01-20T00:00:00Z"));
-    assert_ne!(
-        ver_a, ver_b,
-        "the two raw records must differ (different producer timestamps)"
-    );
-
-    // No producer on the edge -- if the producer-only difference above were
-    // wrongly treated as a rewrite, this edge would be dropped as
-    // uncorrelatable.
+    // Producerless, matching the real capture-tests writer exactly.
     let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
-    let (_temp, path) = write_graph(vec![symbol, ver_a, ver_b, edge]);
+    let (_temp, path) = write_graph(vec![symbol, older_ver, newer_ver, edge]);
 
     let report = run(&path, &[]);
     let rows = verdicts_for(&report, &v1);
     assert_eq!(
         rows.len(),
         1,
-        "a producer-only difference between two writes must not make a \
-         producerless edge look uncorrelatable"
+        "a producerless standalone citation edge must survive a re-capture \
+         of the same TestRun -- absence of ordering evidence means keep, \
+         never drop"
     );
     assert_eq!(rows[0]["cited_handle"]["target_record_id"], sym_id);
     assert_eq!(rows[0]["verdict"], "current");

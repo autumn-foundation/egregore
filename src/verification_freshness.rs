@@ -1057,48 +1057,6 @@ pub fn verification_freshness(
         })
         .collect();
     // Verification IDs with more than one genuinely CONTENT-DIFFERENT
-    // physical node write (a real rewrite, not a re-ingested byte-identical
-    // duplicate -- `repeated_verification_write_is_classified_once` must
-    // stay unaffected). For such an ID, a standalone citation edge with NO
-    // producer stamp at all cannot be correlated to any specific write --
-    // unlike the single-write case, we KNOW ambiguity exists, so keep-by-
-    // default is no longer the safe choice for a producerless edge.
-    // HONEST LIMIT: this still cannot distinguish an edge that reuses the
-    // SAME `producer_started_at` as the latest write despite belonging to
-    // an earlier one -- `eg capture-tests` derives it from the caller-
-    // supplied `--executed-at`, which two genuinely different invocations
-    // could share. No signal in the graph disambiguates that case; a
-    // producer-stamped edge is always kept unless PROVABLY older.
-    // Compared via `with_cleared_producer_started_at` -- the SAME
-    // idempotency-comparison convention the embedded adapter already uses
-    // (`src/adapters/aletheiadb.rs`) -- so a re-ingest that changes only the
-    // non-identity producer envelope (a fresh wall-clock
-    // `producer_started_at` from an otherwise byte-identical re-ingest,
-    // or, per `with_cleared_producer_started_at`'s own contract, a store
-    // write that happens to re-stamp it) is never mistaken for a genuine
-    // rewrite. `producer.egregore_version`/`producer_components` are still
-    // compared (only `producer_started_at` is cleared), so an actual
-    // extractor-version change still counts.
-    let mut ver_first_write: BTreeMap<&str, GraphRecord> = BTreeMap::new();
-    let mut ver_has_multiple_writes: BTreeSet<&str> = BTreeSet::new();
-    for record in records {
-        if let GraphRecord::Node { id, kind, .. } = record
-            && is_verification_kind(*kind)
-        {
-            let cleared = record.with_cleared_producer_started_at();
-            match ver_first_write.entry(id.as_str()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(cleared);
-                }
-                std::collections::btree_map::Entry::Occupied(entry) => {
-                    if *entry.get() != cleared {
-                        ver_has_multiple_writes.insert(id.as_str());
-                    }
-                }
-            }
-        }
-    }
-
     // Every code-citation relation whose source is a verification record,
     // from BOTH representations (mirroring `query::verification_coverage`'s
     // own dual-representation read, since this lane draws on the same
@@ -1137,28 +1095,29 @@ pub fn verification_freshness(
                 && !index.superseded_ids.contains(id.as_str())
                 // Mirrors the node-carried branch below: a re-written
                 // verification record's OLDER citation edges must not
-                // survive alongside its latest write's edges. Excluded on
-                // POSITIVE evidence this edge predates the source's latest
-                // write -- both sides carry a comparable `producer_started_at`
-                // (see above) and the edge's sorts strictly earlier -- OR on
-                // KNOWN ambiguity: the source has multiple content-different
-                // writes (`ver_has_multiple_writes`) and this edge carries no
-                // producer stamp at all, so it cannot be tied to any one of
-                // them. A single-write source's producerless edge is
-                // unambiguous (there is only one write it could belong to)
-                // and stays kept, matching every pre-existing test.
-                && {
-                    let provably_older = producer
-                        .as_ref()
-                        .zip(latest_ver_producer_started_at.get(source.as_str()))
-                        .is_some_and(|(p, &latest)| {
-                            time_cmp(p.producer_started_at.as_str(), latest)
-                                == std::cmp::Ordering::Less
-                        });
-                    let uncorrelatable = producer.is_none()
-                        && ver_has_multiple_writes.contains(source.as_str());
-                    !provably_older && !uncorrelatable
-                } =>
+                // survive alongside its latest write's edges. Excluded ONLY
+                // on POSITIVE evidence this edge predates the source's
+                // latest write -- both sides carry a comparable
+                // `producer_started_at` and the edge's sorts strictly
+                // earlier. A producerless edge is ALWAYS kept, even when the
+                // source has multiple writes: `eg capture-tests` -- the one
+                // real trunk writer -- stamps a producer on the TestRun node
+                // itself but NEVER on its MENTIONS_SYMBOL/TOUCHED_FILE/
+                // FAILED_ON edges (`build_test_run_records` in
+                // `src/test_capture.rs`), so a stricter "drop an
+                // unprovable producerless edge on any multi-write source"
+                // rule (tried and reverted) would drop EVERY edge -- old and
+                // current alike -- on every ordinary re-capture of the same
+                // session/commit/suite, reporting no code citations at all
+                // instead of the current freshness rows. Absence of ordering
+                // evidence means "keep", never "drop", full stop.
+                && !producer
+                    .as_ref()
+                    .zip(latest_ver_producer_started_at.get(source.as_str()))
+                    .is_some_and(|(p, &latest)| {
+                        time_cmp(p.producer_started_at.as_str(), latest)
+                            == std::cmp::Ordering::Less
+                    }) =>
             {
                 citations_by_source
                     .entry(source.as_str())
