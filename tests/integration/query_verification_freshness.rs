@@ -374,6 +374,60 @@ fn unchanged_cited_symbol_is_current() {
 }
 
 #[test]
+fn counts_object_seeds_all_four_verdict_keys_even_at_zero() {
+    // Every citation in this store resolves `current` -- zero `stale`,
+    // `unresolved`, and `unanchored` rows. The `counts` object must still
+    // carry all four verdict keys at `0` (mirrors
+    // `crate::evidence_freshness`'s `verdict_counts`, and matches the
+    // documented example in docs/cli/verification-freshness.md, which shows
+    // `"unanchored": 0` explicitly present) -- a machine consumer relying on
+    // a stable schema must never see a missing/null key for a verdict class
+    // this result set happens not to contain.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![symbol, ver, edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["verdict"], "current");
+
+    let counts = &report["counts"];
+    assert_eq!(counts["current"], 1);
+    assert_eq!(
+        counts["stale"], 0,
+        "stale key must be present at 0, not missing"
+    );
+    assert_eq!(
+        counts["unresolved"], 0,
+        "unresolved key must be present at 0, not missing"
+    );
+    assert_eq!(
+        counts["unanchored"], 0,
+        "unanchored key must be present at 0, not missing"
+    );
+}
+
+#[test]
 fn later_content_change_is_stale_with_content_change_trigger() {
     let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
     let v_early = symbol_version(

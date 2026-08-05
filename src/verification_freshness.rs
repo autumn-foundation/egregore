@@ -1385,9 +1385,18 @@ pub fn stale_only(entries: Vec<VerificationFreshnessEntry>) -> Vec<VerificationF
 }
 
 /// Verdict tally across `current`/`stale`/`unresolved`/`unanchored`.
+///
+/// All four keys are always present, even at zero (mirrors
+/// `crate::evidence_freshness::verdict_counts`) -- a machine consumer relying
+/// on a stable schema must see `0`, never a missing/null key, for a verdict
+/// class the result set happens not to contain.
 #[must_use]
 pub fn verdict_counts(entries: &[VerificationFreshnessEntry]) -> BTreeMap<&'static str, usize> {
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    counts.insert("current", 0);
+    counts.insert("stale", 0);
+    counts.insert("unresolved", 0);
+    counts.insert("unanchored", 0);
     for entry in entries {
         *counts.entry(entry.verdict.as_str()).or_insert(0) += 1;
     }
