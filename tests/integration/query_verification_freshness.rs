@@ -3110,3 +3110,55 @@ fn stale_only_with_zero_evaluable_citations_reports_no_citations_not_no_stale() 
          when nothing was actually evaluable: {codes:?}"
     );
 }
+
+#[test]
+fn inline_supersedes_evidence_link_makes_cited_symbol_unresolved() {
+    // widget is cited by v1's MENTIONS_SYMBOL edge. A SEPARATE agent-memory
+    // node supersedes widget via a node-carried EvidenceLink (relation:
+    // SUPERSEDES) rather than a standalone SUPERSEDES edge -- the third
+    // representation `crate::evidence_freshness` already honors for the
+    // identical purpose. The superseded symbol must no longer be
+    // classified as live: the citation must report unresolved, not current.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let superseder = GraphRecord::node(
+        "agent_memory:v1:superseder".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "supersedes widget".to_owned(),
+    )
+    .with_domain("agent_memory", 1)
+    .with_evidence_links(vec![evidence_link("SUPERSEDES", &sym_id)]);
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-02T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![symbol, superseder, ver, edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["verdict"], "unresolved",
+        "a symbol superseded via a node-carried SUPERSEDES EvidenceLink \
+         must not stay classifiable as current"
+    );
+}

@@ -332,19 +332,25 @@ impl<'a> VerificationFreshnessIndex<'a> {
 
         // Superseded code handles: the node's own `superseded_by` marker
         // (latest physical row wins, so a restored row without the marker
-        // clears an earlier supersession) plus a live `SUPERSEDES` edge.
-        // "Latest physical row" is decided by `producer_wins`, same as the
-        // tombstone-restoration pass above: an unconditional last-occurrence
-        // overwrite would let an OLDER `superseded_by`-carrying row (which
-        // can sort AFTER a later, un-superseded restoration under
-        // `Graph::to_jsonl`'s lexicographic order) win purely by array
-        // position, wrongly re-superseding a handle a later write restored.
+        // clears an earlier supersession) plus a live `SUPERSEDES` edge, plus
+        // a node-carried `evidence_links` entry with `relation: "SUPERSEDES"`
+        // -- the third representation `crate::evidence_freshness` already
+        // honors for the identical purpose. "Latest physical row" is decided
+        // by `producer_wins`, same as the tombstone-restoration pass above:
+        // an unconditional last-occurrence overwrite would let an OLDER
+        // `superseded_by`-carrying row (which can sort AFTER a later,
+        // un-superseded restoration under `Graph::to_jsonl`'s lexicographic
+        // order) win purely by array position, wrongly re-superseding a
+        // handle a later write restored.
         let mut superseded_ids: BTreeSet<&str> = BTreeSet::new();
         let mut last_node_superseded: BTreeMap<&str, (usize, bool)> = BTreeMap::new();
         for (idx, record) in records.iter().enumerate() {
             match record {
                 GraphRecord::Node {
-                    id, superseded_by, ..
+                    id,
+                    superseded_by,
+                    evidence_links,
+                    ..
                 } => {
                     let candidate_superseded =
                         superseded_by.as_deref().is_some_and(|s| !s.is_empty());
@@ -356,6 +362,22 @@ impl<'a> VerificationFreshnessIndex<'a> {
                             });
                     if wins {
                         last_node_superseded.insert(id.as_str(), (idx, candidate_superseded));
+                    }
+                    // A `SUPERSEDES` evidence link is honored only when its
+                    // source (this node) is not itself actively tombstoned
+                    // (mirrors `crate::evidence_freshness`) -- a retracted
+                    // superseding note must not hide the older record.
+                    if let Some(links) = evidence_links
+                        && !tombstone_by_deleted.contains_key(id.as_str())
+                    {
+                        for link in links {
+                            if link.relation == EdgeLabel::Supersedes.as_str()
+                                && let Some(target) = link.target_record_id.as_deref()
+                                && !target.is_empty()
+                            {
+                                superseded_ids.insert(target);
+                            }
+                        }
                     }
                 }
                 GraphRecord::Edge {
