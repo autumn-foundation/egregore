@@ -3162,3 +3162,66 @@ fn inline_supersedes_evidence_link_makes_cited_symbol_unresolved() {
          must not stay classifiable as current"
     );
 }
+
+#[test]
+fn rewritten_source_node_dropping_its_supersedes_link_stops_superseding() {
+    // Same setup as `inline_supersedes_evidence_link_makes_cited_symbol_unresolved`,
+    // but the superseding node's SAME stable ID is later rewritten (a later
+    // `producer_started_at`) to a version that no longer carries the
+    // SUPERSEDES evidence link. Only the LATEST physical write of a source
+    // node should contribute its inline SUPERSEDES links -- an older,
+    // now-retracted write must not permanently keep the target superseded.
+    let sym_id = stable_id(&["node", "Symbol", "src/a.rs", "widget"]);
+    let symbol = symbol_version(
+        &sym_id,
+        "src/a.rs",
+        "widget",
+        span(10, 20),
+        "fn widget() {}",
+        "c1",
+        "2026-01-01T00:00:00Z",
+    );
+    let superseder_v1 = GraphRecord::node(
+        "agent_memory:v1:superseder".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "supersedes widget".to_owned(),
+    )
+    .with_domain("agent_memory", 1)
+    .with_evidence_links(vec![evidence_link("SUPERSEDES", &sym_id)])
+    .with_producer(producer_at("2026-01-01T00:00:00Z"));
+    let superseder_v2 = GraphRecord::node(
+        "agent_memory:v1:superseder".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "no longer supersedes widget".to_owned(),
+    )
+    .with_domain("agent_memory", 1)
+    .with_producer(producer_at("2026-01-02T00:00:00Z"));
+
+    let (v1, ver) = ver_node(
+        "v1",
+        NodeKind::TestRun,
+        Some("test_run"),
+        "pass",
+        Some("2026-01-03T00:00:00Z"),
+        Some("c1"),
+        None,
+        None,
+    );
+    let edge = cite_edge(EdgeLabel::MentionsSymbol, &v1, &sym_id);
+    let (_temp, path) = write_graph(vec![symbol, superseder_v1, superseder_v2, ver, edge]);
+
+    let report = run(&path, &[]);
+    let rows = verdicts_for(&report, &v1);
+    assert_eq!(rows.len(), 1);
+    assert_ne!(
+        rows[0]["verdict"], "unresolved",
+        "the LATEST write of the superseding node dropped its SUPERSEDES link, \
+         so the older write's link must not keep the target superseded"
+    );
+}
