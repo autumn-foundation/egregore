@@ -177,6 +177,47 @@ pub struct ControlCatalog {
     pub controls: Vec<Control>,
 }
 
+/// Maximum characters of any catalog-sourced string echoed into an error
+/// envelope.
+///
+/// The echoed field NAMES are allow-listed, but their VALUES come from the
+/// document under validation — operator- or attacker-controlled. Bounding
+/// mirrors `IDENTITY_FIELD_MAX_CHARS` (#104): a 50 MB `class` string cannot
+/// flood stderr, and truncation is visible via a `…` marker.
+pub const CATALOG_FIELD_MAX_CHARS: usize = 128;
+
+/// Neutralizes control characters in one catalog-sourced string for display.
+///
+/// Control characters (the ESC that starts an ANSI sequence, newlines that
+/// could forge extra output lines, carriage returns) become `.`, so a crafted
+/// catalog value can neither drive a terminal nor split a diagnostic. The
+/// length is NOT capped here: `--format text` echoes values that already
+/// passed validation (a legitimate control title exceeds 128 chars), and the
+/// JSON report mode echoes the full document by design.
+#[must_use]
+pub fn sanitize_catalog_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect()
+}
+
+/// Bounds and sanitizes one catalog-sourced string for an error envelope.
+///
+/// Applies [`sanitize_catalog_text`], then truncates on a CHARACTER boundary
+/// at [`CATALOG_FIELD_MAX_CHARS`] with an explicit `…` marker so truncation is
+/// visible rather than silent. Deterministic: same input, same output.
+#[must_use]
+pub fn bounded_catalog_field(value: &str) -> String {
+    let sanitized = sanitize_catalog_text(value);
+    if sanitized.chars().count() <= CATALOG_FIELD_MAX_CHARS {
+        return sanitized;
+    }
+    let mut out: String = sanitized.chars().take(CATALOG_FIELD_MAX_CHARS).collect();
+    out.push('…');
+    out
+}
+
 /// Errors produced while parsing or validating a control catalog.
 ///
 /// Every variant carries a stable [`CatalogError::code`] and a redaction-safe
@@ -205,8 +246,11 @@ pub enum CatalogError {
         domain: String,
         /// Declared kind.
         kind: String,
-        /// Declared version.
-        version: u32,
+        /// Declared version, echoed as the JSON number it was — a `Number`
+        /// rather than `u32` so a well-formed but unrepresentable version
+        /// (`1.5`, `-1`, `2^32`) is still reported through the version gate
+        /// instead of being masked as `malformed_json`.
+        version: serde_json::Number,
     },
     /// A control named an evidence class outside the closed vocabulary.
     UnknownEvidenceClass {
@@ -264,7 +308,10 @@ impl CatalogError {
     /// Builds a redaction-safe JSON envelope for this error.
     ///
     /// The `unknown_schema_version` shape matches the repo-wide reader contract
-    /// (`{"code":..,"version":{"domain","kind","version"}}`).
+    /// (`{"code":..,"version":{"domain","kind","version"}}`). Every echoed
+    /// string value comes from the document under validation and is therefore
+    /// operator- or attacker-controlled: each is bounded and control-character
+    /// sanitized via [`bounded_catalog_field`] before it reaches the envelope.
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         match self {
@@ -284,13 +331,17 @@ impl CatalogError {
                 version,
             } => serde_json::json!({
                 "code": self.code(),
-                "version": { "domain": domain, "kind": kind, "version": version },
+                "version": {
+                    "domain": bounded_catalog_field(domain),
+                    "kind": bounded_catalog_field(kind),
+                    "version": version,
+                },
             }),
             Self::UnknownEvidenceClass { control_id, class }
             | Self::DuplicateEvidenceClass { control_id, class } => serde_json::json!({
                 "code": self.code(),
-                "control_id": control_id,
-                "class": class,
+                "control_id": bounded_catalog_field(control_id),
+                "class": bounded_catalog_field(class),
             }),
             Self::InvalidRequirement {
                 control_id,
@@ -298,13 +349,13 @@ impl CatalogError {
                 requirement,
             } => serde_json::json!({
                 "code": self.code(),
-                "control_id": control_id,
-                "class": class,
-                "requirement": requirement,
+                "control_id": bounded_catalog_field(control_id),
+                "class": bounded_catalog_field(class),
+                "requirement": bounded_catalog_field(requirement),
             }),
             Self::DuplicateControl { control_id } => serde_json::json!({
                 "code": self.code(),
-                "control_id": control_id,
+                "control_id": bounded_catalog_field(control_id),
             }),
         }
     }
@@ -378,12 +429,16 @@ struct SchemaVersionProbe {
 
 /// Lenient schema-version tuple probe. No `deny_unknown_fields`: unknown keys
 /// inside `schema_version` are ignored during the version gate; the strict v1
-/// shape (phase 2) still rejects them for supported-version catalogs.
+/// shape (phase 2) still rejects them for supported-version catalogs. The
+/// `version` is probed as a raw JSON `Number` (not `u32`) so a well-formed
+/// document declaring an unrepresentable version (`1.5`, `-1`, `2^32`) still
+/// reaches the gate and reports `unknown_schema_version` with its tuple,
+/// rather than failing the probe itself and masking as `malformed_json`.
 #[derive(Debug, Deserialize)]
 struct SchemaVersionTupleProbe {
     domain: String,
     kind: String,
-    version: u32,
+    version: serde_json::Number,
 }
 
 /// Maps a `serde_json::Error` to a redaction-safe [`CatalogError::Json`].
@@ -427,7 +482,14 @@ fn sanitize_json_error(error: &serde_json::Error) -> CatalogError {
 /// removes the sort ties that would otherwise make `canonical_bytes` depend on
 /// input order.
 pub fn parse_catalog(text: &str) -> Result<ControlCatalog, CatalogError> {
-    let normalized = text.replace("\r\n", "\n");
+    // A leading U+FEFF is an encoding artifact of the checkout (Windows
+    // PowerShell 5.1 `Out-File`/`Set-Content` write UTF-8 with a BOM by
+    // default), exactly like CRLF: strip it before parsing so a BOM-prefixed
+    // catalog neither fails as `malformed_json` nor perturbs the hash pin.
+    let normalized = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .replace("\r\n", "\n");
 
     // Phase 1 — lenient version gate. Probe only the `schema_version` tuple,
     // ignoring every other field, so an unsupported-but-well-formed future
@@ -438,11 +500,22 @@ pub fn parse_catalog(text: &str) -> Result<ControlCatalog, CatalogError> {
     let probe: SchemaVersionProbe =
         serde_json::from_str(&normalized).map_err(|error| sanitize_json_error(&error))?;
 
-    if !is_known_control_catalog_schema_version(
-        &probe.schema_version.domain,
-        &probe.schema_version.kind,
-        probe.schema_version.version,
-    ) {
+    // A declared version outside u32 (negative, fractional, > 2^32-1) cannot
+    // possibly be a supported version, so it flows through the same
+    // `unknown_schema_version` refusal, echoing the number as declared.
+    let known = probe
+        .schema_version
+        .version
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .is_some_and(|v| {
+            is_known_control_catalog_schema_version(
+                &probe.schema_version.domain,
+                &probe.schema_version.kind,
+                v,
+            )
+        });
+    if !known {
         return Err(CatalogError::UnknownSchemaVersion {
             domain: probe.schema_version.domain,
             kind: probe.schema_version.kind,
@@ -724,11 +797,12 @@ pub fn load_default_catalog() -> ControlCatalog {
 //     code (source_fact) rows carry a record ID + file/span-or-commit handle
 //     (or a documented absent-handle rule), and 100% of non-code rows carry a
 //     source/evidence/protected handle.
-//   * `gaps` are a closed five-class enum; three are fully derived here
-//     (`merged_pr_without_approving_review`, `commit_outside_any_pr`,
-//     `missing_valid_time`) and two (`review_unanchored_no_commit_sha`,
-//     `approval_precedes_final_head`) require issue #334 facts that are not yet
-//     merged — until #334 lands they always degrade to a single unconditional
+//   * `gaps` are a closed five-class enum, all fully derived here:
+//     `merged_pr_without_approving_review`, `commit_outside_any_pr`,
+//     `missing_valid_time`, plus the two #334-fact-dependent classes
+//     (`review_unanchored_no_commit_sha`, `approval_precedes_final_head`)
+//     whose real derivation issue #339 wired. For a pre-#334 store carrying no
+//     reviewed-commit facts at all, those two degrade to a single
 //     `capability_unavailable` diagnostic naming #334 with zero rows (only for
 //     controls that require review evidence), never a clean-looking check.
 //   * The manifest echoes the #337 catalog pin, the window, and the verbatim
@@ -5869,6 +5943,132 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
             );
         }
     }
+    // Three-way requirement-semantics bind (#337 review hardening): the
+    // per-record hashes bind row CONTENT, but nothing bound the pack's stated
+    // VERDICT scalars — a gate-failing pack with `outcome`, `unavailable_reason`,
+    // `required_classes.passed`, and `ok` hand-edited (no row, hash, or count
+    // touched) previously verified clean. Every check below is recomputable from
+    // the pack alone via `evaluate_requirement`, so recompute and compare.
+    // Documented residual: `status` itself asserts class availability in the
+    // SOURCE STORE, which an offline verify cannot see — forging `status` (a lie
+    // about the store, not about the gate) is TODO(#355) territory alongside
+    // catalog re-derivation.
+    if integrity_passed {
+        let mut recomputed_gate_fail: BTreeSet<&str> = BTreeSet::new();
+        'semantics: for section in &pack.sections {
+            let Some(requirement) = Requirement::from_wire(&section.requirement) else {
+                integrity_passed = false;
+                integrity_detail = format!(
+                    "section {} carries a requirement outside {{required, optional}}",
+                    section.class
+                );
+                break 'semantics;
+            };
+            let availability = match section.status.as_str() {
+                "present" => Availability::Present,
+                "unavailable" => Availability::Unavailable,
+                _ => {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "section {} carries a status outside {{present, unavailable}}",
+                        section.class
+                    );
+                    break 'semantics;
+                }
+            };
+            let expected = evaluate_requirement(requirement, availability);
+            if section.outcome != expected {
+                integrity_passed = false;
+                integrity_detail = format!(
+                    "section {} outcome {:?} contradicts its recorded requirement/status \
+                     ({} + {} recomputes to {:?})",
+                    section.class, section.outcome, section.requirement, section.status, expected,
+                );
+                break 'semantics;
+            }
+            let has_reason = section.unavailable_reason.is_some();
+            if (availability == Availability::Unavailable) != has_reason {
+                integrity_passed = false;
+                integrity_detail = format!(
+                    "section {} unavailable_reason presence contradicts its status \
+                     (unavailable sections carry a reason; present sections carry none)",
+                    section.class,
+                );
+                break 'semantics;
+            }
+            if expected == ClassOutcome::GateFail {
+                recomputed_gate_fail.insert(section.class.as_str());
+            }
+        }
+        // gate_fail sections and `required_class_unavailable` diagnostics must
+        // agree in both directions (assemble emits exactly one per failing class).
+        if integrity_passed {
+            for class in &recomputed_gate_fail {
+                let diagnosed = pack.diagnostics.iter().any(|d| {
+                    d.code == "required_class_unavailable"
+                        && d.evidence_class.as_deref() == Some(class)
+                });
+                if !diagnosed {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "gate-failing section {class} has no required_class_unavailable \
+                         diagnostic (diagnostic deleted)",
+                    );
+                    break;
+                }
+            }
+        }
+        if integrity_passed {
+            for d in &pack.diagnostics {
+                if d.code == "required_class_unavailable"
+                    && !d
+                        .evidence_class
+                        .as_deref()
+                        .is_some_and(|class| recomputed_gate_fail.contains(class))
+                {
+                    integrity_passed = false;
+                    integrity_detail = format!(
+                        "required_class_unavailable diagnostic for {} has no matching \
+                         gate-failing section",
+                        d.evidence_class.as_deref().unwrap_or("<none>"),
+                    );
+                    break;
+                }
+            }
+        }
+        // Aggregate-verdict checks are ONE-DIRECTIONAL, mirroring the Coverage
+        // floor's doctrine (verify may CONFIRM or DOWNGRADE, never UPGRADE): a
+        // `true` contradicted by recomputation is an overclaim — tampering — but
+        // a `false` alongside passing components is an honest under-claim, and
+        // rejecting it would break the #372 self-consistent-citation-forgery
+        // path, whose closing mechanism is Coverage's own re-derivation.
+        if integrity_passed
+            && pack.verdicts.required_classes.passed
+            && !recomputed_gate_fail.is_empty()
+        {
+            integrity_passed = false;
+            integrity_detail = format!(
+                "verdicts.required_classes.passed = true contradicts the {} gate-failing \
+                 section(s) the pack carries",
+                recomputed_gate_fail.len(),
+            );
+        }
+        if integrity_passed {
+            let v = &pack.verdicts;
+            let review_coverage_gate_ok = !v.review_coverage.applicable || v.review_coverage.passed;
+            let expected_ok = v.required_classes.passed
+                && v.citation.passed
+                && review_coverage_gate_ok
+                && v.integrity.passed
+                && v.safety.passed;
+            if v.ok && !expected_ok {
+                integrity_passed = false;
+                integrity_detail = "verdicts.ok = true contradicts its component verdicts \
+                     (conjunction recomputes to false)"
+                    .to_owned();
+            }
+        }
+    }
     // TODO(#355): `catalog_pin` re-derivation and `review_coverage.applicable`
     // recomputation are deliberately out of scope for this hardening pass.
     let integrity = VerificationVerdict {
@@ -7176,7 +7376,7 @@ mod tests {
             CatalogError::UnknownSchemaVersion {
                 domain: "control_catalog".to_owned(),
                 kind: "ControlCatalog".to_owned(),
-                version: 2,
+                version: 2u32.into(),
             }
         );
         let value = err.to_json();
@@ -7221,7 +7421,7 @@ mod tests {
             CatalogError::UnknownSchemaVersion {
                 domain: "control_catalog".to_owned(),
                 kind: "ControlCatalog".to_owned(),
-                version: 2,
+                version: 2u32.into(),
             }
         );
     }
@@ -7240,7 +7440,7 @@ mod tests {
             CatalogError::UnknownSchemaVersion {
                 domain: "control_catalog".to_owned(),
                 kind: "ControlCatalog".to_owned(),
-                version: 2,
+                version: 2u32.into(),
             }
         );
     }
@@ -7518,6 +7718,89 @@ mod tests {
     }
 
     #[test]
+    fn catalog_with_utf8_bom_parses_and_hashes_identically() {
+        // Windows PowerShell 5.1 `Out-File`/`Set-Content` write UTF-8 with a
+        // BOM by default, so a hand-authored `--catalog` file legitimately
+        // starts with U+FEFF. The BOM is an encoding artifact of the checkout,
+        // exactly like CRLF: it must neither fail the parse nor perturb the
+        // `control_catalog:v1:` pin.
+        let json = r#"{
+            "catalog_id": "bom",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+            "controls": [
+                { "control_id": "CC1.1", "title": "t", "evidence_classes": [
+                    { "class": "commits", "requirement": "required" }
+                ] }
+            ]
+        }"#;
+        let bommed = format!("\u{feff}{json}");
+        assert_ne!(json.len(), bommed.len(), "BOM variant must differ in bytes");
+
+        let plain = parse_catalog(json).expect("BOM-less catalog parses");
+        let with_bom = parse_catalog(&bommed).expect("BOM-prefixed catalog parses");
+
+        assert_eq!(catalog_hash(&plain), catalog_hash(&with_bom));
+    }
+
+    #[test]
+    fn non_u32_schema_version_reports_unknown_schema_version_not_malformed_json() {
+        // "version": 1.5 / -1 / 2^32 are well-formed JSON numbers declaring a
+        // version this reader cannot support. Masking them as `malformed_json`
+        // (a value-free line/column) hides the actionable remedy — "this
+        // catalog declares a version I don't read" — so the phase-1 version
+        // gate owns them and echoes the declared tuple.
+        for bad in ["1.5", "-1", "4294967296"] {
+            let json = format!(
+                r#"{{"catalog_id":"x","schema_version":{{"domain":"control_catalog","kind":"ControlCatalog","version":{bad}}},"controls":[]}}"#
+            );
+            let err = parse_catalog(&json).expect_err("unsupported version must fail");
+            assert_eq!(err.code(), "unknown_schema_version", "for version {bad}");
+            let value = err.to_json();
+            assert_eq!(value["version"]["domain"], "control_catalog");
+            assert_eq!(value["version"]["kind"], "ControlCatalog");
+            assert_eq!(
+                value["version"]["version"].to_string(),
+                bad,
+                "declared version echoed as the JSON number it was"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_error_values_are_bounded_and_sanitized() {
+        // Every string the error envelope echoes comes from the document under
+        // validation — operator- or attacker-controlled. Control characters
+        // (an ANSI ESC that could drive a terminal, embedded newlines that
+        // could forge extra diagnostic lines) must be neutralized and the
+        // value length-capped, mirroring `bounded_identity_field` (#104).
+        let evil_class = format!("\u{1b}[2Jcleared{}", "x".repeat(500));
+        let json = format!(
+            r#"{{"catalog_id":"x","schema_version":{{"domain":"control_catalog","kind":"ControlCatalog","version":1}},"controls":[{{"control_id":"CC1.1\ntrailing","title":"t","evidence_classes":[{{"class":{},"requirement":"required"}}]}}]}}"#,
+            serde_json::to_string(&evil_class).expect("encodes"),
+        );
+        let err = parse_catalog(&json).expect_err("unknown class must fail");
+        assert_eq!(err.code(), "unknown_evidence_class");
+        let value = err.to_json();
+        let echoed_class = value["class"].as_str().expect("class echoed");
+        let echoed_control = value["control_id"].as_str().expect("control_id echoed");
+        for echoed in [echoed_class, echoed_control] {
+            assert!(
+                echoed.chars().all(|c| !c.is_control()),
+                "no control characters may ride into a diagnostic: {echoed:?}"
+            );
+        }
+        assert!(
+            echoed_class.chars().count() <= CATALOG_FIELD_MAX_CHARS + 1,
+            "echoed value must be length-capped (got {} chars)",
+            echoed_class.chars().count()
+        );
+        assert!(
+            echoed_class.ends_with('…'),
+            "truncation must be visible, not silent"
+        );
+    }
+
+    #[test]
     fn three_way_requirement_semantics() {
         // required + present => Pass (gate pass)
         let pass = evaluate_requirement(Requirement::Required, Availability::Present);
@@ -7654,6 +7937,55 @@ mod pack338_tests {
         for pair in commits.records.windows(2) {
             assert!(section_sort_key(&pair[0].record) <= section_sort_key(&pair[1].record));
         }
+    }
+
+    #[test]
+    fn manifest_catalog_pin_echoes_identity_for_default_and_custom_catalogs() {
+        // AC4 (#337): the manifest must echo `catalog_id`,
+        // `catalog_schema_version`, and the BLAKE3 hash of the canonical
+        // serialization — for the compiled-in default AND a `--catalog`
+        // override — so a nonstandard catalog is visible in every pack.
+        let default_catalog = load_default_catalog();
+        let pack = assemble_cc81();
+        assert_eq!(pack.manifest.catalog_pin.catalog_id, "soc2-v1");
+        assert_eq!(
+            pack.manifest.catalog_pin.catalog_schema_version.domain,
+            "control_catalog"
+        );
+        assert_eq!(
+            pack.manifest.catalog_pin.catalog_schema_version.kind,
+            "ControlCatalog"
+        );
+        assert_eq!(pack.manifest.catalog_pin.catalog_schema_version.version, 1);
+        assert_eq!(
+            pack.manifest.catalog_pin.catalog_hash,
+            catalog_hash(&default_catalog)
+        );
+
+        let custom = parse_catalog(
+            r#"{
+                "catalog_id": "custom-pin",
+                "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+                "controls": [
+                    { "control_id": "T1", "title": "toy", "evidence_classes": [
+                        { "class": "commits", "requirement": "required" }
+                    ] }
+                ]
+            }"#,
+        )
+        .expect("custom catalog parses");
+        let records = build_seed_records();
+        let custom_pack = assemble_pack(&records, &custom, "T1", &win(), 1.0, "test-0.0.0", None)
+            .expect("assembles under the custom catalog");
+        assert_eq!(custom_pack.manifest.catalog_pin.catalog_id, "custom-pin");
+        assert_eq!(
+            custom_pack.manifest.catalog_pin.catalog_hash,
+            catalog_hash(&custom)
+        );
+        assert_ne!(
+            custom_pack.manifest.catalog_pin.catalog_hash, pack.manifest.catalog_pin.catalog_hash,
+            "a nonstandard catalog must be visible via a distinct pin"
+        );
     }
 
     #[test]
@@ -12685,6 +13017,120 @@ mod pack340_tests {
                 "required_class_unavailable for {class}"
             );
         }
+    }
+
+    /// A gate-failing pack fixture for the verify-side tamper tests: CC7.3
+    /// with `error_signatures` flipped to `required` over a no-log store.
+    fn gate_failing_pack() -> EvidencePack {
+        let mut catalog = load_default_catalog();
+        let cc73 = catalog
+            .controls
+            .iter_mut()
+            .find(|c| c.control_id == "CC7.3")
+            .expect("CC7.3");
+        for cr in &mut cc73.evidence_classes {
+            if cr.class == EvidenceClass::ErrorSignatures {
+                cr.requirement = Requirement::Required;
+            }
+        }
+        let records = build_seed_records();
+        let pack = assemble_pack(&records, &catalog, "CC7.3", &win(), 1.0, "test-0.0.0", None)
+            .expect("assembles");
+        assert!(!pack.verdicts.ok, "fixture must gate-fail");
+        // The untampered gate-failing pack is internally CONSISTENT, so offline
+        // verification passes: verify is tamper-evidence, not a re-gate.
+        let clean = verify_pack(&pack);
+        assert!(clean.ok, "untampered gate-failing pack verifies clean");
+        pack
+    }
+
+    // ── verify-side three-way semantics binding (#337 review finding F1) ──────
+    // The per-record hashes bind row CONTENT; nothing bound the pack's stated
+    // VERDICT scalars. Each test forges one scalar lie an auditor's offline
+    // `evidence-pack verify` must catch, because every one of these is
+    // recomputable from the pack alone via `evaluate_requirement`.
+
+    #[test]
+    fn verify_rejects_forged_section_outcome() {
+        let mut forged = gate_failing_pack();
+        {
+            let sec = forged
+                .sections
+                .iter_mut()
+                .find(|s| s.class == "error_signatures")
+                .expect("section");
+            assert_eq!(sec.status, "unavailable");
+            sec.outcome = ClassOutcome::Pass;
+        }
+        forged.verdicts.required_classes.passed = true;
+        forged.verdicts.required_classes.detail =
+            "every required class resolved (populated or explicitly empty)".to_owned();
+        forged.verdicts.ok = true;
+        forged
+            .diagnostics
+            .retain(|d| d.code != "required_class_unavailable");
+        let report = verify_pack(&forged);
+        assert!(
+            !report.integrity.passed,
+            "a required+unavailable section presented as `pass` must fail Integrity"
+        );
+        assert!(!report.ok);
+    }
+
+    #[test]
+    fn verify_rejects_forged_required_classes_verdict() {
+        // Outcome left honest (`gate_fail`); only the aggregate verdict lies.
+        let mut forged = gate_failing_pack();
+        forged.verdicts.required_classes.passed = true;
+        forged.verdicts.ok = true;
+        let report = verify_pack(&forged);
+        assert!(
+            !report.integrity.passed,
+            "required_classes.passed contradicting a gate_fail section must fail"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_inconsistent_overall_ok() {
+        // Only `ok` lies; every component verdict still says fail.
+        let mut forged = gate_failing_pack();
+        forged.verdicts.ok = true;
+        let report = verify_pack(&forged);
+        assert!(
+            !report.integrity.passed,
+            "ok=true over a failing required_classes verdict must fail"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_dropped_unavailable_reason() {
+        let mut forged = gate_failing_pack();
+        {
+            let sec = forged
+                .sections
+                .iter_mut()
+                .find(|s| s.class == "error_signatures")
+                .expect("section");
+            sec.unavailable_reason = None;
+        }
+        let report = verify_pack(&forged);
+        assert!(
+            !report.integrity.passed,
+            "an unavailable section stripped of its reason must fail"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_deleted_gate_fail_diagnostic() {
+        let mut forged = gate_failing_pack();
+        forged
+            .diagnostics
+            .retain(|d| d.code != "required_class_unavailable");
+        let report = verify_pack(&forged);
+        assert!(
+            !report.integrity.passed,
+            "a gate_fail section with its required_class_unavailable diagnostic deleted must fail"
+        );
     }
 
     // ── AC6: determinism ──────────────────────────────────────────────────────

@@ -37,8 +37,9 @@ cargo run -- audit control-catalog --format text
 
 - `0` — the catalog is valid; the report is printed to stdout.
 - `2` — a read/parse error, an unknown evidence class, an unknown schema
-  version, a duplicate control ID, or a duplicate evidence class within a
-  control; a redaction-safe JSON error is printed to stderr.
+  version, an invalid requirement, a duplicate control ID, or a duplicate
+  evidence class within a control; a redaction-safe JSON error is printed to
+  stderr.
 
 ## JSON output
 
@@ -70,9 +71,25 @@ The parser gates the `schema_version` tuple **first**: any document whose tuple
 is not the supported `(control_catalog, ControlCatalog, 1)` is reported as
 `unknown_schema_version` before the strict v1 body shape is enforced, so an
 unsupported/newer catalog that also adds or renames fields is still reported as
-`unknown_schema_version` (not `malformed_json`). Only supported-version
-documents are then held to the strict v1 shape, where an unknown/stray field is
+`unknown_schema_version` (not `malformed_json`). The declared `version` is
+probed as a raw JSON number, so a well-formed but unrepresentable version
+(`1.5`, `-1`, `4294967296`) also reports `unknown_schema_version` echoing the
+number as declared, never `malformed_json`. Only supported-version documents
+are then held to the strict v1 shape, where an unknown/stray field is
 `malformed_json`.
+
+Input normalization mirrors the hash contract: a leading UTF-8 BOM (Windows
+PowerShell 5.1 `Out-File` writes one by default) and CRLF line endings are both
+stripped before parsing, so neither fails the parse nor perturbs the
+`control_catalog:v1:` pin.
+
+Every catalog-sourced string an envelope echoes (`control_id`, `class`,
+`requirement`, schema `domain`/`kind`) is control-character-sanitized and
+length-capped (`CATALOG_FIELD_MAX_CHARS`, truncation marked with `…`) before
+rendering — the values come from the document under validation and are
+operator/attacker-controlled. `--format text` likewise neutralizes control
+characters in `catalog_id`, `control_id`, and `title`, so a crafted catalog
+cannot drive the operator's terminal.
 
 - Missing/unreadable `--catalog` file:
   `{ "code": "catalog_read_error", "path": "…", "message": "…" }`

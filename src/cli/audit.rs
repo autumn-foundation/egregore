@@ -705,7 +705,19 @@ pub(crate) fn control_catalog_cmd(catalog: Option<PathBuf>, format: OutputFormat
             );
         }
         OutputFormat::Text => {
-            println!("catalog: {} ({})", parsed.catalog_id, catalog_hash);
+            // `catalog_id`, `control_id`, and `title` are free text from the
+            // document under validation — a vendor-supplied `--catalog` could
+            // carry an ANSI escape that drives the operator's terminal. JSON
+            // mode escapes control characters by construction; text mode must
+            // neutralize them explicitly (#104 doctrine). Schema domain/kind
+            // and the class/requirement wire names are exact validated
+            // constants, safe as-is.
+            use crate::evidence_pack::sanitize_catalog_text;
+            println!(
+                "catalog: {} ({})",
+                sanitize_catalog_text(&parsed.catalog_id),
+                catalog_hash
+            );
             println!(
                 "schema_version: {} {} v{}",
                 parsed.schema_version.domain,
@@ -714,7 +726,11 @@ pub(crate) fn control_catalog_cmd(catalog: Option<PathBuf>, format: OutputFormat
             );
             println!("controls: {}", parsed.controls.len());
             for control in &parsed.controls {
-                println!("  {} — {}", control.control_id, control.title);
+                println!(
+                    "  {} — {}",
+                    sanitize_catalog_text(&control.control_id),
+                    sanitize_catalog_text(&control.title)
+                );
                 for cr in &control.evidence_classes {
                     println!("    {} [{}]", cr.class.as_wire(), cr.requirement.as_wire());
                 }
