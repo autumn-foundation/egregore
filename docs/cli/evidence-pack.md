@@ -43,7 +43,7 @@ eg audit evidence-pack assemble --control CC8.1 \
 | #103 validate | Referential-integrity gating is a *separate* pre-ingest step; the pack assumes a validated graph. |
 | #60 protected artifacts | `protected:v1:` handles survive as citations; raw bytes never enter the pack. |
 | #333 PR head/base/merge SHAs | First-class PR Task fields drive merge-target and review joins. |
-| #334 reviewed-commit facts | Merged; issue #339 wired the real derivation. The two #334-dependent gap classes now derive genuine rows; `capability_unavailable` is emitted only for a pre-#334 store carrying no reviewed-commit facts (see below). |
+| #334 reviewed-commit facts | Merged; issue #339 wired the real derivation. The two #334-dependent gap classes now derive genuine rows; `capability_unavailable` is emitted only for a pre-#334 store carrying none of the three #334 fact signals (see below). |
 | #319/#320/#322/#326 log-graph | Runtime incident evidence folded into the CC7.x `error_signatures` / `occurrence_buckets` / `remediation_links` sections (issue #340; see below). |
 
 ## When to use `eg bundle export` instead
@@ -477,15 +477,19 @@ PR/commit/review evidence therefore emits none of those change-management gaps;
 | `commit_outside_any_pr` | An in-window `Commit` not claimed by any PR via `MERGED_AS`. | `commits` and/or `pull_requests` | Fully implemented. |
 | `missing_valid_time` | A class-relevant record with no resolvable valid time — either no valid time at all **or** a present-but-malformed (non-RFC-3339) one. A malformed timestamp is unresolved, not out-of-window. | *(generic — any control)* | Fully implemented. |
 | `review_unanchored_no_commit_sha` | A review with no anchoring reviewed-commit SHA. | `reviews`/`review_coverage` | Fully implemented (issue #339 wired the derivation over the #334 facts). |
-| `approval_precedes_final_head` | A recorded approval whose commit predates the PR's final head. | `reviews`/`review_coverage` | Fully implemented (issue #339 wired the derivation over the #334 facts). |
+| `approval_precedes_final_head` | A recorded approval whose anchored `review_commit_sha` diverges from the PR's final `head_sha` (any divergence, not only an older commit), or an anchored approval whose PR carries no `head_sha` at all (`head_sha_unavailable` — the final head cannot be confirmed). | `reviews`/`review_coverage` | Fully implemented (issue #339 wired the derivation over the #334 facts). |
 
 Issue #334 (the `review_commit_sha` field / `REVIEWS_COMMIT` edge) is merged,
 and issue #339 wired the last two classes to their real derivation. The
 `capability_unavailable` diagnostic naming issue #334 survives only as the
 honest degradation for a **pre-#334 store**: when a control requires review
-evidence and the input carries no reviewed-commit facts at all, the pack emits
-the single diagnostic and zero rows for those two classes rather than
-presenting as if the checks ran cleanly. A control that requires no review
+evidence and the input carries none of the three #334 fact signals — no
+`review_commit_sha` field, no `REVIEWS_COMMIT` edge, and no
+`[github_review_unanchored]` importer `Diagnostic` — the pack emits the single
+diagnostic and zero rows for those two classes rather than presenting as if
+the checks ran cleanly. (The third signal is what distinguishes a store whose
+reviews are all *genuinely* unanchored — which derives real gap rows — from a
+store imported before #334 existed.) A control that requires no review
 evidence (e.g. `CC7.2`, `CC7.3`) emits neither those gap classes nor the #334
 diagnostic. The enum stays closed.
 
@@ -500,10 +504,12 @@ Re-verifies an assembled pack offline and read-only:
   `requirement`/`status` via `evaluate_requirement`, an `unavailable` section
   must carry its `unavailable_reason` (and a `present` one must not),
   gate-failing sections and `required_class_unavailable` diagnostics must agree
-  in both directions, and the aggregate `required_classes.passed` / `ok`
-  verdicts may never **overclaim** what those recomputations support (a `true`
-  contradicted by recomputation fails; a conservative `false` never does —
-  verify may confirm or downgrade, never upgrade). A gate-failing pack whose
+  in both directions, and the aggregate verdicts may never **overclaim**:
+  `required_classes.passed = true` is checked against the recomputed gate-fail
+  set, and `ok = true` against the conjunction of the pack's own recorded
+  component verdicts (a self-consistency check, not a re-derivation of each
+  component). A `true` contradicted there fails; a conservative `false` never
+  does — verify may confirm or downgrade, never upgrade. A gate-failing pack whose
   verdict scalars are hand-edited to present as passing therefore fails
   Integrity even though no record row, hash, or count was touched. Documented
   residual: `status` itself asserts class availability in the source store,

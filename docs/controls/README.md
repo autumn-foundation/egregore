@@ -113,9 +113,12 @@ repo-wide shape:
 { "code": "unknown_schema_version", "version": { "domain": "…", "kind": "…", "version": 2 } }
 ```
 
-A future `soc2-v2` catalog would carry a new `schema_version.version` and be
-recognized by a widened recognizer; readers pinned to v1 reject it rather than
-silently misreading it.
+A future `soc2-v2` **catalog** is a content revision: it carries a new
+`catalog_id` (and therefore a new hash pin) under the *same* document format.
+The `schema_version.version` bumps only when the document **format** itself
+changes; such a future-format catalog would be recognized by a widened
+recognizer, and readers pinned to v1 reject it rather than silently misreading
+it.
 
 The parser gates on this tuple **first**: it probes only the `schema_version`
 tuple leniently and returns `unknown_schema_version` for any unsupported tuple

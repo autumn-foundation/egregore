@@ -4519,10 +4519,6 @@ fn diagnostic_sort_key(d: &PackDiagnostic) -> (String, String, String) {
     )
 }
 
-/// Derives the closed set of gap rows (AC5). Two classes require issue #334
-/// facts that are not yet merged; until #334 lands they unconditionally emit a
-/// single `capability_unavailable` diagnostic (for review-requiring controls
-/// only) and produce zero rows, never a clean-looking check.
 /// True when the control marks `class` as [`Requirement::Required`].
 ///
 /// The control-scoping predicate for gap derivation is derived from this over

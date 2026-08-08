@@ -1470,7 +1470,8 @@ vocabulary, then prints a deterministic single-line report carrying the catalog
 identity, its `control_catalog:v1:<hex>` hash-pin handle, and the per-control
 evidence-class map (`required`/`optional`). Pure, offline, read-only;
 byte-identical across runs. Unknown schema version, unknown evidence class,
-malformed JSON, and unreadable files exit 2 with a redaction-safe JSON error.
+invalid requirement, duplicate control ID, duplicate evidence class, malformed
+JSON, and unreadable files exit 2 with a redaction-safe JSON error.
 Input normalization mirrors the hash contract: a leading UTF-8 BOM and CRLF
 line endings are both stripped before parsing (neither fails the parse nor
 perturbs the pin), and a well-formed but non-u32 declared `version` (`1.5`,

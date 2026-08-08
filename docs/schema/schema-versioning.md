@@ -245,7 +245,7 @@ See [`docs/schema/producer-version.md`](producer-version.md) for the full `Produ
 
 ## 9 - Conformance Fixtures
 
-Executable fixtures live in `tests/schema_versioning.rs`.
+Executable fixtures live in `tests/integration/schema_versioning.rs`.
 
 - `future_schema_version_is_typed_and_inspect_reports_mixed_counts` builds JSONL
   containing one known `codegraph.Symbol` record and one unknown future

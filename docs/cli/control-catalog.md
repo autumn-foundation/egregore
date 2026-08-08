@@ -80,8 +80,9 @@ are then held to the strict v1 shape, where an unknown/stray field is
 
 Input normalization mirrors the hash contract: a leading UTF-8 BOM (Windows
 PowerShell 5.1 `Out-File` writes one by default) and CRLF line endings are both
-stripped before parsing, so neither fails the parse nor perturbs the
-`control_catalog:v1:` pin.
+stripped before parsing, so a BOM'd or CRLF checkout of a valid catalog parses
+and pins identically to its plain LF form (the pin is computed over the parsed
+canonical form, never the raw bytes).
 
 Every catalog-sourced string an envelope echoes (`control_id`, `class`,
 `requirement`, schema `domain`/`kind`) is control-character-sanitized and
