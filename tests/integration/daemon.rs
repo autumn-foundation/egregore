@@ -23,8 +23,8 @@ use aletheia_egregore::{
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, GraphRecord, IdentitySource, NodeKind,
         PROJECT_SCHEMA_VERSION, RepositoryIdentityPayload, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION,
-        SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, stable_id,
-        user_context_stable_id,
+        SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, agent_memory_stable_id,
+        stable_id, user_context_stable_id,
     },
     traj::ImportOptions,
 };
@@ -9830,28 +9830,70 @@ fn query_verb_conformance() {
         );
     }
 
-    // ── (b) reserved: agent_sessions_for_repo → not_implemented ───────────────
+    // ── (b) reserved: drift → not_implemented ─────────────────────────────────
     {
         let res = http_json(
             &metadata,
             "POST",
             "/v1/query",
             &serde_json::json!({
-                "request_id": "vqc-reserved-sessions",
+                "request_id": "vqc-reserved-drift",
                 "agent_id": "verb-test-agent",
-                "verb": "agent_sessions_for_repo",
-                "params": { "repository_id": "some-repo" }
+                "verb": "drift",
+                "params": {}
             }),
         );
         assert!(
             res.starts_with("HTTP/1.1 501"),
-            "agent_sessions_for_repo should return 501, got {res}"
+            "drift should return 501, got {res}"
         );
         let body = response_json(&res);
         assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
         assert_eq!(
             body["error"]["code"], "not_implemented",
             "reserved verb must return not_implemented, got {body}"
+        );
+    }
+
+    // ── (b) implemented: agent_sessions_for_repo → 200 digest (issue #112) ────
+    // The verb is no longer reserved: it answers with a (possibly empty)
+    // repo-scoped session digest, never `not_implemented`.
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-sessions-implemented",
+                "agent_id": "verb-test-agent",
+                "verb": "agent_sessions_for_repo",
+                "params": { "repo": "fixture-rust-basic-stable" }
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "agent_sessions_for_repo must be implemented (200), got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(body["ok"], true, "response must be ok:true, got {body}");
+        let result = &body["result"];
+        assert_eq!(result["verb"], "agent_sessions_for_repo");
+        assert!(
+            result["sessions"].is_array(),
+            "the digest must carry a sessions array, got {body}"
+        );
+        assert!(
+            result["disclaimer"].as_str().is_some_and(|d| !d.is_empty()),
+            "the digest must carry the standing disclaimer, got {body}"
+        );
+        // A scanned code-only store holds zero agent sessions: that is an
+        // explicit empty answer (200 + no_sessions), never a 404.
+        assert_eq!(result["sessions"], serde_json::json!([]));
+        assert!(
+            result["diagnostics"]
+                .as_array()
+                .is_some_and(|d| d.iter().any(|entry| entry["code"] == "no_sessions")),
+            "zero sessions must be signalled by a no_sessions diagnostic, got {body}"
         );
     }
 
@@ -13109,4 +13151,418 @@ fn daemon_observations_for_symbol_invalid_supersession() {
         body["error"]["code"], "bad_request",
         "invalid supersession parameter should return bad_request error code, got {body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `agent_sessions_for_repo` (issue #112) — the daemon face of
+// `eg query sessions <REPO>`. The verb is no longer reserved: it returns the
+// same repo-scoped, recency-ordered session digest the CLI prints.
+// ---------------------------------------------------------------------------
+
+/// Selector every `agent_sessions_for_repo` fixture answers to.
+const SESSIONS_REPO_SELECTOR: &str = "sessions-repo";
+
+/// Builds the deterministic session-digest fixture: one repository with a file
+/// and a symbol, one agent, one session with a templated run and one
+/// symbol-citing observation.
+///
+/// Returned in a fixed order so the same record set can be replayed into a
+/// JSONL graph for the CLI parity check.
+#[allow(clippy::too_many_lines)]
+fn agent_sessions_fixture_records() -> Vec<GraphRecord> {
+    let repo_id = stable_id(&["repository", "operator-override", SESSIONS_REPO_SELECTOR]);
+    let file_id = stable_id(&["node", "file", &repo_id, "src/lib.rs"]);
+    let symbol_id = stable_id(&["node", "symbol", &repo_id, "src/lib.rs", "widget"]);
+    let agent_id = agent_memory_stable_id(&["node", "agent", "sessions-agent-1"]);
+    let session_id = agent_memory_stable_id(&["node", "agent_session", "sessions-sess-1"]);
+    let run_id = agent_memory_stable_id(&["node", "agent_run", "sessions-run-1"]);
+    let observation_id = agent_memory_stable_id(&["node", "observation", "sessions-obs-1"]);
+
+    let memory_node = |id: &str, kind: NodeKind, observed: &str, summary: &str| -> GraphRecord {
+        let mut record =
+            GraphRecord::node(id.to_owned(), kind, None, None, None, summary.to_owned())
+                .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
+        if let GraphRecord::Node {
+            agent_id: node_agent_id,
+            agent_kind,
+            session_id: node_session_id,
+            observed_at,
+            ingested_at,
+            confidence,
+            ..
+        } = &mut record
+        {
+            *node_agent_id = Some("sessions-agent-1".to_owned());
+            *agent_kind = Some("claude-code".to_owned());
+            *node_session_id = Some("sessions-sess-1".to_owned());
+            *observed_at = Some(observed.to_owned());
+            *ingested_at = Some(observed.to_owned());
+            *confidence = Some("1.0".to_owned());
+        }
+        record
+    };
+
+    let mut agent = GraphRecord::node(
+        agent_id.clone(),
+        NodeKind::Agent,
+        None,
+        None,
+        Some("sessions-agent-1".to_owned()),
+        "Agent sessions-agent-1".to_owned(),
+    )
+    .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
+    if let GraphRecord::Node {
+        agent_id: node_agent_id,
+        agent_kind,
+        ..
+    } = &mut agent
+    {
+        *node_agent_id = Some("sessions-agent-1".to_owned());
+        *agent_kind = Some("claude-code".to_owned());
+    }
+
+    vec![
+        GraphRecord::node(
+            repo_id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(SESSIONS_REPO_SELECTOR.to_owned()),
+            format!("Repository {SESSIONS_REPO_SELECTOR}"),
+        )
+        .with_domain("codegraph", SCHEMA_VERSION)
+        .with_repository_identity(RepositoryIdentityPayload {
+            identity_source: IdentitySource::OperatorOverride,
+            remote_url: None,
+            root_commit_sha: None,
+            canonical_path: None,
+            basename: SESSIONS_REPO_SELECTOR.to_owned(),
+        }),
+        GraphRecord::syntax_node(
+            file_id.clone(),
+            NodeKind::File,
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte: 100,
+                start_line: 1,
+                end_line: 100,
+            },
+            "src/lib.rs".to_owned(),
+            "rust",
+            "Source file src/lib.rs".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id,
+            file_id.clone(),
+            Some("1.0".to_owned()),
+            "repository contains file".to_owned(),
+        ),
+        GraphRecord::syntax_node(
+            symbol_id.clone(),
+            NodeKind::Symbol,
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 10,
+                end_byte: 40,
+                start_line: 10,
+                end_line: 20,
+            },
+            "widget".to_owned(),
+            "rust",
+            "Symbol widget".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id,
+            symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "file defines symbol".to_owned(),
+        ),
+        agent,
+        memory_node(
+            &session_id,
+            NodeKind::AgentSession,
+            "2026-03-01T10:00:00Z",
+            "AgentSession sessions-sess-1",
+        ),
+        GraphRecord::agent_memory_edge(
+            EdgeLabel::SessionOf,
+            session_id.clone(),
+            agent_id,
+            Some("1.0".to_owned()),
+            "session of agent".to_owned(),
+        ),
+        memory_node(
+            &run_id,
+            NodeKind::AgentRun,
+            "2026-03-01T10:05:00Z",
+            "AgentRun outcome=success exit_reason=completed",
+        ),
+        GraphRecord::agent_memory_edge(
+            EdgeLabel::SessionOf,
+            run_id,
+            session_id.clone(),
+            Some("1.0".to_owned()),
+            "run of session".to_owned(),
+        ),
+        memory_node(
+            &observation_id,
+            NodeKind::Observation,
+            "2026-03-01T11:00:00Z",
+            "Observation about widget",
+        ),
+        GraphRecord::agent_memory_edge(
+            EdgeLabel::AuthoredBy,
+            observation_id.clone(),
+            session_id,
+            Some("1.0".to_owned()),
+            "observation authored by session".to_owned(),
+        ),
+        GraphRecord::agent_memory_edge(
+            EdgeLabel::MentionsSymbol,
+            observation_id,
+            symbol_id,
+            Some("1.0".to_owned()),
+            "observation mentions symbol".to_owned(),
+        ),
+    ]
+}
+
+/// Writes the fixture straight into a fresh embedded store (before the daemon
+/// takes the write lease), mirroring `seed_observations`/`seed_repository_nodes`.
+fn seed_agent_sessions_store(data_dir: &Path) -> Vec<GraphRecord> {
+    let records = agent_sessions_fixture_records();
+    let mut sink = EmbeddedAletheiaSink::open(data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record)
+            .expect("seeded session fixture record should write");
+    }
+    sink.persist_indexes()
+        .expect("seeded session fixture should persist");
+    records
+}
+
+fn agent_sessions_query(
+    metadata: &DaemonMetadata,
+    request_id: &str,
+    params: &serde_json::Value,
+) -> String {
+    http_json(
+        metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": request_id,
+            "agent_id": "sessions-test-agent",
+            "verb": "agent_sessions_for_repo",
+            "params": params
+        }),
+    )
+}
+
+#[test]
+fn agent_sessions_for_repo_returns_digest() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let records = seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-digest",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "agent_sessions_for_repo must return 200, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], true, "response must be ok:true, got {body}");
+    let result = &body["result"];
+    assert_eq!(result["verb"], "agent_sessions_for_repo");
+
+    let repo_id = records[0].id();
+    assert_eq!(
+        result["repository_id"], repo_id,
+        "the digest must name the resolved repository, got {body}"
+    );
+    assert!(
+        result["disclaimer"].as_str().is_some_and(|d| !d.is_empty()),
+        "the digest must carry the standing disclaimer, got {body}"
+    );
+    assert_eq!(
+        result["unsupported_count_kinds"],
+        serde_json::json!(["lesson"]),
+        "the digest must disclose unsupported count kinds, got {body}"
+    );
+
+    let sessions = result["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1, "exactly one seeded session, got {body}");
+    let row = &sessions[0];
+    assert_eq!(row["session_id"], "sessions-sess-1");
+    assert_eq!(row["trust_class"], "agent_authored");
+    assert_eq!(row["agent_id"], "sessions-agent-1");
+    assert_eq!(row["first_activity"], "2026-03-01T10:00:00Z");
+    assert_eq!(row["last_activity"], "2026-03-01T11:00:00Z");
+    assert_eq!(row["run_status"], "outcome_recorded");
+    let runs = row["runs"].as_array().expect("runs array");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["outcome"], "success");
+    assert_eq!(runs[0]["exit_reason"], "completed");
+    assert_eq!(row["record_counts"]["observation"], 1);
+    assert!(
+        row["record_counts"]["lesson"].is_null(),
+        "lesson has no backing node kind and must be null, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_missing_repo_param_is_bad_request() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(&metadata, "sessions-missing-repo", &serde_json::json!({}));
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "a missing repository selector must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "a missing selector must report missing_field, got {body}"
+    );
+    assert_eq!(
+        body["error"]["field"], "params.repo",
+        "the error must name params.repo, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_unknown_selector_maps_to_unknown_repository_selector() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-unknown-repo",
+        &serde_json::json!({ "repo": "no-such-repository-xyz" }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "an unknown selector must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
+    assert_eq!(
+        body["error"]["code"], "unknown_repository_selector",
+        "an unknown selector must reuse the shared selector mapping, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_accepts_repository_id_alias() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let canonical = agent_sessions_query(
+        &metadata,
+        "sessions-alias-canonical",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR }),
+    );
+    let aliased = agent_sessions_query(
+        &metadata,
+        "sessions-alias-aliased",
+        &serde_json::json!({ "repository_id": SESSIONS_REPO_SELECTOR }),
+    );
+    daemon.stop();
+
+    assert!(
+        aliased.starts_with("HTTP/1.1 200"),
+        "params.repository_id must be accepted as an alias of params.repo, got {aliased}"
+    );
+    assert!(
+        canonical.starts_with("HTTP/1.1 200"),
+        "params.repo must resolve, got {canonical}"
+    );
+    assert_eq!(
+        response_json(&aliased)["result"],
+        response_json(&canonical)["result"],
+        "the alias must produce the identical digest"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_matches_cli_payload() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let records = seed_agent_sessions_store(&data_dir);
+
+    // The same record set, replayed as a JSONL graph for the CLI lane.
+    let graph_path = temp.path().join("sessions-parity.jsonl");
+    let mut jsonl = String::new();
+    for record in &records {
+        jsonl.push_str(&serde_json::to_string(record).expect("record should serialize"));
+        jsonl.push('\n');
+    }
+    fs::write(&graph_path, jsonl).expect("write parity graph");
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-cli-parity",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "agent_sessions_for_repo must return 200, got {res}"
+    );
+    let daemon_result = response_json(&res)["result"].clone();
+
+    let cli_output = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(["query", "sessions", SESSIONS_REPO_SELECTOR, "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let cli: serde_json::Value =
+        serde_json::from_slice(&cli_output).expect("CLI stdout must be one JSON envelope");
+
+    for field in [
+        "repository_id",
+        "repository",
+        "disclaimer",
+        "unsupported_count_kinds",
+        "sessions",
+        "diagnostics",
+    ] {
+        assert_eq!(
+            daemon_result[field], cli[field],
+            "daemon and CLI must agree on `{field}`; daemon={daemon_result} cli={cli}"
+        );
+    }
 }

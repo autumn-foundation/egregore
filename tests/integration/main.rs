@@ -7,6 +7,7 @@
 // The module list below is alphabetized (one `mod` line per file); keep it
 // that way so parallel PRs adding test files merge without conflicts.
 mod accuracy;
+mod agent_sessions;
 mod antigravity;
 mod asof_file_symbols;
 mod author_attribution_doc;
