@@ -49,6 +49,58 @@ fn assemble_over_graph() -> (i32, Value) {
 }
 
 #[test]
+fn assemble_text_output_neutralizes_control_characters_from_catalog() {
+    // The same threat `eg audit control-catalog --format text` neutralizes:
+    // a vendor-supplied --catalog whose control title carries an ANSI escape
+    // (ESC [2J clears the terminal) must not drive the operator's terminal
+    // through `assemble --format text` either (#337 review finding F2).
+    let evil_catalog = r#"{
+        "catalog_id": "evil",
+        "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+        "controls": [
+            { "control_id": "CC8.1", "title": "before\u001b[2Jafter", "evidence_classes": [
+                { "class": "commits", "requirement": "required" }
+            ] }
+        ]
+    }"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let catalog_path = temp.path().join("evil.json");
+    fs::write(&catalog_path, evil_catalog).expect("write catalog");
+    let output = egregore()
+        .args([
+            "audit",
+            "evidence-pack",
+            "assemble",
+            "--control",
+            "CC8.1",
+            "--from",
+            FROM,
+            "--to",
+            TO,
+            "--format",
+            "text",
+            "--catalog",
+        ])
+        .arg(&catalog_path)
+        .arg("--graph")
+        .arg(fixture_path())
+        .output()
+        .expect("run assemble");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(
+        !stdout.is_empty(),
+        "assemble must print the text report (exit {:?}, stderr: {})",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "an ESC byte must never reach the terminal"
+    );
+    assert!(stdout.contains("before"), "title text still rendered");
+}
+
+#[test]
 fn assemble_fails_review_coverage_and_plants_three_gaps() {
     let (code, pack) = assemble_over_graph();
     assert_eq!(code, 1, "review coverage below 1.0 must exit 1");

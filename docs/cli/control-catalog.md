@@ -71,12 +71,16 @@ The parser gates the `schema_version` tuple **first**: any document whose tuple
 is not the supported `(control_catalog, ControlCatalog, 1)` is reported as
 `unknown_schema_version` before the strict v1 body shape is enforced, so an
 unsupported/newer catalog that also adds or renames fields is still reported as
-`unknown_schema_version` (not `malformed_json`). The declared `version` is
-probed as a raw JSON number, so a well-formed but unrepresentable version
-(`1.5`, `-1`, `4294967296`) also reports `unknown_schema_version` echoing the
-number as declared, never `malformed_json`. Only supported-version documents
-are then held to the strict v1 shape, where an unknown/stray field is
-`malformed_json`.
+`unknown_schema_version` (not `malformed_json`). The declared `version` must
+be a JSON **integer literal**: the probe reads it as a raw JSON number, and any
+value that is not an in-range integer literal — `1.5`, `-1`, `4294967296`, and
+also `1.0` (a float literal, even though numerically 1) — reports
+`unknown_schema_version` carrying the declared tuple, with the version echoed
+as `serde_json` re-serializes it (integer literals round-trip; `1e2` echoes as
+`100.0`). One caveat: a number outside JSON double range entirely (e.g.
+`1e400`) fails JSON parsing itself and is `malformed_json`. Only
+supported-version documents are then held to the strict v1 shape, where an
+unknown/stray field is `malformed_json`.
 
 Input normalization mirrors the hash contract: a leading UTF-8 BOM (Windows
 PowerShell 5.1 `Out-File` writes one by default) and CRLF line endings are both

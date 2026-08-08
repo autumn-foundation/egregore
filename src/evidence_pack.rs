@@ -182,9 +182,10 @@ pub struct ControlCatalog {
 ///
 /// The echoed field NAMES are allow-listed, but their VALUES come from the
 /// document under validation — operator- or attacker-controlled. Bounding
-/// mirrors `IDENTITY_FIELD_MAX_CHARS` (#104): a 50 MB `class` string cannot
-/// flood stderr, and truncation is visible via a `…` marker.
-pub const CATALOG_FIELD_MAX_CHARS: usize = 128;
+/// reuses the #104 bound (`IDENTITY_FIELD_MAX_CHARS`) so the two surfaces
+/// cannot drift: a 50 MB `class` string cannot flood stderr, and truncation is
+/// visible via a `…` marker.
+pub const CATALOG_FIELD_MAX_CHARS: usize = crate::embeddings::IDENTITY_FIELD_MAX_CHARS;
 
 /// Neutralizes control characters in one catalog-sourced string for display.
 ///
@@ -204,18 +205,15 @@ pub fn sanitize_catalog_text(value: &str) -> String {
 
 /// Bounds and sanitizes one catalog-sourced string for an error envelope.
 ///
-/// Applies [`sanitize_catalog_text`], then truncates on a CHARACTER boundary
-/// at [`CATALOG_FIELD_MAX_CHARS`] with an explicit `…` marker so truncation is
-/// visible rather than silent. Deterministic: same input, same output.
+/// Control characters become `.`, then the value is truncated on a CHARACTER
+/// boundary at [`CATALOG_FIELD_MAX_CHARS`] with an explicit `…` marker so
+/// truncation is visible rather than silent. Delegates to the #104
+/// [`crate::embeddings::bounded_identity_field`] so the two hardened surfaces
+/// share one implementation and cannot drift. Deterministic: same input, same
+/// output.
 #[must_use]
 pub fn bounded_catalog_field(value: &str) -> String {
-    let sanitized = sanitize_catalog_text(value);
-    if sanitized.chars().count() <= CATALOG_FIELD_MAX_CHARS {
-        return sanitized;
-    }
-    let mut out: String = sanitized.chars().take(CATALOG_FIELD_MAX_CHARS).collect();
-    out.push('…');
-    out
+    crate::embeddings::bounded_identity_field(value)
 }
 
 /// Errors produced while parsing or validating a control catalog.
@@ -246,10 +244,11 @@ pub enum CatalogError {
         domain: String,
         /// Declared kind.
         kind: String,
-        /// Declared version, echoed as the JSON number it was — a `Number`
-        /// rather than `u32` so a well-formed but unrepresentable version
-        /// (`1.5`, `-1`, `2^32`) is still reported through the version gate
-        /// instead of being masked as `malformed_json`.
+        /// Declared version — a `Number` rather than `u32` so a well-formed
+        /// but unrepresentable version (`1.5`, `-1`, `2^32`, a float `1.0`)
+        /// is still reported through the version gate instead of being masked
+        /// as `malformed_json`. Echoed as `serde_json` re-serializes it:
+        /// integer literals round-trip; `1e2` echoes as `100.0`.
         version: serde_json::Number,
     },
     /// A control named an evidence class outside the closed vocabulary.
@@ -500,9 +499,11 @@ pub fn parse_catalog(text: &str) -> Result<ControlCatalog, CatalogError> {
     let probe: SchemaVersionProbe =
         serde_json::from_str(&normalized).map_err(|error| sanitize_json_error(&error))?;
 
-    // A declared version outside u32 (negative, fractional, > 2^32-1) cannot
-    // possibly be a supported version, so it flows through the same
-    // `unknown_schema_version` refusal, echoing the number as declared.
+    // A declared version that is not an in-range JSON integer literal
+    // (negative, fractional, > 2^32-1 — and a float literal like `1.0`, which
+    // serde_json's `as_u64` deliberately never coerces) cannot be a supported
+    // version, so it flows through the same `unknown_schema_version` refusal
+    // carrying the declared tuple.
     let known = probe
         .schema_version
         .version
@@ -944,9 +945,15 @@ impl PackBuildError {
     pub fn to_json(&self) -> serde_json::Value {
         match self {
             Self::UnknownControl { control_id, known } => serde_json::json!({
+                // Both echoes are untrusted free text: `control_id` is the CLI
+                // argument and `known_controls` are catalog-sourced IDs, so
+                // they are bounded/sanitized like every `CatalogError` echo.
                 "code": self.code(),
-                "control_id": control_id,
-                "known_controls": known,
+                "control_id": bounded_catalog_field(control_id),
+                "known_controls": known
+                    .iter()
+                    .map(|id| bounded_catalog_field(id))
+                    .collect::<Vec<_>>(),
             }),
             Self::ReversedWindow { from, to } => serde_json::json!({
                 "code": self.code(),
@@ -5956,7 +5963,7 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                 integrity_passed = false;
                 integrity_detail = format!(
                     "section {} carries a requirement outside {{required, optional}}",
-                    section.class
+                    bounded_catalog_field(&section.class)
                 );
                 break 'semantics;
             };
@@ -5967,7 +5974,7 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     integrity_passed = false;
                     integrity_detail = format!(
                         "section {} carries a status outside {{present, unavailable}}",
-                        section.class
+                        bounded_catalog_field(&section.class)
                     );
                     break 'semantics;
                 }
@@ -5978,7 +5985,11 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                 integrity_detail = format!(
                     "section {} outcome {:?} contradicts its recorded requirement/status \
                      ({} + {} recomputes to {:?})",
-                    section.class, section.outcome, section.requirement, section.status, expected,
+                    bounded_catalog_field(&section.class),
+                    section.outcome,
+                    bounded_catalog_field(&section.requirement),
+                    bounded_catalog_field(&section.status),
+                    expected,
                 );
                 break 'semantics;
             }
@@ -5988,7 +5999,7 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                 integrity_detail = format!(
                     "section {} unavailable_reason presence contradicts its status \
                      (unavailable sections carry a reason; present sections carry none)",
-                    section.class,
+                    bounded_catalog_field(&section.class),
                 );
                 break 'semantics;
             }
@@ -6007,8 +6018,9 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                 if !diagnosed {
                     integrity_passed = false;
                     integrity_detail = format!(
-                        "gate-failing section {class} has no required_class_unavailable \
+                        "gate-failing section {} has no required_class_unavailable \
                          diagnostic (diagnostic deleted)",
+                        bounded_catalog_field(class),
                     );
                     break;
                 }
@@ -6026,7 +6038,7 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     integrity_detail = format!(
                         "required_class_unavailable diagnostic for {} has no matching \
                          gate-failing section",
-                        d.evidence_class.as_deref().unwrap_or("<none>"),
+                        bounded_catalog_field(d.evidence_class.as_deref().unwrap_or("<none>")),
                     );
                     break;
                 }
@@ -6059,9 +6071,9 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                 && v.safety.passed;
             if v.ok && !expected_ok {
                 integrity_passed = false;
-                integrity_detail = "verdicts.ok = true contradicts its component verdicts \
-                     (conjunction recomputes to false)"
-                    .to_owned();
+                "verdicts.ok = true contradicts its component verdicts (conjunction \
+                 recomputes to false)"
+                    .clone_into(&mut integrity_detail);
             }
         }
     }
@@ -7740,12 +7752,16 @@ mod tests {
 
     #[test]
     fn non_u32_schema_version_reports_unknown_schema_version_not_malformed_json() {
-        // "version": 1.5 / -1 / 2^32 are well-formed JSON numbers declaring a
-        // version this reader cannot support. Masking them as `malformed_json`
-        // (a value-free line/column) hides the actionable remedy — "this
-        // catalog declares a version I don't read" — so the phase-1 version
-        // gate owns them and echoes the declared tuple.
-        for bad in ["1.5", "-1", "4294967296"] {
+        // "version": 1.5 / -1 / 2^32 / 1.0 are well-formed JSON numbers
+        // declaring a version this reader cannot support (the version must be
+        // an in-range integer LITERAL — a float `1.0` is rejected even though
+        // numerically 1). Masking them as `malformed_json` (a value-free
+        // line/column) hides the actionable remedy — "this catalog declares a
+        // version I don't read" — so the phase-1 version gate owns them and
+        // echoes the declared tuple. The chosen literals all round-trip
+        // through serde_json byte-identically; exponent forms (`1e2`) are
+        // also rejected but echo re-serialized (`100.0`).
+        for bad in ["1.5", "-1", "4294967296", "1.0"] {
             let json = format!(
                 r#"{{"catalog_id":"x","schema_version":{{"domain":"control_catalog","kind":"ControlCatalog","version":{bad}}},"controls":[]}}"#
             );
@@ -9845,6 +9861,34 @@ mod pack338_tests {
                 control_id: "ZZ9.9".to_owned(),
                 known: vec!["CC7.2".to_owned(), "CC7.3".to_owned(), "CC8.1".to_owned()],
             }
+        );
+    }
+
+    #[test]
+    fn unknown_control_error_values_are_bounded_and_sanitized() {
+        // `known_controls` echoes catalog-sourced control IDs — operator- or
+        // attacker-controlled free text — and `control_id` echoes the CLI
+        // argument. Both must ride the error envelope bounded and
+        // control-character-sanitized, like every `CatalogError` echo (#337
+        // review hardening).
+        let records = build_seed_records();
+        let mut catalog = load_default_catalog();
+        catalog.controls.truncate(1);
+        catalog.controls[0].control_id = format!("CC\u{1b}[2J{}", "x".repeat(500));
+        let err = assemble_pack(&records, &catalog, "NOPE", &win(), 1.0, "v", None)
+            .expect_err("unknown control");
+        assert_eq!(err.code(), "unknown_control");
+        let value = err.to_json();
+        let known = value["known_controls"].as_array().expect("known list");
+        let echoed = known[0].as_str().expect("string entry");
+        assert!(
+            echoed.chars().all(|c| !c.is_control()),
+            "no control characters may ride into a diagnostic: {echoed:?}"
+        );
+        assert!(
+            echoed.chars().count() <= CATALOG_FIELD_MAX_CHARS + 1,
+            "echoed control id must be length-capped (got {} chars)",
+            echoed.chars().count()
         );
     }
 
