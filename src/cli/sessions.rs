@@ -104,9 +104,14 @@ fn render_session_row_text(out: &mut String, row: &query::SessionRow) {
 
     let _ = writeln!(
         out,
-        "session {} [{}] agent_id {} session_id {}",
+        "session {} [{}] agent_record_id {} agent_id {} session_id {}",
         row.session_record_id,
         row.trust_class,
+        // The citable, edge-derived handle — distinct from the uncitable
+        // stamped `agent_id` string printed alongside it: a session with a
+        // live `SESSION_OF -> Agent` edge and one with only a matching string
+        // must not look identical in text output.
+        row.agent_record_id.as_deref().unwrap_or("<absent>"),
         row.agent_id
             .as_deref()
             .map_or_else(|| "<absent>".to_owned(), query::bounded_session_text),
@@ -127,6 +132,12 @@ fn render_session_row_text(out: &mut String, row: &query::SessionRow) {
         row.last_activity.as_deref().unwrap_or("<absent>"),
         row.time_source_count,
         row.time_basis
+    );
+    let _ = writeln!(
+        out,
+        "  ingested {} .. {}",
+        row.first_ingested_at.as_deref().unwrap_or("<absent>"),
+        row.last_ingested_at.as_deref().unwrap_or("<absent>")
     );
     let _ = writeln!(
         out,

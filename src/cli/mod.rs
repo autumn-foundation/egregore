@@ -3336,9 +3336,15 @@ pub(crate) enum QuerySubcommand {
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Maximum session rows returned (default 20, max 200). Values outside
-        /// 1..=200 are rejected with an `invalid_limit` diagnostic.
-        #[arg(long, default_value_t = query::SESSIONS_DEFAULT_LIMIT)]
-        limit: usize,
+        /// 1..=200 — a negative value included — are rejected with an
+        /// `invalid_limit` diagnostic.
+        ///
+        /// Signed (`i64`), not `usize`: a `usize` field would make clap reject
+        /// `--limit -1` with its own parse error before this lane's dispatch
+        /// arm ever runs, bypassing the documented machine-readable
+        /// `invalid_limit` envelope for exactly the values it exists to catch.
+        #[arg(long, allow_hyphen_values = true, default_value_t = query::SESSIONS_DEFAULT_LIMIT as i64)]
+        limit: i64,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -7114,7 +7120,9 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // byte. Wrapped in the `{ok, error}` envelope (issue #112 pins the
             // shape) so a caller can distinguish it from the bare selector
             // diagnostics `resolve_repo_scope` emits.
-            if limit == 0 || limit > query::SESSIONS_MAX_LIMIT {
+            let max =
+                i64::try_from(query::SESSIONS_MAX_LIMIT).expect("SESSIONS_MAX_LIMIT fits i64");
+            if limit < 1 || limit > max {
                 let diag = serde_json::json!({
                     "ok": false,
                     "error": {
@@ -7132,6 +7140,9 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 eprintln!("{diag}");
                 std::process::exit(1);
             }
+            // In-range at this point: 1..=SESSIONS_MAX_LIMIT fits `usize` on
+            // every supported target.
+            let limit = usize::try_from(limit).expect("bounded by the range check above");
             // Strictly read-only lane: `--data-dir` reads a throwaway copy so
             // the live store stays byte-for-byte untouched.
             let records = match (graph.as_deref(), data_dir.as_deref()) {

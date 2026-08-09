@@ -1839,6 +1839,67 @@ fn limit_zero_and_over_max_rejected_with_invalid_limit() {
     }
 }
 
+#[test]
+fn negative_limit_is_invalid_limit_not_a_clap_parse_error() {
+    // `--limit -1` is a WELL-FORMED (if out-of-range) integer: it must reach
+    // this lane's own `invalid_limit` diagnostic, never clap's built-in parse
+    // error (which would exit 2 with a generic usage message, bypassing the
+    // documented machine-readable envelope).
+    let fx = seed_scope();
+    let (code, stdout, stderr) = run_sessions(&fx, "repo-a", &["--limit", "-1"]);
+    assert_eq!(
+        code, 1,
+        "--limit -1 must exit 1 (not clap's exit 2); stderr={stderr}"
+    );
+    let diag: serde_json::Value = stderr
+        .lines()
+        .find_map(|l| serde_json::from_str(l.trim()).ok())
+        .unwrap_or_else(|| panic!("stderr must carry a JSON diagnostic, got {stderr}"));
+    assert_eq!(diag["ok"], false);
+    assert_eq!(diag["error"]["code"], "invalid_limit");
+    assert_eq!(diag["error"]["limit"], serde_json::json!(-1));
+    assert!(
+        stdout.trim().is_empty(),
+        "a rejected limit must not print a digest: {stdout}"
+    );
+}
+
+#[test]
+fn text_format_prints_agent_record_id_and_ingested_bounds() {
+    let fx = seed_edge_cases();
+    let (code, stdout, stderr) = run_sessions(&fx, "repo-a", &["--format", "text"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+
+    // S1 has a live SESSION_OF -> Agent edge (Ag1); the citable handle must be
+    // printed, not just the uncitable stamped `agent_id` string.
+    let value = digest(&fx, "repo-a", &[]);
+    let s1_row = row_for(&value, fx.id("S1"));
+    let s1_agent_record_id = s1_row["agent_record_id"]
+        .as_str()
+        .expect("S1 has an agent_record_id");
+    assert!(
+        stdout.contains(&format!("agent_record_id {s1_agent_record_id} ")),
+        "the text renderer must print the edge-derived agent handle, got:\n{stdout}"
+    );
+
+    // S5 has no SESSION_OF edge at all: the text output must say so
+    // explicitly, not merely omit the field.
+    let s5_id = fx.id("S5");
+    assert!(
+        stdout.contains(&format!(
+            "session {s5_id} [agent_authored] agent_record_id <absent>"
+        )),
+        "a session with no SESSION_OF edge must render agent_record_id <absent>, got:\n{stdout}"
+    );
+
+    // The ingested-at transaction-time bounds are a distinct pair from
+    // first/last_activity and must not be silently dropped from text output.
+    assert!(
+        stdout.contains("  ingested "),
+        "the text renderer must print the ingested-at bounds, got:\n{stdout}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC: determinism, redaction, trust labelling
 // ---------------------------------------------------------------------------
