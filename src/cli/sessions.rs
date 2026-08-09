@@ -58,6 +58,13 @@ pub(crate) fn query_sessions_cmd(
 }
 
 /// Deterministic human-readable rendering of a sessions digest.
+///
+/// Every free-text field (`agent_id`, `session_id`, and the `summary_label`
+/// that interpolates them) is passed through
+/// [`query::bounded_session_text`] first: they are unbounded importer-supplied
+/// strings, and an embedded newline or ANSI escape would otherwise forge output
+/// lines or drive the reader's terminal. The JSON transport needs no such step
+/// (serde escapes control characters) and keeps the raw values.
 pub(crate) fn render_sessions_text(
     digest: &query::SessionsDigest,
     repository_id: &str,
@@ -79,73 +86,117 @@ pub(crate) fn render_sessions_text(
         query::SESSIONS_UNSUPPORTED_COUNT_KINDS.join(", ")
     );
     for row in &digest.sessions {
-        let _ = writeln!(
-            out,
-            "session {} [{}] agent_id {} session_id {}",
-            row.session_record_id,
-            row.trust_class,
-            row.agent_id.as_deref().unwrap_or("<absent>"),
-            row.session_id.as_deref().unwrap_or("<absent>")
-        );
-        let _ = writeln!(
-            out,
-            "  activity {} .. {} ({} source(s), {})",
-            row.first_activity.as_deref().unwrap_or("<absent>"),
-            row.last_activity.as_deref().unwrap_or("<absent>"),
-            row.time_source_count,
-            row.time_basis
-        );
-        let _ = writeln!(
-            out,
-            "  scope {} via {}",
-            row.repository_scope.join(", "),
-            row.scope_basis.join(", ")
-        );
-        let _ = writeln!(out, "  run_status {}", row.run_status);
-        for run in &row.runs {
-            let _ = writeln!(
-                out,
-                "    run {} outcome {} exit_reason {} at {}",
-                run.run_record_id,
-                run.outcome.as_deref().unwrap_or("<unrecorded>"),
-                run.exit_reason.as_deref().unwrap_or("<unrecorded>"),
-                run.observed_at.as_deref().unwrap_or("<absent>")
-            );
-        }
-        for task in &row.tasks {
-            let _ = writeln!(
-                out,
-                "    task {} status {} (recorded {}, {})",
-                task.record_id, task.status, task.status_recorded, task.trust_class
-            );
-        }
-        let _ = writeln!(
-            out,
-            "  counts observation {} decision {} failure {} lesson {}",
-            row.record_counts.observation,
-            row.record_counts.decision,
-            row.record_counts.failure,
-            row.record_counts
-                .lesson
-                .map_or_else(|| "<unsupported>".to_owned(), |n| n.to_string())
-        );
+        render_session_row_text(&mut out, row);
     }
     for diagnostic in &digest.diagnostics {
-        let _ = writeln!(
-            out,
-            "diagnostic {}{}{}",
-            diagnostic.code,
-            diagnostic
-                .session_record_id
-                .as_deref()
-                .map(|id| format!(" session {id}"))
-                .unwrap_or_default(),
-            diagnostic
-                .run_record_id
-                .as_deref()
-                .map(|id| format!(" run {id}"))
-                .unwrap_or_default()
-        );
+        render_diagnostic_text(&mut out, diagnostic);
     }
     out
+}
+
+/// Renders one session row block.
+fn render_session_row_text(out: &mut String, row: &query::SessionRow) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(
+        out,
+        "session {} [{}] agent_id {} session_id {}",
+        row.session_record_id,
+        row.trust_class,
+        row.agent_id
+            .as_deref()
+            .map_or_else(|| "<absent>".to_owned(), query::bounded_session_text),
+        row.session_id
+            .as_deref()
+            .map_or_else(|| "<absent>".to_owned(), query::bounded_session_text)
+    );
+    let _ = writeln!(
+        out,
+        "  summary {} ({})",
+        query::bounded_session_text(&row.summary_label),
+        row.summary_hash.as_deref().unwrap_or("<absent>")
+    );
+    let _ = writeln!(
+        out,
+        "  activity {} .. {} ({} source(s), {})",
+        row.first_activity.as_deref().unwrap_or("<absent>"),
+        row.last_activity.as_deref().unwrap_or("<absent>"),
+        row.time_source_count,
+        row.time_basis
+    );
+    let _ = writeln!(
+        out,
+        "  scope {} via {}",
+        row.repository_scope.join(", "),
+        row.scope_basis.join(", ")
+    );
+    for (repository, bases) in &row.scope_basis_by_repository {
+        let _ = writeln!(out, "    scope {repository} via {}", bases.join(", "));
+    }
+    let _ = writeln!(out, "  aggregation_scope {}", row.aggregation_scope);
+    let _ = writeln!(out, "  run_status {}", row.run_status);
+    for run in &row.runs {
+        let _ = writeln!(
+            out,
+            "    run {} outcome {} exit_reason {} at {}",
+            run.run_record_id,
+            run.outcome.as_deref().unwrap_or("<unrecorded>"),
+            run.exit_reason.as_deref().unwrap_or("<unrecorded>"),
+            run.observed_at.as_deref().unwrap_or("<absent>")
+        );
+    }
+    for task in &row.tasks {
+        let _ = writeln!(
+            out,
+            "    task {} status {} (recorded {}, {})",
+            task.record_id, task.status, task.status_recorded, task.trust_class
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  counts observation {} decision {} failure {} lesson {}",
+        row.record_counts.observation,
+        row.record_counts.decision,
+        row.record_counts.failure,
+        row.record_counts
+            .lesson
+            .map_or_else(|| "<unsupported>".to_owned(), |n| n.to_string())
+    );
+}
+
+/// Renders one diagnostic line, INCLUDING every payload field it carries: a
+/// text reader must not have to switch to `--format json` to learn what a
+/// truncation dropped or which sessions a set-valued diagnostic named.
+fn render_diagnostic_text(out: &mut String, diagnostic: &query::SessionsDiagnostic) {
+    use std::fmt::Write as _;
+
+    let mut payload = String::new();
+    for (field, value) in [
+        ("count", diagnostic.count),
+        ("matched", diagnostic.matched),
+        ("returned", diagnostic.returned),
+        ("limit", diagnostic.limit),
+    ] {
+        if let Some(value) = value {
+            let _ = write!(payload, " {field} {value}");
+        }
+    }
+    if let Some(ids) = diagnostic.session_record_ids.as_ref() {
+        let _ = write!(payload, " sessions [{}]", ids.join(", "));
+    }
+    let _ = writeln!(
+        out,
+        "diagnostic {}{}{}{payload}",
+        diagnostic.code,
+        diagnostic
+            .session_record_id
+            .as_deref()
+            .map(|id| format!(" session {id}"))
+            .unwrap_or_default(),
+        diagnostic
+            .run_record_id
+            .as_deref()
+            .map(|id| format!(" run {id}"))
+            .unwrap_or_default()
+    );
 }

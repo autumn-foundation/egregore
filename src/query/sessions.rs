@@ -54,6 +54,29 @@ pub const SESSIONS_DISCLAIMER: &str = "rows are recorded agent-authored memory a
 /// would claim "we looked and found none"), and the envelope discloses the gap.
 pub const SESSIONS_UNSUPPORTED_COUNT_KINDS: &[&str] = &["lesson"];
 
+/// Maximum characters of any single free-text session field that reaches
+/// rendered output.
+///
+/// `agent_id` / `session_id` are importer-supplied strings: nothing in the
+/// schema bounds their length, so a crafted (or merely pathological) record can
+/// carry megabytes of text. Both the core-computed `summary_label` (which
+/// interpolates them) and the CLI text renderer cap at this one constant, so
+/// the two transports bound identically. Mirrors
+/// `crate::embeddings::IDENTITY_FIELD_MAX_CHARS` (issue #104), which bounds the
+/// same class of store-read, operator-controlled value.
+pub const SESSIONS_FIELD_MAX_CHARS: usize = 128;
+
+/// Marker appended when [`SESSIONS_FIELD_MAX_CHARS`] truncates a value, so a
+/// cap is visible rather than silent.
+const TRUNCATION_MARKER: char = '…';
+
+/// Replacement for a control character in rendered text output.
+const CONTROL_REPLACEMENT: char = '·';
+
+/// Aggregation scope stamped on every session row (see
+/// [`SessionRow::aggregation_scope`]).
+const WHOLE_SESSION_AGGREGATION: &str = "whole_session";
+
 /// Trust class stamped on every session row.
 const SESSION_TRUST_CLASS: &str = "agent_authored";
 
@@ -84,6 +107,22 @@ const CODE_CITATION_RELATIONS: &[EdgeLabel] = &[
 /// task to another.
 const TASK_CODE_RELATIONS: &[EdgeLabel] = &[EdgeLabel::MentionsSymbol, EdgeLabel::TouchesFile];
 
+/// Every relation the citation index is ever asked about: the union of
+/// [`CODE_CITATION_RELATIONS`], `REFERENCES_TASK`, and [`TASK_CODE_RELATIONS`].
+///
+/// The adjacency builder inserts ONLY these, so whole-repository code-graph
+/// topology (`CONTAINS` / `DEFINES` / `CALLS` / …) never bloats the map: on a
+/// real store that topology is the overwhelming majority of edges and none of
+/// it can ever be returned by `cited_targets`.
+const CITATION_RELATIONS: &[EdgeLabel] = &[
+    EdgeLabel::MentionsSymbol,
+    EdgeLabel::TouchedFile,
+    EdgeLabel::TouchesFile,
+    EdgeLabel::Observes,
+    EdgeLabel::FailedOn,
+    EdgeLabel::ReferencesTask,
+];
+
 // ---------------------------------------------------------------------------
 // Output types (serde field order is the wire order)
 // ---------------------------------------------------------------------------
@@ -99,7 +138,14 @@ pub struct RunRow {
     /// Exit-reason token parsed from the same template; `None` alongside
     /// `outcome`.
     pub exit_reason: Option<String>,
-    /// The run's recorded `observed_at`, verbatim.
+    /// The run's recorded `observed_at`, PARSED and re-rendered through
+    /// [`render_instant`] — never the stored bytes verbatim.
+    ///
+    /// `None` when the field is absent, empty, or not RFC 3339: an unparseable
+    /// value is already counted by the session's `unparseable_timestamp`
+    /// diagnostic, so forwarding it would add nothing but a free-text escape
+    /// hatch (a crafted value could forge lines in the text renderer) and would
+    /// render inconsistently with the session's own re-rendered bounds.
     pub observed_at: Option<String>,
 }
 
@@ -165,10 +211,25 @@ pub struct SessionRow {
     /// Number of parseable `observed_at` values that fed the bounds.
     pub time_source_count: u64,
     /// Every repository this session resolves to, sorted ascending.
+    ///
+    /// This is the key set of [`Self::scope_basis_by_repository`].
     pub repository_scope: Vec<String>,
-    /// Why the session resolves to those repositories: `code_citation` and/or
+    /// The UNION of every per-repository basis: `code_citation` and/or
     /// `task_reference`, sorted ascending.
+    ///
+    /// A union answers "how did this session reach code at all"; it does NOT
+    /// say how it reached the repository you queried. Read
+    /// [`Self::scope_basis_by_repository`] for that.
     pub scope_basis: Vec<&'static str>,
+    /// The basis set PER repository, keyed by repository record ID (keys sorted
+    /// by the backing `BTreeMap`, values sorted ascending).
+    ///
+    /// A session attributed to repo A by a direct code citation and to repo B
+    /// only through a referenced task carries
+    /// `{A: ["code_citation"], B: ["task_reference"]}` — the flat
+    /// [`Self::scope_basis`] union would claim `code_citation` in B's digest
+    /// too, which is not a fact about B.
+    pub scope_basis_by_repository: BTreeMap<String, Vec<&'static str>>,
     /// `run_absent` / `outcome_recorded` / `outcome_unrecorded` / `multiple_runs`.
     pub run_status: &'static str,
     /// The session's runs, ordered by `observed_at` ascending (absent last),
@@ -176,6 +237,16 @@ pub struct SessionRow {
     pub runs: Vec<RunRow>,
     /// Distinct referenced tasks, ordered by record ID.
     pub tasks: Vec<TaskRef>,
+    /// Always `whole_session`: the counts, runs, tasks, and time bounds on this
+    /// row aggregate over the session's FULL edge-derived membership,
+    /// regardless of which repository was queried.
+    ///
+    /// A cross-repository session therefore reports the same totals in every
+    /// digest it appears in; they are not per-repository slices. Consult
+    /// [`Self::repository_scope`] together with
+    /// [`Self::scope_basis_by_repository`] to spot such a session. This slice
+    /// DISCLOSES the aggregation rather than computing per-repository counts.
+    pub aggregation_scope: &'static str,
     /// Distinct member record counts by kind.
     pub record_counts: SessionCounts,
 }
@@ -266,12 +337,50 @@ struct Citation<'a> {
 }
 
 /// Per-session scope derivation result.
+///
+/// The basis set is tracked PER repository, never as one flat set: a session
+/// code-citing repo A and reaching repo B only through a referenced task must
+/// not report `code_citation` in repo B's digest.
 #[derive(Debug, Default)]
 struct SessionScope {
-    /// Repository record IDs this session resolves to.
-    repositories: BTreeSet<String>,
-    /// Why: `code_citation` and/or `task_reference`.
-    bases: BTreeSet<&'static str>,
+    /// Repository record ID → the bases (`code_citation` / `task_reference`)
+    /// that put THAT repository in scope.
+    by_repository: BTreeMap<String, BTreeSet<&'static str>>,
+}
+
+impl SessionScope {
+    /// Records `basis` as a reason `repository` is in scope.
+    fn attribute(&mut self, repository: &str, basis: &'static str) {
+        self.by_repository
+            .entry(repository.to_owned())
+            .or_default()
+            .insert(basis);
+    }
+
+    /// The union of every per-repository basis, sorted ascending.
+    fn union_bases(&self) -> Vec<&'static str> {
+        let union: BTreeSet<&'static str> = self
+            .by_repository
+            .values()
+            .flat_map(|bases| bases.iter().copied())
+            .collect();
+        union.into_iter().collect()
+    }
+}
+
+/// One built row travelling with its ordering instant and its own row-scoped
+/// diagnostics, so both survive (or vanish) exactly with the row.
+///
+/// Row-scoped diagnostics are flattened out of the SURVIVING rows only, after
+/// sort and truncation: a diagnostic naming a session or run that `--limit`
+/// dropped would cite a record the answer does not contain.
+struct PendingRow {
+    row: SessionRow,
+    /// The ORIGINAL parsed maximum activity instant. Ordering reads this, never
+    /// the rendered `last_activity` string, so no rendering choice can collapse
+    /// two distinct instants into an artificial tie.
+    order_instant: Option<DateTime<Utc>>,
+    diagnostics: Vec<SessionsDiagnostic>,
 }
 
 // ---------------------------------------------------------------------------
@@ -301,9 +410,11 @@ pub fn sessions_for_repo(
     let nodes = live_nodes(records, &liveness);
     let adjacency = Adjacency::build(records, &liveness, &nodes);
 
+    // Envelope-level diagnostics (never row-scoped): they describe the digest
+    // as a whole and survive truncation unchanged.
     let mut diagnostics: Vec<SessionsDiagnostic> = Vec::new();
     let mut unresolved: Vec<String> = Vec::new();
-    let mut rows: Vec<SessionRow> = Vec::new();
+    let mut pending: Vec<PendingRow> = Vec::new();
     // (session record id, session_id string, member ids) for the scoped rows,
     // used by the unlinked-stamped-record diagnostic below.
     let mut scoped_members: Vec<(String, String, BTreeSet<&str>)> = Vec::new();
@@ -315,15 +426,15 @@ pub fn sessions_for_repo(
         let members = members_of(session_id, &adjacency);
         let scope = derive_scope(session_id, &members, &adjacency, &nodes, index);
 
-        if scope.repositories.is_empty() {
+        if scope.by_repository.is_empty() {
             unresolved.push(session_id.to_owned());
             continue;
         }
-        if !scope.repositories.contains(repository_id) {
+        if !scope.by_repository.contains_key(repository_id) {
             continue;
         }
 
-        let (row, mut row_diagnostics) = build_row(
+        let built = build_row(
             session_id,
             session_record,
             &members,
@@ -334,8 +445,7 @@ pub fn sessions_for_repo(
         if let Some(stamped) = node_session_id(session_record) {
             scoped_members.push((session_id.to_owned(), stamped.to_owned(), members));
         }
-        diagnostics.append(&mut row_diagnostics);
-        rows.push(row);
+        pending.push(built);
     }
 
     if !unresolved.is_empty() {
@@ -357,16 +467,24 @@ pub fn sessions_for_repo(
         diagnostics.push(diagnostic);
     }
 
-    rows.sort_by(|a, b| order_key(a).cmp(&order_key(b)));
+    pending.sort_by(|a, b| pending_order_key(a).cmp(&pending_order_key(b)));
 
-    let matched = rows.len();
+    let matched = pending.len();
     if matched > limit {
-        rows.truncate(limit);
+        pending.truncate(limit);
         let mut diagnostic = SessionsDiagnostic::bare("results_truncated");
         diagnostic.matched = Some(matched as u64);
-        diagnostic.returned = Some(rows.len() as u64);
+        diagnostic.returned = Some(pending.len() as u64);
         diagnostic.limit = Some(limit as u64);
         diagnostics.push(diagnostic);
+    }
+
+    // Row-scoped diagnostics are harvested from the SURVIVING rows only, so no
+    // diagnostic ever names a session or run truncation dropped.
+    let mut rows: Vec<SessionRow> = Vec::with_capacity(pending.len());
+    for entry in pending {
+        diagnostics.extend(entry.diagnostics);
+        rows.push(entry.row);
     }
 
     if rows.is_empty() {
@@ -385,16 +503,20 @@ pub fn sessions_for_repo(
 /// Ordering key: last activity DESCENDING with absent last, then session
 /// record ID ascending. `Reverse` on an `Option<DateTime>` would sort `None`
 /// FIRST, so the key encodes "has a time" explicitly.
-fn order_key(row: &SessionRow) -> (bool, std::cmp::Reverse<i64>, &str) {
-    let instant = row
-        .last_activity
-        .as_deref()
-        .and_then(parse_instant)
-        .map(|dt| dt.timestamp_micros());
+///
+/// The instant is the ORIGINAL parsed value carried on the [`PendingRow`],
+/// never a re-parse of the rendered `last_activity` string: rendering is a
+/// presentation choice and must not be able to introduce ordering ties.
+/// Second and sub-second parts are compared separately so no integer
+/// conversion can overflow or round.
+fn pending_order_key(pending: &PendingRow) -> (bool, std::cmp::Reverse<(i64, u32)>, &str) {
+    let instant = pending
+        .order_instant
+        .map(|dt| (dt.timestamp(), dt.timestamp_subsec_nanos()));
     (
         instant.is_none(),
-        std::cmp::Reverse(instant.unwrap_or(i64::MIN)),
-        row.session_record_id.as_str(),
+        std::cmp::Reverse(instant.unwrap_or((i64::MIN, 0))),
+        pending.row.session_record_id.as_str(),
     )
 }
 
@@ -483,13 +605,18 @@ impl<'a> Adjacency<'a> {
                 }
                 _ => {}
             }
-            citations
-                .entry(source.as_str())
-                .or_default()
-                .insert(Citation {
-                    relation: label.as_str(),
-                    target: target.as_str(),
-                });
+            // Only relations `cited_targets` is ever asked about are indexed:
+            // code-graph topology would otherwise dominate the map on any real
+            // store while never being returnable.
+            if CITATION_RELATIONS.contains(label) {
+                citations
+                    .entry(source.as_str())
+                    .or_default()
+                    .insert(Citation {
+                        relation: label.as_str(),
+                        target: target.as_str(),
+                    });
+            }
         }
 
         // On-node evidence links are the second citation representation: a
@@ -503,6 +630,13 @@ impl<'a> Adjacency<'a> {
                     continue;
                 };
                 if !nodes.contains_key(target) {
+                    continue;
+                }
+                // Same filter as the edge pass, applied through the wire-string
+                // mapping `cited_targets` itself uses.
+                if !EdgeLabel::from_relation(link.relation.as_str())
+                    .is_some_and(|label| CITATION_RELATIONS.contains(&label))
+                {
                     continue;
                 }
                 citations.entry(id).or_default().insert(Citation {
@@ -586,8 +720,7 @@ fn derive_scope(
     for citer in std::iter::once(&session_id).chain(members.iter()) {
         for target in adjacency.cited_targets(citer, CODE_CITATION_RELATIONS) {
             if let Some(repository) = index.owner_of(target) {
-                scope.repositories.insert(repository.to_owned());
-                scope.bases.insert("code_citation");
+                scope.attribute(repository, "code_citation");
             }
         }
         // Task-mediated scope: exactly one hop through the referenced task to
@@ -598,8 +731,7 @@ fn derive_scope(
             }
             for target in adjacency.cited_targets(task_id, TASK_CODE_RELATIONS) {
                 if let Some(repository) = index.owner_of(target) {
-                    scope.repositories.insert(repository.to_owned());
-                    scope.bases.insert("task_reference");
+                    scope.attribute(repository, "task_reference");
                 }
             }
         }
@@ -607,7 +739,8 @@ fn derive_scope(
     scope
 }
 
-/// Builds one row plus the row-scoped diagnostics it raises.
+/// Builds one row plus its ordering instant and the row-scoped diagnostics it
+/// raises (all three travel together as a [`PendingRow`]).
 fn build_row(
     session_id: &str,
     session_record: &GraphRecord,
@@ -615,7 +748,7 @@ fn build_row(
     scope: &SessionScope,
     adjacency: &Adjacency<'_>,
     nodes: &BTreeMap<&str, &GraphRecord>,
-) -> (SessionRow, Vec<SessionsDiagnostic>) {
+) -> PendingRow {
     let mut diagnostics: Vec<SessionsDiagnostic> = Vec::new();
 
     // ── Time bounds ─────────────────────────────────────────────────────────
@@ -641,8 +774,12 @@ fn build_row(
             }
         }
         if let Some(raw) = ingested_at.as_deref().filter(|s| !s.is_empty()) {
-            if let Some(instant) = parse_instant(raw) {
-                ingested.push(instant);
+            // An unparseable `ingested_at` is counted in the SAME per-session
+            // tally as `observed_at`: a timestamp field that could not be read
+            // is a reported gap either way, never a silent drop.
+            match parse_instant(raw) {
+                Some(instant) => ingested.push(instant),
+                None => unparseable += 1,
             }
         }
     }
@@ -653,11 +790,16 @@ fn build_row(
         diagnostics.push(diagnostic);
     }
     let time_source_count = observed.len() as u64;
+    // The ordering instant is the ORIGINAL parsed maximum, kept alongside the
+    // rendered bound so ordering never depends on the rendering.
+    let order_instant = observed.iter().max().copied();
     let (first_activity, last_activity) = bounds(&observed);
     let (first_ingested_at, last_ingested_at) = bounds(&ingested);
 
     // ── Runs ────────────────────────────────────────────────────────────────
-    let mut runs: Vec<RunRow> = Vec::new();
+    // Each run travels with its parsed instant so ordering is by instant, never
+    // by the rendered string.
+    let mut runs: Vec<(Option<DateTime<Utc>>, RunRow)> = Vec::new();
     for id in members {
         let Some(record) = nodes.get(id) else {
             continue;
@@ -684,14 +826,24 @@ fn build_row(
             diagnostics.push(diagnostic);
         }
         let (outcome, exit_reason) = parsed.map_or((None, None), |(o, e)| (Some(o), Some(e)));
-        runs.push(RunRow {
-            run_record_id: (*id).to_owned(),
-            outcome,
-            exit_reason,
-            observed_at: observed_at.clone(),
-        });
+        // The stored `observed_at` is never forwarded verbatim: it is parsed
+        // and re-rendered, so an unparseable or crafted value cannot leak.
+        let instant = observed_at
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(parse_instant);
+        runs.push((
+            instant,
+            RunRow {
+                run_record_id: (*id).to_owned(),
+                outcome,
+                exit_reason,
+                observed_at: instant.map(render_instant),
+            },
+        ));
     }
     runs.sort_by(|a, b| run_order_key(a).cmp(&run_order_key(b)));
+    let mut runs: Vec<RunRow> = runs.into_iter().map(|(_, run)| run).collect();
     let run_status = match runs.as_slice() {
         [] => "run_absent",
         [single] => {
@@ -798,28 +950,40 @@ fn build_row(
             "derived_from_member_observed_at"
         },
         time_source_count,
-        repository_scope: scope.repositories.iter().cloned().collect(),
-        scope_basis: scope.bases.iter().copied().collect(),
+        repository_scope: scope.by_repository.keys().cloned().collect(),
+        scope_basis: scope.union_bases(),
+        scope_basis_by_repository: scope
+            .by_repository
+            .iter()
+            .map(|(repository, bases)| (repository.clone(), bases.iter().copied().collect()))
+            .collect(),
         run_status,
         runs,
         tasks,
+        aggregation_scope: WHOLE_SESSION_AGGREGATION,
         record_counts: counts,
     };
-    (row, diagnostics)
+    PendingRow {
+        row,
+        order_instant,
+        diagnostics,
+    }
 }
 
 /// Ordering key for a session's runs: `observed_at` ascending with absent (or
 /// unparseable) last, then run record ID ascending.
-fn run_order_key(run: &RunRow) -> (bool, i64, &str) {
+///
+/// Reads the PARSED instant carried alongside the row, never a re-parse of the
+/// rendered string. Second and sub-second parts compare separately so no
+/// integer conversion can overflow or round two distinct instants together.
+fn run_order_key(run: &(Option<DateTime<Utc>>, RunRow)) -> (bool, (i64, u32), &str) {
     let instant = run
-        .observed_at
-        .as_deref()
-        .and_then(parse_instant)
-        .map(|dt| dt.timestamp_micros());
+        .0
+        .map(|dt| (dt.timestamp(), dt.timestamp_subsec_nanos()));
     (
         instant.is_none(),
-        instant.unwrap_or(i64::MAX),
-        run.run_record_id.as_str(),
+        instant.unwrap_or((i64::MAX, u32::MAX)),
+        run.1.run_record_id.as_str(),
     )
 }
 
@@ -831,8 +995,14 @@ fn bounds(instants: &[DateTime<Utc>]) -> (Option<String>, Option<String>) {
 }
 
 /// Renders an instant in the Z-normalized RFC 3339 form the graph records use.
+///
+/// `AutoSi` keeps whatever sub-second precision the source carried (importers
+/// emit millisecond timestamps — see `crate::codex::sanitize_rfc3339`) while
+/// rendering a whole-second value with no fractional part at all, exactly as
+/// `SecondsFormat::Secs` did. Truncating to seconds would report two distinct
+/// instants as the same string.
 fn render_instant(instant: DateTime<Utc>) -> String {
-    instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    instant.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
 /// Parses an RFC 3339 timestamp into a UTC instant. All comparisons in this
@@ -883,11 +1053,23 @@ fn is_enum_token(token: &str) -> bool {
 /// Redaction-safe `(label, hash)` for an `AgentSession` summary.
 ///
 /// Mirrors the agent-authored branch of the CLI's `safe_summary` helper
-/// (`src/cli/output.rs`) verbatim — a structured label built from typed fields
-/// plus a BLAKE3 handle over the stored bytes — but is computed HERE so the CLI
+/// (`src/cli/output.rs`) — a structured label built from typed fields plus a
+/// BLAKE3 handle over the stored bytes — but is computed HERE so the CLI
 /// envelope and the daemon verb serialize the identical value. Session
 /// summaries are producer-templated today, yet nothing in the schema stops an
 /// importer from embedding free text, so the raw summary is never forwarded.
+///
+/// This function CANNOT delegate to `cli::output::safe_summary`: that helper
+/// takes its safe branch only when `cli::trust_class_for` returns
+/// `agent_authored`, and `AgentSession` is not in that match arm — it falls to
+/// the `_ => "other"` arm and therefore to `safe_summary`'s ELSE branch, which
+/// returns the RAW stored summary with no hash. Delegating would leak exactly
+/// the bytes this lane exists to withhold, so the duplication here is a safety
+/// requirement, not an oversight. (A test in this module pins the trap.)
+///
+/// The interpolated `who` component is capped at [`SESSIONS_FIELD_MAX_CHARS`]:
+/// `agent_id` / `session_id` are unbounded importer-supplied strings, and the
+/// label is a CORE value, so capping here bounds both transports identically.
 fn safe_session_summary(record: &GraphRecord) -> (String, Option<String>) {
     let GraphRecord::Node {
         kind,
@@ -905,7 +1087,7 @@ fn safe_session_summary(record: &GraphRecord) -> (String, Option<String>) {
         _ => "unknown".to_owned(),
     };
     (
-        format!("{} by {who}", kind.as_str()),
+        format!("{} by {}", kind.as_str(), capped_field(&who)),
         Some(format!(
             "blake3:{}",
             blake3::hash(summary.as_bytes()).to_hex()
@@ -913,24 +1095,73 @@ fn safe_session_summary(record: &GraphRecord) -> (String, Option<String>) {
     )
 }
 
+/// Caps a free-text value at [`SESSIONS_FIELD_MAX_CHARS`] on a CHARACTER
+/// boundary, appending [`TRUNCATION_MARKER`] so the cut is visible.
+///
+/// Deterministic: same input, same output, always.
+fn capped_field(value: &str) -> String {
+    if value.chars().count() <= SESSIONS_FIELD_MAX_CHARS {
+        return value.to_owned();
+    }
+    let mut out: String = value.chars().take(SESSIONS_FIELD_MAX_CHARS).collect();
+    out.push(TRUNCATION_MARKER);
+    out
+}
+
+/// Sanitizes and caps one free-text session field for RENDERED text output.
+///
+/// Control characters (newline, carriage return, and the ESC that starts an
+/// ANSI sequence) become [`CONTROL_REPLACEMENT`], so a crafted `agent_id` or
+/// `session_id` can neither forge extra output lines nor drive a terminal; the
+/// result is then capped by [`capped_field`]. JSON output does not need the
+/// sanitize step (serde escapes control characters) and keeps the raw values,
+/// matching the house precedent in `crate::query::changes`.
+#[must_use]
+pub fn bounded_session_text(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|c| {
+            if c.is_control() {
+                CONTROL_REPLACEMENT
+            } else {
+                c
+            }
+        })
+        .collect();
+    capped_field(&sanitized)
+}
+
 /// Counts distinct live records stamped with a scoped session's `session_id`
 /// that no edge path reaches.
-fn unlinked_stamped_records(
-    scoped: &[(String, String, BTreeSet<&str>)],
-    nodes: &BTreeMap<&str, &GraphRecord>,
+///
+/// Indexed by stamped `session_id` in ONE pass over the nodes, then one lookup
+/// per scoped session. The naive shape — rescanning every node for every scoped
+/// session — is `O(sessions × nodes)` and takes tens of seconds on a store with
+/// a few thousand sessions.
+fn unlinked_stamped_records<'a>(
+    scoped: &[(String, String, BTreeSet<&'a str>)],
+    nodes: &BTreeMap<&'a str, &'a GraphRecord>,
 ) -> u64 {
-    let mut unlinked: BTreeSet<&str> = BTreeSet::new();
+    let mut by_stamped_session: BTreeMap<&'a str, BTreeSet<&'a str>> = BTreeMap::new();
+    for (&id, &record) in nodes {
+        if let Some(stamped) = node_session_id(record).filter(|s| !s.is_empty()) {
+            by_stamped_session.entry(stamped).or_default().insert(id);
+        }
+    }
+
+    let mut unlinked: BTreeSet<&'a str> = BTreeSet::new();
     for (session_record_id, stamped_session_id, members) in scoped {
         if stamped_session_id.is_empty() {
             continue;
         }
-        for (&id, record) in nodes {
-            if id == session_record_id || members.contains(id) {
+        let Some(candidates) = by_stamped_session.get(stamped_session_id.as_str()) else {
+            continue;
+        };
+        for &id in candidates {
+            if id == session_record_id.as_str() || members.contains(id) {
                 continue;
             }
-            if node_session_id(record) == Some(stamped_session_id.as_str()) {
-                unlinked.insert(id);
-            }
+            unlinked.insert(id);
         }
     }
     unlinked.len() as u64
@@ -1294,6 +1525,167 @@ mod tests {
     }
 
     #[test]
+    fn sub_second_activity_differences_order_newest_first() {
+        // Two sessions whose last activity differs ONLY in the fractional
+        // second. Truncating the rendered bound to whole seconds (or re-parsing
+        // a truncated render for the sort key) collapses them into an
+        // artificial tie that falls through to the record-ID tie-break — so the
+        // LATER instant is deliberately assigned to the session with the
+        // LARGER record ID, where that fallback puts it SECOND.
+        let repo = repository("repo-a");
+        let repo_id = repo.id().to_owned();
+        let sym = symbol(&repo_id, "alpha");
+        let sym_id = sym.id().to_owned();
+        let contains = code_edge(EdgeLabel::Contains, &repo_id, &sym_id);
+
+        let id_a = agent_memory_stable_id(&["node", NodeKind::AgentSession.as_str(), "s-sub-a"]);
+        let id_b = agent_memory_stable_id(&["node", NodeKind::AgentSession.as_str(), "s-sub-b"]);
+        let (earlier_key, later_key) = if id_a < id_b {
+            ("s-sub-a", "s-sub-b")
+        } else {
+            ("s-sub-b", "s-sub-a")
+        };
+
+        let mut records = vec![repo, sym, contains];
+        for (key, observed) in [
+            (earlier_key, "2026-02-01T00:00:00.100Z"),
+            (later_key, "2026-02-01T00:00:00.900Z"),
+        ] {
+            let session = memory(NodeKind::AgentSession, key, Some(observed), "S");
+            let obs = memory(
+                NodeKind::Observation,
+                &format!("o-{key}"),
+                Some(observed),
+                "observation",
+            );
+            let (session_id, obs_id) = (session.id().to_owned(), obs.id().to_owned());
+            records.push(session);
+            records.push(obs);
+            records.push(am_edge(EdgeLabel::AuthoredBy, &obs_id, &session_id));
+            records.push(am_edge(EdgeLabel::MentionsSymbol, &obs_id, &sym_id));
+        }
+
+        let result = digest(&records, &repo_id);
+        assert_eq!(result.sessions.len(), 2);
+        assert_eq!(
+            result.sessions[0].last_activity.as_deref(),
+            Some("2026-02-01T00:00:00.900Z"),
+            "a sub-second-newer session must sort FIRST, and the bound must keep \
+             its sub-second precision: {:?}",
+            result.sessions
+        );
+        assert_eq!(
+            result.sessions[1].last_activity.as_deref(),
+            Some("2026-02-01T00:00:00.100Z")
+        );
+        // A whole-second instant still renders with no fractional part, so
+        // existing fixtures are unaffected by the precision change.
+        assert_eq!(
+            render_instant(parse_instant("2026-02-01T00:00:00Z").expect("parses")),
+            "2026-02-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn per_repository_scope_basis_is_not_a_flat_union() {
+        // O -MENTIONS_SYMBOL-> repo A  (code_citation, repo A only)
+        // O -REFERENCES_TASK-> Task -MENTIONS_SYMBOL-> repo B (task_reference,
+        // repo B only). A flat union would claim `code_citation` in repo B's
+        // digest, which is not a fact about repo B.
+        let repo_a = repository("repo-a");
+        let repo_b = repository("repo-b");
+        let (repo_a_id, repo_b_id) = (repo_a.id().to_owned(), repo_b.id().to_owned());
+        let sym_a = symbol(&repo_a_id, "alpha");
+        let sym_b = symbol(&repo_b_id, "beta");
+        let (sym_a_id, sym_b_id) = (sym_a.id().to_owned(), sym_b.id().to_owned());
+        let contains_a = code_edge(EdgeLabel::Contains, &repo_a_id, &sym_a_id);
+        let contains_b = code_edge(EdgeLabel::Contains, &repo_b_id, &sym_b_id);
+
+        let task_b = task("task-b", "open");
+        let task_b_id = task_b.id().to_owned();
+
+        let session = memory(
+            NodeKind::AgentSession,
+            "s",
+            Some("2026-01-01T00:00:00Z"),
+            "S",
+        );
+        let obs = memory(
+            NodeKind::Observation,
+            "o",
+            Some("2026-01-01T00:01:00Z"),
+            "o",
+        );
+        let (session_id, obs_id) = (session.id().to_owned(), obs.id().to_owned());
+
+        let records = vec![
+            repo_a,
+            repo_b,
+            sym_a,
+            sym_b,
+            contains_a,
+            contains_b,
+            task_b,
+            session,
+            obs,
+            am_edge(EdgeLabel::AuthoredBy, &obs_id, &session_id),
+            am_edge(EdgeLabel::MentionsSymbol, &obs_id, &sym_a_id),
+            am_edge(EdgeLabel::ReferencesTask, &obs_id, &task_b_id),
+            GraphRecord::project_edge(
+                EdgeLabel::MentionsSymbol,
+                task_b_id,
+                sym_b_id,
+                Some("1.0".to_owned()),
+                "task mentions symbol".to_owned(),
+            ),
+        ];
+
+        for repository_id in [&repo_a_id, &repo_b_id] {
+            let result = digest(&records, repository_id);
+            assert_eq!(result.sessions.len(), 1, "the session is in both digests");
+            let row = &result.sessions[0];
+            assert_eq!(
+                row.scope_basis_by_repository,
+                BTreeMap::from([
+                    (repo_a_id.clone(), vec!["code_citation"]),
+                    (repo_b_id.clone(), vec!["task_reference"]),
+                ]),
+                "each repository must carry only the basis that put IT in scope: {row:?}"
+            );
+            assert_eq!(
+                row.scope_basis,
+                vec!["code_citation", "task_reference"],
+                "scope_basis stays the sorted UNION: {row:?}"
+            );
+            assert_eq!(row.aggregation_scope, "whole_session");
+        }
+    }
+
+    #[test]
+    fn safe_session_summary_never_returns_the_raw_summary() {
+        // The trap this guards: `cli::trust_class_for` classifies AgentSession
+        // as "other", so delegating to `cli::output::safe_summary` would take
+        // its ELSE branch and hand back the stored bytes with no hash.
+        const RAW: &str = "AgentSession RAW_SUMMARY_SHOULD_NOT_LEAK";
+        let record = memory(NodeKind::AgentSession, "s", None, RAW);
+        let (label, hash) = safe_session_summary(&record);
+        assert_eq!(
+            label, "AgentSession by agent-1:s",
+            "the label is synthesized from typed fields only"
+        );
+        assert!(
+            !label.contains("RAW_SUMMARY_SHOULD_NOT_LEAK"),
+            "the raw summary must never reach the label: {label}"
+        );
+        assert_eq!(
+            hash,
+            Some(format!("blake3:{}", blake3::hash(RAW.as_bytes()).to_hex())),
+            "the stored summary is exposed ONLY as a BLAKE3 handle"
+        );
+    }
+
+    #[test]
     fn outcome_charset_gate_rejects_control_and_whitespace() {
         assert_eq!(
             parse_run_outcome("AgentRun outcome=success exit_reason=completed"),
@@ -1313,6 +1705,13 @@ mod tests {
             "AgentRun outcome=ok",
             "AgentRun claude-code",
             "",
+            // A bare control byte (BEL) — never a token character, even though
+            // it is neither whitespace nor a separator.
+            "AgentRun outcome=o\u{7}k exit_reason=x",
+            "AgentRun outcome=ok exit_reason=\u{7}",
+            // Non-ASCII is outside the closed `[A-Za-z0-9_.:-]` charset.
+            "AgentRun outcome=succès exit_reason=x",
+            "AgentRun outcome=ok exit_reason=完了",
         ] {
             assert_eq!(
                 parse_run_outcome(malformed),

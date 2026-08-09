@@ -46,6 +46,10 @@ const RAW_SESSION_SUMMARY: &str = "RAW_SESSION_SUMMARY_SHOULD_NOT_LEAK";
 const RAW_TASK_TITLE: &str = "RAW_TASK_TITLE_SHOULD_NOT_LEAK";
 const RAW_STDOUT: &str = "RAW_STDOUT_SHOULD_NOT_LEAK";
 const RAW_PATCH: &str = "RAW_PATCH_SHOULD_NOT_LEAK";
+/// A run's stored `observed_at` is importer-controlled free text until it
+/// parses: forwarding it verbatim would let arbitrary bytes ride out on a field
+/// documented as a timestamp.
+const RAW_OBSERVED_AT: &str = "RAW_OBSERVED_AT_SHOULD_NOT_LEAK";
 
 const SENTINELS: &[&str] = &[
     RAW_OBS_TEXT,
@@ -53,6 +57,7 @@ const SENTINELS: &[&str] = &[
     RAW_TASK_TITLE,
     RAW_STDOUT,
     RAW_PATCH,
+    RAW_OBSERVED_AT,
 ];
 
 /// Closed set of `scope_basis` values.
@@ -470,6 +475,11 @@ fn seed_scope_into(builder: &mut Builder) {
     let (file_b, _sym_b) = code_topology(builder, &repo_b, "FileB", "SymB", "src/b.rs", "beta");
 
     let ag1 = agent(builder, "Ag1", "agent-1");
+    // Both sessions carry a real `Agent` record and a canonical
+    // `AgentSession -SESSION_OF-> Agent` edge, matching what the importers
+    // actually write. (`SESSION_OF` runs session→agent, so this adds no member:
+    // membership walks PREDECESSORS of the session.)
+    let ag2 = agent(builder, "Ag2", "agent-2");
 
     // ── Tasks referenced by S1 / S2 ─────────────────────────────────────────
     let task_a = task(
@@ -626,6 +636,7 @@ fn seed_scope_into(builder: &mut Builder) {
         Some("2026-03-02T07:00:00Z"),
         "AgentSession sess-2",
     );
+    am_edge(builder, EdgeLabel::SessionOf, &s2, &ag2);
     let r2 = run(
         builder,
         "R2",
@@ -858,12 +869,15 @@ fn seed_edge_cases() -> Fixture {
         Some("2026-03-11T00:00:00Z"),
         "AgentSession sess-10",
     );
+    // R10's `observed_at` is not a timestamp at all: the digest must parse and
+    // re-render the field, so an unparseable value becomes `null` rather than
+    // riding out verbatim.
     let r10 = run(
         &mut builder,
         "R10",
         "run-10",
         "sess-10",
-        Some("2026-03-11T00:10:00Z"),
+        Some(RAW_OBSERVED_AT),
         "AgentRun outcome=succ ess\nLEAK exit_reason=x",
     );
     am_edge(&mut builder, EdgeLabel::SessionOf, &r10, &s10);
@@ -958,6 +972,97 @@ fn seed_edge_cases() -> Fixture {
     builder.push(o12_dup);
 
     builder.finish("sessions_edge_cases.jsonl")
+}
+
+/// One session scoped to BOTH repositories by two DIFFERENT bases: a direct
+/// code citation into repo A, and a task reference that only reaches repo B.
+fn seed_multi_repo() -> Fixture {
+    let mut builder = Builder::new();
+    let repo_a = repository(&mut builder, "RepoA", "repo-a", "repo-a");
+    let (_file_a, sym_a) =
+        code_topology(&mut builder, &repo_a, "FileA", "SymA", "src/a.rs", "alpha");
+    let repo_b = repository(&mut builder, "RepoB", "repo-b", "repo-b");
+    let (file_b, _sym_b) =
+        code_topology(&mut builder, &repo_b, "FileB", "SymB", "src/b.rs", "beta");
+
+    let task_b = task(&mut builder, "TaskB", "task-b", "open", "beta follow-up");
+    proj_edge(&mut builder, EdgeLabel::TouchesFile, &task_b, &file_b);
+
+    let s = session(
+        &mut builder,
+        "S",
+        "sess-multi",
+        Some("agent-1"),
+        Some("2026-03-01T10:00:00Z"),
+        "AgentSession sess-multi",
+    );
+    let o = memory(
+        &mut builder,
+        "O",
+        NodeKind::Observation,
+        "obs-multi",
+        Some("sess-multi"),
+        Some("2026-03-01T11:00:00Z"),
+        "Observation spanning two repositories",
+        None,
+        None,
+    );
+    am_edge(&mut builder, EdgeLabel::AuthoredBy, &o, &s);
+    am_edge(&mut builder, EdgeLabel::MentionsSymbol, &o, &sym_a);
+    am_edge(&mut builder, EdgeLabel::ReferencesTask, &o, &task_b);
+    builder.finish("sessions_multi_repo.jsonl")
+}
+
+/// One session carrying 21 runs and 21 referenced tasks — one over each
+/// per-row cap.
+fn seed_over_row_caps() -> Fixture {
+    let mut builder = Builder::new();
+    let repo = repository(&mut builder, "RepoA", "repo-a", "repo-a");
+    let (_file, sym) = code_topology(&mut builder, &repo, "FileA", "SymA", "src/a.rs", "alpha");
+
+    let s = session(
+        &mut builder,
+        "S",
+        "sess-cap",
+        Some("agent-1"),
+        Some("2026-03-01T00:00:00Z"),
+        "AgentSession sess-cap",
+    );
+    let o = memory(
+        &mut builder,
+        "O",
+        NodeKind::Observation,
+        "obs-cap",
+        Some("sess-cap"),
+        Some("2026-03-01T00:30:00Z"),
+        "Observation for the capped session",
+        None,
+        None,
+    );
+    am_edge(&mut builder, EdgeLabel::AuthoredBy, &o, &s);
+    am_edge(&mut builder, EdgeLabel::MentionsSymbol, &o, &sym);
+
+    for index in 0..21 {
+        let r = run(
+            &mut builder,
+            &format!("R{index:02}"),
+            &format!("run-{index:02}"),
+            "sess-cap",
+            Some(&format!("2026-03-01T{index:02}:00:00Z")),
+            "AgentRun claude-code",
+        );
+        am_edge(&mut builder, EdgeLabel::SessionOf, &r, &s);
+
+        let t = task(
+            &mut builder,
+            &format!("T{index:02}"),
+            &format!("task-{index:02}"),
+            "open",
+            "capped task",
+        );
+        am_edge(&mut builder, EdgeLabel::ReferencesTask, &o, &t);
+    }
+    builder.finish("sessions_over_row_caps.jsonl")
 }
 
 /// A repository with code but ZERO agent-memory records.
@@ -1246,12 +1351,15 @@ fn row_carries_agent_and_session_handles_and_time_bounds() {
         "summary_hash must be a blake3 handle: {row}"
     );
 
-    // S2 has no SESSION_OF edge → no agent record handle.
+    // S2 carries its own SESSION_OF edge to a DIFFERENT agent: the handle is
+    // resolved per session, never inherited from another row.
     let s2 = row_for(&value, fx.id("S2"));
-    assert!(
-        s2["agent_record_id"].is_null(),
-        "a session with no SESSION_OF edge has no agent record handle: {s2}"
+    assert_eq!(
+        s2["agent_record_id"],
+        fx.id("Ag2"),
+        "each session's agent handle comes from its OWN SESSION_OF edge: {s2}"
     );
+    assert_eq!(s2["agent_id"], "agent-2");
     assert_eq!(s2["session_id"], "sess-2");
     assert_eq!(s2["first_activity"], "2026-03-02T07:00:00Z");
     assert_eq!(s2["last_activity"], "2026-03-02T08:00:00Z");
@@ -1285,6 +1393,24 @@ fn non_template_run_summary_reports_outcome_unrecorded() {
     assert!(
         runs[0]["outcome"].is_null() && runs[0]["exit_reason"].is_null(),
         "a non-template run summary must never be guessed into an outcome: {row}"
+    );
+}
+
+#[test]
+fn session_without_session_of_edge_has_null_agent_record_id() {
+    let fx = seed_edge_cases();
+    let value = digest(&fx, "repo-a", &[]);
+    // S5 has no `SESSION_OF` edge at all. A stamped `agent_id` string is not a
+    // citable agent handle, so the handle must be null — never invented from
+    // the string, and never borrowed from another session's agent.
+    let row = row_for(&value, fx.id("S5"));
+    assert_eq!(
+        row["agent_id"], "agent-1",
+        "the stamped string is still reported: {row}"
+    );
+    assert!(
+        row["agent_record_id"].is_null(),
+        "a session with no SESSION_OF edge has no agent record handle: {row}"
     );
 }
 
@@ -1713,18 +1839,186 @@ fn output_is_byte_identical_across_five_runs() {
 #[test]
 fn no_raw_transcript_bytes_in_output() {
     let fx = seed_edge_cases();
-    let (code, stdout, stderr) = run_sessions(&fx, "repo-a", &[]);
-    assert_eq!(code, 0, "stderr={stderr}");
-    for sentinel in SENTINELS {
-        assert!(
-            !stdout.contains(sentinel),
-            "raw payload sentinel {sentinel} must never reach stdout"
+    // BOTH transports: the text renderer prints fields the JSON envelope also
+    // carries, so a leak must be checked on each surface, not just the default.
+    for format in [&["--format", "json"][..], &["--format", "text"][..]] {
+        let (code, stdout, stderr) = run_sessions(&fx, "repo-a", format);
+        assert_eq!(code, 0, "format={format:?} stderr={stderr}");
+        for sentinel in SENTINELS {
+            assert!(
+                !stdout.contains(sentinel),
+                "raw payload sentinel {sentinel} must never reach stdout (format={format:?})"
+            );
+            assert!(
+                !stderr.contains(sentinel),
+                "raw payload sentinel {sentinel} must never reach stderr (format={format:?})"
+            );
+        }
+    }
+}
+
+#[test]
+fn multi_repo_session_appears_in_both_digests_with_per_repo_basis() {
+    let fx = seed_multi_repo();
+    let (repo_a, repo_b) = (fx.id("RepoA").to_owned(), fx.id("RepoB").to_owned());
+
+    for selector in ["repo-a", "repo-b"] {
+        let value = digest(&fx, selector, &[]);
+        let row = row_for(&value, fx.id("S"));
+
+        let mut scope: Vec<&str> = row["repository_scope"]
+            .as_array()
+            .expect("repository_scope array")
+            .iter()
+            .map(|v| v.as_str().expect("repository id"))
+            .collect();
+        scope.sort_unstable();
+        let mut expected = vec![repo_a.as_str(), repo_b.as_str()];
+        expected.sort_unstable();
+        assert_eq!(
+            scope, expected,
+            "a cross-repo session is reported truthfully in EACH digest: {row}"
         );
-        assert!(
-            !stderr.contains(sentinel),
-            "raw payload sentinel {sentinel} must never reach stderr"
+
+        // The flat union says only that the session reached code somehow; the
+        // per-repository map says HOW it reached each one.
+        assert_eq!(
+            row["scope_basis"],
+            serde_json::json!(["code_citation", "task_reference"]),
+            "scope_basis is the sorted union: {row}"
+        );
+        assert_eq!(
+            row["scope_basis_by_repository"],
+            serde_json::json!({
+                repo_a.clone(): ["code_citation"],
+                repo_b.clone(): ["task_reference"],
+            }),
+            "each repository must carry only the basis that put IT in scope: {row}"
+        );
+        assert_eq!(
+            row["aggregation_scope"], "whole_session",
+            "the row must disclose that its counts span the WHOLE session, not \
+             the queried repository's slice: {row}"
         );
     }
+}
+
+#[test]
+fn runs_truncated_and_tasks_truncated_fire_at_caps() {
+    let fx = seed_over_row_caps();
+    let value = digest(&fx, "repo-a", &[]);
+    let row = row_for(&value, fx.id("S"));
+
+    assert_eq!(
+        row["runs"].as_array().expect("runs array").len(),
+        20,
+        "runs are capped at 20: {row}"
+    );
+    assert_eq!(
+        row["tasks"].as_array().expect("tasks array").len(),
+        20,
+        "tasks are capped at 20: {row}"
+    );
+
+    for (code, session_scoped) in [("runs_truncated", true), ("tasks_truncated", true)] {
+        let diag = diagnostic(&value, code)
+            .unwrap_or_else(|| panic!("{code} diagnostic required: {value}"));
+        assert_eq!(diag["matched"], 21, "the TRUE total is reported: {diag}");
+        assert_eq!(diag["returned"], 20);
+        assert_eq!(diag["limit"], 20);
+        assert!(session_scoped);
+        assert_eq!(
+            diag["session_record_id"],
+            fx.id("S"),
+            "a per-row cap names the row it fired on: {diag}"
+        );
+    }
+}
+
+#[test]
+fn truncated_sessions_leave_no_orphan_diagnostics() {
+    // Diagnostics that name a session or run are attached to their row and must
+    // vanish with it: an answer must never cite a record it does not contain.
+    const ENVELOPE_SCOPED: &[&str] = &[
+        "unresolved_repository_scope",
+        "unlinked_session_stamped_records",
+        "results_truncated",
+        "no_sessions",
+    ];
+
+    let fx = seed_edge_cases();
+    let value = digest(&fx, "repo-a", &["--limit", "1"]);
+    let returned_sessions = row_ids(&value);
+    assert_eq!(returned_sessions.len(), 1);
+    let returned_runs: Vec<String> = rows(&value)
+        .iter()
+        .flat_map(|row| {
+            row["runs"]
+                .as_array()
+                .expect("runs array")
+                .iter()
+                .map(|run| {
+                    run["run_record_id"]
+                        .as_str()
+                        .expect("run_record_id")
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // The full answer DOES carry a run-scoped diagnostic, so this test would be
+    // vacuous if truncation simply never produced one.
+    let full = digest(&fx, "repo-a", &[]);
+    assert!(
+        diagnostic(&full, "outcome_not_enum_shaped").is_some(),
+        "the untruncated answer must carry the run-scoped diagnostic: {full}"
+    );
+
+    for diag in value["diagnostics"].as_array().expect("diagnostics array") {
+        let code = diag["code"].as_str().expect("diagnostic code");
+        if ENVELOPE_SCOPED.contains(&code) {
+            continue;
+        }
+        if let Some(session) = diag["session_record_id"].as_str() {
+            assert!(
+                returned_sessions.iter().any(|id| id == session),
+                "diagnostic {code} names session {session}, which truncation dropped: {value}"
+            );
+        }
+        if let Some(run) = diag["run_record_id"].as_str() {
+            assert!(
+                returned_runs.iter().any(|id| id == run),
+                "diagnostic {code} names run {run}, which truncation dropped: {value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn text_format_is_deterministic_and_payload_complete() {
+    let fx = seed_edge_cases();
+    let (code, first, stderr) = run_sessions(&fx, "repo-a", &["--format", "text", "--limit", "1"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let (code, second, _stderr) =
+        run_sessions(&fx, "repo-a", &["--format", "text", "--limit", "1"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        first, second,
+        "the text rendering must be byte-identical across runs"
+    );
+
+    // The truncation numbers must be readable WITHOUT switching to JSON.
+    let json = digest(&fx, "repo-a", &["--limit", "1"]);
+    let diag = diagnostic(&json, "results_truncated")
+        .unwrap_or_else(|| panic!("results_truncated diagnostic required: {json}"));
+    let matched = diag["matched"].as_u64().expect("matched count");
+    assert!(
+        first.contains(&format!(
+            "diagnostic results_truncated matched {matched} returned 1 limit 1"
+        )),
+        "the text renderer must print the truncation payload, got:\n{first}"
+    );
 }
 
 #[test]

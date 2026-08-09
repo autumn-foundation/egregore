@@ -13162,6 +13162,11 @@ fn daemon_observations_for_symbol_invalid_supersession() {
 /// Selector every `agent_sessions_for_repo` fixture answers to.
 const SESSIONS_REPO_SELECTOR: &str = "sessions-repo";
 
+/// Raw payload sentinel seeded into the session summary: the digest reduces a
+/// summary to a structured label plus a BLAKE3 hash, so these bytes must never
+/// appear anywhere in the daemon response.
+const SESSIONS_RAW_SENTINEL: &str = "RAW_SESSION_PAYLOAD_SHOULD_NOT_LEAK";
+
 /// Builds the deterministic session-digest fixture: one repository with a file
 /// and a symbol, one agent, one session with a templated run and one
 /// symbol-citing observation.
@@ -13285,7 +13290,7 @@ fn agent_sessions_fixture_records() -> Vec<GraphRecord> {
             &session_id,
             NodeKind::AgentSession,
             "2026-03-01T10:00:00Z",
-            "AgentSession sessions-sess-1",
+            &format!("AgentSession {SESSIONS_RAW_SENTINEL}"),
         ),
         GraphRecord::agent_memory_edge(
             EdgeLabel::SessionOf,
@@ -13507,6 +13512,135 @@ fn agent_sessions_for_repo_accepts_repository_id_alias() {
         response_json(&aliased)["result"],
         response_json(&canonical)["result"],
         "the alias must produce the identical digest"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_never_leaks_raw_payloads() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-no-raw-payload",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "agent_sessions_for_repo must return 200, got {res}"
+    );
+    assert!(
+        !res.contains(SESSIONS_RAW_SENTINEL),
+        "the stored session summary must never reach the daemon response body, got {res}"
+    );
+    let row = &response_json(&res)["result"]["sessions"][0];
+    assert_eq!(
+        row["summary_label"], "AgentSession by sessions-agent-1:sessions-sess-1",
+        "the summary must be reduced to a structured label, got {row}"
+    );
+    assert!(
+        row["summary_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("blake3:")),
+        "the stored summary is exposed only as a BLAKE3 handle, got {row}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_limit_out_of_range_is_invalid_limit() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-limit-zero",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR, "limit": 0 }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "an out-of-range limit must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
+    assert_eq!(
+        body["error"]["code"], "invalid_limit",
+        "an out-of-range limit is distinct from a shape error, got {body}"
+    );
+    assert_eq!(
+        body["error"]["field"], "params.limit",
+        "the error must name params.limit, got {body}"
+    );
+    assert_eq!(
+        body["error"]["message"], "params.limit must be between 1 and 200 (default 20)",
+        "the message must state the accepted range and the default, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_non_integer_limit_is_bad_request() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-limit-not-integer",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR, "limit": "twenty" }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "a non-integer limit must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "a shape error stays bad_request, distinct from invalid_limit, got {body}"
+    );
+    assert_eq!(
+        body["error"]["field"], "params.limit",
+        "the error must name params.limit, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_non_string_alias_names_the_key_the_caller_sent() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-non-string-alias",
+        &serde_json::json!({ "repository_id": 42 }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "a non-string selector must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["error"]["code"], "bad_request", "got {body}");
+    assert_eq!(
+        body["error"]["field"], "params.repository_id",
+        "the error must name the key the CALLER sent, not the canonical alias \
+         target it is rewrapped under, got {body}"
     );
 }
 

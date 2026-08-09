@@ -485,8 +485,8 @@ two transports cannot drift.
 
 | Field   | Type   | Required | Notes |
 |---------|--------|----------|-------|
-| `repo`  | string | yes      | Repository selector (record ID, basename, remote URL, root commit SHA, canonical path, or final-segment shorthand). `repository_id` is accepted as an alias; `repo` wins when both are present. |
-| `limit` | u64    | no       | Session-row ceiling. Default 20, capped at 200. |
+| `repo`  | string | yes      | Repository selector (record ID, basename, remote URL, root commit SHA, canonical path, or final-segment shorthand). `repository_id` is accepted as an alias; `repo` wins when both are present. A non-string value is rejected naming the key the caller actually sent, never the canonical key it would be rewrapped under. |
+| `limit` | u64    | no       | Session-row ceiling. Default 20, capped at 200. A non-integer is a shape error (`bad_request`); a well-formed integer out of range is `invalid_limit`, mirroring the CLI. |
 
 **Result shape** (parity with the `eg query sessions` envelope):
 ```json
@@ -515,7 +515,9 @@ command output, patch hunks, tool-call arguments, or task titles.
 | Condition | Code | HTTP |
 |-----------|------|------|
 | Both `params.repo` and `params.repository_id` absent | `missing_field` | 400 |
-| `limit` not an integer or outside 1..=200 | `bad_request` | 400 |
+| Selector present but not a string | `bad_request` | 400 |
+| `limit` not an integer | `bad_request` | 400 |
+| `limit` a well-formed integer outside 1..=200 | `invalid_limit` | 400 |
 | Selector matches no repository | `unknown_repository_selector` | 400 |
 | Selector matches several repositories | `ambiguous_repository_selector` | 400 |
 | Budget `timeout_ms` elapsed | `query_timeout` | 408 |

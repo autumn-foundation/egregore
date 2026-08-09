@@ -780,13 +780,22 @@ code citations (`MENTIONS_SYMBOL`/`TOUCHED_FILE`/`OBSERVES`/`FAILED_ON`, edge re
 on-node evidence links) plus one `REFERENCES_TASK`→Task→code hop, all resolved through
 `RepositoryIndex::owner_of`; a session with no derivable repo is excluded from every digest
 under `unresolved_repository_scope`, and cross-repo sessions truthfully appear in each repo's
-digest with the full `repository_scope` set. Ordering: `last_activity` DESC (absent sorts
-last), tie-break session record ID ASC; `--limit` default 20 max 200 truncates after ordering
-with `results_truncated`. Output is allow-list only (IDs, handles, enums, bounded counts,
-structured summary labels + BLAKE3 hashes — never raw transcript/summary/task-title text),
-strictly read-only (`--data-dir` reads a throwaway copy), byte-identical across runs, exit 0
-for rows or the explicit `no_sessions` empty. No temporal selectors in this slice. See
-`docs/cli/agent-sessions.md`.
+digest with the full `repository_scope` set. `scope_basis` is the sorted UNION, while
+`scope_basis_by_repository` gives the basis set PER repository — so a session code-citing repo
+A and reaching repo B only through a task never claims `code_citation` in B's digest. Every
+row also carries `aggregation_scope: "whole_session"`, DISCLOSING that counts/runs/tasks/time
+bounds aggregate over the session's full edge-derived membership regardless of the queried
+repository (this slice discloses rather than computing per-repo counts). Ordering:
+`last_activity` DESC (absent sorts last), tie-break session record ID ASC, by the ORIGINAL
+parsed instant — bounds render with `SecondsFormat::AutoSi` so importer millisecond precision
+survives instead of collapsing into an artificial tie; `--limit` default 20 max 200 truncates
+after ordering with `results_truncated`, and row-scoped diagnostics are harvested from the
+SURVIVING rows only, so a truncated answer never cites a session/run it does not contain.
+Output is allow-list only (IDs, handles, enums, bounded counts, structured summary labels +
+BLAKE3 hashes — never raw transcript/summary/task-title text; a run's `observed_at` is
+re-rendered from the parsed value, never forwarded verbatim), strictly read-only (`--data-dir`
+reads a throwaway copy), byte-identical across runs, exit 0 for rows or the explicit
+`no_sessions` empty. No temporal selectors in this slice. See `docs/cli/agent-sessions.md`.
 
 `eg query deltas <base> <head>` returns the observed structural deltas between two commit
 handles (full SHA or unique prefix) from a `scan-history` graph or embedded store, grouped by

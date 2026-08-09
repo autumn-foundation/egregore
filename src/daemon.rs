@@ -925,6 +925,11 @@ enum ErrorCode {
     /// Added by #67 (repository-scoped queries): `params.repo` matches more
     /// than one repository identity; ambiguity is never resolved implicitly.
     AmbiguousRepositorySelector,
+    /// Added by #112 (`agent_sessions_for_repo`): a well-formed integer
+    /// `params.limit` fell outside the accepted range. Distinct from
+    /// [`Self::BadRequest`] so a caller can tell "not a number" from
+    /// "out of range", matching the CLI's `invalid_limit` diagnostic code.
+    InvalidLimit,
 }
 
 impl ErrorCode {
@@ -964,6 +969,7 @@ impl ErrorCode {
             Self::IncompatibleEmbeddingDimension => "incompatible_embedding_dimension",
             Self::UnknownRepositorySelector => "unknown_repository_selector",
             Self::AmbiguousRepositorySelector => "ambiguous_repository_selector",
+            Self::InvalidLimit => "invalid_limit",
         }
     }
 
@@ -976,7 +982,8 @@ impl ErrorCode {
             | Self::InlinePayloadExceedsCeiling
             | Self::AmbiguousCommitPrefix
             | Self::UnknownRepositorySelector
-            | Self::AmbiguousRepositorySelector => 400,
+            | Self::AmbiguousRepositorySelector
+            | Self::InvalidLimit => 400,
             Self::IdempotencyConflict => 409,
             Self::NotFound => 404,
             Self::PayloadTooLarge => 413,
@@ -10820,20 +10827,32 @@ fn handle_verb_agent_sessions_for_repo(
     // `params.repo` is canonical; `params.repository_id` is the accepted alias.
     // A present-but-null value counts as absent so a caller can send either key
     // explicitly nulled without tripping the type check.
-    let selector = match (params.get("repo"), params.get("repository_id")) {
+    let (selector_key, selector) = match (params.get("repo"), params.get("repository_id")) {
         (Some(serde_json::Value::Null) | None, Some(serde_json::Value::Null) | None) => {
             return HttpResponse::error_with_id(request_id, ApiError::missing_field("params.repo"));
         }
-        (Some(value), _) if !value.is_null() => value.clone(),
-        (_, Some(alias)) => alias.clone(),
+        (Some(value), _) if !value.is_null() => ("params.repo", value.clone()),
+        (_, Some(alias)) => ("params.repository_id", alias.clone()),
         _ => {
             return HttpResponse::error_with_id(request_id, ApiError::missing_field("params.repo"));
         }
     };
+    // Type-check HERE, before the value is rewrapped under the canonical `repo`
+    // key: `resolve_verb_repo_selector` can only ever name `params.repo`, so a
+    // non-string sent as `params.repository_id` would be reported against a key
+    // the caller never used.
+    if !selector.is_string() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request_field(format!("{selector_key} must be a string"), selector_key),
+        );
+    }
 
     let limit = match params.get("limit") {
         None | Some(serde_json::Value::Null) => graph_query::SESSIONS_DEFAULT_LIMIT,
         Some(value) => {
+            // A non-integer is a shape error (`bad_request`); a well-formed
+            // integer outside the range is `invalid_limit`, mirroring the CLI.
             let Some(requested) = value.as_u64() else {
                 return HttpResponse::error_with_id(
                     request_id,
@@ -10841,16 +10860,16 @@ fn handle_verb_agent_sessions_for_repo(
                 );
             };
             let max = graph_query::SESSIONS_MAX_LIMIT as u64;
+            let default = graph_query::SESSIONS_DEFAULT_LIMIT as u64;
             match usize::try_from(requested) {
                 Ok(limit) if (1..=graph_query::SESSIONS_MAX_LIMIT).contains(&limit) => limit,
                 _ => {
-                    return HttpResponse::error_with_id(
-                        request_id,
-                        ApiError::bad_request_field(
-                            format!("params.limit must be between 1 and {max}"),
-                            "params.limit",
-                        ),
+                    let mut error = ApiError::new(
+                        ErrorCode::InvalidLimit,
+                        format!("params.limit must be between 1 and {max} (default {default})"),
                     );
+                    error.field = Some("params.limit".to_owned());
+                    return HttpResponse::error_with_id(request_id, error);
                 }
             }
         }
