@@ -441,12 +441,21 @@ pub fn sessions_for_repo(
     // `limit`.
     let mut kept: BinaryHeap<HeapEntry> = BinaryHeap::new();
     let mut matched: u64 = 0;
-    // (session record id, session_id string, member ids) for EVERY live
-    // AgentSession in the WHOLE STORE, regardless of which repository (if
-    // any) it resolves to — feeds the sibling-linkage union below, since a
+    // Stamped `session_id` string → every LIVE AgentSession record ID sharing
+    // it, for EVERY session in the WHOLE STORE regardless of which repository
+    // (if any) it resolves to — feeds the sibling-linkage union below, since a
     // stamp-sharing sibling scoped to a DIFFERENT repository, or to none at
     // all, still has REAL edge-linked members that must count as linked.
-    let mut all_session_members: Vec<(&str, &str, BTreeSet<&str>)> = Vec::new();
+    //
+    // This deliberately holds only RECORD IDS, not each session's full member
+    // set: cloning every session's members up front costs O(total store
+    // memberships) peak memory regardless of `--limit`/`--repo`. Membership
+    // for the (typically few) sessions that actually share a scoped stamp is
+    // recomputed on demand inside `unlinked_stamped_records`, trading a
+    // little redundant `members_of` work (bounded by `scoped_stamps`, not the
+    // whole store) for not retaining every session's members for the
+    // digest's full lifetime.
+    let mut sessions_by_stamp: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     // Stamps actually represented among THIS digest's scoped rows — the
     // unlinked-stamped-record diagnostic below is scoped to these, never to
     // every stamp in the store.
@@ -459,7 +468,10 @@ pub fn sessions_for_repo(
         let members = members_of(session_id, &adjacency);
         let stamped = node_session_id(session_record).filter(|s| !s.is_empty());
         if let Some(stamped) = stamped {
-            all_session_members.push((session_id, stamped, members.clone()));
+            sessions_by_stamp
+                .entry(stamped)
+                .or_default()
+                .insert(session_id);
         }
 
         let scope = derive_scope(session_id, &members, &adjacency, &nodes, index);
@@ -521,7 +533,7 @@ pub fn sessions_for_repo(
     // Records stamped with a scoped session's `session_id` but reachable by no
     // edge path: reported once, never counted as members (issue #112 AC:
     // membership is edge-derived only).
-    let unlinked = unlinked_stamped_records(&scoped_stamps, &all_session_members, &nodes);
+    let unlinked = unlinked_stamped_records(&scoped_stamps, &sessions_by_stamp, &adjacency, &nodes);
     if unlinked > 0 {
         let mut diagnostic = SessionsDiagnostic::bare("unlinked_session_stamped_records");
         diagnostic.count = Some(unlinked);
@@ -619,6 +631,41 @@ impl PartialOrd for HeapEntry {
 }
 
 impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+/// A `(run instant, RunRow)` pair ordered by [`run_order_key`], for the
+/// bounded top-[`MAX_RUNS_PER_SESSION`] retention in [`build_row`].
+///
+/// Same max-heap-evicts-the-worst-kept-entry pattern as [`HeapEntry`], scaled
+/// down to per-session run collection: a session with a pathologically large
+/// number of runs must not force full materialization of every one before
+/// the cap applies.
+struct RunHeapEntry((Option<DateTime<Utc>>, RunRow));
+
+impl RunHeapEntry {
+    fn key(&self) -> (bool, (i64, u32), &str) {
+        run_order_key(&self.0)
+    }
+}
+
+impl PartialEq for RunHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for RunHeapEntry {}
+
+impl PartialOrd for RunHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RunHeapEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.key().cmp(&other.key())
     }
@@ -908,9 +955,15 @@ fn build_row(
     let (first_ingested_at, last_ingested_at) = bounds(&ingested);
 
     // ── Runs ────────────────────────────────────────────────────────────────
-    // Each run travels with its parsed instant so ordering is by instant, never
-    // by the rendered string.
-    let mut runs: Vec<(Option<DateTime<Utc>>, RunRow)> = Vec::new();
+    // Bounded top-`MAX_RUNS_PER_SESSION` retention, same pattern as the
+    // digest-level row cap: a session with a pathologically large number of
+    // runs must not force this function to fully materialize (and sort)
+    // every one of them before truncating — only the best
+    // `MAX_RUNS_PER_SESSION` `RunRow`s are ever held at once. `total_runs`
+    // tracks the true count separately so `runs_truncated` still reports an
+    // honest total.
+    let mut kept_runs: BinaryHeap<RunHeapEntry> = BinaryHeap::new();
+    let mut total_runs: u64 = 0;
     for id in members {
         let Some(record) = nodes.get(id) else {
             continue;
@@ -926,6 +979,7 @@ fn build_row(
         else {
             continue;
         };
+        total_runs += 1;
         let parsed = parse_run_outcome(summary);
         if parsed.is_none() && claims_outcome(summary) {
             // The summary CLAIMS an outcome but is not enum-shaped: report the
@@ -943,7 +997,7 @@ fn build_row(
             .as_deref()
             .filter(|s| !s.is_empty())
             .and_then(parse_instant);
-        runs.push((
+        let entry = RunHeapEntry((
             instant,
             RunRow {
                 run_record_id: (*id).to_owned(),
@@ -952,13 +1006,28 @@ fn build_row(
                 observed_at: instant.map(render_instant),
             },
         ));
+        if kept_runs.len() < MAX_RUNS_PER_SESSION {
+            kept_runs.push(entry);
+        } else if kept_runs.peek().is_some_and(|worst| entry < *worst) {
+            kept_runs.pop();
+            kept_runs.push(entry);
+        }
+        // Otherwise this run sorts worse than every currently-kept run and is
+        // dropped here, immediately, rather than retained until a final
+        // truncation pass.
     }
+    let mut runs: Vec<(Option<DateTime<Utc>>, RunRow)> =
+        kept_runs.into_iter().map(|entry| entry.0).collect();
     runs.sort_by(|a, b| run_order_key(a).cmp(&run_order_key(b)));
-    let mut runs: Vec<RunRow> = runs.into_iter().map(|(_, run)| run).collect();
-    let run_status = match runs.as_slice() {
-        [] => "run_absent",
-        [single] => {
-            if single.outcome.is_some() {
+    let runs: Vec<RunRow> = runs.into_iter().map(|(_, run)| run).collect();
+    // `total_runs` (0 / 1 / many), never the post-truncation `runs.len()`:
+    // `MAX_RUNS_PER_SESSION` is comfortably above 1, so the two agree in
+    // every reachable case, but classifying from the TRUE total avoids a
+    // correctness dependency on that constant's specific value.
+    let run_status = match total_runs {
+        0 => "run_absent",
+        1 => {
+            if runs.first().is_some_and(|run| run.outcome.is_some()) {
                 "outcome_recorded"
             } else {
                 "outcome_unrecorded"
@@ -966,12 +1035,10 @@ fn build_row(
         }
         _ => "multiple_runs",
     };
-    if runs.len() > MAX_RUNS_PER_SESSION {
-        let matched = runs.len();
-        runs.truncate(MAX_RUNS_PER_SESSION);
+    if total_runs > runs.len() as u64 {
         let mut diagnostic = SessionsDiagnostic::bare("runs_truncated");
         diagnostic.session_record_id = Some(session_id.to_owned());
-        diagnostic.matched = Some(matched as u64);
+        diagnostic.matched = Some(total_runs);
         diagnostic.returned = Some(runs.len() as u64);
         diagnostic.limit = Some(MAX_RUNS_PER_SESSION as u64);
         diagnostics.push(diagnostic);
@@ -986,8 +1053,14 @@ fn build_row(
             }
         }
     }
-    let mut tasks: Vec<TaskRef> = task_ids
+    // `task_ids` iterates in the exact final ascending order (a `BTreeSet`),
+    // so capping via `.take` here is behavior-identical to building every
+    // `TaskRef` and truncating afterward — but never materializes a `TaskRef`
+    // (with its `.to_owned()` allocations) for a task beyond the cap.
+    let matched_tasks = task_ids.len();
+    let tasks: Vec<TaskRef> = task_ids
         .iter()
+        .take(MAX_TASKS_PER_SESSION)
         .map(|task_id| {
             let recorded = nodes
                 .get(task_id)
@@ -1004,12 +1077,10 @@ fn build_row(
             }
         })
         .collect();
-    if tasks.len() > MAX_TASKS_PER_SESSION {
-        let matched = tasks.len();
-        tasks.truncate(MAX_TASKS_PER_SESSION);
+    if matched_tasks > tasks.len() {
         let mut diagnostic = SessionsDiagnostic::bare("tasks_truncated");
         diagnostic.session_record_id = Some(session_id.to_owned());
-        diagnostic.matched = Some(matched as u64);
+        diagnostic.matched = Some(matched_tasks as u64);
         diagnostic.returned = Some(tasks.len() as u64);
         diagnostic.limit = Some(MAX_TASKS_PER_SESSION as u64);
         diagnostics.push(diagnostic);
@@ -1249,9 +1320,16 @@ pub fn bounded_session_text(value: &str) -> String {
 /// per scoped session. The naive shape — rescanning every node for every scoped
 /// session — is `O(sessions × nodes)` and takes tens of seconds on a store with
 /// a few thousand sessions.
+///
+/// `sessions_by_stamp` carries every LIVE session's record ID per stamp for
+/// the WHOLE STORE (cheap: string refs only), but deliberately NOT each
+/// session's member set — computing the linked union recomputes
+/// [`members_of`] on demand, but only for the sessions sharing a stamp that
+/// is actually represented in `scoped_stamps`, never for the whole store.
 fn unlinked_stamped_records<'a>(
     scoped_stamps: &BTreeSet<&'a str>,
-    all_session_members: &[(&'a str, &'a str, BTreeSet<&'a str>)],
+    sessions_by_stamp: &BTreeMap<&'a str, BTreeSet<&'a str>>,
+    adjacency: &Adjacency<'a>,
     nodes: &BTreeMap<&'a str, &'a GraphRecord>,
 ) -> u64 {
     let mut by_stamped_session: BTreeMap<&'a str, BTreeSet<&'a str>> = BTreeMap::new();
@@ -1261,36 +1339,31 @@ fn unlinked_stamped_records<'a>(
         }
     }
 
-    // Two AgentSession NODE IDs can legitimately share one stamped
-    // `session_id` STRING: `build_agent_session_node` hashes `observed_at`
-    // into the node id, so re-observing the same logical session at a new
-    // instant mints a sibling session node under the same stamp. The set of
-    // records genuinely linked to a stamp is therefore the UNION across
-    // EVERY LIVE session in the WHOLE STORE sharing it — each session's own
-    // record ID plus its edge-derived members — regardless of which
-    // repository (if any) that sibling itself resolves to. A sibling scoped
-    // to a DIFFERENT repository, or to none at all, is still a REAL session
-    // with REAL edge-linked members; checking only sessions scoped to the
-    // CURRENTLY queried repository would falsely flag such a sibling's
-    // members as unlinked. Only the DIAGNOSTIC below is scoped, via
-    // `scoped_stamps`, to stamps actually represented in this digest.
-    let mut linked_by_stamped_session: BTreeMap<&'a str, BTreeSet<&'a str>> = BTreeMap::new();
-    for &(session_record_id, stamped_session_id, ref members) in all_session_members {
-        let linked = linked_by_stamped_session
-            .entry(stamped_session_id)
-            .or_default();
-        linked.insert(session_record_id);
-        linked.extend(members.iter().copied());
-    }
-
     let mut unlinked: BTreeSet<&'a str> = BTreeSet::new();
     for &stamped_session_id in scoped_stamps {
         let Some(candidates) = by_stamped_session.get(stamped_session_id) else {
             continue;
         };
-        let Some(linked) = linked_by_stamped_session.get(stamped_session_id) else {
-            continue;
-        };
+        // Two AgentSession NODE IDs can legitimately share one stamped
+        // `session_id` STRING: `build_agent_session_node` hashes
+        // `observed_at` into the node id, so re-observing the same logical
+        // session at a new instant mints a sibling session node under the
+        // same stamp. The set of records genuinely linked to a stamp is
+        // therefore the UNION across EVERY LIVE session in the WHOLE STORE
+        // sharing it — each session's own record ID plus its edge-derived
+        // members — regardless of which repository (if any) that sibling
+        // itself resolves to. A sibling scoped to a DIFFERENT repository, or
+        // to none at all, is still a REAL session with REAL edge-linked
+        // members; checking only sessions scoped to the CURRENTLY queried
+        // repository would falsely flag such a sibling's members as
+        // unlinked.
+        let mut linked: BTreeSet<&'a str> = BTreeSet::new();
+        if let Some(session_ids) = sessions_by_stamp.get(stamped_session_id) {
+            for &session_id in session_ids {
+                linked.insert(session_id);
+                linked.extend(members_of(session_id, adjacency));
+            }
+        }
         for &id in candidates {
             if linked.contains(id) {
                 continue;
@@ -2037,6 +2110,91 @@ mod tests {
             "both the session's empty observed_at and the member's empty \
              ingested_at must be counted, got {diagnostic:?}"
         );
+    }
+
+    #[test]
+    fn runs_beyond_the_cap_keep_the_earliest_not_an_arbitrary_subset() {
+        // Bounded run retention (issue #112 review round 15) must select the
+        // CORRECT top-`MAX_RUNS_PER_SESSION` runs by ascending observed_at,
+        // never merely any 20 of them — e.g. the first 20 encountered in
+        // adjacency iteration order, which has nothing to do with timestamp
+        // order.
+        let repo = repository("repo-a");
+        let repo_id = repo.id().to_owned();
+        let sym = symbol(&repo_id, "alpha");
+        let sym_id = sym.id().to_owned();
+
+        let session = memory(
+            NodeKind::AgentSession,
+            "s",
+            Some("2026-01-01T00:00:00Z"),
+            "S",
+        );
+        let session_id = session.id().to_owned();
+        let obs = memory(
+            NodeKind::Observation,
+            "o",
+            Some("2026-01-01T00:00:00Z"),
+            "O",
+        );
+        let obs_id = obs.id().to_owned();
+
+        let mut records = vec![
+            repo,
+            sym,
+            code_edge(EdgeLabel::Contains, &repo_id, &sym_id),
+            session,
+            obs,
+            am_edge(EdgeLabel::AuthoredBy, &obs_id, &session_id),
+            am_edge(EdgeLabel::MentionsSymbol, &obs_id, &sym_id),
+        ];
+
+        // 21 runs, one per day starting 2026-01-01: the earliest 20
+        // (01-01 .. 01-20) must survive; 01-21 must be dropped.
+        let mut expected_survivors = Vec::new();
+        for day in 1..=21 {
+            let key = format!("r{day}");
+            let observed = format!("2026-01-{day:02}T00:00:00Z");
+            let run = memory(
+                NodeKind::AgentRun,
+                &key,
+                Some(&observed),
+                "AgentRun outcome=success exit_reason=completed",
+            );
+            let run_id = run.id().to_owned();
+            records.push(run);
+            records.push(am_edge(EdgeLabel::SessionOf, &run_id, &session_id));
+            if day <= 20 {
+                expected_survivors.push(run_id);
+            }
+        }
+
+        let out = digest(&records, &repo_id);
+        assert_eq!(out.sessions.len(), 1, "one scoped session: {out:?}");
+        let runs = &out.sessions[0].runs;
+        assert_eq!(
+            runs.len(),
+            20,
+            "runs capped at MAX_RUNS_PER_SESSION: {runs:?}"
+        );
+        let survivor_ids: Vec<&str> = runs.iter().map(|r| r.run_record_id.as_str()).collect();
+        assert_eq!(
+            survivor_ids, expected_survivors,
+            "the EARLIEST 20 runs must survive, in ascending order — not an \
+             arbitrary 20: {runs:?}"
+        );
+        let truncated = out
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "runs_truncated")
+            .unwrap_or_else(|| panic!("must disclose truncation: {out:?}"));
+        assert_eq!(
+            truncated.matched,
+            Some(21),
+            "the TRUE total, got {truncated:?}"
+        );
+        assert_eq!(truncated.returned, Some(20));
+        assert_eq!(truncated.limit, Some(20));
     }
 
     #[test]
