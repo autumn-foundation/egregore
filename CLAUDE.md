@@ -1470,12 +1470,27 @@ vocabulary, then prints a deterministic single-line report carrying the catalog
 identity, its `control_catalog:v1:<hex>` hash-pin handle, and the per-control
 evidence-class map (`required`/`optional`). Pure, offline, read-only;
 byte-identical across runs. Unknown schema version, unknown evidence class,
-malformed JSON, and unreadable files exit 2 with a redaction-safe JSON error.
+invalid requirement, duplicate control ID, duplicate evidence class, malformed
+JSON, and unreadable files exit 2 with a redaction-safe JSON error.
+Input normalization mirrors the hash contract: a leading UTF-8 BOM and CRLF
+line endings are both stripped before parsing (neither fails the parse nor
+perturbs the pin), and a declared `version` that is not an in-range JSON
+integer literal (`1.5`, `-1`, `2^32`, even `1.0`) reports
+`unknown_schema_version` echoing the declared tuple rather than a value-free
+`malformed_json`. Every catalog-sourced string an error envelope echoes
+is control-character-sanitized and length-capped (`CATALOG_FIELD_MAX_CHARS`),
+and `--format text` neutralizes control characters in `catalog_id`/
+`control_id`/`title` — catalog values are operator/attacker-controlled (#104
+doctrine). The `(control_catalog, ControlCatalog, 1)` tuple is a document
+contract registered in `docs/schema/schema-versioning.md` (§1 table + #337
+Coordination Note), deliberately off the `GraphRecord` reader path.
 The catalog maps a control ID to Egregore evidence classes — not an
 interpretation of the AICPA criteria and not legal advice; evidence of process
 execution, never proof of control effectiveness. This is the catalog surface
-only; evidence-pack assembly is #338. See `docs/cli/control-catalog.md` and
-`docs/controls/README.md`.
+only; evidence-pack assembly is #338 (whose `verify` Integrity check re-checks
+the #337 three-way requirement semantics from the pack alone, rejecting
+verdict-scalar overclaims — see `docs/cli/evidence-pack.md`). See
+`docs/cli/control-catalog.md` and `docs/controls/README.md`.
 
 Control-scoped, time-windowed evidence-pack assembly + verify (issue #338):
 

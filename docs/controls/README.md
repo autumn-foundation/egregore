@@ -42,6 +42,21 @@ Each control lists its evidence classes with a `requirement`:
 - `required` — the class must be present or the control gate fails.
 - `optional` — the class is reported when present; its absence never fails the gate.
 
+This set is closed too: a requirement outside `{required, optional}` is
+rejected at load time with `invalid_requirement` (naming the control, class,
+and offending value), never silently coerced.
+
+## Vocabulary boundary (what this slice adds — and doesn't)
+
+This slice introduces one new **document contract** and its
+`(control_catalog, ControlCatalog, 1)` schema tuple — a deliberate, called-out
+exception to the repo's no-new-vocabulary norm, registered in
+`docs/schema/schema-versioning.md` (§1 table and the #337 Coordination Note).
+It adds **no** new graph domain, node kind, edge label, trust class, importer,
+network access, or LLM-generated content: control titles are quoted
+descriptors, not generated prose, and the catalog is never ingested into the
+graph as records — it is a document contract like the redaction policy.
+
 ## Catalog document format
 
 ```json
@@ -98,9 +113,12 @@ repo-wide shape:
 { "code": "unknown_schema_version", "version": { "domain": "…", "kind": "…", "version": 2 } }
 ```
 
-A future `soc2-v2` catalog would carry a new `schema_version.version` and be
-recognized by a widened recognizer; readers pinned to v1 reject it rather than
-silently misreading it.
+A future `soc2-v2` **catalog** is a content revision: it carries a new
+`catalog_id` (and therefore a new hash pin) under the *same* document format.
+The `schema_version.version` bumps only when the document **format** itself
+changes; such a future-format catalog would be recognized by a widened
+recognizer, and readers pinned to v1 reject it rather than silently misreading
+it.
 
 The parser gates on this tuple **first**: it probes only the `schema_version`
 tuple leniently and returns `unknown_schema_version` for any unsupported tuple
@@ -135,13 +153,23 @@ control_catalog:v1:<hex>
 ```
 
 mirroring the code-graph `stable_id` handle shape. This hash goes into every
-future evidence-pack manifest (issue #338) so an assembled pack is tied to the
-exact catalog version it was built against.
+evidence-pack manifest (issue #338, shipped as `eg audit evidence-pack
+assemble`'s `catalog_pin`) so an assembled pack is tied to the exact catalog
+content it was built against.
+
+The pin is **content-addressed over the canonical (sorted) form**, so it is
+deliberately order-independent: two catalog files that differ only in the
+declaration order of controls or classes carry the same pin. Pack **section
+order**, by contrast, follows the catalog's declaration order. Same pin
+therefore means same catalog *content*, not byte-identical *packs* — comparing
+two packs still means comparing their contents, with the pin guaranteeing the
+control→class mapping behind them is identical.
 
 ## Three-way requirement semantics
 
-When an evidence pack is later assembled (issue #338), each class requirement is
-evaluated against whether evidence of that class was found:
+When an evidence pack is assembled (issue #338, `eg audit evidence-pack
+assemble`), each class requirement is evaluated against whether evidence of
+that class was found:
 
 | Requirement | Availability | Outcome | Gate |
 | --- | --- | --- | --- |
@@ -157,8 +185,14 @@ Only a `required` class that is unavailable fails the gate; an unavailable
 
 CC8.1 (change management) is fully supported today: commits, pull requests,
 reviews, and review coverage are all first-class Egregore evidence. CC7.2
-(system monitoring) and CC7.3 (incident evaluation and response) depend on a
-log/error-graph domain (the umbrella issue #319) that is **not yet implemented**;
-it is a soft dependency. Until that domain lands, every CC7.2/CC7.3 evidence
-class is `optional` so their absence never fails a gate. A future `soc2-v2`
-flips the relevant classes to `required` once the log domain exists.
+(system monitoring) and CC7.3 (incident evaluation and response) depend on the
+log/error-graph domain (the umbrella issue #319) — a soft dependency when this
+catalog shipped, and one that has since landed: `eg scan-logs` mints
+`ErrorSignature`/`LogOccurrenceBucket` records and issue #340 folds them into
+the CC7.x pack sections. The CC7.x classes nonetheless **stay `optional` in
+`soc2-v1`**, because flipping a class to `required` is a gate-breaking catalog
+change: it would turn every existing pack assembly over a store without log
+records from a pass into a gate failure under the *same* catalog identity. The
+flip to `required` is therefore deferred to a future `soc2-v2`, whose new
+`catalog_id`/hash pin makes the stricter gate visible in every pack built
+under it.

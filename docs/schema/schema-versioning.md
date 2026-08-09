@@ -41,6 +41,7 @@ incremental producers. New domains use their own constants:
 | `project` | `PROJECT_SCHEMA_VERSION` | project-graph records |
 | `semantic` | `SEMANTIC_SCHEMA_VERSION` | semantic-drift records |
 | `log` | `LOG_SCHEMA_VERSION` | log-signature records (`LogSource`, `ErrorSignature`, `LogEvent`, `LogOccurrenceBucket`) — version 3 |
+| `control_catalog` | `CONTROL_CATALOG_SCHEMA_VERSION` | the SOC2 control→evidence-class catalog **document** (`ControlCatalog`, issue #337) — version 1. A standalone document contract, **not** a `GraphRecord` domain: it is recognized by `is_known_control_catalog_schema_version` in `src/schema_version.rs`, deliberately outside `is_known_record_version`, because the catalog is never ingested as a record and adding a `control_catalog` arm to the `GraphRecord` reader path would corrupt it. |
 
 The `log` domain was bumped 1 → 2 by issue #361 (source-aware
 `LogOccurrenceBucket` identity: the owning `LogSource` is folded into the
@@ -229,10 +230,22 @@ See [`docs/schema/producer-version.md`](producer-version.md) for the full `Produ
 - #8: bi-temporal `as_of` reads must surface each returned record's
   `schema_version` because historical reads can return older versions by
   construction.
+- #337: introduces the `(control_catalog, ControlCatalog, 1)` tuple — a
+  **deliberate exception to the no-new-vocabulary norm**, called out here per
+  that norm. It is a versioned *document* contract (the SOC2 control→
+  evidence-class catalog, `docs/controls/soc2-v1.json`), not graph vocabulary:
+  the slice adds **no** new graph domain, node kind, edge label, trust class,
+  importer, network access, or LLM-generated content. The tuple follows the
+  standard reader contract (`unknown_schema_version` rejection for future
+  versions) via `is_known_control_catalog_schema_version`, kept off the
+  `GraphRecord` reader path (see the §1 table row and
+  `docs/controls/README.md`). Future bumps are `breaking` by default: a pack
+  built under one catalog version is comparable to another iff their
+  `control_catalog:v1:<hex>` hash pins match.
 
-## 8 - Conformance Fixtures
+## 9 - Conformance Fixtures
 
-Executable fixtures live in `tests/schema_versioning.rs`.
+Executable fixtures live in `tests/integration/schema_versioning.rs`.
 
 - `future_schema_version_is_typed_and_inspect_reports_mixed_counts` builds JSONL
   containing one known `codegraph.Symbol` record and one unknown future

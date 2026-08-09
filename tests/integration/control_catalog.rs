@@ -24,6 +24,48 @@ fn write_temp(name: &str, contents: &str) -> (tempfile::TempDir, std::path::Path
 }
 
 #[test]
+fn text_output_neutralizes_control_characters_in_catalog_values() {
+    // A vendor-supplied `--catalog` is untrusted input: a control title
+    // carrying an ANSI escape (ESC `[2J` clears the terminal) must not be
+    // able to drive the operator's terminal through `--format text` (#337
+    // review finding F2; mirrors the #104 `bounded_identity_field` doctrine).
+    // The fixture carries the ESC as a JSON `\\u001b` escape, which the
+    // parser materializes into a real control character.
+    let catalog = r#"{
+        "catalog_id": "evil",
+        "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+        "controls": [
+            { "control_id": "CC1.1", "title": "before\u001b[2Jafter", "evidence_classes": [
+                { "class": "commits", "requirement": "required" }
+            ] }
+        ]
+    }"#;
+    let (_temp, path) = write_temp("evil.json", catalog);
+    let output = egregore()
+        .args([
+            "audit",
+            "control-catalog",
+            "--catalog",
+            path.to_str().expect("utf8 path"),
+            "--format",
+            "text",
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the catalog itself is schema-valid"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "an ESC byte must never reach the terminal"
+    );
+    assert!(stdout.contains("before"), "title text still rendered");
+}
+
+#[test]
 fn default_catalog_is_valid_and_reports_identity() {
     let output = egregore()
         .args(["audit", "control-catalog"])

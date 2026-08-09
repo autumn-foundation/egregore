@@ -3701,8 +3701,9 @@ pub(crate) enum AuditSubcommand {
     ///
     /// Exit codes:
     ///   0 — the catalog is valid; the report is printed to stdout.
-    ///   2 — read/parse error, unknown evidence class, or unknown schema version;
-    ///       a redaction-safe JSON error is printed to stderr.
+    ///   2 — read/parse error, unknown evidence class, unknown schema version,
+    ///       invalid requirement, duplicate control ID, or duplicate evidence
+    ///       class; a redaction-safe JSON error is printed to stderr.
     ControlCatalog {
         /// Catalog document path. Defaults to the embedded `soc2-v1` catalog.
         #[arg(long)]
