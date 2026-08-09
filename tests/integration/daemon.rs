@@ -23,8 +23,8 @@ use aletheia_egregore::{
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, GraphRecord, IdentitySource, NodeKind,
         PROJECT_SCHEMA_VERSION, RepositoryIdentityPayload, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION,
-        SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, stable_id,
-        user_context_stable_id,
+        SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, agent_memory_stable_id,
+        stable_id, user_context_stable_id,
     },
     traj::ImportOptions,
 };
@@ -2617,10 +2617,19 @@ impl Drop for RunningDaemon {
 }
 
 fn start_daemon(data_dir: &Path) -> RunningDaemon {
+    start_daemon_with_env(data_dir, &[])
+}
+
+/// Like `start_daemon`, but sets extra environment variables on the spawned
+/// `egregore daemon run` subprocess — used to arm debug-build-only test
+/// instrumentation (env vars gated behind `#[cfg(debug_assertions)]` in the
+/// daemon binary itself) without affecting the ordinary daemon start path.
+fn start_daemon_with_env(data_dir: &Path, envs: &[(&str, &str)]) -> RunningDaemon {
     fs::create_dir_all(data_dir).expect("should create data dir");
     let stdout_file = fs::File::create(data_dir.join("daemon.stdout")).expect("stdout file");
     let stderr_file = fs::File::create(data_dir.join("daemon.stderr")).expect("stderr file");
-    let child = ProcessCommand::new(assert_cmd::cargo::cargo_bin("egregore"))
+    let mut command = ProcessCommand::new(assert_cmd::cargo::cargo_bin("egregore"));
+    command
         .arg("daemon")
         .arg("run")
         .arg("--data-dir")
@@ -2628,9 +2637,11 @@ fn start_daemon(data_dir: &Path) -> RunningDaemon {
         .arg("--port")
         .arg("0")
         .stdout(stdout_file)
-        .stderr(stderr_file)
-        .spawn()
-        .expect("daemon should spawn");
+        .stderr(stderr_file);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let child = command.spawn().expect("daemon should spawn");
     let _ = read_running_metadata(data_dir);
     RunningDaemon {
         child: Some(child),
@@ -9830,28 +9841,70 @@ fn query_verb_conformance() {
         );
     }
 
-    // ── (b) reserved: agent_sessions_for_repo → not_implemented ───────────────
+    // ── (b) reserved: drift → not_implemented ─────────────────────────────────
     {
         let res = http_json(
             &metadata,
             "POST",
             "/v1/query",
             &serde_json::json!({
-                "request_id": "vqc-reserved-sessions",
+                "request_id": "vqc-reserved-drift",
                 "agent_id": "verb-test-agent",
-                "verb": "agent_sessions_for_repo",
-                "params": { "repository_id": "some-repo" }
+                "verb": "drift",
+                "params": {}
             }),
         );
         assert!(
             res.starts_with("HTTP/1.1 501"),
-            "agent_sessions_for_repo should return 501, got {res}"
+            "drift should return 501, got {res}"
         );
         let body = response_json(&res);
         assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
         assert_eq!(
             body["error"]["code"], "not_implemented",
             "reserved verb must return not_implemented, got {body}"
+        );
+    }
+
+    // ── (b) implemented: agent_sessions_for_repo → 200 digest (issue #112) ────
+    // The verb is no longer reserved: it answers with a (possibly empty)
+    // repo-scoped session digest, never `not_implemented`.
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-sessions-implemented",
+                "agent_id": "verb-test-agent",
+                "verb": "agent_sessions_for_repo",
+                "params": { "repo": "fixture-rust-basic-stable" }
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "agent_sessions_for_repo must be implemented (200), got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(body["ok"], true, "response must be ok:true, got {body}");
+        let result = &body["result"];
+        assert_eq!(result["verb"], "agent_sessions_for_repo");
+        assert!(
+            result["sessions"].is_array(),
+            "the digest must carry a sessions array, got {body}"
+        );
+        assert!(
+            result["disclaimer"].as_str().is_some_and(|d| !d.is_empty()),
+            "the digest must carry the standing disclaimer, got {body}"
+        );
+        // A scanned code-only store holds zero agent sessions: that is an
+        // explicit empty answer (200 + no_sessions), never a 404.
+        assert_eq!(result["sessions"], serde_json::json!([]));
+        assert!(
+            result["diagnostics"]
+                .as_array()
+                .is_some_and(|d| d.iter().any(|entry| entry["code"] == "no_sessions")),
+            "zero sessions must be signalled by a no_sessions diagnostic, got {body}"
         );
     }
 
@@ -13108,5 +13161,1008 @@ fn daemon_observations_for_symbol_invalid_supersession() {
     assert_eq!(
         body["error"]["code"], "bad_request",
         "invalid supersession parameter should return bad_request error code, got {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `agent_sessions_for_repo` (issue #112) — the daemon face of
+// `eg query sessions <REPO>`. The verb is no longer reserved: it returns the
+// same repo-scoped, recency-ordered session digest the CLI prints.
+// ---------------------------------------------------------------------------
+
+/// Selector every `agent_sessions_for_repo` fixture answers to.
+const SESSIONS_REPO_SELECTOR: &str = "sessions-repo";
+
+/// Raw payload sentinel seeded into the session summary: the digest reduces a
+/// summary to a structured label plus a BLAKE3 hash, so these bytes must never
+/// appear anywhere in the daemon response.
+const SESSIONS_RAW_SENTINEL: &str = "RAW_SESSION_PAYLOAD_SHOULD_NOT_LEAK";
+
+/// Builds the deterministic session-digest fixture: one repository with a file
+/// and a symbol, one agent, one session with a templated run and one
+/// symbol-citing observation.
+///
+/// Returned in a fixed order so the same record set can be replayed into a
+/// JSONL graph for the CLI parity check.
+#[allow(clippy::too_many_lines)]
+fn agent_sessions_fixture_records() -> Vec<GraphRecord> {
+    let repo_id = stable_id(&["repository", "operator-override", SESSIONS_REPO_SELECTOR]);
+    let file_id = stable_id(&["node", "file", &repo_id, "src/lib.rs"]);
+    let symbol_id = stable_id(&["node", "symbol", &repo_id, "src/lib.rs", "widget"]);
+    let agent_id = agent_memory_stable_id(&["node", "agent", "sessions-agent-1"]);
+    let session_id = agent_memory_stable_id(&["node", "agent_session", "sessions-sess-1"]);
+    let run_id = agent_memory_stable_id(&["node", "agent_run", "sessions-run-1"]);
+    let observation_id = agent_memory_stable_id(&["node", "observation", "sessions-obs-1"]);
+
+    let memory_node = |id: &str, kind: NodeKind, observed: &str, summary: &str| -> GraphRecord {
+        let mut record =
+            GraphRecord::node(id.to_owned(), kind, None, None, None, summary.to_owned())
+                .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
+        if let GraphRecord::Node {
+            agent_id: node_agent_id,
+            agent_kind,
+            session_id: node_session_id,
+            observed_at,
+            ingested_at,
+            confidence,
+            ..
+        } = &mut record
+        {
+            *node_agent_id = Some("sessions-agent-1".to_owned());
+            *agent_kind = Some("claude-code".to_owned());
+            *node_session_id = Some("sessions-sess-1".to_owned());
+            *observed_at = Some(observed.to_owned());
+            *ingested_at = Some(observed.to_owned());
+            *confidence = Some("1.0".to_owned());
+        }
+        record
+    };
+
+    let mut agent = GraphRecord::node(
+        agent_id.clone(),
+        NodeKind::Agent,
+        None,
+        None,
+        Some("sessions-agent-1".to_owned()),
+        "Agent sessions-agent-1".to_owned(),
+    )
+    .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
+    if let GraphRecord::Node {
+        agent_id: node_agent_id,
+        agent_kind,
+        ..
+    } = &mut agent
+    {
+        *node_agent_id = Some("sessions-agent-1".to_owned());
+        *agent_kind = Some("claude-code".to_owned());
+    }
+
+    vec![
+        GraphRecord::node(
+            repo_id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(SESSIONS_REPO_SELECTOR.to_owned()),
+            format!("Repository {SESSIONS_REPO_SELECTOR}"),
+        )
+        .with_domain("codegraph", SCHEMA_VERSION)
+        .with_repository_identity(RepositoryIdentityPayload {
+            identity_source: IdentitySource::OperatorOverride,
+            remote_url: None,
+            root_commit_sha: None,
+            canonical_path: None,
+            basename: SESSIONS_REPO_SELECTOR.to_owned(),
+        }),
+        GraphRecord::syntax_node(
+            file_id.clone(),
+            NodeKind::File,
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte: 100,
+                start_line: 1,
+                end_line: 100,
+            },
+            "src/lib.rs".to_owned(),
+            "rust",
+            "Source file src/lib.rs".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id,
+            file_id.clone(),
+            Some("1.0".to_owned()),
+            "repository contains file".to_owned(),
+        ),
+        GraphRecord::syntax_node(
+            symbol_id.clone(),
+            NodeKind::Symbol,
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 10,
+                end_byte: 40,
+                start_line: 10,
+                end_line: 20,
+            },
+            "widget".to_owned(),
+            "rust",
+            "Symbol widget".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id,
+            symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "file defines symbol".to_owned(),
+        ),
+        agent,
+        memory_node(
+            &session_id,
+            NodeKind::AgentSession,
+            "2026-03-01T10:00:00Z",
+            &format!("AgentSession {SESSIONS_RAW_SENTINEL}"),
+        ),
+        GraphRecord::agent_memory_edge(
+            EdgeLabel::SessionOf,
+            session_id.clone(),
+            agent_id,
+            Some("1.0".to_owned()),
+            "session of agent".to_owned(),
+        ),
+        memory_node(
+            &run_id,
+            NodeKind::AgentRun,
+            "2026-03-01T10:05:00Z",
+            "AgentRun outcome=success exit_reason=completed",
+        ),
+        GraphRecord::agent_memory_edge(
+            EdgeLabel::SessionOf,
+            run_id,
+            session_id.clone(),
+            Some("1.0".to_owned()),
+            "run of session".to_owned(),
+        ),
+        memory_node(
+            &observation_id,
+            NodeKind::Observation,
+            "2026-03-01T11:00:00Z",
+            "Observation about widget",
+        ),
+        GraphRecord::agent_memory_edge(
+            EdgeLabel::AuthoredBy,
+            observation_id.clone(),
+            session_id,
+            Some("1.0".to_owned()),
+            "observation authored by session".to_owned(),
+        ),
+        GraphRecord::agent_memory_edge(
+            EdgeLabel::MentionsSymbol,
+            observation_id,
+            symbol_id,
+            Some("1.0".to_owned()),
+            "observation mentions symbol".to_owned(),
+        ),
+    ]
+}
+
+/// Writes the fixture straight into a fresh embedded store (before the daemon
+/// takes the write lease), mirroring `seed_observations`/`seed_repository_nodes`.
+fn seed_agent_sessions_store(data_dir: &Path) -> Vec<GraphRecord> {
+    let records = agent_sessions_fixture_records();
+    let mut sink = EmbeddedAletheiaSink::open(data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record)
+            .expect("seeded session fixture record should write");
+    }
+    sink.persist_indexes()
+        .expect("seeded session fixture should persist");
+    records
+}
+
+fn agent_sessions_query(
+    metadata: &DaemonMetadata,
+    request_id: &str,
+    params: &serde_json::Value,
+) -> String {
+    http_json(
+        metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": request_id,
+            "agent_id": "sessions-test-agent",
+            "verb": "agent_sessions_for_repo",
+            "params": params
+        }),
+    )
+}
+
+#[test]
+fn agent_sessions_for_repo_returns_digest() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let records = seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-digest",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "agent_sessions_for_repo must return 200, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], true, "response must be ok:true, got {body}");
+    let result = &body["result"];
+    assert_eq!(result["verb"], "agent_sessions_for_repo");
+
+    let repo_id = records[0].id();
+    assert_eq!(
+        result["repository_id"], repo_id,
+        "the digest must name the resolved repository, got {body}"
+    );
+    assert!(
+        result["disclaimer"].as_str().is_some_and(|d| !d.is_empty()),
+        "the digest must carry the standing disclaimer, got {body}"
+    );
+    assert_eq!(
+        result["unsupported_count_kinds"],
+        serde_json::json!(["lesson"]),
+        "the digest must disclose unsupported count kinds, got {body}"
+    );
+
+    let sessions = result["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1, "exactly one seeded session, got {body}");
+    let row = &sessions[0];
+    assert_eq!(row["session_id"], "sessions-sess-1");
+    assert_eq!(row["trust_class"], "agent_authored");
+    assert_eq!(row["agent_id"], "sessions-agent-1");
+    assert_eq!(row["first_activity"], "2026-03-01T10:00:00Z");
+    assert_eq!(row["last_activity"], "2026-03-01T11:00:00Z");
+    assert_eq!(row["run_status"], "outcome_recorded");
+    let runs = row["runs"].as_array().expect("runs array");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["outcome"], "success");
+    assert_eq!(runs[0]["exit_reason"], "completed");
+    assert_eq!(row["record_counts"]["observation"], 1);
+    assert!(
+        row["record_counts"]["lesson"].is_null(),
+        "lesson has no backing node kind and must be null, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_missing_repo_param_is_bad_request() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(&metadata, "sessions-missing-repo", &serde_json::json!({}));
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "a missing repository selector must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "a missing selector must report missing_field, got {body}"
+    );
+    assert_eq!(
+        body["error"]["field"], "params.repo",
+        "the error must name params.repo, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_unknown_selector_maps_to_unknown_repository_selector() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-unknown-repo",
+        &serde_json::json!({ "repo": "no-such-repository-xyz" }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "an unknown selector must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
+    assert_eq!(
+        body["error"]["code"], "unknown_repository_selector",
+        "an unknown selector must reuse the shared selector mapping, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_accepts_repository_id_alias() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let canonical = agent_sessions_query(
+        &metadata,
+        "sessions-alias-canonical",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR }),
+    );
+    let aliased = agent_sessions_query(
+        &metadata,
+        "sessions-alias-aliased",
+        &serde_json::json!({ "repository_id": SESSIONS_REPO_SELECTOR }),
+    );
+    daemon.stop();
+
+    assert!(
+        aliased.starts_with("HTTP/1.1 200"),
+        "params.repository_id must be accepted as an alias of params.repo, got {aliased}"
+    );
+    assert!(
+        canonical.starts_with("HTTP/1.1 200"),
+        "params.repo must resolve, got {canonical}"
+    );
+    assert_eq!(
+        response_json(&aliased)["result"],
+        response_json(&canonical)["result"],
+        "the alias must produce the identical digest"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_never_leaks_raw_payloads() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-no-raw-payload",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "agent_sessions_for_repo must return 200, got {res}"
+    );
+    assert!(
+        !res.contains(SESSIONS_RAW_SENTINEL),
+        "the stored session summary must never reach the daemon response body, got {res}"
+    );
+    let row = &response_json(&res)["result"]["sessions"][0];
+    assert_eq!(
+        row["summary_label"], "AgentSession by sessions-agent-1:sessions-sess-1",
+        "the summary must be reduced to a structured label, got {row}"
+    );
+    assert!(
+        row["summary_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("blake3:")),
+        "the stored summary is exposed only as a BLAKE3 handle, got {row}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_limit_out_of_range_is_invalid_limit() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-limit-zero",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR, "limit": 0 }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "an out-of-range limit must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
+    assert_eq!(
+        body["error"]["code"], "invalid_limit",
+        "an out-of-range limit is distinct from a shape error, got {body}"
+    );
+    assert_eq!(
+        body["error"]["field"], "params.limit",
+        "the error must name params.limit, got {body}"
+    );
+    assert_eq!(
+        body["error"]["message"], "params.limit must be between 1 and 200 (default 20)",
+        "the message must state the accepted range and the default, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_non_integer_limit_is_bad_request() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-limit-not-integer",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR, "limit": "twenty" }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "a non-integer limit must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "a shape error stays bad_request, distinct from invalid_limit, got {body}"
+    );
+    assert_eq!(
+        body["error"]["field"], "params.limit",
+        "the error must name params.limit, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_non_string_alias_names_the_key_the_caller_sent() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-non-string-alias",
+        &serde_json::json!({ "repository_id": 42 }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "a non-string selector must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["error"]["code"], "bad_request", "got {body}");
+    assert_eq!(
+        body["error"]["field"], "params.repository_id",
+        "the error must name the key the CALLER sent, not the canonical alias \
+         target it is rewrapped under, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_matches_cli_payload() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let records = seed_agent_sessions_store(&data_dir);
+
+    // The same record set, replayed as a JSONL graph for the CLI lane.
+    let graph_path = temp.path().join("sessions-parity.jsonl");
+    let mut jsonl = String::new();
+    for record in &records {
+        jsonl.push_str(&serde_json::to_string(record).expect("record should serialize"));
+        jsonl.push('\n');
+    }
+    fs::write(&graph_path, jsonl).expect("write parity graph");
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-cli-parity",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "agent_sessions_for_repo must return 200, got {res}"
+    );
+    let daemon_result = response_json(&res)["result"].clone();
+
+    let cli_output = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(["query", "sessions", SESSIONS_REPO_SELECTOR, "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let cli: serde_json::Value =
+        serde_json::from_slice(&cli_output).expect("CLI stdout must be one JSON envelope");
+
+    for field in [
+        "repository_id",
+        "repository",
+        "disclaimer",
+        "unsupported_count_kinds",
+        "sessions",
+        "diagnostics",
+    ] {
+        assert_eq!(
+            daemon_result[field], cli[field],
+            "daemon and CLI must agree on `{field}`; daemon={daemon_result} cli={cli}"
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn agent_sessions_for_repo_budget_max_results_bounds_rows() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+
+    // The standard fixture plus a SECOND, newer session citing the same
+    // symbol, so a row cap of 1 has something real to truncate.
+    let repo_id = stable_id(&["repository", "operator-override", SESSIONS_REPO_SELECTOR]);
+    let symbol_id = stable_id(&["node", "symbol", &repo_id, "src/lib.rs", "widget"]);
+    let session2_id = agent_memory_stable_id(&["node", "agent_session", "sessions-sess-2"]);
+    let obs2_id = agent_memory_stable_id(&["node", "observation", "sessions-obs-2"]);
+    let second_session_node = |id: &str, kind: NodeKind, observed: &str| -> GraphRecord {
+        let mut record = GraphRecord::node(
+            id.to_owned(),
+            kind,
+            None,
+            None,
+            None,
+            "second session".to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
+        if let GraphRecord::Node {
+            agent_id: node_agent_id,
+            agent_kind,
+            session_id: node_session_id,
+            observed_at,
+            ingested_at,
+            confidence,
+            ..
+        } = &mut record
+        {
+            *node_agent_id = Some("sessions-agent-1".to_owned());
+            *agent_kind = Some("claude-code".to_owned());
+            *node_session_id = Some("sessions-sess-2".to_owned());
+            *observed_at = Some(observed.to_owned());
+            *ingested_at = Some(observed.to_owned());
+            *confidence = Some("1.0".to_owned());
+        }
+        record
+    };
+    let mut records = agent_sessions_fixture_records();
+    records.push(second_session_node(
+        &session2_id,
+        NodeKind::AgentSession,
+        "2026-03-02T10:00:00Z",
+    ));
+    records.push(second_session_node(
+        &obs2_id,
+        NodeKind::Observation,
+        "2026-03-02T11:00:00Z",
+    ));
+    records.push(GraphRecord::agent_memory_edge(
+        EdgeLabel::AuthoredBy,
+        obs2_id.clone(),
+        session2_id,
+        Some("1.0".to_owned()),
+        "observation authored by session".to_owned(),
+    ));
+    records.push(GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        obs2_id,
+        symbol_id,
+        Some("1.0".to_owned()),
+        "observation mentions symbol".to_owned(),
+    ));
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record)
+            .expect("seeded session fixture record should write");
+    }
+    sink.persist_indexes()
+        .expect("seeded session fixture should persist");
+    drop(sink);
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // `params.limit` allows 200 rows, but the common budget contract caps the
+    // response at `budget.max_results` = 1: the effective limit is the MINIMUM.
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sessions-budget-cap",
+            "agent_id": "sessions-test-agent",
+            "verb": "agent_sessions_for_repo",
+            "params": { "repo": SESSIONS_REPO_SELECTOR, "limit": 200 },
+            "budget": { "max_results": 1 }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "a budget-capped digest is still a 200, got {res}"
+    );
+    let result = &response_json(&res)["result"];
+    let sessions = result["sessions"].as_array().expect("sessions array");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "budget.max_results must bound the rows, got {result}"
+    );
+    assert_eq!(
+        sessions[0]["session_id"], "sessions-sess-2",
+        "the surviving row must be the newest session, got {result}"
+    );
+    let diagnostics = result["diagnostics"].as_array().expect("diagnostics");
+    let truncated = diagnostics
+        .iter()
+        .find(|d| d["code"] == "results_truncated")
+        .unwrap_or_else(|| panic!("a budget-capped digest must disclose truncation: {result}"));
+    assert_eq!(truncated["matched"], 2, "true total, got {truncated}");
+    assert_eq!(truncated["returned"], 1, "returned rows, got {truncated}");
+    assert_eq!(
+        truncated["limit"], 1,
+        "the cap that ACTUALLY applied (the budget), got {truncated}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_zero_budget_never_reports_no_sessions() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // budget.max_results: 0 truncates every matched row away, but the
+    // repository genuinely HAS a scoped session — `no_sessions` would claim
+    // otherwise and must not appear alongside `results_truncated`.
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sessions-zero-budget",
+            "agent_id": "sessions-test-agent",
+            "verb": "agent_sessions_for_repo",
+            "params": { "repo": SESSIONS_REPO_SELECTOR },
+            "budget": { "max_results": 0 }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "a zero-budget digest is still a 200, got {res}"
+    );
+    let result = &response_json(&res)["result"];
+    assert_eq!(
+        result["sessions"],
+        serde_json::json!([]),
+        "zero budget truncates every row, got {result}"
+    );
+    let diagnostics = result["diagnostics"].as_array().expect("diagnostics");
+    assert!(
+        diagnostics.iter().any(|d| d["code"] == "results_truncated"),
+        "the zero-row response must disclose truncation, got {result}"
+    );
+    assert!(
+        !diagnostics.iter().any(|d| d["code"] == "no_sessions"),
+        "a budget-truncated repo with real sessions must never report \
+         no_sessions, got {result}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_negative_limit_is_invalid_limit_not_bad_request() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // -1 is a WELL-FORMED integer, just outside the 1..=200 range: the
+    // diagnosis must be `invalid_limit`, never `bad_request` ("not an
+    // integer"), which would misdescribe the input.
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-negative-limit",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR, "limit": -1 }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "an out-of-range limit must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "invalid_limit",
+        "a negative but well-formed integer is out-of-range, not a shape \
+         error, got {body}"
+    );
+    assert_eq!(
+        body["error"]["field"], "params.limit",
+        "the error must name params.limit, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_limit_wider_than_u64_is_bad_request_not_misclassified() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // 2^64 overflows both i64 and u64: once parsed, this is indistinguishable
+    // from an ordinary whole-valued float (`1.0`, `2e0`) without the
+    // `arbitrary_precision` feature this crate does not enable (see the
+    // sibling test `agent_sessions_for_repo_whole_valued_float_limit_is_bad_request`,
+    // which proves the reverse direction of the SAME ambiguity). The request
+    // body is hand-built to exercise the raw wire payload rather than going
+    // through `serde_json::to_value`, which cannot even construct a number
+    // this large. `bad_request` here is a documented, honest limit, not a bug.
+    let body = format!(
+        "{{\"request_id\":\"sessions-huge-limit\",\"agent_id\":\"sessions-test-agent\",\
+         \"verb\":\"agent_sessions_for_repo\",\"params\":{{\"repo\":\"{SESSIONS_REPO_SELECTOR}\",\
+         \"limit\":18446744073709551616}}}}"
+    );
+    let res = http_request(
+        &metadata.address,
+        &format!(
+            "POST /v1/query HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            metadata.token,
+            body.len()
+        ),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "an unrepresentable limit must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "indistinguishable from a whole-valued float once parsed, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_whole_valued_float_limit_is_bad_request() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // `1.0` is LEXICALLY a float (it has a decimal point), even though its
+    // VALUE happens to be a whole number in range. It must stay `bad_request`
+    // ("not an integer") -- never reclassified as `invalid_limit` just
+    // because `fract() == 0.0`, which would conflate it with the genuinely
+    // out-of-range-integer case the sibling test covers.
+    for limit_literal in ["1.0", "2e0"] {
+        let res = agent_sessions_query(
+            &metadata,
+            "sessions-float-limit",
+            &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR, "limit": serde_json::from_str::<serde_json::Value>(limit_literal).unwrap() }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 400"),
+            "a float-shaped limit ({limit_literal}) must be a 400, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["error"]["code"], "bad_request",
+            "{limit_literal} is a FLOAT shape, not an out-of-range integer, got {body}"
+        );
+    }
+    daemon.stop();
+}
+
+#[test]
+fn agent_sessions_for_repo_rejects_as_of_valid_time() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // This lane has no temporal selectors in this slice: an `as_of.valid_time`
+    // must be REJECTED, never silently dropped in favor of the current-state
+    // digest — that would answer an unrequested (and here, malformed) question
+    // with a misleading 200.
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sessions-as-of-rejected",
+            "agent_id": "sessions-test-agent",
+            "verb": "agent_sessions_for_repo",
+            "params": { "repo": SESSIONS_REPO_SELECTOR },
+            "as_of": { "valid_time": "not-a-real-timestamp" }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 501"),
+        "an unsupported as_of.valid_time must be rejected, not silently \
+         answered, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
+    assert_eq!(body["error"]["code"], "not_implemented", "got {body}");
+}
+
+// The delay hook this test arms (`EGREGORE_TEST_SESSIONS_PRE_DIGEST_DELAY_MS`
+// in `src/daemon.rs`) is itself `#[cfg(debug_assertions)]`, compiled out of
+// release binaries entirely. Under `cargo test --release` the hook would be
+// absent, the injected delay would never happen, and the request would
+// return a fast 200 instead of the asserted 408 — an unrelated build-profile
+// difference failing this test, not a real regression. Gate the test the
+// same way as its hook so the two can never drift out of sync.
+#[cfg(debug_assertions)]
+#[test]
+fn agent_sessions_for_repo_timeout_fires_only_after_pre_digest_check_passes() {
+    // Proves the SECOND (post-digest) `check_query_budget` call in
+    // `handle_verb_agent_sessions_for_repo` is load-bearing, not the first.
+    // A prior version of this verb checked the deadline once before calling
+    // `sessions_for_repo` and never again; removing that second check would
+    // not fail without a test like this one, since
+    // `daemon_semantic_search_honours_query_timeout` only exercises
+    // `handle_query`'s global `budget.timeout_ms == 0` short-circuit, which
+    // fires before ANY verb-specific code runs.
+    //
+    // An earlier version of this test tried to reach this proof by timing a
+    // large (800-session) store and deriving a "tight" deadline as a
+    // fraction of a measured warm-run total. That was flagged as
+    // insufficiently rigorous: nothing bounds `load_cross_domain_records` +
+    // `RepositoryIndex::build` (the PRE-digest work) staying under that
+    // fraction on every machine, so the derived deadline could not prove
+    // *which* of the two checks actually caught it — deleting the
+    // post-digest check might still leave the test green if the pre-digest
+    // check happened to fire first on a slower CI runner.
+    //
+    // This version removes the guesswork entirely via a debug-build-only
+    // delay hook (`EGREGORE_TEST_SESSIONS_PRE_DIGEST_DELAY_MS`, compiled out
+    // of release binaries) that sleeps immediately AFTER the pre-digest
+    // check and BEFORE computing the digest. Against the small standard
+    // fixture (pre-digest work: sub-millisecond) with a deadline set well
+    // above realistic pre-digest time but well below the injected delay,
+    // the pre-digest check is deterministically guaranteed to pass — so a
+    // 408 can only come from the post-digest check. Removing that check
+    // would deterministically flip this test to 200 on every machine.
+    //
+    // A well-founded follow-up: the assumption above ("pre-digest work
+    // finishes within 30ms") is exactly the kind of machine-dependent claim
+    // the calibration approach was rejected for making. A slow or
+    // contended CI worker could in principle exceed 30ms of REAL pre-digest
+    // work and get 408 from the FIRST check, never reaching the delay hook
+    // at all — which would leave this test green even with the
+    // post-digest check deleted. Closing that gap needs a signal that the
+    // request actually passed through the delay, not just the final status
+    // code: this test therefore also asserts the request's wall-clock
+    // duration is at least close to the injected delay. A 408 returned by
+    // the pre-digest check (before the delay hook ever runs) would return
+    // in a few milliseconds, not 150ms+ — so this positively proves
+    // execution reached and completed the delay before the timeout fired.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let delay_ms: u64 = 150;
+    let mut daemon = start_daemon_with_env(
+        &data_dir,
+        &[(
+            "EGREGORE_TEST_SESSIONS_PRE_DIGEST_DELAY_MS",
+            &delay_ms.to_string(),
+        )],
+    );
+    let metadata = read_metadata(&data_dir);
+
+    // 30ms comfortably exceeds real pre-digest work on the tiny fixture
+    // (load + index-build over a handful of records) while sitting well
+    // below the 150ms injected delay, so the deadline is crossed strictly
+    // between the two checks, never before the first one runs.
+    let started = Instant::now();
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sessions-pre-digest-delay-timeout",
+            "agent_id": "sessions-test-agent",
+            "verb": "agent_sessions_for_repo",
+            "params": { "repo": SESSIONS_REPO_SELECTOR },
+            "budget": { "timeout_ms": 30 }
+        }),
+    );
+    let elapsed = started.elapsed();
+    daemon.stop();
+
+    // A margin below the full 150ms tolerates normal scheduling jitter
+    // around the sleep call while still being far above anything a
+    // pre-digest-only failure (a few milliseconds) could produce — so this
+    // assertion cannot pass unless execution actually reached and ran the
+    // delay hook, proving the pre-digest check passed first.
+    assert!(
+        elapsed >= Duration::from_millis(120),
+        "the request returned in {elapsed:?}, too fast to have passed \
+         through the {delay_ms}ms delay hook — this means the PRE-digest \
+         check (not the post-digest one under test) is what produced the \
+         response, so this run does not prove what it claims"
+    );
+
+    assert!(
+        res.starts_with("HTTP/1.1 408"),
+        "a deadline crossed only by the post-pre-digest-check delay must \
+         still time out, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "query_timeout",
+        "timeout must use the query_timeout code, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_pre_digest_delay_hook_does_not_fire_without_the_env_var() {
+    // Sanity check on the test hook itself: with the SAME env var never set,
+    // an ordinary request against the same fixture succeeds — the delay is
+    // opt-in per request/process, never an ambient slowdown. This
+    // deliberately does NOT assert an absolute wall-clock upper bound: a
+    // slow or contended CI worker can legitimately take longer than any
+    // fixed ceiling for an ordinary request, for reasons unrelated to this
+    // hook, which would make the ceiling flaky rather than meaningful. The
+    // 200 itself is the signal — a leaking (always-on) hook would instead
+    // time out or otherwise fail the request under the daemon's normal
+    // budget, which this still catches.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-no-delay-hook",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "without the delay hook armed, a normal query must succeed, got {res}"
     );
 }

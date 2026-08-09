@@ -232,6 +232,16 @@ const VALID_TASK_STATUSES: &[&str] = &[
     "closed_dropped",
     "unknown",
 ];
+/// Returns the closed project-domain task-status vocabulary.
+///
+/// The importer validates against this set when writing `Task` nodes; readers
+/// (e.g. the `eg query sessions` digest, issue #112) validate against the SAME
+/// set when reporting a recorded status, so the two can never drift into
+/// disagreeing about what counts as a recorded status.
+pub(crate) const fn valid_task_statuses() -> &'static [&'static str] {
+    VALID_TASK_STATUSES
+}
+
 const VALID_TASK_PRIORITIES: &[&str] = &["low", "normal", "high", "urgent", "unknown"];
 const VALID_AC_STATUSES: &[&str] = &["unverified", "verified", "failed", "superseded", "unknown"];
 const VALID_LINK_SYSTEMS: &[&str] = &["github", "gitlab", "local_file", "harness_legacy", "other"];

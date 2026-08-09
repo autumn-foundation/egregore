@@ -925,6 +925,11 @@ enum ErrorCode {
     /// Added by #67 (repository-scoped queries): `params.repo` matches more
     /// than one repository identity; ambiguity is never resolved implicitly.
     AmbiguousRepositorySelector,
+    /// Added by #112 (`agent_sessions_for_repo`): a well-formed integer
+    /// `params.limit` fell outside the accepted range. Distinct from
+    /// [`Self::BadRequest`] so a caller can tell "not a number" from
+    /// "out of range", matching the CLI's `invalid_limit` diagnostic code.
+    InvalidLimit,
 }
 
 impl ErrorCode {
@@ -964,6 +969,7 @@ impl ErrorCode {
             Self::IncompatibleEmbeddingDimension => "incompatible_embedding_dimension",
             Self::UnknownRepositorySelector => "unknown_repository_selector",
             Self::AmbiguousRepositorySelector => "ambiguous_repository_selector",
+            Self::InvalidLimit => "invalid_limit",
         }
     }
 
@@ -976,7 +982,8 @@ impl ErrorCode {
             | Self::InlinePayloadExceedsCeiling
             | Self::AmbiguousCommitPrefix
             | Self::UnknownRepositorySelector
-            | Self::AmbiguousRepositorySelector => 400,
+            | Self::AmbiguousRepositorySelector
+            | Self::InvalidLimit => 400,
             Self::IdempotencyConflict => 409,
             Self::NotFound => 404,
             Self::PayloadTooLarge => 413,
@@ -10800,6 +10807,190 @@ fn handle_verb_criteria_for_task(
     )
 }
 
+// ── agent_sessions_for_repo (issue #112) ─────────────────────────────────────
+
+/// Daemon face of `eg query sessions <REPO>`.
+///
+/// Resolves the repository selector (`params.repo`, with `params.repository_id`
+/// accepted as an alias — `repo` wins when both are present), then returns the
+/// SAME digest the CLI prints: `sessions` and `diagnostics` are serialized from
+/// the identical `graph_query::SessionsDigest` value, so the two transports
+/// cannot drift. Zero sessions is an explicit 200 carrying a `no_sessions`
+/// diagnostic, never a 404 — an empty digest is an answer, not a miss.
+///
+/// `budget_max_results` is the server-enforced result budget the main query
+/// handler derives from `budget.max_results`; the effective row cap is the
+/// MINIMUM of it and the verb's own `params.limit`, so a caller can constrain
+/// this verb through the common budget contract like every other verb.
+///
+/// `as_of_valid_time` is rejected outright, never silently dropped: this lane
+/// (like the CLI's `eg query sessions`) has no temporal selectors in this
+/// slice, so honoring — or quietly ignoring — a caller's `as_of.valid_time`
+/// would answer a different, unrequested question (or a malformed one) with a
+/// misleading `200`.
+#[allow(clippy::too_many_lines)]
+fn handle_verb_agent_sessions_for_repo(
+    request_id: &str,
+    params: &serde_json::Value,
+    as_of_valid_time: Option<&str>,
+    budget_max_results: usize,
+    started: Instant,
+    budget: Option<Duration>,
+    state: &ServerState,
+) -> HttpResponse {
+    if as_of_valid_time.is_some() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::new(
+                ErrorCode::NotImplemented,
+                "as_of.valid_time is not supported for the 'agent_sessions_for_repo' verb; this lane has no temporal selectors",
+            ),
+        );
+    }
+
+    // `params.repo` is canonical; `params.repository_id` is the accepted alias.
+    // A present-but-null value counts as absent so a caller can send either key
+    // explicitly nulled without tripping the type check.
+    let (selector_key, selector) = match (params.get("repo"), params.get("repository_id")) {
+        (Some(serde_json::Value::Null) | None, Some(serde_json::Value::Null) | None) => {
+            return HttpResponse::error_with_id(request_id, ApiError::missing_field("params.repo"));
+        }
+        (Some(value), _) if !value.is_null() => ("params.repo", value.clone()),
+        (_, Some(alias)) => ("params.repository_id", alias.clone()),
+        _ => {
+            return HttpResponse::error_with_id(request_id, ApiError::missing_field("params.repo"));
+        }
+    };
+    // Type-check HERE, before the value is rewrapped under the canonical `repo`
+    // key: `resolve_verb_repo_selector` can only ever name `params.repo`, so a
+    // non-string sent as `params.repository_id` would be reported against a key
+    // the caller never used.
+    if !selector.is_string() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request_field(format!("{selector_key} must be a string"), selector_key),
+        );
+    }
+
+    let limit = match params.get("limit") {
+        None | Some(serde_json::Value::Null) => graph_query::SESSIONS_DEFAULT_LIMIT,
+        Some(value) => {
+            // A well-formed JSON integer can be negative, which is why this
+            // goes through `i128` rather than `as_u64()` alone (`as_u64()`
+            // returns `None` for `-1`, which would misreport it as "not an
+            // integer" instead of the true diagnosis, `invalid_limit`).
+            //
+            // KNOWN GAP, deliberately not solved here: an integer literal so
+            // large it overflows both `i64` and `u64` (e.g.
+            // `18446744073709551616`) is, once parsed, byte-for-byte
+            // indistinguishable from an ordinary fractional-shaped float that
+            // happens to hold a whole value (e.g. `1.0`, `2e0`) — both fall
+            // back to `serde_json::Number`'s internal `f64` storage with
+            // `is_i64()`/`is_u64()` false, and this crate does not enable
+            // `arbitrary_precision`, the only thing that preserves the
+            // original lexical distinction. An earlier version of this
+            // parser treated any whole-valued fallback float as an
+            // out-of-range integer to catch the former case, which silently
+            // misclassified the latter, far more common case (`1.0` is not
+            // `invalid_limit`; it is simply not the integer shape `limit`
+            // requires). Both now land in `bad_request` — an honest gap
+            // rather than a guess.
+            let requested: Option<i128> = value
+                .as_i64()
+                .map(i128::from)
+                .or_else(|| value.as_u64().map(i128::from));
+            let Some(requested) = requested else {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request_field("params.limit must be an integer", "params.limit"),
+                );
+            };
+            let max = graph_query::SESSIONS_MAX_LIMIT as i128;
+            let default = graph_query::SESSIONS_DEFAULT_LIMIT as u64;
+            if (1..=max).contains(&requested) {
+                usize::try_from(requested).expect("bounded by SESSIONS_MAX_LIMIT above")
+            } else {
+                let mut error = ApiError::new(
+                    ErrorCode::InvalidLimit,
+                    format!(
+                        "params.limit must be between 1 and {max} (default {default})",
+                        max = graph_query::SESSIONS_MAX_LIMIT
+                    ),
+                );
+                error.field = Some("params.limit".to_owned());
+                return HttpResponse::error_with_id(request_id, error);
+            }
+        }
+    };
+
+    let (records, _snapshot) = match load_cross_domain_records(state, started, budget) {
+        Ok(loaded) => loaded,
+        Err(error) => return HttpResponse::error_with_id(request_id, error),
+    };
+
+    let index = graph_query::RepositoryIndex::build(&records);
+    // Reuse the shared selector mapping so unknown/ambiguous selectors carry the
+    // same stable codes (and candidate list) every other repo-scoped verb emits.
+    let repository_id = match resolve_verb_repo_selector(&json!({ "repo": selector }), &index) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return HttpResponse::error_with_id(request_id, ApiError::missing_field("params.repo"));
+        }
+        Err(error) => return HttpResponse::error_with_id(request_id, error),
+    };
+
+    if let Err(error) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, error);
+    }
+
+    // Test-only instrumentation, compiled into debug builds only (never a
+    // release binary): when this env var is set to a valid millisecond
+    // count, sleep for that long right here, immediately after the
+    // pre-digest budget check above and before computing the digest below.
+    // This lets an integration test PROVE that a deadline crossed strictly
+    // between the two `check_query_budget` calls is still caught by the
+    // post-digest check further down, rather than relying on wall-clock
+    // calibration against a large fixture (whose timing can vary by
+    // machine and can't rule out the pre-digest check catching it first).
+    // Inert unless the env var is set, so it changes no production
+    // behavior; see `agent_sessions_for_repo_timeout_fires_only_after_pre_digest_check_passes`.
+    #[cfg(debug_assertions)]
+    if let Ok(delay_ms) = std::env::var("EGREGORE_TEST_SESSIONS_PRE_DIGEST_DELAY_MS")
+        && let Ok(ms) = delay_ms.parse::<u64>()
+    {
+        thread::sleep(Duration::from_millis(ms));
+    }
+
+    // The effective row cap honors the common budget contract: the smaller of
+    // the verb's own limit and the server-enforced `budget.max_results`. The
+    // core's `results_truncated` diagnostic then reports the cap that actually
+    // applied.
+    let effective_limit = limit.min(budget_max_results);
+    let digest = graph_query::sessions_for_repo(&records, &index, &repository_id, effective_limit);
+
+    // The digest traversal itself can cross the deadline on a large store, so
+    // re-check AFTER computing it: a caller with a tight `budget.timeout_ms`
+    // gets the documented `query_timeout`, never a late 200.
+    if let Err(error) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, error);
+    }
+    let repository = index.display_of(&repository_id);
+
+    HttpResponse::success(
+        Some(request_id),
+        200,
+        json!({
+            "verb": "agent_sessions_for_repo",
+            "repository_id": repository_id,
+            "repository": repository,
+            "disclaimer": graph_query::SESSIONS_DISCLAIMER,
+            "unsupported_count_kinds": graph_query::SESSIONS_UNSUPPORTED_COUNT_KINDS,
+            "sessions": digest.sessions,
+            "diagnostics": digest.diagnostics,
+        }),
+    )
+}
+
 // ── Main query handler ────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
@@ -10979,7 +11170,17 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
                 )
             }
         }
-        "drift" | "agent_sessions_for_repo" => HttpResponse::error_with_id(
+        // The daemon face of `eg query sessions <REPO>` (issue #112).
+        "agent_sessions_for_repo" => handle_verb_agent_sessions_for_repo(
+            &request_id,
+            &params,
+            as_of_valid_time.as_deref(),
+            limit,
+            started,
+            budget,
+            state,
+        ),
+        "drift" => HttpResponse::error_with_id(
             &request_id,
             ApiError::new(
                 ErrorCode::NotImplemented,

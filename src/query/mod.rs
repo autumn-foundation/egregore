@@ -58,6 +58,8 @@ mod path;
 mod who_imports;
 // Appended (issue #471); kept at the end to minimize cross-lane merge conflicts.
 mod who_constructs;
+// Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
+mod sessions;
 
 pub use as_of::*;
 pub use change_impact::*;
@@ -106,3 +108,5 @@ pub use path::*;
 pub use who_imports::*;
 // Appended (issue #471); kept at the end to minimize cross-lane merge conflicts.
 pub use who_constructs::*;
+// Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
+pub use sessions::*;

@@ -120,6 +120,7 @@ All error codes are snake\_case identifiers. String literals at call sites in
 | `internal_error`      | 500  | yes       | no               | all    |
 | `not_implemented`     | 501  | no        | no               | reserved |
 | `ambiguous_commit_prefix` | 400 | no     | no               | query (symbol_at_commit) |
+| `invalid_limit`       | 400  | no        | no               | query (agent_sessions_for_repo) |
 | `runtime_permissions_unsafe` | 500 | no | no               | daemon startup |
 | `token_rotated`       | 401  | yes       | no               | reserved |
 | `shutdown_in_progress`| 503  | yes       | yes              | all    |
@@ -323,7 +324,10 @@ Success result:
 ```
 
 Verb set: `get_records`, `symbol_by_name`, `symbol_at_commit`, `file_defines`,
-`drift_top_n`; reserved: `observations_for_symbol`, `agent_sessions_for_repo`.
+`drift_top_n`, `semantic_search`, `observations_for_symbol`,
+`criteria_for_task`, `agent_sessions_for_repo` (issue #112; see
+[`daemon-query.md`](daemon-query.md) for the full verb table); reserved:
+`drift`.
 
 ### `POST /v1/agents/register`
 
