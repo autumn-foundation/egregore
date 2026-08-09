@@ -2617,10 +2617,19 @@ impl Drop for RunningDaemon {
 }
 
 fn start_daemon(data_dir: &Path) -> RunningDaemon {
+    start_daemon_with_env(data_dir, &[])
+}
+
+/// Like `start_daemon`, but sets extra environment variables on the spawned
+/// `egregore daemon run` subprocess — used to arm debug-build-only test
+/// instrumentation (env vars gated behind `#[cfg(debug_assertions)]` in the
+/// daemon binary itself) without affecting the ordinary daemon start path.
+fn start_daemon_with_env(data_dir: &Path, envs: &[(&str, &str)]) -> RunningDaemon {
     fs::create_dir_all(data_dir).expect("should create data dir");
     let stdout_file = fs::File::create(data_dir.join("daemon.stdout")).expect("stdout file");
     let stderr_file = fs::File::create(data_dir.join("daemon.stderr")).expect("stderr file");
-    let child = ProcessCommand::new(assert_cmd::cargo::cargo_bin("egregore"))
+    let mut command = ProcessCommand::new(assert_cmd::cargo::cargo_bin("egregore"));
+    command
         .arg("daemon")
         .arg("run")
         .arg("--data-dir")
@@ -2628,9 +2637,11 @@ fn start_daemon(data_dir: &Path) -> RunningDaemon {
         .arg("--port")
         .arg("0")
         .stdout(stdout_file)
-        .stderr(stderr_file)
-        .spawn()
-        .expect("daemon should spawn");
+        .stderr(stderr_file);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let child = command.spawn().expect("daemon should spawn");
     let _ = read_running_metadata(data_dir);
     RunningDaemon {
         child: Some(child),
@@ -14015,179 +14026,103 @@ fn agent_sessions_for_repo_rejects_as_of_valid_time() {
     assert_eq!(body["error"]["code"], "not_implemented", "got {body}");
 }
 
-/// Seeds a session-heavy store: many `AgentSession`s, each with its own
-/// `Observation` citing the same repo/symbol. Large enough that building the
-/// digest (`Liveness`/`Adjacency`/per-session traversal, all `O(store size)`)
-/// takes measurable wall-clock time, unlike the small standard fixture.
-fn seed_bulk_agent_sessions_store(data_dir: &Path, session_count: usize) -> Vec<GraphRecord> {
-    let repo_id = stable_id(&["repository", "operator-override", SESSIONS_REPO_SELECTOR]);
-    let symbol_id = stable_id(&["node", "symbol", &repo_id, "src/lib.rs", "widget"]);
-    let mut records = vec![
-        GraphRecord::node(
-            repo_id,
-            NodeKind::Repository,
-            None,
-            None,
-            Some(SESSIONS_REPO_SELECTOR.to_owned()),
-            format!("Repository {SESSIONS_REPO_SELECTOR}"),
-        )
-        .with_domain("codegraph", SCHEMA_VERSION)
-        .with_repository_identity(RepositoryIdentityPayload {
-            identity_source: IdentitySource::OperatorOverride,
-            remote_url: None,
-            root_commit_sha: None,
-            canonical_path: None,
-            basename: SESSIONS_REPO_SELECTOR.to_owned(),
-        }),
-        GraphRecord::syntax_node(
-            symbol_id.clone(),
-            NodeKind::Symbol,
-            "src/lib.rs".to_owned(),
-            SourceSpan {
-                start_byte: 10,
-                end_byte: 40,
-                start_line: 10,
-                end_line: 20,
-            },
-            "widget".to_owned(),
-            "rust",
-            "Symbol widget".to_owned(),
-        ),
-    ];
-    for i in 0..session_count {
-        let key = format!("bulk-sess-{i}");
-        let session_id = agent_memory_stable_id(&["node", "agent_session", &key]);
-        let obs_id = agent_memory_stable_id(&["node", "observation", &key]);
-        let mut session = GraphRecord::node(
-            session_id.clone(),
-            NodeKind::AgentSession,
-            None,
-            None,
-            None,
-            format!("AgentSession {key}"),
-        )
-        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
-        let mut obs = GraphRecord::node(
-            obs_id.clone(),
-            NodeKind::Observation,
-            None,
-            None,
-            None,
-            format!("Observation {key}"),
-        )
-        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
-        for record in [&mut session, &mut obs] {
-            if let GraphRecord::Node {
-                agent_id,
-                session_id: node_session_id,
-                observed_at,
-                ingested_at,
-                confidence,
-                ..
-            } = record
-            {
-                *agent_id = Some("bulk-agent".to_owned());
-                *node_session_id = Some(key.clone());
-                *observed_at = Some("2026-01-01T00:00:00Z".to_owned());
-                *ingested_at = Some("2026-01-01T00:00:00Z".to_owned());
-                *confidence = Some("1.0".to_owned());
-            }
-        }
-        records.push(session);
-        records.push(obs);
-        records.push(GraphRecord::agent_memory_edge(
-            EdgeLabel::AuthoredBy,
-            obs_id.clone(),
-            session_id,
-            Some("1.0".to_owned()),
-            "observation authored by session".to_owned(),
-        ));
-        records.push(GraphRecord::agent_memory_edge(
-            EdgeLabel::MentionsSymbol,
-            obs_id,
-            symbol_id.clone(),
-            Some("1.0".to_owned()),
-            "observation mentions symbol".to_owned(),
-        ));
-    }
-    let mut sink = EmbeddedAletheiaSink::open(data_dir).expect("embedded store should open");
-    for record in &records {
-        sink.write_record(record)
-            .expect("bulk session fixture record should write");
-    }
-    sink.persist_indexes()
-        .expect("bulk session fixture should persist");
-    records
-}
-
 #[test]
-fn agent_sessions_for_repo_honours_query_timeout_on_a_large_store() {
+fn agent_sessions_for_repo_timeout_fires_only_after_pre_digest_check_passes() {
+    // Proves the SECOND (post-digest) `check_query_budget` call in
+    // `handle_verb_agent_sessions_for_repo` is load-bearing, not the first.
+    // A prior version of this verb checked the deadline once before calling
+    // `sessions_for_repo` and never again; removing that second check would
+    // not fail without a test like this one, since
+    // `daemon_semantic_search_honours_query_timeout` only exercises
+    // `handle_query`'s global `budget.timeout_ms == 0` short-circuit, which
+    // fires before ANY verb-specific code runs.
+    //
+    // An earlier version of this test tried to reach this proof by timing a
+    // large (800-session) store and deriving a "tight" deadline as a
+    // fraction of a measured warm-run total. That was flagged as
+    // insufficiently rigorous: nothing bounds `load_cross_domain_records` +
+    // `RepositoryIndex::build` (the PRE-digest work) staying under that
+    // fraction on every machine, so the derived deadline could not prove
+    // *which* of the two checks actually caught it — deleting the
+    // post-digest check might still leave the test green if the pre-digest
+    // check happened to fire first on a slower CI runner.
+    //
+    // This version removes the guesswork entirely via a debug-build-only
+    // delay hook (`EGREGORE_TEST_SESSIONS_PRE_DIGEST_DELAY_MS`, compiled out
+    // of release binaries) that sleeps immediately AFTER the pre-digest
+    // check and BEFORE computing the digest. Against the small standard
+    // fixture (pre-digest work: sub-millisecond) with a deadline set well
+    // above realistic pre-digest time but well below the injected delay,
+    // the pre-digest check is deterministically guaranteed to pass — so a
+    // 408 can only come from the post-digest check. Removing that check
+    // would deterministically flip this test to 200 on every machine.
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
-    // Large enough that Liveness/Adjacency construction plus the per-session
-    // traversal inside `sessions_for_repo` take measurable wall-clock time —
-    // proving the deadline is actually enforced around digest construction,
-    // not merely accepted as an unused parameter. A prior version of this
-    // verb checked the deadline once before calling `sessions_for_repo` and
-    // never again; removing that second check would not fail without this
-    // test, since the earlier `daemon_semantic_search_honours_query_timeout`
-    // test only exercises `handle_query`'s global `budget.timeout_ms == 0`
-    // short-circuit, which fires before ANY verb-specific code runs.
-    //
-    // A FIXED small timeout (e.g. `1`) risks tripping the PRE-digest budget
-    // check instead — `load_cross_domain_records` + `RepositoryIndex::build`
-    // also scale with store size, since they scan the exact same `records`
-    // slice `sessions_for_repo` does. Rather than guess a machine-independent
-    // constant, this test SELF-CALIBRATES: it first times a full, successful
-    // run against THIS store on THIS machine, then re-runs with a deadline
-    // set to a small fraction of that measured total. `sessions_for_repo`
-    // does substantially more per-record work than the single linear
-    // `RepositoryIndex::build` pass it is compared against (per-session
-    // membership BFS, time-bound/run/task construction, and the
-    // store-wide `unlinked_stamped_records` union), so pre-digest work is a
-    // small share of the total — a generous margin, not a razor's edge.
-    seed_bulk_agent_sessions_store(&data_dir, 800);
-    let mut daemon = start_daemon(&data_dir);
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon_with_env(
+        &data_dir,
+        &[("EGREGORE_TEST_SESSIONS_PRE_DIGEST_DELAY_MS", "150")],
+    );
     let metadata = read_metadata(&data_dir);
 
-    let warm_started = Instant::now();
-    let warm_res = agent_sessions_query(
-        &metadata,
-        "sessions-timeout-calibration",
-        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR }),
-    );
-    let total = warm_started.elapsed();
-    assert!(
-        warm_res.starts_with("HTTP/1.1 200"),
-        "the calibration run itself must succeed, got {warm_res}"
-    );
-
-    // A tenth of the measured total, floored at 2ms (never zero — a zero
-    // budget trips `handle_query`'s GLOBAL short-circuit before any
-    // verb-specific code runs, which is not what this test exercises).
-    let tight_timeout_ms = (total.as_millis() / 10).max(2);
+    // 30ms comfortably exceeds real pre-digest work on the tiny fixture
+    // (load + index-build over a handful of records) while sitting well
+    // below the 150ms injected delay, so the deadline is crossed strictly
+    // between the two checks, never before the first one runs.
     let res = http_json(
         &metadata,
         "POST",
         "/v1/query",
         &serde_json::json!({
-            "request_id": "sessions-large-timeout",
+            "request_id": "sessions-pre-digest-delay-timeout",
             "agent_id": "sessions-test-agent",
             "verb": "agent_sessions_for_repo",
             "params": { "repo": SESSIONS_REPO_SELECTOR },
-            "budget": { "timeout_ms": tight_timeout_ms }
+            "budget": { "timeout_ms": 30 }
         }),
     );
     daemon.stop();
 
     assert!(
         res.starts_with("HTTP/1.1 408"),
-        "a {tight_timeout_ms}ms budget (1/10 of the {total:?} warm run) \
-         must time out, got {res}"
+        "a deadline crossed only by the post-pre-digest-check delay must \
+         still time out, got {res}"
     );
     let body = response_json(&res);
     assert_eq!(
         body["error"]["code"], "query_timeout",
         "timeout must use the query_timeout code, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_pre_digest_delay_hook_does_not_fire_without_the_env_var() {
+    // Sanity check on the test hook itself: with the SAME 150ms delay value
+    // never set, an ordinary generous-timeout request against the same
+    // fixture succeeds quickly — the delay is opt-in per request/process,
+    // never an ambient slowdown that could mask other timing bugs.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let started = Instant::now();
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-no-delay-hook",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR }),
+    );
+    let elapsed = started.elapsed();
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "without the delay hook armed, a normal query must succeed, got {res}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "without the delay hook armed, the query must return fast \
+         (took {elapsed:?}) — the hook must be opt-in, not ambient"
     );
 }

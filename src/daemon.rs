@@ -10943,6 +10943,24 @@ fn handle_verb_agent_sessions_for_repo(
         return HttpResponse::error_with_id(request_id, error);
     }
 
+    // Test-only instrumentation, compiled into debug builds only (never a
+    // release binary): when this env var is set to a valid millisecond
+    // count, sleep for that long right here, immediately after the
+    // pre-digest budget check above and before computing the digest below.
+    // This lets an integration test PROVE that a deadline crossed strictly
+    // between the two `check_query_budget` calls is still caught by the
+    // post-digest check further down, rather than relying on wall-clock
+    // calibration against a large fixture (whose timing can vary by
+    // machine and can't rule out the pre-digest check catching it first).
+    // Inert unless the env var is set, so it changes no production
+    // behavior; see `agent_sessions_for_repo_timeout_fires_only_after_pre_digest_check_passes`.
+    #[cfg(debug_assertions)]
+    if let Ok(delay_ms) = std::env::var("EGREGORE_TEST_SESSIONS_PRE_DIGEST_DELAY_MS")
+        && let Ok(ms) = delay_ms.parse::<u64>()
+    {
+        thread::sleep(Duration::from_millis(ms));
+    }
+
     // The effective row cap honors the common budget contract: the smaller of
     // the verb's own limit and the server-enforced `budget.max_results`. The
     // core's `results_truncated` diagnostic then reports the cap that actually
