@@ -44,6 +44,14 @@ pub const MAX_RUNS_PER_SESSION: usize = 20;
 /// Maximum `tasks` entries carried on one row before `tasks_truncated` fires.
 pub const MAX_TASKS_PER_SESSION: usize = 20;
 
+/// Maximum session IDs listed on one `unresolved_repository_scope` diagnostic.
+///
+/// Unlike row truncation, this list is NOT bounded by
+/// `--limit`/`budget.max_results` (it describes sessions excluded from every
+/// digest, not rows in this one), so a store with many not-yet-linked
+/// imported sessions could otherwise serialize an unbounded payload.
+pub const MAX_UNRESOLVED_SESSION_IDS: usize = 200;
+
 /// The standing epistemic disclaimer every sessions answer carries verbatim,
 /// on both the CLI envelope and the daemon verb result.
 pub const SESSIONS_DISCLAIMER: &str = "rows are recorded agent-authored memory and project-state facts; outcomes, observations, decisions, failures, and counts are agent claims, never verification, proof of task completion, or proof that code works; an absent citation is not evidence that no work happened; task status is a recorded project-domain fact, not a correctness claim";
@@ -467,8 +475,22 @@ pub fn sessions_for_repo(
         unresolved.sort_unstable();
         let count = unresolved.len() as u64;
         let mut diagnostic = SessionsDiagnostic::bare("unresolved_repository_scope");
+        // A store with many imported-but-not-yet-`link-evidence`d sessions
+        // (the documented pre-linking state) can carry an unbounded number
+        // of unresolved sessions, unrelated to `--limit`/`budget.max_results`
+        // (which cap ROWS, not this envelope-level diagnostic). Cap the
+        // listed IDs the same way `runs`/`tasks` cap theirs, so a one-row
+        // query cannot allocate and serialize an O(total sessions) payload;
+        // `count` always stays the TRUE total, and `returned` discloses when
+        // the list itself was capped.
+        let returned = count.min(MAX_UNRESOLVED_SESSION_IDS as u64);
+        unresolved.truncate(MAX_UNRESOLVED_SESSION_IDS);
         diagnostic.session_record_ids = Some(unresolved);
         diagnostic.count = Some(count);
+        if returned < count {
+            diagnostic.returned = Some(returned);
+            diagnostic.limit = Some(MAX_UNRESOLVED_SESSION_IDS as u64);
+        }
         diagnostics.push(diagnostic);
     }
 
@@ -2004,6 +2026,60 @@ mod tests {
             out_a.sessions[0].record_counts.observation, 1,
             "repo A's row counts only its OWN member (O_a): {:?}",
             out_a.sessions[0]
+        );
+    }
+
+    #[test]
+    fn unresolved_repository_scope_ids_are_capped_with_the_true_count_disclosed() {
+        // A store with many imported-but-not-yet-`link-evidence`d sessions
+        // (the documented pre-linking state) must not serialize an unbounded
+        // `session_record_ids` list: it is capped at
+        // MAX_UNRESOLVED_SESSION_IDS, with `count` staying the TRUE total and
+        // `returned`/`limit` disclosing the cap.
+        let repo = repository("repo-a");
+        let repo_id = repo.id().to_owned();
+        let total = MAX_UNRESOLVED_SESSION_IDS + 37;
+        let mut records = vec![repo];
+        for i in 0..total {
+            records.push(memory(
+                NodeKind::AgentSession,
+                &format!("unresolved-{i}"),
+                Some("2026-01-01T00:00:00Z"),
+                "S",
+            ));
+        }
+        let index = RepositoryIndex::build(&records);
+        let out = sessions_for_repo(&records, &index, &repo_id, SESSIONS_DEFAULT_LIMIT);
+
+        assert!(out.sessions.is_empty(), "no session resolves: {out:?}");
+        let diagnostic = out
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "unresolved_repository_scope")
+            .unwrap_or_else(|| panic!("must disclose the unresolved sessions: {out:?}"));
+        assert_eq!(
+            diagnostic.count,
+            Some(total as u64),
+            "count is the TRUE total, uncapped: {diagnostic:?}"
+        );
+        assert_eq!(
+            diagnostic
+                .session_record_ids
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            MAX_UNRESOLVED_SESSION_IDS,
+            "the LIST is capped: {diagnostic:?}"
+        );
+        assert_eq!(
+            diagnostic.returned,
+            Some(MAX_UNRESOLVED_SESSION_IDS as u64),
+            "returned discloses the capped count: {diagnostic:?}"
+        );
+        assert_eq!(
+            diagnostic.limit,
+            Some(MAX_UNRESOLVED_SESSION_IDS as u64),
+            "limit names the cap that applied: {diagnostic:?}"
         );
     }
 }

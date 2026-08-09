@@ -14014,3 +14014,152 @@ fn agent_sessions_for_repo_rejects_as_of_valid_time() {
     assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
     assert_eq!(body["error"]["code"], "not_implemented", "got {body}");
 }
+
+/// Seeds a session-heavy store: many `AgentSession`s, each with its own
+/// `Observation` citing the same repo/symbol. Large enough that building the
+/// digest (`Liveness`/`Adjacency`/per-session traversal, all `O(store size)`)
+/// takes measurable wall-clock time, unlike the small standard fixture.
+fn seed_bulk_agent_sessions_store(data_dir: &Path, session_count: usize) -> Vec<GraphRecord> {
+    let repo_id = stable_id(&["repository", "operator-override", SESSIONS_REPO_SELECTOR]);
+    let symbol_id = stable_id(&["node", "symbol", &repo_id, "src/lib.rs", "widget"]);
+    let mut records = vec![
+        GraphRecord::node(
+            repo_id,
+            NodeKind::Repository,
+            None,
+            None,
+            Some(SESSIONS_REPO_SELECTOR.to_owned()),
+            format!("Repository {SESSIONS_REPO_SELECTOR}"),
+        )
+        .with_domain("codegraph", SCHEMA_VERSION)
+        .with_repository_identity(RepositoryIdentityPayload {
+            identity_source: IdentitySource::OperatorOverride,
+            remote_url: None,
+            root_commit_sha: None,
+            canonical_path: None,
+            basename: SESSIONS_REPO_SELECTOR.to_owned(),
+        }),
+        GraphRecord::syntax_node(
+            symbol_id.clone(),
+            NodeKind::Symbol,
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 10,
+                end_byte: 40,
+                start_line: 10,
+                end_line: 20,
+            },
+            "widget".to_owned(),
+            "rust",
+            "Symbol widget".to_owned(),
+        ),
+    ];
+    for i in 0..session_count {
+        let key = format!("bulk-sess-{i}");
+        let session_id = agent_memory_stable_id(&["node", "agent_session", &key]);
+        let obs_id = agent_memory_stable_id(&["node", "observation", &key]);
+        let mut session = GraphRecord::node(
+            session_id.clone(),
+            NodeKind::AgentSession,
+            None,
+            None,
+            None,
+            format!("AgentSession {key}"),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
+        let mut obs = GraphRecord::node(
+            obs_id.clone(),
+            NodeKind::Observation,
+            None,
+            None,
+            None,
+            format!("Observation {key}"),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
+        for record in [&mut session, &mut obs] {
+            if let GraphRecord::Node {
+                agent_id,
+                session_id: node_session_id,
+                observed_at,
+                ingested_at,
+                confidence,
+                ..
+            } = record
+            {
+                *agent_id = Some("bulk-agent".to_owned());
+                *node_session_id = Some(key.clone());
+                *observed_at = Some("2026-01-01T00:00:00Z".to_owned());
+                *ingested_at = Some("2026-01-01T00:00:00Z".to_owned());
+                *confidence = Some("1.0".to_owned());
+            }
+        }
+        records.push(session);
+        records.push(obs);
+        records.push(GraphRecord::agent_memory_edge(
+            EdgeLabel::AuthoredBy,
+            obs_id.clone(),
+            session_id,
+            Some("1.0".to_owned()),
+            "observation authored by session".to_owned(),
+        ));
+        records.push(GraphRecord::agent_memory_edge(
+            EdgeLabel::MentionsSymbol,
+            obs_id,
+            symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "observation mentions symbol".to_owned(),
+        ));
+    }
+    let mut sink = EmbeddedAletheiaSink::open(data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record)
+            .expect("bulk session fixture record should write");
+    }
+    sink.persist_indexes()
+        .expect("bulk session fixture should persist");
+    records
+}
+
+#[test]
+fn agent_sessions_for_repo_honours_query_timeout_on_a_large_store() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    // Large enough that Liveness/Adjacency construction plus the per-session
+    // traversal inside `sessions_for_repo` take measurable wall-clock time —
+    // proving the deadline is actually enforced around digest construction,
+    // not merely accepted as an unused parameter. A prior version of this
+    // verb checked the deadline once before calling `sessions_for_repo` and
+    // never again; removing that second check would not fail without this
+    // test, since the earlier `daemon_semantic_search_honours_query_timeout`
+    // test only exercises `handle_query`'s global `budget.timeout_ms == 0`
+    // short-circuit, which fires before ANY verb-specific code runs.
+    seed_bulk_agent_sessions_store(&data_dir, 400);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // Nonzero (never trips the global `timeout_ms == 0` shortcut in
+    // `handle_query`) but far below what building this digest takes.
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sessions-large-timeout",
+            "agent_id": "sessions-test-agent",
+            "verb": "agent_sessions_for_repo",
+            "params": { "repo": SESSIONS_REPO_SELECTOR },
+            "budget": { "timeout_ms": 1 }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 408"),
+        "a 1ms budget against a 400-session store must time out, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "query_timeout",
+        "timeout must use the query_timeout code, got {body}"
+    );
+}

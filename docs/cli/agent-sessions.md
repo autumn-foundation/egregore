@@ -200,7 +200,7 @@ An out-of-vocabulary or absent task status is reported as `"unknown"` with
 | Code | Meaning |
 |------|---------|
 | `no_sessions` | The repository resolved but has zero scoped sessions — an explicit empty success (exit 0), never a fabricated row |
-| `unresolved_repository_scope` | Sessions with no derivable repository, listed by record ID, excluded from every digest. The same list appears in every repository's digest by design — those sessions belong to no repository, and the listed values are opaque handles |
+| `unresolved_repository_scope` | Sessions with no derivable repository, listed by record ID, excluded from every digest. The same list appears in every repository's digest by design — those sessions belong to no repository, and the listed values are opaque handles. The list is capped at 200 IDs (unrelated to `--limit`, which bounds rows, not this envelope-level diagnostic); `count` always names the TRUE total, with `returned`/`limit` present only when the cap fired |
 | `unlinked_session_stamped_records` | Live records stamped with a scoped session's `session_id` string but reachable by no edge path |
 | `results_truncated` / `runs_truncated` / `tasks_truncated` | A cap fired; carries `matched`, `returned`, `limit` |
 | `outcome_not_enum_shaped` | A run summary claimed an outcome but did not match the producer template; the malformed bytes are never echoed |
