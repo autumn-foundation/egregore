@@ -14056,12 +14056,30 @@ fn agent_sessions_for_repo_timeout_fires_only_after_pre_digest_check_passes() {
     // the pre-digest check is deterministically guaranteed to pass — so a
     // 408 can only come from the post-digest check. Removing that check
     // would deterministically flip this test to 200 on every machine.
+    //
+    // A well-founded follow-up: the assumption above ("pre-digest work
+    // finishes within 30ms") is exactly the kind of machine-dependent claim
+    // the calibration approach was rejected for making. A slow or
+    // contended CI worker could in principle exceed 30ms of REAL pre-digest
+    // work and get 408 from the FIRST check, never reaching the delay hook
+    // at all — which would leave this test green even with the
+    // post-digest check deleted. Closing that gap needs a signal that the
+    // request actually passed through the delay, not just the final status
+    // code: this test therefore also asserts the request's wall-clock
+    // duration is at least close to the injected delay. A 408 returned by
+    // the pre-digest check (before the delay hook ever runs) would return
+    // in a few milliseconds, not 150ms+ — so this positively proves
+    // execution reached and completed the delay before the timeout fired.
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
     seed_agent_sessions_store(&data_dir);
+    let delay_ms: u64 = 150;
     let mut daemon = start_daemon_with_env(
         &data_dir,
-        &[("EGREGORE_TEST_SESSIONS_PRE_DIGEST_DELAY_MS", "150")],
+        &[(
+            "EGREGORE_TEST_SESSIONS_PRE_DIGEST_DELAY_MS",
+            &delay_ms.to_string(),
+        )],
     );
     let metadata = read_metadata(&data_dir);
 
@@ -14069,6 +14087,7 @@ fn agent_sessions_for_repo_timeout_fires_only_after_pre_digest_check_passes() {
     // (load + index-build over a handful of records) while sitting well
     // below the 150ms injected delay, so the deadline is crossed strictly
     // between the two checks, never before the first one runs.
+    let started = Instant::now();
     let res = http_json(
         &metadata,
         "POST",
@@ -14081,7 +14100,21 @@ fn agent_sessions_for_repo_timeout_fires_only_after_pre_digest_check_passes() {
             "budget": { "timeout_ms": 30 }
         }),
     );
+    let elapsed = started.elapsed();
     daemon.stop();
+
+    // A margin below the full 150ms tolerates normal scheduling jitter
+    // around the sleep call while still being far above anything a
+    // pre-digest-only failure (a few milliseconds) could produce — so this
+    // assertion cannot pass unless execution actually reached and ran the
+    // delay hook, proving the pre-digest check passed first.
+    assert!(
+        elapsed >= Duration::from_millis(120),
+        "the request returned in {elapsed:?}, too fast to have passed \
+         through the {delay_ms}ms delay hook — this means the PRE-digest \
+         check (not the post-digest one under test) is what produced the \
+         response, so this run does not prove what it claims"
+    );
 
     assert!(
         res.starts_with("HTTP/1.1 408"),
