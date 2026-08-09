@@ -81,6 +81,8 @@ mod who_imports;
 mod who_constructs;
 // Appended (issue #248); kept at the end to minimize cross-lane merge conflicts.
 mod forget_repo;
+// Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
+mod sessions;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
@@ -160,6 +162,8 @@ pub(crate) use who_constructs::*;
 // Appended (issue #248); kept at the end to minimize cross-lane merge conflicts.
 #[cfg(feature = "embedded-aletheiadb")]
 pub(crate) use forget_repo::*;
+// Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
+pub(crate) use sessions::*;
 
 use std::{
     collections::BTreeMap,
@@ -3280,6 +3284,61 @@ pub(crate) enum QuerySubcommand {
         /// exclusive with --at-head / --at / --as-of.
         #[arg(long)]
         all_history: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Digest the recent agent sessions recorded for one repository (issue #112).
+    ///
+    /// Answers "what did agents recently do in this repository?" from records
+    /// that already exist: one row per live `AgentSession` whose members cite
+    /// code in the selected repository, ordered by last activity descending,
+    /// carrying the agent/session handles, time bounds, run outcomes,
+    /// referenced tasks, and per-kind record counts.
+    ///
+    /// Trust separation is explicit and never collapsed: every session row is
+    /// `agent_authored` — an agent CLAIM, never verification, never proof a
+    /// task completed or that code works — while each referenced task carries
+    /// `project_state`, the recorded project fact, passed through verbatim and
+    /// never re-judged. An absent citation is not evidence that no work
+    /// happened. Session summaries never leave the store verbatim: rows carry a
+    /// structured label plus a BLAKE3 handle.
+    ///
+    /// Membership is EDGE-DERIVED only (`AUTHORED_BY` / `SESSION_OF`, at most
+    /// three hops); a record merely stamped with a matching `session_id` string
+    /// is NOT a member and is reported once under
+    /// `unlinked_session_stamped_records`. Repository scope comes from member
+    /// citations (`MENTIONS_SYMBOL` / `TOUCHED_FILE` / `OBSERVES` /
+    /// `FAILED_ON`, as graph edges or on-node evidence links) and from one hop
+    /// through a referenced task; a session with no resolvable repository is
+    /// excluded from every digest and listed under
+    /// `unresolved_repository_scope`, never silently dropped.
+    ///
+    /// This slice has no temporal selectors (`--at` / `--as-of`) and no corpus
+    /// flags: the answer is the current recorded state. Read-only over
+    /// `--graph` / `--data-dir` (the embedded store is read through a throwaway
+    /// copy) and byte-identical across runs.
+    ///
+    /// Exit codes:
+    ///   0 — rows returned, or an explicit empty digest (`no_sessions`).
+    ///   1 — unknown / ambiguous repository selector, or a `--limit` outside
+    ///       1..=200 (machine-readable JSON on stderr).
+    ///
+    /// Documented in `docs/cli/agent-sessions.md`.
+    Sessions {
+        /// Repository selector (record ID, basename, remote URL, root commit
+        /// SHA, canonical path, or final-path-segment shorthand).
+        repo: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Maximum session rows returned (default 20, max 200). Values outside
+        /// 1..=200 are rejected with an `invalid_limit` diagnostic.
+        #[arg(long, default_value_t = query::SESSIONS_DEFAULT_LIMIT)]
+        limit: usize,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -7041,6 +7100,55 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 all_history,
                 format,
             )
+        }
+        // Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::Sessions {
+            repo,
+            graph,
+            data_dir,
+            limit,
+            format,
+        } => {
+            // Validate the limit BEFORE touching the store so a malformed bound
+            // fails fast with a machine-readable diagnostic and never reads a
+            // byte. Wrapped in the `{ok, error}` envelope (issue #112 pins the
+            // shape) so a caller can distinguish it from the bare selector
+            // diagnostics `resolve_repo_scope` emits.
+            if limit == 0 || limit > query::SESSIONS_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "invalid_limit",
+                        "limit": limit,
+                        "min": 1,
+                        "max": query::SESSIONS_MAX_LIMIT,
+                        "message": format!(
+                            "--limit must be between 1 and {} (default {})",
+                            query::SESSIONS_MAX_LIMIT,
+                            query::SESSIONS_DEFAULT_LIMIT
+                        ),
+                    }
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            // Strictly read-only lane: `--data-dir` reads a throwaway copy so
+            // the live store stays byte-for-byte untouched.
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            // The selector is REQUIRED here (a digest is always repo-scoped);
+            // `resolve_repo_scope` exits 1 with the shared stable diagnostics
+            // for an unknown or ambiguous selector.
+            let repository_id = resolve_repo_scope(&index, Some(repo.as_str()))
+                .expect("a required selector always resolves or exits");
+            query_sessions_cmd(&records, &index, &repository_id, limit, format)
         }
     }
 }

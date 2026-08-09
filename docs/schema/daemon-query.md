@@ -145,9 +145,9 @@ Error responses follow the standard envelope in
 | `drift_top_n`           | implemented | `limit?: u64` (default 10, max 100), `repo?: string` | SemanticDrift records ranked by score |
 | `semantic_search`       | implemented | `query_vector: [f32]`, `limit?: u64` (default 10, max 100), `repo?: string` | Natural-language code search over the shared store's embedding index. Requires the `embeddings` feature. |
 | `drift`                 | reserved    | same as `drift_top_n`         | Reserved for issue #10; returns `not_implemented` until wired. |
-| `observations_for_symbol` | reserved  | —                             | Returns `not_implemented` |
-| `agent_sessions_for_repo` | reserved  | —                             | Returns `not_implemented` |
-| `criteria_for_task`      | reserved  | `task_id: string`              | Future project-graph query over [`docs/schema/project-graph.md`](project-graph.md); returns `not_implemented` until wired. |
+| `observations_for_symbol` | implemented | `name: string`, `supersession?: string` | Cross-domain symbol context (issue #86); parity with `eg query context`. |
+| `agent_sessions_for_repo` | implemented | `repo: string` (alias `repository_id`), `limit?: u64` (default 20, max 200) | Repo-scoped recency digest of recent agent sessions (issue #112); daemon face of `eg query sessions`. |
+| `criteria_for_task`      | implemented | `task_id: string`            | Task acceptance-criteria/evidence context over [`docs/schema/project-graph.md`](project-graph.md); daemon face of `eg query task`. |
 
 Partial-name symbol matching (`eg query symbols <PATTERN>`, issue #102) is
 **CLI-only in this slice**: the daemon exposes no substring/glob symbol verb,
@@ -467,6 +467,64 @@ surfaced by the shared discovery contract in
 When to reach for this verb vs. structural reads is covered in
 [`docs/cli/semantic-search-guidance.md`](../cli/semantic-search-guidance.md),
 including how this slice relates to issue #58's relevance gate.
+
+### `agent_sessions_for_repo`
+
+Repo-scoped, recency-ordered digest of the recent agent sessions recorded for
+one repository (issue #112) — the daemon face of `eg query sessions <REPO>`.
+The formerly reserved verb, now implemented. The full behavioral contract
+(membership, scope derivation, ordering, run-outcome honesty, redaction) lives
+in [`docs/cli/agent-sessions.md`](../cli/agent-sessions.md); the daemon result
+serializes the identical core digest value the CLI envelope carries, so the
+two transports cannot drift.
+
+**Params:**
+```json
+{ "repo": "repo-a", "limit": 20 }
+```
+
+| Field   | Type   | Required | Notes |
+|---------|--------|----------|-------|
+| `repo`  | string | yes      | Repository selector (record ID, basename, remote URL, root commit SHA, canonical path, or final-segment shorthand). `repository_id` is accepted as an alias; `repo` wins when both are present. |
+| `limit` | u64    | no       | Session-row ceiling. Default 20, capped at 200. |
+
+**Result shape** (parity with the `eg query sessions` envelope):
+```json
+{
+  "verb": "agent_sessions_for_repo",
+  "repository_id": "codegraph:v8:...",
+  "repository": "repo-a",
+  "disclaimer": "rows are recorded agent-authored memory and project-state facts; ...",
+  "unsupported_count_kinds": ["lesson"],
+  "sessions": [ /* SessionRow objects, ordered by last_activity desc */ ],
+  "diagnostics": [ /* sorted machine-readable diagnostics */ ]
+}
+```
+
+Every session row is trust-labeled `agent_authored` (an agent claim, never
+verification); referenced tasks carry `project_state`. Rows are allow-list
+only — record IDs, handles, time fields, status/outcome enums, bounded counts,
+structured summary labels, and BLAKE3 hashes; never raw transcript text,
+command output, patch hunks, tool-call arguments, or task titles.
+
+**Determinism:** for a fixed store, repeated calls return byte-identical
+`sessions` and `diagnostics`, matching the CLI answer over the same records.
+
+**Diagnostics:**
+
+| Condition | Code | HTTP |
+|-----------|------|------|
+| Both `params.repo` and `params.repository_id` absent | `missing_field` | 400 |
+| `limit` not an integer or outside 1..=200 | `bad_request` | 400 |
+| Selector matches no repository | `unknown_repository_selector` | 400 |
+| Selector matches several repositories | `ambiguous_repository_selector` | 400 |
+| Budget `timeout_ms` elapsed | `query_timeout` | 408 |
+| Missing/invalid bearer token | `unauthorized` | 401 |
+
+A repository that resolves but has **zero** scoped sessions is a successful
+`200` carrying `sessions: []` plus a `no_sessions` diagnostic — an empty digest
+is an answer, never a `404` and never a fabricated row. Sessions with no
+derivable repository scope surface under `unresolved_repository_scope`.
 
 ---
 

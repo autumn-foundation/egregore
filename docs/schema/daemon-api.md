@@ -323,7 +323,9 @@ Success result:
 ```
 
 Verb set: `get_records`, `symbol_by_name`, `symbol_at_commit`, `file_defines`,
-`drift_top_n`; reserved: `observations_for_symbol`, `agent_sessions_for_repo`.
+`drift_top_n`, `semantic_search`, `observations_for_symbol`,
+`criteria_for_task`, `agent_sessions_for_repo` (issue #112; see
+[`daemon-query.md`](daemon-query.md) for the full verb table).
 
 ### `POST /v1/agents/register`
 

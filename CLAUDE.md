@@ -414,6 +414,11 @@ cargo run -- query who-constructs Deal --graph history.graph.jsonl --all-history
 cargo run -- query who-constructs Lonely --graph graph.jsonl          # exit 2 (no_match: zero constructors)
 cargo run -- query who-constructs "" --graph graph.jsonl             # exit 1 (malformed_type_handle)
 
+# Recency-ordered digest of one repo's recent agent sessions (issue #112)
+cargo run -- query sessions repo-a --graph graph.jsonl               # exit 0 (rows, or explicit no_sessions)
+cargo run -- query sessions acme/widget --data-dir .egregore --limit 10
+cargo run -- query sessions no-such-repo --graph graph.jsonl         # exit 1 (unknown_repository_selector)
+
 # Symbol- and file-level deltas across a commit range (issue #118)
 cargo run -- query deltas <base_sha> <head_sha> --graph history.graph.jsonl  # exit 0 on match
 cargo run -- query deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
@@ -755,6 +760,33 @@ Exit 0 on a match, exit 2 (`no_match`) for a well-formed type with zero live
 constructors. Rows are construction-site LEADS and `e0063_risk` an actionable
 signal, never proof a specific field addition breaks. See
 `docs/cli/who-constructs.md`.
+
+`eg query sessions <repo>` returns a recency-ordered digest of the recent agent sessions
+recorded for one repository (issue #112) — the resume-a-repo lane, and the lighting-up of the
+formerly reserved `agent_sessions_for_repo` daemon verb (both transports serialize the SAME
+core digest, so they cannot drift). One row per live `AgentSession` whose members cite code in
+the selected repo: agent/session handles, derived time bounds (min/max member `observed_at`;
+sessions have no native time fields), run outcome/exit_reason parsed ONLY from the exact
+producer template `AgentRun outcome=<X> exit_reason=<Y>` with a charset gate (anything else is
+`outcome_unrecorded`, zero runs is `run_absent` — never fabricated), referenced Tasks with
+their validated `status` (labeled `project_state`; rows themselves are `agent_authored` — an
+agent CLAIM, never verification or proof of completion), and distinct-record-ID counts of
+Observation/Decision/Failure (`lesson` is always `null` + disclosed under
+`unsupported_count_kinds` — no `Lesson` NodeKind exists). Membership is EDGE-DERIVED only
+(`AUTHORED_BY`/`SESSION_OF`, ≤3 hops, both canonical and legacy trajectory shapes); a record
+merely stamped with a matching `session_id` string is NOT a member
+(`unlinked_session_stamped_records` diagnostic). Repo scope is derived, never guessed: member
+code citations (`MENTIONS_SYMBOL`/`TOUCHED_FILE`/`OBSERVES`/`FAILED_ON`, edge records AND
+on-node evidence links) plus one `REFERENCES_TASK`→Task→code hop, all resolved through
+`RepositoryIndex::owner_of`; a session with no derivable repo is excluded from every digest
+under `unresolved_repository_scope`, and cross-repo sessions truthfully appear in each repo's
+digest with the full `repository_scope` set. Ordering: `last_activity` DESC (absent sorts
+last), tie-break session record ID ASC; `--limit` default 20 max 200 truncates after ordering
+with `results_truncated`. Output is allow-list only (IDs, handles, enums, bounded counts,
+structured summary labels + BLAKE3 hashes — never raw transcript/summary/task-title text),
+strictly read-only (`--data-dir` reads a throwaway copy), byte-identical across runs, exit 0
+for rows or the explicit `no_sessions` empty. No temporal selectors in this slice. See
+`docs/cli/agent-sessions.md`.
 
 `eg query deltas <base> <head>` returns the observed structural deltas between two commit
 handles (full SHA or unique prefix) from a `scan-history` graph or embedded store, grouped by

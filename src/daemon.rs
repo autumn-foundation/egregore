@@ -10800,6 +10800,100 @@ fn handle_verb_criteria_for_task(
     )
 }
 
+// ── agent_sessions_for_repo (issue #112) ─────────────────────────────────────
+
+/// Daemon face of `eg query sessions <REPO>`.
+///
+/// Resolves the repository selector (`params.repo`, with `params.repository_id`
+/// accepted as an alias — `repo` wins when both are present), then returns the
+/// SAME digest the CLI prints: `sessions` and `diagnostics` are serialized from
+/// the identical `graph_query::SessionsDigest` value, so the two transports
+/// cannot drift. Zero sessions is an explicit 200 carrying a `no_sessions`
+/// diagnostic, never a 404 — an empty digest is an answer, not a miss.
+fn handle_verb_agent_sessions_for_repo(
+    request_id: &str,
+    params: &serde_json::Value,
+    started: Instant,
+    budget: Option<Duration>,
+    state: &ServerState,
+) -> HttpResponse {
+    // `params.repo` is canonical; `params.repository_id` is the accepted alias.
+    // A present-but-null value counts as absent so a caller can send either key
+    // explicitly nulled without tripping the type check.
+    let selector = match (params.get("repo"), params.get("repository_id")) {
+        (Some(serde_json::Value::Null) | None, Some(serde_json::Value::Null) | None) => {
+            return HttpResponse::error_with_id(request_id, ApiError::missing_field("params.repo"));
+        }
+        (Some(value), _) if !value.is_null() => value.clone(),
+        (_, Some(alias)) => alias.clone(),
+        _ => {
+            return HttpResponse::error_with_id(request_id, ApiError::missing_field("params.repo"));
+        }
+    };
+
+    let limit = match params.get("limit") {
+        None | Some(serde_json::Value::Null) => graph_query::SESSIONS_DEFAULT_LIMIT,
+        Some(value) => {
+            let Some(requested) = value.as_u64() else {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request_field("params.limit must be an integer", "params.limit"),
+                );
+            };
+            let max = graph_query::SESSIONS_MAX_LIMIT as u64;
+            match usize::try_from(requested) {
+                Ok(limit) if (1..=graph_query::SESSIONS_MAX_LIMIT).contains(&limit) => limit,
+                _ => {
+                    return HttpResponse::error_with_id(
+                        request_id,
+                        ApiError::bad_request_field(
+                            format!("params.limit must be between 1 and {max}"),
+                            "params.limit",
+                        ),
+                    );
+                }
+            }
+        }
+    };
+
+    let (records, _snapshot) = match load_cross_domain_records(state, started, budget) {
+        Ok(loaded) => loaded,
+        Err(error) => return HttpResponse::error_with_id(request_id, error),
+    };
+
+    let index = graph_query::RepositoryIndex::build(&records);
+    // Reuse the shared selector mapping so unknown/ambiguous selectors carry the
+    // same stable codes (and candidate list) every other repo-scoped verb emits.
+    let repository_id = match resolve_verb_repo_selector(&json!({ "repo": selector }), &index) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return HttpResponse::error_with_id(request_id, ApiError::missing_field("params.repo"));
+        }
+        Err(error) => return HttpResponse::error_with_id(request_id, error),
+    };
+
+    if let Err(error) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, error);
+    }
+
+    let digest = graph_query::sessions_for_repo(&records, &index, &repository_id, limit);
+    let repository = index.display_of(&repository_id);
+
+    HttpResponse::success(
+        Some(request_id),
+        200,
+        json!({
+            "verb": "agent_sessions_for_repo",
+            "repository_id": repository_id,
+            "repository": repository,
+            "disclaimer": graph_query::SESSIONS_DISCLAIMER,
+            "unsupported_count_kinds": graph_query::SESSIONS_UNSUPPORTED_COUNT_KINDS,
+            "sessions": digest.sessions,
+            "diagnostics": digest.diagnostics,
+        }),
+    )
+}
+
 // ── Main query handler ────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
@@ -10979,7 +11073,11 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
                 )
             }
         }
-        "drift" | "agent_sessions_for_repo" => HttpResponse::error_with_id(
+        // The daemon face of `eg query sessions <REPO>` (issue #112).
+        "agent_sessions_for_repo" => {
+            handle_verb_agent_sessions_for_repo(&request_id, &params, started, budget, state)
+        }
+        "drift" => HttpResponse::error_with_id(
             &request_id,
             ApiError::new(
                 ErrorCode::NotImplemented,
