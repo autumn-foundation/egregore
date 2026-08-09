@@ -159,15 +159,27 @@ impl RepositoryIndex {
         }
 
         // Containment adjacency over the deterministic code-graph topology.
+        //
+        // A tombstoned or superseded containment edge must not still attribute
+        // ownership over an append-only `--graph`: an embedded `--data-dir`
+        // current-state read never sees a retracted/stale edge, so including
+        // one here would let the two transports disagree on which repository
+        // owns a node for the exact same current state (mirrors the same
+        // `deleted`/`is_latest_edge_version` gate `Adjacency::build` in
+        // `query::sessions` already applies to its own edge classes).
         let mut adjacency: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for record in records {
+        for (position, record) in records.iter().enumerate() {
             if let GraphRecord::Edge {
+                id,
                 label: EdgeLabel::Contains | EdgeLabel::Defines | EdgeLabel::Imports,
                 source,
                 target,
                 ..
             } = record
             {
+                if liveness.deleted(id.as_str()) || !liveness.is_latest_edge_version(id, position) {
+                    continue;
+                }
                 adjacency.entry(source.as_str()).or_default().push(target);
             }
         }
@@ -457,6 +469,71 @@ mod tests {
             ),
             "a stale pre-tombstone selector must not resolve the revived repository"
         );
+    }
+
+    #[test]
+    fn tombstoned_containment_edge_does_not_attribute_ownership() {
+        // Issue #112 review round 17: a CONTAINS/DEFINES/IMPORTS edge later
+        // retracted (e.g. a re-scan after a file moved out of the repo) must
+        // not still attribute ownership over an append-only `--graph` — an
+        // embedded `--data-dir` current-state read never sees the retracted
+        // edge, so including it here would let the two transports disagree
+        // on which repository owns the SAME live node for the SAME current
+        // state.
+        let repo_id = "codegraph:v1:repo-x";
+        let file_id = "codegraph:v1:file-y";
+        let contains = GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id.to_owned(),
+            file_id.to_owned(),
+            Some("1.0".to_owned()),
+            "repository contains file".to_owned(),
+        );
+        let edge_id = contains.id().to_owned();
+        let edge_tombstone = GraphRecord::Tombstone {
+            id: format!("codegraph:v{SCHEMA_VERSION}:tomb-{edge_id}"),
+            schema_version: SCHEMA_VERSION,
+            deleted_id: edge_id,
+            summary: "removed".to_owned(),
+            producer: None,
+        };
+        let records = vec![repo_node(repo_id, "myrepo"), contains, edge_tombstone];
+        let index = RepositoryIndex::build(&records);
+        assert_eq!(
+            index.owner_of(file_id),
+            None,
+            "a tombstoned containment edge must not attribute ownership"
+        );
+    }
+
+    #[test]
+    fn re_ingested_containment_edge_still_attributes_from_its_latest_write() {
+        // Two physical writes of the SAME edge id (identical label/source/
+        // target — e.g. the edge re-observed on a later scan with a changed
+        // confidence value) must still attribute ownership normally: the
+        // round-17 liveness gate excludes an edge only when it is actually
+        // TOMBSTONED, never merely because an earlier write of the same id
+        // exists. Guards against the tombstone-exclusion fix above being
+        // over-broad.
+        let repo_id = "codegraph:v1:repo-x";
+        let file_id = "codegraph:v1:file-y";
+        let contains_v1 = GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id.to_owned(),
+            file_id.to_owned(),
+            Some("0.5".to_owned()),
+            "repository contains file (v1)".to_owned(),
+        );
+        let contains_v2 = GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id.to_owned(),
+            file_id.to_owned(),
+            Some("1.0".to_owned()),
+            "repository contains file (v2)".to_owned(),
+        );
+        let records = vec![repo_node(repo_id, "myrepo"), contains_v1, contains_v2];
+        let index = RepositoryIndex::build(&records);
+        assert_eq!(index.owner_of(file_id), Some(repo_id));
     }
 
     #[test]

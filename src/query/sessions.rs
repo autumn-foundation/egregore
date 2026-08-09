@@ -636,18 +636,25 @@ impl Ord for HeapEntry {
     }
 }
 
-/// A `(run instant, RunRow)` pair ordered by [`run_order_key`], for the
-/// bounded top-[`MAX_RUNS_PER_SESSION`] retention in [`build_row`].
+/// A run entry ordered by [`run_order_key`], for the bounded
+/// top-[`MAX_RUNS_PER_SESSION`] retention in [`build_row`].
 ///
 /// Same max-heap-evicts-the-worst-kept-entry pattern as [`HeapEntry`], scaled
 /// down to per-session run collection: a session with a pathologically large
 /// number of runs must not force full materialization of every one before
-/// the cap applies.
-struct RunHeapEntry((Option<DateTime<Utc>>, RunRow));
+/// the cap applies. `malformed` travels WITH the entry (rather than in a
+/// separately grown set keyed by run id) so a malformed run's bookkeeping is
+/// automatically bounded by the same heap eviction — never O(total malformed
+/// runs) for a pathological session.
+struct RunHeapEntry {
+    instant: Option<DateTime<Utc>>,
+    row: RunRow,
+    malformed: bool,
+}
 
 impl RunHeapEntry {
     fn key(&self) -> (bool, (i64, u32), &str) {
-        run_order_key(&self.0)
+        run_order_key(self.instant, &self.row.run_record_id)
     }
 }
 
@@ -964,15 +971,6 @@ fn build_row(
     // honest total.
     let mut kept_runs: BinaryHeap<RunHeapEntry> = BinaryHeap::new();
     let mut total_runs: u64 = 0;
-    // A malformed run's diagnostic can only be emitted once we know the run
-    // actually SURVIVES the bounded-retention cap below: a run that sorts
-    // worse than every kept run is dropped immediately, and a diagnostic
-    // naming it would cite a record the answer does not contain (the same
-    // invariant `results_truncated`/`runs_truncated` already uphold at the
-    // session/run-list level). So this only RECORDS which run ids are
-    // malformed; the diagnostics themselves are emitted below, once the
-    // final retained `runs` list is known.
-    let mut malformed_run_ids: BTreeSet<&str> = BTreeSet::new();
     for id in members {
         let Some(record) = nodes.get(id) else {
             continue;
@@ -990,13 +988,16 @@ fn build_row(
         };
         total_runs += 1;
         let parsed = parse_run_outcome(summary);
-        if parsed.is_none() && claims_outcome(summary) {
-            // The summary CLAIMS an outcome but is not enum-shaped. A summary
-            // that records no outcome at all is simply `outcome_unrecorded` —
-            // there is nothing malformed to name, and the raw bytes never
-            // reach the diagnostic either way.
-            malformed_run_ids.insert(*id);
-        }
+        // The summary CLAIMS an outcome but is not enum-shaped. A summary
+        // that records no outcome at all is simply `outcome_unrecorded` —
+        // there is nothing malformed to name, and the raw bytes never reach
+        // the diagnostic either way. This travels WITH the heap entry (never
+        // a separately grown set keyed by run id) so a malformed run's
+        // diagnostic is emitted only once the retained `runs` list is known
+        // below — never for a run the bounded-retention cap dropped — while
+        // staying bounded by the same heap eviction: O(MAX_RUNS_PER_SESSION),
+        // not O(total malformed runs).
+        let malformed = parsed.is_none() && claims_outcome(summary);
         let (outcome, exit_reason) = parsed.map_or((None, None), |(o, e)| (Some(o), Some(e)));
         // The stored `observed_at` is never forwarded verbatim: it is parsed
         // and re-rendered, so an unparseable or crafted value cannot leak.
@@ -1004,15 +1005,16 @@ fn build_row(
             .as_deref()
             .filter(|s| !s.is_empty())
             .and_then(parse_instant);
-        let entry = RunHeapEntry((
+        let entry = RunHeapEntry {
             instant,
-            RunRow {
+            row: RunRow {
                 run_record_id: (*id).to_owned(),
                 outcome,
                 exit_reason,
                 observed_at: instant.map(render_instant),
             },
-        ));
+            malformed,
+        };
         if kept_runs.len() < MAX_RUNS_PER_SESSION {
             kept_runs.push(entry);
         } else if kept_runs.peek().is_some_and(|worst| entry < *worst) {
@@ -1023,20 +1025,19 @@ fn build_row(
         // dropped here, immediately, rather than retained until a final
         // truncation pass.
     }
-    let mut runs: Vec<(Option<DateTime<Utc>>, RunRow)> =
-        kept_runs.into_iter().map(|entry| entry.0).collect();
-    runs.sort_by(|a, b| run_order_key(a).cmp(&run_order_key(b)));
-    let runs: Vec<RunRow> = runs.into_iter().map(|(_, run)| run).collect();
+    let mut runs: Vec<RunHeapEntry> = kept_runs.into_iter().collect();
+    runs.sort_by(|a, b| a.key().cmp(&b.key()));
     // Now that the retained run list is final, emit `outcome_not_enum_shaped`
     // only for malformed runs that actually SURVIVED truncation — never for
     // one the bounded-retention cap above dropped.
-    for run in &runs {
-        if malformed_run_ids.contains(run.run_record_id.as_str()) {
+    for entry in &runs {
+        if entry.malformed {
             let mut diagnostic = SessionsDiagnostic::bare("outcome_not_enum_shaped");
-            diagnostic.run_record_id = Some(run.run_record_id.clone());
+            diagnostic.run_record_id = Some(entry.row.run_record_id.clone());
             diagnostics.push(diagnostic);
         }
     }
+    let runs: Vec<RunRow> = runs.into_iter().map(|entry| entry.row).collect();
     // `total_runs` (0 / 1 / many), never the post-truncation `runs.len()`:
     // `MAX_RUNS_PER_SESSION` is comfortably above 1, so the two agree in
     // every reachable case, but classifying from the TRUE total avoids a
@@ -1062,22 +1063,32 @@ fn build_row(
     }
 
     // ── Referenced tasks ────────────────────────────────────────────────────
+    // Bounded at `MAX_TASKS_PER_SESSION` entries DURING collection: a
+    // `BTreeSet` already iterates in the final ascending order the truncated
+    // output uses, so once the set exceeds the cap the LARGEST (worst) id is
+    // evicted via `pop_last`, keeping only the smallest `MAX_TASKS_PER_SESSION`
+    // — behavior-identical to collecting every id and truncating afterward,
+    // but the set itself never grows past the cap for a session referencing
+    // a pathologically large number of tasks. `matched_tasks` tracks the true
+    // total separately, counted only on a genuinely NEW id (a repeated
+    // citation of the same task must not inflate it).
     let mut task_ids: BTreeSet<&str> = BTreeSet::new();
+    let mut matched_tasks: u64 = 0;
     for id in std::iter::once(&session_id).chain(members.iter()) {
         for task_id in adjacency.cited_targets(id, &[EdgeLabel::ReferencesTask]) {
-            if nodes.get(task_id).and_then(|r| node_kind(r)) == Some(NodeKind::Task) {
-                task_ids.insert(task_id);
+            if nodes.get(task_id).and_then(|r| node_kind(r)) != Some(NodeKind::Task) {
+                continue;
+            }
+            if task_ids.insert(task_id) {
+                matched_tasks += 1;
+                if task_ids.len() > MAX_TASKS_PER_SESSION {
+                    task_ids.pop_last();
+                }
             }
         }
     }
-    // `task_ids` iterates in the exact final ascending order (a `BTreeSet`),
-    // so capping via `.take` here is behavior-identical to building every
-    // `TaskRef` and truncating afterward — but never materializes a `TaskRef`
-    // (with its `.to_owned()` allocations) for a task beyond the cap.
-    let matched_tasks = task_ids.len();
     let tasks: Vec<TaskRef> = task_ids
         .iter()
-        .take(MAX_TASKS_PER_SESSION)
         .map(|task_id| {
             let recorded = nodes
                 .get(task_id)
@@ -1094,10 +1105,10 @@ fn build_row(
             }
         })
         .collect();
-    if matched_tasks > tasks.len() {
+    if matched_tasks > tasks.len() as u64 {
         let mut diagnostic = SessionsDiagnostic::bare("tasks_truncated");
         diagnostic.session_record_id = Some(session_id.to_owned());
-        diagnostic.matched = Some(matched_tasks as u64);
+        diagnostic.matched = Some(matched_tasks);
         diagnostic.returned = Some(tasks.len() as u64);
         diagnostic.limit = Some(MAX_TASKS_PER_SESSION as u64);
         diagnostics.push(diagnostic);
@@ -1175,14 +1186,12 @@ fn build_row(
 /// Reads the PARSED instant carried alongside the row, never a re-parse of the
 /// rendered string. Second and sub-second parts compare separately so no
 /// integer conversion can overflow or round two distinct instants together.
-fn run_order_key(run: &(Option<DateTime<Utc>>, RunRow)) -> (bool, (i64, u32), &str) {
-    let instant = run
-        .0
-        .map(|dt| (dt.timestamp(), dt.timestamp_subsec_nanos()));
+fn run_order_key(instant: Option<DateTime<Utc>>, run_record_id: &str) -> (bool, (i64, u32), &str) {
+    let instant = instant.map(|dt| (dt.timestamp(), dt.timestamp_subsec_nanos()));
     (
         instant.is_none(),
         instant.unwrap_or((i64::MAX, u32::MAX)),
-        run.1.run_record_id.as_str(),
+        run_record_id,
     )
 }
 
@@ -1349,11 +1358,23 @@ fn unlinked_stamped_records<'a>(
     adjacency: &Adjacency<'a>,
     nodes: &BTreeMap<&'a str, &'a GraphRecord>,
 ) -> u64 {
+    // `scoped_stamps` is fully known by the time this function runs (the main
+    // loop that builds it has already finished), so this index is filtered
+    // DURING insertion to stamps it actually contains — never every stamped
+    // record in the store. Ordinary agent-memory nodes (observations,
+    // decisions, runs, ...) commonly carry the SAME stamped `session_id` as
+    // their owning session, so without this filter the index would retain an
+    // O(total store records) tree of references the subsequent loop never
+    // reads.
     let mut by_stamped_session: BTreeMap<&'a str, BTreeSet<&'a str>> = BTreeMap::new();
     for (&id, &record) in nodes {
-        if let Some(stamped) = node_session_id(record).filter(|s| !s.is_empty()) {
-            by_stamped_session.entry(stamped).or_default().insert(id);
+        let Some(stamped) = node_session_id(record).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if !scoped_stamps.contains(stamped) {
+            continue;
         }
+        by_stamped_session.entry(stamped).or_default().insert(id);
     }
 
     let mut unlinked: BTreeSet<&'a str> = BTreeSet::new();
@@ -2295,6 +2316,81 @@ mod tests {
              outcome_not_enum_shaped diagnostic: {:?}",
             out.diagnostics
         );
+    }
+
+    #[test]
+    fn tasks_beyond_the_cap_keep_the_smallest_ids_not_an_arbitrary_subset() {
+        // Bounded task-id retention (issue #112 review round 17) must select
+        // the CORRECT smallest MAX_TASKS_PER_SESSION record IDs — the same
+        // set building-then-truncating an unbounded `BTreeSet` would
+        // produce — never merely some 20 of them.
+        let repo = repository("repo-a");
+        let repo_id = repo.id().to_owned();
+        let sym = symbol(&repo_id, "alpha");
+        let sym_id = sym.id().to_owned();
+
+        let session = memory(
+            NodeKind::AgentSession,
+            "s",
+            Some("2026-01-01T00:00:00Z"),
+            "S",
+        );
+        let session_id = session.id().to_owned();
+        let obs = memory(
+            NodeKind::Observation,
+            "o",
+            Some("2026-01-01T00:00:00Z"),
+            "O",
+        );
+        let obs_id = obs.id().to_owned();
+
+        let mut records = vec![
+            repo,
+            sym,
+            code_edge(EdgeLabel::Contains, &repo_id, &sym_id),
+            session,
+            obs,
+            am_edge(EdgeLabel::AuthoredBy, &obs_id, &session_id),
+            am_edge(EdgeLabel::MentionsSymbol, &obs_id, &sym_id),
+        ];
+
+        let mut task_ids: Vec<String> = Vec::new();
+        for i in 0..21 {
+            let key = format!("t{i}");
+            let referenced_task = task(&key, "open");
+            let task_id = referenced_task.id().to_owned();
+            task_ids.push(task_id.clone());
+            records.push(referenced_task);
+            records.push(am_edge(EdgeLabel::ReferencesTask, &obs_id, &task_id));
+        }
+        // The final selection is ordered by record ID (a `BTreeSet`), NOT by
+        // insertion order or the `t{i}` key — so the expected survivors are
+        // the smallest 20 of the actual hashed IDs.
+        task_ids.sort();
+        let expected_survivors = task_ids[..20].to_vec();
+
+        let out = digest(&records, &repo_id);
+        assert_eq!(out.sessions.len(), 1, "one scoped session: {out:?}");
+        let tasks = &out.sessions[0].tasks;
+        assert_eq!(tasks.len(), 20, "tasks capped at 20: {tasks:?}");
+        let survivor_ids: Vec<&str> = tasks.iter().map(|t| t.record_id.as_str()).collect();
+        assert_eq!(
+            survivor_ids, expected_survivors,
+            "the smallest 20 record IDs must survive: {tasks:?}"
+        );
+
+        let truncated = out
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "tasks_truncated")
+            .unwrap_or_else(|| panic!("must disclose truncation: {out:?}"));
+        assert_eq!(
+            truncated.matched,
+            Some(21),
+            "the TRUE total, got {truncated:?}"
+        );
+        assert_eq!(truncated.returned, Some(20));
+        assert_eq!(truncated.limit, Some(20));
     }
 
     #[test]
