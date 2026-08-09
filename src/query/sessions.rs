@@ -964,6 +964,15 @@ fn build_row(
     // honest total.
     let mut kept_runs: BinaryHeap<RunHeapEntry> = BinaryHeap::new();
     let mut total_runs: u64 = 0;
+    // A malformed run's diagnostic can only be emitted once we know the run
+    // actually SURVIVES the bounded-retention cap below: a run that sorts
+    // worse than every kept run is dropped immediately, and a diagnostic
+    // naming it would cite a record the answer does not contain (the same
+    // invariant `results_truncated`/`runs_truncated` already uphold at the
+    // session/run-list level). So this only RECORDS which run ids are
+    // malformed; the diagnostics themselves are emitted below, once the
+    // final retained `runs` list is known.
+    let mut malformed_run_ids: BTreeSet<&str> = BTreeSet::new();
     for id in members {
         let Some(record) = nodes.get(id) else {
             continue;
@@ -982,13 +991,11 @@ fn build_row(
         total_runs += 1;
         let parsed = parse_run_outcome(summary);
         if parsed.is_none() && claims_outcome(summary) {
-            // The summary CLAIMS an outcome but is not enum-shaped: report the
-            // defect by run handle. A summary that records no outcome at all is
-            // simply `outcome_unrecorded` — there is nothing malformed to name,
-            // and the raw bytes never reach the diagnostic either way.
-            let mut diagnostic = SessionsDiagnostic::bare("outcome_not_enum_shaped");
-            diagnostic.run_record_id = Some((*id).to_owned());
-            diagnostics.push(diagnostic);
+            // The summary CLAIMS an outcome but is not enum-shaped. A summary
+            // that records no outcome at all is simply `outcome_unrecorded` —
+            // there is nothing malformed to name, and the raw bytes never
+            // reach the diagnostic either way.
+            malformed_run_ids.insert(*id);
         }
         let (outcome, exit_reason) = parsed.map_or((None, None), |(o, e)| (Some(o), Some(e)));
         // The stored `observed_at` is never forwarded verbatim: it is parsed
@@ -1020,6 +1027,16 @@ fn build_row(
         kept_runs.into_iter().map(|entry| entry.0).collect();
     runs.sort_by(|a, b| run_order_key(a).cmp(&run_order_key(b)));
     let runs: Vec<RunRow> = runs.into_iter().map(|(_, run)| run).collect();
+    // Now that the retained run list is final, emit `outcome_not_enum_shaped`
+    // only for malformed runs that actually SURVIVED truncation — never for
+    // one the bounded-retention cap above dropped.
+    for run in &runs {
+        if malformed_run_ids.contains(run.run_record_id.as_str()) {
+            let mut diagnostic = SessionsDiagnostic::bare("outcome_not_enum_shaped");
+            diagnostic.run_record_id = Some(run.run_record_id.clone());
+            diagnostics.push(diagnostic);
+        }
+    }
     // `total_runs` (0 / 1 / many), never the post-truncation `runs.len()`:
     // `MAX_RUNS_PER_SESSION` is comfortably above 1, so the two agree in
     // every reachable case, but classifying from the TRUE total avoids a
@@ -2195,6 +2212,89 @@ mod tests {
         );
         assert_eq!(truncated.returned, Some(20));
         assert_eq!(truncated.limit, Some(20));
+    }
+
+    #[test]
+    fn a_malformed_run_dropped_by_the_cap_raises_no_orphan_diagnostic() {
+        // Issue #112 review round 16: `outcome_not_enum_shaped` must never
+        // name a run that the bounded MAX_RUNS_PER_SESSION retention above
+        // dropped — that would cite a record the answer does not contain,
+        // the same invariant `results_truncated`/`runs_truncated` uphold at
+        // the session/run-list level. The malformed run here is the LATEST
+        // of 21 (day 21), so it sorts worse than every one of the retained
+        // earliest-20 and must be evicted — its diagnostic must vanish with
+        // it, not leak into the response.
+        let repo = repository("repo-a");
+        let repo_id = repo.id().to_owned();
+        let sym = symbol(&repo_id, "alpha");
+        let sym_id = sym.id().to_owned();
+
+        let session = memory(
+            NodeKind::AgentSession,
+            "s",
+            Some("2026-01-01T00:00:00Z"),
+            "S",
+        );
+        let session_id = session.id().to_owned();
+        let obs = memory(
+            NodeKind::Observation,
+            "o",
+            Some("2026-01-01T00:00:00Z"),
+            "O",
+        );
+        let obs_id = obs.id().to_owned();
+
+        let mut records = vec![
+            repo,
+            sym,
+            code_edge(EdgeLabel::Contains, &repo_id, &sym_id),
+            session,
+            obs,
+            am_edge(EdgeLabel::AuthoredBy, &obs_id, &session_id),
+            am_edge(EdgeLabel::MentionsSymbol, &obs_id, &sym_id),
+        ];
+
+        let mut dropped_malformed_run_id = String::new();
+        for day in 1..=21 {
+            let key = format!("r{day}");
+            let observed = format!("2026-01-{day:02}T00:00:00Z");
+            // Day 21 CLAIMS an outcome but is not enum-shaped (missing
+            // exit_reason); every other run is well-formed. Day 21 is also
+            // the LATEST run, so it is the one the cap must evict.
+            let summary = if day == 21 {
+                "AgentRun outcome=weird_but_no_exit_reason"
+            } else {
+                "AgentRun outcome=success exit_reason=completed"
+            };
+            let run = memory(NodeKind::AgentRun, &key, Some(&observed), summary);
+            let run_id = run.id().to_owned();
+            if day == 21 {
+                dropped_malformed_run_id = run_id.clone();
+            }
+            records.push(run);
+            records.push(am_edge(EdgeLabel::SessionOf, &run_id, &session_id));
+        }
+        assert!(!dropped_malformed_run_id.is_empty());
+
+        let out = digest(&records, &repo_id);
+        assert_eq!(out.sessions.len(), 1, "one scoped session: {out:?}");
+        let runs = &out.sessions[0].runs;
+        assert_eq!(runs.len(), 20, "runs capped at 20: {runs:?}");
+        assert!(
+            !runs
+                .iter()
+                .any(|r| r.run_record_id == dropped_malformed_run_id),
+            "the malformed 21st run must be the one evicted: {runs:?}"
+        );
+
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| d.code == "outcome_not_enum_shaped"),
+            "a malformed run dropped by truncation must raise NO \
+             outcome_not_enum_shaped diagnostic: {:?}",
+            out.diagnostics
+        );
     }
 
     #[test]
