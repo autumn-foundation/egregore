@@ -199,6 +199,9 @@ fn render_diagnostic_text(out: &mut String, diagnostic: &query::SessionsDiagnost
     if let Some(ids) = diagnostic.session_record_ids.as_ref() {
         let _ = write!(payload, " sessions [{}]", ids.join(", "));
     }
+    if let Some(ids) = diagnostic.candidate_ids.as_ref() {
+        let _ = write!(payload, " candidates [{}]", ids.join(", "));
+    }
     let _ = writeln!(
         out,
         "diagnostic {}{}{}{payload}",

@@ -971,6 +971,38 @@ fn seed_edge_cases() -> Fixture {
     builder.push(s12_dup);
     builder.push(o12_dup);
 
+    // ── S13: two live SESSION_OF edges to distinct Agent nodes ──────────────
+    // Ingest validates SESSION_OF endpoint kinds but not the documented
+    // many-to-one cardinality, so this is reachable; the digest must refuse
+    // to guess an `agent_record_id` and instead raise
+    // `ambiguous_agent_provenance` naming both candidates — on BOTH the JSON
+    // and `--format text` surfaces.
+    let ag1 = builder.ids["Ag1"].clone();
+    let ag2 = builder.ids["Ag2"].clone();
+    let s13 = session(
+        &mut builder,
+        "S13",
+        "sess-13",
+        Some("agent-1"),
+        Some("2026-03-13T00:00:00Z"),
+        "AgentSession sess-13",
+    );
+    let o13 = memory(
+        &mut builder,
+        "O13",
+        NodeKind::Observation,
+        "obs-13",
+        Some("sess-13"),
+        Some("2026-03-13T00:00:00Z"),
+        "Observation for session 13",
+        None,
+        None,
+    );
+    am_edge(&mut builder, EdgeLabel::AuthoredBy, &o13, &s13);
+    am_edge(&mut builder, EdgeLabel::MentionsSymbol, &o13, &sym_a);
+    am_edge(&mut builder, EdgeLabel::SessionOf, &s13, &ag1);
+    am_edge(&mut builder, EdgeLabel::SessionOf, &s13, &ag2);
+
     builder.finish("sessions_edge_cases.jsonl")
 }
 
@@ -1990,6 +2022,49 @@ fn text_format_prints_agent_record_id_and_ingested_bounds() {
     assert!(
         stdout.contains("  ingested "),
         "the text renderer must print the ingested-at bounds, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn ambiguous_agent_provenance_diagnostic_names_candidates_in_both_formats() {
+    // S13 has two live SESSION_OF edges to distinct Agent nodes. The digest
+    // must refuse to guess agent_record_id and raise
+    // ambiguous_agent_provenance naming both candidates on the JSON envelope
+    // AND the --format text renderer — a text-only renderer bug would
+    // silently report "ambiguous" without identifying who the candidates are.
+    let fx = seed_edge_cases();
+    let mut expected_candidates = [fx.id("Ag1").to_owned(), fx.id("Ag2").to_owned()];
+    expected_candidates.sort();
+
+    let value = digest(&fx, "repo-a", &[]);
+    let s13_row = row_for(&value, fx.id("S13"));
+    assert!(
+        s13_row["agent_record_id"].is_null(),
+        "an ambiguous agent must never be guessed: {s13_row}"
+    );
+    let diag = diagnostic(&value, "ambiguous_agent_provenance")
+        .expect("ambiguous_agent_provenance diagnostic present in JSON");
+    assert_eq!(diag["session_record_id"], fx.id("S13"));
+    let candidates: Vec<String> = diag["candidate_ids"]
+        .as_array()
+        .expect("candidate_ids array")
+        .iter()
+        .map(|v| v.as_str().expect("candidate id is a string").to_owned())
+        .collect();
+    assert_eq!(candidates, expected_candidates);
+
+    let (code, stdout, stderr) = run_sessions(&fx, "repo-a", &["--format", "text"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        stdout.contains("ambiguous_agent_provenance"),
+        "text output must surface the diagnostic code, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "candidates [{}, {}]",
+            expected_candidates[0], expected_candidates[1]
+        )),
+        "text output must name both candidates, not just say 'ambiguous', got:\n{stdout}"
     );
 }
 
