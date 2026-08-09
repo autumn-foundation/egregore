@@ -10875,39 +10875,30 @@ fn handle_verb_agent_sessions_for_repo(
     let limit = match params.get("limit") {
         None | Some(serde_json::Value::Null) => graph_query::SESSIONS_DEFAULT_LIMIT,
         Some(value) => {
-            // A well-formed JSON integer can be negative, or wider than `u64`
-            // (serde_json falls back to storing an out-of-u64/i64-range
-            // integer literal as `f64`, losing exactness but NOT its
-            // integer-shaped-ness). Parse through `i128` before
-            // range-checking: `as_u64()` alone returns `None` for a negative
-            // integer, and `as_i64()`/`as_u64()` both return `None` once the
-            // literal overflows into `f64` storage — either way that would
-            // misreport a well-formed, merely out-of-range integer as "not an
-            // integer" (`bad_request`) instead of the true diagnosis,
-            // `invalid_limit`. Only a GENUINELY non-integer shape (a
-            // fractional float, a string, ...) stays `bad_request`.
+            // A well-formed JSON integer can be negative, which is why this
+            // goes through `i128` rather than `as_u64()` alone (`as_u64()`
+            // returns `None` for `-1`, which would misreport it as "not an
+            // integer" instead of the true diagnosis, `invalid_limit`).
+            //
+            // KNOWN GAP, deliberately not solved here: an integer literal so
+            // large it overflows both `i64` and `u64` (e.g.
+            // `18446744073709551616`) is, once parsed, byte-for-byte
+            // indistinguishable from an ordinary fractional-shaped float that
+            // happens to hold a whole value (e.g. `1.0`, `2e0`) — both fall
+            // back to `serde_json::Number`'s internal `f64` storage with
+            // `is_i64()`/`is_u64()` false, and this crate does not enable
+            // `arbitrary_precision`, the only thing that preserves the
+            // original lexical distinction. An earlier version of this
+            // parser treated any whole-valued fallback float as an
+            // out-of-range integer to catch the former case, which silently
+            // misclassified the latter, far more common case (`1.0` is not
+            // `invalid_limit`; it is simply not the integer shape `limit`
+            // requires). Both now land in `bad_request` — an honest gap
+            // rather than a guess.
             let requested: Option<i128> = value
                 .as_i64()
                 .map(i128::from)
-                .or_else(|| value.as_u64().map(i128::from))
-                .or_else(|| {
-                    // Neither accessor matched: the literal overflowed `i64`/
-                    // `u64` into `f64` storage. A finite whole number (or an
-                    // overflow to +/-infinity) is still integer-shaped and
-                    // certainly out of range; only a genuine fraction is a
-                    // shape error.
-                    value.as_f64().and_then(|f| {
-                        if !f.is_finite() || f.fract() == 0.0 {
-                            Some(if f.is_sign_negative() {
-                                i128::MIN
-                            } else {
-                                i128::MAX
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                });
+                .or_else(|| value.as_u64().map(i128::from));
             let Some(requested) = requested else {
                 return HttpResponse::error_with_id(
                     request_id,

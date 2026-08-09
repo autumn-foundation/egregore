@@ -418,15 +418,27 @@ pub fn sessions_for_repo(
     let mut diagnostics: Vec<SessionsDiagnostic> = Vec::new();
     let mut unresolved: Vec<String> = Vec::new();
     let mut pending: Vec<PendingRow> = Vec::new();
-    // (session record id, session_id string, member ids) for the scoped rows,
-    // used by the unlinked-stamped-record diagnostic below.
-    let mut scoped_members: Vec<(String, String, BTreeSet<&str>)> = Vec::new();
+    // (session record id, session_id string, member ids) for EVERY live
+    // AgentSession in the WHOLE STORE, regardless of which repository (if
+    // any) it resolves to — feeds the sibling-linkage union below, since a
+    // stamp-sharing sibling scoped to a DIFFERENT repository, or to none at
+    // all, still has REAL edge-linked members that must count as linked.
+    let mut all_session_members: Vec<(&str, &str, BTreeSet<&str>)> = Vec::new();
+    // Stamps actually represented among THIS digest's scoped rows — the
+    // unlinked-stamped-record diagnostic below is scoped to these, never to
+    // every stamp in the store.
+    let mut scoped_stamps: BTreeSet<&str> = BTreeSet::new();
 
     for (&session_id, session_record) in &nodes {
         if node_kind(session_record) != Some(NodeKind::AgentSession) {
             continue;
         }
         let members = members_of(session_id, &adjacency);
+        let stamped = node_session_id(session_record).filter(|s| !s.is_empty());
+        if let Some(stamped) = stamped {
+            all_session_members.push((session_id, stamped, members.clone()));
+        }
+
         let scope = derive_scope(session_id, &members, &adjacency, &nodes, index);
 
         if scope.by_repository.is_empty() {
@@ -445,8 +457,8 @@ pub fn sessions_for_repo(
             &adjacency,
             &nodes,
         );
-        if let Some(stamped) = node_session_id(session_record) {
-            scoped_members.push((session_id.to_owned(), stamped.to_owned(), members));
+        if let Some(stamped) = stamped {
+            scoped_stamps.insert(stamped);
         }
         pending.push(built);
     }
@@ -463,7 +475,7 @@ pub fn sessions_for_repo(
     // Records stamped with a scoped session's `session_id` but reachable by no
     // edge path: reported once, never counted as members (issue #112 AC:
     // membership is edge-derived only).
-    let unlinked = unlinked_stamped_records(&scoped_members, &nodes);
+    let unlinked = unlinked_stamped_records(&scoped_stamps, &all_session_members, &nodes);
     if unlinked > 0 {
         let mut diagnostic = SessionsDiagnostic::bare("unlinked_session_stamped_records");
         diagnostic.count = Some(unlinked);
@@ -1147,7 +1159,8 @@ pub fn bounded_session_text(value: &str) -> String {
 /// session — is `O(sessions × nodes)` and takes tens of seconds on a store with
 /// a few thousand sessions.
 fn unlinked_stamped_records<'a>(
-    scoped: &[(String, String, BTreeSet<&'a str>)],
+    scoped_stamps: &BTreeSet<&'a str>,
+    all_session_members: &[(&'a str, &'a str, BTreeSet<&'a str>)],
     nodes: &BTreeMap<&'a str, &'a GraphRecord>,
 ) -> u64 {
     let mut by_stamped_session: BTreeMap<&'a str, BTreeSet<&'a str>> = BTreeMap::new();
@@ -1161,31 +1174,30 @@ fn unlinked_stamped_records<'a>(
     // `session_id` STRING: `build_agent_session_node` hashes `observed_at`
     // into the node id, so re-observing the same logical session at a new
     // instant mints a sibling session node under the same stamp. The set of
-    // records genuinely linked to a stamp is therefore the UNION across every
-    // SCOPED session sharing it — each session's own record ID plus its
-    // edge-derived members — never one session's membership checked in
-    // isolation, which would falsely flag a sibling session's real,
-    // edge-linked members as unlinked.
-    let mut linked_by_stamped_session: BTreeMap<&str, BTreeSet<&'a str>> = BTreeMap::new();
-    for (session_record_id, stamped_session_id, members) in scoped {
-        if stamped_session_id.is_empty() {
-            continue;
-        }
-        let Some((&session_key, _)) = nodes.get_key_value(session_record_id.as_str()) else {
-            continue;
-        };
+    // records genuinely linked to a stamp is therefore the UNION across
+    // EVERY LIVE session in the WHOLE STORE sharing it — each session's own
+    // record ID plus its edge-derived members — regardless of which
+    // repository (if any) that sibling itself resolves to. A sibling scoped
+    // to a DIFFERENT repository, or to none at all, is still a REAL session
+    // with REAL edge-linked members; checking only sessions scoped to the
+    // CURRENTLY queried repository would falsely flag such a sibling's
+    // members as unlinked. Only the DIAGNOSTIC below is scoped, via
+    // `scoped_stamps`, to stamps actually represented in this digest.
+    let mut linked_by_stamped_session: BTreeMap<&'a str, BTreeSet<&'a str>> = BTreeMap::new();
+    for &(session_record_id, stamped_session_id, ref members) in all_session_members {
         let linked = linked_by_stamped_session
-            .entry(stamped_session_id.as_str())
+            .entry(stamped_session_id)
             .or_default();
-        linked.insert(session_key);
+        linked.insert(session_record_id);
         linked.extend(members.iter().copied());
     }
 
     let mut unlinked: BTreeSet<&'a str> = BTreeSet::new();
-    for (stamped_session_id, candidates) in &by_stamped_session {
+    for &stamped_session_id in scoped_stamps {
+        let Some(candidates) = by_stamped_session.get(stamped_session_id) else {
+            continue;
+        };
         let Some(linked) = linked_by_stamped_session.get(stamped_session_id) else {
-            // No SCOPED session carries this stamp at all: its stamped
-            // records are simply outside this digest, not "unlinked".
             continue;
         };
         for &id in candidates {
@@ -1899,5 +1911,99 @@ mod tests {
                 "each sibling session must count its OWN observation only: {row:?}"
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn unlinked_check_unions_across_siblings_scoped_to_different_repositories() {
+        // Same stamped session_id, but S_a resolves to repo A and S_b to
+        // repo B (a DIFFERENT repository, never appearing in repo A's
+        // digest at all). Querying repo A must still recognize O_b as
+        // genuinely linked (to S_b) — a sibling scoped to another repository
+        // is a real session with real edge-linked members, not evidence of
+        // an unlinked stamped record.
+        let repo_a = repository("repo-a");
+        let repo_a_id = repo_a.id().to_owned();
+        let repo_b = repository("repo-b");
+        let repo_b_id = repo_b.id().to_owned();
+        let sym_a = symbol(&repo_a_id, "alpha");
+        let sym_a_id = sym_a.id().to_owned();
+        let sym_b = symbol(&repo_b_id, "beta");
+        let sym_b_id = sym_b.id().to_owned();
+
+        let stamp = |mut record: GraphRecord| -> GraphRecord {
+            if let GraphRecord::Node { session_id, .. } = &mut record {
+                *session_id = Some("shared-sess".to_owned());
+            }
+            record
+        };
+
+        let s_a = stamp(memory(
+            NodeKind::AgentSession,
+            "s-a",
+            Some("2026-01-01T00:00:00Z"),
+            "S_a",
+        ));
+        let s_a_id = s_a.id().to_owned();
+        let s_b = stamp(memory(
+            NodeKind::AgentSession,
+            "s-b",
+            Some("2026-01-01T01:00:00Z"),
+            "S_b",
+        ));
+        let s_b_id = s_b.id().to_owned();
+        let o_a = stamp(memory(
+            NodeKind::Observation,
+            "o-a",
+            Some("2026-01-01T00:30:00Z"),
+            "O_a",
+        ));
+        let o_a_id = o_a.id().to_owned();
+        let o_b = stamp(memory(
+            NodeKind::Observation,
+            "o-b",
+            Some("2026-01-01T01:30:00Z"),
+            "O_b",
+        ));
+        let o_b_id = o_b.id().to_owned();
+
+        let records = vec![
+            repo_a,
+            repo_b,
+            sym_a,
+            sym_b,
+            code_edge(EdgeLabel::Contains, &repo_a_id, &sym_a_id),
+            code_edge(EdgeLabel::Contains, &repo_b_id, &sym_b_id),
+            s_a,
+            s_b,
+            o_a,
+            o_b,
+            am_edge(EdgeLabel::AuthoredBy, &o_a_id, &s_a_id),
+            am_edge(EdgeLabel::MentionsSymbol, &o_a_id, &sym_a_id),
+            am_edge(EdgeLabel::AuthoredBy, &o_b_id, &s_b_id),
+            am_edge(EdgeLabel::MentionsSymbol, &o_b_id, &sym_b_id),
+        ];
+        let index = RepositoryIndex::build(&records);
+        let out_a = sessions_for_repo(&records, &index, &repo_a_id, SESSIONS_DEFAULT_LIMIT);
+
+        assert_eq!(
+            out_a.sessions.len(),
+            1,
+            "only S_a is scoped to repo A: {out_a:?}"
+        );
+        assert!(
+            !out_a
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "unlinked_session_stamped_records"),
+            "S_b's real, edge-linked member (O_b) must never be flagged \
+             unlinked in repo A's digest just because S_b itself is scoped \
+             to a DIFFERENT repository: {out_a:?}"
+        );
+        assert_eq!(
+            out_a.sessions[0].record_counts.observation, 1,
+            "repo A's row counts only its OWN member (O_a): {:?}",
+            out_a.sessions[0]
+        );
     }
 }

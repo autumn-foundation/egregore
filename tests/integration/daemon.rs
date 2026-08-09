@@ -13905,22 +13905,21 @@ fn agent_sessions_for_repo_negative_limit_is_invalid_limit_not_bad_request() {
 }
 
 #[test]
-fn agent_sessions_for_repo_limit_wider_than_u64_is_invalid_limit_not_bad_request() {
+fn agent_sessions_for_repo_limit_wider_than_u64_is_bad_request_not_misclassified() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
     seed_agent_sessions_store(&data_dir);
     let mut daemon = start_daemon(&data_dir);
     let metadata = read_metadata(&data_dir);
 
-    // 2^64 overflows both i64 and u64. `serde_json::Value`'s own Rust-side
-    // `Serialize` path (what `json!`/`agent_sessions_query` would use) cannot
-    // even CONSTRUCT such a number without the `arbitrary_precision` feature
-    // -- but PARSING that literal from raw JSON TEXT (what a real client
-    // sends, and what the daemon actually receives) degrades it to an `f64`
-    // instead of erroring. The request body is therefore hand-built here,
-    // bypassing `serde_json::to_value`, to exercise exactly what a hostile
-    // wire payload looks like: the value must still be diagnosed as a
-    // well-formed, merely out-of-range integer, never a shape error.
+    // 2^64 overflows both i64 and u64: once parsed, this is indistinguishable
+    // from an ordinary whole-valued float (`1.0`, `2e0`) without the
+    // `arbitrary_precision` feature this crate does not enable (see the
+    // sibling test `agent_sessions_for_repo_whole_valued_float_limit_is_bad_request`,
+    // which proves the reverse direction of the SAME ambiguity). The request
+    // body is hand-built to exercise the raw wire payload rather than going
+    // through `serde_json::to_value`, which cannot even construct a number
+    // this large. `bad_request` here is a documented, honest limit, not a bug.
     let body = format!(
         "{{\"request_id\":\"sessions-huge-limit\",\"agent_id\":\"sessions-test-agent\",\
          \"verb\":\"agent_sessions_for_repo\",\"params\":{{\"repo\":\"{SESSIONS_REPO_SELECTOR}\",\
@@ -13939,13 +13938,45 @@ fn agent_sessions_for_repo_limit_wider_than_u64_is_invalid_limit_not_bad_request
 
     assert!(
         res.starts_with("HTTP/1.1 400"),
-        "an out-of-range limit must be a 400, got {res}"
+        "an unrepresentable limit must be a 400, got {res}"
     );
     let body = response_json(&res);
     assert_eq!(
-        body["error"]["code"], "invalid_limit",
-        "an integer past u64::MAX is out-of-range, not a shape error, got {body}"
+        body["error"]["code"], "bad_request",
+        "indistinguishable from a whole-valued float once parsed, got {body}"
     );
+}
+
+#[test]
+fn agent_sessions_for_repo_whole_valued_float_limit_is_bad_request() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // `1.0` is LEXICALLY a float (it has a decimal point), even though its
+    // VALUE happens to be a whole number in range. It must stay `bad_request`
+    // ("not an integer") -- never reclassified as `invalid_limit` just
+    // because `fract() == 0.0`, which would conflate it with the genuinely
+    // out-of-range-integer case the sibling test covers.
+    for limit_literal in ["1.0", "2e0"] {
+        let res = agent_sessions_query(
+            &metadata,
+            "sessions-float-limit",
+            &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR, "limit": serde_json::from_str::<serde_json::Value>(limit_literal).unwrap() }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 400"),
+            "a float-shaped limit ({limit_literal}) must be a 400, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["error"]["code"], "bad_request",
+            "{limit_literal} is a FLOAT shape, not an out-of-range integer, got {body}"
+        );
+    }
+    daemon.stop();
 }
 
 #[test]
