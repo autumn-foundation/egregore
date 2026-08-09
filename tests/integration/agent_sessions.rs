@@ -1897,6 +1897,65 @@ fn negative_limit_is_invalid_limit_not_a_clap_parse_error() {
 }
 
 #[test]
+fn limit_beyond_i128_range_is_invalid_limit_not_a_clap_parse_error() {
+    // Issue #112 review round 22: `--limit` is now a raw `String`, so a
+    // decimal literal wider than EVEN i128 (one past i128::MAX) reaches this
+    // lane's own `invalid_limit` diagnostic instead of clap's built-in parse
+    // error -- proving there is no fixed-width ceiling left to overflow.
+    let fx = seed_scope();
+    let (code, stdout, stderr) = run_sessions(
+        &fx,
+        "repo-a",
+        &["--limit", "170141183460469231731687303715884105728"], // i128::MAX + 1
+    );
+    assert_eq!(
+        code, 1,
+        "an i128-overflowing --limit must exit 1 (not clap's exit 2); stderr={stderr}"
+    );
+    let diag: serde_json::Value = stderr
+        .lines()
+        .find_map(|l| serde_json::from_str(l.trim()).ok())
+        .unwrap_or_else(|| panic!("stderr must carry a JSON diagnostic, got {stderr}"));
+    assert_eq!(diag["ok"], false);
+    assert_eq!(diag["error"]["code"], "invalid_limit");
+    assert_eq!(
+        diag["error"]["limit"],
+        serde_json::json!("170141183460469231731687303715884105728"),
+        "a value that never even parses as i128 renders as the raw decimal \
+         token verbatim: {diag}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a rejected limit must not print a digest: {stdout}"
+    );
+}
+
+#[test]
+fn limit_non_numeric_is_invalid_limit_not_a_clap_parse_error() {
+    // The non-numeric sibling of the above: with `--limit` now a raw
+    // `String`, clap no longer rejects a non-integer token at all -- it must
+    // reach this lane's own diagnostic just like an out-of-range integer,
+    // never a bare clap usage error.
+    let fx = seed_scope();
+    let (code, stdout, stderr) = run_sessions(&fx, "repo-a", &["--limit", "not-a-number"]);
+    assert_eq!(
+        code, 1,
+        "a non-numeric --limit must exit 1 (not clap's exit 2); stderr={stderr}"
+    );
+    let diag: serde_json::Value = stderr
+        .lines()
+        .find_map(|l| serde_json::from_str(l.trim()).ok())
+        .unwrap_or_else(|| panic!("stderr must carry a JSON diagnostic, got {stderr}"));
+    assert_eq!(diag["ok"], false);
+    assert_eq!(diag["error"]["code"], "invalid_limit");
+    assert_eq!(diag["error"]["limit"], serde_json::json!("not-a-number"));
+    assert!(
+        stdout.trim().is_empty(),
+        "a rejected limit must not print a digest: {stdout}"
+    );
+}
+
+#[test]
 fn limit_wider_than_i64_is_invalid_limit_not_a_clap_parse_error() {
     // One past `i64::MAX`: still a well-formed positive integer, and clap's
     // built-in parser for a narrower integer type would reject it before

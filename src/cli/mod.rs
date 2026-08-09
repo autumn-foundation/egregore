@@ -3336,18 +3336,20 @@ pub(crate) enum QuerySubcommand {
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Maximum session rows returned (default 20, max 200). Values outside
-        /// 1..=200 — negative or wider than a machine word — are rejected
-        /// with an `invalid_limit` diagnostic.
+        /// 1..=200 — negative, non-numeric, or wider than any fixed-width
+        /// integer — are rejected with an `invalid_limit` diagnostic.
         ///
-        /// Signed and 128-bit, not `usize`: a `usize` field would make clap
-        /// reject `--limit -1` OR `--limit 9223372036854775808` (one past
-        /// `i64::MAX`, still a well-formed integer) with its own parse error
-        /// before this lane's dispatch arm ever runs, bypassing the
-        /// documented machine-readable `invalid_limit` envelope for exactly
-        /// the values it exists to catch. `i128`'s range comfortably covers
-        /// every value worth distinguishing from a genuine shape error.
-        #[arg(long, allow_hyphen_values = true, default_value_t = query::SESSIONS_DEFAULT_LIMIT as i128)]
-        limit: i128,
+        /// Raw `String`, not a fixed-width integer: ANY bounded integer field
+        /// (`usize`, `i64`, even `i128`) still gives clap a ceiling of its
+        /// own, so a decimal literal one past that type's max reaches clap's
+        /// built-in parser error before this lane's dispatch arm ever runs
+        /// (issue #112 review round 22, after rounds 6/19 each just moved the
+        /// same ceiling to a wider type). Accepting the raw token instead and
+        /// parsing it ourselves below removes the ceiling entirely — no
+        /// magnitude of decimal integer can bypass the documented
+        /// machine-readable envelope.
+        #[arg(long, allow_hyphen_values = true, default_value_t = query::SESSIONS_DEFAULT_LIMIT.to_string())]
+        limit: String,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -7125,22 +7127,36 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // diagnostics `resolve_repo_scope` emits.
             let max =
                 i128::try_from(query::SESSIONS_MAX_LIMIT).expect("SESSIONS_MAX_LIMIT fits i128");
-            if limit < 1 || limit > max {
-                // `serde_json::json!` embeds `limit: i128` via `Serialize`,
+            // `--limit` is a raw `String` (issue #112 review round 22): no
+            // fixed-width integer type bounds this parse, so a decimal
+            // literal of ANY magnitude reaches this lane's own range check
+            // rather than a clap parse error. `parse::<i128>()` fails both
+            // for genuinely non-numeric text AND for a well-formed integer
+            // wider than i128 — both are equally "not 1..=max", so both are
+            // reported identically as `invalid_limit`, never a bare clap
+            // usage error.
+            let parsed = limit.parse::<i128>().ok();
+            let in_range = parsed.is_some_and(|n| (1..=max).contains(&n));
+            if !in_range {
+                // `serde_json::json!` embeds a raw `i128` via `Serialize`,
                 // which PANICS for a value outside BOTH i64 and u64 range
                 // (serde_json's `Number` cannot represent one without the
                 // `arbitrary_precision` feature, which this crate does not
-                // enable) — reachable here precisely because `--limit`
-                // accepts the FULL i128 range so clap's own parser never
-                // rejects an out-of-range value first. Render as a NUMBER
-                // when representable (matching every in-range case callers
-                // already rely on), falling back to its decimal STRING only
-                // for the genuinely unrepresentable tail — never a lossy
-                // truncation and never a panic.
-                let limit_value = i64::try_from(limit)
-                    .map(serde_json::Value::from)
-                    .or_else(|_| u64::try_from(limit).map(serde_json::Value::from))
-                    .unwrap_or_else(|_| serde_json::Value::String(limit.to_string()));
+                // enable). Render as a NUMBER when representable (matching
+                // every in-range case callers already rely on), falling back
+                // to the exact decimal STRING otherwise — the parsed value's
+                // string form when it parsed but overflowed i64/u64, or the
+                // raw token verbatim when it never parsed as an integer at
+                // all — never a lossy truncation and never a panic.
+                let limit_value = parsed.map_or_else(
+                    || serde_json::Value::String(limit),
+                    |n| {
+                        i64::try_from(n)
+                            .map(serde_json::Value::from)
+                            .or_else(|_| u64::try_from(n).map(serde_json::Value::from))
+                            .unwrap_or_else(|_| serde_json::Value::String(n.to_string()))
+                    },
+                );
                 let diag = serde_json::json!({
                     "ok": false,
                     "error": {
@@ -7160,7 +7176,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             }
             // In-range at this point: 1..=SESSIONS_MAX_LIMIT fits `usize` on
             // every supported target.
-            let limit = usize::try_from(limit).expect("bounded by the range check above");
+            let limit = usize::try_from(parsed.expect("in_range implies Some"))
+                .expect("bounded by the range check above");
             // Strictly read-only lane: `--data-dir` reads a throwaway copy so
             // the live store stays byte-for-byte untouched.
             let records = match (graph.as_deref(), data_dir.as_deref()) {
