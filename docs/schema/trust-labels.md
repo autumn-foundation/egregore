@@ -1,7 +1,21 @@
 # Derived Trust Labels on Context Answers
 
 **Status:** Active. This document is the single source of truth for the `trust`
-field emitted on every record row of a cross-domain context answer (issue #114).
+field emitted on every record row of a **cross-domain context answer**
+(issue #114) — the surfaces listed in §7.
+
+> **Name collision, stated up front.** Several *single-domain* lanes
+> (`eg query deps`, `path`, `transitive-callers`, `transitive-callees`,
+> `change-impact`, `who-imports`, `who-constructs`, `unsafe-sites`,
+> `unwrap-expect`, `debt-markers`, `coupling`) already emit a field also spelled
+> `trust`, carrying a *different* per-lane vocabulary (`source_fact`,
+> `reachability_lead`, `dependency_lead`, `impact_lead`,
+> `historical_co_change_lead`). Those are row-provenance markers for
+> single-tier answers and predate this contract; they are **out of scope here
+> and unchanged**. The vocabulary below is closed **for context answers only**.
+> Note `source_fact` appears in both sets with different meanings — a consumer
+> reading `trust` across lanes must key on the lane, not on the field name
+> alone.
 
 **Applies to:** the answer surfaces listed in §7. It is a **read-time query-answer
 field**: it is never persisted, never enters a `GraphRecord` payload, and mints no
@@ -129,23 +143,43 @@ and with `is_verified_claim` in the memory audit.
 `Verification`, `CommandEvidence`, `TestRun`, `CommandRun`, `CIStatus`,
 `BenchmarkRun`, `CoverageReport`, `ProofResult`.
 
-**Agent-claim kinds** → the agent branch (rows 3–5):
+**Asserted-claim kinds** → the agent branch (rows 3–5):
 `Observation`, `Decision`, `Failure`, `Agent`, `AgentSession`, `AgentRun`,
-`AgentTurn`, `ToolCall`.
+`AgentTurn`, `ToolCall`, plus the user-context policy kinds
+(`PromoteCandidate`, `PromotionPrompt`, `PromotionDecision`, `Preference`,
+`WorkflowRule`, `NamingDecision`, `Constraint`).
 
 **Everything else** → `source_derived`: code-graph kinds, `SemanticDrift` and the
 embedding kinds, project kinds, artifact kinds (`Artifact`, `PatchArtifact`,
-`FileEdit`), log kinds, user-context kinds, `Diagnostic`, `Retraction`,
-`CostUsage`, `ScanCoverage`.
+`FileEdit`), log kinds, `Diagnostic`, `Retraction`, `CostUsage`, `ScanCoverage`.
 
-> **Honest limit — trajectory-imported verifications.** The trajectory importers
-> (`src/traj.rs`, `src/codex.rs`, `src/antigravity.rs`) mint `Verification` and
-> `CommandRun` nodes under `agent_memory:v1:` record IDs, because the evidence was
-> recovered from the agent's own transcript. Classification is by node kind, not by
-> ID prefix, so those rows read `verification_evidence` and can confer
-> `agent_verified`. That is a deterministic transcription of a recorded command
-> execution — it is **not** independent verification, and a store built only from
-> agent trajectories should be read with that in mind.
+> **Why the user-context kinds sit in the claim branch.** Issue #114 explicitly
+> **defers** promotion / preference trust to the promotion flow, and
+> `classify_node` returns `None` for every one of these kinds, so no context
+> answer renders them today. The wildcard-free match still forces a choice, and
+> the fail-closed one is the claim branch: a `Preference` or `Constraint` is an
+> *assertion*, not something derived from a source artifact, so `source_derived`
+> would over-claim. The honest caveat is that the emitted value would read
+> `agent_unverified`, which understates authorship (these are operator-authored)
+> while correctly stating that nothing corroborates them. Whoever first renders
+> them must revisit this.
+
+> **Honest limit — trajectory-imported records.** The trajectory importers
+> (`src/traj.rs`, `src/codex.rs`, `src/claude_code.rs`, `src/antigravity.rs`)
+> mint `Verification`, `CommandRun`, `ToolCall`, `FileEdit`, and `PatchArtifact`
+> nodes under `agent_memory:v1:` record IDs, because the evidence was recovered
+> from the agent's own transcript. Classification is by node kind, not by ID
+> prefix, so a trajectory-imported `Verification` reads `verification_evidence`
+> and can confer `agent_verified`, and a trajectory-imported `FileEdit` /
+> `PatchArtifact` reads `source_derived`.
+>
+> Two things follow. First, that is a deterministic transcription of a recorded
+> command execution — **not** independent verification. Second, the `FileEdit`
+> case is weaker than `source_derived` normally implies: `src/traj.rs` sets
+> `before_hash`/`after_hash` to *surrogate* hashes derived from the transcript
+> (no file was read), `repo_relative_path` comes from a shell-string parse,
+> and `edit_kind`/`hunk_count` are hardcoded. A store built only from agent
+> trajectories should be read with both limits in mind.
 
 ---
 
@@ -165,9 +199,18 @@ A link promotes an agent-authored claim to `agent_verified` **only if all five h
 3. **The target is a verification kind** (§4). A link to another agent-authored
    record never qualifies — *an agent-authored claim is never counted as evidence
    for itself*.
-4. **The target is live at this snapshot** — not tombstoned, and its own
-   supersession status is `current`.
-5. **The target is passing** (§6).
+4. **The target is live at this snapshot** — it is the **latest physical
+   version** of its record ID, it is not tombstoned, and its own supersession
+   status is `current`. The latest-version rule matters: `eg export`
+   deliberately re-emits superseded versions, and `eg capture-tests` keys a
+   `TestRun` on `(session, commit, suite)` with `status` **not** an identity
+   input, so a suite re-run that went red yields two versions of one ID.
+   Without it a stale green version would outvote the current red one, and
+   `--graph` would disagree with `--data-dir`.
+5. **The link itself is live** — the edge is the latest version of its edge ID
+   and is not tombstoned. `eg forget` can retract an evidence-link edge; a
+   retracted link must stop conferring trust, not merely stop being traversed.
+6. **The target is passing** (§6).
 
 **Direct links only — one hop.** There is no file-level widening and no transitive
 closure. `eg query verification-coverage` deliberately widens to `link_level: file`;
@@ -190,9 +233,27 @@ The rule is therefore closed and fail-closed:
 |----------------|----------|
 | `status` present, ASCII-lowercased/trimmed value is `pass` or `passed` | **yes** |
 | `status` present, any other value (`fail`, `skip`, `error`, `timeout`, unrecognized) | no |
-| `status` absent or empty, `exit_code == 0` | **yes** |
+| `status` absent or empty, `exit_code == 0`, **and** the kind is `Verification` / `TestRun` / `CIStatus` / `ProofResult` / `BenchmarkRun` / `CoverageReport` | **yes** |
+| `status` absent or empty, `exit_code == 0`, kind is `CommandRun` / `CommandEvidence` | **no** |
 | `status` absent or empty, `exit_code != 0` | no |
 | `status` absent or empty, no `exit_code` | no |
+
+The exit-code fallback is **kind-restricted on purpose**. `src/traj.rs` mints a
+status-less `Verification` only for a *test* command (it is gated on
+`is_test_command`), so a zero exit there really is a verification verdict. But
+`src/codex.rs` and `src/claude_code.rs` mint a `CommandRun` for **every** shell
+invocation — and `src/claude_code.rs` also mints a
+`ToolCall --PRODUCED_EVIDENCE--> CommandRun` edge, a write-path-valid backing
+relation. Without the restriction, an agent claim linked to a successful `ls`
+would read `agent_verified`. A `CommandRun` must therefore say `pass`
+explicitly.
+
+**Link confidence is not consulted.** An `EvidenceLink` carries a `confidence`
+string, and a link with `confidence: "0.0"` still confers `agent_verified` when
+every condition in §5 holds. This matches `is_verified_claim` in the memory
+audit. Thresholding a free-string confidence would invent a policy this contract
+does not own; the raw `evidence_links` ride on the row, so a consumer that cares
+can apply its own.
 
 `status` wins when present: a record carrying `status: "fail"` is not passing even
 if `exit_code` is `0`. `pass` is the canonical token
@@ -221,8 +282,27 @@ Every record row of every cross-domain context answer:
 | `eg query locate` | the bundle sections |
 | `eg query semantic-context` | the per-match bundle sections |
 | `eg query task` | `tasks`, `acceptance_criteria` (including a nested `verification_record`), `source_facts`, `observations`, `artifacts`, `verification_evidence`, `reviews`, `external_links` |
+| `eg query error-context` | `source_facts`, `observations`, `project_state`, `artifacts`, `verification_evidence` (each row also keeps its own domain-keyed `trust_class`) |
+| `eg query changes` | `observations`, `project_state`, `artifacts`, `verification_evidence` |
 | daemon `observations_for_symbol` | the same sections as `eg query context` |
+| daemon `criteria_for_task` | the same sections as `eg query task` |
 | MCP `symbol_context`, `task_evidence` | the same sections as their CLI equivalents |
+
+`eg query subsystem` has no `drift_history`; its drift rows are the
+`semantic_drift` section, and it adds `log_signatures`. Both carry `trust`.
+
+### Rows that are deliberately outside this contract
+
+The label exists because a **trust-MIXED** section can hide the difference
+between a fact and a guess. Rows that are single-tier by construction, or that
+are not context rows at all, are left alone:
+
+| Row | Why it carries no `trust` |
+|-----|---------------------------|
+| `eg query locate`'s `symbol` and `enclosing_chain` | These are the *location* answer, identical in shape to `eg query at` (a single-domain lane). The located record also appears in `source_facts`, where it does carry its label. |
+| `eg query changes`' `changed_files`, `changed_symbols`, `commits`, `tombstones`, `drift_records`, `unexplained_changes` | Every row in each is a code-graph record, so the section is single-tier and its name already says what it holds. Only that lane's genuinely mixed sections (`observations`, `project_state`, `artifacts`, `verification_evidence`) are labeled. |
+| `eg query evidence-path` hops | A witness path over evidence edges, not a trust-separated context bundle. Hop rows keep their existing `trust_class`. |
+| Single-domain lanes (`deps`, `who-imports`, `unsafe-sites`, …) | Single-tier answers; see the name-collision note at the top of this document. |
 
 All transports derive the label with the same function over the same record slice,
 so a CLI answer and a daemon answer cannot disagree.
@@ -256,11 +336,39 @@ labels. Guaranteed by construction:
 
 - inputs are only the record slice, its evidence links, its incident edges, and the
   supersession graph — all snapshot-scoped;
-- every internal index is a `BTreeMap`/`BTreeSet`, never a `HashMap`/`HashSet`;
+- every index owned by the derivation is a `BTreeMap`/`BTreeSet`;
 - the supporting-link check is an order-independent existential;
 - no wall clock, no randomness, no filesystem, no network.
 
+One caveat, stated precisely because the easy version of this claim is false:
+the derivation embeds a `TemporalResolver`, whose internal indexes **are**
+`HashMap`/`HashSet`. Determinism there does not come from container choice. It
+comes from the shape of the answer: `resolve_status` returns a scalar status
+that is set-determined rather than iteration-ordered — its DFS keeps only the
+current path in the visited set and pops on backtrack, so it is exhaustive over
+simple paths and reports a cycle iff one is reachable, and its head set is the
+order-invariant set of successor-less reachable nodes — and its returned
+reference lists are sorted before use.
+
 The label is also invariant to the physical order of records in the input JSONL.
+
+### Scope caveats a consumer should know
+
+- **The label is snapshot-relative, not absolute.** `eg query context` derives
+  it over the *corpus-filtered* slice, so a record can read `agent_verified`
+  under `--all-history` and `agent_unverified` under the default HEAD-anchored
+  corpus if the supporting run is not current at HEAD. That is the intended
+  reading of "at the queried snapshot", but a consumer caching labels across
+  flag combinations will see them move.
+- **The daemon's `as_of` narrowing drops tombstones**, so under
+  `as_of.valid_time` the §5 liveness rules see a slice with no tombstones and a
+  retracted supporting link can still confer `agent_verified`. Pre-existing
+  filter behaviour, disclosed here because this field turns a silent omission
+  into a positive verdict.
+- **"The transports cannot disagree"** means they call the *same derivation over
+  the slice each transport resolved*. Where the slices differ — the CLI applies
+  corpus filtering that the daemon verb does not — the labels can differ,
+  honestly reflecting the different corpora.
 
 ---
 

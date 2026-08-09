@@ -23,13 +23,19 @@ use serde::{Deserialize, Serialize};
 use crate::ir::{EdgeLabel, GraphRecord, NodeKind};
 use crate::temporal_status::TemporalResolver;
 
+use super::liveness::Liveness;
+
 /// The closed, derived trust vocabulary carried by every record row of a
 /// cross-domain context answer (issue #114).
 ///
 /// Distinct from the pre-existing `trust_class` domain vocabulary, which is
 /// retained unchanged and answers a different question. See
 /// `docs/schema/trust-labels.md` §1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+// Deliberately NOT `PartialOrd`/`Ord`: the five values are a closed set of
+// distinct verdicts, not a ranking. Deriving an ordering would invite a consumer
+// to "sort by trust" and silently rank, say, a `source_derived` project row
+// against an `agent_verified` observation as if the comparison meant something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustLabel {
     /// Deterministically derived from a source artifact rather than asserted by
@@ -99,6 +105,14 @@ const PASS_STATUSES: [&str; 2] = ["pass", "passed"];
 ///
 /// Canonical home for the mapping so the answer surfaces and the CLI cannot
 /// drift; `crate::cli::trust_class_for` delegates here.
+///
+/// **This mapping is FROZEN.** It gates `eg audit citations`: the trust class a
+/// record resolves to decides which citation handle the audit REQUIRES of it,
+/// so adding an arm silently changes that gate. Adding `SemanticDrift` here,
+/// for instance, makes the audit demand a path/span handle of every drift row
+/// and fails the seeded gate. A kind with no arm falls to `"other"`; a surface
+/// that needs a better label for such a kind must supply it locally (see
+/// `ContextDrift`) rather than widening this function.
 #[must_use]
 pub fn trust_class_for(record: &GraphRecord) -> &'static str {
     let Some(kind) = record.node_kind_name() else {
@@ -147,8 +161,9 @@ pub fn trust_class_for(record: &GraphRecord) -> &'static str {
 enum KindClass {
     /// A verification-domain execution record.
     Verification,
-    /// An agent-authored claim: the only class that can reach an `agent_*` label.
-    AgentClaim,
+    /// An asserted claim — agent-authored, or a (deferred) user-context
+    /// assertion. The only class that can reach an `agent_*` label.
+    AssertedClaim,
     /// Everything else — deterministic, not interposed by agent judgement.
     SourceDerived,
 }
@@ -173,9 +188,14 @@ const fn kind_class(kind: NodeKind) -> KindClass {
         // ── agent-authored claims ─────────────────────────────────────────────
         // Observation/Decision/Failure are the claim kinds a context answer
         // returns. The run/turn/tool-call/identity kinds are agent-memory
-        // records recovered from the agent's own transcript; they are relay
-        // nodes that no context section returns today, but classifying them
-        // here keeps the fail-closed direction if that ever changes.
+        // records recovered from the agent's own transcript; `classify_node`
+        // returns `None` for them, so no context section renders them today.
+        // They are classified here so that a future section which DID render
+        // them would get an `agent_*` verdict rather than `source_derived`.
+        // Note this alone is not sufficient protection: a `ToolCall` carries a
+        // write-path-valid `PRODUCED_EVIDENCE` edge to the `CommandRun` it
+        // produced, so a successful non-test command must not read as a pass —
+        // that is what `exit_code_may_stand_in_for_status` prevents.
         NodeKind::Observation
         | NodeKind::Decision
         | NodeKind::Failure
@@ -183,7 +203,24 @@ const fn kind_class(kind: NodeKind) -> KindClass {
         | NodeKind::AgentSession
         | NodeKind::AgentRun
         | NodeKind::AgentTurn
-        | NodeKind::ToolCall => KindClass::AgentClaim,
+        | NodeKind::ToolCall
+        // User-context policy kinds. Issue #114 explicitly DEFERS promotion /
+        // preference trust to the promotion flow, and `classify_node` returns
+        // `None` for all of them, so none is rendered by a context answer
+        // today. The exhaustive match still forces a choice, and the
+        // fail-closed one is this branch: a `Preference` or `Constraint` is an
+        // ASSERTION, not something derived from a source artifact, so calling
+        // it `source_derived` would over-claim. The honest caveat is that the
+        // emitted value reads `agent_unverified`, which understates authorship
+        // (these are operator-authored) while correctly stating that nothing
+        // corroborates them. Whoever renders them must revisit this.
+        | NodeKind::PromoteCandidate
+        | NodeKind::PromotionPrompt
+        | NodeKind::PromotionDecision
+        | NodeKind::Preference
+        | NodeKind::WorkflowRule
+        | NodeKind::NamingDecision
+        | NodeKind::Constraint => KindClass::AssertedClaim,
 
         // ── everything else is deterministically source-derived ───────────────
         // code graph
@@ -221,14 +258,6 @@ const fn kind_class(kind: NodeKind) -> KindClass {
         | NodeKind::Artifact
         | NodeKind::FileEdit
         | NodeKind::PatchArtifact
-        // user context / policy
-        | NodeKind::PromoteCandidate
-        | NodeKind::PromotionPrompt
-        | NodeKind::PromotionDecision
-        | NodeKind::Preference
-        | NodeKind::WorkflowRule
-        | NodeKind::NamingDecision
-        | NodeKind::Constraint
         // operational
         | NodeKind::CostUsage
         | NodeKind::Retraction
@@ -240,30 +269,64 @@ const fn kind_class(kind: NodeKind) -> KindClass {
     }
 }
 
+/// Kinds for which a recorded `exit_code == 0` may stand in for a missing
+/// `status`.
+///
+/// Deliberately EXCLUDES `CommandRun`/`CommandEvidence`. The trajectory
+/// importers mint a status-less `Verification` only for a *test* command
+/// (`src/traj.rs`, gated on `is_test_command`), so exit 0 there really does mean
+/// "the check passed" — but `src/codex.rs` and `src/claude_code.rs` mint a
+/// `CommandRun` for EVERY shell invocation, so a successful `ls` would otherwise
+/// be read as verification. A `CommandRun` must therefore say `pass` explicitly.
+const fn exit_code_may_stand_in_for_status(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Verification
+            | NodeKind::TestRun
+            | NodeKind::CIStatus
+            | NodeKind::ProofResult
+            | NodeKind::BenchmarkRun
+            | NodeKind::CoverageReport
+    )
+}
+
 /// Returns `true` when a verification-domain record counts as **passing**.
 ///
 /// See `docs/schema/trust-labels.md` §6 for the full table. `status` wins when
 /// present; the `exit_code == 0` fallback exists because the trajectory
-/// importers record only an exit code. Unknown is never a pass.
+/// importers record only an exit code, and is restricted to the kinds where a
+/// zero exit really is a verification verdict. Unknown is never a pass.
 fn verification_is_passing(record: &GraphRecord) -> bool {
     let GraphRecord::Node {
-        status, exit_code, ..
+        kind,
+        status,
+        exit_code,
+        ..
     } = record
     else {
         return false;
     };
-    match status.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => PASS_STATUSES.contains(&s.to_ascii_lowercase().as_str()),
-        None => *exit_code == Some(0),
-    }
+    let recorded = status.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    recorded.map_or_else(
+        || exit_code_may_stand_in_for_status(*kind) && *exit_code == Some(0),
+        |s| PASS_STATUSES.contains(&s.to_ascii_lowercase().as_str()),
+    )
 }
 
 /// Snapshot-scoped index used to derive [`TrustLabel`] for records of one answer.
 ///
 /// Built once per answer from the same record slice the answer was computed
-/// over, so the label is "at the queried snapshot" by construction. Every index
-/// is a `BTree*` — never a `HashMap`/`HashSet` — so derivation is
-/// order-independent and byte-stable across runs.
+/// over, so the label is "at the queried snapshot" by construction.
+///
+/// Derivation is order-independent and byte-stable across runs. Every index
+/// OWNED here is a `BTree*`, and the supporting-link check is an existential
+/// over sorted iteration. The embedded [`TemporalResolver`] is `HashMap`-backed,
+/// so the guarantee there rests on a different argument: `resolve_status`
+/// returns a scalar status whose value is set-determined, not iteration-ordered
+/// — its DFS keeps only the current path in the visited set and pops on
+/// backtrack, so it is exhaustive over simple paths and reports a cycle iff one
+/// is reachable, and its head set is the order-invariant set of successor-less
+/// reachable nodes. Its returned reference lists are sorted before use.
 pub struct TrustContext<'a> {
     /// Verification records that are live and passing at this snapshot.
     passing_verifications: BTreeSet<&'a str>,
@@ -278,27 +341,38 @@ impl<'a> TrustContext<'a> {
     #[must_use]
     pub fn build(records: &'a [GraphRecord]) -> Self {
         let resolver = TemporalResolver::build(records);
+        let liveness = Liveness::new(records);
 
-        let tombstoned: BTreeSet<&str> = records
-            .iter()
-            .filter_map(|r| match r {
-                GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
-                _ => None,
-            })
-            .collect();
+        // Latest physical write per node id, so a SUPERSEDED earlier version of a
+        // verification record can never confer `agent_verified` on the strength
+        // of a result the store has since replaced. Mirrors the embedded
+        // current-state read (and `eg query task`'s own `rfind`-by-id), which
+        // matters because `eg export` deliberately re-emits superseded versions:
+        // without this, `--graph` and `--data-dir` would disagree.
+        let mut latest_node_write: BTreeMap<&str, usize> = BTreeMap::new();
+        for (index, record) in records.iter().enumerate() {
+            if let GraphRecord::Node { id, .. } = record {
+                latest_node_write.insert(id.as_str(), index);
+            }
+        }
 
-        // A verification record confers `agent_verified` only when it is live
-        // (not tombstoned, not itself superseded/contradicted) and passing.
+        // A verification record confers `agent_verified` only when it is the
+        // latest version of its id, live (not tombstoned, not itself
+        // superseded/contradicted), and passing.
         let passing_verifications: BTreeSet<&str> = records
             .iter()
-            .filter_map(|r| {
+            .enumerate()
+            .filter_map(|(index, r)| {
                 let GraphRecord::Node { id, kind, .. } = r else {
                     return None;
                 };
                 if kind_class(*kind) != KindClass::Verification {
                     return None;
                 }
-                if tombstoned.contains(id.as_str()) {
+                if latest_node_write.get(id.as_str()) != Some(&index) {
+                    return None;
+                }
+                if liveness.deleted(id.as_str()) {
                     return None;
                 }
                 if resolver.resolve_status(id.as_str()).0 != "current" {
@@ -309,8 +383,9 @@ impl<'a> TrustContext<'a> {
             .collect();
 
         let mut supporting_edge_targets: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-        for record in records {
+        for (index, record) in records.iter().enumerate() {
             let GraphRecord::Edge {
+                id,
                 label,
                 source,
                 target,
@@ -322,15 +397,25 @@ impl<'a> TrustContext<'a> {
             // Forward direction only (claim → verification). Backward traversal
             // would let two claims validated by the same run verify each other —
             // the hazard `is_forward_only_label` documents.
-            if matches!(
+            if !matches!(
                 label,
                 EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence | EdgeLabel::ProducedEvidence
             ) {
-                supporting_edge_targets
-                    .entry(source.as_str())
-                    .or_default()
-                    .insert(target.as_str());
+                continue;
             }
+            // The LINK must be live too, not just its target: `eg forget` can
+            // retract an evidence-link edge, and a stale earlier version of an
+            // edge id must not shadow its current metadata. Mirrors
+            // `memory_audit::verification_support_indexes` and the tombstone gate
+            // `symbol_context` already applies to its own traversal.
+            if !liveness.is_latest_edge_version(id.as_str(), index) || liveness.deleted(id.as_str())
+            {
+                continue;
+            }
+            supporting_edge_targets
+                .entry(source.as_str())
+                .or_default()
+                .insert(target.as_str());
         }
 
         Self {
@@ -342,18 +427,21 @@ impl<'a> TrustContext<'a> {
 
     /// Derives the trust label for one record.
     ///
-    /// A non-node record (edge or tombstone) is reported [`TrustLabel::SourceDerived`];
-    /// no answer surface labels those rows (see `docs/schema/trust-labels.md` §7),
-    /// so this is a defensive default rather than a rendered value.
+    /// No answer surface labels a non-node record — `topology_edges` and
+    /// `unresolved` deliberately carry no label (see
+    /// `docs/schema/trust-labels.md` §7) — so the edge/tombstone arm is
+    /// unreachable in rendered output. It returns the WEAKEST label rather than
+    /// the most authoritative one, so a future caller that reaches it
+    /// under-claims instead of over-claiming.
     #[must_use]
     pub fn label_for(&self, record: &GraphRecord) -> TrustLabel {
         let GraphRecord::Node { id, kind, .. } = record else {
-            return TrustLabel::SourceDerived;
+            return TrustLabel::AgentUnverified;
         };
         match kind_class(*kind) {
             KindClass::Verification => TrustLabel::VerificationEvidence,
             KindClass::SourceDerived => TrustLabel::SourceDerived,
-            KindClass::AgentClaim => {
+            KindClass::AssertedClaim => {
                 // Contradiction beats verification: a stale green run never
                 // rescues a superseded claim, and an unresolvable supersession
                 // cycle is reported contradicted rather than merely unverified.
@@ -908,6 +996,168 @@ mod tests {
             label(&records, "agent_memory:v1:obs"),
             TrustLabel::AgentUnverified
         );
+    }
+
+    #[test]
+    fn a_superseded_physical_version_of_a_passing_run_confers_nothing() {
+        // `eg export` re-emits superseded versions and `capture-tests` keys a
+        // TestRun on (session, commit, suite) with status NOT an identity input,
+        // so re-running a suite that went red yields two versions of one id.
+        // Only the latest write may decide.
+        let records = vec![
+            with_links(
+                node("agent_memory:v1:obs", NodeKind::Observation),
+                vec![link("HAS_EVIDENCE", "verification:v1:t")],
+            ),
+            verification("verification:v1:t", Some("pass"), None),
+            verification("verification:v1:t", Some("fail"), Some(1)),
+        ];
+        assert_eq!(
+            label(&records, "agent_memory:v1:obs"),
+            TrustLabel::AgentUnverified,
+            "a stale green version must not outvote the current red one"
+        );
+    }
+
+    #[test]
+    fn a_later_passing_version_does_confer_verified() {
+        // The mirror of the case above: red first, green latest.
+        let records = vec![
+            with_links(
+                node("agent_memory:v1:obs", NodeKind::Observation),
+                vec![link("HAS_EVIDENCE", "verification:v1:t")],
+            ),
+            verification("verification:v1:t", Some("fail"), Some(1)),
+            verification("verification:v1:t", Some("pass"), None),
+        ];
+        assert_eq!(
+            label(&records, "agent_memory:v1:obs"),
+            TrustLabel::AgentVerified
+        );
+    }
+
+    #[test]
+    fn a_tombstoned_supporting_edge_confers_nothing() {
+        // `eg forget` can retract an evidence-link edge; the LINK's liveness
+        // must be checked, not only the target's.
+        let edge = GraphRecord::edge(
+            EdgeLabel::ValidatedBy,
+            "agent_memory:v1:obs".to_owned(),
+            "verification:v1:t".to_owned(),
+            Some("1.0".to_owned()),
+            "validated".to_owned(),
+        );
+        let edge_id = edge.id().to_owned();
+        let records = vec![
+            node("agent_memory:v1:obs", NodeKind::Observation),
+            verification("verification:v1:t", Some("pass"), None),
+            edge,
+            GraphRecord::Tombstone {
+                id: format!("{edge_id}:tombstone"),
+                schema_version: 1,
+                deleted_id: edge_id,
+                summary: "retracted evidence link".to_owned(),
+                producer: None,
+            },
+        ];
+        assert_eq!(
+            label(&records, "agent_memory:v1:obs"),
+            TrustLabel::AgentUnverified,
+            "a retracted evidence link must not still confer agent_verified"
+        );
+    }
+
+    #[test]
+    fn a_successful_non_test_command_run_is_not_a_pass() {
+        // `codex`/`claude_code` mint a status-less CommandRun for EVERY shell
+        // invocation, so a successful `ls` must never read as verification.
+        let mut cmd = node("agent_memory:v1:cmd", NodeKind::CommandRun);
+        if let GraphRecord::Node {
+            ref mut exit_code, ..
+        } = cmd
+        {
+            *exit_code = Some(0);
+        }
+        let records = vec![
+            with_links(
+                node("agent_memory:v1:obs", NodeKind::Observation),
+                vec![link("PRODUCED_EVIDENCE", "agent_memory:v1:cmd")],
+            ),
+            cmd,
+        ];
+        assert_eq!(
+            label(&records, "agent_memory:v1:obs"),
+            TrustLabel::AgentUnverified,
+            "exit 0 on a generic CommandRun is not a verification verdict"
+        );
+    }
+
+    #[test]
+    fn an_explicit_pass_status_on_a_command_run_does_confer_verified() {
+        // The exit-code fallback is narrowed, not the explicit status.
+        let records = vec![
+            with_links(
+                node("agent_memory:v1:obs", NodeKind::Observation),
+                vec![link("VALIDATED_BY", "verification:v1:cmd")],
+            ),
+            {
+                let mut r = node("verification:v1:cmd", NodeKind::CommandRun);
+                if let GraphRecord::Node {
+                    ref mut status,
+                    ref mut exit_code,
+                    ..
+                } = r
+                {
+                    *status = Some("pass".to_owned());
+                    *exit_code = Some(0);
+                }
+                r
+            },
+        ];
+        assert_eq!(
+            label(&records, "agent_memory:v1:obs"),
+            TrustLabel::AgentVerified
+        );
+    }
+
+    #[test]
+    fn trust_class_and_trust_never_disagree_on_authorship() {
+        // A row must never serialize {"trust_class":"other","trust":"agent_*"}
+        // or {"trust_class":"agent_authored","trust":"source_derived"}.
+        // Restricted to the kinds a context section actually renders
+        // (`classify_node`), because `trust_class_for` is a frozen contract that
+        // reports `other` for kinds outside its arms — including the
+        // agent-memory relay kinds, which no answer surfaces.
+        for kind in [
+            NodeKind::Observation,
+            NodeKind::Decision,
+            NodeKind::Failure,
+            NodeKind::Symbol,
+            NodeKind::File,
+            NodeKind::Task,
+            NodeKind::Artifact,
+            NodeKind::PatchArtifact,
+            NodeKind::TestRun,
+            NodeKind::CommandRun,
+            NodeKind::ErrorSignature,
+        ] {
+            let records = vec![node("agent_memory:v1:x", kind)];
+            let derived = label(&records, "agent_memory:v1:x");
+            let class = trust_class_for(&records[0]);
+            let derived_is_agent = matches!(
+                derived,
+                TrustLabel::AgentVerified
+                    | TrustLabel::AgentUnverified
+                    | TrustLabel::AgentContradicted
+            );
+            assert_eq!(
+                derived_is_agent,
+                class == "agent_authored",
+                "{kind:?} disagrees: trust_class={class}, trust={}",
+                derived.as_str()
+            );
+            assert_ne!(class, "other", "{kind:?} must have a real trust_class");
+        }
     }
 
     #[test]

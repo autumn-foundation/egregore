@@ -10110,7 +10110,11 @@ fn context_source_fact_to_json(
         ..
     } = record
     else {
-        return json!({ "record_id": record.id() });
+        return json!({
+            "record_id": record.id(),
+            "trust_class": graph_query::trust_class_for(record),
+            "trust": trust.label_for(record).as_str(),
+        });
     };
     json!({
         "record_id": id,
@@ -10134,7 +10138,18 @@ fn context_observation_to_json(
 ) -> serde_json::Value {
     graph_query::context_observation(record, trust)
         .and_then(|obs| serde_json::to_value(&obs).ok())
-        .unwrap_or_else(|| json!({ "record_id": record.id() }))
+        // The degraded fallback still carries the label: the CLI's
+        // `ExcludedDiagnostic.trust` is a non-optional field, and
+        // `apply_supersession_json` copies `trust` off this object, so omitting
+        // it here would let a daemon `excluded` row silently lose its label
+        // where the CLI's cannot (issue #114).
+        .unwrap_or_else(|| {
+            json!({
+                "record_id": record.id(),
+                "trust_class": graph_query::trust_class_for(record),
+                "trust": trust.label_for(record).as_str(),
+            })
+        })
 }
 
 fn context_linked_item_to_json(
@@ -10143,7 +10158,13 @@ fn context_linked_item_to_json(
 ) -> serde_json::Value {
     graph_query::context_linked_item(record, trust)
         .and_then(|item| serde_json::to_value(&item).ok())
-        .unwrap_or_else(|| json!({ "record_id": record.id() }))
+        .unwrap_or_else(|| {
+            json!({
+                "record_id": record.id(),
+                "trust_class": graph_query::trust_class_for(record),
+                "trust": trust.label_for(record).as_str(),
+            })
+        })
 }
 
 /// Builds one `drift_history` row from a `SemanticDrift` record (issue #108),
@@ -10176,10 +10197,10 @@ fn context_drift_to_json(
     let (resolved_path, _resolved_name, resolved_span) = resolved;
     let mut obj = serde_json::Map::new();
     obj.insert("record_id".to_owned(), json!(id.as_str()));
-    obj.insert(
-        "trust_class".to_owned(),
-        json!(graph_query::trust_class_for(record)),
-    );
+    // See `eg query context`'s `context_drift`: the frozen `trust_class_for`
+    // has no `SemanticDrift` arm, and the citation audit treats a drift handle
+    // as `source_fact`.
+    obj.insert("trust_class".to_owned(), json!("source_fact"));
     obj.insert("trust".to_owned(), json!(trust.label_for(record).as_str()));
     obj.insert("score".to_owned(), json!(drift.score));
     obj.insert("before_commit".to_owned(), json!(&drift.before_git_commit));
@@ -10363,6 +10384,9 @@ fn apply_supersession_json(
                         });
                         if let Some(trust) = obs.get("trust").cloned() {
                             diag["trust"] = trust;
+                        }
+                        if let Some(class) = obs.get("trust_class").cloned() {
+                            diag["trust_class"] = class;
                         }
                         if !superseded_by.is_empty() {
                             diag["superseded_by"] =

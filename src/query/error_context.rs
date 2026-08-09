@@ -76,6 +76,11 @@ pub struct Row {
     pub domain: String,
     /// Trust class derived from the domain — REQUIRED on every row.
     pub trust_class: &'static str,
+    /// Derived trust verdict (issue #114) — *how much uncorroborated agent
+    /// judgement this row requires*, from the closed five-value vocabulary.
+    /// Distinct from `trust_class`, which reports the record's domain; see
+    /// `docs/schema/trust-labels.md`.
+    pub trust: super::TrustLabel,
     /// Node kind name (`Symbol`, `Observation`, `CommandRun`, …).
     pub kind: String,
     /// Repo-relative path when the record carries one.
@@ -369,6 +374,7 @@ fn record_domain(record: &GraphRecord) -> String {
 /// Returns `None` for non-node records (edges/tombstones never become rows).
 fn project_row(
     record: &GraphRecord,
+    trust: &super::TrustContext<'_>,
     basis: Option<String>,
     supersession: Option<(String, Vec<String>)>,
 ) -> Option<Row> {
@@ -396,6 +402,7 @@ fn project_row(
         schema_version: *schema_version,
         domain,
         trust_class,
+        trust: trust.label_for(record),
         kind: kind.as_str().to_owned(),
         repo_relative_path: repo_relative_path.clone(),
         span: *span,
@@ -1055,6 +1062,9 @@ pub fn error_context(
 
     // Supersession policy over the agent/project/artifact/verification sections.
     let resolver = TemporalResolver::build(records);
+    // Derived trust labels (issue #114) over the same record slice, so this
+    // lane's rows agree with `eg query context` on every shared record.
+    let trust_ctx = super::TrustContext::build(records);
     let mut excluded: Vec<ExcludedRef> = Vec::new();
     let project = |section: BTreeMap<String, &GraphRecord>,
                    basis: &BTreeMap<String, CorrelationBasis>,
@@ -1080,6 +1090,7 @@ pub fn error_context(
                 (Some((reason, refs)), SupersessionMode::IncludeButFlag) => {
                     if let Some(mut row) = project_row(
                         record,
+                        &trust_ctx,
                         correlation_basis,
                         Some((
                             reason.to_owned(),
@@ -1091,7 +1102,7 @@ pub fn error_context(
                     }
                 }
                 (None, _) => {
-                    if let Some(row) = project_row(record, correlation_basis, None) {
+                    if let Some(row) = project_row(record, &trust_ctx, correlation_basis, None) {
                         rows.push(row);
                     }
                 }
@@ -1103,7 +1114,7 @@ pub fn error_context(
     let empty_basis: BTreeMap<String, CorrelationBasis> = BTreeMap::new();
     let mut source_facts_rows: Vec<Row> = source_facts
         .into_values()
-        .filter_map(|r| project_row(r, None, None))
+        .filter_map(|r| project_row(r, &trust_ctx, None, None))
         .collect();
     let mut observations_rows = project(observations, &basis_by_run, &mut excluded);
     let mut project_state_rows = project(project_state, &empty_basis, &mut excluded);

@@ -114,6 +114,7 @@ pub(crate) fn apply_supersession<'a>(
                 crate::temporal_status::SupersessionMode::Exclude => {
                     excluded.push(ExcludedDiagnostic {
                         record_id: obs.record_id,
+                        trust_class: obs.trust_class,
                         trust: obs.trust,
                         reason,
                         superseded_by: if superseded_by.is_empty() {
@@ -279,7 +280,12 @@ pub(crate) fn context_drift<'a>(
     let (resolved_path, _resolved_name, resolved_span) = resolved;
     Some(ContextDrift {
         record_id: id,
-        trust_class: trust_class_for(record),
+        // `trust_class_for` is frozen and has no `SemanticDrift` arm (it gates
+        // `eg audit citations`), so it would report `other` here. The audit
+        // itself already classifies a drift handle `source_fact` via
+        // `classify_code_handle`, so state that directly rather than widen the
+        // shared mapping and change the audit's gate.
+        trust_class: "source_fact",
         trust: trust.label_for(record),
         score: drift.score,
         before_commit: &drift.before_git_commit,

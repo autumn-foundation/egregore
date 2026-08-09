@@ -527,9 +527,6 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
             Some(item)
         })
         .collect();
-    // Derived trust labels (issue #114): the same derivation the CLI and daemon
-    // call, over the same record slice, so all three transports agree.
-    let trust = query::TrustContext::build(records);
     let source_facts: Vec<Value> = ctx
         .source_facts
         .iter()
@@ -830,10 +827,10 @@ fn record_to_drift(
     let (resolved_path, _resolved_name, resolved_span) = resolved;
     let mut obj = serde_json::Map::new();
     obj.insert("record_id".to_owned(), json!(id.as_str()));
-    obj.insert(
-        "trust_class".to_owned(),
-        json!(query::trust_class_for(record)),
-    );
+    // See `eg query context`'s `context_drift`: the frozen `trust_class_for`
+    // has no `SemanticDrift` arm, and the citation audit treats a drift handle
+    // as `source_fact`.
+    obj.insert("trust_class".to_owned(), json!("source_fact"));
     obj.insert("trust".to_owned(), json!(trust.label_for(record).as_str()));
     obj.insert("score".to_owned(), json!(drift.score));
     obj.insert("before_commit".to_owned(), json!(&drift.before_git_commit));

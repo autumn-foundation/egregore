@@ -138,7 +138,10 @@ pub(crate) fn query_subsystem_cmd(
             let (path, _, span) = query::resolve_drift_target(records, id, drift_meta, None, None);
             Some(SubsystemDrift {
                 record_id: id,
-                trust_class: trust_class_for(r),
+                // See `context_drift`: the frozen `trust_class_for` has no
+                // `SemanticDrift` arm, and the citation audit already treats a
+                // drift handle as `source_fact`.
+                trust_class: "source_fact",
                 trust: trust_ctx.label_for(r),
                 score: drift_meta.score,
                 target_repo_relative_path: path,
@@ -146,6 +149,22 @@ pub(crate) fn query_subsystem_cmd(
                 after_git_commit: Some(drift_meta.after_git_commit.as_str()),
             })
         })
+        .collect();
+
+    // Resolve each signature row back to its record so the label goes through
+    // the SHARED derivation rather than a hardcoded constant.
+    let signature_records: std::collections::BTreeMap<&str, &GraphRecord> = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                GraphRecord::Node {
+                    kind: crate::ir::NodeKind::ErrorSignature,
+                    ..
+                }
+            )
+        })
+        .map(|r| (r.id(), r))
         .collect();
 
     let log_signatures: Vec<SubsystemLogSignature<'_>> = ctx
@@ -157,8 +176,13 @@ pub(crate) fn query_subsystem_cmd(
             trust_class: "runtime_observation",
             // Deterministically parsed from a captured artifact, so the derived
             // verdict is `source_derived` even though the domain class is
-            // `runtime_observation` (issue #114).
-            trust: query::TrustLabel::SourceDerived,
+            // `runtime_observation` (issue #114). Derived through the shared
+            // context rather than hardcoded, so this lane cannot silently
+            // desync from `eg query context` if `ErrorSignature` is ever
+            // reclassified.
+            trust: signature_records
+                .get(s.record_id)
+                .map_or(query::TrustLabel::SourceDerived, |r| trust_ctx.label_for(r)),
             schema_version: s.schema_version,
             severity: s.severity,
             occurrence_count: s.occurrence_count,

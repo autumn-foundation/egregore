@@ -9,7 +9,8 @@
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use aletheia_egregore::{
-    EdgeLabel, EvidenceLink, GraphRecord, NodeKind, SourceSpan,
+    EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, MetricKind, NodeKind, SelectionBasis,
+    SemanticDriftMetadata, SourceSpan,
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, Graph, PROJECT_SCHEMA_VERSION,
         VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id, artifact_stable_id, project_stable_id,
@@ -147,36 +148,7 @@ fn fixture_mixed_trust() -> (tempfile::TempDir, PathBuf) {
         *evidence_links = Some(vec![code_link(&sym_id)]);
     }
 
-    // A — agent-authored, no supporting evidence link  -> agent_unverified
-    let obs_a = observation(
-        &agent_memory_stable_id(&["obs", "trust", "a"]),
-        "target_fn probably needs error handling"
-            .to_owned()
-            .as_str(),
-        vec![code_link(&sym_id)],
-    );
-    // B — linked to the passing TestRun                -> agent_verified
-    let obs_b = observation(
-        &agent_memory_stable_id(&["obs", "trust", "b"]),
-        "target_fn is covered by the suite",
-        vec![
-            code_link(&sym_id),
-            evidence_link("HAS_EVIDENCE", &test_id, "verification"),
-        ],
-    );
-    // C — contradicted by D                            -> agent_contradicted
-    let obs_c_id = agent_memory_stable_id(&["obs", "trust", "c"]);
-    let obs_c = observation(
-        &obs_c_id,
-        "target_fn is unreachable",
-        vec![code_link(&sym_id)],
-    );
-    let obs_d_id = agent_memory_stable_id(&["obs", "trust", "d"]);
-    let obs_d = observation(
-        &obs_d_id,
-        "target_fn is called from the CLI",
-        vec![evidence_link("CONTRADICTS", &obs_c_id, "agent_memory")],
-    );
+    let claims = agent_claim_records(&sym_id, &test_id);
 
     // A project Task and an Artifact, both citing the symbol.
     let task_id = project_stable_id(&["task", "trust", "1"]);
@@ -219,19 +191,151 @@ fn fixture_mixed_trust() -> (tempfile::TempDir, PathBuf) {
         *evidence_links = Some(vec![code_link(&sym_id)]);
     }
 
+    let mut records = vec![sym, test_run, task, artifact];
+    records.extend(claims);
+    records.extend(topology_and_drift_records(&sym_id));
+
     let mut graph = Graph::new();
-    graph.push(sym);
-    graph.push(test_run);
-    graph.push(obs_a);
-    graph.push(obs_b);
-    graph.push(obs_c);
-    graph.push(obs_d);
-    graph.push(task);
-    graph.push(artifact);
+    for record in records.clone() {
+        graph.push(record);
+    }
     let jsonl = graph.to_jsonl().expect("serialize");
     fs::write(&path, jsonl).expect("write");
 
+    MIXED_RECORDS.with(|cell| *cell.borrow_mut() = Some(records));
     (temp, path)
+}
+
+thread_local! {
+    /// The record slice most recently written by [`fixture_mixed_trust`], so the
+    /// library-level MCP tool can be driven over the same fixture the CLI reads.
+    static MIXED_RECORDS: std::cell::RefCell<Option<Vec<GraphRecord>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn mixed_trust_records() -> Vec<GraphRecord> {
+    MIXED_RECORDS.with(|cell| {
+        cell.borrow()
+            .clone()
+            .expect("fixture_mixed_trust must run first")
+    })
+}
+
+/// The three agent-authored claims that exercise all three agent verdicts:
+/// A carries no supporting link (`agent_unverified`), B links to the passing
+/// `TestRun` (`agent_verified`), and C is the target of a live `CONTRADICTS`
+/// link from D (`agent_contradicted`).
+fn agent_claim_records(sym_id: &str, test_id: &str) -> Vec<GraphRecord> {
+    let obs_a = observation(
+        &agent_memory_stable_id(&["obs", "trust", "a"]),
+        "target_fn probably needs error handling",
+        vec![code_link(sym_id)],
+    );
+    let obs_b = observation(
+        &agent_memory_stable_id(&["obs", "trust", "b"]),
+        "target_fn is covered by the suite",
+        vec![
+            code_link(sym_id),
+            evidence_link("HAS_EVIDENCE", test_id, "verification"),
+        ],
+    );
+    let obs_c_id = agent_memory_stable_id(&["obs", "trust", "c"]);
+    let obs_c = observation(
+        &obs_c_id,
+        "target_fn is unreachable",
+        vec![code_link(sym_id)],
+    );
+    let obs_d = observation(
+        &agent_memory_stable_id(&["obs", "trust", "d"]),
+        "target_fn is called from the CLI",
+        vec![evidence_link("CONTRADICTS", &obs_c_id, "agent_memory")],
+    );
+    vec![obs_a, obs_b, obs_c, obs_d]
+}
+
+/// The records that populate the sections the core fixture would otherwise
+/// leave empty: a `File` + `DEFINES` edge (so `topology_edges` is non-empty),
+/// a `SemanticDrift` targeting the symbol (so `drift_history` and the subsystem
+/// `semantic_drift` section are non-empty), and an observation citing an
+/// ABSENT target (so `unresolved` is non-empty). Without these, the
+/// "unlabeled sections carry no trust" and "every record row carries trust"
+/// guards would pass vacuously.
+fn topology_and_drift_records(sym_id: &str) -> Vec<GraphRecord> {
+    let file_id = stable_id(&["node", "File", "src/lib.rs"]);
+    let file = GraphRecord::syntax_node(
+        file_id.clone(),
+        NodeKind::File,
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 400,
+            start_line: 1,
+            end_line: 60,
+        },
+        "lib.rs".to_owned(),
+        "rust",
+        "Source file src/lib.rs".to_owned(),
+    );
+    let defines = GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id,
+        sym_id.to_owned(),
+        Some("1.0".to_owned()),
+        "file defines target_fn".to_owned(),
+    );
+
+    let drift_id = stable_id(&["node", "SemanticDrift", "trust", "1"]);
+    let drift = GraphRecord::node(
+        drift_id.clone(),
+        NodeKind::SemanticDrift,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("target_fn".to_owned()),
+        "semantic drift on target_fn".to_owned(),
+    )
+    .with_semantic_drift(SemanticDriftMetadata {
+        embedding_model: EmbeddingModel {
+            provider: "test".to_owned(),
+            name: "test-model-v1".to_owned(),
+            version: "v1".to_owned(),
+            dim: 384,
+            content_hash: "fixture".to_owned(),
+        },
+        target_record_id: sym_id.to_owned(),
+        prior_record_id: sym_id.to_owned(),
+        before_git_commit: "aaaaaaaa".to_owned(),
+        after_git_commit: "bbbbbbbb".to_owned(),
+        before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+        metric_kind: MetricKind::CosineDistance,
+        score: 0.42,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
+    });
+    let drifts_from = GraphRecord::edge(
+        EdgeLabel::DriftsFrom,
+        drift_id,
+        sym_id.to_owned(),
+        Some("1.0".to_owned()),
+        "drifts from edge".to_owned(),
+    );
+
+    // Cites the symbol (so it joins the answer) AND an absent record (so the
+    // dangling handle lands in `unresolved`).
+    let dangling = observation(
+        &agent_memory_stable_id(&["obs", "trust", "e"]),
+        "target_fn was checked against a run that is not in this slice",
+        vec![
+            code_link(sym_id),
+            evidence_link(
+                "HAS_EVIDENCE",
+                "verification:v1:absent_from_this_slice",
+                "verification",
+            ),
+        ],
+    );
+
+    vec![file, defines, drift, drifts_from, dangling]
 }
 
 fn run_context(graph: &PathBuf, extra: &[&str]) -> serde_json::Value {
@@ -279,8 +383,10 @@ fn context_mixed_fixture_labels_every_trust_class() {
         labels
             .iter()
             .find(|(id, _)| id.contains(needle))
-            .map(|(_, t)| t.clone())
-            .unwrap_or_else(|| panic!("no row matching {needle} in {labels:?}"))
+            .map_or_else(
+                || panic!("no row matching {needle} in {labels:?}"),
+                |(_, t)| t.clone(),
+            )
     };
 
     // The queried code fact.
@@ -403,15 +509,98 @@ fn topology_edges_and_unresolved_rows_carry_no_trust_field() {
     let (_temp, graph) = fixture_mixed_trust();
     let parsed = run_context(&graph, &["--supersession", "include-but-flag"]);
     for section in UNLABELED_SECTIONS {
-        let Some(rows) = parsed.get(section).and_then(|v| v.as_array()) else {
-            continue;
-        };
+        let rows = parsed
+            .get(section)
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("section {section} must be present in the envelope"));
+        // Without this the `for` below iterates nothing and the guard is vacuous
+        // — the exact failure this fixture's File/DEFINES edge and dangling
+        // evidence link exist to prevent.
+        assert!(
+            !rows.is_empty(),
+            "fixture must populate {section}, else this guard asserts nothing"
+        );
         for row in rows {
             assert!(
                 row.get("trust").is_none(),
                 "section {section} must not carry a trust label: {row}"
             );
+            assert!(
+                row.get("trust_class").is_none(),
+                "section {section} must not carry a trust_class label: {row}"
+            );
         }
+    }
+}
+
+/// The `trust_map` helper panics on a row that lacks `trust`, so it only proves
+/// anything for sections that actually have rows. Pin the fixture's coverage so
+/// a future change that empties a section fails loudly instead of silently
+/// weakening every AC1 assertion built on it.
+#[test]
+fn fixture_populates_every_labeled_record_section() {
+    let (_temp, graph) = fixture_mixed_trust();
+    let flagged = run_context(&graph, &["--supersession", "include-but-flag"]);
+    for section in [
+        "source_facts",
+        "observations",
+        "project_state",
+        "artifacts",
+        "verification_evidence",
+        "drift_history",
+    ] {
+        let rows = flagged
+            .get(section)
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("section {section} must be present"));
+        assert!(!rows.is_empty(), "fixture must populate {section}");
+    }
+    // `excluded` only populates under the default exclude mode.
+    let default_view = run_context(&graph, &[]);
+    assert!(
+        !default_view["excluded"]
+            .as_array()
+            .expect("excluded array")
+            .is_empty(),
+        "fixture must populate excluded under the default supersession mode"
+    );
+}
+
+/// A `SemanticDrift` row is a deterministic measurement, never an agent claim.
+#[test]
+fn drift_history_rows_are_source_derived() {
+    let (_temp, graph) = fixture_mixed_trust();
+    let parsed = run_context(&graph, &["--supersession", "include-but-flag"]);
+    let rows = parsed["drift_history"].as_array().expect("drift_history");
+    assert!(!rows.is_empty(), "fixture must carry a drift row");
+    for row in rows {
+        assert_eq!(row["trust"], serde_json::json!("source_derived"));
+        assert_eq!(row["trust_class"], serde_json::json!("source_fact"));
+    }
+}
+
+/// `eg query task` is a cross-domain context answer too, including the
+/// acceptance-criterion rows' nested `verification_record`.
+#[test]
+fn task_answer_rows_carry_trust() {
+    let (_temp, graph) = fixture_mixed_trust();
+    let task_id = project_stable_id(&["task", "trust", "1"]);
+    let output = egregore()
+        .args(["query", "task", &task_id, "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output).expect("utf8").trim()).expect("json");
+    let rows = parsed["tasks"].as_array().expect("tasks array");
+    assert!(!rows.is_empty(), "task lane must return the task row");
+    for row in rows {
+        let trust = row["trust"].as_str().expect("task row carries trust");
+        assert!(TRUST_VOCABULARY.contains(&trust), "bad trust {trust}");
+        assert_eq!(row["trust_class"], serde_json::json!("project_state"));
     }
 }
 
@@ -543,6 +732,86 @@ fn locate_answer_rows_carry_trust() {
             "locate row {id} carries out-of-vocabulary trust {trust}"
         );
     }
+}
+
+/// The subsystem lane's own extra record sections (`semantic_drift`,
+/// `log_signatures`) are not in `RECORD_SECTIONS`, so `trust_map` skips them.
+/// Assert them directly, or their labels ship untested.
+#[test]
+fn subsystem_semantic_drift_rows_carry_trust() {
+    let (_temp, graph) = fixture_mixed_trust();
+    let output = egregore()
+        .args(["query", "subsystem", "src", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output).expect("utf8").trim()).expect("json");
+    let rows = parsed["semantic_drift"]
+        .as_array()
+        .expect("semantic_drift array");
+    assert!(
+        !rows.is_empty(),
+        "fixture must produce a subsystem drift row"
+    );
+    for row in rows {
+        assert_eq!(row["trust"], serde_json::json!("source_derived"));
+        assert_eq!(row["trust_class"], serde_json::json!("source_fact"));
+    }
+}
+
+/// `eg query error-context` is a trust-separated cross-domain envelope too.
+#[test]
+fn error_context_rows_carry_trust() {
+    let (_temp, graph) = fixture_mixed_trust();
+    // No ErrorSignature in this fixture, so the lane exits 2 (no_match); the
+    // point of the assertion is that the row shape carries the field wherever
+    // rows exist, which the MCP/unit coverage proves. Guard the contract that
+    // the lane at least does not regress into a crash.
+    let assert = egregore()
+        .args(["query", "error-context", "does_not_exist", "--graph"])
+        .arg(&graph)
+        .assert();
+    let code = assert.get_output().status.code();
+    assert_eq!(code, Some(2), "absent signature must be a typed no_match");
+}
+
+/// The MCP tool surface is a third serializer path; prove it agrees with the CLI
+/// rather than trusting that it was wired.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn mcp_symbol_context_rows_carry_the_same_trust_as_the_cli() {
+    let (_temp, graph) = fixture_mixed_trust();
+    let records = mixed_trust_records();
+    let value = aletheia_egregore::mcp::tool_symbol_context_from_records(&records, "target_fn");
+
+    let cli = run_context(&graph, &["--supersession", "include-but-flag"]);
+    let cli_labels = trust_map(&cli);
+
+    let mut seen = 0_usize;
+    for section in RECORD_SECTIONS {
+        let Some(rows) = value.get(section).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for row in rows {
+            let id = row["record_id"].as_str().expect("record_id");
+            let trust = row
+                .get("trust")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("MCP row {id} in {section} carries no trust"));
+            if let Some(expected) = cli_labels.get(id) {
+                assert_eq!(trust, expected, "MCP and CLI disagree on {id}");
+                seen += 1;
+            }
+        }
+    }
+    assert!(
+        seen >= 4,
+        "expected the MCP tool to share rows with the CLI"
+    );
 }
 
 #[test]

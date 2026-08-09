@@ -4837,6 +4837,8 @@ pub(crate) struct ContextDrift<'a> {
 #[derive(Serialize)]
 pub(crate) struct ExcludedDiagnostic<'a> {
     record_id: &'a str,
+    /// Domain trust class — *where this record lives* (issue #114).
+    trust_class: &'static str,
     /// Derived trust verdict, carried even though the row was filtered out of
     /// its section (issue #114). The label is a property of the record and its
     /// edges, never of the rendering filter, so `agent_contradicted` stays

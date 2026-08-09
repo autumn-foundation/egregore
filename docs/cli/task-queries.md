@@ -66,6 +66,8 @@ name a target absent from the store, so there is no record to classify. See
     {
       "record_id": "project:v1:10a45b6...",
       "kind": "Task",
+      "trust_class": "project_state",
+      "trust": "source_derived",
       "summary": "Task #48 implementation",
       "title": "Implement task evidence query"
     }
@@ -74,11 +76,15 @@ name a target absent from the store, so there is no record to classify. See
     {
       "record_id": "project:v1:30bcf9e...",
       "kind": "AcceptanceCriterion",
+      "trust_class": "project_state",
+      "trust": "source_derived",
       "summary": "AC 1: JSON output",
       "status": "verified",
       "verification_record": {
         "record_id": "verification:v1:40fed8a...",
         "kind": "Verification",
+        "trust_class": "verification_evidence",
+        "trust": "verification_evidence",
         "status": "pass",
         "verification_kind": "command_run",
         "summary": "Verification pass"
@@ -89,6 +95,8 @@ name a target absent from the store, so there is no record to classify. See
     {
       "record_id": "codegraph:v1:50ef8ad...",
       "kind": "File",
+      "trust_class": "source_fact",
+      "trust": "source_derived",
       "repo_relative_path": "src/query.rs"
     }
   ],
@@ -99,6 +107,8 @@ name a target absent from the store, so there is no record to classify. See
     {
       "record_id": "codegraph:v1:98abc12...",
       "kind": "ExternalLink",
+      "trust_class": "project_state",
+      "trust": "source_derived",
       "summary": "GitHub Issue #48 Link"
     }
   ],

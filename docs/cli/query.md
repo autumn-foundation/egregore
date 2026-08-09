@@ -1278,8 +1278,8 @@ eg query locate src/lib.rs:412 --graph g.jsonl
     "span": {"start_byte": 4096, "end_byte": 5200, "start_line": 409, "end_line": 431}
   },
   "enclosing_chain": [ /* module → impl → method, outermost → innermost */ ],
-  "source_facts": [ {"record_id": "codegraph:v4:abc...", "kind": "Symbol", "name": "outer::Gadget::method_one", "repo_relative_path": "src/lib.rs"} ],
-  "observations": [ {"record_id": "agent_memory:v1:...", "text_summary": "method_one panics on empty input"} ],
+  "source_facts": [ {"record_id": "codegraph:v4:abc...", "kind": "Symbol", "trust_class": "source_fact", "trust": "source_derived", "name": "outer::Gadget::method_one", "repo_relative_path": "src/lib.rs"} ],
+  "observations": [ {"record_id": "agent_memory:v1:...", "kind": "Observation", "trust_class": "agent_authored", "trust": "agent_unverified", "text_summary": "method_one panics on empty input"} ],
   "project_state": [],
   "artifacts": [],
   "verification_evidence": [],

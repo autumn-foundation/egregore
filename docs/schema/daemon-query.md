@@ -1,8 +1,9 @@
 # `POST /v1/query` — Verb-Dispatch Query Surface
 
 **Schema version:** 1 (`DAEMON_QUERY_SCHEMA_VERSION`)
-**Status:** Implemented. Changes that alter the response shape for existing verbs,
-rename verbs, or remove verbs require a new `schema_version`.
+**Status:** Implemented. **Breaking** changes to the response shape for existing
+verbs, verb renames, and verb removals require a new `schema_version`; purely
+**additive** changes do not. See §9 for the exact split.
 
 ---
 
@@ -147,7 +148,7 @@ Error responses follow the standard envelope in
 | `drift`                 | reserved    | same as `drift_top_n`         | Reserved for issue #10; returns `not_implemented` until wired. |
 | `observations_for_symbol` | implemented | `name: string`, `supersession?: string` | Cross-domain symbol context (issue #86); parity with `eg query context`. Every record row carries `trust_class` + a derived `trust` label (issue #114, see below). |
 | `agent_sessions_for_repo` | implemented | `repo: string` (alias `repository_id`), `limit?: u64` (default 20, max 200) | Repo-scoped recency digest of recent agent sessions (issue #112); daemon face of `eg query sessions`. |
-| `criteria_for_task`      | implemented | `task_id: string`            | Task acceptance-criteria/evidence context over [`docs/schema/project-graph.md`](project-graph.md); daemon face of `eg query task`. |
+| `criteria_for_task`      | implemented | `task_id: string`            | Task acceptance-criteria/evidence context over [`docs/schema/project-graph.md`](project-graph.md); daemon face of `eg query task`. Every record row carries `trust_class` + a derived `trust` label (issue #114). |
 
 Partial-name symbol matching (`eg query symbols <PATTERN>`, issue #102) is
 **CLI-only in this slice**: the daemon exposes no substring/glob symbol verb,
@@ -479,8 +480,11 @@ carries two labels:
 | `trust_class` | *Where does this record live?* (provenance domain) | `source_fact`, `agent_authored`, `verification_evidence`, `project_state`, `artifact`, `runtime_observation`, `other` |
 | `trust` | *How much uncorroborated agent judgement must I accept?* | `source_derived`, `verification_evidence`, `agent_verified`, `agent_unverified`, `agent_contradicted` |
 
-Both are **additive optional fields** on the response payload — no
-`api_version` bump and no `DAEMON_QUERY_SCHEMA_VERSION` break.
+Both are **additive** fields on the response payload — new keys inside
+`result`, which §9 and [`daemon-api.md`](daemon-api.md) both classify as
+non-breaking, so there is no `api_version` bump and no
+`DAEMON_QUERY_SCHEMA_VERSION` break. Note they are **always present**, not
+optional: a row never omits them.
 
 `trust` is derived by the same function `eg query context` calls, over the same
 record slice the verb resolved (including any `as_of.valid_time` narrowing), so
@@ -613,7 +617,9 @@ Cursor-based pagination is reserved for a future slice.
 
 `DAEMON_QUERY_SCHEMA_VERSION = 1` is a Rust constant in `src/daemon.rs`.
 
-- Additive changes (new verbs, new optional response fields) do not bump the version.
+- Additive changes (new verbs, new response fields — whether optional or
+  always-present) do not bump the version. Adding a key to an existing verb's
+  rows is additive; changing or removing an existing key is not.
 - Breaking changes (renamed verbs, removed fields, changed `record` shapes for
   existing verbs) require bumping `DAEMON_QUERY_SCHEMA_VERSION` and updating
   this document and `daemon-api.md`.

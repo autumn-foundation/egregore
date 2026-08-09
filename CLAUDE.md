@@ -636,14 +636,24 @@ default), and `include-but-flag` yields the identical label in `observations`.
 `topology_edges` and `unresolved` deliberately carry NO `trust` field — an edge
 is a relation, not a record, and an unresolved row names a target ABSENT from the
 store, so labeling either would be fabrication. Emitted by `eg query context`,
-`subsystem`, `locate`, `semantic-context`, `task`, the daemon
-`observations_for_symbol`/`criteria_for_task` verbs, and the MCP
+`subsystem`, `locate`, `semantic-context`, `task`, `error-context`, `changes`,
+the daemon `observations_for_symbol`/`criteria_for_task` verbs, and the MCP
 `symbol_context`/`task_evidence` tools — all through ONE shared
-`query::TrustContext` over the SAME record slice, so the transports cannot
-disagree. Read-time only: no persisted field, no new node kind/edge label, and
+`query::TrustContext`. "The transports cannot disagree" means they run the SAME
+derivation over the slice EACH transport resolved: where the slices differ (the
+CLI applies #427/#456 corpus filtering that the daemon verb does not) the labels
+differ, honestly reflecting the different corpora. The field name `trust` also
+appears on several SINGLE-domain lanes (`deps`, `path`, `transitive-callers`,
+`change-impact`, `who-imports`, …) carrying a DIFFERENT per-lane vocabulary
+(`reachability_lead`, `dependency_lead`, …); those predate this contract, are
+unchanged, and `source_fact` means different things in the two sets — a consumer
+must key on the lane, not the field name. Read-time only: no persisted field, no
+new node kind/edge label, and
 NO schema-version bump. Determinism is by construction (`BTreeMap`/`BTreeSet`
-only, order-independent existential, no wall clock), so labels are byte-identical
-across runs and invariant to input record order. HONEST LIMITS: `source_derived`
+only in the derivation's own indexes, order-independent existential, no wall
+clock), so labels are byte-identical across runs and invariant to input record
+order — the embedded `TemporalResolver` is `HashMap`-backed, so determinism
+there rests instead on `resolve_status` returning a SET-determined scalar. HONEST LIMITS: `source_derived`
 means only that no agent judgement was interposed — never that the content is
 true, current, or correct; `agent_verified` records a live passing link AT THIS
 SNAPSHOT, never proof the claim is right, and `agent_unverified` is absence of
