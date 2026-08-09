@@ -68,6 +68,10 @@ context sections produced by `eg query context` (`source_facts`,
 `observations`, `project_state`, `artifacts`, `verification_evidence`, plus
 `topology_edges` and `unresolved`).
 
+Every record row in those sections carries `trust_class` plus a derived `trust`
+label (issue #114) — see
+[Trust labels on context answers](query.md#trust-labels-on-context-answers-issue-114).
+
 ### Shortest workflow
 
 ```sh

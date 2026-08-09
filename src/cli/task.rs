@@ -46,17 +46,20 @@ pub(crate) fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Res
         std::process::exit(2);
     }
 
+    // Derived trust labels (issue #114) over the same record slice.
+    let trust_ctx = query::TrustContext::build(records);
+
     let tasks: Vec<ContextLinkedItem<'_>> = ctx
         .tasks
         .iter()
-        .filter_map(|r| context_linked_item(r))
+        .filter_map(|r| context_linked_item(r, &trust_ctx))
         .collect();
 
     let acceptance_criteria: Vec<ContextLinkedItem<'_>> = ctx
         .acceptance_criteria
         .iter()
         .filter_map(|r| {
-            let mut ac = context_linked_item(r)?;
+            let mut ac = context_linked_item(r, &trust_ctx)?;
             if ac.status == Some("verified") {
                 let GraphRecord::Node {
                     verification_link_id,
@@ -88,7 +91,8 @@ pub(crate) fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Res
                 if let Some(ver_record) =
                     ver_id.and_then(|vid| records.iter().rfind(|cand| cand.id() == vid))
                 {
-                    ac.verification_record = context_linked_item(ver_record).map(Box::new);
+                    ac.verification_record =
+                        context_linked_item(ver_record, &trust_ctx).map(Box::new);
                 }
             }
             Some(ac)
@@ -98,37 +102,37 @@ pub(crate) fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Res
     let source_facts: Vec<ContextSourceFact<'_>> = ctx
         .source_facts
         .iter()
-        .filter_map(|r| context_source_fact(r))
+        .filter_map(|r| context_source_fact(r, &trust_ctx))
         .collect();
 
     let observations: Vec<ContextObservation<'_>> = ctx
         .observations
         .iter()
-        .filter_map(|r| context_observation(r))
+        .filter_map(|r| context_observation(r, &trust_ctx))
         .collect();
 
     let artifacts: Vec<ContextLinkedItem<'_>> = ctx
         .artifacts
         .iter()
-        .filter_map(|r| context_linked_item(r))
+        .filter_map(|r| context_linked_item(r, &trust_ctx))
         .collect();
 
     let verification_evidence: Vec<ContextLinkedItem<'_>> = ctx
         .verification_evidence
         .iter()
-        .filter_map(|r| context_linked_item(r))
+        .filter_map(|r| context_linked_item(r, &trust_ctx))
         .collect();
 
     let reviews: Vec<ContextLinkedItem<'_>> = ctx
         .reviews
         .iter()
-        .filter_map(|r| context_linked_item(r))
+        .filter_map(|r| context_linked_item(r, &trust_ctx))
         .collect();
 
     let external_links: Vec<ContextLinkedItem<'_>> = ctx
         .external_links
         .iter()
-        .filter_map(|r| context_linked_item(r))
+        .filter_map(|r| context_linked_item(r, &trust_ctx))
         .collect();
 
     let unresolved: Vec<ContextUnresolved<'_>> = ctx

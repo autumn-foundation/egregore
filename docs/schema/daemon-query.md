@@ -145,7 +145,7 @@ Error responses follow the standard envelope in
 | `drift_top_n`           | implemented | `limit?: u64` (default 10, max 100), `repo?: string` | SemanticDrift records ranked by score |
 | `semantic_search`       | implemented | `query_vector: [f32]`, `limit?: u64` (default 10, max 100), `repo?: string` | Natural-language code search over the shared store's embedding index. Requires the `embeddings` feature. |
 | `drift`                 | reserved    | same as `drift_top_n`         | Reserved for issue #10; returns `not_implemented` until wired. |
-| `observations_for_symbol` | implemented | `name: string`, `supersession?: string` | Cross-domain symbol context (issue #86); parity with `eg query context`. |
+| `observations_for_symbol` | implemented | `name: string`, `supersession?: string` | Cross-domain symbol context (issue #86); parity with `eg query context`. Every record row carries `trust_class` + a derived `trust` label (issue #114, see below). |
 | `agent_sessions_for_repo` | implemented | `repo: string` (alias `repository_id`), `limit?: u64` (default 20, max 200) | Repo-scoped recency digest of recent agent sessions (issue #112); daemon face of `eg query sessions`. |
 | `criteria_for_task`      | implemented | `task_id: string`            | Task acceptance-criteria/evidence context over [`docs/schema/project-graph.md`](project-graph.md); daemon face of `eg query task`. |
 
@@ -467,6 +467,44 @@ surfaced by the shared discovery contract in
 When to reach for this verb vs. structural reads is covered in
 [`docs/cli/semantic-search-guidance.md`](../cli/semantic-search-guidance.md),
 including how this slice relates to issue #58's relevance gate.
+
+### `observations_for_symbol` — trust labels (issue #114)
+
+Every **record row** in the `source_facts`, `observations`, `project_state`,
+`artifacts`, `verification_evidence`, `drift_history`, and `excluded` sections
+carries two labels:
+
+| Field | Question | Vocabulary |
+|-------|----------|------------|
+| `trust_class` | *Where does this record live?* (provenance domain) | `source_fact`, `agent_authored`, `verification_evidence`, `project_state`, `artifact`, `runtime_observation`, `other` |
+| `trust` | *How much uncorroborated agent judgement must I accept?* | `source_derived`, `verification_evidence`, `agent_verified`, `agent_unverified`, `agent_contradicted` |
+
+Both are **additive optional fields** on the response payload — no
+`api_version` bump and no `DAEMON_QUERY_SCHEMA_VERSION` break.
+
+`trust` is derived by the same function `eg query context` calls, over the same
+record slice the verb resolved (including any `as_of.valid_time` narrowing), so
+**the daemon and the CLI cannot disagree on a label**. Derivation rules, the
+qualifying-link conditions, the passing-status table, and the determinism
+guarantees are specified once in
+[`docs/schema/trust-labels.md`](trust-labels.md).
+
+The label is computed **before** the `supersession` partition, so it is a
+property of the record and not of the rendering mode: under the default
+`exclude` a contradicted observation moves into `excluded` and keeps its
+`agent_contradicted` label; under `include-but-flag` the same record carries the
+same label inside `observations`.
+
+`topology_edges` and `unresolved` deliberately carry **no** `trust` field — an
+edge is a relation rather than a record, and an unresolved row names a target
+that is absent from the store, so there is nothing to classify.
+
+The same two fields appear on `criteria_for_task` rows (including a nested
+`verification_record`).
+
+**Determinism:** for a fixed store, repeated calls return byte-identical labels.
+
+---
 
 ### `agent_sessions_for_repo`
 

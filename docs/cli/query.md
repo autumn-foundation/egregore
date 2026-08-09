@@ -227,6 +227,76 @@ flag pair, and the per-category defaults — is documented once in
 
 ---
 
+## Trust labels on context answers (issue #114)
+
+A cross-domain context answer deliberately returns code facts, agent
+observations, project state, artifacts, and verification evidence side by side.
+That is the one place where "two kinds of truth" can collapse into one
+undifferentiated list, so **every record row carries a derived `trust` field**
+from a closed five-value vocabulary:
+
+| `trust` | Meaning |
+|---------|---------|
+| `source_derived` | Deterministically derived from a source artifact rather than asserted by an agent. |
+| `verification_evidence` | A recorded verification-domain execution. |
+| `agent_verified` | An agent-authored claim with a live, direct, supporting link to a **passing** verification record at this snapshot. |
+| `agent_unverified` | An agent-authored claim with no such supporting link. |
+| `agent_contradicted` | An agent-authored claim acted on by a live `CONTRADICTS`/`SUPERSEDES` relationship. |
+
+### Domain is not trust
+
+Rows carry **two** labels, answering different questions:
+
+```json
+{
+  "record_id": "agent_memory:v1:…",
+  "kind": "Observation",
+  "trust_class": "agent_authored",
+  "trust": "agent_unverified"
+}
+```
+
+`trust_class` says **where the record lives** (its provenance domain — the
+pre-existing seven-value vocabulary, unchanged). `trust` says **how much
+uncorroborated agent judgement you must accept to believe the row**, and it
+moves as evidence and contradiction edges move around the same record. A runtime
+log signature shows the split at its clearest: `"trust_class":
+"runtime_observation"` (a program's own claim, not verification) with `"trust":
+"source_derived"` (deterministically parsed from a captured artifact, not
+asserted by an agent).
+
+`source_derived` is **not** a claim that the content is true, current, or
+correct — only that no agent judgement was interposed. `agent_verified` records
+that a passing verification link existed at this snapshot; it is never proof the
+claim is right, and `agent_unverified` is never proof it is wrong.
+
+### Which lanes and which rows
+
+Emitted by `eg query context`, `eg query subsystem`, `eg query locate`,
+`eg query semantic-context`, `eg query task`, the daemon
+`observations_for_symbol` verb, and the MCP `symbol_context` / `task_evidence`
+tools — all through one shared derivation over the same record slice, so the
+transports cannot disagree.
+
+`topology_edges` and `unresolved` deliberately carry **no** `trust` field: an
+edge is a relation rather than a record, and an unresolved row describes a
+handle whose target is absent from the store — there is no record to classify,
+and labelling one would be fabrication.
+
+### Contradicted rows under `--supersession`
+
+The label is derived before the supersession filter runs, so it is a property of
+the record rather than of the rendering mode. Under the default
+`--supersession exclude` a contradicted observation moves into `excluded` **and
+keeps** its `agent_contradicted` label; under `include-but-flag` the same record
+carries the same label inside `observations`.
+
+Derivation rules, the qualifying-link conditions, the passing-status table, and
+the determinism guarantees are specified in
+[`docs/schema/trust-labels.md`](../schema/trust-labels.md).
+
+---
+
 ## Store freshness (`--repo-path`, issue #82)
 
 `eg query symbol`, `eg query file`, and `eg query context` accept an optional
@@ -406,6 +476,9 @@ The JSON envelope carries `ok`, `prefix`, and the trust-separated sections
 `verification_evidence`, `semantic_drift`, `log_signatures`, `unresolved`, and
 `excluded`. `log_signatures` and `unresolved` are **always present** (`[]` when
 empty); `topology_edges` and `excluded` are omitted when empty.
+
+Every record row carries `trust_class` plus a derived `trust` label — see
+[Trust labels on context answers](#trust-labels-on-context-answers-issue-114).
 
 ### `log_signatures` (issue #325)
 
@@ -1141,6 +1214,9 @@ answer:
 | `artifacts` | artifact | Linked `Artifact`/`PatchArtifact`/`FileEdit` nodes. |
 | `verification_evidence` | verification | Linked `Verification`/`TestRun`/`CommandRun` evidence. |
 | `unresolved` | diagnostic | Evidence-link targets absent from this store slice. |
+
+Every record row additionally carries `trust_class` plus a derived `trust`
+label — see [Trust labels on context answers](#trust-labels-on-context-answers-issue-114).
 
 The bundle is **not** temporally filtered under a commit pin: the pin selects
 *which* symbol is located, and the bundle is everything known about that symbol

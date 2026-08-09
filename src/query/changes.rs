@@ -110,6 +110,11 @@ pub struct UnexplainedChange<'a> {
 pub struct ContextObservation<'a> {
     pub record_id: &'a str,
     pub kind: &'static str,
+    /// Domain trust class — *where this record lives* (issue #114).
+    pub trust_class: &'static str,
+    /// Derived trust verdict — *how much uncorroborated agent judgement this
+    /// row requires* (issue #114). See `docs/schema/trust-labels.md`.
+    pub trust: super::TrustLabel,
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<&'a str>,
@@ -143,6 +148,11 @@ pub struct ContextObservation<'a> {
 pub struct ContextLinkedItem<'a> {
     pub record_id: &'a str,
     pub kind: &'static str,
+    /// Domain trust class — *where this record lives* (issue #114).
+    pub trust_class: &'static str,
+    /// Derived trust verdict — *how much uncorroborated agent judgement this
+    /// row requires* (issue #114). See `docs/schema/trust-labels.md`.
+    pub trust: super::TrustLabel,
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<&'a str>,
@@ -248,8 +258,15 @@ fn patch_handle_metadata_only(handle: &PatchHandle) -> PatchHandle {
 }
 
 /// Helper function to convert a GraphRecord to ContextObservation.
+///
+/// Takes the answer's [`super::TrustContext`] so the derived `trust` label is
+/// attached at row-construction time — before any supersession filter — and can
+/// never be forgotten by a caller (issue #114).
 #[must_use]
-pub fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
+pub fn context_observation<'a>(
+    record: &'a GraphRecord,
+    trust: &super::TrustContext<'_>,
+) -> Option<ContextObservation<'a>> {
     let GraphRecord::Node {
         id,
         kind,
@@ -275,6 +292,8 @@ pub fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_
     Some(ContextObservation {
         record_id: id,
         kind: kind.as_str(),
+        trust_class: super::trust_class_for(record),
+        trust: trust.label_for(record),
         summary: summary.to_owned(),
         text: text.as_deref(),
         provenance_handle,
@@ -293,7 +312,10 @@ pub fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_
 
 /// Helper function to convert a GraphRecord to ContextObservation with redacted payloads.
 #[must_use]
-pub fn redacted_context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
+pub fn redacted_context_observation<'a>(
+    record: &'a GraphRecord,
+    trust: &super::TrustContext<'_>,
+) -> Option<ContextObservation<'a>> {
     let GraphRecord::Node {
         id,
         kind,
@@ -322,6 +344,8 @@ pub fn redacted_context_observation(record: &GraphRecord) -> Option<ContextObser
     Some(ContextObservation {
         record_id: id,
         kind: kind.as_str(),
+        trust_class: super::trust_class_for(record),
+        trust: trust.label_for(record),
         summary,
         text: None,
         provenance_handle,
@@ -339,8 +363,14 @@ pub fn redacted_context_observation(record: &GraphRecord) -> Option<ContextObser
 }
 
 /// Helper function to convert a GraphRecord to ContextLinkedItem.
+///
+/// Takes the answer's [`super::TrustContext`] so the derived `trust` label is
+/// attached at row-construction time and can never be forgotten (issue #114).
 #[must_use]
-pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
+pub fn context_linked_item<'a>(
+    record: &'a GraphRecord,
+    trust: &super::TrustContext<'_>,
+) -> Option<ContextLinkedItem<'a>> {
     let GraphRecord::Node {
         id,
         kind,
@@ -391,6 +421,8 @@ pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>
     Some(ContextLinkedItem {
         record_id: id,
         kind: kind.as_str(),
+        trust_class: super::trust_class_for(record),
+        trust: trust.label_for(record),
         summary: summary.to_owned(),
         title: title.as_deref(),
         name: name.as_deref(),
@@ -436,7 +468,10 @@ pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>
 
 /// Helper function to convert a GraphRecord to ContextLinkedItem with redacted payloads.
 #[must_use]
-pub fn redacted_context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
+pub fn redacted_context_linked_item<'a>(
+    record: &'a GraphRecord,
+    trust: &super::TrustContext<'_>,
+) -> Option<ContextLinkedItem<'a>> {
     let GraphRecord::Node {
         id,
         kind,
@@ -492,6 +527,8 @@ pub fn redacted_context_linked_item(record: &GraphRecord) -> Option<ContextLinke
     Some(ContextLinkedItem {
         record_id: id,
         kind: kind.as_str(),
+        trust_class: super::trust_class_for(record),
+        trust: trust.label_for(record),
         summary,
         title: None,
         name: name.as_deref(),
@@ -1469,10 +1506,14 @@ pub fn changes_context<'a>(
         frontier = next_frontier.into_iter().collect();
     }
 
+    // Derived trust labels (issue #114) over the same record slice this answer
+    // was computed from, so the label is "at the queried snapshot".
+    let trust_ctx = super::TrustContext::build(records);
+
     let mut output_observations = Vec::new();
     for id in observations {
         if let Some(rec) = by_id.get(id) {
-            if let Some(obs) = redacted_context_observation(rec) {
+            if let Some(obs) = redacted_context_observation(rec, &trust_ctx) {
                 output_observations.push(obs);
             }
         }
@@ -1480,7 +1521,7 @@ pub fn changes_context<'a>(
     let mut output_project_state = Vec::new();
     for id in project_state {
         if let Some(rec) = by_id.get(id) {
-            if let Some(item) = redacted_context_linked_item(rec) {
+            if let Some(item) = redacted_context_linked_item(rec, &trust_ctx) {
                 output_project_state.push(item);
             }
         }
@@ -1488,7 +1529,7 @@ pub fn changes_context<'a>(
     let mut output_artifacts = Vec::new();
     for id in artifacts {
         if let Some(rec) = by_id.get(id) {
-            if let Some(item) = redacted_context_linked_item(rec) {
+            if let Some(item) = redacted_context_linked_item(rec, &trust_ctx) {
                 output_artifacts.push(item);
             }
         }
@@ -1496,7 +1537,7 @@ pub fn changes_context<'a>(
     let mut output_verification_evidence = Vec::new();
     for id in verification_evidence {
         if let Some(rec) = by_id.get(id) {
-            if let Some(item) = redacted_context_linked_item(rec) {
+            if let Some(item) = redacted_context_linked_item(rec, &trust_ctx) {
                 output_verification_evidence.push(item);
             }
         }

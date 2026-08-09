@@ -212,7 +212,9 @@ pub(crate) fn query_locate_cmd(
             let symbol = location_node_json(primary).expect("primary is a node by construction");
             let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
                 disclose_head_anchored_corpus(records, at.is_some() || as_of.is_some());
-            let sections = build_context_sections(&context);
+            // Derived trust labels (issue #114) over the same record slice.
+            let trust_ctx = query::TrustContext::build(records);
+            let sections = build_context_sections(&context, &trust_ctx);
             let resolver = crate::temporal_status::TemporalResolver::build(records);
             let (observations, excluded) =
                 apply_supersession(sections.observations, &resolver, supersession);

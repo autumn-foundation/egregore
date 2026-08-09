@@ -46,16 +46,19 @@ pub(crate) fn query_subsystem_cmd(
         std::process::exit(2);
     }
 
+    // Derived trust labels (issue #114) over the same corpus-filtered slice.
+    let trust_ctx = query::TrustContext::build(records);
+
     let source_facts: Vec<ContextSourceFact<'_>> = ctx
         .source_facts
         .iter()
-        .filter_map(|r| context_source_fact(r))
+        .filter_map(|r| context_source_fact(r, &trust_ctx))
         .collect();
 
     let raw_observations: Vec<ContextObservation<'_>> = ctx
         .observations
         .iter()
-        .filter_map(|r| context_observation(r))
+        .filter_map(|r| context_observation(r, &trust_ctx))
         .collect();
 
     let resolver = crate::temporal_status::TemporalResolver::build(records);
@@ -64,19 +67,19 @@ pub(crate) fn query_subsystem_cmd(
     let project_state: Vec<ContextLinkedItem<'_>> = ctx
         .project_state
         .iter()
-        .filter_map(|r| context_linked_item(r))
+        .filter_map(|r| context_linked_item(r, &trust_ctx))
         .collect();
 
     let artifacts: Vec<ContextLinkedItem<'_>> = ctx
         .artifacts
         .iter()
-        .filter_map(|r| context_linked_item(r))
+        .filter_map(|r| context_linked_item(r, &trust_ctx))
         .collect();
 
     let verification_evidence: Vec<ContextLinkedItem<'_>> = ctx
         .verification_evidence
         .iter()
-        .filter_map(|r| context_linked_item(r))
+        .filter_map(|r| context_linked_item(r, &trust_ctx))
         .collect();
 
     let unresolved: Vec<ContextUnresolved<'_>> = ctx
@@ -135,6 +138,8 @@ pub(crate) fn query_subsystem_cmd(
             let (path, _, span) = query::resolve_drift_target(records, id, drift_meta, None, None);
             Some(SubsystemDrift {
                 record_id: id,
+                trust_class: trust_class_for(r),
+                trust: trust_ctx.label_for(r),
                 score: drift_meta.score,
                 target_repo_relative_path: path,
                 target_span: span,
@@ -150,6 +155,10 @@ pub(crate) fn query_subsystem_cmd(
             record_id: s.record_id,
             kind: "ErrorSignature",
             trust_class: "runtime_observation",
+            // Deterministically parsed from a captured artifact, so the derived
+            // verdict is `source_derived` even though the domain class is
+            // `runtime_observation` (issue #114).
+            trust: query::TrustLabel::SourceDerived,
             schema_version: s.schema_version,
             severity: s.severity,
             occurrence_count: s.occurrence_count,

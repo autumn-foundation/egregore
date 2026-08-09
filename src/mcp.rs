@@ -371,30 +371,33 @@ pub fn tool_symbol_context_from_records(records: &[GraphRecord], symbol_name: &s
         });
     }
 
+    // Derived trust labels (issue #114): the same derivation the CLI and daemon
+    // call, over the same record slice, so all three transports agree.
+    let trust = query::TrustContext::build(records);
     let source_facts: Vec<Value> = ctx
         .source_facts
         .iter()
-        .filter_map(|r| record_to_source_fact(r))
+        .filter_map(|r| record_to_source_fact(r, &trust))
         .collect();
     let observations: Vec<Value> = ctx
         .observations
         .iter()
-        .filter_map(|r| record_to_observation(r))
+        .filter_map(|r| record_to_observation(r, &trust))
         .collect();
     let project_state: Vec<Value> = ctx
         .project_state
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let artifacts: Vec<Value> = ctx
         .artifacts
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let verification_evidence: Vec<Value> = ctx
         .verification_evidence
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let topology_edges: Vec<Value> = ctx
         .topology_edges
@@ -406,7 +409,7 @@ pub fn tool_symbol_context_from_records(records: &[GraphRecord], symbol_name: &s
         .drift_history
         .iter()
         .zip(resolved_drift_targets)
-        .filter_map(|(r, resolved)| record_to_drift(r, resolved))
+        .filter_map(|(r, resolved)| record_to_drift(r, &trust, resolved))
         .collect();
     let unresolved: Vec<Value> = ctx.unresolved.iter().map(unresolved_to_json).collect();
 
@@ -475,16 +478,18 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
         });
     }
 
+    // Derived trust labels (issue #114) over the same record slice.
+    let trust = query::TrustContext::build(records);
     let tasks: Vec<Value> = ctx
         .tasks
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let acceptance_criteria: Vec<Value> = ctx
         .acceptance_criteria
         .iter()
         .filter_map(|r| {
-            let mut item = record_to_linked_item(r)?;
+            let mut item = record_to_linked_item(r, &trust)?;
             if item["status"].as_str() == Some("verified") {
                 let GraphRecord::Node {
                     verification_link_id,
@@ -514,7 +519,7 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
                 });
                 if let Some(ver) = ver_id
                     .and_then(|vid| records.iter().find(|c| c.id() == vid))
-                    .and_then(record_to_linked_item)
+                    .and_then(|r| record_to_linked_item(r, &trust))
                 {
                     item["verification_record"] = ver;
                 }
@@ -522,35 +527,38 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
             Some(item)
         })
         .collect();
+    // Derived trust labels (issue #114): the same derivation the CLI and daemon
+    // call, over the same record slice, so all three transports agree.
+    let trust = query::TrustContext::build(records);
     let source_facts: Vec<Value> = ctx
         .source_facts
         .iter()
-        .filter_map(|r| record_to_source_fact(r))
+        .filter_map(|r| record_to_source_fact(r, &trust))
         .collect();
     let observations: Vec<Value> = ctx
         .observations
         .iter()
-        .filter_map(|r| record_to_observation(r))
+        .filter_map(|r| record_to_observation(r, &trust))
         .collect();
     let artifacts: Vec<Value> = ctx
         .artifacts
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let verification_evidence: Vec<Value> = ctx
         .verification_evidence
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let reviews: Vec<Value> = ctx
         .reviews
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let external_links: Vec<Value> = ctx
         .external_links
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let unresolved: Vec<Value> = ctx.unresolved.iter().map(unresolved_to_json).collect();
 
@@ -585,7 +593,7 @@ fn run_inspect_store(data_dir: &Path) -> Value {
 
 // ── Record → JSON helpers ─────────────────────────────────────────────────────
 
-fn record_to_source_fact(record: &GraphRecord) -> Option<Value> {
+fn record_to_source_fact(record: &GraphRecord, trust: &query::TrustContext<'_>) -> Option<Value> {
     let GraphRecord::Node {
         id,
         kind,
@@ -604,6 +612,8 @@ fn record_to_source_fact(record: &GraphRecord) -> Option<Value> {
     Some(json!({
         "record_id": id,
         "kind": kind.as_str(),
+        "trust_class": query::trust_class_for(record),
+        "trust": trust.label_for(record).as_str(),
         "name": name,
         "repo_relative_path": repo_relative_path,
         "span": span,
@@ -615,7 +625,7 @@ fn record_to_source_fact(record: &GraphRecord) -> Option<Value> {
     }))
 }
 
-fn record_to_observation(record: &GraphRecord) -> Option<Value> {
+fn record_to_observation(record: &GraphRecord, trust: &query::TrustContext<'_>) -> Option<Value> {
     let GraphRecord::Node {
         id,
         kind,
@@ -654,6 +664,8 @@ fn record_to_observation(record: &GraphRecord) -> Option<Value> {
     Some(json!({
         "record_id": id,
         "kind": kind.as_str(),
+        "trust_class": query::trust_class_for(record),
+        "trust": trust.label_for(record).as_str(),
         "summary": summary,
         "text": text,
         "provenance_handle": provenance_handle,
@@ -677,7 +689,7 @@ fn patch_handle_citation(h: &crate::ir::PatchHandle) -> Value {
     json!({ "path": h.path })
 }
 
-fn record_to_linked_item(record: &GraphRecord) -> Option<Value> {
+fn record_to_linked_item(record: &GraphRecord, trust: &query::TrustContext<'_>) -> Option<Value> {
     let GraphRecord::Node {
         id,
         kind,
@@ -733,6 +745,8 @@ fn record_to_linked_item(record: &GraphRecord) -> Option<Value> {
     Some(json!({
         "record_id": id,
         "kind": kind.as_str(),
+        "trust_class": query::trust_class_for(record),
+        "trust": trust.label_for(record).as_str(),
         "summary": summary,
         "title": title,
         "name": name,
@@ -802,6 +816,7 @@ fn record_to_topology_edge(record: &GraphRecord) -> Option<Value> {
 /// the CLI/daemon shape if that invariant were ever broken.
 fn record_to_drift(
     record: &GraphRecord,
+    trust: &query::TrustContext<'_>,
     resolved: (Option<&str>, Option<&str>, Option<crate::ir::SourceSpan>),
 ) -> Option<Value> {
     let GraphRecord::Node {
@@ -815,6 +830,11 @@ fn record_to_drift(
     let (resolved_path, _resolved_name, resolved_span) = resolved;
     let mut obj = serde_json::Map::new();
     obj.insert("record_id".to_owned(), json!(id.as_str()));
+    obj.insert(
+        "trust_class".to_owned(),
+        json!(query::trust_class_for(record)),
+    );
+    obj.insert("trust".to_owned(), json!(trust.label_for(record).as_str()));
     obj.insert("score".to_owned(), json!(drift.score));
     obj.insert("before_commit".to_owned(), json!(&drift.before_git_commit));
     obj.insert("after_commit".to_owned(), json!(&drift.after_git_commit));

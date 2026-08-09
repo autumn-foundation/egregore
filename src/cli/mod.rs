@@ -4749,6 +4749,11 @@ pub(crate) struct WhoResult<'a> {
 pub(crate) struct ContextSourceFact<'a> {
     record_id: &'a str,
     kind: &'static str,
+    /// Domain trust class — *where this record lives* (issue #114).
+    trust_class: &'static str,
+    /// Derived trust verdict — *how much uncorroborated agent judgement this
+    /// row requires* (issue #114). See `docs/schema/trust-labels.md`.
+    trust: query::TrustLabel,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4810,6 +4815,12 @@ pub(crate) struct ContextTopologyEdge<'a> {
 #[derive(Serialize)]
 pub(crate) struct ContextDrift<'a> {
     record_id: &'a str,
+    /// Domain trust class — *where this record lives* (issue #114).
+    trust_class: &'static str,
+    /// Derived trust verdict (issue #114). A `SemanticDrift` record is a
+    /// deterministic measurement, never an agent claim, so it is always
+    /// `source_derived` — the label makes that machine-readable.
+    trust: query::TrustLabel,
     score: f64,
     before_commit: &'a str,
     after_commit: &'a str,
@@ -4826,6 +4837,11 @@ pub(crate) struct ContextDrift<'a> {
 #[derive(Serialize)]
 pub(crate) struct ExcludedDiagnostic<'a> {
     record_id: &'a str,
+    /// Derived trust verdict, carried even though the row was filtered out of
+    /// its section (issue #114). The label is a property of the record and its
+    /// edges, never of the rendering filter, so `agent_contradicted` stays
+    /// observable under the default `--supersession exclude`.
+    trust: query::TrustLabel,
     reason: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     superseded_by: Option<Vec<crate::temporal_status::TemporalReference>>,
@@ -4891,6 +4907,10 @@ pub(crate) struct TaskContextResponse<'a> {
 #[derive(Serialize)]
 pub(crate) struct SubsystemDrift<'a> {
     record_id: &'a str,
+    /// Domain trust class — *where this record lives* (issue #114).
+    trust_class: &'static str,
+    /// Derived trust verdict (issue #114): always `source_derived`.
+    trust: query::TrustLabel,
     score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_repo_relative_path: Option<&'a str>,
@@ -4920,6 +4940,10 @@ pub(crate) struct SubsystemLogSignature<'a> {
     record_id: &'a str,
     kind: &'static str,
     trust_class: &'static str,
+    /// Derived trust verdict (issue #114). A runtime signature is
+    /// deterministically parsed from a captured artifact, so it is
+    /// `source_derived` — distinct from its `runtime_observation` domain class.
+    trust: query::TrustLabel,
     schema_version: u32,
     severity: &'a str,
     occurrence_count: u64,
@@ -7568,44 +7592,11 @@ pub(crate) struct PublicApiDiagnosticJson<'a> {
 
 /// Maps a node kind to its trust class so an agent claim is never labelled as
 /// source truth (AC3).
+///
+/// Delegates to [`query::trust_class_for`], the canonical mapping shared with
+/// the answer-row builders (issue #114), so the CLI and the query core cannot
+/// drift. This is the **domain** vocabulary; the derived per-row verdict is
+/// [`query::TrustLabel`] — see `docs/schema/trust-labels.md` §1.
 pub(crate) fn trust_class_for(record: &GraphRecord) -> &'static str {
-    let Some(kind) = record.node_kind_name() else {
-        return "other";
-    };
-    match kind {
-        "Observation" | "Decision" | "Failure" | "Lesson" => "agent_authored",
-        "Verification" | "CommandEvidence" | "CommandRun" | "TestRun" | "CIStatus"
-        | "BenchmarkRun" | "CoverageReport" | "ProofResult" => "verification_evidence",
-        "File"
-        | "Symbol"
-        | "Module"
-        | "Import"
-        | "Commit"
-        | "Change"
-        | "Repository"
-        | "PanicRiskSite"
-        | "DebtMarker"
-        | "UnsafeSite"
-        | "DependencyDeclaration" => "source_fact",
-        "Task"
-        | "AcceptanceCriterion"
-        | "LocalTask"
-        | "GitHubIssue"
-        | "PR"
-        | "Review"
-        | "ExternalIdentity"
-        | "ReviewStateTransition"
-        | "ExternalLink"
-        | "Product"
-        | "Project"
-        | "Plan" => "project_state",
-        "Artifact" | "PatchArtifact" | "FileEdit" => "artifact",
-        // Runtime log-signature observations (issues #319 / #320): a program's
-        // own claim about its execution, deterministically parsed but never
-        // verified — never source truth or verification evidence.
-        "LogSource" | "ErrorSignature" | "LogEvent" | "LogOccurrenceBucket" => {
-            "runtime_observation"
-        }
-        _ => "other",
-    }
+    query::trust_class_for(record)
 }

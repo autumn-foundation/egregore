@@ -1032,11 +1032,14 @@ pub(crate) fn query_semantic_context(
         report_semantic_context_no_match(query, min_score)?;
     }
 
+    // Derived trust labels (issue #114): built ONCE over the record slice and
+    // shared by every retrieval lead, so per-match rows cannot disagree.
+    let trust_ctx = query::TrustContext::build(&records);
     let match_rows: Vec<SemanticContextMatch<'_>> = bundle
         .matches
         .iter()
         .map(|m| {
-            let sections = build_context_sections(&m.context);
+            let sections = build_context_sections(&m.context, &trust_ctx);
             let (observations, excluded) =
                 apply_supersession(sections.observations, &resolver, supersession);
             let repository_id = index.owner_of(&m.lead.record_id);

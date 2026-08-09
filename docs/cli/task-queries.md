@@ -49,6 +49,13 @@ The output is a structured JSON envelope containing 8 context sections, sorted d
 * **`external_links`**: `ExternalLink` nodes referencing source issues.
 * **`unresolved`**: Missing evidence link targets.
 
+Every **record row** above (including a nested `verification_record`) carries a
+`trust_class` (its provenance domain) and a derived `trust` label (issue #114) —
+one of `source_derived`, `verification_evidence`, `agent_verified`,
+`agent_unverified`, `agent_contradicted`. `unresolved` rows carry neither: they
+name a target absent from the store, so there is no record to classify. See
+[`docs/schema/trust-labels.md`](../schema/trust-labels.md).
+
 ### Example Success Output
 
 ```json

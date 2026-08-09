@@ -593,6 +593,67 @@ scope for this issue and keep their existing five sections. `eg audit citations`
 workflow shares one drift-classification cache with the `subsystem` workflow so every
 `SemanticDrift` record is resolved once per audit run, not once per workflow.
 
+Every RECORD ROW of every cross-domain context answer carries a derived `trust`
+label (issue #114) from a CLOSED five-value vocabulary — `source_derived`,
+`verification_evidence`, `agent_verified`, `agent_unverified`,
+`agent_contradicted` — alongside the pre-existing, UNCHANGED `trust_class`
+domain vocabulary. The two answer different questions and that split IS the
+point: `trust_class` says WHERE a record lives (its provenance domain), `trust`
+says HOW MUCH uncorroborated agent judgement believing the row requires. A
+runtime log signature shows the split at its clearest — `trust_class:
+runtime_observation` (a program's own claim, never verification) with `trust:
+source_derived` (deterministically parsed from a captured artifact, never
+asserted by an agent). Derivation is a total, precedence-ordered function over
+`(node kind, evidence links, incident edges, supersession graph)` at the queried
+snapshot: a verification kind is `verification_evidence`; any NON-agent-claim
+kind is `source_derived`; an agent-claim kind is `agent_contradicted` when the
+shared `TemporalResolver` reports `superseded`/`contradicted`/`cycle`, else
+`agent_verified` when it carries at least one qualifying supporting link, else
+`agent_unverified`. Rows 1–2 make AC2 STRUCTURAL rather than merely tested: the
+agent branch is the only producer of an `agent_*` value and only an agent-claim
+kind reaches it, so a code/semantic/project/artifact/log record CANNOT be
+mislabeled. `kind_class` is an exhaustive `NodeKind` match with NO wildcard arm
+(the #247 completeness invariant), so a new kind fails to compile until
+classified. A qualifying supporting link is DIRECT (one hop, no file-level
+widening — deliberately narrower than `verification-coverage`'s `link_level:
+file`), FORWARD only (claim → verification, so two claims sharing one run never
+verify each other), carries a backing relation (`VALIDATED_BY`/`HAS_EVIDENCE`/
+`PRODUCED_EVIDENCE` — a generic `RELATES_TO` confers nothing), targets a
+verification KIND (an agent claim is never evidence for itself), and that target
+must be LIVE (not tombstoned, own status `current`) and PASSING. Passing is
+fail-closed and closed-set: `status` (lowercased/trimmed) in `{pass, passed}`,
+or — when `status` is absent/empty — `exit_code == 0`, the case that matters
+because the trajectory importers (`traj`/`codex`/`antigravity`) record only an
+exit code. `status` WINS over `exit_code`, and unknown is NEVER a pass. A link to
+a FAILING run yields `agent_unverified`, never `agent_verified` and never
+`agent_contradicted` (a red run is not a `CONTRADICTS` relationship);
+CONTRADICTION BEATS VERIFICATION, so a stale green run never rescues a superseded
+claim. The label is derived BEFORE the supersession filter, so it is a property of
+the record and not of the rendering mode: under the default `--supersession
+exclude` a contradicted observation moves into `excluded` and KEEPS its
+`agent_contradicted` label (otherwise that class would be unreachable by
+default), and `include-but-flag` yields the identical label in `observations`.
+`topology_edges` and `unresolved` deliberately carry NO `trust` field — an edge
+is a relation, not a record, and an unresolved row names a target ABSENT from the
+store, so labeling either would be fabrication. Emitted by `eg query context`,
+`subsystem`, `locate`, `semantic-context`, `task`, the daemon
+`observations_for_symbol`/`criteria_for_task` verbs, and the MCP
+`symbol_context`/`task_evidence` tools — all through ONE shared
+`query::TrustContext` over the SAME record slice, so the transports cannot
+disagree. Read-time only: no persisted field, no new node kind/edge label, and
+NO schema-version bump. Determinism is by construction (`BTreeMap`/`BTreeSet`
+only, order-independent existential, no wall clock), so labels are byte-identical
+across runs and invariant to input record order. HONEST LIMITS: `source_derived`
+means only that no agent judgement was interposed — never that the content is
+true, current, or correct; `agent_verified` records a live passing link AT THIS
+SNAPSHOT, never proof the claim is right, and `agent_unverified` is absence of
+recorded corroboration, never proof it is wrong; and because classification is by
+node kind rather than ID prefix, a trajectory-imported `Verification` (minted
+under an `agent_memory:v1:` ID from the agent's own transcript) reads
+`verification_evidence` and can confer `agent_verified` — a deterministic
+transcription of a recorded command execution, not independent verification. See
+`docs/schema/trust-labels.md`.
+
 `eg query change-impact <handle>` returns graph-derived impact leads grouped by relation
 (`direct_callers`, `direct_callees`, `referencing_files`, `implementation_symbols`,
 `containing_context`) for a symbol name, canonical record ID, or repo-relative file path.
