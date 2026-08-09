@@ -13822,3 +13822,120 @@ fn agent_sessions_for_repo_budget_max_results_bounds_rows() {
         "the cap that ACTUALLY applied (the budget), got {truncated}"
     );
 }
+
+#[test]
+fn agent_sessions_for_repo_zero_budget_never_reports_no_sessions() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // budget.max_results: 0 truncates every matched row away, but the
+    // repository genuinely HAS a scoped session — `no_sessions` would claim
+    // otherwise and must not appear alongside `results_truncated`.
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sessions-zero-budget",
+            "agent_id": "sessions-test-agent",
+            "verb": "agent_sessions_for_repo",
+            "params": { "repo": SESSIONS_REPO_SELECTOR },
+            "budget": { "max_results": 0 }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "a zero-budget digest is still a 200, got {res}"
+    );
+    let result = &response_json(&res)["result"];
+    assert_eq!(
+        result["sessions"],
+        serde_json::json!([]),
+        "zero budget truncates every row, got {result}"
+    );
+    let diagnostics = result["diagnostics"].as_array().expect("diagnostics");
+    assert!(
+        diagnostics.iter().any(|d| d["code"] == "results_truncated"),
+        "the zero-row response must disclose truncation, got {result}"
+    );
+    assert!(
+        !diagnostics.iter().any(|d| d["code"] == "no_sessions"),
+        "a budget-truncated repo with real sessions must never report \
+         no_sessions, got {result}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_negative_limit_is_invalid_limit_not_bad_request() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // -1 is a WELL-FORMED integer, just outside the 1..=200 range: the
+    // diagnosis must be `invalid_limit`, never `bad_request` ("not an
+    // integer"), which would misdescribe the input.
+    let res = agent_sessions_query(
+        &metadata,
+        "sessions-negative-limit",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR, "limit": -1 }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "an out-of-range limit must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "invalid_limit",
+        "a negative but well-formed integer is out-of-range, not a shape \
+         error, got {body}"
+    );
+    assert_eq!(
+        body["error"]["field"], "params.limit",
+        "the error must name params.limit, got {body}"
+    );
+}
+
+#[test]
+fn agent_sessions_for_repo_rejects_as_of_valid_time() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // This lane has no temporal selectors in this slice: an `as_of.valid_time`
+    // must be REJECTED, never silently dropped in favor of the current-state
+    // digest — that would answer an unrequested (and here, malformed) question
+    // with a misleading 200.
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sessions-as-of-rejected",
+            "agent_id": "sessions-test-agent",
+            "verb": "agent_sessions_for_repo",
+            "params": { "repo": SESSIONS_REPO_SELECTOR },
+            "as_of": { "valid_time": "not-a-real-timestamp" }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 501"),
+        "an unsupported as_of.valid_time must be rejected, not silently \
+         answered, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
+    assert_eq!(body["error"]["code"], "not_implemented", "got {body}");
+}

@@ -1073,6 +1073,28 @@ fn seed_empty_repo() -> Fixture {
     builder.finish("sessions_empty_repo.jsonl")
 }
 
+/// One repository whose display name (the node's own `name`, distinct from
+/// the safe record-ID selector this test resolves by) carries control
+/// characters, so a naive `--format text` renderer would forge output lines.
+fn seed_hostile_repository_display() -> Fixture {
+    let mut builder = Builder::new();
+    let repo_id = repository(
+        &mut builder,
+        "RepoHostile",
+        "REPO_DISPLAY_LEAK\u{7}\nFORGED_LINE",
+        "repo-hostile",
+    );
+    code_topology(
+        &mut builder,
+        &repo_id,
+        "FileHostile",
+        "SymHostile",
+        "src/hostile.rs",
+        "hostile",
+    );
+    builder.finish("sessions_hostile_repo_display.jsonl")
+}
+
 /// Two repositories sharing the selector `widget` so a bare basename is
 /// ambiguous.
 fn seed_ambiguous_repos() -> Fixture {
@@ -2018,6 +2040,29 @@ fn text_format_is_deterministic_and_payload_complete() {
             "diagnostic results_truncated matched {matched} returned 1 limit 1"
         )),
         "the text renderer must print the truncation payload, got:\n{first}"
+    );
+}
+
+#[test]
+fn text_format_sanitizes_hostile_repository_display_name() {
+    let fx = seed_hostile_repository_display();
+    // Select by the SAFE record-ID handle; the repository's own display name
+    // (rendered in the header line) is the hostile string under test.
+    let repo_id = fx.id("RepoHostile").to_owned();
+    let (code, stdout, stderr) = run_sessions(&fx, &repo_id, &["--format", "text"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        !stdout.contains("REPO_DISPLAY_LEAK\u{7}"),
+        "the control byte must never reach the terminal raw, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("FORGED_LINE\n") && !stdout.lines().any(|l| l == "FORGED_LINE"),
+        "an embedded newline in the display name must never forge a \
+         standalone output line, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("REPO_DISPLAY_LEAK") && stdout.contains("FORGED_LINE"),
+        "the sanitized (not deleted) text must still be present, got:\n{stdout}"
     );
 }
 

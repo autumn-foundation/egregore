@@ -490,7 +490,12 @@ pub fn sessions_for_repo(
         rows.push(entry.row);
     }
 
-    if rows.is_empty() {
+    // `matched == 0`, never `rows.is_empty()`: a zero `limit` (e.g. a daemon
+    // caller's `budget.max_results: 0`) truncates every matched row away, and
+    // that is a `results_truncated` answer, not "this repository has no
+    // sessions" — the two diagnostics must never both describe the same
+    // zero-row response for different reasons.
+    if matched == 0 {
         diagnostics.push(SessionsDiagnostic::bare("no_sessions"));
     }
 
@@ -1727,5 +1732,61 @@ mod tests {
         let too_long = "a".repeat(65);
         assert!(parse_run_outcome(&format!("AgentRun outcome={ok} exit_reason=x")).is_some());
         assert!(parse_run_outcome(&format!("AgentRun outcome={too_long} exit_reason=x")).is_none());
+    }
+
+    #[test]
+    fn zero_limit_truncates_without_a_no_sessions_diagnostic() {
+        // A `limit` of zero is unreachable through the CLI (which validates
+        // 1..=SESSIONS_MAX_LIMIT before ever calling this core), but the
+        // daemon can pass one after folding in a caller's `budget.max_results:
+        // 0`. The repository genuinely HAS a matching session, so the answer
+        // must be `results_truncated`, never the false claim `no_sessions`.
+        let repo = repository("repo-a");
+        let repo_id = repo.id().to_owned();
+        let sym = symbol(&repo_id, "alpha");
+        let sym_id = sym.id().to_owned();
+        let session = memory(
+            NodeKind::AgentSession,
+            "s",
+            Some("2026-01-01T00:00:00Z"),
+            "S",
+        );
+        let session_id = session.id().to_owned();
+        let obs = memory(
+            NodeKind::Observation,
+            "o",
+            Some("2026-01-01T00:00:00Z"),
+            "O",
+        );
+        let obs_id = obs.id().to_owned();
+        let records = vec![
+            repo,
+            sym,
+            code_edge(EdgeLabel::Contains, &repo_id, &sym_id),
+            session,
+            obs,
+            am_edge(EdgeLabel::AuthoredBy, &obs_id, &session_id),
+            am_edge(EdgeLabel::MentionsSymbol, &obs_id, &sym_id),
+        ];
+        let index = RepositoryIndex::build(&records);
+        let out = sessions_for_repo(&records, &index, &repo_id, 0);
+
+        assert!(
+            out.sessions.is_empty(),
+            "a zero limit truncates every row: {out:?}"
+        );
+        let truncated = out
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "results_truncated")
+            .unwrap_or_else(|| panic!("must disclose truncation: {out:?}"));
+        assert_eq!(truncated.matched, Some(1));
+        assert_eq!(truncated.returned, Some(0));
+        assert_eq!(truncated.limit, Some(0));
+        assert!(
+            !out.diagnostics.iter().any(|d| d.code == "no_sessions"),
+            "a truncated-to-zero repository with a real session must never \
+             also claim no_sessions: {out:?}"
+        );
     }
 }

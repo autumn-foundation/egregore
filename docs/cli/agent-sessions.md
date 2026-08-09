@@ -252,7 +252,14 @@ present) and optional `limit`. The result carries the identical
 transports cannot drift. A non-string selector is a 400 `bad_request` naming
 the key the caller actually sent (`params.repo` **or** `params.repository_id`);
 a non-integer `limit` is a 400 `bad_request`, and a well-formed integer outside
-`1..=200` is a 400 `invalid_limit` — the same distinction the CLI draws. See
+`1..=200` — a negative value included, never mistaken for a shape error — is a
+400 `invalid_limit`, the same distinction the CLI draws. The row cap is
+further bounded by the request's `budget.max_results` (the smaller of the two
+applies, with `results_truncated` naming it), and a `limit` of `0` truncates to
+an empty `sessions` array without ever being confused for `no_sessions` — that
+code means the repository has no scoped sessions at all, not that the answer
+was capped away. This lane has no temporal selectors: `as_of.valid_time` is
+rejected with `not_implemented` rather than silently answered. See
 `docs/schema/daemon-query.md`.
 
 ## When to use this versus neighboring lanes

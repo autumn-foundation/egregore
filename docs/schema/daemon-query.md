@@ -486,7 +486,14 @@ two transports cannot drift.
 | Field   | Type   | Required | Notes |
 |---------|--------|----------|-------|
 | `repo`  | string | yes      | Repository selector (record ID, basename, remote URL, root commit SHA, canonical path, or final-segment shorthand). `repository_id` is accepted as an alias; `repo` wins when both are present. A non-string value is rejected naming the key the caller actually sent, never the canonical key it would be rewrapped under. |
-| `limit` | u64    | no       | Session-row ceiling. Default 20, capped at 200. A non-integer is a shape error (`bad_request`); a well-formed integer out of range is `invalid_limit`, mirroring the CLI. Further bounded by the request's `budget.max_results`: the effective cap is the minimum of the two, and `results_truncated` reports the cap that applied. The traversal deadline is re-checked after the digest is built, so a tight `budget.timeout_ms` yields `query_timeout`, never a late 200. |
+| `limit` | integer | no      | Session-row ceiling. Default 20, capped at 200. A non-integer shape (a float, a string, ...) is `bad_request`; a well-formed integer outside `1..=200` — including a **negative** value — is `invalid_limit`, mirroring the CLI. Further bounded by the request's `budget.max_results`: the effective cap is the minimum of the two, and `results_truncated` reports the cap that actually applied — including `limit: 0` (an empty row set is still `200`, never conflated with `no_sessions`, which means the repository has none at all). The traversal deadline is re-checked after the digest is built, so a tight `budget.timeout_ms` yields `query_timeout`, never a late 200. |
+
+This lane has **no temporal selectors** in this slice (matching the CLI, which
+carries neither `--at` nor `--as-of`): a request naming `as_of.valid_time` is
+rejected outright with `not_implemented` rather than silently answering the
+current-state digest for an unrequested — or malformed — point in time.
+`as_of.transaction_time` and `as_of.since` are already rejected globally for
+every verb but `symbol_by_name` (see §2).
 
 **Result shape** (parity with the `eg query sessions` envelope):
 ```json
@@ -516,11 +523,12 @@ command output, patch hunks, tool-call arguments, or task titles.
 |-----------|------|------|
 | Both `params.repo` and `params.repository_id` absent | `missing_field` | 400 |
 | Selector present but not a string | `bad_request` | 400 |
-| `limit` not an integer | `bad_request` | 400 |
-| `limit` a well-formed integer outside 1..=200 | `invalid_limit` | 400 |
+| `limit` not a well-formed integer (a float, a string, ...) | `bad_request` | 400 |
+| `limit` a well-formed integer outside 1..=200 (negative included) | `invalid_limit` | 400 |
+| `as_of.valid_time` present | `not_implemented` | 501 |
 | Selector matches no repository | `unknown_repository_selector` | 400 |
 | Selector matches several repositories | `ambiguous_repository_selector` | 400 |
-| Budget `timeout_ms` elapsed | `query_timeout` | 408 |
+| Budget `timeout_ms` elapsed (checked before AND after building the digest) | `query_timeout` | 408 |
 | Missing/invalid bearer token | `unauthorized` | 401 |
 
 A repository that resolves but has **zero** scoped sessions is a successful

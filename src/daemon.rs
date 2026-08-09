@@ -10822,14 +10822,31 @@ fn handle_verb_criteria_for_task(
 /// handler derives from `budget.max_results`; the effective row cap is the
 /// MINIMUM of it and the verb's own `params.limit`, so a caller can constrain
 /// this verb through the common budget contract like every other verb.
+///
+/// `as_of_valid_time` is rejected outright, never silently dropped: this lane
+/// (like the CLI's `eg query sessions`) has no temporal selectors in this
+/// slice, so honoring — or quietly ignoring — a caller's `as_of.valid_time`
+/// would answer a different, unrequested question (or a malformed one) with a
+/// misleading `200`.
 fn handle_verb_agent_sessions_for_repo(
     request_id: &str,
     params: &serde_json::Value,
+    as_of_valid_time: Option<&str>,
     budget_max_results: usize,
     started: Instant,
     budget: Option<Duration>,
     state: &ServerState,
 ) -> HttpResponse {
+    if as_of_valid_time.is_some() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::new(
+                ErrorCode::NotImplemented,
+                "as_of.valid_time is not supported for the 'agent_sessions_for_repo' verb; this lane has no temporal selectors",
+            ),
+        );
+    }
+
     // `params.repo` is canonical; `params.repository_id` is the accepted alias.
     // A present-but-null value counts as absent so a caller can send either key
     // explicitly nulled without tripping the type check.
@@ -10857,26 +10874,37 @@ fn handle_verb_agent_sessions_for_repo(
     let limit = match params.get("limit") {
         None | Some(serde_json::Value::Null) => graph_query::SESSIONS_DEFAULT_LIMIT,
         Some(value) => {
-            // A non-integer is a shape error (`bad_request`); a well-formed
-            // integer outside the range is `invalid_limit`, mirroring the CLI.
-            let Some(requested) = value.as_u64() else {
+            // A well-formed JSON integer can be negative or wider than `usize`
+            // (a huge `u64`), so parse through `i128` before range-checking:
+            // `as_u64()` alone returns `None` for a negative integer, which
+            // would misreport `-1` as "not an integer" (`bad_request`) instead
+            // of the true diagnosis, "a well-formed integer outside the
+            // range" (`invalid_limit`). Only a genuinely non-integer shape
+            // (a float, a string, ...) is `bad_request`.
+            let parsed: Option<i128> = value
+                .as_i64()
+                .map(i128::from)
+                .or_else(|| value.as_u64().map(i128::from));
+            let Some(requested) = parsed else {
                 return HttpResponse::error_with_id(
                     request_id,
                     ApiError::bad_request_field("params.limit must be an integer", "params.limit"),
                 );
             };
-            let max = graph_query::SESSIONS_MAX_LIMIT as u64;
+            let max = graph_query::SESSIONS_MAX_LIMIT as i128;
             let default = graph_query::SESSIONS_DEFAULT_LIMIT as u64;
-            match usize::try_from(requested) {
-                Ok(limit) if (1..=graph_query::SESSIONS_MAX_LIMIT).contains(&limit) => limit,
-                _ => {
-                    let mut error = ApiError::new(
-                        ErrorCode::InvalidLimit,
-                        format!("params.limit must be between 1 and {max} (default {default})"),
-                    );
-                    error.field = Some("params.limit".to_owned());
-                    return HttpResponse::error_with_id(request_id, error);
-                }
+            if (1..=max).contains(&requested) {
+                usize::try_from(requested).expect("bounded by SESSIONS_MAX_LIMIT above")
+            } else {
+                let mut error = ApiError::new(
+                    ErrorCode::InvalidLimit,
+                    format!(
+                        "params.limit must be between 1 and {max} (default {default})",
+                        max = graph_query::SESSIONS_MAX_LIMIT
+                    ),
+                );
+                error.field = Some("params.limit".to_owned());
+                return HttpResponse::error_with_id(request_id, error);
             }
         }
     };
@@ -11111,9 +11139,15 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             }
         }
         // The daemon face of `eg query sessions <REPO>` (issue #112).
-        "agent_sessions_for_repo" => {
-            handle_verb_agent_sessions_for_repo(&request_id, &params, limit, started, budget, state)
-        }
+        "agent_sessions_for_repo" => handle_verb_agent_sessions_for_repo(
+            &request_id,
+            &params,
+            as_of_valid_time.as_deref(),
+            limit,
+            started,
+            budget,
+            state,
+        ),
         "drift" => HttpResponse::error_with_id(
             &request_id,
             ApiError::new(

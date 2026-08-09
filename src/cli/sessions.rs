@@ -59,12 +59,13 @@ pub(crate) fn query_sessions_cmd(
 
 /// Deterministic human-readable rendering of a sessions digest.
 ///
-/// Every free-text field (`agent_id`, `session_id`, and the `summary_label`
-/// that interpolates them) is passed through
-/// [`query::bounded_session_text`] first: they are unbounded importer-supplied
-/// strings, and an embedded newline or ANSI escape would otherwise forge output
-/// lines or drive the reader's terminal. The JSON transport needs no such step
-/// (serde escapes control characters) and keeps the raw values.
+/// Every free-text field — `agent_id`, `session_id`, the `summary_label` that
+/// interpolates them, and the repository's own display name (a local basename
+/// or operator override, itself unbounded importer/operator-supplied text) —
+/// is passed through [`query::bounded_session_text`] first: an embedded
+/// newline or ANSI escape would otherwise forge output lines or drive the
+/// reader's terminal. The JSON transport needs no such step (serde escapes
+/// control characters) and keeps the raw values.
 pub(crate) fn render_sessions_text(
     digest: &query::SessionsDigest,
     repository_id: &str,
@@ -77,7 +78,10 @@ pub(crate) fn render_sessions_text(
         out,
         "sessions: {} row(s) for {} ({repository_id})",
         digest.sessions.len(),
-        repository.unwrap_or("<unnamed repository>")
+        repository.map_or_else(
+            || "<unnamed repository>".to_owned(),
+            query::bounded_session_text
+        )
     );
     let _ = writeln!(out, "disclaimer: {}", query::SESSIONS_DISCLAIMER);
     let _ = writeln!(
