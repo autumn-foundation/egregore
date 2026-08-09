@@ -20,7 +20,7 @@
 //! — a matching `session_id` string is not membership — and all timestamp
 //! ordering is by parsed UTC instant, never raw RFC 3339 string order.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use chrono::{DateTime, Utc};
 
@@ -432,7 +432,15 @@ pub fn sessions_for_repo(
     // is sorted BY CONSTRUCTION and needs no separate sort pass.
     let mut unresolved: Vec<String> = Vec::new();
     let mut unresolved_total: u64 = 0;
-    let mut pending: Vec<PendingRow> = Vec::new();
+    // Bounded top-`limit` retention: a max-heap capped at `limit` entries, so
+    // the digest never holds more than `limit` fully-materialized rows (each
+    // carrying cloned handles, runs, tasks, and diagnostics) at once,
+    // regardless of how many sessions this repository actually matches.
+    // `matched` tracks the TRUE total separately, so `results_truncated`
+    // still reports an honest count even though `kept` never grows past
+    // `limit`.
+    let mut kept: BinaryHeap<HeapEntry> = BinaryHeap::new();
+    let mut matched: u64 = 0;
     // (session record id, session_id string, member ids) for EVERY live
     // AgentSession in the WHOLE STORE, regardless of which repository (if
     // any) it resolves to — feeds the sibling-linkage union below, since a
@@ -467,6 +475,17 @@ pub fn sessions_for_repo(
             continue;
         }
 
+        matched += 1;
+        if let Some(stamped) = stamped {
+            scoped_stamps.insert(stamped);
+        }
+
+        // A `limit` of 0 (e.g. a daemon caller's `budget.max_results: 0`)
+        // discards every row regardless, so skip building one entirely —
+        // no point paying the allocation for a row that can never survive.
+        if limit == 0 {
+            continue;
+        }
         let built = build_row(
             session_id,
             session_record,
@@ -475,10 +494,16 @@ pub fn sessions_for_repo(
             &adjacency,
             &nodes,
         );
-        if let Some(stamped) = stamped {
-            scoped_stamps.insert(stamped);
+        let entry = HeapEntry(built);
+        if kept.len() < limit {
+            kept.push(entry);
+        } else if kept.peek().is_some_and(|worst| entry < *worst) {
+            kept.pop();
+            kept.push(entry);
         }
-        pending.push(built);
+        // Otherwise `entry` is worse than every currently-kept row and is
+        // dropped here, immediately, rather than retained until a final
+        // truncation pass.
     }
 
     if unresolved_total > 0 {
@@ -503,13 +528,14 @@ pub fn sessions_for_repo(
         diagnostics.push(diagnostic);
     }
 
+    // `kept` already holds at most `limit` entries (bounded during the loop
+    // above), so this sort is over `limit` rows, never `matched` rows.
+    let mut pending: Vec<PendingRow> = kept.into_iter().map(|entry| entry.0).collect();
     pending.sort_by(|a, b| pending_order_key(a).cmp(&pending_order_key(b)));
 
-    let matched = pending.len();
-    if matched > limit {
-        pending.truncate(limit);
+    if matched > pending.len() as u64 {
         let mut diagnostic = SessionsDiagnostic::bare("results_truncated");
-        diagnostic.matched = Some(matched as u64);
+        diagnostic.matched = Some(matched);
         diagnostic.returned = Some(pending.len() as u64);
         diagnostic.limit = Some(limit as u64);
         diagnostics.push(diagnostic);
@@ -559,6 +585,43 @@ fn pending_order_key(pending: &PendingRow) -> (bool, std::cmp::Reverse<(i64, u32
         std::cmp::Reverse(instant.unwrap_or((i64::MIN, 0))),
         pending.row.session_record_id.as_str(),
     )
+}
+
+/// A [`PendingRow`] ordered by [`pending_order_key`], for the bounded
+/// top-`limit` retention in [`sessions_for_repo`].
+///
+/// A max-heap of `HeapEntry` therefore always surfaces the WORST (least
+/// recently active) currently-kept row at its peak — the one to evict when a
+/// better row arrives — while the best rows sink to the bottom of the heap's
+/// internal order. This is the opposite of `pending_order_key`'s own
+/// ascending "best first" meaning; `HeapEntry`'s `Ord` is deliberately the
+/// same comparison, relied on for `BinaryHeap`'s max-at-top behavior.
+struct HeapEntry(PendingRow);
+
+impl HeapEntry {
+    fn key(&self) -> (bool, std::cmp::Reverse<(i64, u32)>, &str) {
+        pending_order_key(&self.0)
+    }
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for HeapEntry {}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
 }
 
 /// Latest live node write per stable record ID.
@@ -1844,6 +1907,73 @@ mod tests {
             "a truncated-to-zero repository with a real session must never \
              also claim no_sessions: {out:?}"
         );
+    }
+
+    #[test]
+    fn limit_below_matched_count_retains_exactly_the_top_k_most_recent() {
+        // `sessions_for_repo` retains only the best `limit` rows via a bounded
+        // max-heap rather than materializing every matched row before
+        // truncating (issue #112 review round 13: unbounded retention could
+        // let the digest's memory scale with `matched` instead of `limit`).
+        // Five sessions with distinct last-activity instants, `limit: 2`,
+        // exercises repeated eviction (not just the single-swap case a
+        // 2-session/limit-1 fixture would cover) — this proves the heap
+        // converges on the correct top-K, not merely an order-preserving
+        // subset of whichever rows happened to be built first.
+        let repo = repository("repo-a");
+        let repo_id = repo.id().to_owned();
+        let sym = symbol(&repo_id, "alpha");
+        let sym_id = sym.id().to_owned();
+        let mut records = vec![repo, sym, code_edge(EdgeLabel::Contains, &repo_id, &sym_id)];
+        let mut expected_order = Vec::new();
+        for (key, observed) in [
+            ("s-1", "2026-01-01T00:00:00Z"),
+            ("s-2", "2026-02-01T00:00:00Z"),
+            ("s-3", "2026-03-01T00:00:00Z"),
+            ("s-4", "2026-04-01T00:00:00Z"),
+            ("s-5", "2026-05-01T00:00:00Z"),
+        ] {
+            let session = memory(NodeKind::AgentSession, key, Some(observed), "S");
+            let obs = memory(
+                NodeKind::Observation,
+                &format!("o-{key}"),
+                Some(observed),
+                "observation",
+            );
+            let (session_id, obs_id) = (session.id().to_owned(), obs.id().to_owned());
+            expected_order.push(key.to_owned());
+            records.push(session);
+            records.push(obs);
+            records.push(am_edge(EdgeLabel::AuthoredBy, &obs_id, &session_id));
+            records.push(am_edge(EdgeLabel::MentionsSymbol, &obs_id, &sym_id));
+        }
+        expected_order.reverse(); // most-recent-first: s-5, s-4
+
+        let index = RepositoryIndex::build(&records);
+        let out = sessions_for_repo(&records, &index, &repo_id, 2);
+
+        let ids: Vec<&str> = out
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            ids,
+            expected_order[..2],
+            "the two MOST RECENT sessions must survive, in recency order: {out:?}"
+        );
+        let truncated = out
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "results_truncated")
+            .unwrap_or_else(|| panic!("must disclose truncation: {out:?}"));
+        assert_eq!(
+            truncated.matched,
+            Some(5),
+            "the TRUE total, got {truncated:?}"
+        );
+        assert_eq!(truncated.returned, Some(2));
+        assert_eq!(truncated.limit, Some(2));
     }
 
     #[test]
