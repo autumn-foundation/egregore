@@ -7126,11 +7126,26 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let max =
                 i128::try_from(query::SESSIONS_MAX_LIMIT).expect("SESSIONS_MAX_LIMIT fits i128");
             if limit < 1 || limit > max {
+                // `serde_json::json!` embeds `limit: i128` via `Serialize`,
+                // which PANICS for a value outside BOTH i64 and u64 range
+                // (serde_json's `Number` cannot represent one without the
+                // `arbitrary_precision` feature, which this crate does not
+                // enable) — reachable here precisely because `--limit`
+                // accepts the FULL i128 range so clap's own parser never
+                // rejects an out-of-range value first. Render as a NUMBER
+                // when representable (matching every in-range case callers
+                // already rely on), falling back to its decimal STRING only
+                // for the genuinely unrepresentable tail — never a lossy
+                // truncation and never a panic.
+                let limit_value = i64::try_from(limit)
+                    .map(serde_json::Value::from)
+                    .or_else(|_| u64::try_from(limit).map(serde_json::Value::from))
+                    .unwrap_or_else(|_| serde_json::Value::String(limit.to_string()));
                 let diag = serde_json::json!({
                     "ok": false,
                     "error": {
                         "code": "invalid_limit",
-                        "limit": limit,
+                        "limit": limit_value,
                         "min": 1,
                         "max": query::SESSIONS_MAX_LIMIT,
                         "message": format!(

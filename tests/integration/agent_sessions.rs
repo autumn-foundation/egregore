@@ -1888,6 +1888,76 @@ fn limit_wider_than_i64_is_invalid_limit_not_a_clap_parse_error() {
 }
 
 #[test]
+fn limit_beyond_u64_range_is_invalid_limit_not_a_panic() {
+    // Issue #112 review round 19: `--limit` accepts the FULL `i128` range,
+    // so a value beyond BOTH `i64` and `u64` (unlike the sibling
+    // i64-overflow test above, whose regression value still fits `u64`)
+    // reaches the `invalid_limit` diagnostic builder. `serde_json::json!`
+    // embeds the raw `i128` via `Serialize`, which PANICS for such a value
+    // without the `arbitrary_precision` feature this crate does not enable
+    // -- this must render as the exit-1 `invalid_limit` envelope, never
+    // crash the process.
+    let fx = seed_scope();
+    let (code, stdout, stderr) = run_sessions(
+        &fx,
+        "repo-a",
+        &["--limit", "18446744073709551616"], // u64::MAX + 1
+    );
+    assert_eq!(
+        code, 1,
+        "a u64-overflowing --limit must exit 1, not panic; stderr={stderr}"
+    );
+    let diag: serde_json::Value = stderr
+        .lines()
+        .find_map(|l| serde_json::from_str(l.trim()).ok())
+        .unwrap_or_else(|| panic!("stderr must carry a JSON diagnostic, got {stderr}"));
+    assert_eq!(diag["ok"], false);
+    assert_eq!(diag["error"]["code"], "invalid_limit");
+    assert_eq!(
+        diag["error"]["limit"],
+        serde_json::json!("18446744073709551616"),
+        "a value unrepresentable as a JSON number renders as its exact \
+         decimal string, never silently truncated: {diag}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a rejected limit must not print a digest: {stdout}"
+    );
+}
+
+#[test]
+fn limit_below_i64_min_is_invalid_limit_not_a_panic() {
+    // The negative mirror of the beyond-u64 case: one past `i64::MIN`,
+    // still within `i128`, unrepresentable as a `serde_json::Number`.
+    let fx = seed_scope();
+    let (code, stdout, stderr) = run_sessions(
+        &fx,
+        "repo-a",
+        &["--limit", "-9223372036854775809"], // i64::MIN - 1
+    );
+    assert_eq!(
+        code, 1,
+        "an i64::MIN-underflowing --limit must exit 1, not panic; stderr={stderr}"
+    );
+    let diag: serde_json::Value = stderr
+        .lines()
+        .find_map(|l| serde_json::from_str(l.trim()).ok())
+        .unwrap_or_else(|| panic!("stderr must carry a JSON diagnostic, got {stderr}"));
+    assert_eq!(diag["ok"], false);
+    assert_eq!(diag["error"]["code"], "invalid_limit");
+    assert_eq!(
+        diag["error"]["limit"],
+        serde_json::json!("-9223372036854775809"),
+        "a value unrepresentable as a JSON number renders as its exact \
+         decimal string, never silently truncated: {diag}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a rejected limit must not print a digest: {stdout}"
+    );
+}
+
+#[test]
 fn text_format_prints_agent_record_id_and_ingested_bounds() {
     let fx = seed_edge_cases();
     let (code, stdout, stderr) = run_sessions(&fx, "repo-a", &["--format", "text"]);
