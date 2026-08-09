@@ -1157,16 +1157,39 @@ fn unlinked_stamped_records<'a>(
         }
     }
 
-    let mut unlinked: BTreeSet<&'a str> = BTreeSet::new();
+    // Two AgentSession NODE IDs can legitimately share one stamped
+    // `session_id` STRING: `build_agent_session_node` hashes `observed_at`
+    // into the node id, so re-observing the same logical session at a new
+    // instant mints a sibling session node under the same stamp. The set of
+    // records genuinely linked to a stamp is therefore the UNION across every
+    // SCOPED session sharing it — each session's own record ID plus its
+    // edge-derived members — never one session's membership checked in
+    // isolation, which would falsely flag a sibling session's real,
+    // edge-linked members as unlinked.
+    let mut linked_by_stamped_session: BTreeMap<&str, BTreeSet<&'a str>> = BTreeMap::new();
     for (session_record_id, stamped_session_id, members) in scoped {
         if stamped_session_id.is_empty() {
             continue;
         }
-        let Some(candidates) = by_stamped_session.get(stamped_session_id.as_str()) else {
+        let Some((&session_key, _)) = nodes.get_key_value(session_record_id.as_str()) else {
+            continue;
+        };
+        let linked = linked_by_stamped_session
+            .entry(stamped_session_id.as_str())
+            .or_default();
+        linked.insert(session_key);
+        linked.extend(members.iter().copied());
+    }
+
+    let mut unlinked: BTreeSet<&'a str> = BTreeSet::new();
+    for (stamped_session_id, candidates) in &by_stamped_session {
+        let Some(linked) = linked_by_stamped_session.get(stamped_session_id) else {
+            // No SCOPED session carries this stamp at all: its stamped
+            // records are simply outside this digest, not "unlinked".
             continue;
         };
         for &id in candidates {
-            if id == session_record_id.as_str() || members.contains(id) {
+            if linked.contains(id) {
                 continue;
             }
             unlinked.insert(id);
@@ -1788,5 +1811,93 @@ mod tests {
             "a truncated-to-zero repository with a real session must never \
              also claim no_sessions: {out:?}"
         );
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn unlinked_check_unions_memberships_across_sibling_sessions_sharing_one_session_id() {
+        // Two distinct AgentSession NODE IDs sharing one stamped `session_id`
+        // STRING — the normal shape `build_agent_session_node` produces when
+        // the same logical session is re-observed at a different instant
+        // (`observed_at` is a record-id input). Each sibling has its own real
+        // AUTHORED_BY/MENTIONS_SYMBOL member; NEITHER member may be reported
+        // as unlinked just because it is absent from the OTHER sibling's
+        // membership set.
+        let repo = repository("repo-a");
+        let repo_id = repo.id().to_owned();
+        let sym = symbol(&repo_id, "alpha");
+        let sym_id = sym.id().to_owned();
+
+        let stamp = |mut record: GraphRecord| -> GraphRecord {
+            if let GraphRecord::Node { session_id, .. } = &mut record {
+                *session_id = Some("shared-sess".to_owned());
+            }
+            record
+        };
+
+        let s_a = stamp(memory(
+            NodeKind::AgentSession,
+            "s-a",
+            Some("2026-01-01T00:00:00Z"),
+            "S_a",
+        ));
+        let s_a_id = s_a.id().to_owned();
+        let s_b = stamp(memory(
+            NodeKind::AgentSession,
+            "s-b",
+            Some("2026-01-01T01:00:00Z"),
+            "S_b",
+        ));
+        let s_b_id = s_b.id().to_owned();
+        let o_a = stamp(memory(
+            NodeKind::Observation,
+            "o-a",
+            Some("2026-01-01T00:30:00Z"),
+            "O_a",
+        ));
+        let o_a_id = o_a.id().to_owned();
+        let o_b = stamp(memory(
+            NodeKind::Observation,
+            "o-b",
+            Some("2026-01-01T01:30:00Z"),
+            "O_b",
+        ));
+        let o_b_id = o_b.id().to_owned();
+
+        let records = vec![
+            repo,
+            sym,
+            code_edge(EdgeLabel::Contains, &repo_id, &sym_id),
+            s_a,
+            s_b,
+            o_a,
+            o_b,
+            am_edge(EdgeLabel::AuthoredBy, &o_a_id, &s_a_id),
+            am_edge(EdgeLabel::MentionsSymbol, &o_a_id, &sym_id),
+            am_edge(EdgeLabel::AuthoredBy, &o_b_id, &s_b_id),
+            am_edge(EdgeLabel::MentionsSymbol, &o_b_id, &sym_id),
+        ];
+        let index = RepositoryIndex::build(&records);
+        let out = sessions_for_repo(&records, &index, &repo_id, SESSIONS_DEFAULT_LIMIT);
+
+        assert_eq!(
+            out.sessions.len(),
+            2,
+            "both sibling sessions must be scoped and returned: {out:?}"
+        );
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| d.code == "unlinked_session_stamped_records"),
+            "each session's own edge-linked member must never be flagged \
+             unlinked merely because it belongs to a SIBLING session sharing \
+             the stamp: {out:?}"
+        );
+        for row in &out.sessions {
+            assert_eq!(
+                row.record_counts.observation, 1,
+                "each sibling session must count its OWN observation only: {row:?}"
+            );
+        }
     }
 }
