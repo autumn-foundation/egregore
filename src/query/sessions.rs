@@ -871,13 +871,20 @@ fn build_row(
         else {
             continue;
         };
-        if let Some(raw) = observed_at.as_deref().filter(|s| !s.is_empty()) {
+        // A PRESENT field (`Some`, including `Some("")`) that fails to parse
+        // is unparseable and reported; only a field that is entirely ABSENT
+        // (`None`) is silently skipped. `parse_instant("")` already fails
+        // RFC 3339 parsing on its own, so an empty string falls straight
+        // into the `None` arm below and is counted — it must never be
+        // filtered out ahead of the parse and treated as if the field were
+        // simply missing.
+        if let Some(raw) = observed_at.as_deref() {
             match parse_instant(raw) {
                 Some(instant) => observed.push(instant),
                 None => unparseable += 1,
             }
         }
-        if let Some(raw) = ingested_at.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(raw) = ingested_at.as_deref() {
             // An unparseable `ingested_at` is counted in the SAME per-session
             // tally as `observed_at`: a timestamp field that could not be read
             // is a reported gap either way, never a silent drop.
@@ -1974,6 +1981,62 @@ mod tests {
         );
         assert_eq!(truncated.returned, Some(2));
         assert_eq!(truncated.limit, Some(2));
+    }
+
+    #[test]
+    fn present_but_empty_timestamps_are_counted_as_unparseable() {
+        // An entirely ABSENT `observed_at`/`ingested_at` field is silently
+        // skipped (no time source, nothing malformed to report), but a
+        // PRESENT-and-empty string is a real defect distinct from absence —
+        // it must be counted toward `unparseable_timestamp`, never silently
+        // treated as if the field were simply missing (issue #112 review
+        // round 14).
+        let repo = repository("repo-a");
+        let repo_id = repo.id().to_owned();
+        let sym = symbol(&repo_id, "alpha");
+        let sym_id = sym.id().to_owned();
+
+        // The session's OWN `observed_at` is present but empty.
+        let session = memory(NodeKind::AgentSession, "s", Some(""), "S");
+        let session_id = session.id().to_owned();
+
+        // The member observation has a VALID `observed_at` (so it doesn't
+        // also trip the `observed_at` path) but an empty `ingested_at`.
+        let mut obs = memory(
+            NodeKind::Observation,
+            "o",
+            Some("2026-01-01T00:00:00Z"),
+            "O",
+        );
+        let obs_id = obs.id().to_owned();
+        if let GraphRecord::Node { ingested_at, .. } = &mut obs {
+            *ingested_at = Some(String::new());
+        }
+
+        let records = vec![
+            repo,
+            sym,
+            code_edge(EdgeLabel::Contains, &repo_id, &sym_id),
+            session,
+            obs,
+            am_edge(EdgeLabel::AuthoredBy, &obs_id, &session_id),
+            am_edge(EdgeLabel::MentionsSymbol, &obs_id, &sym_id),
+        ];
+        let index = RepositoryIndex::build(&records);
+        let out = sessions_for_repo(&records, &index, &repo_id, 10);
+
+        assert_eq!(out.sessions.len(), 1, "one scoped session: {out:?}");
+        let diagnostic = out
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "unparseable_timestamp")
+            .unwrap_or_else(|| panic!("empty observed_at/ingested_at must be reported: {out:?}"));
+        assert_eq!(
+            diagnostic.count,
+            Some(2),
+            "both the session's empty observed_at and the member's empty \
+             ingested_at must be counted, got {diagnostic:?}"
+        );
     }
 
     #[test]
