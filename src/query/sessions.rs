@@ -1063,15 +1063,26 @@ fn build_row(
     }
 
     // ── Referenced tasks ────────────────────────────────────────────────────
-    // Bounded at `MAX_TASKS_PER_SESSION` entries DURING collection: a
-    // `BTreeSet` already iterates in the final ascending order the truncated
-    // output uses, so once the set exceeds the cap the LARGEST (worst) id is
-    // evicted via `pop_last`, keeping only the smallest `MAX_TASKS_PER_SESSION`
-    // — behavior-identical to collecting every id and truncating afterward,
-    // but the set itself never grows past the cap for a session referencing
-    // a pathologically large number of tasks. `matched_tasks` tracks the true
-    // total separately, counted only on a genuinely NEW id (a repeated
-    // citation of the same task must not inflate it).
+    // `seen_task_ids` accumulates every DISTINCT task id referenced by any
+    // citer (the session or a member) — the authoritative "have we ever
+    // counted this one" check `matched_tasks` relies on. An earlier version
+    // of this fix (review round 17) checked `task_ids.insert(...)` directly
+    // for that purpose, which double-counted: once `task_ids` evicts an id
+    // via `pop_last` below, a LATER citer referencing that SAME task makes
+    // `task_ids.insert` report "new" again, inflating `matched_tasks` past
+    // the true distinct total (review round 18). An exact distinct count
+    // cannot be produced from less than O(distinct referenced tasks) of
+    // bookkeeping — this crate never substitutes an approximation for a
+    // disclosed count — but `seen_task_ids` holds only `&str` REFERENCES,
+    // never the `TaskRef` structs (with their `.to_owned()` allocations and
+    // per-task node lookups) that were round 15's actual materialization
+    // cost. Those stay bounded at `MAX_TASKS_PER_SESSION` via `task_ids`,
+    // which keeps only the smallest ids (a `BTreeSet` already iterates in
+    // the final ascending order the truncated output uses, so evicting the
+    // LARGEST id via `pop_last` once the cap is exceeded is
+    // behavior-identical to collecting every retained id and truncating
+    // afterward).
+    let mut seen_task_ids: BTreeSet<&str> = BTreeSet::new();
     let mut task_ids: BTreeSet<&str> = BTreeSet::new();
     let mut matched_tasks: u64 = 0;
     for id in std::iter::once(&session_id).chain(members.iter()) {
@@ -1079,11 +1090,13 @@ fn build_row(
             if nodes.get(task_id).and_then(|r| node_kind(r)) != Some(NodeKind::Task) {
                 continue;
             }
-            if task_ids.insert(task_id) {
-                matched_tasks += 1;
-                if task_ids.len() > MAX_TASKS_PER_SESSION {
-                    task_ids.pop_last();
-                }
+            if !seen_task_ids.insert(task_id) {
+                continue;
+            }
+            matched_tasks += 1;
+            task_ids.insert(task_id);
+            if task_ids.len() > MAX_TASKS_PER_SESSION {
+                task_ids.pop_last();
             }
         }
     }
@@ -2391,6 +2404,87 @@ mod tests {
         );
         assert_eq!(truncated.returned, Some(20));
         assert_eq!(truncated.limit, Some(20));
+    }
+
+    #[test]
+    fn a_task_cited_by_multiple_citers_after_eviction_is_counted_once() {
+        // Issue #112 review round 18: the bounded `task_ids` retention set's
+        // eviction must not let a task LOOK new again when a DIFFERENT citer
+        // references it after it has already been evicted — `matched_tasks`
+        // (the disclosed TRUE total) must equal the true distinct count,
+        // never inflate on a repeated citation of an already-evicted task.
+        let repo = repository("repo-a");
+        let repo_id = repo.id().to_owned();
+        let sym = symbol(&repo_id, "alpha");
+        let sym_id = sym.id().to_owned();
+
+        let session = memory(
+            NodeKind::AgentSession,
+            "s",
+            Some("2026-01-01T00:00:00Z"),
+            "S",
+        );
+        let session_id = session.id().to_owned();
+        let obs = memory(
+            NodeKind::Observation,
+            "o",
+            Some("2026-01-01T00:00:00Z"),
+            "O",
+        );
+        let obs_id = obs.id().to_owned();
+
+        let mut records = vec![
+            repo,
+            sym,
+            code_edge(EdgeLabel::Contains, &repo_id, &sym_id),
+            session,
+            obs,
+            am_edge(EdgeLabel::AuthoredBy, &obs_id, &session_id),
+            am_edge(EdgeLabel::MentionsSymbol, &obs_id, &sym_id),
+        ];
+
+        let mut task_ids: Vec<String> = Vec::new();
+        for i in 0..21 {
+            let key = format!("t{i}");
+            let referenced_task = task(&key, "open");
+            let task_id = referenced_task.id().to_owned();
+            task_ids.push(task_id.clone());
+            records.push(referenced_task);
+            // The SESSION itself cites every task directly, in one pass —
+            // this evicts the largest of the 21 (the one processed last).
+            records.push(am_edge(EdgeLabel::ReferencesTask, &session_id, &task_id));
+        }
+        task_ids.sort();
+        let evicted_task_id = task_ids.last().expect("21 tasks").clone();
+
+        // The MEMBER separately cites the SAME task the session's own pass
+        // already evicted — this must not double count it.
+        records.push(am_edge(
+            EdgeLabel::ReferencesTask,
+            &obs_id,
+            &evicted_task_id,
+        ));
+
+        let out = digest(&records, &repo_id);
+        assert_eq!(out.sessions.len(), 1, "one scoped session: {out:?}");
+        let tasks = &out.sessions[0].tasks;
+        assert_eq!(tasks.len(), 20, "tasks capped at 20: {tasks:?}");
+        assert!(
+            !tasks.iter().any(|t| t.record_id == evicted_task_id),
+            "the evicted task must not reappear in the output: {tasks:?}"
+        );
+
+        let truncated = out
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "tasks_truncated")
+            .unwrap_or_else(|| panic!("must disclose truncation: {out:?}"));
+        assert_eq!(
+            truncated.matched,
+            Some(21),
+            "the TRUE distinct total must stay 21, not inflate to 22 from \
+             the repeated citation of the evicted task: {truncated:?}"
+        );
     }
 
     #[test]
