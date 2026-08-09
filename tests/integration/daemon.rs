@@ -13905,6 +13905,50 @@ fn agent_sessions_for_repo_negative_limit_is_invalid_limit_not_bad_request() {
 }
 
 #[test]
+fn agent_sessions_for_repo_limit_wider_than_u64_is_invalid_limit_not_bad_request() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_sessions_store(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // 2^64 overflows both i64 and u64. `serde_json::Value`'s own Rust-side
+    // `Serialize` path (what `json!`/`agent_sessions_query` would use) cannot
+    // even CONSTRUCT such a number without the `arbitrary_precision` feature
+    // -- but PARSING that literal from raw JSON TEXT (what a real client
+    // sends, and what the daemon actually receives) degrades it to an `f64`
+    // instead of erroring. The request body is therefore hand-built here,
+    // bypassing `serde_json::to_value`, to exercise exactly what a hostile
+    // wire payload looks like: the value must still be diagnosed as a
+    // well-formed, merely out-of-range integer, never a shape error.
+    let body = format!(
+        "{{\"request_id\":\"sessions-huge-limit\",\"agent_id\":\"sessions-test-agent\",\
+         \"verb\":\"agent_sessions_for_repo\",\"params\":{{\"repo\":\"{SESSIONS_REPO_SELECTOR}\",\
+         \"limit\":18446744073709551616}}}}"
+    );
+    let res = http_request(
+        &metadata.address,
+        &format!(
+            "POST /v1/query HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            metadata.token,
+            body.len()
+        ),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "an out-of-range limit must be a 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "invalid_limit",
+        "an integer past u64::MAX is out-of-range, not a shape error, got {body}"
+    );
+}
+
+#[test]
 fn agent_sessions_for_repo_rejects_as_of_valid_time() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");

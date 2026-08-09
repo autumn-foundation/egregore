@@ -10828,6 +10828,7 @@ fn handle_verb_criteria_for_task(
 /// slice, so honoring — or quietly ignoring — a caller's `as_of.valid_time`
 /// would answer a different, unrequested question (or a malformed one) with a
 /// misleading `200`.
+#[allow(clippy::too_many_lines)]
 fn handle_verb_agent_sessions_for_repo(
     request_id: &str,
     params: &serde_json::Value,
@@ -10874,18 +10875,40 @@ fn handle_verb_agent_sessions_for_repo(
     let limit = match params.get("limit") {
         None | Some(serde_json::Value::Null) => graph_query::SESSIONS_DEFAULT_LIMIT,
         Some(value) => {
-            // A well-formed JSON integer can be negative or wider than `usize`
-            // (a huge `u64`), so parse through `i128` before range-checking:
-            // `as_u64()` alone returns `None` for a negative integer, which
-            // would misreport `-1` as "not an integer" (`bad_request`) instead
-            // of the true diagnosis, "a well-formed integer outside the
-            // range" (`invalid_limit`). Only a genuinely non-integer shape
-            // (a float, a string, ...) is `bad_request`.
-            let parsed: Option<i128> = value
+            // A well-formed JSON integer can be negative, or wider than `u64`
+            // (serde_json falls back to storing an out-of-u64/i64-range
+            // integer literal as `f64`, losing exactness but NOT its
+            // integer-shaped-ness). Parse through `i128` before
+            // range-checking: `as_u64()` alone returns `None` for a negative
+            // integer, and `as_i64()`/`as_u64()` both return `None` once the
+            // literal overflows into `f64` storage — either way that would
+            // misreport a well-formed, merely out-of-range integer as "not an
+            // integer" (`bad_request`) instead of the true diagnosis,
+            // `invalid_limit`. Only a GENUINELY non-integer shape (a
+            // fractional float, a string, ...) stays `bad_request`.
+            let requested: Option<i128> = value
                 .as_i64()
                 .map(i128::from)
-                .or_else(|| value.as_u64().map(i128::from));
-            let Some(requested) = parsed else {
+                .or_else(|| value.as_u64().map(i128::from))
+                .or_else(|| {
+                    // Neither accessor matched: the literal overflowed `i64`/
+                    // `u64` into `f64` storage. A finite whole number (or an
+                    // overflow to +/-infinity) is still integer-shaped and
+                    // certainly out of range; only a genuine fraction is a
+                    // shape error.
+                    value.as_f64().and_then(|f| {
+                        if !f.is_finite() || f.fract() == 0.0 {
+                            Some(if f.is_sign_negative() {
+                                i128::MIN
+                            } else {
+                                i128::MAX
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                });
+            let Some(requested) = requested else {
                 return HttpResponse::error_with_id(
                     request_id,
                     ApiError::bad_request_field("params.limit must be an integer", "params.limit"),

@@ -252,7 +252,8 @@ present) and optional `limit`. The result carries the identical
 transports cannot drift. A non-string selector is a 400 `bad_request` naming
 the key the caller actually sent (`params.repo` **or** `params.repository_id`);
 a non-integer `limit` is a 400 `bad_request`, and a well-formed integer outside
-`1..=200` — a negative value included, never mistaken for a shape error — is a
+`1..=200` — negative, or wider than `u64` (a literal parsed as a lossy `f64`
+rather than rejected as malformed), never mistaken for a shape error — is a
 400 `invalid_limit`, the same distinction the CLI draws. The row cap is
 further bounded by the request's `budget.max_results` (the smaller of the two
 applies, with `results_truncated` naming it), and a `limit` of `0` truncates to

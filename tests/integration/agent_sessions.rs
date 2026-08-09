@@ -1865,6 +1865,29 @@ fn negative_limit_is_invalid_limit_not_a_clap_parse_error() {
 }
 
 #[test]
+fn limit_wider_than_i64_is_invalid_limit_not_a_clap_parse_error() {
+    // One past `i64::MAX`: still a well-formed positive integer, and clap's
+    // built-in parser for a narrower integer type would reject it before
+    // this lane's own range check ever runs.
+    let fx = seed_scope();
+    let (code, stdout, stderr) = run_sessions(&fx, "repo-a", &["--limit", "9223372036854775808"]);
+    assert_eq!(
+        code, 1,
+        "an i64-overflowing --limit must exit 1 (not clap's exit 2); stderr={stderr}"
+    );
+    let diag: serde_json::Value = stderr
+        .lines()
+        .find_map(|l| serde_json::from_str(l.trim()).ok())
+        .unwrap_or_else(|| panic!("stderr must carry a JSON diagnostic, got {stderr}"));
+    assert_eq!(diag["ok"], false);
+    assert_eq!(diag["error"]["code"], "invalid_limit");
+    assert!(
+        stdout.trim().is_empty(),
+        "a rejected limit must not print a digest: {stdout}"
+    );
+}
+
+#[test]
 fn text_format_prints_agent_record_id_and_ingested_bounds() {
     let fx = seed_edge_cases();
     let (code, stdout, stderr) = run_sessions(&fx, "repo-a", &["--format", "text"]);

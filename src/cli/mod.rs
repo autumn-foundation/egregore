@@ -3336,15 +3336,18 @@ pub(crate) enum QuerySubcommand {
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Maximum session rows returned (default 20, max 200). Values outside
-        /// 1..=200 — a negative value included — are rejected with an
-        /// `invalid_limit` diagnostic.
+        /// 1..=200 — negative or wider than a machine word — are rejected
+        /// with an `invalid_limit` diagnostic.
         ///
-        /// Signed (`i64`), not `usize`: a `usize` field would make clap reject
-        /// `--limit -1` with its own parse error before this lane's dispatch
-        /// arm ever runs, bypassing the documented machine-readable
-        /// `invalid_limit` envelope for exactly the values it exists to catch.
-        #[arg(long, allow_hyphen_values = true, default_value_t = query::SESSIONS_DEFAULT_LIMIT as i64)]
-        limit: i64,
+        /// Signed and 128-bit, not `usize`: a `usize` field would make clap
+        /// reject `--limit -1` OR `--limit 9223372036854775808` (one past
+        /// `i64::MAX`, still a well-formed integer) with its own parse error
+        /// before this lane's dispatch arm ever runs, bypassing the
+        /// documented machine-readable `invalid_limit` envelope for exactly
+        /// the values it exists to catch. `i128`'s range comfortably covers
+        /// every value worth distinguishing from a genuine shape error.
+        #[arg(long, allow_hyphen_values = true, default_value_t = query::SESSIONS_DEFAULT_LIMIT as i128)]
+        limit: i128,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -7121,7 +7124,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // shape) so a caller can distinguish it from the bare selector
             // diagnostics `resolve_repo_scope` emits.
             let max =
-                i64::try_from(query::SESSIONS_MAX_LIMIT).expect("SESSIONS_MAX_LIMIT fits i64");
+                i128::try_from(query::SESSIONS_MAX_LIMIT).expect("SESSIONS_MAX_LIMIT fits i128");
             if limit < 1 || limit > max {
                 let diag = serde_json::json!({
                     "ok": false,
