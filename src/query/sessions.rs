@@ -44,6 +44,10 @@ pub const MAX_RUNS_PER_SESSION: usize = 20;
 /// Maximum `tasks` entries carried on one row before `tasks_truncated` fires.
 pub const MAX_TASKS_PER_SESSION: usize = 20;
 
+/// Maximum `candidate_ids` entries listed on one `ambiguous_agent_provenance`
+/// diagnostic before it reports a truncated view.
+pub const MAX_AGENT_CANDIDATES_PER_SESSION: usize = 20;
+
 /// Maximum session IDs listed on one `unresolved_repository_scope` diagnostic.
 ///
 /// Unlike row truncation, this list is NOT bounded by
@@ -1165,22 +1169,42 @@ fn build_row(
     // instead: exactly one resolves normally, zero is the documented absent
     // case, and two or more is reported via `ambiguous_agent_provenance`
     // rather than guessed.
-    let agent_candidates: BTreeSet<&str> = adjacency
+    // `session_of_successors.get(session_id)` is already a `BTreeSet` (unique
+    // targets, no duplicate risk), so a single pass suffices: `retained` is
+    // capped DURING collection at `MAX_AGENT_CANDIDATES_PER_SESSION` while
+    // `candidate_total` tracks the TRUE distinct count separately — a session
+    // with many live SESSION_OF edges to distinct Agent nodes never lets the
+    // per-row diagnostic payload grow unbounded.
+    let mut agent_candidates: BTreeSet<&str> = BTreeSet::new();
+    let mut agent_candidate_total: u64 = 0;
+    for target in adjacency
         .session_of_successors
         .get(session_id)
         .into_iter()
         .flatten()
-        .filter(|target| nodes.get(**target).and_then(|r| node_kind(r)) == Some(NodeKind::Agent))
-        .copied()
-        .collect();
-    let agent_record_id = match agent_candidates.len() {
+    {
+        if nodes.get(*target).and_then(|r| node_kind(r)) != Some(NodeKind::Agent) {
+            continue;
+        }
+        agent_candidate_total += 1;
+        if agent_candidates.len() < MAX_AGENT_CANDIDATES_PER_SESSION {
+            agent_candidates.insert(target);
+        }
+    }
+    let agent_record_id = match agent_candidate_total {
         0 => None,
         1 => agent_candidates.into_iter().next().map(str::to_owned),
         _ => {
             let mut diagnostic = SessionsDiagnostic::bare("ambiguous_agent_provenance");
             diagnostic.session_record_id = Some(session_id.to_owned());
+            let returned = agent_candidates.len() as u64;
             diagnostic.candidate_ids =
                 Some(agent_candidates.iter().map(|id| (*id).to_owned()).collect());
+            diagnostic.count = Some(agent_candidate_total);
+            if returned < agent_candidate_total {
+                diagnostic.returned = Some(returned);
+                diagnostic.limit = Some(MAX_AGENT_CANDIDATES_PER_SESSION as u64);
+            }
             diagnostics.push(diagnostic);
             None
         }
@@ -1422,7 +1446,14 @@ fn unlinked_stamped_records<'a>(
         by_stamped_session.entry(stamped).or_default().insert(id);
     }
 
-    let mut unlinked: BTreeSet<&'a str> = BTreeSet::new();
+    // A plain counter, not a `BTreeSet`: `by_stamped_session` is keyed by each
+    // node's OWN stamped `session_id` (at most one per node), so a candidate
+    // id appears under exactly one `stamped_session_id` bucket across this
+    // whole loop, and `candidates` is itself already a `BTreeSet` (unique
+    // within one bucket) — no id can be counted twice, so retaining every
+    // unlinked id just to compute a final `.len()` costs O(total unlinked
+    // records) for nothing this function ever returns.
+    let mut unlinked_count: u64 = 0;
     for &stamped_session_id in scoped_stamps {
         let Some(candidates) = by_stamped_session.get(stamped_session_id) else {
             continue;
@@ -1451,10 +1482,10 @@ fn unlinked_stamped_records<'a>(
             if linked.contains(id) {
                 continue;
             }
-            unlinked.insert(id);
+            unlinked_count += 1;
         }
     }
-    unlinked.len() as u64
+    unlinked_count
 }
 
 /// Node kind of a record, or `None` for edges/tombstones.
@@ -1738,6 +1769,78 @@ mod tests {
         assert_eq!(
             diagnostic.candidate_ids.as_deref(),
             Some(candidates.as_slice())
+        );
+    }
+
+    #[test]
+    fn ambiguous_agent_candidates_beyond_the_cap_keep_the_smallest_ids_with_true_count_disclosed() {
+        // Bounded candidate-id retention (issue #112 review round 23) must
+        // select the CORRECT smallest MAX_AGENT_CANDIDATES_PER_SESSION record
+        // IDs, mirroring the existing tasks/runs cap tests, and disclose the
+        // TRUE total via `count` distinct from the truncated `returned` list.
+        let repo = repository("repo-a");
+        let repo_id = repo.id().to_owned();
+        let sym = symbol(&repo_id, "alpha");
+        let sym_id = sym.id().to_owned();
+
+        let session = memory(
+            NodeKind::AgentSession,
+            "s",
+            Some("2026-01-01T00:00:00Z"),
+            "S",
+        );
+        let session_id = session.id().to_owned();
+
+        let mut records = vec![
+            repo,
+            sym,
+            code_edge(EdgeLabel::Contains, &repo_id, &sym_id),
+            session,
+        ];
+        records.push(am_edge(EdgeLabel::MentionsSymbol, &session_id, &sym_id));
+
+        let mut agent_ids: Vec<String> = Vec::new();
+        for i in 0..21 {
+            let key = format!("agent-{i}");
+            let agent = memory(NodeKind::Agent, &key, None, &format!("Agent {i}"));
+            let agent_id = agent.id().to_owned();
+            agent_ids.push(agent_id.clone());
+            records.push(agent);
+            records.push(am_edge(EdgeLabel::SessionOf, &session_id, &agent_id));
+        }
+        agent_ids.sort();
+        let expected_survivors = agent_ids[..20].to_vec();
+
+        let out = digest(&records, &repo_id);
+        assert_eq!(out.sessions.len(), 1, "one scoped session: {out:?}");
+        assert_eq!(out.sessions[0].agent_record_id, None);
+        let diagnostic = out
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "ambiguous_agent_provenance")
+            .expect("an ambiguous_agent_provenance diagnostic must be raised");
+        let candidates = diagnostic
+            .candidate_ids
+            .as_ref()
+            .expect("candidate_ids present");
+        assert_eq!(
+            candidates.len(),
+            20,
+            "candidates capped at 20: {candidates:?}"
+        );
+        assert_eq!(
+            candidates, &expected_survivors,
+            "the smallest 20 candidate record IDs must survive: {candidates:?}"
+        );
+        assert_eq!(
+            diagnostic.count,
+            Some(21),
+            "count must carry the TRUE total, not the capped length"
+        );
+        assert_eq!(diagnostic.returned, Some(20));
+        assert_eq!(
+            diagnostic.limit,
+            Some(MAX_AGENT_CANDIDATES_PER_SESSION as u64)
         );
     }
 
