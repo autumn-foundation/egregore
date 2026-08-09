@@ -10817,9 +10817,15 @@ fn handle_verb_criteria_for_task(
 /// the identical `graph_query::SessionsDigest` value, so the two transports
 /// cannot drift. Zero sessions is an explicit 200 carrying a `no_sessions`
 /// diagnostic, never a 404 — an empty digest is an answer, not a miss.
+///
+/// `budget_max_results` is the server-enforced result budget the main query
+/// handler derives from `budget.max_results`; the effective row cap is the
+/// MINIMUM of it and the verb's own `params.limit`, so a caller can constrain
+/// this verb through the common budget contract like every other verb.
 fn handle_verb_agent_sessions_for_repo(
     request_id: &str,
     params: &serde_json::Value,
+    budget_max_results: usize,
     started: Instant,
     budget: Option<Duration>,
     state: &ServerState,
@@ -10895,7 +10901,19 @@ fn handle_verb_agent_sessions_for_repo(
         return HttpResponse::error_with_id(request_id, error);
     }
 
-    let digest = graph_query::sessions_for_repo(&records, &index, &repository_id, limit);
+    // The effective row cap honors the common budget contract: the smaller of
+    // the verb's own limit and the server-enforced `budget.max_results`. The
+    // core's `results_truncated` diagnostic then reports the cap that actually
+    // applied.
+    let effective_limit = limit.min(budget_max_results);
+    let digest = graph_query::sessions_for_repo(&records, &index, &repository_id, effective_limit);
+
+    // The digest traversal itself can cross the deadline on a large store, so
+    // re-check AFTER computing it: a caller with a tight `budget.timeout_ms`
+    // gets the documented `query_timeout`, never a late 200.
+    if let Err(error) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, error);
+    }
     let repository = index.display_of(&repository_id);
 
     HttpResponse::success(
@@ -11094,7 +11112,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         }
         // The daemon face of `eg query sessions <REPO>` (issue #112).
         "agent_sessions_for_repo" => {
-            handle_verb_agent_sessions_for_repo(&request_id, &params, started, budget, state)
+            handle_verb_agent_sessions_for_repo(&request_id, &params, limit, started, budget, state)
         }
         "drift" => HttpResponse::error_with_id(
             &request_id,

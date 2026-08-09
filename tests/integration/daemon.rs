@@ -13700,3 +13700,125 @@ fn agent_sessions_for_repo_matches_cli_payload() {
         );
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn agent_sessions_for_repo_budget_max_results_bounds_rows() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+
+    // The standard fixture plus a SECOND, newer session citing the same
+    // symbol, so a row cap of 1 has something real to truncate.
+    let repo_id = stable_id(&["repository", "operator-override", SESSIONS_REPO_SELECTOR]);
+    let symbol_id = stable_id(&["node", "symbol", &repo_id, "src/lib.rs", "widget"]);
+    let session2_id = agent_memory_stable_id(&["node", "agent_session", "sessions-sess-2"]);
+    let obs2_id = agent_memory_stable_id(&["node", "observation", "sessions-obs-2"]);
+    let second_session_node = |id: &str, kind: NodeKind, observed: &str| -> GraphRecord {
+        let mut record = GraphRecord::node(
+            id.to_owned(),
+            kind,
+            None,
+            None,
+            None,
+            "second session".to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
+        if let GraphRecord::Node {
+            agent_id: node_agent_id,
+            agent_kind,
+            session_id: node_session_id,
+            observed_at,
+            ingested_at,
+            confidence,
+            ..
+        } = &mut record
+        {
+            *node_agent_id = Some("sessions-agent-1".to_owned());
+            *agent_kind = Some("claude-code".to_owned());
+            *node_session_id = Some("sessions-sess-2".to_owned());
+            *observed_at = Some(observed.to_owned());
+            *ingested_at = Some(observed.to_owned());
+            *confidence = Some("1.0".to_owned());
+        }
+        record
+    };
+    let mut records = agent_sessions_fixture_records();
+    records.push(second_session_node(
+        &session2_id,
+        NodeKind::AgentSession,
+        "2026-03-02T10:00:00Z",
+    ));
+    records.push(second_session_node(
+        &obs2_id,
+        NodeKind::Observation,
+        "2026-03-02T11:00:00Z",
+    ));
+    records.push(GraphRecord::agent_memory_edge(
+        EdgeLabel::AuthoredBy,
+        obs2_id.clone(),
+        session2_id,
+        Some("1.0".to_owned()),
+        "observation authored by session".to_owned(),
+    ));
+    records.push(GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        obs2_id,
+        symbol_id,
+        Some("1.0".to_owned()),
+        "observation mentions symbol".to_owned(),
+    ));
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+    for record in &records {
+        sink.write_record(record)
+            .expect("seeded session fixture record should write");
+    }
+    sink.persist_indexes()
+        .expect("seeded session fixture should persist");
+    drop(sink);
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // `params.limit` allows 200 rows, but the common budget contract caps the
+    // response at `budget.max_results` = 1: the effective limit is the MINIMUM.
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sessions-budget-cap",
+            "agent_id": "sessions-test-agent",
+            "verb": "agent_sessions_for_repo",
+            "params": { "repo": SESSIONS_REPO_SELECTOR, "limit": 200 },
+            "budget": { "max_results": 1 }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "a budget-capped digest is still a 200, got {res}"
+    );
+    let result = &response_json(&res)["result"];
+    let sessions = result["sessions"].as_array().expect("sessions array");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "budget.max_results must bound the rows, got {result}"
+    );
+    assert_eq!(
+        sessions[0]["session_id"], "sessions-sess-2",
+        "the surviving row must be the newest session, got {result}"
+    );
+    let diagnostics = result["diagnostics"].as_array().expect("diagnostics");
+    let truncated = diagnostics
+        .iter()
+        .find(|d| d["code"] == "results_truncated")
+        .unwrap_or_else(|| panic!("a budget-capped digest must disclose truncation: {result}"));
+    assert_eq!(truncated["matched"], 2, "true total, got {truncated}");
+    assert_eq!(truncated["returned"], 1, "returned rows, got {truncated}");
+    assert_eq!(
+        truncated["limit"], 1,
+        "the cap that ACTUALLY applied (the budget), got {truncated}"
+    );
+}

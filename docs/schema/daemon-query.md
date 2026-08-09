@@ -486,7 +486,7 @@ two transports cannot drift.
 | Field   | Type   | Required | Notes |
 |---------|--------|----------|-------|
 | `repo`  | string | yes      | Repository selector (record ID, basename, remote URL, root commit SHA, canonical path, or final-segment shorthand). `repository_id` is accepted as an alias; `repo` wins when both are present. A non-string value is rejected naming the key the caller actually sent, never the canonical key it would be rewrapped under. |
-| `limit` | u64    | no       | Session-row ceiling. Default 20, capped at 200. A non-integer is a shape error (`bad_request`); a well-formed integer out of range is `invalid_limit`, mirroring the CLI. |
+| `limit` | u64    | no       | Session-row ceiling. Default 20, capped at 200. A non-integer is a shape error (`bad_request`); a well-formed integer out of range is `invalid_limit`, mirroring the CLI. Further bounded by the request's `budget.max_results`: the effective cap is the minimum of the two, and `results_truncated` reports the cap that applied. The traversal deadline is re-checked after the digest is built, so a tight `budget.timeout_ms` yields `query_timeout`, never a late 200. |
 
 **Result shape** (parity with the `eg query sessions` envelope):
 ```json

@@ -393,7 +393,10 @@ struct PendingRow {
 /// slice so `owner_of` attributions line up. `repository_id` is an already
 /// resolved repository record ID (selector resolution is the caller's job).
 /// `limit` is assumed pre-validated against `1..=SESSIONS_MAX_LIMIT`
-/// (see [`SESSIONS_MAX_LIMIT`]).
+/// (see [`SESSIONS_MAX_LIMIT`]) — except that the daemon may pass a SMALLER
+/// effective cap after folding in the common `budget.max_results` contract;
+/// any value simply truncates the ordered rows, with `results_truncated`
+/// reporting the cap that actually applied.
 ///
 /// A session belongs to this digest exactly when `repository_id` is in the set
 /// of repositories its members cite. Sessions with no derivable repository at
