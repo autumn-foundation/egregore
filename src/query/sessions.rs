@@ -424,7 +424,14 @@ pub fn sessions_for_repo(
     // Envelope-level diagnostics (never row-scoped): they describe the digest
     // as a whole and survive truncation unchanged.
     let mut diagnostics: Vec<SessionsDiagnostic> = Vec::new();
+    // Capped at MAX_UNRESOLVED_SESSION_IDS DURING the loop below (never grows
+    // past it), with `unresolved_total` tracking the TRUE count separately —
+    // so a store with millions of pre-linking sessions costs O(1) extra
+    // memory per session, not O(total unresolved). `nodes` is a `BTreeMap`,
+    // so this loop already visits `session_id` in ascending order: the list
+    // is sorted BY CONSTRUCTION and needs no separate sort pass.
     let mut unresolved: Vec<String> = Vec::new();
+    let mut unresolved_total: u64 = 0;
     let mut pending: Vec<PendingRow> = Vec::new();
     // (session record id, session_id string, member ids) for EVERY live
     // AgentSession in the WHOLE STORE, regardless of which repository (if
@@ -450,7 +457,10 @@ pub fn sessions_for_repo(
         let scope = derive_scope(session_id, &members, &adjacency, &nodes, index);
 
         if scope.by_repository.is_empty() {
-            unresolved.push(session_id.to_owned());
+            unresolved_total += 1;
+            if unresolved.len() < MAX_UNRESOLVED_SESSION_IDS {
+                unresolved.push(session_id.to_owned());
+            }
             continue;
         }
         if !scope.by_repository.contains_key(repository_id) {
@@ -471,23 +481,12 @@ pub fn sessions_for_repo(
         pending.push(built);
     }
 
-    if !unresolved.is_empty() {
-        unresolved.sort_unstable();
-        let count = unresolved.len() as u64;
+    if unresolved_total > 0 {
         let mut diagnostic = SessionsDiagnostic::bare("unresolved_repository_scope");
-        // A store with many imported-but-not-yet-`link-evidence`d sessions
-        // (the documented pre-linking state) can carry an unbounded number
-        // of unresolved sessions, unrelated to `--limit`/`budget.max_results`
-        // (which cap ROWS, not this envelope-level diagnostic). Cap the
-        // listed IDs the same way `runs`/`tasks` cap theirs, so a one-row
-        // query cannot allocate and serialize an O(total sessions) payload;
-        // `count` always stays the TRUE total, and `returned` discloses when
-        // the list itself was capped.
-        let returned = count.min(MAX_UNRESOLVED_SESSION_IDS as u64);
-        unresolved.truncate(MAX_UNRESOLVED_SESSION_IDS);
+        let returned = unresolved.len() as u64;
         diagnostic.session_record_ids = Some(unresolved);
-        diagnostic.count = Some(count);
-        if returned < count {
+        diagnostic.count = Some(unresolved_total);
+        if returned < unresolved_total {
             diagnostic.returned = Some(returned);
             diagnostic.limit = Some(MAX_UNRESOLVED_SESSION_IDS as u64);
         }

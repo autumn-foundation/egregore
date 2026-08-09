@@ -14133,12 +14133,39 @@ fn agent_sessions_for_repo_honours_query_timeout_on_a_large_store() {
     // test, since the earlier `daemon_semantic_search_honours_query_timeout`
     // test only exercises `handle_query`'s global `budget.timeout_ms == 0`
     // short-circuit, which fires before ANY verb-specific code runs.
-    seed_bulk_agent_sessions_store(&data_dir, 400);
+    //
+    // A FIXED small timeout (e.g. `1`) risks tripping the PRE-digest budget
+    // check instead — `load_cross_domain_records` + `RepositoryIndex::build`
+    // also scale with store size, since they scan the exact same `records`
+    // slice `sessions_for_repo` does. Rather than guess a machine-independent
+    // constant, this test SELF-CALIBRATES: it first times a full, successful
+    // run against THIS store on THIS machine, then re-runs with a deadline
+    // set to a small fraction of that measured total. `sessions_for_repo`
+    // does substantially more per-record work than the single linear
+    // `RepositoryIndex::build` pass it is compared against (per-session
+    // membership BFS, time-bound/run/task construction, and the
+    // store-wide `unlinked_stamped_records` union), so pre-digest work is a
+    // small share of the total — a generous margin, not a razor's edge.
+    seed_bulk_agent_sessions_store(&data_dir, 800);
     let mut daemon = start_daemon(&data_dir);
     let metadata = read_metadata(&data_dir);
 
-    // Nonzero (never trips the global `timeout_ms == 0` shortcut in
-    // `handle_query`) but far below what building this digest takes.
+    let warm_started = Instant::now();
+    let warm_res = agent_sessions_query(
+        &metadata,
+        "sessions-timeout-calibration",
+        &serde_json::json!({ "repo": SESSIONS_REPO_SELECTOR }),
+    );
+    let total = warm_started.elapsed();
+    assert!(
+        warm_res.starts_with("HTTP/1.1 200"),
+        "the calibration run itself must succeed, got {warm_res}"
+    );
+
+    // A tenth of the measured total, floored at 2ms (never zero — a zero
+    // budget trips `handle_query`'s GLOBAL short-circuit before any
+    // verb-specific code runs, which is not what this test exercises).
+    let tight_timeout_ms = (total.as_millis() / 10).max(2);
     let res = http_json(
         &metadata,
         "POST",
@@ -14148,14 +14175,15 @@ fn agent_sessions_for_repo_honours_query_timeout_on_a_large_store() {
             "agent_id": "sessions-test-agent",
             "verb": "agent_sessions_for_repo",
             "params": { "repo": SESSIONS_REPO_SELECTOR },
-            "budget": { "timeout_ms": 1 }
+            "budget": { "timeout_ms": tight_timeout_ms }
         }),
     );
     daemon.stop();
 
     assert!(
         res.starts_with("HTTP/1.1 408"),
-        "a 1ms budget against a 400-session store must time out, got {res}"
+        "a {tight_timeout_ms}ms budget (1/10 of the {total:?} warm run) \
+         must time out, got {res}"
     );
     let body = response_json(&res);
     assert_eq!(
