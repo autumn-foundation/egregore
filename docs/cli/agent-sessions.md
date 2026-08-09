@@ -205,6 +205,7 @@ An out-of-vocabulary or absent task status is reported as `"unknown"` with
 | `results_truncated` / `runs_truncated` / `tasks_truncated` | A cap fired; carries `matched`, `returned`, `limit` |
 | `outcome_not_enum_shaped` | A run summary claimed an outcome but did not match the producer template; the malformed bytes are never echoed |
 | `unparseable_timestamp` | A member carried a non-RFC-3339 timestamp field (`observed_at` **or** `ingested_at`); skipped for bounds, counted per session. The unreadable value is never echoed |
+| `ambiguous_agent_provenance` | A session had more than one live `SESSION_OF` edge to a distinct `Agent` node — ingest validates endpoint kinds but not the documented many-to-one cardinality. `agent_record_id` reports `null` rather than guessing one; `candidate_ids` lists every competing `Agent` record ID |
 
 ### Exit codes
 

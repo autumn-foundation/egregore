@@ -193,8 +193,13 @@ pub struct SessionRow {
     /// Always `agent_authored`.
     pub trust_class: &'static str,
     /// Stable `Agent` record ID reached by the session's own `SESSION_OF` edge;
-    /// `None` when no such edge exists (a stamped `agent_id` alone is not a
-    /// citable agent handle).
+    /// `None` when no such edge exists, OR when the session has more than one
+    /// live `SESSION_OF` edge to a DISTINCT `Agent` node (ingest validates
+    /// endpoint kinds but not the documented many-to-one cardinality, so this
+    /// is reachable) — in the ambiguous case a row-scoped
+    /// `ambiguous_agent_provenance` diagnostic names every candidate, and
+    /// this field is never guessed by picking one (a stamped `agent_id`
+    /// alone is not a citable agent handle either way).
     pub agent_record_id: Option<String>,
     /// The session node's recorded `agent_id` string.
     pub agent_id: Option<String>,
@@ -277,6 +282,12 @@ pub struct SessionsDiagnostic {
     /// Every session named by a set-valued diagnostic, sorted ascending.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_record_ids: Option<Vec<String>>,
+    /// Every candidate record ID an ambiguous resolution could not choose
+    /// between, sorted ascending (e.g. `ambiguous_agent_provenance`'s
+    /// competing `Agent` record IDs). Distinct from `session_record_ids`,
+    /// which is always a set of SESSION handles specifically.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_ids: Option<Vec<String>>,
     /// Generic count payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<u64>,
@@ -299,6 +310,7 @@ impl SessionsDiagnostic {
             session_record_id: None,
             run_record_id: None,
             session_record_ids: None,
+            candidate_ids: None,
             count: None,
             matched: None,
             returned: None,
@@ -1144,15 +1156,35 @@ fn build_row(
     }
 
     // ── Handles ─────────────────────────────────────────────────────────────
-    let agent_record_id = adjacency
+    // Ingest validates SESSION_OF endpoint kinds but not the documented
+    // many-to-one cardinality (one session, at most one agent), so a session
+    // with more than one live SESSION_OF edge to a DISTINCT Agent node is
+    // reachable. Picking the lexicographically-first candidate (the prior
+    // `.find()` shape) would silently attribute the session to an arbitrary
+    // agent — never a citable fact. Collect every distinct Agent candidate
+    // instead: exactly one resolves normally, zero is the documented absent
+    // case, and two or more is reported via `ambiguous_agent_provenance`
+    // rather than guessed.
+    let agent_candidates: BTreeSet<&str> = adjacency
         .session_of_successors
         .get(session_id)
-        .and_then(|targets| {
-            targets.iter().find(|target| {
-                nodes.get(*target).and_then(|r| node_kind(r)) == Some(NodeKind::Agent)
-            })
-        })
-        .map(|target| (*target).to_owned());
+        .into_iter()
+        .flatten()
+        .filter(|target| nodes.get(**target).and_then(|r| node_kind(r)) == Some(NodeKind::Agent))
+        .copied()
+        .collect();
+    let agent_record_id = match agent_candidates.len() {
+        0 => None,
+        1 => agent_candidates.into_iter().next().map(str::to_owned),
+        _ => {
+            let mut diagnostic = SessionsDiagnostic::bare("ambiguous_agent_provenance");
+            diagnostic.session_record_id = Some(session_id.to_owned());
+            diagnostic.candidate_ids =
+                Some(agent_candidates.iter().map(|id| (*id).to_owned()).collect());
+            diagnostics.push(diagnostic);
+            None
+        }
+    };
     let (summary_label, summary_hash) = safe_session_summary(session_record);
 
     let row = SessionRow {
@@ -1641,6 +1673,71 @@ mod tests {
             result.sessions[0].last_activity.as_deref(),
             Some("2026-01-01T00:02:00Z"),
             "the four-hop record must not contribute to the time bounds"
+        );
+    }
+
+    #[test]
+    fn two_live_session_of_edges_to_distinct_agents_reports_ambiguity_not_a_guess() {
+        // Ingest validates SESSION_OF endpoint kinds but not the documented
+        // many-to-one cardinality (one session, at most one agent), so a
+        // session with two live SESSION_OF edges to two distinct Agent nodes
+        // is reachable. The row must report `agent_record_id: None` plus an
+        // `ambiguous_agent_provenance` diagnostic naming both candidates —
+        // never silently pick the lexicographically-first one.
+        let repo = repository("repo-a");
+        let repo_id = repo.id().to_owned();
+        let sym = symbol(&repo_id, "alpha");
+        let sym_id = sym.id().to_owned();
+
+        let session = memory(
+            NodeKind::AgentSession,
+            "s",
+            Some("2026-01-01T00:00:00Z"),
+            "S",
+        );
+        let agent1 = memory(NodeKind::Agent, "agent-a", None, "Agent A");
+        let agent2 = memory(NodeKind::Agent, "agent-b", None, "Agent B");
+        let (session_id, agent1_id, agent2_id) = (
+            session.id().to_owned(),
+            agent1.id().to_owned(),
+            agent2.id().to_owned(),
+        );
+
+        let mut candidates = [agent1_id.clone(), agent2_id.clone()];
+        candidates.sort();
+
+        let contains = code_edge(EdgeLabel::Contains, &repo_id, &sym_id);
+        let records = vec![
+            repo,
+            sym,
+            contains,
+            session,
+            agent1,
+            agent2,
+            am_edge(EdgeLabel::MentionsSymbol, &session_id, &sym_id),
+            am_edge(EdgeLabel::SessionOf, &session_id, &agent1_id),
+            am_edge(EdgeLabel::SessionOf, &session_id, &agent2_id),
+        ];
+
+        let result = digest(&records, &repo_id);
+        assert_eq!(result.sessions.len(), 1);
+        let row = &result.sessions[0];
+        assert_eq!(
+            row.agent_record_id, None,
+            "an ambiguous agent must never be guessed: {row:?}"
+        );
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "ambiguous_agent_provenance")
+            .expect("an ambiguous_agent_provenance diagnostic must be raised");
+        assert_eq!(
+            diagnostic.session_record_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        assert_eq!(
+            diagnostic.candidate_ids.as_deref(),
+            Some(candidates.as_slice())
         );
     }
 
