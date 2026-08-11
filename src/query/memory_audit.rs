@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::liveness::Liveness;
-use crate::ir::{EdgeLabel, GraphRecord, NodeKind};
+use crate::ir::{EdgeLabel, EvidenceLink, GraphRecord, NodeKind};
 
 /// Error returned when resolving a memory record ID or source/session handle.
 ///
@@ -227,15 +227,79 @@ pub(super) fn imported_symbol_names(import_path: &str) -> Vec<&str> {
     )
 }
 
+/// Yields every live verification-domain record a claim cites through a
+/// **backing relation** — `VALIDATED_BY`, `HAS_EVIDENCE`, or
+/// `PRODUCED_EVIDENCE`, carried either as an evidence link on the claim or as an
+/// outgoing edge from it.
+///
+/// A generic relation (e.g. `RELATES_TO`) that merely happens to point at a
+/// verification record does not count, a triple-only citation stub that names no
+/// record never counts, and a tombstoned target is treated as absent.
+///
+/// This is the **single** traversal behind two predicates that must not drift:
+///
+/// - [`is_verified_claim`] — "does the claim cite any verification record at
+///   all?", the `--verified-only` filter shared by the memory audit and the
+///   semantic-memory recall surface (issue #91).
+/// - [`super::TrustIndex`]'s `agent_verified` derivation (issue #114), which
+///   adds one refinement on top: the cited record must also be **passing**.
+///
+/// Adding a fourth backing relation therefore changes both surfaces at once,
+/// rather than silently letting `--verified-only` include a claim that
+/// `eg query context` labels `agent_unverified`.
+///
+/// Structural and non-inferential — never a truth judgement.
+pub(super) fn backing_verification_records<'a, 'b>(
+    record: &'b GraphRecord,
+    by_id: &'b BTreeMap<&'a str, &'a GraphRecord>,
+    edges_from: &'b OutgoingEdgeIndex<'a>,
+    tombstoned: &'b TombstonedSet<'a>,
+) -> impl Iterator<Item = &'a GraphRecord> + 'b {
+    let links: &'b [EvidenceLink] = match record {
+        GraphRecord::Node {
+            evidence_links: Some(links),
+            ..
+        } => links,
+        _ => &[],
+    };
+    links
+        .iter()
+        .filter(|link| {
+            matches!(
+                link.relation.as_str(),
+                "VALIDATED_BY" | "HAS_EVIDENCE" | "PRODUCED_EVIDENCE"
+            )
+        })
+        .filter_map(|link| link.target_record_id.as_deref())
+        .chain(
+            edges_from
+                .get(record.id())
+                .into_iter()
+                .flatten()
+                .filter(|(label, _)| {
+                    matches!(
+                        label,
+                        EdgeLabel::ValidatedBy
+                            | EdgeLabel::HasEvidence
+                            | EdgeLabel::ProducedEvidence
+                    )
+                })
+                .map(|(_, target)| *target),
+        )
+        .filter(move |id| !tombstoned.contains(id))
+        .filter_map(move |id| by_id.get(id).copied())
+        .filter(|target| record_node_kind(target).is_some_and(is_verification_kind))
+}
+
 /// A claim is **verified** when it cites at least one present verification-domain
-/// record through an evidence link (`VALIDATED_BY`, `HAS_EVIDENCE`,
-/// `PRODUCED_EVIDENCE`) or an equivalent outgoing edge. This is a structural,
-/// non-inferential rule over existing contracts — not a truth judgement.
+/// record through a backing relation. This is a structural, non-inferential rule
+/// over existing contracts — not a truth judgement.
 ///
 /// Shared by the memory-audit `--verified-only` filter and the semantic-memory
 /// recall `--verified-only` filter (issue #91) so both surfaces apply the
-/// identical rule: a resolvable, non-tombstoned verification record is required;
-/// a triple-only citation stub that names no record never counts as verified.
+/// identical rule. The traversal itself lives in
+/// [`backing_verification_records`], which the issue #114 trust derivation also
+/// uses, so all three surfaces agree on which records back a claim.
 // Kept `pub(crate)`: the `pub use` glob in mod.rs re-exports this at its
 // original crate-internal visibility; `pub` would widen it to the public API.
 #[allow(clippy::redundant_pub_crate)]
@@ -245,45 +309,9 @@ pub(crate) fn is_verified_claim(
     edges_from: &BTreeMap<&str, Vec<(&EdgeLabel, &str)>>,
     tombstoned: &BTreeSet<&str>,
 ) -> bool {
-    if let GraphRecord::Node {
-        evidence_links: Some(links),
-        ..
-    } = record
-    {
-        for link in links {
-            // A backing relation is required; a generic link (e.g. RELATES_TO)
-            // that merely happens to point at a verification record does not make
-            // the claim verified. Tombstoned targets are treated as absent.
-            let backed = matches!(
-                link.relation.as_str(),
-                "VALIDATED_BY" | "HAS_EVIDENCE" | "PRODUCED_EVIDENCE"
-            );
-            if backed
-                && let Some(target_id) = link.target_record_id.as_deref()
-                && !tombstoned.contains(target_id)
-                && let Some(target) = by_id.get(target_id)
-                && record_node_kind(target).is_some_and(is_verification_kind)
-            {
-                return true;
-            }
-        }
-    }
-    if let Some(out) = edges_from.get(record.id()) {
-        for (label, target) in out {
-            let backed = matches!(
-                label,
-                EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence | EdgeLabel::ProducedEvidence
-            );
-            if backed
-                && !tombstoned.contains(*target)
-                && let Some(target) = by_id.get(*target)
-                && record_node_kind(target).is_some_and(is_verification_kind)
-            {
-                return true;
-            }
-        }
-    }
-    false
+    backing_verification_records(record, by_id, edges_from, tombstoned)
+        .next()
+        .is_some()
 }
 
 /// Outgoing edges keyed by source record ID, used for edge-backed verification.

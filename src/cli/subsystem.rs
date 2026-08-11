@@ -46,37 +46,41 @@ pub(crate) fn query_subsystem_cmd(
         std::process::exit(2);
     }
 
+    let trust = query::TrustIndex::build(records);
+
     let source_facts: Vec<ContextSourceFact<'_>> = ctx
         .source_facts
         .iter()
-        .filter_map(|r| context_source_fact(r))
+        .filter_map(|r| context_source_fact(r, &trust))
         .collect();
 
     let raw_observations: Vec<ContextObservation<'_>> = ctx
         .observations
         .iter()
-        .filter_map(|r| context_observation(r))
+        .filter_map(|r| context_observation(r, &trust))
         .collect();
 
-    let resolver = crate::temporal_status::TemporalResolver::build(records);
-    let (observations, excluded) = apply_supersession(raw_observations, &resolver, supersession);
+    // Shared with the trust index (built over this exact slice) so `trust` and
+    // `temporal_status` cannot be computed from different corpora.
+    let (observations, excluded) =
+        apply_supersession(raw_observations, trust.resolver(), supersession);
 
     let project_state: Vec<ContextLinkedItem<'_>> = ctx
         .project_state
         .iter()
-        .filter_map(|r| context_linked_item(r))
+        .filter_map(|r| context_linked_item(r, &trust))
         .collect();
 
     let artifacts: Vec<ContextLinkedItem<'_>> = ctx
         .artifacts
         .iter()
-        .filter_map(|r| context_linked_item(r))
+        .filter_map(|r| context_linked_item(r, &trust))
         .collect();
 
     let verification_evidence: Vec<ContextLinkedItem<'_>> = ctx
         .verification_evidence
         .iter()
-        .filter_map(|r| context_linked_item(r))
+        .filter_map(|r| context_linked_item(r, &trust))
         .collect();
 
     let unresolved: Vec<ContextUnresolved<'_>> = ctx
@@ -107,6 +111,7 @@ pub(crate) fn query_subsystem_cmd(
             {
                 Some(ContextTopologyEdge {
                     record_id: id,
+                    trust: trust.classify(r),
                     label: label.as_str(),
                     source_id: source,
                     target_id: target,
@@ -135,6 +140,7 @@ pub(crate) fn query_subsystem_cmd(
             let (path, _, span) = query::resolve_drift_target(records, id, drift_meta, None, None);
             Some(SubsystemDrift {
                 record_id: id,
+                trust: trust.classify(r),
                 score: drift_meta.score,
                 target_repo_relative_path: path,
                 target_span: span,
@@ -149,7 +155,10 @@ pub(crate) fn query_subsystem_cmd(
         .map(|s| SubsystemLogSignature {
             record_id: s.record_id,
             kind: "ErrorSignature",
-            trust_class: "runtime_observation",
+            trust: crate::query::TrustClass::RuntimeObservation,
+            // Tied to the same value so the two vocabularies cannot be typed
+            // out independently and drift.
+            trust_class: crate::query::TrustClass::RuntimeObservation.as_str(),
             schema_version: s.schema_version,
             severity: s.severity,
             occurrence_count: s.occurrence_count,

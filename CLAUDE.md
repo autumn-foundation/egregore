@@ -550,6 +550,88 @@ cargo run -- query verification-coverage --graph graph.jsonl --limit 50   # per-
 cargo run -- query verification-coverage src/nope --graph graph.jsonl     # exit 2 (scope_not_found)
 ```
 
+Every record returned by a CROSS-DOMAIN CONTEXT ANSWER carries a single derived
+`trust` field (issue #114) — `eg query context`, `subsystem`, `locate` (including
+the located `symbol`/`enclosing_chain` anchor rows, shared with `eg query at`),
+`semantic-context` (including each match's own anchor row), `task`, `changes`
+(EVERY record-shaped section, not just the cross-domain four), `error-context`
+(every `Row`, alongside its pre-existing DOMAIN-lookup `trust_class`, which
+reads `agent_observation` for any agent claim whatever its evidence), the daemon
+`observations_for_symbol` / `criteria_for_task` verbs, and the MCP
+`symbol_context` / `task_evidence` tools (the primary agentic consumption path).
+All three transports call the SAME derivation, so the RULE cannot drift; the one
+caveat is that CLI lanes derive over their corpus-filtered slice while the daemon
+has no corpus selector — same rule, potentially a different snapshot. Records already carry a `domain` namespace (#3), but `domain` is WHERE a
+record lives, not HOW MUCH it should be trusted: an `agent_memory` Observation
+may be an unverified guess, a guess backed by a passing verification record, or
+one since contradicted — all three sit in one domain, and an answer that mixes
+code facts, agent claims, and verification evidence side by side is the one place
+that distinction can collapse. The vocabulary is CLOSED (9 values):
+`source_derived` (code-graph + semantic-derived facts AND code-graph topology
+edges), `verification_evidence`, `agent_verified` / `agent_unverified` /
+`agent_contradicted`, `project_state`, `artifact`, `runtime_observation`, and
+`other`. The classifier is an EXHAUSTIVE `NodeKind` match with NO wildcard arm
+(the #247 completeness invariant), so a new node kind fails to compile until
+deliberately classified, and an unclassified kind falls to `other` — NEVER to a
+truth-bearing label. Non-agent kinds are labelled from kind alone; the three
+agent kinds (`Observation`/`Decision`/`Failure`) route through a private
+3-variant `AgentTrust` enum that is STRUCTURALLY unable to return
+`source_derived`/`verification_evidence`, resolved in precedence order:
+(1) DISPLACED → `agent_contradicted` when the claim is superseded or contradicted
+at this snapshot, computed by the SAME `TemporalResolver` that drives
+`temporal_status` and the `excluded` section so the two can never disagree (a
+supersession cycle counts as displaced, matching `--supersession exclude`; #114's
+AC3 folds SUPERSEDES and CONTRADICTS into one label — read it as "displaced", not
+"asserts the opposite"); (2) `agent_verified` when the claim cites a LIVE
+verification record through a backing relation (`VALIDATED_BY`/`HAS_EVIDENCE`/
+`PRODUCED_EVIDENCE`, evidence-link or outgoing edge — literally the same
+`backing_verification_records` traversal `--verified-only` uses, ONE
+implementation, so the surfaces cannot disagree on WHICH records back a claim)
+whose outcome is PASSING (`status` ∈ {`pass`,`passed`,`success`} trimmed +
+case-insensitive; when `status` is absent, `exit_code == 0`; anything else fails
+CLOSED to unverified rather than overclaiming) AND which provably lives in the
+VERIFICATION DOMAIN by its record-ID prefix, not merely by carrying a
+verification-shaped kind — `eg command-evidence` mints `CommandEvidence` with an
+`agent_memory:v1:` id and a status derived purely from the agent-supplied
+`--exit-code`, so without the domain gate an agent could write its own proof and
+have Egregore certify it, violating the standing "an agent-authored claim is
+never evidence for itself" invariant (such a record still APPEARS in
+`verification_evidence`; it simply confers nothing); (3) otherwise
+`agent_unverified`. Contradiction WINS over verification. A tombstoned
+verification record confers nothing, and a generic relation (e.g. `RELATES_TO`)
+onto a verification record does not verify. Displacement itself is now
+LIVENESS-AWARE: `TemporalResolver::build` skips a retracted `SUPERSEDES`/
+`CONTRADICTS` edge (and stale earlier edge versions), so a withdrawn
+contradiction stops displacing its target instead of marking an otherwise-current
+claim `contradicted` forever — this fixes `temporal_status`/`excluded` on every
+existing lane too, since they read the same resolver. Honest limit: liveness is
+evaluated on the record CARRYING the relationship, so a live `CONTRADICTS` edge
+whose source node was separately retracted still displaces. `trust` is a deterministic function
+of node kind plus evidence/contradiction edges AT THE QUERIED SNAPSHOT — no wall
+clock, no ranking, no numeric confidence (per-observation `confidence` is a
+separate, unchanged field) — so re-running an answer over an unchanged store
+yields byte-identical labels. LABEL LIMITS: `verification_evidence` marks a
+recorded EXECUTION, never proof of correctness or that it passed; `agent_verified`
+is a structural fact about citations, never a truth judgement; `source_derived`
+never claims the record still matches the working tree (use `--repo-path`);
+`project_state` is an issue tracker's claim. The `unresolved` section carries NO
+`trust` (its target record is ABSENT — labelling an absence would be
+fabrication); the `excluded` diagnostics DO. The older static kind-only
+`trust_class` field on non-context lanes (`query memory`, `sessions`,
+`transaction-time`, subsystem `log_signatures`) is UNCHANGED; the two vocabularies
+agree modulo `source_fact`→`source_derived` and `agent_authored`→the three agent
+classes, pinned by a drift-guard test (which also pins `is_verification_kind`
+against the `verification_evidence` arm) so changing one classifier without the
+other fails the build. SEPARATE KEY COLLISION, documented not fixed: ten
+SINGLE-domain lanes (`who-imports`, `who-constructs`, `debt-markers`,
+`unsafe-sites`, `unwrap-expect`, `change-impact`, `deps`, `path`,
+`transitive-callers`/`callees`, `coupling`) already emit a top-level `trust`
+carrying a fixed ROW-CLASS label (`source_fact`, `impact_lead`,
+`dependency_lead`, `reachability_lead`, `historical_co_change_lead`) — a
+different vocabulary under the same key. Those lanes return one domain, so they
+have nothing to disambiguate; `trust` is only comparable within a family, and
+unifying would break ten shipped lanes' documented output. See `docs/cli/query.md` and `docs/schema/daemon-query.md`.
+
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
 verification evidence, semantic drift, and runtime error signatures for everything under a
 repo-relative directory prefix. Path matching is segment-aware: `src/alpha` never bleeds into

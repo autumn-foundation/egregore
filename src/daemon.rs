@@ -10093,7 +10093,13 @@ fn load_cross_domain_records(
     Ok((records, snapshot))
 }
 
-fn context_source_fact_to_json(record: &GraphRecord) -> serde_json::Value {
+/// Renders one `source_facts` row, carrying the derived `trust` class so the
+/// daemon and `eg query context` label rows identically (issue #114).
+fn context_source_fact_to_json(
+    record: &GraphRecord,
+    trust: &graph_query::TrustIndex<'_>,
+) -> serde_json::Value {
+    let trust_class = trust.classify(record);
     let GraphRecord::Node {
         id,
         kind,
@@ -10107,11 +10113,12 @@ fn context_source_fact_to_json(record: &GraphRecord) -> serde_json::Value {
         ..
     } = record
     else {
-        return json!({ "record_id": record.id() });
+        return json!({ "record_id": record.id(), "trust": trust_class.as_str() });
     };
     json!({
         "record_id": id,
         "kind": kind.as_str(),
+        "trust": trust_class.as_str(),
         "name": name,
         "repo_relative_path": repo_relative_path,
         "span": span,
@@ -10123,16 +10130,26 @@ fn context_source_fact_to_json(record: &GraphRecord) -> serde_json::Value {
     })
 }
 
-fn context_observation_to_json(record: &GraphRecord) -> serde_json::Value {
-    graph_query::context_observation(record)
+fn context_observation_to_json(
+    record: &GraphRecord,
+    trust: &graph_query::TrustIndex<'_>,
+) -> serde_json::Value {
+    graph_query::context_observation(record, trust)
         .and_then(|obs| serde_json::to_value(&obs).ok())
-        .unwrap_or_else(|| json!({ "record_id": record.id() }))
+        .unwrap_or_else(
+            || json!({ "record_id": record.id(), "trust": trust.classify(record).as_str() }),
+        )
 }
 
-fn context_linked_item_to_json(record: &GraphRecord) -> serde_json::Value {
-    graph_query::context_linked_item(record)
+fn context_linked_item_to_json(
+    record: &GraphRecord,
+    trust: &graph_query::TrustIndex<'_>,
+) -> serde_json::Value {
+    graph_query::context_linked_item(record, trust)
         .and_then(|item| serde_json::to_value(&item).ok())
-        .unwrap_or_else(|| json!({ "record_id": record.id() }))
+        .unwrap_or_else(
+            || json!({ "record_id": record.id(), "trust": trust.classify(record).as_str() }),
+        )
 }
 
 /// Builds one `drift_history` row from a `SemanticDrift` record (issue #108),
@@ -10152,6 +10169,7 @@ fn context_linked_item_to_json(record: &GraphRecord) -> serde_json::Value {
 fn context_drift_to_json(
     record: &GraphRecord,
     resolved: (Option<&str>, Option<&str>, Option<crate::ir::SourceSpan>),
+    trust: &graph_query::TrustIndex<'_>,
 ) -> Option<serde_json::Value> {
     let GraphRecord::Node {
         id,
@@ -10164,6 +10182,7 @@ fn context_drift_to_json(
     let (resolved_path, _resolved_name, resolved_span) = resolved;
     let mut obj = serde_json::Map::new();
     obj.insert("record_id".to_owned(), json!(id.as_str()));
+    obj.insert("trust".to_owned(), json!(trust.classify(record).as_str()));
     obj.insert("score".to_owned(), json!(drift.score));
     obj.insert("before_commit".to_owned(), json!(&drift.before_git_commit));
     obj.insert("after_commit".to_owned(), json!(&drift.after_git_commit));
@@ -10200,6 +10219,7 @@ fn build_context_sections(
     records: &[GraphRecord],
     ctx: &graph_query::SymbolContext<'_>,
     limit: usize,
+    trust: &graph_query::TrustIndex<'_>,
 ) -> ContextSections {
     let mut rem = limit;
 
@@ -10207,7 +10227,7 @@ fn build_context_sections(
         .source_facts
         .iter()
         .take(rem)
-        .map(|r| context_source_fact_to_json(r))
+        .map(|r| context_source_fact_to_json(r, trust))
         .collect();
     rem = rem.saturating_sub(source_facts.len());
 
@@ -10226,7 +10246,9 @@ fn build_context_sections(
             } = r
             {
                 Some(json!({
-                    "record_id": id, "label": label.as_str(),
+                    "record_id": id,
+                    "trust": trust.classify(r).as_str(),
+                    "label": label.as_str(),
                     "source_id": source, "target_id": target, "summary": summary,
                     "git_commit": temporal.as_ref().map(|t| t.git_commit.as_str()),
                     "valid_time": temporal.as_ref().map(|t| t.valid_time.as_str()),
@@ -10243,7 +10265,7 @@ fn build_context_sections(
         .observations
         .iter()
         .take(rem)
-        .map(|r| context_observation_to_json(r))
+        .map(|r| context_observation_to_json(r, trust))
         .collect();
     rem = rem.saturating_sub(observations.len());
 
@@ -10251,7 +10273,7 @@ fn build_context_sections(
         .project_state
         .iter()
         .take(rem)
-        .map(|r| context_linked_item_to_json(r))
+        .map(|r| context_linked_item_to_json(r, trust))
         .collect();
     rem = rem.saturating_sub(project_state.len());
 
@@ -10259,7 +10281,7 @@ fn build_context_sections(
         .artifacts
         .iter()
         .take(rem)
-        .map(|r| context_linked_item_to_json(r))
+        .map(|r| context_linked_item_to_json(r, trust))
         .collect();
     rem = rem.saturating_sub(artifacts.len());
 
@@ -10267,7 +10289,7 @@ fn build_context_sections(
         .verification_evidence
         .iter()
         .take(rem)
-        .map(|r| context_linked_item_to_json(r))
+        .map(|r| context_linked_item_to_json(r, trust))
         .collect();
     rem = rem.saturating_sub(verification_evidence.len());
 
@@ -10278,7 +10300,7 @@ fn build_context_sections(
     let drift_history: Vec<_> = drift_history_records
         .iter()
         .zip(resolved_drift_targets)
-        .filter_map(|(r, resolved)| context_drift_to_json(r, resolved))
+        .filter_map(|(r, resolved)| context_drift_to_json(r, resolved, trust))
         .collect();
     rem = rem.saturating_sub(drift_history.len());
 
@@ -10332,8 +10354,14 @@ fn apply_supersession_json(
                 };
                 match mode {
                     crate::temporal_status::SupersessionMode::Exclude => {
+                        // A displaced agent claim is `agent_contradicted` by the
+                        // same derivation that produced this branch, so the
+                        // diagnostic carries the class as a typed constant --
+                        // never recovered from the JSON it was rendered into,
+                        // which could silently yield `null` (issue #114).
                         let mut diag = serde_json::json!({
                             "record_id": record_id,
+                            "trust": graph_query::TrustClass::AgentContradicted.as_str(),
                             "reason": reason,
                         });
                         if !superseded_by.is_empty() {
@@ -10509,10 +10537,14 @@ fn handle_verb_observations_for_symbol(
         );
     }
 
-    let s = build_context_sections(&records, &ctx, limit);
+    // One index per answer, built over the same slice the context was: it owns
+    // the supersession resolver `apply_supersession_json` needs, so `trust` and
+    // `temporal_status` can never be computed from different corpora.
+    let trust = graph_query::TrustIndex::build(&records);
+    let s = build_context_sections(&records, &ctx, limit, &trust);
 
-    let resolver = crate::temporal_status::TemporalResolver::build(&records);
-    let (observations, excluded) = apply_supersession_json(s.observations, &resolver, supersession);
+    let (observations, excluded) =
+        apply_supersession_json(s.observations, trust.resolver(), supersession);
 
     HttpResponse::success(
         Some(request_id),
@@ -10670,12 +10702,13 @@ fn handle_verb_criteria_for_task(
     }
 
     let mut rem = limit;
+    let trust = graph_query::TrustIndex::build(&records);
 
     let tasks: Vec<_> = ctx
         .tasks
         .iter()
         .take(rem)
-        .map(|r| context_linked_item_to_json(r))
+        .map(|r| context_linked_item_to_json(r, &trust))
         .collect();
     rem = rem.saturating_sub(tasks.len());
 
@@ -10684,7 +10717,7 @@ fn handle_verb_criteria_for_task(
         .iter()
         .take(rem)
         .map(|r| {
-            let mut ac_json = context_linked_item_to_json(r);
+            let mut ac_json = context_linked_item_to_json(r, &trust);
             if ac_json.get("status").and_then(serde_json::Value::as_str) == Some("verified") {
                 let GraphRecord::Node {
                     verification_link_id,
@@ -10716,7 +10749,8 @@ fn handle_verb_criteria_for_task(
                 if let Some(ver_record) =
                     ver_id.and_then(|vid| records.iter().find(|cand| cand.id() == vid))
                 {
-                    ac_json["verification_record"] = context_linked_item_to_json(ver_record);
+                    ac_json["verification_record"] =
+                        context_linked_item_to_json(ver_record, &trust);
                 }
             }
             ac_json
@@ -10728,7 +10762,7 @@ fn handle_verb_criteria_for_task(
         .source_facts
         .iter()
         .take(rem)
-        .map(|r| context_source_fact_to_json(r))
+        .map(|r| context_source_fact_to_json(r, &trust))
         .collect();
     rem = rem.saturating_sub(source_facts.len());
 
@@ -10736,7 +10770,7 @@ fn handle_verb_criteria_for_task(
         .observations
         .iter()
         .take(rem)
-        .map(|r| context_observation_to_json(r))
+        .map(|r| context_observation_to_json(r, &trust))
         .collect();
     rem = rem.saturating_sub(observations.len());
 
@@ -10744,7 +10778,7 @@ fn handle_verb_criteria_for_task(
         .artifacts
         .iter()
         .take(rem)
-        .map(|r| context_linked_item_to_json(r))
+        .map(|r| context_linked_item_to_json(r, &trust))
         .collect();
     rem = rem.saturating_sub(artifacts.len());
 
@@ -10752,7 +10786,7 @@ fn handle_verb_criteria_for_task(
         .verification_evidence
         .iter()
         .take(rem)
-        .map(|r| context_linked_item_to_json(r))
+        .map(|r| context_linked_item_to_json(r, &trust))
         .collect();
     rem = rem.saturating_sub(verification_evidence.len());
 
@@ -10760,7 +10794,7 @@ fn handle_verb_criteria_for_task(
         .reviews
         .iter()
         .take(rem)
-        .map(|r| context_linked_item_to_json(r))
+        .map(|r| context_linked_item_to_json(r, &trust))
         .collect();
     rem = rem.saturating_sub(reviews.len());
 
@@ -10768,7 +10802,7 @@ fn handle_verb_criteria_for_task(
         .external_links
         .iter()
         .take(rem)
-        .map(|r| context_linked_item_to_json(r))
+        .map(|r| context_linked_item_to_json(r, &trust))
         .collect();
     rem = rem.saturating_sub(external_links.len());
 
@@ -15373,7 +15407,8 @@ mod tests {
             .next()
             .expect("one resolved entry");
 
-        let value = context_drift_to_json(&drift_record, resolved).expect("drift row");
+        let trust = graph_query::TrustIndex::build(&records);
+        let value = context_drift_to_json(&drift_record, resolved, &trust).expect("drift row");
         let obj = value.as_object().expect("object");
         assert!(
             !obj.contains_key("repo_relative_path"),

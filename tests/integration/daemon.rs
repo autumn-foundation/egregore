@@ -11100,6 +11100,20 @@ fn verification_stdout_handle_empty_hash_rejected() {
     daemon.stop();
 }
 
+/// The closed `trust` vocabulary (issue #114), mirrored from
+/// `crate::query::TrustClass` so a daemon response cannot invent a class.
+const TRUST_VOCABULARY: &[&str] = &[
+    "source_derived",
+    "verification_evidence",
+    "agent_verified",
+    "agent_unverified",
+    "agent_contradicted",
+    "project_state",
+    "artifact",
+    "runtime_observation",
+    "other",
+];
+
 // ── observations_for_symbol: cross-domain context query (issue #38) ───────────
 
 /// Unique constant IDs for the `observations_for_symbol` fixture.
@@ -11407,6 +11421,75 @@ fn observations_for_symbol_returns_cross_domain_context() {
         !source_facts.iter().any(|r| r["record_id"] == OFS_TASK_ID),
         "AC4: Task must not be in source_facts"
     );
+
+    // ── issue #114: every returned record carries a derived `trust` class, and
+    // the daemon derives it identically to `eg query context` ────────────────
+    for (section_name, section) in [
+        ("source_facts", source_facts),
+        ("observations", observations),
+        ("project_state", project_state),
+        ("verification_evidence", ver_evidence),
+    ] {
+        for row in section {
+            let trust = row["trust"].as_str().unwrap_or_else(|| {
+                panic!("#114: row in `{section_name}` carries no `trust` field: {row}")
+            });
+            assert!(
+                TRUST_VOCABULARY.contains(&trust),
+                "#114: `{trust}` in `{section_name}` is outside the closed vocabulary"
+            );
+        }
+    }
+    // The symbol is source-derived; the Task is project state; the Verification
+    // is verification evidence — never an agent class.
+    assert_eq!(
+        source_facts
+            .iter()
+            .find(|r| r["record_id"] == OFS_SYMBOL_ID)
+            .map(|r| r["trust"].as_str().unwrap_or("")),
+        Some("source_derived"),
+        "#114: Symbol must be source_derived"
+    );
+    assert_eq!(
+        project_state
+            .iter()
+            .find(|r| r["record_id"] == OFS_TASK_ID)
+            .map(|r| r["trust"].as_str().unwrap_or("")),
+        Some("project_state"),
+        "#114: Task must be project_state"
+    );
+    assert_eq!(
+        ver_evidence
+            .iter()
+            .find(|r| r["record_id"] == OFS_VERIFICATION_ID)
+            .map(|r| r["trust"].as_str().unwrap_or("")),
+        Some("verification_evidence"),
+        "#114: Verification must be verification_evidence"
+    );
+    // The seeded Observation cites the `status: passed` Verification through
+    // VALIDATED_BY, so the daemon must derive `agent_verified` — the same label
+    // the CLI derives for the same shape (see `tests/integration/trust_class.rs`).
+    assert_eq!(
+        observations
+            .iter()
+            .find(|r| r["record_id"] == OFS_OBSERVATION_ID)
+            .map(|r| r["trust"].as_str().unwrap_or("")),
+        Some("agent_verified"),
+        "#114: an observation citing a passing verification record is agent_verified"
+    );
+    // Zero mislabels in either direction.
+    for row in observations {
+        assert!(
+            row["trust"].as_str().unwrap_or("").starts_with("agent_"),
+            "#114: an agent-authored row escaped the agent classes: {row}"
+        );
+    }
+    for row in source_facts.iter().chain(ver_evidence) {
+        assert!(
+            !row["trust"].as_str().unwrap_or("").starts_with("agent_"),
+            "#114: a code/verification row was labelled with an agent class: {row}"
+        );
+    }
 
     // AC6: no-match returns machine-readable 404
     let nomatch = http_json(

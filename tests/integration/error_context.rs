@@ -3270,3 +3270,179 @@ fn cli_at_reresolves_frames_against_commit_view() {
         "`--at c2` re-resolves the frame to the symbol at that commit view"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Derived trust class (issue #114).
+// ---------------------------------------------------------------------------
+
+/// The closed `trust` vocabulary, mirrored from `crate::query::TrustClass`.
+const TRUST_VOCABULARY: &[&str] = &[
+    "source_derived",
+    "verification_evidence",
+    "agent_verified",
+    "agent_unverified",
+    "agent_contradicted",
+    "project_state",
+    "artifact",
+    "runtime_observation",
+    "other",
+];
+
+/// Issue #114: every record-shaped projection in an `error-context` envelope
+/// carries a derived `trust` class — the top-level `Row`s, each
+/// `SignatureBlock`, and its nested `SourceHandle` / `BucketRow` projections.
+///
+/// Asserts the SERIALIZED envelope rather than the typed structs: the `trust`
+/// fields are non-`Option`, so a struct-level check proves little, while a
+/// future `skip_serializing_if` or rename that drops a field from the wire
+/// would still compile. The lane's promise is a uniform wire shape, so that is
+/// what gets checked.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn every_record_shaped_projection_carries_a_trust_class() {
+    let (sym_id, sym) = code_symbol("boom_handler", "src/lib.rs", 1, 10);
+    let (file_id, file) = code_file("src/lib.rs");
+    let (sig_id, sig) = error_signature("boom", "error", SIG_FIRST, SIG_LAST, 7, None);
+    let (src_id, src) = log_source(ANCHOR, "logs/app.log", "a".repeat(64).as_str());
+    let (bucket_node, bucket_edge) = bucket_with_edge(&sig_id, SIG_FIRST, 7);
+    // An agent claim citing the frame-resolved symbol, with no verification
+    // backing: a hypothesis, and never a non-agent class.
+    let (obs_id, obs) = observation(
+        "trust",
+        vec![evidence_link("OBSERVES", &sym_id, "codegraph")],
+    );
+
+    let records = vec![
+        sym,
+        file,
+        defines(&file_id, &sym_id),
+        sig,
+        src,
+        captured_from(&sig_id, &src_id),
+        bucket_node,
+        bucket_edge,
+        obs,
+        observes_edge(&obs_id, &sym_id),
+        frame_resolves(&sig_id, &sym_id, 0, FrameResolution::Resolved),
+    ];
+
+    let ctx = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("resolve");
+
+    let json: serde_json::Value = serde_json::to_value(&ctx).expect("serialize error context");
+
+    // Top-level record sections.
+    let mut labelled = 0_usize;
+    for section in [
+        "source_facts",
+        "observations",
+        "project_state",
+        "artifacts",
+        "verification_evidence",
+    ] {
+        for row in json[section].as_array().expect("section is an array") {
+            let trust = row["trust"]
+                .as_str()
+                .unwrap_or_else(|| panic!("row in `{section}` carries no `trust`: {row}"));
+            assert!(
+                TRUST_VOCABULARY.contains(&trust),
+                "`{trust}` in `{section}` is outside the closed vocabulary"
+            );
+            labelled += 1;
+        }
+    }
+
+    // Signature blocks and their nested projections.
+    let signatures = json["signatures"].as_array().expect("signatures array");
+    assert!(!signatures.is_empty(), "fixture must produce a signature");
+    for block in signatures {
+        assert_eq!(
+            block["trust"].as_str(),
+            Some("runtime_observation"),
+            "a signature is a runtime observation: {block}"
+        );
+        let sources = block["source_handles"]
+            .as_array()
+            .expect("source_handles array");
+        assert!(
+            !sources.is_empty(),
+            "the fixture's CAPTURED_FROM source must be present, or this proves nothing"
+        );
+        for handle in sources {
+            assert_eq!(
+                handle["trust"].as_str(),
+                Some("runtime_observation"),
+                "a LogSource handle carries the derived class too: {handle}"
+            );
+        }
+        let buckets = block["buckets"].as_array().expect("buckets array");
+        assert!(
+            !buckets.is_empty(),
+            "the fixture's AGGREGATES bucket must be present, or this proves nothing"
+        );
+        for bucket in buckets {
+            assert_eq!(
+                bucket["trust"].as_str(),
+                Some("runtime_observation"),
+                "a LogOccurrenceBucket carries the derived class too: {bucket}"
+            );
+        }
+    }
+
+    // Classification: the frame-resolved code facts are source-derived, and the
+    // unbacked agent claim is a hypothesis — never source truth.
+    assert!(labelled > 0, "fixture produced no top-level rows");
+    let source_facts = json["source_facts"].as_array().expect("array");
+    assert!(!source_facts.is_empty(), "frame target must resolve");
+    for row in source_facts {
+        assert_eq!(row["trust"].as_str(), Some("source_derived"));
+    }
+    let obs_row = json["observations"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|r| r["record_id"].as_str() == Some(obs_id.as_str()))
+        .expect("observation present");
+    assert_eq!(obs_row["trust"].as_str(), Some("agent_unverified"));
+}
+
+/// A displaced agent claim carries `agent_contradicted` into the `excluded`
+/// diagnostics, so a consumer reading that section sees the same label the row
+/// would have carried in the answer.
+#[test]
+fn excluded_superseded_row_carries_its_trust_class() {
+    let (records, sig_id, obs_old_id) = supersession_fixture();
+    let ctx = error_context(
+        &records,
+        &sig_id,
+        None,
+        None,
+        None,
+        SupersessionMode::Exclude,
+        None,
+        false,
+    )
+    .expect("resolve");
+
+    let json: serde_json::Value = serde_json::to_value(&ctx).expect("serialize error context");
+    let excluded = json["excluded"].as_array().expect("excluded array");
+    let row = excluded
+        .iter()
+        .find(|e| e["record_id"].as_str() == Some(obs_old_id.as_str()))
+        .expect("the superseded row must appear in excluded");
+    assert_eq!(
+        row["trust"].as_str(),
+        Some("agent_contradicted"),
+        "a displaced claim is agent_contradicted, matching its `reason`: {row}"
+    );
+    assert_eq!(row["reason"].as_str(), Some("superseded"));
+}

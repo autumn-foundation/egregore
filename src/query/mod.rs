@@ -60,6 +60,8 @@ mod who_imports;
 mod who_constructs;
 // Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
 mod sessions;
+// Appended (issue #114); kept at the end to minimize cross-lane merge conflicts.
+mod trust;
 
 pub use as_of::*;
 pub use change_impact::*;
@@ -110,3 +112,5 @@ pub use who_imports::*;
 pub use who_constructs::*;
 // Appended (issue #112); kept at the end to minimize cross-lane merge conflicts.
 pub use sessions::*;
+// Appended (issue #114); kept at the end to minimize cross-lane merge conflicts.
+pub use trust::*;

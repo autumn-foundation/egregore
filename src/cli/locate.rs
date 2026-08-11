@@ -209,13 +209,14 @@ pub(crate) fn query_locate_cmd(
             repository_id,
             context,
         } => {
-            let symbol = location_node_json(primary).expect("primary is a node by construction");
+            let trust = query::TrustIndex::build(records);
+            let symbol =
+                location_node_json(primary, &trust).expect("primary is a node by construction");
             let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
                 disclose_head_anchored_corpus(records, at.is_some() || as_of.is_some());
-            let sections = build_context_sections(&context);
-            let resolver = crate::temporal_status::TemporalResolver::build(records);
+            let sections = build_context_sections(&context, &trust);
             let (observations, excluded) =
-                apply_supersession(sections.observations, &resolver, supersession);
+                apply_supersession(sections.observations, trust.resolver(), supersession);
 
             let response = LocateResponse {
                 ok: true,
@@ -226,7 +227,7 @@ pub(crate) fn query_locate_cmd(
                 symbol,
                 enclosing_chain: chain
                     .iter()
-                    .filter_map(|record| location_node_json(record))
+                    .filter_map(|record| location_node_json(record, &trust))
                     .collect(),
                 repository_id,
                 repository: repository_id.and_then(|repo| index.display_of(repo)),

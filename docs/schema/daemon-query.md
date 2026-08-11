@@ -536,6 +536,52 @@ A repository that resolves but has **zero** scoped sessions is a successful
 is an answer, never a `404` and never a fabricated row. Sessions with no
 derivable repository scope surface under `unresolved_repository_scope`.
 
+### `observations_for_symbol` / `criteria_for_task` — the `trust` field (issue #114)
+
+The two cross-domain verbs return code facts, agent observations, project
+state, and verification evidence side by side. Every record in every section of
+those results carries a single `trust` field drawn from a closed vocabulary, so
+a consuming agent can weight a verified fact above an unverified hypothesis
+without re-traversing the graph.
+
+The vocabulary and the full derivation rules are documented once in
+[`docs/cli/query.md` § Trust class](../cli/query.md#trust-class-trust-issue-114).
+The summary:
+
+| `trust` | Meaning |
+|---|---|
+| `source_derived` | Deterministic code-graph or semantic-derived fact |
+| `verification_evidence` | A recorded verification execution |
+| `agent_verified` | Agent claim citing a live **passing** verification record |
+| `agent_unverified` | Agent claim with no such citation |
+| `agent_contradicted` | Agent claim displaced by a live `CONTRADICTS`/`SUPERSEDES` |
+| `project_state` | Imported external work state |
+| `artifact` | Produced bytes |
+| `runtime_observation` | A program's own claim about its execution |
+| `other` | No derivation rule applies |
+
+`domain` says *where a record lives*; `trust` says *how much weight it has
+earned*. The label is a deterministic function of the record's node kind plus
+its evidence and contradiction edges at the queried snapshot, so repeating a
+query over an unchanged store yields byte-identical labels.
+
+**Parity:** the daemon and `eg query context` / `eg query task` call the same
+derivation, so the *rule* cannot drift between transports. Caveat: the CLI lanes
+derive over their corpus-filtered slice (`--at-head` / `--all-history`) while
+this surface has no corpus selector — same rule, potentially a different
+snapshot.
+
+**Versioning:** adding `trust` is an **additive** change under §9 — a new
+response field, with no existing field renamed, removed, or reshaped — so
+`DAEMON_QUERY_SCHEMA_VERSION` stays `1`. This matches the precedent set when
+issue #108 added the whole `drift_history` section to `observations_for_symbol`
+without a bump.
+
+The `unresolved` section carries no `trust`: its entries describe an evidence
+link whose target record is **absent**, and there is no record to classify. The
+`excluded` diagnostics section does carry `trust`, since those entries name real
+records the answer withheld.
+
 ---
 
 ## 7 — CLI mapping
@@ -575,7 +621,11 @@ Cursor-based pagination is reserved for a future slice.
 
 `DAEMON_QUERY_SCHEMA_VERSION = 1` is a Rust constant in `src/daemon.rs`.
 
-- Additive changes (new verbs, new optional response fields) do not bump the version.
+- Additive changes (new verbs, new response fields — whether optional or always
+  present) do not bump the version. A consumer reading version 1 still finds
+  every version-1 field, unrenamed and unreshaped; JSON consumers tolerate keys
+  they do not know. The looser summary at the top of this document ("changes
+  that alter the response shape") is subordinate to this rule.
 - Breaking changes (renamed verbs, removed fields, changed `record` shapes for
   existing verbs) require bumping `DAEMON_QUERY_SCHEMA_VERSION` and updating
   this document and `daemon-api.md`.

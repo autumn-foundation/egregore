@@ -1902,3 +1902,205 @@ fn test_triple_only_deletion_prior_commit_citation_surfaced() {
         "a triple-only deletion citation anchored to the prior live commit must be surfaced"
     );
 }
+
+/// Issue #114: every record-shaped section of a `changes` response carries a
+/// derived `trust` class from the closed vocabulary.
+///
+/// The lane's documented guarantee is that a consumer can require the field
+/// UNIFORMLY across the whole envelope, so this asserts the serialized JSON —
+/// not just the typed struct — for all ten record-shaped sections, including
+/// the six (`changed_files`, `changed_symbols`, `commits`, `tombstones`,
+/// `drift_records`, `unexplained`) that carry code-graph and semantic facts
+/// rather than cross-domain evidence.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn changes_labels_every_record_shaped_section_with_a_trust_class() {
+    /// The closed `trust` vocabulary, mirrored from `crate::query::TrustClass`.
+    const TRUST_VOCABULARY: &[&str] = &[
+        "source_derived",
+        "verification_evidence",
+        "agent_verified",
+        "agent_unverified",
+        "agent_contradicted",
+        "project_state",
+        "artifact",
+        "runtime_observation",
+        "other",
+    ];
+
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let c3 = commit("cccccccc", &["bbbbbbbb"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+    let e2 = parent_edge("bbbbbbbb", "cccccccc");
+
+    let f1 = file_node("src/lib.rs", "bbbbbbbb");
+    let s1 = symbol_node("hello", "src/lib.rs", "bbbbbbbb");
+    let f2 = file_node("src/main.rs", "cccccccc");
+    let s2 = symbol_node("main", "src/main.rs", "cccccccc");
+    let s1_id = s1.id().to_owned();
+    let s2_id = s2.id().to_owned();
+
+    let drift = GraphRecord::node(
+        "drift:trust".to_owned(),
+        NodeKind::SemanticDrift,
+        Some("src/main.rs".to_owned()),
+        None,
+        Some("main".to_owned()),
+        "Drift main".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "cccccccc".to_owned(),
+        git_parent_commits: vec!["bbbbbbbb".to_owned()],
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
+    })
+    .with_semantic_drift(SemanticDriftMetadata {
+        embedding_model: EmbeddingModel {
+            provider: "test".to_owned(),
+            name: "fake-code-model".to_owned(),
+            version: "v1".to_owned(),
+            dim: 384,
+            content_hash: "fixture".to_owned(),
+        },
+        target_record_id: s2_id,
+        prior_record_id: s1_id.clone(),
+        before_git_commit: "bbbbbbbb".to_owned(),
+        after_git_commit: "cccccccc".to_owned(),
+        before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        after_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        metric_kind: MetricKind::CosineDistance,
+        score: 0.5,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
+    });
+
+    let tombstone = GraphRecord::Tombstone {
+        id: "tombstone:trust".to_owned(),
+        schema_version: 4,
+        deleted_id: "node:symbol:repo_test:src/lib.rs:old_symbol".to_owned(),
+        summary: "Invalidated stale cached record from src/lib.rs".to_owned(),
+        producer: None,
+    };
+
+    // An agent observation citing `hello`, with no verification backing.
+    let obs_id = agent_memory_stable_id(&["obs", "trust_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation about hello".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ref mut agent_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:1".to_owned());
+        *observed_at = Some("2026-01-01T00:00:00Z".to_owned());
+        *confidence = Some("1.0".to_owned());
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(s1_id),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let records = vec![c1, c2, c3, e1, e2, f1, s1, f2, s2, drift, tombstone, obs];
+    let ctx = changes_context(&records, "aaaa", "cccc", None).expect("changes context");
+
+    // Serialize: the guarantee is about the wire shape, not the typed struct.
+    let json: serde_json::Value = serde_json::to_value(&ctx).expect("serialize changes context");
+
+    let record_sections = [
+        "changed_files",
+        "changed_symbols",
+        "commits",
+        "tombstones",
+        "drift_records",
+        "unexplained",
+        "observations",
+        "project_state",
+        "artifacts",
+        "verification_evidence",
+    ];
+    let mut labelled = 0_usize;
+    for section in record_sections {
+        for row in json[section].as_array().expect("section is an array") {
+            let trust = row["trust"].as_str().unwrap_or_else(|| {
+                panic!("row in `{section}` carries no `trust` field: {row}");
+            });
+            assert!(
+                TRUST_VOCABULARY.contains(&trust),
+                "row in `{section}` carries `trust` outside the closed vocabulary: {trust}"
+            );
+            labelled += 1;
+        }
+    }
+    assert!(labelled > 0, "fixture produced no rows to label");
+
+    // The six newly-labelled sections must be non-empty, or this test would
+    // pass vacuously on exactly the rows it exists to cover.
+    for section in [
+        "changed_files",
+        "changed_symbols",
+        "commits",
+        "tombstones",
+        "drift_records",
+        "unexplained",
+    ] {
+        assert!(
+            !json[section].as_array().expect("array").is_empty(),
+            "`{section}` must be populated for this test to prove anything"
+        );
+    }
+
+    // Classification, not just presence. Code-graph facts, commits, and
+    // semantic drift are all deterministic source-derived records; a tombstone
+    // is a deletion marker, which carries no truth-bearing class.
+    for section in [
+        "changed_files",
+        "changed_symbols",
+        "commits",
+        "drift_records",
+        "unexplained",
+    ] {
+        for row in json[section].as_array().expect("array") {
+            assert_eq!(
+                row["trust"].as_str(),
+                Some("source_derived"),
+                "`{section}` row should be source_derived: {row}"
+            );
+        }
+    }
+    for row in json["tombstones"].as_array().expect("array") {
+        assert_eq!(
+            row["trust"].as_str(),
+            Some("other"),
+            "a tombstone is a deletion marker, never a truth-bearing class: {row}"
+        );
+    }
+    // The agent observation cites no verification record, so it is a hypothesis
+    // — and must never be labelled with a non-agent class.
+    let obs_row = json["observations"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|r| r["record_id"].as_str() == Some(obs_id.as_str()))
+        .expect("observation present");
+    assert_eq!(obs_row["trust"].as_str(), Some("agent_unverified"));
+}

@@ -49,7 +49,7 @@ use crate::ir::{
 };
 use crate::log_resolve;
 use crate::protected::{PROTECTED_HANDLE_PREFIX, ProtectedStore};
-use crate::temporal_status::{SupersessionMode, TemporalResolver};
+use crate::temporal_status::SupersessionMode;
 
 /// Always-present advisory stamped on every [`ErrorContext`]. NOT proof of cause.
 pub const ERROR_CONTEXT_DISCLAIMER: &str = "Rows are CORRELATION LEADS, never proof of cause: a \
@@ -75,7 +75,19 @@ pub struct Row {
     /// Record domain (`codegraph`, `agent_memory`, `project`, …).
     pub domain: String,
     /// Trust class derived from the domain — REQUIRED on every row.
+    ///
+    /// This is a DOMAIN lookup: every agent-memory record is
+    /// `agent_observation` here regardless of its evidence or contradiction
+    /// edges. Prefer [`Self::trust`] when you need to tell a verified claim from
+    /// a contradicted one.
     pub trust_class: &'static str,
+    /// Derived trust class (issue #114) — REQUIRED on every row.
+    ///
+    /// Unlike [`Self::trust_class`], an agent-authored row resolves to
+    /// `agent_verified` / `agent_unverified` / `agent_contradicted` from its
+    /// evidence and contradiction edges at the queried snapshot. Drawn from the
+    /// closed vocabulary in [`crate::query::TrustClass`].
+    pub trust: crate::query::TrustClass,
     /// Node kind name (`Symbol`, `Observation`, `CommandRun`, …).
     pub kind: String,
     /// Repo-relative path when the record carries one.
@@ -109,6 +121,9 @@ pub struct Row {
 pub struct SourceHandle {
     /// Stable `LogSource` record ID.
     pub record_id: String,
+    /// Derived trust class (issue #114): always `runtime_observation` — a
+    /// `LogSource` is a program's own claim about its execution.
+    pub trust: crate::query::TrustClass,
     /// Repo-relative path of the captured log artifact.
     pub source_relative_path: String,
     /// BLAKE3 hex of the newline-normalized artifact bytes.
@@ -120,6 +135,8 @@ pub struct SourceHandle {
 pub struct BucketRow {
     /// Stable `LogOccurrenceBucket` record ID.
     pub record_id: String,
+    /// Derived trust class (issue #114): always `runtime_observation`.
+    pub trust: crate::query::TrustClass,
     /// RFC 3339 UTC hour-aligned bucket start.
     pub bucket_start: String,
     /// Bucket width token (`1h`).
@@ -137,6 +154,10 @@ pub struct SignatureBlock {
     pub schema_version: u32,
     /// Always `runtime_observation`.
     pub trust_class: &'static str,
+    /// Derived trust class (issue #114): always `runtime_observation` for a
+    /// signature. Carried so every record in the envelope answers to the same
+    /// `trust` key.
+    pub trust: crate::query::TrustClass,
     /// Closed severity class: `fatal` / `error` / `warn`.
     pub severity: String,
     /// Fingerprint algorithm identifier (`template-v1`).
@@ -200,6 +221,10 @@ pub enum FirstSeenRange {
 pub struct ExcludedRef {
     /// Stable record ID that was superseded or contradicted.
     pub record_id: String,
+    /// Derived trust class of the excluded record (issue #114), so a consumer
+    /// reading the diagnostics sees the same label the row would have carried in
+    /// the answer.
+    pub trust: crate::query::TrustClass,
     /// Reason: `superseded` or `contradicted`.
     pub reason: String,
     /// Forward supersession/contradiction handles.
@@ -371,6 +396,7 @@ fn project_row(
     record: &GraphRecord,
     basis: Option<String>,
     supersession: Option<(String, Vec<String>)>,
+    trust: &crate::query::TrustIndex<'_>,
 ) -> Option<Row> {
     let GraphRecord::Node {
         id,
@@ -396,6 +422,7 @@ fn project_row(
         schema_version: *schema_version,
         domain,
         trust_class,
+        trust: trust.classify(record),
         kind: kind.as_str().to_owned(),
         repo_relative_path: repo_relative_path.clone(),
         span: *span,
@@ -817,6 +844,7 @@ pub fn error_context(
             if sig_set.contains(sig) {
                 buckets_by_sig.entry(*sig).or_default().push(BucketRow {
                     record_id: id.clone(),
+                    trust: crate::query::TrustClass::RuntimeObservation,
                     bucket_start: bucket.bucket_start.clone(),
                     bucket_width: bucket.bucket_width.clone(),
                     occurrence_count: bucket_count,
@@ -881,6 +909,7 @@ pub fn error_context(
                 }) => match payload.as_ref() {
                     LogPayload::LogSource(p) => Some(SourceHandle {
                         record_id: (*src).to_owned(),
+                        trust: crate::query::TrustClass::RuntimeObservation,
                         source_relative_path: p.source_relative_path.clone(),
                         source_artifact_hash: p.source_artifact_hash.clone(),
                     }),
@@ -921,6 +950,7 @@ pub fn error_context(
             record_id: sig_id.clone(),
             schema_version,
             trust_class: "runtime_observation",
+            trust: crate::query::TrustClass::RuntimeObservation,
             severity: first.severity.clone(),
             fingerprint_algorithm: first.fingerprint_algorithm.clone(),
             template_excerpt: first.template_excerpt.clone(),
@@ -1054,7 +1084,11 @@ pub fn error_context(
     }
 
     // Supersession policy over the agent/project/artifact/verification sections.
-    let resolver = TemporalResolver::build(records);
+    // The trust index owns the resolver (issue #114), so the derived `trust`
+    // class and the `supersession_status`/`excluded` flags cannot be computed
+    // from different corpora.
+    let trust_index = crate::query::TrustIndex::build(records);
+    let resolver = trust_index.resolver();
     let mut excluded: Vec<ExcludedRef> = Vec::new();
     let project = |section: BTreeMap<String, &GraphRecord>,
                    basis: &BTreeMap<String, CorrelationBasis>,
@@ -1073,6 +1107,7 @@ pub fn error_context(
                 (Some((reason, refs)), SupersessionMode::Exclude) => {
                     excluded.push(ExcludedRef {
                         record_id: id.clone(),
+                        trust: trust_index.classify(record),
                         reason: reason.to_owned(),
                         superseded_by: refs.into_iter().map(|r| r.record_id).collect(),
                     });
@@ -1085,13 +1120,14 @@ pub fn error_context(
                             reason.to_owned(),
                             refs.into_iter().map(|r| r.record_id).collect(),
                         )),
+                        &trust_index,
                     ) {
                         row.superseded_by.sort();
                         rows.push(row);
                     }
                 }
                 (None, _) => {
-                    if let Some(row) = project_row(record, correlation_basis, None) {
+                    if let Some(row) = project_row(record, correlation_basis, None, &trust_index) {
                         rows.push(row);
                     }
                 }
@@ -1103,7 +1139,7 @@ pub fn error_context(
     let empty_basis: BTreeMap<String, CorrelationBasis> = BTreeMap::new();
     let mut source_facts_rows: Vec<Row> = source_facts
         .into_values()
-        .filter_map(|r| project_row(r, None, None))
+        .filter_map(|r| project_row(r, None, None, &trust_index))
         .collect();
     let mut observations_rows = project(observations, &basis_by_run, &mut excluded);
     let mut project_state_rows = project(project_state, &empty_basis, &mut excluded);

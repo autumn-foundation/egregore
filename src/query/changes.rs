@@ -23,6 +23,10 @@ pub struct ChangesFileItem<'a> {
     pub record: &'a GraphRecord,
     /// Stable record ID of the changed file fact.
     pub record_id: &'a str,
+    /// Derived trust class (issue #114). Always present, drawn from the closed
+    /// vocabulary in [`super::TrustClass`], so a consumer can require the field
+    /// uniformly across every record-shaped row of a `changes` response.
+    pub trust: super::TrustClass,
     /// The repository-relative path of the file.
     pub path: &'a str,
     /// Source span of the file fact, when present.
@@ -43,6 +47,10 @@ pub struct ChangesSymbolItem<'a> {
     pub record: &'a GraphRecord,
     /// Stable record ID of the changed symbol fact.
     pub record_id: &'a str,
+    /// Derived trust class (issue #114). Always present, drawn from the closed
+    /// vocabulary in [`super::TrustClass`], so a consumer can require the field
+    /// uniformly across every record-shaped row of a `changes` response.
+    pub trust: super::TrustClass,
     /// The name of the symbol.
     pub name: &'a str,
     /// The repository-relative path of the symbol definition.
@@ -59,6 +67,10 @@ pub struct ChangesSymbolItem<'a> {
 pub struct ChangesCommitItem<'a> {
     /// The graph record for the commit.
     pub record: &'a GraphRecord,
+    /// Derived trust class (issue #114). Always present, drawn from the closed
+    /// vocabulary in [`super::TrustClass`], so a consumer can require the field
+    /// uniformly across every record-shaped row of a `changes` response.
+    pub trust: super::TrustClass,
     /// The full Git commit SHA.
     pub commit: &'a str,
     /// The commit author timestamp if available.
@@ -70,6 +82,10 @@ pub struct ChangesCommitItem<'a> {
 pub struct ChangesTombstoneItem<'a> {
     /// The graph record for the tombstone.
     pub record: &'a GraphRecord,
+    /// Derived trust class (issue #114). Always present, drawn from the closed
+    /// vocabulary in [`super::TrustClass`], so a consumer can require the field
+    /// uniformly across every record-shaped row of a `changes` response.
+    pub trust: super::TrustClass,
     /// The stable ID of the deleted node.
     pub deleted_id: &'a str,
 }
@@ -79,6 +95,10 @@ pub struct ChangesTombstoneItem<'a> {
 pub struct ChangesDriftItem<'a> {
     /// The graph record for the semantic drift.
     pub record: &'a GraphRecord,
+    /// Derived trust class (issue #114). Always present, drawn from the closed
+    /// vocabulary in [`super::TrustClass`], so a consumer can require the field
+    /// uniformly across every record-shaped row of a `changes` response.
+    pub trust: super::TrustClass,
     /// The stable ID of the target node.
     pub target_record_id: &'a str,
     /// The computed drift score.
@@ -94,6 +114,10 @@ pub struct ChangesDriftItem<'a> {
 pub struct UnexplainedChange<'a> {
     /// The stable ID of the unexplained node.
     pub record_id: &'a str,
+    /// Derived trust class (issue #114). Always present, drawn from the closed
+    /// vocabulary in [`super::TrustClass`], so a consumer can require the field
+    /// uniformly across every record-shaped row of a `changes` response.
+    pub trust: super::TrustClass,
     /// The node kind (e.g. "Symbol", "File").
     pub kind: &'a str,
     /// The repository-relative path of the unexplained code fact.
@@ -110,6 +134,11 @@ pub struct UnexplainedChange<'a> {
 pub struct ContextObservation<'a> {
     pub record_id: &'a str,
     pub kind: &'static str,
+    /// Derived trust class (issue #114): one of `agent_verified`,
+    /// `agent_unverified`, or `agent_contradicted` for an agent-authored claim.
+    /// Always present — `domain` says where the record lives, `trust` says how
+    /// much weight it has earned. See `crate::query::TrustClass`.
+    pub trust: super::TrustClass,
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<&'a str>,
@@ -143,6 +172,9 @@ pub struct ContextObservation<'a> {
 pub struct ContextLinkedItem<'a> {
     pub record_id: &'a str,
     pub kind: &'static str,
+    /// Derived trust class (issue #114). Always present; drawn from the closed
+    /// vocabulary in `crate::query::TrustClass`.
+    pub trust: super::TrustClass,
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<&'a str>,
@@ -248,8 +280,15 @@ fn patch_handle_metadata_only(handle: &PatchHandle) -> PatchHandle {
 }
 
 /// Helper function to convert a GraphRecord to ContextObservation.
+///
+/// `trust` carries the [`super::TrustIndex`]-derived class (issue #114); the
+/// index is a required argument so no caller can render a context row without a
+/// trust label.
 #[must_use]
-pub fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
+pub fn context_observation<'a>(
+    record: &'a GraphRecord,
+    trust: &super::TrustIndex<'_>,
+) -> Option<ContextObservation<'a>> {
     let GraphRecord::Node {
         id,
         kind,
@@ -275,6 +314,7 @@ pub fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_
     Some(ContextObservation {
         record_id: id,
         kind: kind.as_str(),
+        trust: trust.classify(record),
         summary: summary.to_owned(),
         text: text.as_deref(),
         provenance_handle,
@@ -293,7 +333,10 @@ pub fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_
 
 /// Helper function to convert a GraphRecord to ContextObservation with redacted payloads.
 #[must_use]
-pub fn redacted_context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
+pub fn redacted_context_observation<'a>(
+    record: &'a GraphRecord,
+    trust: &super::TrustIndex<'_>,
+) -> Option<ContextObservation<'a>> {
     let GraphRecord::Node {
         id,
         kind,
@@ -322,6 +365,7 @@ pub fn redacted_context_observation(record: &GraphRecord) -> Option<ContextObser
     Some(ContextObservation {
         record_id: id,
         kind: kind.as_str(),
+        trust: trust.classify(record),
         summary,
         text: None,
         provenance_handle,
@@ -339,8 +383,13 @@ pub fn redacted_context_observation(record: &GraphRecord) -> Option<ContextObser
 }
 
 /// Helper function to convert a GraphRecord to ContextLinkedItem.
+///
+/// `trust` carries the [`super::TrustIndex`]-derived class (issue #114).
 #[must_use]
-pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
+pub fn context_linked_item<'a>(
+    record: &'a GraphRecord,
+    trust: &super::TrustIndex<'_>,
+) -> Option<ContextLinkedItem<'a>> {
     let GraphRecord::Node {
         id,
         kind,
@@ -391,6 +440,7 @@ pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>
     Some(ContextLinkedItem {
         record_id: id,
         kind: kind.as_str(),
+        trust: trust.classify(record),
         summary: summary.to_owned(),
         title: title.as_deref(),
         name: name.as_deref(),
@@ -436,7 +486,10 @@ pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>
 
 /// Helper function to convert a GraphRecord to ContextLinkedItem with redacted payloads.
 #[must_use]
-pub fn redacted_context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
+pub fn redacted_context_linked_item<'a>(
+    record: &'a GraphRecord,
+    trust: &super::TrustIndex<'_>,
+) -> Option<ContextLinkedItem<'a>> {
     let GraphRecord::Node {
         id,
         kind,
@@ -492,6 +545,7 @@ pub fn redacted_context_linked_item(record: &GraphRecord) -> Option<ContextLinke
     Some(ContextLinkedItem {
         record_id: id,
         kind: kind.as_str(),
+        trust: trust.classify(record),
         summary,
         title: None,
         name: name.as_deref(),
@@ -909,6 +963,10 @@ pub fn changes_context<'a>(
     // differs from — or has no — parent-commit snapshot of the same symbol id.
     // The check is conservative: when the parent topology or parent snapshot is
     // unavailable we cannot prove the body is unchanged, so we keep the row.
+    // One trust index for every record-shaped row this lane returns (issue
+    // #114), built over the same slice the rows are drawn from.
+    let trust = super::TrustIndex::build(records);
+
     let mut symbol_snapshot_bodies: BTreeMap<(&str, &str), &str> = BTreeMap::new();
     for r in records {
         if let GraphRecord::Node {
@@ -960,6 +1018,7 @@ pub fn changes_context<'a>(
             } if range_commit_shas.contains(sha.as_str()) && in_scope(r.id()) => {
                 commits.push(ChangesCommitItem {
                     record: r,
+                    trust: trust.classify(r),
                     commit: sha,
                     author_time: temporal.as_ref().and_then(|t| t.author_time.as_deref()),
                 });
@@ -973,6 +1032,7 @@ pub fn changes_context<'a>(
             } if is_changed_node(r, t) && in_scope(r.id()) => {
                 changed_files.push(ChangesFileItem {
                     record: r,
+                    trust: trust.classify(r),
                     record_id: r.id(),
                     path,
                     span: *span,
@@ -995,6 +1055,7 @@ pub fn changes_context<'a>(
             {
                 changed_symbols.push(ChangesSymbolItem {
                     record: r,
+                    trust: trust.classify(r),
                     record_id: r.id(),
                     name: sym_name,
                     path,
@@ -1015,6 +1076,7 @@ pub fn changes_context<'a>(
                 if in_range && in_scope(r.id()) {
                     drift_records.push(ChangesDriftItem {
                         record: r,
+                        trust: trust.classify(r),
                         target_record_id: &drift.target_record_id,
                         score: drift.score,
                     });
@@ -1072,6 +1134,7 @@ pub fn changes_context<'a>(
                 if added_file_commits.insert((path.as_str(), t.git_commit.as_str())) {
                     changed_files.push(ChangesFileItem {
                         record: r,
+                        trust: trust.classify(r),
                         record_id: r.id(),
                         path,
                         span: *span,
@@ -1108,6 +1171,7 @@ pub fn changes_context<'a>(
             {
                 tombstones.push(ChangesTombstoneItem {
                     record: r,
+                    trust: trust.classify(r),
                     deleted_id,
                 });
             }
@@ -1472,7 +1536,7 @@ pub fn changes_context<'a>(
     let mut output_observations = Vec::new();
     for id in observations {
         if let Some(rec) = by_id.get(id) {
-            if let Some(obs) = redacted_context_observation(rec) {
+            if let Some(obs) = redacted_context_observation(rec, &trust) {
                 output_observations.push(obs);
             }
         }
@@ -1480,7 +1544,7 @@ pub fn changes_context<'a>(
     let mut output_project_state = Vec::new();
     for id in project_state {
         if let Some(rec) = by_id.get(id) {
-            if let Some(item) = redacted_context_linked_item(rec) {
+            if let Some(item) = redacted_context_linked_item(rec, &trust) {
                 output_project_state.push(item);
             }
         }
@@ -1488,7 +1552,7 @@ pub fn changes_context<'a>(
     let mut output_artifacts = Vec::new();
     for id in artifacts {
         if let Some(rec) = by_id.get(id) {
-            if let Some(item) = redacted_context_linked_item(rec) {
+            if let Some(item) = redacted_context_linked_item(rec, &trust) {
                 output_artifacts.push(item);
             }
         }
@@ -1496,7 +1560,7 @@ pub fn changes_context<'a>(
     let mut output_verification_evidence = Vec::new();
     for id in verification_evidence {
         if let Some(rec) = by_id.get(id) {
-            if let Some(item) = redacted_context_linked_item(rec) {
+            if let Some(item) = redacted_context_linked_item(rec, &trust) {
                 output_verification_evidence.push(item);
             }
         }
@@ -1614,12 +1678,15 @@ pub fn changes_context<'a>(
         if linked(seed_id) {
             continue;
         }
-        let Some(GraphRecord::Node {
+        let Some(seed) = by_id.get(seed_id).copied() else {
+            continue;
+        };
+        let GraphRecord::Node {
             kind,
             repo_relative_path,
             temporal,
             ..
-        }) = by_id.get(seed_id)
+        } = seed
         else {
             continue;
         };
@@ -1646,6 +1713,7 @@ pub fn changes_context<'a>(
         }
         unexplained.push(UnexplainedChange {
             record_id: seed_id,
+            trust: trust.classify(seed),
             kind: kind.as_str(),
             path: repo_relative_path.as_deref(),
             git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),

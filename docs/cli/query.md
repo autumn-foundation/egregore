@@ -227,6 +227,176 @@ flag pair, and the per-category defaults — is documented once in
 
 ---
 
+## Trust class (`trust`, issue #114)
+
+Every record a **cross-domain context answer** returns carries a single `trust`
+field. A cross-domain answer deliberately puts code facts, agent observations,
+project state, and verification evidence side by side — the one place where the
+distinction between them can collapse. Without a per-row label the cheapest
+thing a consuming agent can do is treat every row as equally true, which is the
+failure the PRD calls out ("cannot distinguish source truth from agent guesses").
+
+The lanes that carry the derived `trust` class described here:
+
+| Surface | Notes |
+|---|---|
+| `eg query context` | all record sections + the `excluded` diagnostics |
+| `eg query subsystem` | same, plus `semantic_drift` and `log_signatures` |
+| `eg query locate` | the context sections **and** the located `symbol` / `enclosing_chain` rows |
+| `eg query at` | the located `symbol` / `enclosing_chain` rows (shares the row shape; not itself a cross-domain answer) |
+| `eg query semantic-context` | the context sections of each match **and** each match's own anchor row |
+| `eg query task` | `tasks`, `acceptance_criteria` (incl. the nested `verification_record`), `source_facts`, `observations`, `artifacts`, `verification_evidence`, `reviews`, `external_links` |
+| `eg query changes` | every record-shaped section: `changed_files`, `changed_symbols`, `commits`, `tombstones`, `drift_records`, `unexplained`, `observations`, `project_state`, `artifacts`, `verification_evidence` |
+| `eg query error-context` | every `Row` and `SignatureBlock`, their nested `SourceHandle` / `BucketRow` projections, and the `excluded` diagnostics — alongside the pre-existing domain-lookup `trust_class` (see below) |
+| daemon `observations_for_symbol`, `criteria_for_task` | the same sections as their CLI counterparts |
+| MCP `symbol_context`, `task_evidence` | the same sections; MCP is the primary agentic consumption path |
+
+The CLI, daemon, and MCP transports all call the same derivation over the same
+kind of slice, so the *rule* cannot drift between them. One caveat: the CLI
+lanes derive over their corpus-filtered slice (`--at-head` / `--all-history`,
+see [Corpus scope](#corpus-scope-issue-427)) while the daemon has no corpus
+selector — same rule, potentially a different snapshot.
+
+### Domain is not trust
+
+Records already carry a `domain` namespace (issue #3), but `domain` is *where a
+record lives*, not *how much it should be trusted*. An `agent_memory`
+`Observation` may be an unverified guess, a guess backed by a passing
+verification record, or one that has since been contradicted — all three sit in
+the same domain. `trust` is what separates them.
+
+### Vocabulary (closed)
+
+| `trust` | Meaning | Typical kinds |
+|---|---|---|
+| `source_derived` | Deterministic code-graph or semantic-derived fact | `Symbol`, `File`, `Module`, `Import`, `Commit`, `Change`, `Diagnostic`, `ScanCoverage`, `PanicRiskSite`, `DebtMarker`, `UnsafeSite`, `DependencyDeclaration`, `Repository`, `SemanticDrift`, `EmbeddingModel`, `EmbeddingVector`, and code-graph topology edges |
+| `verification_evidence` | A recorded verification execution | `Verification`, `CommandEvidence`, `CommandRun`, `TestRun`, `CIStatus`, `BenchmarkRun`, `CoverageReport`, `ProofResult` |
+| `agent_verified` | Agent-authored claim citing at least one live **passing** verification record | `Observation`, `Decision`, `Failure` |
+| `agent_unverified` | Agent-authored claim with no such citation | `Observation`, `Decision`, `Failure` |
+| `agent_contradicted` | Agent-authored claim displaced by a live `CONTRADICTS`/`SUPERSEDES` relationship | `Observation`, `Decision`, `Failure` |
+| `project_state` | Imported external work state | `Task`, `AcceptanceCriterion`, `LocalTask`, `GitHubIssue`, `PR`, `Review`, `ExternalIdentity`, `ReviewStateTransition`, `ExternalLink`, `Product`, `Project`, `Plan` |
+| `artifact` | Produced bytes | `Artifact`, `PatchArtifact`, `FileEdit` |
+| `runtime_observation` | A program's own claim about its execution | `LogSource`, `ErrorSignature`, `LogEvent`, `LogOccurrenceBucket` |
+| `other` | No derivation rule applies | `Agent`, `AgentSession`, `AgentRun`, `AgentTurn`, `ToolCall`, `CostUsage`, `Retraction`, user-context kinds, non-topology edges |
+
+The vocabulary is closed and the classifier is an exhaustive match over every
+node kind with **no wildcard arm**, so a newly added kind fails to compile until
+it is deliberately classified. A kind with no rule maps to `other` — never to
+`source_derived` or `verification_evidence`.
+
+### Derivation rules
+
+`trust` is a deterministic function of the record's node kind plus its evidence
+and contradiction edges **at the queried snapshot**. Re-running the same answer
+over an unchanged store yields byte-identical labels; no wall clock, ranking, or
+numeric confidence is involved (per-observation `confidence` is a separate
+field and is unaffected).
+
+Non-agent kinds are labelled from their kind alone. Agent-authored kinds
+(`Observation`, `Decision`, `Failure`) are resolved in this precedence order:
+
+1. **Displaced → `agent_contradicted`.** The claim is superseded or contradicted
+   at this snapshot. Resolved by the same resolver that drives the
+   `temporal_status` field and the `excluded` section, so `trust` can never
+   disagree with them. A supersession *cycle* counts as displaced for the same
+   reason `--supersession exclude` drops it: the chain is broken, so the claim
+   cannot be presented as current.
+
+   Issue #114 folds `SUPERSEDES` and `CONTRADICTS` into this single label. Read
+   it as **displaced** — "another record has taken this one's place, do not act
+   on it" — rather than as a claim that the two records assert opposite things.
+
+2. **`agent_verified`.** The claim cites at least one live verification-domain
+   record through a backing relation (`VALIDATED_BY`, `HAS_EVIDENCE`, or
+   `PRODUCED_EVIDENCE` — as an evidence link on the claim or an outgoing edge
+   from it) **and** that record's recorded outcome is passing. A passing outcome
+   is a `status` of `pass`, `passed`, or `success` (trimmed, case-insensitive);
+   when `status` is absent, an `exit_code` of `0` counts. Anything else —
+   including an absent or unrecognized status — is **not** passing, so the
+   derivation fails closed to `agent_unverified` rather than overclaiming.
+
+   Contradiction wins over verification: a displaced claim that also cites a
+   passing run is `agent_contradicted`, not `agent_verified`.
+
+3. Otherwise **`agent_unverified`.**
+
+A tombstoned verification record is treated as absent and confers nothing. A
+generic relation that merely happens to point at a verification record (e.g.
+`RELATES_TO`) does not verify a claim.
+
+The backing-relation traversal is the one `--verified-only` uses on
+`eg query memory` and `eg query semantic-memory`, so the two surfaces agree on
+*which* records back a claim; `agent_verified` adds the passing requirement on
+top.
+
+### What a `trust` label does not claim
+
+- `verification_evidence` marks a **recorded verification execution**, never
+  proof of correctness or that the check passed. Read the row's own `status`.
+- `agent_verified` states that the claim **cites** a live passing verification
+  record. It is a structural fact about the graph, not a truth judgement about
+  the claim.
+- `source_derived` states that the record was derived deterministically from
+  source — not that it still matches the working tree. Use `--repo-path` for
+  that ([store freshness](#store-freshness---repo-path-issue-82)).
+- `project_state` is a claim made by an issue tracker, not verified by Egregore.
+- `agent_contradicted` marks the claim as displaced. It is not a verdict that
+  the displacing record is correct.
+
+### A different `trust` key on the single-domain lanes
+
+Several **single-domain** lanes already emit a top-level `trust` field with a
+*different* vocabulary, and they are unchanged:
+
+| Lane | `trust` value | What it means there |
+|---|---|---|
+| `who-imports`, `who-constructs`, `debt-markers`, `unsafe-sites`, `unwrap-expect` | `source_fact` | every row is an extractor fact — a fixed row-class label, not a derived class |
+| `change-impact` | `impact_lead` | the row is a lead to inspect, not a fact |
+| `deps`, `transitive-callees` | `dependency_lead` | ” |
+| `path`, `transitive-callers` | `reachability_lead` | ” |
+| `coupling` | `historical_co_change_lead` | ” |
+
+Those lanes return rows from **one** domain, so there is nothing to
+disambiguate: their `trust` names the kind of answer the whole lane gives. The
+derived vocabulary on this page applies **only** to the cross-domain answers
+listed above, which is where the distinction actually has to be made per row.
+
+The practical consequence: `trust` is only comparable across lanes of the same
+family. A consumer that wants the derived class must read it from a
+cross-domain answer; treating `who-imports`'s `source_fact` and `context`'s
+`source_derived` as the same string will not work. This overlap is a known
+wart — unifying it would be a breaking change to the documented output of ten
+shipped lanes and is deliberately out of scope here.
+
+### Relationship to the older `trust_class` field
+
+Some lanes (`eg query memory`, `eg query sessions`, `eg query
+transaction-time`, `eg query error-context`, and the subsystem `log_signatures`
+rows) already emit a `trust_class` field. That one is a **static, kind-only** bucket and is
+unchanged. `trust` is the **derived** per-row class described above; where the
+two overlap they agree, modulo two deliberate refinements:
+
+| `trust_class` | `trust` |
+|---|---|
+| `source_fact` | `source_derived` |
+| `agent_authored` | `agent_verified` / `agent_unverified` / `agent_contradicted` |
+| all others | identical string |
+
+`eg query error-context` emits both. Its `trust_class` is a pure **domain**
+lookup — every agent-memory record reads `agent_observation` whatever its
+evidence — so a verified and a contradicted observation are indistinguishable
+there. Read `trust` when that distinction matters.
+
+### Rows that carry no `trust`
+
+The `unresolved` section describes an evidence link whose target record is
+**absent** from the store slice. There is no record to classify, so those
+entries carry no `trust` — labelling an absence would be fabrication. The
+`excluded` diagnostics section does carry `trust`, since those entries name real
+records the answer chose to withhold.
+
+---
+
 ## Store freshness (`--repo-path`, issue #82)
 
 `eg query symbol`, `eg query file`, and `eg query context` accept an optional

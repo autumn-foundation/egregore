@@ -232,6 +232,16 @@ eg query error-context log:v3:<hex> --graph combined.graph.jsonl
   `--graph` queries and pure `scan` stores (issue #363, see above).
 - Every row carries a `trust_class`; runtime observations live only in
   `signatures`, never in `source_facts` (zero cross-class leakage).
+- Every record-shaped row *also* carries a derived `trust` class (issue #114) —
+  `Row`s, `SignatureBlock`s, their nested `SourceHandle` / `BucketRow`
+  projections, and the `excluded` diagnostics. The two fields answer different
+  questions: `trust_class` is a **domain** lookup, so every agent-memory record
+  reads `agent_observation` whatever its evidence, while `trust` resolves an
+  agent claim to `agent_verified` / `agent_unverified` / `agent_contradicted`
+  from its evidence and contradiction edges at the queried snapshot. Read
+  `trust` when you need to tell a verified claim from a contradicted one. The
+  closed vocabulary and derivation rules are documented once in
+  [`docs/cli/query.md` § Trust class](query.md#trust-class-trust-issue-114).
 - Output is deterministic and byte-identical across runs: every section is
   sorted by record ID (frames by `(frame_index, frame_resolution, target)`,
   buckets by `(bucket_start, record_id)`), and all timestamp ordering is by
