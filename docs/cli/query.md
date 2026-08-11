@@ -247,6 +247,7 @@ The lanes that carry the derived `trust` class described here:
 | `eg query semantic-context` | the context sections of each match **and** each match's own anchor row |
 | `eg query task` | `tasks`, `acceptance_criteria` (incl. the nested `verification_record`), `source_facts`, `observations`, `artifacts`, `verification_evidence`, `reviews`, `external_links` |
 | `eg query changes` | every record-shaped section: `changed_files`, `changed_symbols`, `commits`, `tombstones`, `drift_records`, `unexplained`, `observations`, `project_state`, `artifacts`, `verification_evidence` |
+| `eg query error-context` | every `Row`, alongside its pre-existing domain-lookup `trust_class` (see below) |
 | daemon `observations_for_symbol`, `criteria_for_task` | the same sections as their CLI counterparts |
 | MCP `symbol_context`, `task_evidence` | the same sections; MCP is the primary agentic consumption path |
 
@@ -369,9 +370,9 @@ shipped lanes and is deliberately out of scope here.
 
 ### Relationship to the older `trust_class` field
 
-Some non-context lanes (`eg query memory`, `eg query sessions`, `eg query
-transaction-time`, and the subsystem `log_signatures` rows) already emit a
-`trust_class` field. That one is a **static, kind-only** bucket and is
+Some lanes (`eg query memory`, `eg query sessions`, `eg query
+transaction-time`, `eg query error-context`, and the subsystem `log_signatures`
+rows) already emit a `trust_class` field. That one is a **static, kind-only** bucket and is
 unchanged. `trust` is the **derived** per-row class described above; where the
 two overlap they agree, modulo two deliberate refinements:
 
@@ -380,6 +381,11 @@ two overlap they agree, modulo two deliberate refinements:
 | `source_fact` | `source_derived` |
 | `agent_authored` | `agent_verified` / `agent_unverified` / `agent_contradicted` |
 | all others | identical string |
+
+`eg query error-context` emits both. Its `trust_class` is a pure **domain**
+lookup — every agent-memory record reads `agent_observation` whatever its
+evidence — so a verified and a contradicted observation are indistinguishable
+there. Read `trust` when that distinction matters.
 
 ### Rows that carry no `trust`
 

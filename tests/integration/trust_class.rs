@@ -746,6 +746,46 @@ fn agent_minted_command_evidence_does_not_confer_agent_verified_end_to_end() {
     );
 }
 
+/// The MCP tools are the primary agentic consumption path for these answers, so
+/// an unlabelled row there does the most damage.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn mcp_symbol_context_labels_every_record_with_a_trust_class() {
+    let fixture = fixture_trust_graph();
+    let text = fs::read_to_string(&fixture.path).expect("read fixture");
+    let records: Vec<GraphRecord> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("parse record"))
+        .collect();
+
+    let envelope =
+        aletheia_egregore::mcp::tool_symbol_context_from_records(&records, "trusted_function");
+    assert_eq!(envelope["ok"], Value::Bool(true));
+
+    let mut seen = 0_usize;
+    for section in RECORD_SECTIONS {
+        for row in rows(&envelope, section) {
+            let trust = row
+                .get("trust")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("MCP row in `{section}` carries no `trust`: {row}"));
+            assert!(TRUST_VOCABULARY.contains(&trust));
+            seen += 1;
+        }
+    }
+    assert!(seen > 0, "MCP symbol_context returned no rows");
+    assert_eq!(trust_of(&envelope, &fixture.symbol_id), "source_derived");
+    assert_eq!(
+        trust_of(&envelope, &fixture.verified_obs_id),
+        "agent_verified"
+    );
+    assert_eq!(
+        trust_of(&envelope, &fixture.unverified_obs_id),
+        "agent_unverified"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Liveness: a tombstoned verification record confers nothing
 // ---------------------------------------------------------------------------

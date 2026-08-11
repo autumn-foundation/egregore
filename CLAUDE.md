@@ -554,7 +554,9 @@ Every record returned by a CROSS-DOMAIN CONTEXT ANSWER carries a single derived
 `trust` field (issue #114) — `eg query context`, `subsystem`, `locate` (including
 the located `symbol`/`enclosing_chain` anchor rows, shared with `eg query at`),
 `semantic-context` (including each match's own anchor row), `task`, `changes`
-(EVERY record-shaped section, not just the cross-domain four), the daemon
+(EVERY record-shaped section, not just the cross-domain four), `error-context`
+(every `Row`, alongside its pre-existing DOMAIN-lookup `trust_class`, which
+reads `agent_observation` for any agent claim whatever its evidence), the daemon
 `observations_for_symbol` / `criteria_for_task` verbs, and the MCP
 `symbol_context` / `task_evidence` tools (the primary agentic consumption path).
 All three transports call the SAME derivation, so the RULE cannot drift; the one
