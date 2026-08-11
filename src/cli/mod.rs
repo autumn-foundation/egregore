@@ -4749,6 +4749,9 @@ pub(crate) struct WhoResult<'a> {
 pub(crate) struct ContextSourceFact<'a> {
     record_id: &'a str,
     kind: &'static str,
+    /// Derived trust class (issue #114): always `source_derived` for a
+    /// code-graph or semantic record. See `crate::query::TrustClass`.
+    trust: crate::query::TrustClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4788,6 +4791,9 @@ pub(crate) struct ContextUnresolved<'a> {
 #[derive(Serialize)]
 pub(crate) struct ContextTopologyEdge<'a> {
     record_id: &'a str,
+    /// Derived trust class (issue #114): always `source_derived` — this section
+    /// carries code-graph topology edges only.
+    trust: crate::query::TrustClass,
     label: &'static str,
     source_id: &'a str,
     target_id: &'a str,
@@ -4810,6 +4816,10 @@ pub(crate) struct ContextTopologyEdge<'a> {
 #[derive(Serialize)]
 pub(crate) struct ContextDrift<'a> {
     record_id: &'a str,
+    /// Derived trust class (issue #114): always `source_derived` — a
+    /// `SemanticDrift` record is a deterministic measurement, never an agent
+    /// claim.
+    trust: crate::query::TrustClass,
     score: f64,
     before_commit: &'a str,
     after_commit: &'a str,
@@ -4826,6 +4836,10 @@ pub(crate) struct ContextDrift<'a> {
 #[derive(Serialize)]
 pub(crate) struct ExcludedDiagnostic<'a> {
     record_id: &'a str,
+    /// Derived trust class of the excluded record (issue #114), so a consumer
+    /// reading the diagnostics section sees the same label the row would have
+    /// carried in the answer.
+    trust: crate::query::TrustClass,
     reason: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     superseded_by: Option<Vec<crate::temporal_status::TemporalReference>>,
@@ -4891,6 +4905,10 @@ pub(crate) struct TaskContextResponse<'a> {
 #[derive(Serialize)]
 pub(crate) struct SubsystemDrift<'a> {
     record_id: &'a str,
+    /// Derived trust class (issue #114): always `source_derived` — a
+    /// `SemanticDrift` record is a deterministic measurement, never an agent
+    /// claim.
+    trust: crate::query::TrustClass,
     score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_repo_relative_path: Option<&'a str>,
@@ -4919,6 +4937,10 @@ pub(crate) struct SubsystemLogFrame<'a> {
 pub(crate) struct SubsystemLogSignature<'a> {
     record_id: &'a str,
     kind: &'static str,
+    /// Derived trust class (issue #114): always `runtime_observation`. Carried
+    /// alongside the pre-existing `trust_class` field so every record in the
+    /// envelope answers to the same `trust` key.
+    trust: crate::query::TrustClass,
     trust_class: &'static str,
     schema_version: u32,
     severity: &'a str,
@@ -7568,6 +7590,19 @@ pub(crate) struct PublicApiDiagnosticJson<'a> {
 
 /// Maps a node kind to its trust class so an agent claim is never labelled as
 /// source truth (AC3).
+///
+/// This is the **static, kind-only** bucket rendered as `trust_class` by the
+/// non-context lanes (`eg query memory`, `eg query sessions`, `eg query
+/// transaction-time`, the subsystem `log_signatures` rows). Cross-domain
+/// context answers instead carry the **derived** per-row `trust` field from
+/// [`crate::query::TrustClass`] (issue #114), which renames this function's
+/// `source_fact` to `source_derived` and splits `agent_authored` into
+/// `agent_verified` / `agent_unverified` / `agent_contradicted` using the
+/// record's evidence and contradiction edges.
+///
+/// The correspondence between the two is pinned by
+/// `query::trust::tests::derived_and_legacy_trust_vocabularies_do_not_drift`,
+/// so changing one classifier without the other fails the build.
 pub(crate) fn trust_class_for(record: &GraphRecord) -> &'static str {
     let Some(kind) = record.node_kind_name() else {
         return "other";

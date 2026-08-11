@@ -4,13 +4,16 @@ use super::*;
 /// views, reusing the existing per-record builders (`context_source_fact`,
 /// `context_observation`, `context_linked_item`). `.copied()` collapses the
 /// `&&GraphRecord` from `iter()` so each view borrows the record slice directly.
-pub(crate) fn build_context_sections<'a>(ctx: &'a query::SymbolContext<'a>) -> ContextSections<'a> {
+pub(crate) fn build_context_sections<'a>(
+    ctx: &'a query::SymbolContext<'a>,
+    trust: &query::TrustIndex<'_>,
+) -> ContextSections<'a> {
     ContextSections {
         source_facts: ctx
             .source_facts
             .iter()
             .copied()
-            .filter_map(context_source_fact)
+            .filter_map(|r| context_source_fact(r, trust))
             .collect(),
         topology_edges: ctx
             .topology_edges
@@ -29,6 +32,7 @@ pub(crate) fn build_context_sections<'a>(ctx: &'a query::SymbolContext<'a>) -> C
                 {
                     Some(ContextTopologyEdge {
                         record_id: id,
+                        trust: trust.classify(r),
                         label: label.as_str(),
                         source_id: source,
                         target_id: target,
@@ -45,25 +49,25 @@ pub(crate) fn build_context_sections<'a>(ctx: &'a query::SymbolContext<'a>) -> C
             .observations
             .iter()
             .copied()
-            .filter_map(context_observation)
+            .filter_map(|r| context_observation(r, trust))
             .collect(),
         project_state: ctx
             .project_state
             .iter()
             .copied()
-            .filter_map(context_linked_item)
+            .filter_map(|r| context_linked_item(r, trust))
             .collect(),
         artifacts: ctx
             .artifacts
             .iter()
             .copied()
-            .filter_map(context_linked_item)
+            .filter_map(|r| context_linked_item(r, trust))
             .collect(),
         verification_evidence: ctx
             .verification_evidence
             .iter()
             .copied()
-            .filter_map(context_linked_item)
+            .filter_map(|r| context_linked_item(r, trust))
             .collect(),
         unresolved: ctx
             .unresolved
@@ -106,6 +110,7 @@ pub(crate) fn apply_supersession<'a>(
                 crate::temporal_status::SupersessionMode::Exclude => {
                     excluded.push(ExcludedDiagnostic {
                         record_id: obs.record_id,
+                        trust: obs.trust,
                         reason,
                         superseded_by: if superseded_by.is_empty() {
                             None
@@ -180,7 +185,8 @@ pub(crate) fn query_context_cmd(
         std::process::exit(2);
     }
 
-    let sections = build_context_sections(&ctx);
+    let trust = query::TrustIndex::build(records);
+    let sections = build_context_sections(&ctx, &trust);
 
     // Attach the freshness verdict only when every source fact belongs to the
     // repository the verdict was computed for (PR #186): `query context` has no
@@ -207,7 +213,7 @@ pub(crate) fn query_context_cmd(
         .iter()
         .copied()
         .zip(resolved_drift_targets)
-        .filter_map(|(record, resolved)| context_drift(record, resolved))
+        .filter_map(|(record, resolved)| context_drift(record, resolved, &trust))
         .collect();
 
     let corpus_disclaimer = corpus_mode.disclaimer().to_owned();
@@ -254,6 +260,7 @@ pub(crate) fn context_drift<'a>(
         Option<&'a str>,
         Option<crate::ir::SourceSpan>,
     ),
+    trust: &query::TrustIndex<'_>,
 ) -> Option<ContextDrift<'a>> {
     let GraphRecord::Node {
         id,
@@ -266,6 +273,7 @@ pub(crate) fn context_drift<'a>(
     let (resolved_path, _resolved_name, resolved_span) = resolved;
     Some(ContextDrift {
         record_id: id,
+        trust: trust.classify(record),
         score: drift.score,
         before_commit: &drift.before_git_commit,
         after_commit: &drift.after_git_commit,
@@ -277,7 +285,10 @@ pub(crate) fn context_drift<'a>(
     })
 }
 
-pub(crate) fn context_source_fact(record: &GraphRecord) -> Option<ContextSourceFact<'_>> {
+pub(crate) fn context_source_fact<'a>(
+    record: &'a GraphRecord,
+    trust: &query::TrustIndex<'_>,
+) -> Option<ContextSourceFact<'a>> {
     let GraphRecord::Node {
         id,
         kind,
@@ -296,6 +307,7 @@ pub(crate) fn context_source_fact(record: &GraphRecord) -> Option<ContextSourceF
     Some(ContextSourceFact {
         record_id: id,
         kind: kind.as_str(),
+        trust: trust.classify(record),
         name: name.as_deref(),
         repo_relative_path: repo_relative_path.as_deref(),
         span: *span,
