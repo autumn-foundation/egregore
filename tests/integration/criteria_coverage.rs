@@ -41,11 +41,21 @@ fn criterion_line(
     )
 }
 
+/// A verification record. Carries an evidence handle, as every real writer does
+/// — the write path refuses a verification record without one.
 fn verification_line(id: &str, kind: &str, status: Option<&str>, exit_code: Option<i64>) -> String {
     let status_field = status.map_or_else(String::new, |s| format!(r#","status":"{s}""#));
     let exit_field = exit_code.map_or_else(String::new, |c| format!(r#","exit_code":{c}"#));
     format!(
-        r#"{{"record_type":"node","id":"{id}","kind":"{kind}","domain":"verification","schema_version":1,"text":"SECRET-COMMAND-OUTPUT"{status_field}{exit_field},"summary":"run {id}"}}"#
+        r#"{{"record_type":"node","id":"{id}","kind":"{kind}","domain":"verification","schema_version":1,"text":"SECRET-COMMAND-OUTPUT","source_artifact_path":"tests/run.sh","source_artifact_hash":"blake3:fixture"{status_field}{exit_field},"summary":"run {id}"}}"#
+    )
+}
+
+/// A verification record with NO evidence handle — what the daemon refuses to
+/// persist but a hand-authored graph can still contain.
+fn verification_line_without_handle(id: &str, status: &str) -> String {
+    format!(
+        r#"{{"record_type":"node","id":"{id}","kind":"TestRun","domain":"verification","schema_version":1,"status":"{status}","summary":"run {id}"}}"#
     )
 }
 
@@ -707,7 +717,7 @@ fn hostile_store_values_cannot_forge_output_or_drive_the_terminal() {
     let lines = vec![
         task_line("task-done", "closed_completed"),
         format!(
-            r#"{{"record_type":"node","id":"verification:v1:evil","kind":"TestRun","domain":"verification","schema_version":1,"status":{},"summary":"evil"}}"#,
+            r#"{{"record_type":"node","id":"verification:v1:evil","kind":"TestRun","domain":"verification","schema_version":1,"source_artifact_hash":"blake3:evil","status":{},"summary":"evil"}}"#,
             serde_json::to_string(&evil_status).unwrap()
         ),
         // Resolves to the hostile record, so its `status` really flows through.
@@ -977,4 +987,89 @@ fn optional_citation_handles_are_emitted_when_recorded() {
     assert_eq!(r["span"]["start_line"], 3);
     assert_eq!(r["source_handle"], "tasks.jsonl:ac-cited:h");
     assert_eq!(r["external_link_id"], "project:v1:extlink");
+}
+
+/// A verification record citing no evidence handle, and a verification kind the
+/// closure edge may not target, must both be refused at the CLI level.
+#[test]
+fn evidence_provenance_and_legal_closure_kinds_are_required() {
+    // (a) A bare passing TestRun with no evidence handle.
+    let lines = vec![
+        task_line("task-done", "closed_completed"),
+        verification_line_without_handle("verification:v1:bare", "pass"),
+        criterion_line(
+            "ac-bare",
+            "task-done",
+            0,
+            "verified",
+            Some("verification:v1:bare"),
+        ),
+    ];
+    let (_g, path) = write_graph(&lines);
+    let (code, report, _) = run_graph(&path, &[]);
+    assert_eq!(
+        row(&report, "ac-bare")["bucket"],
+        "non_verification_evidence"
+    );
+    assert_eq!(
+        row(&report, "ac-bare")["closing_links"][0]["resolution"],
+        "missing_evidence_handle"
+    );
+    assert_eq!(code, 1, "a record citing nothing cannot prove");
+
+    // (b) A passing CoverageReport — a verification kind, but not one a
+    // CLOSES_ACCEPTANCE_CRITERION edge may target.
+    let lines = vec![
+        task_line("task-done", "closed_completed"),
+        verification_line("verification:v1:cov", "CoverageReport", Some("pass"), None),
+        criterion_line(
+            "ac-cov",
+            "task-done",
+            0,
+            "verified",
+            Some("verification:v1:cov"),
+        ),
+    ];
+    let (_g, path) = write_graph(&lines);
+    let (code, report, _) = run_graph(&path, &[]);
+    assert_eq!(
+        row(&report, "ac-cov")["bucket"],
+        "non_verification_evidence"
+    );
+    assert_eq!(
+        row(&report, "ac-cov")["closing_links"][0]["resolution"],
+        "not_verification_record"
+    );
+    assert_eq!(code, 1);
+}
+
+/// A `Task` rewritten from `closed_completed` to `open` must not let record
+/// order drop its unproven criteria out of the gap set.
+#[test]
+fn a_task_status_mutation_cannot_hide_a_criterion_from_the_gate() {
+    let lines = vec![
+        task_line("task-done", "closed_completed"),
+        criterion_line("ac-hidden", "task-done", 0, "unverified", None),
+        // A second write of the SAME task id, sorting/appearing later.
+        task_line("task-done", "open"),
+    ];
+    let (_g, path) = write_graph(&lines);
+    let (code, report, _) = run_graph(&path, &[]);
+    assert!(
+        report["claimed_done_unproven"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["record_id"] == "project:v1:ac-hidden"),
+        "a done version anywhere must hold the criterion in the gap set"
+    );
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "parent_task_status_ambiguous"),
+        "the ambiguity must be disclosed"
+    );
+    assert_eq!(code, 1);
 }

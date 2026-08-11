@@ -118,6 +118,7 @@ pub use trust::{TrustClass, TrustIndex};
 // the daemon write path, but it is not public API: re-exported crate-internally
 // so the shared rule cannot fork, without widening `egregore::query`.
 pub(crate) use trust::{
-    VERIFICATION_DOMAIN_KINDS, VerificationOutcome, is_verification_domain_kind,
-    is_verification_domain_record, verification_outcome,
+    CLOSURE_TARGET_KINDS, VERIFICATION_DOMAIN_KINDS, VerificationOutcome, has_evidence_handle,
+    is_closure_target_kind, is_verification_domain_kind, is_verification_domain_record,
+    verification_outcome,
 };

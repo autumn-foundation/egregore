@@ -2504,8 +2504,6 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
             kind,
             domain,
             schema_version,
-            source_artifact_hash,
-            source_artifact_path,
             stdout_handle,
             stderr_handle,
             executed_at,
@@ -2545,16 +2543,10 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
             )));
         }
 
-        let has_artifact_handle = source_artifact_hash
-            .as_deref()
-            .is_some_and(|s| !s.is_empty())
-            || source_artifact_path
-                .as_deref()
-                .is_some_and(|s| !s.is_empty());
-        let stdout_hash = stdout_handle.as_deref().is_some_and(|h| !h.hash.is_empty());
-        let stderr_hash = stderr_handle.as_deref().is_some_and(|h| !h.hash.is_empty());
-
-        if !has_artifact_handle && !stdout_hash && !stderr_hash {
+        // The predicate itself is shared with the read-side gate in
+        // `crate::criteria_coverage` (issue #115), so "what may be persisted as
+        // evidence" and "what a reader may treat as evidence" cannot fork.
+        if !crate::query::has_evidence_handle(record) {
             return Err(ApiError::new(
                 ErrorCode::MissingEvidenceHandle,
                 "verification-domain records must carry an evidence handle \
@@ -3619,11 +3611,7 @@ fn validate_project_edge(
                 source_kind,
                 &[NodeKind::AcceptanceCriterion],
                 target_kind,
-                &[
-                    NodeKind::Verification,
-                    NodeKind::CommandRun,
-                    NodeKind::TestRun,
-                ],
+                crate::query::CLOSURE_TARGET_KINDS,
             )?;
         }
         EdgeLabel::TouchesFile => {

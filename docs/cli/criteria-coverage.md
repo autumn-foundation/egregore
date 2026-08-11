@@ -50,19 +50,29 @@ The verbatim disclaimer appears in every report.
 `CLOSES_ACCEPTANCE_CRITERION` link to a verification record whose recorded
 outcome is passing.**
 
-Being a verification record takes **three checks, not one**:
+Being a verification record takes **four checks, not one**:
 
 1. the record ID is verification-domain (`verification:v<N>:`);
-2. the `NodeKind` is one the verification domain permits — the *same* list the
-   daemon write path enforces (`CommandRun`, `Verification`, `TestRun`,
-   `CIStatus`, `BenchmarkRun`, `CoverageReport`, `ProofResult`);
-3. the handle is not the criterion's own record ID.
+2. the `NodeKind` is one a `CLOSES_ACCEPTANCE_CRITERION` edge may target —
+   `Verification`, `CommandRun`, `TestRun`. This is deliberately **narrower**
+   than the verification domain itself: a passing `CoverageReport` or
+   `BenchmarkRun` closing a criterion is a relationship the write API rejects,
+   so the reader must not accept it either;
+3. the record carries the **evidence handle** the schema requires
+   (`source_artifact_hash`, `source_artifact_path`, or an output-handle hash).
+   A bare `TestRun { status: "pass" }` claims an outcome while citing nothing,
+   and the daemon refuses to persist one (`MissingEvidenceHandle`);
+4. the handle is not the criterion's own record ID.
 
-The ID prefix alone is not sufficient, because the embedded ingest path does not
-run the daemon's `validate_verification_domain_records`: a store really can hold
-a node with a `verification:v1:` ID and an `Observation`, `Task`, or even
-`AcceptanceCriterion` kind. Anything failing any of the three lands in
-`non_verification_evidence`.
+Checks 2 and 3 exist because `--graph` reads and embedded ingest both **bypass**
+the daemon's `validate_verification_domain_records` and `validate_project_edge`.
+A store really can hold a node with a `verification:v1:` ID and an `Observation`
+kind, or a passing `TestRun` citing no artifact at all — each of which a
+prefix-only gate would certify as proof. Every rule here is the *same constant*
+the write path enforces (`CLOSURE_TARGET_KINDS`, `has_evidence_handle`), shared
+so a reader can never accept what a writer would refuse. Failures land in
+`non_verification_evidence` with a precise resolution
+(`not_verification_record` / `missing_evidence_handle`).
 
 A criterion is **never** counted proven from:
 
@@ -207,6 +217,7 @@ fabricated `0.0` — alongside the stable `no_acceptance_criteria` diagnostic.
 | `no_acceptance_criteria` | Zero live criteria; ratios have a zero denominator. Not a failure. |
 | `dangling_closing_evidence` | Names every criterion carrying a closing handle that resolves to no live record — including one masked by a higher-precedence bucket. |
 | `criterion_parent_task_conflict` | `OWNED_BY_TASK` target ≠ `parent_task_id`; the field wins. |
+| `parent_task_status_ambiguous` | The owning `Task` has several live versions recording DIFFERENT statuses; the claimed-done test counts the criterion when ANY version is done. |
 | `criterion_parent_task_unresolved` | The owning `Task` does not resolve to a live `Task`. Still counted in the census, but can never enter the claimed-done set. |
 | `superseded_criteria_counted` | Names criteria recorded `status: superseded`, which ARE counted in the proof gap — disclosed because the symmetric argument excludes `closed_dropped` tasks. |
 | `results_truncated` | `--limit` truncated a row list; counts stay pre-truncation. |
@@ -337,10 +348,15 @@ lines (`Graph::to_jsonl`, `eg export`), so over `--graph` the relative order of
 two physical writes of one record ID carries no information about which is
 current. This lane therefore never decides an outcome by position: when live
 versions of a closing record disagree, the link resolves `ambiguous_versions` and
-the criterion is never reported `proven`. The residual limit is liveness — a
-record tombstoned and later re-added cannot be distinguished from one merely
-tombstoned in a sorted graph, so it is reported deleted. **`--data-dir` is the
-authoritative current-state read.**
+the criterion is never reported `proven`. The same rule covers the owning `Task`, which is
+*mutable* (`open` → `closed_completed`): the claimed-done test reads **every**
+live version and counts the criterion when any of them is done, so a status
+mutation can never drop unproven criteria out of the gap set by line order.
+Disagreeing versions are disclosed as `parent_task_status_ambiguous`.
+
+The residual limit is liveness — a record tombstoned and later re-added cannot be
+distinguished from one merely tombstoned in a sorted graph, so it is reported
+deleted. **`--data-dir` is the authoritative current-state read.**
 
 ## Scope
 
