@@ -3842,6 +3842,53 @@ pub(crate) enum AuditSubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Report store-wide acceptance-criterion verification coverage (issue #115).
+    ///
+    /// Classifies every live `AcceptanceCriterion` in the store into a CLOSED,
+    /// mutually exclusive bucket set — `proven`, `failed_evidence`,
+    /// `dangling_evidence`, `non_verification_evidence`, `inconclusive_evidence`,
+    /// `unverified` — names the CLAIMED-DONE-BUT-UNPROVEN set (criteria owned by
+    /// a closed/done `Task` that carry no passing evidence), and gates on the
+    /// proven ratio and that set's size.
+    ///
+    /// `proven` derives ONLY from a live `CLOSES_ACCEPTANCE_CRITERION` link to a
+    /// verification-DOMAIN record with a passing outcome — never from
+    /// `Task.status`, never from the criterion's own recorded `status`, never
+    /// from an agent-authored claim. A poor number is a reason to REVIEW/VERIFY,
+    /// never proof that any one task is wrong.
+    ///
+    /// Distinct from `eg query task` (#48, one task's evidence),
+    /// `eg query verification-coverage` (#109, code symbols lacking
+    /// verification), and `eg audit memory-health` (#94, agent-memory health).
+    ///
+    /// Exit codes:
+    ///   0 — every threshold met (`ok: true`); a store with zero acceptance
+    ///       criteria is a vacuous pass carrying `no_acceptance_criteria`.
+    ///   1 — a threshold was breached (`ok: false`); the full report is still
+    ///       printed with a `breaches` array naming each metric and its observed
+    ///       value.
+    ///   2 — usage/load error (both or neither input flag, out-of-range
+    ///       threshold or `--limit`, unreadable/empty store or graph).
+    CriteriaCoverage {
+        /// Graph JSONL path (mutually exclusive with `--data-dir`).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` store directory (mutually exclusive with `--graph`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Minimum acceptable `proven / total_criteria` ratio.
+        #[arg(long, default_value_t = 1.0)]
+        min_proven_ratio: f64,
+        /// Maximum acceptable claimed-done-but-unproven criterion count.
+        #[arg(long, default_value_t = 0)]
+        max_claimed_done_unproven: usize,
+        /// Per-list row cap.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Gate semantic-search relevance against a labeled query corpus (issue #106).
     ///
     /// Runs every corpus query against an `--embed` embedded store, computes

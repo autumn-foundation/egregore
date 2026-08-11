@@ -1723,6 +1723,72 @@ derivation now that #334 is merged, emitting the `capability_unavailable`
 diagnostic only for a pre-#334 store with no reviewed-commit facts. See
 `docs/cli/review-coverage.md`.
 
+`eg audit criteria-coverage --graph <g>|--data-dir <d>` is the store-wide
+acceptance-criterion verification-coverage census and proof-gap gate (issue #115)
+— the roll-up neither `eg query task` (#48, ONE named task's evidence),
+`eg query verification-coverage` (#109, code SYMBOLS lacking verification), nor
+`eg audit memory-health` (#94, agent-memory) can give: "across all imported work,
+which acceptance criteria are actually proven, and which tasks are marked done
+while owning unproven criteria?" Every live `AcceptanceCriterion` lands in exactly
+ONE of a CLOSED, mutually exclusive 6-bucket set that sums to `total_criteria`:
+`proven`, `failed_evidence`, `dangling_evidence`, `non_verification_evidence`,
+`inconclusive_evidence`, `unverified`. `proven` derives ONLY from a live
+`CLOSES_ACCEPTANCE_CRITERION` link (edge OR the denormalized
+`verification_link_id`, both read) to a record that provably lives in the
+VERIFICATION DOMAIN by its `verification:v<N>:` id prefix — the SAME gate
+`src/query/trust.rs` applies — whose outcome is PASSING. Never from `Task.status`,
+never from the criterion's own `AcceptanceCriterion.status: verified` (echoed as
+`criterion_status` for citation, never read for bucketing), never from an agent
+observation, commit message, prose, or semantic similarity. The domain gate closes
+a SELF-CERTIFICATION hole: `eg command-evidence` mints `NodeKind::CommandEvidence`
+under an `agent_memory:v1:` id with a status derived purely from an agent-supplied
+`--exit-code`, so without it an agent could write its own proof and have Egregore
+certify a criterion from it; such a link lands in `non_verification_evidence` —
+reported with its claimed status visible, never counted. Pass/fail is the SINGLE
+SHARED `verification_outcome` rule in `src/query/trust.rs` (passing
+`pass`/`passed`/`success` or, absent a status, `exit_code == 0`; failing
+`fail`/`failed`/`failure`/`error`/`errored`/`timeout`/`timed_out` or a non-zero
+exit code; everything else — including `skip` — INCONCLUSIVE, fail-closed), reused
+verbatim so this census and the derived `agent_verified` trust class cannot drift
+into two notions of "passing"; a disjointness test pins the two vocabularies
+apart. Bucket precedence is FAIL-CLOSED (`failed_evidence` > `dangling_evidence` >
+`non_verification_evidence` > `inconclusive_evidence` > `proven` > `unverified`),
+so a passing link can never mask a failing or dangling one; the schema's many:1
+cardinality means it normally never fires, and every handle rides on the row in
+`closing_links` with its own closed-set `resolution` so the derivation is
+auditable rather than asserted. The CLAIMED-DONE-BUT-UNPROVEN set names criteria
+owned (via `OWNED_BY_TASK` OR `parent_task_id`, both read; on disagreement the
+field wins and `criterion_parent_task_conflict` is reported) by a Task in a
+closed/done state that are not `proven`, each citing criterion + parent-task +
+closing-verification handles; `done_task_statuses` is echoed into every report and
+is `["closed_completed"]` ALONE — `closed_dropped` is closed but claims no
+completion, so counting it would manufacture a proof gap for deliberately
+abandoned work. Every ratio reports `{numerator, denominator, ratio}` and NEVER a
+bare percentage; a zero denominator reports `ratio: null` (never a divide-by-zero,
+never a fabricated `0.0`) with the stable `no_acceptance_criteria` diagnostic and
+is a VACUOUS PASS. The gate is `--min-proven-ratio` (default 1.0) and
+`--max-claimed-done-unproven` (default 0): exit 0 met, exit 1 breached (full
+report still printed with a `breaches` array naming each metric, observed value,
+and bound), exit 2 usage/load — an out-of-range or non-finite threshold is an
+ERROR, never a clamp, so the gate cannot be silently disabled or inverted. Output
+is allow-list only (IDs, handles, enums, kinds, spans, paths, counts, ratios,
+bounded messages — never criterion `text`, task titles, command output, patch
+hunks, or tokens; pinned by sentinel strings planted in every prose field), pure
+and deterministic (no I/O, no wall clock, byte-identical across 5 runs and
+independent of record order), and strictly read-only (`--data-dir` reads a
+throwaway copy; a fixture fingerprints every store file before and after).
+Liveness is the shared latest-write-wins `Liveness` gate so `--graph` and
+`--data-dir` agree. TRANSPORT NOTE: the ingest write path enforces referential
+integrity, so an edge to a NEVER-WRITTEN target cannot exist in an embedded store
+— the absent-target flavour of `dangling_evidence` is `--graph`-only, while the
+tombstoned-target flavour is reachable on both. A poor coverage number is a reason
+to REVIEW/VERIFY, never proof that any one task is wrong; absence of closing
+evidence means no imported proof, not that the work is broken; presence of a
+passing record is a recorded execution, never proof of correctness. This slice
+only MEASURES — it never auto-closes, auto-verifies, re-runs tests, or edits any
+status, and introduces no new graph domain, node kind, edge vocabulary, importer,
+trust model, or schema version. See `docs/cli/criteria-coverage.md`.
+
 `eg import github <owner>/<repo>` preserves review-state HISTORY so a dismissal
 never erases an approval (issue #336). For each PR whose `/pulls` list entry
 changed — the SAME `pulls_changed` trigger that drives the per-PR review
