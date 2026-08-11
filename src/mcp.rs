@@ -352,11 +352,18 @@ pub fn tool_inspect_store_from_records(
 
 /// Builds an evidence-backed symbol context for a record slice.
 ///
-/// Returns trust-separated sections: `source_facts` (deterministic code-graph),
+/// Returns domain-separated sections: `source_facts` (deterministic code-graph),
 /// `observations` (agent-authored — never treat as source truth), `project_state`
 /// (tasks/ACs), `artifacts`, `verification_evidence`, and `drift_history`
 /// (issue #108's `SemanticDrift` rows, resolved to the same citable
 /// `repo_relative_path`/`span` handle the CLI and daemon render).
+///
+/// The section a record lands in is its DOMAIN, which is not the same thing as
+/// how far it should be trusted — an `observations` row may be an unverified
+/// guess, one backed by a passing verification record, or one since
+/// contradicted. Every returned record therefore also carries a derived `trust`
+/// class (issue #114) from the same closed vocabulary the CLI and daemon use;
+/// see `crate::query::TrustClass` and `docs/cli/query.md`.
 ///
 /// Returns `{"ok":false,"error":{"code":"no_match"}}` when the symbol is absent.
 /// Output ordering is deterministic (sorted by record ID within each section).
@@ -371,42 +378,44 @@ pub fn tool_symbol_context_from_records(records: &[GraphRecord], symbol_name: &s
         });
     }
 
+    let trust = query::TrustIndex::build(records);
+
     let source_facts: Vec<Value> = ctx
         .source_facts
         .iter()
-        .filter_map(|r| record_to_source_fact(r))
+        .filter_map(|r| record_to_source_fact(r, &trust))
         .collect();
     let observations: Vec<Value> = ctx
         .observations
         .iter()
-        .filter_map(|r| record_to_observation(r))
+        .filter_map(|r| record_to_observation(r, &trust))
         .collect();
     let project_state: Vec<Value> = ctx
         .project_state
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let artifacts: Vec<Value> = ctx
         .artifacts
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let verification_evidence: Vec<Value> = ctx
         .verification_evidence
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let topology_edges: Vec<Value> = ctx
         .topology_edges
         .iter()
-        .filter_map(|r| record_to_topology_edge(r))
+        .filter_map(|r| record_to_topology_edge(r, &trust))
         .collect();
     let resolved_drift_targets = query::resolve_drift_targets(records, &ctx.drift_history);
     let drift_history: Vec<Value> = ctx
         .drift_history
         .iter()
         .zip(resolved_drift_targets)
-        .filter_map(|(r, resolved)| record_to_drift(r, resolved))
+        .filter_map(|(r, resolved)| record_to_drift(r, resolved, &trust))
         .collect();
     let unresolved: Vec<Value> = ctx.unresolved.iter().map(unresolved_to_json).collect();
 
@@ -475,16 +484,18 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
         });
     }
 
+    let trust = query::TrustIndex::build(records);
+
     let tasks: Vec<Value> = ctx
         .tasks
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let acceptance_criteria: Vec<Value> = ctx
         .acceptance_criteria
         .iter()
         .filter_map(|r| {
-            let mut item = record_to_linked_item(r)?;
+            let mut item = record_to_linked_item(r, &trust)?;
             if item["status"].as_str() == Some("verified") {
                 let GraphRecord::Node {
                     verification_link_id,
@@ -514,7 +525,7 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
                 });
                 if let Some(ver) = ver_id
                     .and_then(|vid| records.iter().find(|c| c.id() == vid))
-                    .and_then(record_to_linked_item)
+                    .and_then(|r| record_to_linked_item(r, &trust))
                 {
                     item["verification_record"] = ver;
                 }
@@ -522,35 +533,37 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
             Some(item)
         })
         .collect();
+    let trust = query::TrustIndex::build(records);
+
     let source_facts: Vec<Value> = ctx
         .source_facts
         .iter()
-        .filter_map(|r| record_to_source_fact(r))
+        .filter_map(|r| record_to_source_fact(r, &trust))
         .collect();
     let observations: Vec<Value> = ctx
         .observations
         .iter()
-        .filter_map(|r| record_to_observation(r))
+        .filter_map(|r| record_to_observation(r, &trust))
         .collect();
     let artifacts: Vec<Value> = ctx
         .artifacts
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let verification_evidence: Vec<Value> = ctx
         .verification_evidence
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let reviews: Vec<Value> = ctx
         .reviews
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let external_links: Vec<Value> = ctx
         .external_links
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| record_to_linked_item(r, &trust))
         .collect();
     let unresolved: Vec<Value> = ctx.unresolved.iter().map(unresolved_to_json).collect();
 
@@ -585,7 +598,7 @@ fn run_inspect_store(data_dir: &Path) -> Value {
 
 // ── Record → JSON helpers ─────────────────────────────────────────────────────
 
-fn record_to_source_fact(record: &GraphRecord) -> Option<Value> {
+fn record_to_source_fact(record: &GraphRecord, trust: &query::TrustIndex<'_>) -> Option<Value> {
     let GraphRecord::Node {
         id,
         kind,
@@ -604,6 +617,7 @@ fn record_to_source_fact(record: &GraphRecord) -> Option<Value> {
     Some(json!({
         "record_id": id,
         "kind": kind.as_str(),
+        "trust": trust.classify(record).as_str(),
         "name": name,
         "repo_relative_path": repo_relative_path,
         "span": span,
@@ -615,7 +629,7 @@ fn record_to_source_fact(record: &GraphRecord) -> Option<Value> {
     }))
 }
 
-fn record_to_observation(record: &GraphRecord) -> Option<Value> {
+fn record_to_observation(record: &GraphRecord, trust: &query::TrustIndex<'_>) -> Option<Value> {
     let GraphRecord::Node {
         id,
         kind,
@@ -654,6 +668,7 @@ fn record_to_observation(record: &GraphRecord) -> Option<Value> {
     Some(json!({
         "record_id": id,
         "kind": kind.as_str(),
+        "trust": trust.classify(record).as_str(),
         "summary": summary,
         "text": text,
         "provenance_handle": provenance_handle,
@@ -677,7 +692,7 @@ fn patch_handle_citation(h: &crate::ir::PatchHandle) -> Value {
     json!({ "path": h.path })
 }
 
-fn record_to_linked_item(record: &GraphRecord) -> Option<Value> {
+fn record_to_linked_item(record: &GraphRecord, trust: &query::TrustIndex<'_>) -> Option<Value> {
     let GraphRecord::Node {
         id,
         kind,
@@ -733,6 +748,7 @@ fn record_to_linked_item(record: &GraphRecord) -> Option<Value> {
     Some(json!({
         "record_id": id,
         "kind": kind.as_str(),
+        "trust": trust.classify(record).as_str(),
         "summary": summary,
         "title": title,
         "name": name,
@@ -764,7 +780,7 @@ fn record_to_linked_item(record: &GraphRecord) -> Option<Value> {
     }))
 }
 
-fn record_to_topology_edge(record: &GraphRecord) -> Option<Value> {
+fn record_to_topology_edge(record: &GraphRecord, trust: &query::TrustIndex<'_>) -> Option<Value> {
     let GraphRecord::Edge {
         id,
         label,
@@ -779,6 +795,7 @@ fn record_to_topology_edge(record: &GraphRecord) -> Option<Value> {
     };
     Some(json!({
         "record_id": id,
+        "trust": trust.classify(record).as_str(),
         "label": label.as_str(),
         "source_id": source,
         "target_id": target,
@@ -803,6 +820,7 @@ fn record_to_topology_edge(record: &GraphRecord) -> Option<Value> {
 fn record_to_drift(
     record: &GraphRecord,
     resolved: (Option<&str>, Option<&str>, Option<crate::ir::SourceSpan>),
+    trust: &query::TrustIndex<'_>,
 ) -> Option<Value> {
     let GraphRecord::Node {
         id,
@@ -815,6 +833,7 @@ fn record_to_drift(
     let (resolved_path, _resolved_name, resolved_span) = resolved;
     let mut obj = serde_json::Map::new();
     obj.insert("record_id".to_owned(), json!(id.as_str()));
+    obj.insert("trust".to_owned(), json!(trust.classify(record).as_str()));
     obj.insert("score".to_owned(), json!(drift.score));
     obj.insert("before_commit".to_owned(), json!(&drift.before_git_commit));
     obj.insert("after_commit".to_owned(), json!(&drift.after_git_commit));

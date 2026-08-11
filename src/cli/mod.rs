@@ -4998,6 +4998,12 @@ pub(crate) struct SubsystemResponse<'a> {
 #[derive(Serialize)]
 pub(crate) struct SemanticContextMatch<'a> {
     record_id: &'a str,
+    /// Derived trust class of the matched record (issue #114). A semantic match
+    /// anchors on a code-graph `Symbol`/`File`, so this is `source_derived`; it
+    /// is emitted rather than assumed so every record the envelope returns —
+    /// including the match anchor, not just the rows of its context sections —
+    /// carries a label.
+    trust: crate::query::TrustClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]

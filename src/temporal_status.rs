@@ -1,4 +1,5 @@
 use crate::ir::{EdgeLabel, GraphRecord};
+use crate::query::liveness::Liveness;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -38,11 +39,28 @@ struct DfsFrame<'b, 'a> {
 
 impl<'a> TemporalResolver<'a> {
     /// Build the resolver from a slice of graph records.
+    ///
+    /// Only **live** displacement relationships are collected: a `SUPERSEDES` /
+    /// `CONTRADICTS` edge or a relationship-bearing node whose own record has
+    /// been retracted (its tombstone is the id's most recent write, per the
+    /// shared latest-write-wins [`Liveness`] gate) is skipped, and a stale
+    /// earlier version of an edge id never supplies the relationship. A
+    /// retracted contradiction therefore stops displacing its target, instead of
+    /// leaving an otherwise-current claim permanently marked `superseded` /
+    /// `contradicted` (and, since issue #114 derives its `agent_contradicted`
+    /// trust class from this same resolver, permanently mislabelled).
+    ///
+    /// Honest limit: liveness is evaluated on the record that *carries* the
+    /// relationship. A live `CONTRADICTS` edge whose source node was separately
+    /// retracted still displaces its target; retract the edge to withdraw the
+    /// relationship.
     #[must_use]
     pub fn build(records: &'a [GraphRecord]) -> Self {
         let mut superseded_by: HashMap<&'a str, HashSet<&'a str>> = HashMap::new();
         let mut contradicts: HashMap<&'a str, HashSet<&'a str>> = HashMap::new();
         let mut records_by_id: HashMap<&'a str, &'a GraphRecord> = HashMap::new();
+
+        let liveness = Liveness::new(records);
 
         // First pass: collect all nodes by ID
         for r in records {
@@ -51,8 +69,21 @@ impl<'a> TemporalResolver<'a> {
             }
         }
 
-        // Second pass: extract relationships from nodes
-        for r in records {
+        // Second pass: extract relationships from live records
+        for (index, r) in records.iter().enumerate() {
+            // A retracted record asserts nothing. Edges additionally contribute
+            // only from their latest version, so superseded edge metadata never
+            // resurrects a withdrawn relationship.
+            match r {
+                GraphRecord::Node { id, .. } if liveness.deleted(id.as_str()) => continue,
+                GraphRecord::Edge { id, .. }
+                    if liveness.deleted(id.as_str())
+                        || !liveness.is_latest_edge_version(id.as_str(), index) =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
             match r {
                 GraphRecord::Node {
                     id,

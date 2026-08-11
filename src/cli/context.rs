@@ -203,9 +203,11 @@ pub(crate) fn query_context_cmd(
         (owners.len() == 1 && owners.contains(&Some(owner_id.as_str()))).then_some(code)
     });
 
-    let resolver = crate::temporal_status::TemporalResolver::build(records);
+    // Reuse the resolver the trust index already built over this exact slice
+    // (one O(n) build per answer) so `trust` and `temporal_status` can never be
+    // computed from different corpora.
     let (observations, excluded) =
-        apply_supersession(sections.observations, &resolver, supersession);
+        apply_supersession(sections.observations, trust.resolver(), supersession);
 
     let resolved_drift_targets = query::resolve_drift_targets(records, &ctx.drift_history);
     let drift_history: Vec<ContextDrift<'_>> = ctx

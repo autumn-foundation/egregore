@@ -38,6 +38,12 @@ pub(crate) struct LocationNodeJson<'a> {
     pub(crate) symbol_kind: Option<&'a str>,
     pub(crate) repo_relative_path: Option<&'a str>,
     pub(crate) span: Option<SourceSpan>,
+    /// Derived trust class (issue #114). A located node is always a code-graph
+    /// `Symbol`/`Module`, so this is `source_derived`; it is emitted rather than
+    /// assumed so `eg query locate` — a cross-domain context answer — labels
+    /// *every* record it returns, including the located symbol and its
+    /// enclosing chain.
+    pub(crate) trust: crate::query::TrustClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) language: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,7 +82,10 @@ pub(crate) struct LocationResponse<'a> {
     corpus_disclaimer: String,
 }
 
-pub(crate) fn location_node_json(record: &GraphRecord) -> Option<LocationNodeJson<'_>> {
+pub(crate) fn location_node_json<'a>(
+    record: &'a GraphRecord,
+    trust: &query::TrustIndex<'_>,
+) -> Option<LocationNodeJson<'a>> {
     let GraphRecord::Node {
         id,
         kind,
@@ -103,6 +112,7 @@ pub(crate) fn location_node_json(record: &GraphRecord) -> Option<LocationNodeJso
         symbol_kind: symbol_kind.as_deref(),
         repo_relative_path: repo_relative_path.as_deref(),
         span: *span,
+        trust: trust.classify(record),
         language: language.as_deref(),
         visibility: visibility.as_deref(),
         signature: signature.as_deref(),
@@ -195,7 +205,8 @@ pub(crate) fn query_at_cmd(
         location_error_exit(&error, 2);
     };
 
-    let symbol = location_node_json(primary).expect("primary is a node by construction");
+    let trust = query::TrustIndex::build(records);
+    let symbol = location_node_json(primary, &trust).expect("primary is a node by construction");
     let repository_id = index.owner_of(symbol.record_id);
     let (corpus_mode, corpus_mode_source, corpus_disclaimer) =
         disclose_head_anchored_corpus(records, at_prefix.is_some());
@@ -207,7 +218,7 @@ pub(crate) fn query_at_cmd(
         enclosing_chain: ctx
             .chain
             .iter()
-            .filter_map(|record| location_node_json(record))
+            .filter_map(|record| location_node_json(record, &trust))
             .collect(),
         repository_id,
         repository: repository_id.and_then(|repo| index.display_of(repo)),

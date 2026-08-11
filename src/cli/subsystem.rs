@@ -60,8 +60,10 @@ pub(crate) fn query_subsystem_cmd(
         .filter_map(|r| context_observation(r, &trust))
         .collect();
 
-    let resolver = crate::temporal_status::TemporalResolver::build(records);
-    let (observations, excluded) = apply_supersession(raw_observations, &resolver, supersession);
+    // Shared with the trust index (built over this exact slice) so `trust` and
+    // `temporal_status` cannot be computed from different corpora.
+    let (observations, excluded) =
+        apply_supersession(raw_observations, trust.resolver(), supersession);
 
     let project_state: Vec<ContextLinkedItem<'_>> = ctx
         .project_state
@@ -154,7 +156,9 @@ pub(crate) fn query_subsystem_cmd(
             record_id: s.record_id,
             kind: "ErrorSignature",
             trust: crate::query::TrustClass::RuntimeObservation,
-            trust_class: "runtime_observation",
+            // Tied to the same value so the two vocabularies cannot be typed
+            // out independently and drift.
+            trust_class: crate::query::TrustClass::RuntimeObservation.as_str(),
             schema_version: s.schema_version,
             severity: s.severity,
             occurrence_count: s.occurrence_count,

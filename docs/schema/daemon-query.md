@@ -566,10 +566,16 @@ its evidence and contradiction edges at the queried snapshot, so repeating a
 query over an unchanged store yields byte-identical labels.
 
 **Parity:** the daemon and `eg query context` / `eg query task` call the same
-derivation, so a record labelled `agent_unverified` over one transport is
-labelled `agent_unverified` over the other. Adding `trust` is **additive** — no
-existing field changed and `DAEMON_QUERY_SCHEMA_VERSION` is unaffected (see
-§9).
+derivation, so the *rule* cannot drift between transports. Caveat: the CLI lanes
+derive over their corpus-filtered slice (`--at-head` / `--all-history`) while
+this surface has no corpus selector — same rule, potentially a different
+snapshot.
+
+**Versioning:** adding `trust` is an **additive** change under §9 — a new
+response field, with no existing field renamed, removed, or reshaped — so
+`DAEMON_QUERY_SCHEMA_VERSION` stays `1`. This matches the precedent set when
+issue #108 added the whole `drift_history` section to `observations_for_symbol`
+without a bump.
 
 The `unresolved` section carries no `trust`: its entries describe an evidence
 link whose target record is **absent**, and there is no record to classify. The
@@ -615,7 +621,11 @@ Cursor-based pagination is reserved for a future slice.
 
 `DAEMON_QUERY_SCHEMA_VERSION = 1` is a Rust constant in `src/daemon.rs`.
 
-- Additive changes (new verbs, new optional response fields) do not bump the version.
+- Additive changes (new verbs, new response fields — whether optional or always
+  present) do not bump the version. A consumer reading version 1 still finds
+  every version-1 field, unrenamed and unreshaped; JSON consumers tolerate keys
+  they do not know. The looser summary at the top of this document ("changes
+  that alter the response shape") is subordinate to this rule.
 - Breaking changes (renamed verbs, removed fields, changed `record` shapes for
   existing verbs) require bumping `DAEMON_QUERY_SCHEMA_VERSION` and updating
   this document and `daemon-api.md`.

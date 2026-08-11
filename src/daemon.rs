@@ -10219,15 +10219,15 @@ fn build_context_sections(
     records: &[GraphRecord],
     ctx: &graph_query::SymbolContext<'_>,
     limit: usize,
+    trust: &graph_query::TrustIndex<'_>,
 ) -> ContextSections {
     let mut rem = limit;
-    let trust = graph_query::TrustIndex::build(records);
 
     let source_facts: Vec<_> = ctx
         .source_facts
         .iter()
         .take(rem)
-        .map(|r| context_source_fact_to_json(r, &trust))
+        .map(|r| context_source_fact_to_json(r, trust))
         .collect();
     rem = rem.saturating_sub(source_facts.len());
 
@@ -10265,7 +10265,7 @@ fn build_context_sections(
         .observations
         .iter()
         .take(rem)
-        .map(|r| context_observation_to_json(r, &trust))
+        .map(|r| context_observation_to_json(r, trust))
         .collect();
     rem = rem.saturating_sub(observations.len());
 
@@ -10273,7 +10273,7 @@ fn build_context_sections(
         .project_state
         .iter()
         .take(rem)
-        .map(|r| context_linked_item_to_json(r, &trust))
+        .map(|r| context_linked_item_to_json(r, trust))
         .collect();
     rem = rem.saturating_sub(project_state.len());
 
@@ -10281,7 +10281,7 @@ fn build_context_sections(
         .artifacts
         .iter()
         .take(rem)
-        .map(|r| context_linked_item_to_json(r, &trust))
+        .map(|r| context_linked_item_to_json(r, trust))
         .collect();
     rem = rem.saturating_sub(artifacts.len());
 
@@ -10289,7 +10289,7 @@ fn build_context_sections(
         .verification_evidence
         .iter()
         .take(rem)
-        .map(|r| context_linked_item_to_json(r, &trust))
+        .map(|r| context_linked_item_to_json(r, trust))
         .collect();
     rem = rem.saturating_sub(verification_evidence.len());
 
@@ -10300,7 +10300,7 @@ fn build_context_sections(
     let drift_history: Vec<_> = drift_history_records
         .iter()
         .zip(resolved_drift_targets)
-        .filter_map(|(r, resolved)| context_drift_to_json(r, resolved, &trust))
+        .filter_map(|(r, resolved)| context_drift_to_json(r, resolved, trust))
         .collect();
     rem = rem.saturating_sub(drift_history.len());
 
@@ -10354,12 +10354,14 @@ fn apply_supersession_json(
                 };
                 match mode {
                     crate::temporal_status::SupersessionMode::Exclude => {
-                        // Carry the row's derived trust class into the
-                        // diagnostic so the daemon's `excluded` section matches
-                        // the CLI's `ExcludedDiagnostic` shape (issue #114).
+                        // A displaced agent claim is `agent_contradicted` by the
+                        // same derivation that produced this branch, so the
+                        // diagnostic carries the class as a typed constant --
+                        // never recovered from the JSON it was rendered into,
+                        // which could silently yield `null` (issue #114).
                         let mut diag = serde_json::json!({
                             "record_id": record_id,
-                            "trust": obs.get("trust").cloned().unwrap_or_default(),
+                            "trust": graph_query::TrustClass::AgentContradicted.as_str(),
                             "reason": reason,
                         });
                         if !superseded_by.is_empty() {
@@ -10535,10 +10537,14 @@ fn handle_verb_observations_for_symbol(
         );
     }
 
-    let s = build_context_sections(&records, &ctx, limit);
+    // One index per answer, built over the same slice the context was: it owns
+    // the supersession resolver `apply_supersession_json` needs, so `trust` and
+    // `temporal_status` can never be computed from different corpora.
+    let trust = graph_query::TrustIndex::build(&records);
+    let s = build_context_sections(&records, &ctx, limit, &trust);
 
-    let resolver = crate::temporal_status::TemporalResolver::build(&records);
-    let (observations, excluded) = apply_supersession_json(s.observations, &resolver, supersession);
+    let (observations, excluded) =
+        apply_supersession_json(s.observations, trust.resolver(), supersession);
 
     HttpResponse::success(
         Some(request_id),

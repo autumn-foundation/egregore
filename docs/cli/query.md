@@ -236,10 +236,25 @@ distinction between them can collapse. Without a per-row label the cheapest
 thing a consuming agent can do is treat every row as equally true, which is the
 failure the PRD calls out ("cannot distinguish source truth from agent guesses").
 
-The lanes that carry `trust`: `eg query context`, `eg query subsystem`,
-`eg query locate`, `eg query semantic-context`, `eg query task`, `eg query
-changes`, and the daemon `observations_for_symbol` / `task_context` verbs (both
-transports serialize the same derivation, so they cannot drift).
+The lanes that carry the derived `trust` class described here:
+
+| Surface | Notes |
+|---|---|
+| `eg query context` | all record sections + the `excluded` diagnostics |
+| `eg query subsystem` | same, plus `semantic_drift` and `log_signatures` |
+| `eg query locate` | the context sections **and** the located `symbol` / `enclosing_chain` rows |
+| `eg query at` | the located `symbol` / `enclosing_chain` rows (shares the row shape; not itself a cross-domain answer) |
+| `eg query semantic-context` | the context sections of each match **and** each match's own anchor row |
+| `eg query task` | `tasks`, `acceptance_criteria` (incl. the nested `verification_record`), `source_facts`, `observations`, `artifacts`, `verification_evidence`, `reviews`, `external_links` |
+| `eg query changes` | every record-shaped section: `changed_files`, `changed_symbols`, `commits`, `tombstones`, `drift_records`, `unexplained`, `observations`, `project_state`, `artifacts`, `verification_evidence` |
+| daemon `observations_for_symbol`, `criteria_for_task` | the same sections as their CLI counterparts |
+| MCP `symbol_context`, `task_evidence` | the same sections; MCP is the primary agentic consumption path |
+
+The CLI, daemon, and MCP transports all call the same derivation over the same
+kind of slice, so the *rule* cannot drift between them. One caveat: the CLI
+lanes derive over their corpus-filtered slice (`--at-head` / `--all-history`,
+see [Corpus scope](#corpus-scope-issue-427)) while the daemon has no corpus
+selector — same rule, potentially a different snapshot.
 
 ### Domain is not trust
 
@@ -326,6 +341,31 @@ top.
 - `project_state` is a claim made by an issue tracker, not verified by Egregore.
 - `agent_contradicted` marks the claim as displaced. It is not a verdict that
   the displacing record is correct.
+
+### A different `trust` key on the single-domain lanes
+
+Several **single-domain** lanes already emit a top-level `trust` field with a
+*different* vocabulary, and they are unchanged:
+
+| Lane | `trust` value | What it means there |
+|---|---|---|
+| `who-imports`, `who-constructs`, `debt-markers`, `unsafe-sites`, `unwrap-expect` | `source_fact` | every row is an extractor fact — a fixed row-class label, not a derived class |
+| `change-impact` | `impact_lead` | the row is a lead to inspect, not a fact |
+| `deps`, `transitive-callees` | `dependency_lead` | ” |
+| `path`, `transitive-callers` | `reachability_lead` | ” |
+| `coupling` | `historical_co_change_lead` | ” |
+
+Those lanes return rows from **one** domain, so there is nothing to
+disambiguate: their `trust` names the kind of answer the whole lane gives. The
+derived vocabulary on this page applies **only** to the cross-domain answers
+listed above, which is where the distinction actually has to be made per row.
+
+The practical consequence: `trust` is only comparable across lanes of the same
+family. A consumer that wants the derived class must read it from a
+cross-domain answer; treating `who-imports`'s `source_fact` and `context`'s
+`source_derived` as the same string will not work. This overlap is a known
+wart — unifying it would be a breaking change to the documented output of ten
+shipped lanes and is deliberately out of scope here.
 
 ### Relationship to the older `trust_class` field
 

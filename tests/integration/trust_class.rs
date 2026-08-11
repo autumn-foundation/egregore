@@ -625,6 +625,125 @@ fn locate_lane_labels_every_record_with_a_trust_class() {
         trust_of(&envelope, &fixture.unverified_obs_id),
         "agent_unverified"
     );
+
+    // The anchor rows are records too, and they are NOT inside any of the array
+    // sections `trust_of` scans — a labelled `source_facts` copy of the same
+    // symbol must not be mistaken for the anchor carrying its own label.
+    assert_eq!(
+        envelope["symbol"]["trust"].as_str(),
+        Some("source_derived"),
+        "the located symbol itself must carry `trust`"
+    );
+    for row in envelope["enclosing_chain"]
+        .as_array()
+        .expect("enclosing_chain is an array")
+    {
+        let trust = row["trust"]
+            .as_str()
+            .unwrap_or_else(|| panic!("enclosing_chain row carries no `trust`: {row}"));
+        assert!(TRUST_VOCABULARY.contains(&trust));
+    }
+}
+
+#[test]
+fn at_lane_labels_the_located_symbol_and_chain() {
+    let fixture = fixture_trust_graph();
+    let out = Command::cargo_bin("eg")
+        .expect("binary")
+        .arg("query")
+        .arg("at")
+        .arg("src/lib.rs:12")
+        .arg("--graph")
+        .arg(&fixture.path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let envelope: Value = serde_json::from_slice(&out).expect("at envelope is JSON");
+    assert_eq!(
+        envelope["symbol"]["trust"].as_str(),
+        Some("source_derived"),
+        "`eg query at` shares the located-node row shape and must label it too"
+    );
+}
+
+/// An agent must not be able to certify its own claim by writing a
+/// `CommandEvidence` record: it is minted in the agent-memory domain from the
+/// agent's own `--exit-code`. End-to-end over the real CLI.
+#[test]
+fn agent_minted_command_evidence_does_not_confer_agent_verified_end_to_end() {
+    let fixture = fixture_trust_graph();
+
+    // A verification-SHAPED node with an agent-memory record ID and a passing
+    // status, cited VALIDATED_BY from a fresh observation on the same symbol.
+    let mut self_signed = GraphRecord::node(
+        agent_memory_stable_id(&["node", "command_evidence", "self_signed"]),
+        NodeKind::CommandEvidence,
+        None,
+        None,
+        None,
+        "self-reported command evidence".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        status,
+        exit_code,
+        ..
+    } = &mut self_signed
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *status = Some("pass".to_owned());
+        *exit_code = Some(0);
+    }
+    let self_signed_id = self_signed.id().to_owned();
+
+    let mut claim = observation("trust_self_certified", "self-certified claim");
+    link(
+        &mut claim,
+        "MENTIONS_SYMBOL",
+        &fixture.symbol_id,
+        "codegraph",
+    );
+    link(&mut claim, "VALIDATED_BY", &self_signed_id, "verification");
+    let claim_id = claim.id().to_owned();
+
+    let mut lines: Vec<String> = fs::read_to_string(&fixture.path)
+        .expect("read fixture")
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect();
+    for record in [&self_signed, &claim] {
+        lines.push(serde_json::to_string(record).expect("serialize"));
+    }
+    let path = fixture.path.with_file_name("trust_self_certified.jsonl");
+    fs::write(&path, lines.join("\n")).expect("write");
+
+    let out = Command::cargo_bin("eg")
+        .expect("binary")
+        .arg("query")
+        .arg("context")
+        .arg("trusted_function")
+        .arg("--graph")
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let envelope: Value = serde_json::from_slice(&out).expect("context envelope is JSON");
+
+    assert_eq!(
+        trust_of(&envelope, &claim_id),
+        "agent_unverified",
+        "an agent-minted CommandEvidence must never certify the agent that wrote it"
+    );
+    // A genuine verification-domain record still confers agent_verified, so the
+    // gate discriminates on domain rather than on kind.
+    assert_eq!(
+        trust_of(&envelope, &fixture.verified_obs_id),
+        "agent_verified"
+    );
 }
 
 // ---------------------------------------------------------------------------

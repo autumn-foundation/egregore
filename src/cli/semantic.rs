@@ -1026,8 +1026,8 @@ pub(crate) fn query_semantic_context(
     };
 
     let bundle = query::semantic_context_bundle(&records, &leads, min_score);
-    let resolver = crate::temporal_status::TemporalResolver::build(&records);
     let trust = query::TrustIndex::build(&records);
+    let resolver = trust.resolver();
 
     if bundle.is_no_match() {
         report_semantic_context_no_match(query, min_score)?;
@@ -1039,10 +1039,14 @@ pub(crate) fn query_semantic_context(
         .map(|m| {
             let sections = build_context_sections(&m.context, &trust);
             let (observations, excluded) =
-                apply_supersession(sections.observations, &resolver, supersession);
+                apply_supersession(sections.observations, resolver, supersession);
             let repository_id = index.owner_of(&m.lead.record_id);
             SemanticContextMatch {
                 record_id: &m.lead.record_id,
+                trust: records
+                    .iter()
+                    .find(|r| r.id() == m.lead.record_id)
+                    .map_or(crate::query::TrustClass::Other, |r| trust.classify(r)),
                 name: m.lead.name.as_deref(),
                 repo_relative_path: m.lead.repo_relative_path.as_deref(),
                 span: m.lead.span,

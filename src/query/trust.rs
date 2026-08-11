@@ -37,12 +37,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::ir::{EdgeLabel, GraphRecord, NodeKind};
+use crate::ir::{GraphRecord, NodeKind};
 use crate::temporal_status::TemporalResolver;
 
 use super::memory_audit::{
-    OutgoingEdgeIndex, TombstonedSet, is_verification_kind, record_node_kind,
-    verification_support_indexes,
+    OutgoingEdgeIndex, TombstonedSet, backing_verification_records, verification_support_indexes,
 };
 
 /// Verification `status` values that count as a **passing** outcome when
@@ -63,7 +62,11 @@ const PASSING_VERIFICATION_STATUSES: &[&str] = &["pass", "passed", "success"];
 ///
 /// See the module documentation for the "domain is not trust" distinction and
 /// for what each label does *not* claim.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+// Deliberately NOT `Ord`/`PartialOrd`: the variants are a closed set of
+// distinct classes, not a ranking. Deriving an ordering would invite reading
+// `SourceDerived < AgentVerified` as "less trusted than", which this module
+// explicitly does not assert.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum TrustClass {
     /// Deterministic code-graph or semantic-derived record (`Symbol`, `File`,
     /// `Commit`, `SemanticDrift`, code-graph topology edges, …). Derived from
@@ -126,8 +129,11 @@ impl TrustClass {
 
     /// Returns `true` for the three agent-authored classes.
     ///
-    /// Used by the answer-surface guarantee: a row in an agent-authored section
-    /// must be one of these, and a code or verification row must not be.
+    /// Backs the zero-mislabel assertions in this module's tests and in
+    /// `tests/integration/trust_class.rs`: a row in an agent-authored section
+    /// must be one of these, and a code or verification row must not be. The
+    /// guarantee itself is delivered by [`Self::agent_trust`]'s return type,
+    /// not by this predicate.
     #[must_use]
     pub const fn is_agent_authored(self) -> bool {
         matches!(
@@ -145,10 +151,12 @@ impl serde::Serialize for TrustClass {
 
 /// The trust class of an agent-authored record.
 ///
-/// A separate enum so the agent branch of [`TrustIndex::classify`] is
-/// *structurally* unable to return `source_derived` or `verification_evidence`
-/// — the mislabel this issue exists to prevent cannot be written, not merely
-/// tested against.
+/// A separate enum so the body of [`TrustIndex::agent_trust`] — where all the
+/// evidence and contradiction logic lives — cannot name `source_derived` or
+/// `verification_evidence` at all. The mislabel this issue exists to prevent
+/// cannot be written there, rather than only being tested against afterwards.
+/// (The one-line dispatch arm in [`TrustIndex::classify`] is still ordinary
+/// code; the zero-mislabel tests cover that.)
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum AgentTrust {
     Verified,
@@ -342,74 +350,90 @@ impl<'a> TrustIndex<'a> {
                 return AgentTrust::Contradicted;
             }
         }
-        if self.cites_passing_verification(record) {
+        // Read the evidence links off the slice's latest version of this id, so
+        // two physical versions of one claim can never render as two rows with
+        // the same `record_id` and different `trust`. Falls back to the record
+        // as handed in when it is absent from the slice.
+        let current = self.by_id.get(record.id()).copied().unwrap_or(record);
+        if self.cites_passing_verification(current) {
             AgentTrust::Verified
         } else {
             AgentTrust::Unverified
         }
     }
 
-    /// Returns `true` when the claim cites at least one live verification
-    /// record whose recorded status is passing.
+    /// Returns `true` when the claim cites at least one live,
+    /// **verification-domain**, **passing** record.
     ///
-    /// The traversal is the one [`super::memory_audit::is_verified_claim`]
-    /// performs for `--verified-only` — an outbound `VALIDATED_BY`,
-    /// `HAS_EVIDENCE`, or `PRODUCED_EVIDENCE` evidence link or edge onto a live
-    /// verification-domain record — so the two surfaces agree on *which* records
-    /// back a claim. This adds one refinement mandated by AC3: the backing
-    /// record must also be **passing**, so a claim whose only evidence is a
-    /// failing run stays `agent_unverified`.
+    /// The traversal is [`backing_verification_records`] — the same single
+    /// implementation [`super::memory_audit::is_verified_claim`] uses for
+    /// `--verified-only`, so the two surfaces cannot disagree about *which*
+    /// records back a claim. Two refinements are layered on top, both required
+    /// for `agent_verified` to mean anything:
+    ///
+    /// 1. The backing record must be **passing** (AC3), so a claim whose only
+    ///    evidence is a failing run stays `agent_unverified`.
+    /// 2. The backing record must live in the **verification domain**, proven by
+    ///    its record-ID prefix — not merely carry a verification-shaped
+    ///    `NodeKind`.
+    ///
+    /// Rule 2 closes a self-certification hole. `NodeKind::CommandEvidence` is a
+    /// verification-shaped kind, but `eg command-evidence` mints it with an
+    /// `agent_memory:v1:` id and derives its pass/fail purely from the
+    /// agent-supplied `--exit-code`. Without the domain gate an agent could
+    /// write a `CommandEvidence` claiming exit 0, cite it `VALIDATED_BY` from
+    /// its own `Observation`, and have Egregore label that observation
+    /// `agent_verified` — an agent-authored claim counted as evidence for
+    /// itself, the exact standing invariant the citation audit exists to
+    /// protect. The gate mirrors the daemon write path's
+    /// `validate_evidence_target_domain` rule, applied here because the
+    /// `--graph` read path never enforced it.
+    ///
+    /// A `CommandEvidence` record still appears in the answer's
+    /// `verification_evidence` section (its section membership is unchanged);
+    /// it simply cannot *confer* trust on the agent that wrote it.
     fn cites_passing_verification(&self, record: &GraphRecord) -> bool {
-        self.backing_verification_records(record)
-            .into_iter()
+        backing_verification_records(record, &self.by_id, &self.edges_from, &self.tombstoned)
+            .filter(|backing| is_verification_domain_record(backing))
             .any(is_passing_verification)
     }
 
-    /// Collects the live verification-domain records a claim cites through a
-    /// backing relation, in deterministic slice order.
-    fn backing_verification_records(&self, record: &GraphRecord) -> Vec<&'a GraphRecord> {
-        let mut out: Vec<&'a GraphRecord> = Vec::new();
-        let mut push = |target_id: &str| {
-            if self.tombstoned.contains(target_id) {
-                return;
-            }
-            if let Some(target) = self.by_id.get(target_id)
-                && record_node_kind(target).is_some_and(is_verification_kind)
-            {
-                out.push(target);
-            }
-        };
-
-        if let GraphRecord::Node {
-            evidence_links: Some(links),
-            ..
-        } = record
-        {
-            for link in links {
-                // A backing relation is required: a generic link that merely
-                // happens to point at a verification record does not make the
-                // claim verified.
-                if matches!(
-                    link.relation.as_str(),
-                    "VALIDATED_BY" | "HAS_EVIDENCE" | "PRODUCED_EVIDENCE"
-                ) && let Some(target_id) = link.target_record_id.as_deref()
-                {
-                    push(target_id);
-                }
-            }
-        }
-        if let Some(outgoing) = self.edges_from.get(record.id()) {
-            for (label, target) in outgoing {
-                if matches!(
-                    label,
-                    EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence | EdgeLabel::ProducedEvidence
-                ) {
-                    push(target);
-                }
-            }
-        }
-        out
+    /// Borrows the supersession resolver this index already built.
+    ///
+    /// Callers render `temporal_status` and the `excluded` section from a
+    /// [`TemporalResolver`] over the same slice; sharing this one keeps that to a
+    /// single O(n) build per answer and makes it *impossible* for the two to be
+    /// constructed over different slices — the hazard [`Self::build`] warns
+    /// about.
+    #[must_use]
+    pub const fn resolver(&self) -> &TemporalResolver<'a> {
+        &self.resolver
     }
+}
+
+/// Record-ID prefix every verification-domain record carries
+/// (`crate::ir::verification_stable_id`).
+const VERIFICATION_ID_PREFIX: &str = "verification:v";
+
+/// Returns `true` when a record provably lives in the verification domain.
+///
+/// Proven by the record's own ID prefix rather than by its `NodeKind`, because
+/// a verification-shaped kind is not sufficient: `eg command-evidence` mints
+/// `NodeKind::CommandEvidence` under an `agent_memory:v1:` id. Only a record
+/// whose identity was minted by the verification domain may confer
+/// [`TrustClass::AgentVerified`] on an agent claim.
+///
+/// The prefix is matched version-agnostically (`verification:v<N>:`) so a future
+/// verification schema bump keeps conferring trust rather than silently
+/// downgrading every verified claim to `agent_unverified`.
+fn is_verification_domain_record(record: &GraphRecord) -> bool {
+    record
+        .id()
+        .strip_prefix(VERIFICATION_ID_PREFIX)
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(version, _)| {
+            !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit())
+        })
 }
 
 /// Returns `true` when a verification record's recorded outcome is passing.
@@ -436,7 +460,7 @@ fn is_passing_verification(record: &GraphRecord) -> bool {
 mod tests {
     use super::*;
     use crate::ir::{
-        AGENT_MEMORY_SCHEMA_VERSION, EvidenceLink, VERIFICATION_SCHEMA_VERSION,
+        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, VERIFICATION_SCHEMA_VERSION,
         agent_memory_stable_id, verification_stable_id,
     };
 
@@ -543,6 +567,96 @@ mod tests {
             index.classify(&passing),
             TrustClass::VerificationEvidence,
             "a verification record is never an agent class"
+        );
+    }
+
+    /// A verification-SHAPED kind minted in the agent-memory domain must not
+    /// certify the agent that wrote it.
+    ///
+    /// `eg command-evidence` mints `NodeKind::CommandEvidence` with an
+    /// `agent_memory:v1:` id and derives its pass/fail purely from the
+    /// agent-supplied `--exit-code`. Counting it would let an agent write its
+    /// own proof — an agent-authored claim used as evidence for itself.
+    #[test]
+    fn agent_minted_command_evidence_cannot_self_certify() {
+        let mut self_signed = node(
+            agent_memory_stable_id(&["node", "command_evidence", "self"]),
+            NodeKind::CommandEvidence,
+        );
+        if let GraphRecord::Node {
+            schema_version,
+            status,
+            exit_code,
+            ..
+        } = &mut self_signed
+        {
+            *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+            *status = Some("pass".to_owned());
+            *exit_code = Some(0);
+        }
+        let mut claim = observation("self_certified");
+        cite(&mut claim, "VALIDATED_BY", self_signed.id());
+
+        let records = vec![self_signed.clone(), claim.clone()];
+        let index = TrustIndex::build(&records);
+        assert_eq!(
+            index.classify(&claim),
+            TrustClass::AgentUnverified,
+            "an agent-minted CommandEvidence must not confer agent_verified"
+        );
+        // Its own section membership is unchanged — it simply confers nothing.
+        assert_eq!(
+            index.classify(&self_signed),
+            TrustClass::VerificationEvidence
+        );
+
+        // The same claim backed by a genuine verification-domain record does
+        // resolve to agent_verified, so the gate is on domain, not on kind.
+        let genuine = run("genuine", Some("pass"), None);
+        let mut backed = observation("domain_backed");
+        cite(&mut backed, "VALIDATED_BY", genuine.id());
+        let records = vec![genuine, backed.clone()];
+        assert_eq!(
+            TrustIndex::build(&records).classify(&backed),
+            TrustClass::AgentVerified
+        );
+    }
+
+    /// A retracted `CONTRADICTS` edge stops displacing its target: the
+    /// relationship is no longer live at the queried snapshot.
+    #[test]
+    fn retracted_contradiction_no_longer_displaces() {
+        let claim = observation("still_current");
+        let rebuttal = observation("withdrawn_rebuttal");
+        let edge = GraphRecord::agent_memory_edge(
+            EdgeLabel::Contradicts,
+            rebuttal.id().to_owned(),
+            claim.id().to_owned(),
+            None,
+            "contradicts".to_owned(),
+        );
+        let edge_id = edge.id().to_owned();
+
+        // While the edge is live the claim is displaced.
+        let live = vec![claim.clone(), rebuttal, edge];
+        assert_eq!(
+            TrustIndex::build(&live).classify(&claim),
+            TrustClass::AgentContradicted
+        );
+
+        // Retracting the edge withdraws the relationship.
+        let mut retracted = live;
+        retracted.push(GraphRecord::Tombstone {
+            id: format!("{edge_id}:tombstone"),
+            schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+            deleted_id: edge_id,
+            summary: "withdrawn".to_owned(),
+            producer: None,
+        });
+        assert_eq!(
+            TrustIndex::build(&retracted).classify(&claim),
+            TrustClass::AgentUnverified,
+            "a retracted CONTRADICTS edge must stop displacing its target"
         );
     }
 
@@ -769,6 +883,19 @@ mod tests {
                     "derived and legacy trust classes disagree for {record:?}"
                 );
             }
+
+            // A new verification kind forces a `classify` arm (the exhaustive
+            // match will not compile otherwise), but nothing forces the
+            // `is_verification_kind` edit that `backing_verification_records`
+            // gates on. Without this assertion a record could be labelled
+            // `verification_evidence` while claims citing it stayed
+            // `agent_unverified`.
+            assert_eq!(
+                derived == TrustClass::VerificationEvidence,
+                super::super::memory_audit::record_node_kind(record)
+                    .is_some_and(super::super::memory_audit::is_verification_kind),
+                "is_verification_kind and classify disagree for {record:?}"
+            );
         }
     }
 
