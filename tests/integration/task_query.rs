@@ -550,3 +550,109 @@ fn query_task_ambiguous_handle_exits_1_with_json_error() {
         2
     );
 }
+
+/// Issue #114: every record-shaped section of a `query task` response carries a
+/// derived `trust` class from the closed vocabulary.
+///
+/// The task lane wires `trust` through eight sections plus the acceptance
+/// criteria's nested `verification_record`, which is transport-specific
+/// plumbing rather than shared code, so it needs its own proof. Asserts the
+/// serialized envelope — the fields are non-`Option`, so a struct-level check
+/// would prove little while a future `skip_serializing_if` would still compile.
+#[test]
+fn query_task_labels_every_record_with_a_trust_class() {
+    /// The closed `trust` vocabulary, mirrored from `crate::query::TrustClass`.
+    const TRUST_VOCABULARY: &[&str] = &[
+        "source_derived",
+        "verification_evidence",
+        "agent_verified",
+        "agent_unverified",
+        "agent_contradicted",
+        "project_state",
+        "artifact",
+        "runtime_observation",
+        "other",
+    ];
+
+    let (_temp, graph, task_id) = fixture_task_query_seeded();
+
+    let output = egregore()
+        .args(["query", "task", &task_id, "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output).expect("utf8").trim()).expect("valid JSON");
+
+    let sections = [
+        "tasks",
+        "acceptance_criteria",
+        "source_facts",
+        "observations",
+        "artifacts",
+        "verification_evidence",
+        "reviews",
+    ];
+    for section in sections {
+        let rows = parsed[section].as_array().expect("section is an array");
+        assert!(
+            !rows.is_empty(),
+            "`{section}` must be populated or this test proves nothing about it"
+        );
+        for row in rows {
+            let trust = row["trust"]
+                .as_str()
+                .unwrap_or_else(|| panic!("row in `{section}` carries no `trust`: {row}"));
+            assert!(
+                TRUST_VOCABULARY.contains(&trust),
+                "`{trust}` in `{section}` is outside the closed vocabulary"
+            );
+        }
+    }
+
+    // Classification, per section.
+    for section in ["tasks", "acceptance_criteria", "reviews"] {
+        for row in parsed[section].as_array().expect("array") {
+            assert_eq!(
+                row["trust"].as_str(),
+                Some("project_state"),
+                "`{section}` carries imported external work state: {row}"
+            );
+        }
+    }
+    for row in parsed["source_facts"].as_array().expect("array") {
+        assert_eq!(row["trust"].as_str(), Some("source_derived"));
+    }
+    for row in parsed["verification_evidence"].as_array().expect("array") {
+        assert_eq!(row["trust"].as_str(), Some("verification_evidence"));
+    }
+    for row in parsed["artifacts"].as_array().expect("array") {
+        assert_eq!(row["trust"].as_str(), Some("artifact"));
+    }
+    // Zero mislabels: no agent-authored row escapes the agent classes, and no
+    // code/verification row borrows one.
+    for row in parsed["observations"].as_array().expect("array") {
+        assert!(
+            row["trust"].as_str().unwrap_or("").starts_with("agent_"),
+            "an agent-authored row was labelled non-agent: {row}"
+        );
+    }
+
+    // The nested `verification_record` inlined on a verified acceptance
+    // criterion is a record too, and carries its own label.
+    let ac_1_id = project_stable_id(&["acceptance_criterion", "ac_1"]);
+    let ac1 = parsed["acceptance_criteria"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|ac| ac["record_id"].as_str() == Some(&ac_1_id))
+        .expect("verified acceptance criterion present");
+    assert_eq!(
+        ac1["verification_record"]["trust"].as_str(),
+        Some("verification_evidence"),
+        "the inlined verification record carries the derived class: {ac1}"
+    );
+}

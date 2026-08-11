@@ -533,8 +533,10 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
             Some(item)
         })
         .collect();
-    let trust = query::TrustIndex::build(records);
 
+    // Reuses the index built above: each build scans the whole graph and
+    // allocates the node/edge/tombstone maps plus a temporal resolver, so a
+    // second one would double that cost per request for no benefit.
     let source_facts: Vec<Value> = ctx
         .source_facts
         .iter()

@@ -836,3 +836,90 @@ fn tombstoned_verification_record_does_not_confer_agent_verified() {
     );
     assert!(!fixture.failing_run_id.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// semantic-context (issue #90 lane): the anchor row AND the context sections
+// ---------------------------------------------------------------------------
+
+/// Issue #114: `eg query semantic-context` labels every record it returns —
+/// each match's own anchor row as well as the rows of its context sections.
+///
+/// The anchor is the lane-specific piece: the section rows come from the shared
+/// `build_context_sections`, which the `context`/`subsystem`/`locate` tests
+/// already cover, but the per-match anchor is built only here.
+///
+/// IGNORED BY DEFAULT, following this repo's convention for every `--embed`
+/// test (see `citation_audit::semantic_workflow_enabled_over_embedded_store`):
+/// building the index loads the re-exported embedding model, which is fetched
+/// on first use, and the offline matrix must not depend on it. This test
+/// therefore does NOT run in CI — run it where the model is available:
+///
+/// ```sh
+/// cargo test --features embeddings --test integration -- --ignored semantic_context
+/// ```
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+#[ignore = "requires a locally available embedding model (offline-incompatible)"]
+#[test]
+fn semantic_context_labels_the_match_anchor_and_every_section() {
+    let fixture = fixture_trust_graph();
+    let data_dir = fixture.path.with_file_name("semantic-context-store");
+
+    Command::cargo_bin("eg")
+        .expect("binary")
+        .args(["ingest"])
+        .arg(&fixture.path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .arg("--embed")
+        .assert()
+        .success();
+
+    let out = Command::cargo_bin("eg")
+        .expect("binary")
+        .args([
+            "query",
+            "semantic-context",
+            "trusted function",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .args(["--min-score", "0.0"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let envelope: Value = serde_json::from_slice(&out).expect("semantic-context envelope is JSON");
+
+    let matches = envelope["matches"].as_array().expect("matches array");
+    assert!(
+        !matches.is_empty(),
+        "the fixture must produce at least one match or this proves nothing"
+    );
+    for m in matches {
+        // The match anchor is a record and carries its own label — it is NOT
+        // covered by the section rows, even when the same record also appears
+        // inside this match's `source_facts`.
+        let anchor = m["trust"]
+            .as_str()
+            .unwrap_or_else(|| panic!("match anchor carries no `trust`: {m}"));
+        assert!(
+            TRUST_VOCABULARY.contains(&anchor),
+            "`{anchor}` is outside the closed vocabulary"
+        );
+        for section in RECORD_SECTIONS {
+            for row in m
+                .get(section)
+                .and_then(Value::as_array)
+                .map(|a| a.iter().collect::<Vec<_>>())
+                .unwrap_or_default()
+            {
+                let trust = row
+                    .get("trust")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("row in `{section}` carries no `trust`: {row}"));
+                assert!(TRUST_VOCABULARY.contains(&trust));
+            }
+        }
+    }
+}
