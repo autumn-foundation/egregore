@@ -147,3 +147,11 @@ before HEAD does not appear. The summary envelope discloses `corpus_mode`
 `corpus_mode_source`, and `corpus_disclaimer`. An `--at`/`--as-of` selector this
 lane accepts pins a single commit (`commit_pinned`). See
 [Corpus scope for query lanes](corpus-modes.md).
+
+## Store-wide counterpart
+
+This lane measures verification coverage of **code symbols**. For the
+**acceptance-criterion** census — what fraction of imported requirements are
+closed by passing evidence, and which closed tasks own unproven criteria — see
+[`docs/cli/criteria-coverage.md`](criteria-coverage.md). High code coverage with
+unproven acceptance criteria is still an unproven feature.

@@ -2476,15 +2476,13 @@ fn incoming_identity_is_local(payload: &crate::ir::RepositoryIdentityPayload) ->
 }
 
 /// Verification-domain node kinds permitted under `verification:v1:` IDs.
-const VERIFICATION_NODE_KINDS: &[NodeKind] = &[
-    NodeKind::CommandRun,
-    NodeKind::Verification,
-    NodeKind::TestRun,
-    NodeKind::CIStatus,
-    NodeKind::BenchmarkRun,
-    NodeKind::CoverageReport,
-    NodeKind::ProofResult,
-];
+/// The node kinds permitted under the verification domain.
+///
+/// Re-exported from `crate::query::trust` so the write path here and the
+/// read-side gate in `crate::criteria_coverage` (issue #115) share ONE list — a
+/// kind added to the domain must not become persistable without also becoming
+/// readable as verification evidence, or vice versa.
+const VERIFICATION_NODE_KINDS: &[NodeKind] = crate::query::VERIFICATION_DOMAIN_KINDS;
 
 /// Validates verification-domain records against the rules in
 /// `docs/schema/verification.md`:

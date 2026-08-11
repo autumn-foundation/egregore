@@ -20,6 +20,8 @@ pub mod claude_code;
 pub mod cli;
 /// Codex session/rollout JSONL importer (M3 agent-memory source).
 pub mod codex;
+/// Acceptance-criterion verification-coverage census (issue #115).
+pub mod criteria_coverage;
 /// Local daemon for shared multi-agent store access.
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod daemon;

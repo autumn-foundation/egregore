@@ -57,6 +57,87 @@ use super::memory_audit::{
 /// overclaiming.
 const PASSING_VERIFICATION_STATUSES: &[&str] = &["pass", "passed", "success"];
 
+/// Verification `status` values that count as a **failing** outcome.
+///
+/// The mirror of [`PASSING_VERIFICATION_STATUSES`], drawn from the free-string
+/// vocabulary `docs/schema/verification.md` documents (`pass` / `fail` / `skip` /
+/// `error` / `timeout`) plus the spellings the importers emit. `error` and
+/// `timeout` are failing because the check *ran and did not succeed*; `skip` is
+/// deliberately absent — a skipped check proves nothing either way and must fall
+/// through to the inconclusive outcome rather than be reported as a failure.
+///
+/// Anything outside BOTH sets is [`VerificationOutcome::Inconclusive`]: neither
+/// vocabulary is widened by guessing.
+const FAILING_VERIFICATION_STATUSES: &[&str] = &[
+    "fail",
+    "failed",
+    "failure",
+    "error",
+    "errored",
+    "timeout",
+    "timed_out",
+];
+
+/// The recorded outcome of a verification record: the single pass/fail rule this
+/// crate applies.
+///
+/// Shared so the derived-trust classifier (`agent_verified`) and the
+/// acceptance-criterion coverage census (`crate::criteria_coverage`, issue #115)
+/// cannot drift into two different notions of "passing". A new consumer must
+/// call [`verification_outcome`] rather than re-deriving one.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum VerificationOutcome {
+    /// The recorded outcome is passing.
+    Passing,
+    /// The recorded outcome is failing.
+    Failing,
+    /// The outcome is absent or outside both closed vocabularies. **Not**
+    /// passing — the deliberate fail-closed fallback.
+    Inconclusive,
+}
+
+/// Classifies a record's recorded verification outcome.
+///
+/// `status` wins when present, compared case-insensitively after trimming. When
+/// it is absent an `exit_code` decides (`0` passing, non-zero failing) — the same
+/// rule `crate::evidence` uses when deriving a status from a command's exit code.
+/// With neither field the outcome is [`VerificationOutcome::Inconclusive`].
+#[must_use]
+pub fn verification_outcome(record: &GraphRecord) -> VerificationOutcome {
+    let GraphRecord::Node {
+        status, exit_code, ..
+    } = record
+    else {
+        return VerificationOutcome::Inconclusive;
+    };
+    if let Some(status) = status.as_deref() {
+        let normalized = status.trim().to_ascii_lowercase();
+        if PASSING_VERIFICATION_STATUSES.contains(&normalized.as_str()) {
+            return VerificationOutcome::Passing;
+        }
+        if FAILING_VERIFICATION_STATUSES.contains(&normalized.as_str()) {
+            return VerificationOutcome::Failing;
+        }
+        // An UNRECOGNIZED status is not a pass, and a non-zero exit code is
+        // hard evidence the check did not succeed — so it still reports
+        // Failing. Without this a `status: "cancelled", exit_code: 137` or a
+        // panicking `exit_code: 101` would be filed as merely inconclusive,
+        // concealing the severity of a store full of crashed runs. A ZERO exit
+        // code under an unrecognized status stays inconclusive: the status is
+        // the record's own summary, and overriding it with the exit code would
+        // manufacture a pass the record never claimed.
+        return match exit_code {
+            Some(code) if *code != 0 => VerificationOutcome::Failing,
+            _ => VerificationOutcome::Inconclusive,
+        };
+    }
+    match exit_code {
+        Some(0) => VerificationOutcome::Passing,
+        Some(_) => VerificationOutcome::Failing,
+        None => VerificationOutcome::Inconclusive,
+    }
+}
+
 /// The closed trust vocabulary attached to every record a cross-domain context
 /// answer returns (issue #114).
 ///
@@ -426,7 +507,14 @@ const VERIFICATION_ID_PREFIX: &str = "verification:v";
 /// The prefix is matched version-agnostically (`verification:v<N>:`) so a future
 /// verification schema bump keeps conferring trust rather than silently
 /// downgrading every verified claim to `agent_unverified`.
-fn is_verification_domain_record(record: &GraphRecord) -> bool {
+///
+/// **Not sufficient on its own** for a reader deciding "is this really a
+/// verification record?": the embedded ingest path does not run the daemon's
+/// validator, so a store can hold a node with a `verification:v<N>:` ID and an
+/// `Observation` (or `Task`, or `AcceptanceCriterion`) kind. Pair it with
+/// [`is_verification_domain_kind`].
+#[must_use]
+pub fn is_verification_domain_record(record: &GraphRecord) -> bool {
     record
         .id()
         .strip_prefix(VERIFICATION_ID_PREFIX)
@@ -436,24 +524,41 @@ fn is_verification_domain_record(record: &GraphRecord) -> bool {
         })
 }
 
+/// The node kinds permitted under the verification domain.
+///
+/// The single definition shared with the daemon write path's
+/// `validate_verification_domain_records`, so "what may be persisted as a
+/// verification record" and "what a reader may treat as one" are one list — a
+/// kind added to the domain cannot become persistable without also becoming
+/// readable as verification evidence, or vice versa.
+pub const VERIFICATION_DOMAIN_KINDS: &[NodeKind] = &[
+    NodeKind::CommandRun,
+    NodeKind::Verification,
+    NodeKind::TestRun,
+    NodeKind::CIStatus,
+    NodeKind::BenchmarkRun,
+    NodeKind::CoverageReport,
+    NodeKind::ProofResult,
+];
+
+/// Returns `true` when `record` is a node whose kind is permitted under the
+/// verification domain.
+///
+/// Deliberately SEPARATE from [`is_verification_domain_record`], which reads the
+/// record ID: a reader deciding whether a record may be treated as verification
+/// evidence must check BOTH.
+#[must_use]
+pub fn is_verification_domain_kind(record: &GraphRecord) -> bool {
+    matches!(record, GraphRecord::Node { kind, .. } if VERIFICATION_DOMAIN_KINDS.contains(kind))
+}
+
 /// Returns `true` when a verification record's recorded outcome is passing.
 ///
-/// `status` wins when present. When it is absent, an `exit_code` of `0` counts
-/// as passing — the same rule `crate::evidence` uses when it derives a status
-/// from a command's exit code. With neither field the outcome is unknown, which
-/// is **not** passing.
+/// A thin reading of the shared [`verification_outcome`] rule, so this predicate
+/// and the acceptance-criterion coverage census can never disagree about what
+/// "passing" means.
 fn is_passing_verification(record: &GraphRecord) -> bool {
-    let GraphRecord::Node {
-        status, exit_code, ..
-    } = record
-    else {
-        return false;
-    };
-    if let Some(status) = status.as_deref() {
-        return PASSING_VERIFICATION_STATUSES
-            .contains(&status.trim().to_ascii_lowercase().as_str());
-    }
-    exit_code.is_some_and(|code| code == 0)
+    matches!(verification_outcome(record), VerificationOutcome::Passing)
 }
 
 #[cfg(test)]
@@ -946,6 +1051,101 @@ mod tests {
                     .is_some_and(super::super::memory_audit::is_verification_kind),
                 "is_verification_kind and classify disagree for {record:?}"
             );
+        }
+    }
+
+    /// The two outcome vocabularies must stay disjoint, and everything outside
+    /// both must fail closed to `Inconclusive`.
+    ///
+    /// [`verification_outcome`] is shared with the acceptance-criterion coverage
+    /// census (`crate::criteria_coverage`, issue #115), which buckets `Passing`
+    /// as *proven* and `Failing` as *failed evidence*. A status landing in both
+    /// sets would make those buckets order-dependent; a status silently widening
+    /// the passing set would let the census overclaim proof.
+    #[test]
+    fn passing_and_failing_status_vocabularies_are_disjoint_and_fail_closed() {
+        for status in PASSING_VERIFICATION_STATUSES {
+            assert!(
+                !FAILING_VERIFICATION_STATUSES.contains(status),
+                "{status} is in both outcome vocabularies"
+            );
+        }
+        for (status, expected) in [
+            ("pass", VerificationOutcome::Passing),
+            ("PASSED", VerificationOutcome::Passing),
+            ("  success  ", VerificationOutcome::Passing),
+            ("fail", VerificationOutcome::Failing),
+            ("Error", VerificationOutcome::Failing),
+            ("timeout", VerificationOutcome::Failing),
+            // A skipped check proves nothing either way — never a failure.
+            ("skip", VerificationOutcome::Inconclusive),
+            ("inconclusive", VerificationOutcome::Inconclusive),
+            ("", VerificationOutcome::Inconclusive),
+        ] {
+            assert_eq!(
+                verification_outcome(&run("v", Some(status), None)),
+                expected,
+                "status {status:?}"
+            );
+        }
+        // Exit codes decide only when `status` is absent.
+        assert_eq!(
+            verification_outcome(&run("v", None, Some(0))),
+            VerificationOutcome::Passing
+        );
+        assert_eq!(
+            verification_outcome(&run("v", None, Some(1))),
+            VerificationOutcome::Failing
+        );
+        assert_eq!(
+            verification_outcome(&run("v", None, None)),
+            VerificationOutcome::Inconclusive
+        );
+        // An explicit status always wins over a conflicting exit code.
+        assert_eq!(
+            verification_outcome(&run("v", Some("fail"), Some(0))),
+            VerificationOutcome::Failing
+        );
+        // An UNRECOGNIZED status plus a non-zero exit code is still a failure —
+        // a crashed or cancelled run must not be filed as merely inconclusive.
+        assert_eq!(
+            verification_outcome(&run("v", Some("cancelled"), Some(137))),
+            VerificationOutcome::Failing
+        );
+        assert_eq!(
+            verification_outcome(&run("v", Some("unknown"), Some(101))),
+            VerificationOutcome::Failing
+        );
+        // ...but a ZERO exit code never manufactures a pass the status did not
+        // claim.
+        assert_eq!(
+            verification_outcome(&run("v", Some("inconclusive"), Some(0))),
+            VerificationOutcome::Inconclusive
+        );
+    }
+
+    /// `is_passing_verification` must be exactly the `Passing` reading of the
+    /// shared rule, so the trust classifier and the criteria census can never
+    /// disagree about what "passing" means.
+    #[test]
+    fn is_passing_verification_is_the_shared_rule() {
+        for status in [
+            Some("pass"),
+            Some("passed"),
+            Some("success"),
+            Some("fail"),
+            Some("skip"),
+            Some("weird"),
+            None,
+        ] {
+            for code in [None, Some(0), Some(3)] {
+                let record = run("v", status, code);
+                assert_eq!(
+                    is_passing_verification(&record),
+                    verification_outcome(&record) == VerificationOutcome::Passing,
+                    "status={status:?} exit_code={code:?}"
+                );
+            }
         }
     }
 

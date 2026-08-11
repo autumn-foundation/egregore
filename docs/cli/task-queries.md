@@ -122,3 +122,12 @@ The output is a structured JSON envelope containing 8 context sections, sorted d
   }
 }
 ```
+
+## Store-wide counterpart
+
+These lanes answer for **one task you already named**. For the store-wide
+acceptance-criterion proof-gap census — which criteria across all imported work
+are actually closed by passing evidence, and which tasks are marked done while
+owning unproven criteria — see
+[`docs/cli/criteria-coverage.md`](criteria-coverage.md). It is the report that
+tells you *which* tasks are worth drilling into here.

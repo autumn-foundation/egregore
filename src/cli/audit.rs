@@ -1,6 +1,7 @@
 use super::*;
 
 /// Routes `eg audit` subcommands.
+#[allow(clippy::too_many_lines)] // a flat dispatch table, one arm per subcommand
 pub(crate) fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
     match subcommand {
         AuditSubcommand::Citations {
@@ -74,6 +75,21 @@ pub(crate) fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
             require_final_head,
             format,
         ),
+        AuditSubcommand::CriteriaCoverage {
+            graph,
+            data_dir,
+            min_proven_ratio,
+            max_claimed_done_unproven,
+            limit,
+            format,
+        } => criteria_coverage_cmd(
+            graph.as_deref(),
+            data_dir.as_deref(),
+            min_proven_ratio,
+            max_claimed_done_unproven,
+            limit,
+            format,
+        ),
         AuditSubcommand::SemanticRelevance {
             corpus,
             data_dir,
@@ -101,6 +117,18 @@ pub(crate) fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
 
 /// Prints a redaction-safe JSON error and exits with the usage/load code (2).
 pub(crate) fn review_coverage_exit(value: &serde_json::Value) -> ! {
+    eprintln!("{value}");
+    std::process::exit(2);
+}
+
+/// The `eg audit criteria-coverage` usage/load-error exit (issue #115).
+///
+/// Every audit subcommand carries its own lane-named exit helper
+/// (`review_coverage_exit`, `evidence_pack_exit`, `control_catalog_exit`, …), so
+/// a reader tracing an `invalid_min_proven_ratio` envelope lands in a function
+/// named for THIS lane and a change to another lane's error shape cannot
+/// silently change this one's.
+fn criteria_coverage_exit(value: &serde_json::Value) -> ! {
     eprintln!("{value}");
     std::process::exit(2);
 }
@@ -264,6 +292,253 @@ fn render_review_coverage_text(report: &crate::review_coverage::ReviewCoverageRe
     }
     lines.push(format!("disclaimer: {}", report.disclaimer));
     lines.join("\n")
+}
+
+/// Handles `eg audit criteria-coverage` (issue #115): the store-wide
+/// acceptance-criterion verification-coverage census and proof-gap gate.
+///
+/// Strictly read-only — an embedded store is read through the throwaway copy
+/// `readonly_audit_store` makes, so the original is left byte-for-byte
+/// untouched. Exit 0 thresholds met (a store with zero criteria is a vacuous
+/// pass), 1 threshold breached (report still printed), 2 usage/load error.
+pub(crate) fn criteria_coverage_cmd(
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+    min_proven_ratio: f64,
+    max_claimed_done_unproven: usize,
+    limit: Option<usize>,
+    format: OutputFormat,
+) -> Result<()> {
+    use crate::criteria_coverage::{
+        CRITERIA_COVERAGE_DEFAULT_LIMIT, CRITERIA_COVERAGE_MAX_LIMIT, CriteriaCoverageConfig,
+        run_criteria_coverage,
+    };
+
+    // Validate the gate bounds before touching any store: a non-finite or
+    // out-of-range ratio would silently disable or invert the gate.
+    if !min_proven_ratio.is_finite() || !(0.0..=1.0).contains(&min_proven_ratio) {
+        criteria_coverage_exit(&serde_json::json!({
+            "code": "invalid_min_proven_ratio",
+            "value": min_proven_ratio.to_string(),
+            "message": "--min-proven-ratio must be a finite value in [0.0, 1.0]",
+        }));
+    }
+    let limit = limit.unwrap_or(CRITERIA_COVERAGE_DEFAULT_LIMIT);
+    if limit == 0 || limit > CRITERIA_COVERAGE_MAX_LIMIT {
+        criteria_coverage_exit(&serde_json::json!({
+            "code": "invalid_limit",
+            "value": limit.to_string(),
+            "message": format!("--limit must be in 1..={CRITERIA_COVERAGE_MAX_LIMIT}"),
+        }));
+    }
+
+    // Enforce exactly-one-of the input flags before opening any store.
+    match (graph, data_dir) {
+        (Some(_), Some(_)) => criteria_coverage_exit(&serde_json::json!({
+            "code": "conflicting_input_flags",
+            "message": "provide only one of --graph or --data-dir, not both",
+        })),
+        (None, None) => criteria_coverage_exit(&serde_json::json!({
+            "code": "missing_input_flag",
+            "message": "provide --graph <path> or --data-dir <path>",
+        })),
+        _ => {}
+    }
+
+    let store_copy = data_dir.map(|dir| match readonly_audit_store(dir) {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    });
+    let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
+    #[allow(clippy::option_if_let_else)] // `--graph` uses the sanitizing reader
+    let records = match graph {
+        Some(graph_path) => load_graph_records_sanitized(graph_path),
+        None => match load_query_records(graph, effective_data_dir) {
+            Ok(records) => records,
+            Err(error) => {
+                eprintln!("{error}");
+                drop(store_copy);
+                std::process::exit(2);
+            }
+        },
+    };
+
+    // A genuinely empty input is a LOAD error naming the path, distinct from the
+    // vacuous `no_acceptance_criteria` SUCCESS (a populated store that simply
+    // records no acceptance criteria).
+    if records.is_empty() {
+        let source_path = graph
+            .or(data_dir)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        drop(store_copy);
+        criteria_coverage_exit(&serde_json::json!({
+            "code": "empty_evidence_input",
+            "path": source_path,
+            "message": "input holds zero records; provide a non-empty graph or store",
+        }));
+    }
+
+    let config = CriteriaCoverageConfig {
+        min_proven_ratio,
+        max_claimed_done_unproven,
+        limit,
+    };
+    let report = run_criteria_coverage(&records, &config);
+
+    let output = match format {
+        OutputFormat::Json => serde_json::to_string(&report)
+            .context("failed to serialize criteria-coverage report")?,
+        OutputFormat::Text => render_criteria_coverage_text(&report),
+    };
+    println!("{output}");
+    let exit_code = i32::from(!report.ok);
+    drop(store_copy);
+    std::process::exit(exit_code);
+}
+
+/// Renders a criteria-coverage report as a deterministic human-readable form
+/// that mirrors the JSON contract field for field.
+fn render_criteria_coverage_text(
+    report: &crate::criteria_coverage::CriteriaCoverageReport,
+) -> String {
+    /// Renders one ratio as `numerator/denominator (ratio)`, never a bare
+    /// percentage, and never a fabricated `0.0` on a zero denominator.
+    fn ratio_line(label: &str, r: &crate::criteria_coverage::Ratio) -> String {
+        let rendered = r
+            .ratio
+            .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.4}"));
+        format!("  {label}: {}/{} ({rendered})", r.numerator, r.denominator)
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("ok: {}", report.ok));
+    lines.push(format!("total_criteria: {}", report.total_criteria));
+    lines.push("coverage:".to_owned());
+    lines.push(ratio_line("proven", &report.proven));
+    lines.push(ratio_line("unverified", &report.unverified));
+    lines.push(ratio_line("failed_evidence", &report.failed_evidence));
+    lines.push(ratio_line("dangling_evidence", &report.dangling_evidence));
+    lines.push(ratio_line(
+        "non_verification_evidence",
+        &report.non_verification_evidence,
+    ));
+    lines.push(ratio_line(
+        "inconclusive_evidence",
+        &report.inconclusive_evidence,
+    ));
+    lines.push(ratio_line("proof_gap", &report.proof_gap));
+    lines.push("bucket_counts:".to_owned());
+    for (bucket, count) in &report.bucket_counts {
+        lines.push(format!("  {bucket}: {count}"));
+    }
+    lines.push(format!(
+        "thresholds: min_proven_ratio={:.4} max_claimed_done_unproven={}",
+        report.thresholds.min_proven_ratio, report.thresholds.max_claimed_done_unproven
+    ));
+    lines.push(format!(
+        "done_task_statuses: {}",
+        report.done_task_statuses.join(",")
+    ));
+    lines.push(format!(
+        "claimed_done_unproven: {} (showing {})",
+        report.claimed_done_unproven_count,
+        report.claimed_done_unproven.len()
+    ));
+    for row in &report.claimed_done_unproven {
+        lines.extend(criterion_text_lines(row));
+    }
+    lines.push(format!("criteria: {}", report.criteria.len()));
+    for row in &report.criteria {
+        lines.extend(criterion_text_lines(row));
+    }
+    lines.push(format!("breaches: {}", report.breaches.len()));
+    for breach in &report.breaches {
+        lines.push(format!(
+            "  {} observed={} bound={} — {}",
+            breach.metric, breach.observed, breach.bound, breach.message
+        ));
+    }
+    lines.push(format!("diagnostics: {}", report.diagnostics.len()));
+    for d in &report.diagnostics {
+        lines.push(format!("  {} {}", d.code, d.detail));
+        // The record IDs a diagnostic names ARE its citation: dropping them
+        // would leave the text form asserting a gap it never points at.
+        for id in &d.record_ids {
+            lines.push(format!("    {id}"));
+        }
+    }
+    lines.push(format!("disclaimer: {}", report.disclaimer));
+    lines.join("\n")
+}
+
+/// Renders one criterion row as human-readable lines carrying the SAME citable
+/// evidence the JSON row carries.
+///
+/// The text form is documented as mirroring the JSON contract, and issue #115's
+/// citation AC requires every listed criterion to carry a citable record ID and,
+/// where present, a repo-relative file/span or source-system handle — in BOTH
+/// formats. Collapsing a row to `id/task/bucket` would leave a reader unable to
+/// audit WHY a criterion landed in its bucket, which is the whole point of the
+/// per-link resolution list.
+///
+/// Values are already control-sanitized and length-bounded by the pure core, so
+/// no value here can forge an extra line or drive the reader's terminal.
+fn criterion_text_lines(row: &crate::criteria_coverage::CriterionRowJson) -> Vec<String> {
+    let mut lines = vec![format!(
+        "  {} task={} task_status={} bucket={} status={} ordinal={}",
+        row.record_id,
+        row.parent_task_id.as_deref().unwrap_or("-"),
+        row.parent_task_status.as_deref().unwrap_or("-"),
+        row.bucket,
+        row.criterion_status.as_deref().unwrap_or("-"),
+        row.ordinal
+            .map_or_else(|| "-".to_owned(), |o| o.to_string()),
+    )];
+    for link in &row.closing_links {
+        lines.push(format!(
+            "    closing={} origins={} resolution={} node_kind={} verification_kind={} status={} exit_code={}",
+            link.handle,
+            link.origins.join("+"),
+            link.resolution,
+            link.node_kind.as_deref().unwrap_or("-"),
+            link.verification_kind.as_deref().unwrap_or("-"),
+            link.status.as_deref().unwrap_or("-"),
+            link.exit_code
+                .map_or_else(|| "-".to_owned(), |c| c.to_string()),
+        ));
+        if let Some(producer) = &link.producer_kind {
+            lines.push(format!("      producer={producer}"));
+        }
+    }
+    if let Some(proving) = &row.proving_verification_id {
+        lines.push(format!("    proven_by={proving}"));
+    }
+    // The source handles: only emitted when actually recorded, so the text form
+    // never implies a citation the record does not carry.
+    let span = row.span.map(|s| format!("{}-{}", s.start_line, s.end_line));
+    let handles: Vec<String> = [
+        row.repo_relative_path
+            .as_deref()
+            .map(|p| format!("path={p}")),
+        span.map(|s| format!("span={s}")),
+        row.source_handle
+            .as_deref()
+            .map(|h| format!("source_handle={h}")),
+        row.external_link_id
+            .as_deref()
+            .map(|l| format!("external_link={l}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !handles.is_empty() {
+        lines.push(format!("    {}", handles.join(" ")));
+    }
+    lines
 }
 
 /// Routes `eg audit evidence-pack` actions (issue #338).
