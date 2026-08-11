@@ -121,6 +121,9 @@ pub struct Row {
 pub struct SourceHandle {
     /// Stable `LogSource` record ID.
     pub record_id: String,
+    /// Derived trust class (issue #114): always `runtime_observation` — a
+    /// `LogSource` is a program's own claim about its execution.
+    pub trust: crate::query::TrustClass,
     /// Repo-relative path of the captured log artifact.
     pub source_relative_path: String,
     /// BLAKE3 hex of the newline-normalized artifact bytes.
@@ -132,6 +135,8 @@ pub struct SourceHandle {
 pub struct BucketRow {
     /// Stable `LogOccurrenceBucket` record ID.
     pub record_id: String,
+    /// Derived trust class (issue #114): always `runtime_observation`.
+    pub trust: crate::query::TrustClass,
     /// RFC 3339 UTC hour-aligned bucket start.
     pub bucket_start: String,
     /// Bucket width token (`1h`).
@@ -216,6 +221,10 @@ pub enum FirstSeenRange {
 pub struct ExcludedRef {
     /// Stable record ID that was superseded or contradicted.
     pub record_id: String,
+    /// Derived trust class of the excluded record (issue #114), so a consumer
+    /// reading the diagnostics sees the same label the row would have carried in
+    /// the answer.
+    pub trust: crate::query::TrustClass,
     /// Reason: `superseded` or `contradicted`.
     pub reason: String,
     /// Forward supersession/contradiction handles.
@@ -835,6 +844,7 @@ pub fn error_context(
             if sig_set.contains(sig) {
                 buckets_by_sig.entry(*sig).or_default().push(BucketRow {
                     record_id: id.clone(),
+                    trust: crate::query::TrustClass::RuntimeObservation,
                     bucket_start: bucket.bucket_start.clone(),
                     bucket_width: bucket.bucket_width.clone(),
                     occurrence_count: bucket_count,
@@ -899,6 +909,7 @@ pub fn error_context(
                 }) => match payload.as_ref() {
                     LogPayload::LogSource(p) => Some(SourceHandle {
                         record_id: (*src).to_owned(),
+                        trust: crate::query::TrustClass::RuntimeObservation,
                         source_relative_path: p.source_relative_path.clone(),
                         source_artifact_hash: p.source_artifact_hash.clone(),
                     }),
@@ -1096,6 +1107,7 @@ pub fn error_context(
                 (Some((reason, refs)), SupersessionMode::Exclude) => {
                     excluded.push(ExcludedRef {
                         record_id: id.clone(),
+                        trust: trust_index.classify(record),
                         reason: reason.to_owned(),
                         superseded_by: refs.into_iter().map(|r| r.record_id).collect(),
                     });

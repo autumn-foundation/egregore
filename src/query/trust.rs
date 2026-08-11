@@ -660,6 +660,56 @@ mod tests {
         );
     }
 
+    /// An append-only `--graph` that REWRITES a non-temporal node to drop its
+    /// `CONTRADICTS` link must stop displacing the target.
+    ///
+    /// Neither physical version is tombstoned, so a liveness check alone does
+    /// not catch this: the stale earlier version has to lose to the later one by
+    /// node-version selection, exactly as edges do. The embedded `--data-dir`
+    /// read keeps only the latest node write, so without this the two transports
+    /// would disagree.
+    #[test]
+    fn rewritten_node_dropping_its_contradiction_no_longer_displaces() {
+        let claim = observation("target_claim");
+
+        // v1 of the rebuttal contradicts the claim; v2 (same id) withdraws it.
+        let mut rebuttal_v1 = observation("rebuttal");
+        let GraphRecord::Node { evidence_links, .. } = &mut rebuttal_v1 else {
+            panic!("node expected");
+        };
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(claim.id().to_owned()),
+            target_domain: "agent_memory".to_owned(),
+            relation: "CONTRADICTS".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+        let rebuttal_v2 = observation("rebuttal");
+        assert_eq!(
+            rebuttal_v1.id(),
+            rebuttal_v2.id(),
+            "both versions must share one stable id for this to be a rewrite"
+        );
+
+        // v1 alone displaces the claim.
+        let before = vec![claim.clone(), rebuttal_v1.clone()];
+        assert_eq!(
+            TrustIndex::build(&before).classify(&claim),
+            TrustClass::AgentContradicted
+        );
+
+        // Appending v2 (which carries no link) withdraws the relationship.
+        let after = vec![claim.clone(), rebuttal_v1, rebuttal_v2];
+        assert_eq!(
+            TrustIndex::build(&after).classify(&claim),
+            TrustClass::AgentUnverified,
+            "a stale earlier node version must not resurrect a withdrawn relationship"
+        );
+    }
+
     #[test]
     fn generic_relation_onto_a_passing_run_does_not_verify() {
         let passing = run("pass", Some("passed"), None);

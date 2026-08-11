@@ -71,11 +71,22 @@ impl<'a> TemporalResolver<'a> {
 
         // Second pass: extract relationships from live records
         for (index, r) in records.iter().enumerate() {
-            // A retracted record asserts nothing. Edges additionally contribute
-            // only from their latest version, so superseded edge metadata never
-            // resurrects a withdrawn relationship.
+            // A retracted record asserts nothing, and both nodes and edges
+            // contribute only from their LATEST version — an append-only graph
+            // that rewrites a record to drop a `SUPERSEDES`/`CONTRADICTS` link
+            // leaves both physical versions live (neither is tombstoned), so
+            // reading every version would resurrect the withdrawn relationship
+            // while the embedded read, which keeps only the latest write, would
+            // not. Temporal nodes are exempt: bitemporal history versions of one
+            // id are distinct legitimate snapshots, not stale rewrites.
             match r {
-                GraphRecord::Node { id, .. } if liveness.deleted(id.as_str()) => continue,
+                GraphRecord::Node { id, temporal, .. }
+                    if liveness.deleted(id.as_str())
+                        || (temporal.is_none()
+                            && !liveness.is_latest_node_version(id.as_str(), index)) =>
+                {
+                    continue;
+                }
                 GraphRecord::Edge { id, .. }
                     if liveness.deleted(id.as_str())
                         || !liveness.is_latest_edge_version(id.as_str(), index) =>

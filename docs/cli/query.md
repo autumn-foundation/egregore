@@ -247,7 +247,7 @@ The lanes that carry the derived `trust` class described here:
 | `eg query semantic-context` | the context sections of each match **and** each match's own anchor row |
 | `eg query task` | `tasks`, `acceptance_criteria` (incl. the nested `verification_record`), `source_facts`, `observations`, `artifacts`, `verification_evidence`, `reviews`, `external_links` |
 | `eg query changes` | every record-shaped section: `changed_files`, `changed_symbols`, `commits`, `tombstones`, `drift_records`, `unexplained`, `observations`, `project_state`, `artifacts`, `verification_evidence` |
-| `eg query error-context` | every `Row`, alongside its pre-existing domain-lookup `trust_class` (see below) |
+| `eg query error-context` | every `Row` and `SignatureBlock`, their nested `SourceHandle` / `BucketRow` projections, and the `excluded` diagnostics — alongside the pre-existing domain-lookup `trust_class` (see below) |
 | daemon `observations_for_symbol`, `criteria_for_task` | the same sections as their CLI counterparts |
 | MCP `symbol_context`, `task_evidence` | the same sections; MCP is the primary agentic consumption path |
 

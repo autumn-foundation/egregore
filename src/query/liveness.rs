@@ -48,6 +48,8 @@ pub struct Liveness<'a> {
     last_write: BTreeMap<&'a str, usize>,
     /// Greatest index of an `Edge` write per id (edge-only).
     last_edge_write: BTreeMap<&'a str, usize>,
+    /// Greatest index of a `Node` write per id (node-only).
+    last_node_write: BTreeMap<&'a str, usize>,
     /// Greatest index of a `Tombstone` per `deleted_id`.
     last_tomb: BTreeMap<&'a str, usize>,
     /// Ids carrying a bitemporal/history version (never suppressed by a tombstone).
@@ -59,12 +61,14 @@ impl<'a> Liveness<'a> {
     pub fn new(records: &'a [GraphRecord]) -> Self {
         let mut last_write: BTreeMap<&'a str, usize> = BTreeMap::new();
         let mut last_edge_write: BTreeMap<&'a str, usize> = BTreeMap::new();
+        let mut last_node_write: BTreeMap<&'a str, usize> = BTreeMap::new();
         let mut last_tomb: BTreeMap<&'a str, usize> = BTreeMap::new();
         let mut has_temporal: BTreeSet<&'a str> = BTreeSet::new();
         for (index, r) in records.iter().enumerate() {
             match r {
                 GraphRecord::Node { id, temporal, .. } => {
                     last_write.insert(id.as_str(), index);
+                    last_node_write.insert(id.as_str(), index);
                     if temporal.is_some() {
                         has_temporal.insert(id.as_str());
                     }
@@ -84,6 +88,7 @@ impl<'a> Liveness<'a> {
         Self {
             last_write,
             last_edge_write,
+            last_node_write,
             last_tomb,
             has_temporal,
         }
@@ -109,6 +114,29 @@ impl<'a> Liveness<'a> {
     /// edge's current metadata (mirrors embedded `latest_edge_versions`).
     pub fn is_latest_edge_version(&self, edge_id: &str, index: usize) -> bool {
         self.last_edge_write.get(edge_id) == Some(&index)
+    }
+
+    /// True when the record at append index `index` is the LATEST write of node
+    /// `node_id` computed over NODES ONLY — the node-side mirror of
+    /// [`Self::is_latest_edge_version`].
+    ///
+    /// A lane that reads a node's own relationship metadata (`superseded_by`,
+    /// `evidence_links`) must select only the latest version: an append-only
+    /// `--graph` that rewrites a non-temporal node to REMOVE a
+    /// `SUPERSEDES`/`CONTRADICTS` link leaves both physical versions live
+    /// (neither is tombstoned), so reading every version would resurrect the
+    /// withdrawn relationship while the embedded read — which retains only the
+    /// latest node write — would not.
+    ///
+    /// Computed over NODES ONLY for the same reason the edge map is edge-only
+    /// (issue #391): a node and an edge may legitimately share one stable record
+    /// ID, and keying off the cross-kind map would let a later same-id EDGE
+    /// write suppress the node's current metadata.
+    ///
+    /// Callers must apply this only to NON-temporal nodes: bitemporal history
+    /// versions of one id are distinct legitimate snapshots, not stale rewrites.
+    pub fn is_latest_node_version(&self, node_id: &str, index: usize) -> bool {
+        self.last_node_write.get(node_id) == Some(&index)
     }
 }
 
