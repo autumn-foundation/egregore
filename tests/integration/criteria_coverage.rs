@@ -365,7 +365,7 @@ fn recorded_status_and_agent_minted_evidence_never_prove_a_criterion() {
     assert_eq!(row(&report, "ac-n1")["bucket"], "non_verification_evidence");
     assert_eq!(
         row(&report, "ac-n1")["closing_links"][0]["resolution"],
-        "non_verification_domain"
+        "not_verification_record"
     );
     assert!(row(&report, "ac-n1")["proving_verification_id"].is_null());
 
@@ -682,21 +682,299 @@ fn graph_and_data_dir_agree_on_the_gate_verdict_and_metrics() {
         "the tombstoned-target dangling case must survive ingest"
     );
     assert_eq!(out.status.code(), Some(graph_code), "same gate verdict");
-    for field in [
-        "total_criteria",
-        "proven",
-        "unverified",
-        "failed_evidence",
-        "dangling_evidence",
-        "non_verification_evidence",
-        "inconclusive_evidence",
-        "proof_gap",
-        "bucket_counts",
-        "claimed_done_unproven_count",
-    ] {
-        assert_eq!(
-            store[field], graph_report[field],
-            "--graph and --data-dir disagree on {field}"
+    // Both sides are built from IDENTICAL lines, so the WHOLE report must match
+    // — comparing only the scalars would hide an ingest round-trip that dropped
+    // `source_handle`, `ordinal`, `criterion_status`, or a closing link.
+    assert_eq!(
+        store, graph_report,
+        "--graph and --data-dir must produce the identical report"
+    );
+}
+
+// ── review round 2: hostile input, gaps, and CLI-level plumbing ─────────────
+
+/// A crafted store value must not be able to forge output lines or drive the
+/// reader's terminal in EITHER format.
+///
+/// `docs/schema/verification.md` documents `status` as a free string with no
+/// enum enforcement, and a dangling `verification_link_id` is reported with its
+/// ORIGINAL text — the one value no writer validated.
+#[test]
+fn hostile_store_values_cannot_forge_output_or_drive_the_terminal() {
+    let ansi = "\u{1b}[2J";
+    let evil_status = format!("pass{ansi}\nbucket=proven\n{}", "A".repeat(5000));
+    let evil_handle = "verification:v1:x\nclaimed_done_unproven: 0\nfake";
+    let lines = vec![
+        task_line("task-done", "closed_completed"),
+        format!(
+            r#"{{"record_type":"node","id":"verification:v1:evil","kind":"TestRun","domain":"verification","schema_version":1,"status":{},"summary":"evil"}}"#,
+            serde_json::to_string(&evil_status).unwrap()
+        ),
+        // Resolves to the hostile record, so its `status` really flows through.
+        criterion_line(
+            "ac-evil",
+            "task-done",
+            0,
+            "verified",
+            Some("verification:v1:evil"),
+        ),
+        // Carries the forged DANGLING handle — the one value no writer validated.
+        format!(
+            r#"{{"record_type":"node","id":"project:v1:ac-forged","kind":"AcceptanceCriterion","domain":"project","schema_version":1,"parent_task_id":"project:v1:task-done","ordinal":1,"status":"verified","verification_link_id":{},"summary":"forged"}}"#,
+            serde_json::to_string(evil_handle).unwrap()
+        ),
+    ];
+    let (_g, path) = write_graph(&lines);
+
+    for extra in [vec![], vec!["--format", "text"]] {
+        let (_code, report, bytes) = run_graph(&path, &extra);
+        let text = String::from_utf8(bytes).expect("utf-8");
+        assert!(
+            !text.contains('\u{1b}'),
+            "an ANSI escape reached the output ({extra:?})"
+        );
+        // The forged fragments must never appear as a line of their own.
+        for forged in ["bucket=proven", "claimed_done_unproven: 0", "fake"] {
+            assert!(
+                !text.lines().any(|l| l.trim_start() == forged),
+                "a crafted value forged the line {forged:?} ({extra:?})"
+            );
+        }
+        if extra.is_empty() {
+            // JSON: the whole report is one line, so bound the FIELD values.
+            let evil = report["criteria"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["record_id"] == "project:v1:ac-evil")
+                .expect("the evil row");
+            let status = evil["closing_links"][0]["status"]
+                .as_str()
+                .expect("the hostile status flowed through a RESOLVED link");
+            assert!(
+                status.chars().count() <= 129,
+                "the free-text status was not bounded: {} chars",
+                status.chars().count()
+            );
+            assert!(!status.contains('\n') && !status.contains('\u{1b}'));
+            // The dangling handle is sanitized but kept WHOLE — a truncated
+            // handle would stop being a citation.
+            let forged = report["criteria"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["record_id"] == "project:v1:ac-forged")
+                .expect("the forged row");
+            let handle = forged["closing_links"][0]["handle"].as_str().unwrap();
+            assert!(!handle.contains('\n'), "newline survived in a handle");
+            assert!(handle.ends_with("fake"), "handle must not be truncated");
+        } else {
+            // Text: no single rendered line may blow up.
+            assert!(
+                text.lines().all(|l| l.chars().count() < 2000),
+                "an unbounded value reached a text line"
+            );
+        }
+    }
+}
+
+/// A `verification:v1:`-prefixed record with a non-verification kind, and a
+/// criterion closing itself, must both be refused at the CLI level.
+#[test]
+fn prefix_alone_does_not_certify_a_criterion() {
+    let lines = vec![
+        task_line("task-done", "closed_completed"),
+        // A verification-PREFIXED Observation claiming to pass.
+        r#"{"record_type":"node","id":"verification:v1:impostor","kind":"Observation","domain":"agent_memory","schema_version":1,"status":"pass","summary":"impostor"}"#.to_owned(),
+        criterion_line(
+            "ac-impostor",
+            "task-done",
+            0,
+            "verified",
+            Some("verification:v1:impostor"),
+        ),
+    ];
+    let (_g, path) = write_graph(&lines);
+    let (code, report, _) = run_graph(&path, &[]);
+    let r = row(&report, "ac-impostor");
+    assert_eq!(
+        r["bucket"], "non_verification_evidence",
+        "a verification: prefix on an Observation must not prove"
+    );
+    assert_eq!(
+        r["closing_links"][0]["resolution"],
+        "not_verification_record"
+    );
+    assert!(r["proving_verification_id"].is_null());
+    assert_eq!(code, 1, "and the gate must fail");
+}
+
+/// Every `proven` row discloses the producer that WROTE its closing record,
+/// because the verification-domain gate does not establish independent
+/// observation.
+#[test]
+fn proven_rows_cite_the_proving_record_and_disclose_its_producer() {
+    let (_g, path) = planted_graph();
+    let (_code, report, _) = run_graph(&path, &[]);
+    assert_eq!(
+        row(&report, "ac-p1")["proving_verification_id"],
+        "verification:v1:pass1"
+    );
+    assert_eq!(
+        row(&report, "ac-p2")["proving_verification_id"],
+        "verification:v1:pass2",
+        "the field-sourced link cites its record too"
+    );
+    // `node_kind` is the trusted closed vocabulary, always present when resolved.
+    assert_eq!(
+        row(&report, "ac-p1")["closing_links"][0]["node_kind"],
+        "TestRun"
+    );
+    // A non-proven row never names a proving record.
+    for id in ["ac-u1", "ac-f1", "ac-d1", "ac-n1", "ac-i1"] {
+        assert!(
+            row(&report, id)["proving_verification_id"].is_null(),
+            "{id} must not name a proving record"
         );
     }
+}
+
+/// The edge and the denormalized field naming the SAME verification collapse to
+/// one link carrying both origins.
+#[test]
+fn edge_and_field_naming_one_record_merge_into_a_single_link() {
+    let mut lines = vec![
+        task_line("task-done", "closed_completed"),
+        verification_line("verification:v1:pass1", "TestRun", Some("pass"), None),
+        criterion_line(
+            "ac-both",
+            "task-done",
+            0,
+            "verified",
+            Some("verification:v1:pass1"),
+        ),
+    ];
+    lines.push(project_edge_line(
+        1,
+        "CLOSES_ACCEPTANCE_CRITERION",
+        "project:v1:ac-both",
+        "verification:v1:pass1",
+    ));
+    let (_g, path) = write_graph(&lines);
+    let (code, report, _) = run_graph(&path, &[]);
+    let closing = row(&report, "ac-both")["closing_links"]
+        .as_array()
+        .expect("closing links");
+    assert_eq!(closing.len(), 1, "one handle, one link");
+    assert_eq!(
+        closing[0]["origins"],
+        serde_json::json!(["closes_edge", "verification_link_id"]),
+        "both representations are disclosed"
+    );
+    assert_eq!(code, 0, "a fully proven store passes");
+}
+
+/// `--limit` truncates both lists while the counts stay pre-truncation.
+#[test]
+fn limit_truncates_at_the_cli_while_counts_stay_whole() {
+    let (_g, path) = planted_graph();
+    let (_code, report, _) = run_graph(&path, &["--limit", "2"]);
+    assert_eq!(report["total_criteria"], 10, "counts are pre-truncation");
+    assert_eq!(report["criteria"].as_array().unwrap().len(), 2);
+    assert_eq!(report["claimed_done_unproven_count"], 3);
+    assert_eq!(report["claimed_done_unproven"].as_array().unwrap().len(), 2);
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "results_truncated")
+    );
+    // Boundaries: the documented maximum is accepted, one past it is rejected.
+    let (accepted, _, _) = run_graph(&path, &["--limit", "1000"]);
+    assert_eq!(accepted, 1, "1000 is within range (gate still fails)");
+    let (rejected, _, _) = run_graph(&path, &["--limit", "1001"]);
+    assert_eq!(rejected, 2, "1001 exceeds the documented maximum");
+}
+
+/// The text form renders the zero-denominator case as `n/a`, never `0.0000`.
+#[test]
+fn text_format_renders_the_zero_denominator_case() {
+    let (_g, path) = write_graph(&[task_line("task-open", "open")]);
+    let (code, _v, bytes) = run_graph(&path, &["--format", "text"]);
+    let text = String::from_utf8(bytes).expect("utf-8");
+    assert_eq!(code, 0);
+    assert!(text.contains("proven: 0/0 (n/a)"), "{text}");
+    assert!(!text.contains("0.0000"), "no fabricated ratio: {text}");
+    assert!(text.contains("no_acceptance_criteria"));
+}
+
+/// The text form carries the same citable evidence the JSON row carries.
+#[test]
+fn text_rows_carry_their_citable_evidence() {
+    let (_g, path) = planted_graph();
+    let (_code, _v, bytes) = run_graph(&path, &["--format", "text"]);
+    let text = String::from_utf8(bytes).expect("utf-8");
+    assert!(text.contains("closing=verification:v1:fail1"), "{text}");
+    assert!(text.contains("resolution=failing"), "{text}");
+    assert!(text.contains("proven_by=verification:v1:pass1"), "{text}");
+    assert!(
+        text.contains("source_handle=tasks.jsonl:ac-p1:abc123"),
+        "{text}"
+    );
+    // Diagnostics name the records they derive from.
+    assert!(text.contains("dangling_closing_evidence"), "{text}");
+    assert!(
+        text.lines().any(|l| l.trim() == "project:v1:ac-d1"),
+        "diagnostic record IDs are rendered: {text}"
+    );
+}
+
+/// Text output is deterministic too, not just JSON.
+#[test]
+fn text_output_is_byte_identical_across_five_runs() {
+    let (_g, path) = planted_graph();
+    let (_c, _v, first) = run_graph(&path, &["--format", "text"]);
+    for _ in 0..5 {
+        let (_c, _v, again) = run_graph(&path, &["--format", "text"]);
+        assert_eq!(first, again, "text output must be byte-identical");
+    }
+}
+
+/// A missing `--data-dir` is a load error, not a panic or a silent pass.
+#[test]
+fn a_missing_data_dir_exits_two() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("no-such-store");
+    let out = egregore()
+        .args(["audit", "criteria-coverage", "--data-dir"])
+        .arg(&missing)
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty(), "no report on a load error");
+}
+
+/// A criterion carrying an `EXTERNAL_HANDLE` edge, a path, and a span cites all
+/// three — the "where present" half of the citation contract.
+#[test]
+fn optional_citation_handles_are_emitted_when_recorded() {
+    let lines = vec![
+        task_line("task-open", "open"),
+        r#"{"record_type":"node","id":"project:v1:extlink","kind":"ExternalLink","domain":"project","schema_version":1,"url":"https://example.invalid/1","summary":"link"}"#.to_owned(),
+        r#"{"record_type":"node","id":"project:v1:ac-cited","kind":"AcceptanceCriterion","domain":"project","schema_version":1,"parent_task_id":"project:v1:task-open","ordinal":0,"status":"unverified","repo_relative_path":"docs/spec.md","span":{"start_byte":0,"end_byte":10,"start_line":3,"end_line":4},"source_handle":"tasks.jsonl:ac-cited:h","summary":"cited"}"#.to_owned(),
+        project_edge_line(
+            1,
+            "EXTERNAL_HANDLE",
+            "project:v1:ac-cited",
+            "project:v1:extlink",
+        ),
+    ];
+    let (_g, path) = write_graph(&lines);
+    let (_code, report, _) = run_graph(&path, &[]);
+    let r = row(&report, "ac-cited");
+    assert_eq!(r["repo_relative_path"], "docs/spec.md");
+    assert_eq!(r["span"]["start_line"], 3);
+    assert_eq!(r["source_handle"], "tasks.jsonl:ac-cited:h");
+    assert_eq!(r["external_link_id"], "project:v1:extlink");
 }

@@ -121,6 +121,18 @@ pub(crate) fn review_coverage_exit(value: &serde_json::Value) -> ! {
     std::process::exit(2);
 }
 
+/// The `eg audit criteria-coverage` usage/load-error exit (issue #115).
+///
+/// Every audit subcommand carries its own lane-named exit helper
+/// (`review_coverage_exit`, `evidence_pack_exit`, `control_catalog_exit`, …), so
+/// a reader tracing an `invalid_min_proven_ratio` envelope lands in a function
+/// named for THIS lane and a change to another lane's error shape cannot
+/// silently change this one's.
+fn criteria_coverage_exit(value: &serde_json::Value) -> ! {
+    eprintln!("{value}");
+    std::process::exit(2);
+}
+
 /// Handles `eg audit review-coverage` (issue #339): gates review coverage over
 /// PRs merged in a valid-time window. Exit 0 coverage met (empty window is a
 /// vacuous pass), 1 below threshold (report still printed), 2 usage/load error.
@@ -305,7 +317,7 @@ pub(crate) fn criteria_coverage_cmd(
     // Validate the gate bounds before touching any store: a non-finite or
     // out-of-range ratio would silently disable or invert the gate.
     if !min_proven_ratio.is_finite() || !(0.0..=1.0).contains(&min_proven_ratio) {
-        review_coverage_exit(&serde_json::json!({
+        criteria_coverage_exit(&serde_json::json!({
             "code": "invalid_min_proven_ratio",
             "value": min_proven_ratio.to_string(),
             "message": "--min-proven-ratio must be a finite value in [0.0, 1.0]",
@@ -313,7 +325,7 @@ pub(crate) fn criteria_coverage_cmd(
     }
     let limit = limit.unwrap_or(CRITERIA_COVERAGE_DEFAULT_LIMIT);
     if limit == 0 || limit > CRITERIA_COVERAGE_MAX_LIMIT {
-        review_coverage_exit(&serde_json::json!({
+        criteria_coverage_exit(&serde_json::json!({
             "code": "invalid_limit",
             "value": limit.to_string(),
             "message": format!("--limit must be in 1..={CRITERIA_COVERAGE_MAX_LIMIT}"),
@@ -322,11 +334,11 @@ pub(crate) fn criteria_coverage_cmd(
 
     // Enforce exactly-one-of the input flags before opening any store.
     match (graph, data_dir) {
-        (Some(_), Some(_)) => review_coverage_exit(&serde_json::json!({
+        (Some(_), Some(_)) => criteria_coverage_exit(&serde_json::json!({
             "code": "conflicting_input_flags",
             "message": "provide only one of --graph or --data-dir, not both",
         })),
-        (None, None) => review_coverage_exit(&serde_json::json!({
+        (None, None) => criteria_coverage_exit(&serde_json::json!({
             "code": "missing_input_flag",
             "message": "provide --graph <path> or --data-dir <path>",
         })),
@@ -363,7 +375,7 @@ pub(crate) fn criteria_coverage_cmd(
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         drop(store_copy);
-        review_coverage_exit(&serde_json::json!({
+        criteria_coverage_exit(&serde_json::json!({
             "code": "empty_evidence_input",
             "path": source_path,
             "message": "input holds zero records; provide a non-empty graph or store",
@@ -437,30 +449,11 @@ fn render_criteria_coverage_text(
         report.claimed_done_unproven.len()
     ));
     for row in &report.claimed_done_unproven {
-        lines.push(format!(
-            "  {} task={} bucket={} closing={}",
-            row.record_id,
-            row.parent_task_id.as_deref().unwrap_or("-"),
-            row.bucket,
-            if row.closing_links.is_empty() {
-                "-".to_owned()
-            } else {
-                row.closing_links
-                    .iter()
-                    .map(|l| format!("{}[{}]", l.handle, l.resolution))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            }
-        ));
+        lines.extend(criterion_text_lines(row));
     }
     lines.push(format!("criteria: {}", report.criteria.len()));
     for row in &report.criteria {
-        lines.push(format!(
-            "  {} task={} bucket={}",
-            row.record_id,
-            row.parent_task_id.as_deref().unwrap_or("-"),
-            row.bucket
-        ));
+        lines.extend(criterion_text_lines(row));
     }
     lines.push(format!("breaches: {}", report.breaches.len()));
     for breach in &report.breaches {
@@ -472,9 +465,80 @@ fn render_criteria_coverage_text(
     lines.push(format!("diagnostics: {}", report.diagnostics.len()));
     for d in &report.diagnostics {
         lines.push(format!("  {} {}", d.code, d.detail));
+        // The record IDs a diagnostic names ARE its citation: dropping them
+        // would leave the text form asserting a gap it never points at.
+        for id in &d.record_ids {
+            lines.push(format!("    {id}"));
+        }
     }
     lines.push(format!("disclaimer: {}", report.disclaimer));
     lines.join("\n")
+}
+
+/// Renders one criterion row as human-readable lines carrying the SAME citable
+/// evidence the JSON row carries.
+///
+/// The text form is documented as mirroring the JSON contract, and issue #115's
+/// citation AC requires every listed criterion to carry a citable record ID and,
+/// where present, a repo-relative file/span or source-system handle — in BOTH
+/// formats. Collapsing a row to `id/task/bucket` would leave a reader unable to
+/// audit WHY a criterion landed in its bucket, which is the whole point of the
+/// per-link resolution list.
+///
+/// Values are already control-sanitized and length-bounded by the pure core, so
+/// no value here can forge an extra line or drive the reader's terminal.
+fn criterion_text_lines(row: &crate::criteria_coverage::CriterionRowJson) -> Vec<String> {
+    let mut lines = vec![format!(
+        "  {} task={} task_status={} bucket={} status={} ordinal={}",
+        row.record_id,
+        row.parent_task_id.as_deref().unwrap_or("-"),
+        row.parent_task_status.as_deref().unwrap_or("-"),
+        row.bucket,
+        row.criterion_status.as_deref().unwrap_or("-"),
+        row.ordinal
+            .map_or_else(|| "-".to_owned(), |o| o.to_string()),
+    )];
+    for link in &row.closing_links {
+        lines.push(format!(
+            "    closing={} origins={} resolution={} node_kind={} verification_kind={} status={} exit_code={}",
+            link.handle,
+            link.origins.join("+"),
+            link.resolution,
+            link.node_kind.as_deref().unwrap_or("-"),
+            link.verification_kind.as_deref().unwrap_or("-"),
+            link.status.as_deref().unwrap_or("-"),
+            link.exit_code
+                .map_or_else(|| "-".to_owned(), |c| c.to_string()),
+        ));
+        if let Some(producer) = &link.producer_kind {
+            lines.push(format!("      producer={producer}"));
+        }
+    }
+    if let Some(proving) = &row.proving_verification_id {
+        lines.push(format!("    proven_by={proving}"));
+    }
+    // The source handles: only emitted when actually recorded, so the text form
+    // never implies a citation the record does not carry.
+    let span = row.span.map(|s| format!("{}-{}", s.start_line, s.end_line));
+    let handles: Vec<String> = [
+        row.repo_relative_path
+            .as_deref()
+            .map(|p| format!("path={p}")),
+        span.map(|s| format!("span={s}")),
+        row.source_handle
+            .as_deref()
+            .map(|h| format!("source_handle={h}")),
+        row.external_link_id
+            .as_deref()
+            .map(|l| format!("external_link={l}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !handles.is_empty() {
+        lines.push(format!("    {}", handles.join(" ")));
+    }
+    lines
 }
 
 /// Routes `eg audit evidence-pack` actions (issue #338).

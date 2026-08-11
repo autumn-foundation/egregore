@@ -118,7 +118,18 @@ pub fn verification_outcome(record: &GraphRecord) -> VerificationOutcome {
         if FAILING_VERIFICATION_STATUSES.contains(&normalized.as_str()) {
             return VerificationOutcome::Failing;
         }
-        return VerificationOutcome::Inconclusive;
+        // An UNRECOGNIZED status is not a pass, and a non-zero exit code is
+        // hard evidence the check did not succeed — so it still reports
+        // Failing. Without this a `status: "cancelled", exit_code: 137` or a
+        // panicking `exit_code: 101` would be filed as merely inconclusive,
+        // concealing the severity of a store full of crashed runs. A ZERO exit
+        // code under an unrecognized status stays inconclusive: the status is
+        // the record's own summary, and overriding it with the exit code would
+        // manufacture a pass the record never claimed.
+        return match exit_code {
+            Some(code) if *code != 0 => VerificationOutcome::Failing,
+            _ => VerificationOutcome::Inconclusive,
+        };
     }
     match exit_code {
         Some(0) => VerificationOutcome::Passing,
@@ -496,6 +507,12 @@ const VERIFICATION_ID_PREFIX: &str = "verification:v";
 /// The prefix is matched version-agnostically (`verification:v<N>:`) so a future
 /// verification schema bump keeps conferring trust rather than silently
 /// downgrading every verified claim to `agent_unverified`.
+///
+/// **Not sufficient on its own** for a reader deciding "is this really a
+/// verification record?": the embedded ingest path does not run the daemon's
+/// validator, so a store can hold a node with a `verification:v<N>:` ID and an
+/// `Observation` (or `Task`, or `AcceptanceCriterion`) kind. Pair it with
+/// [`is_verification_domain_kind`].
 #[must_use]
 pub fn is_verification_domain_record(record: &GraphRecord) -> bool {
     record
@@ -505,6 +522,34 @@ pub fn is_verification_domain_record(record: &GraphRecord) -> bool {
         .is_some_and(|(version, _)| {
             !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit())
         })
+}
+
+/// The node kinds permitted under the verification domain.
+///
+/// The single definition shared with the daemon write path's
+/// `validate_verification_domain_records`, so "what may be persisted as a
+/// verification record" and "what a reader may treat as one" are one list — a
+/// kind added to the domain cannot become persistable without also becoming
+/// readable as verification evidence, or vice versa.
+pub const VERIFICATION_DOMAIN_KINDS: &[NodeKind] = &[
+    NodeKind::CommandRun,
+    NodeKind::Verification,
+    NodeKind::TestRun,
+    NodeKind::CIStatus,
+    NodeKind::BenchmarkRun,
+    NodeKind::CoverageReport,
+    NodeKind::ProofResult,
+];
+
+/// Returns `true` when `record` is a node whose kind is permitted under the
+/// verification domain.
+///
+/// Deliberately SEPARATE from [`is_verification_domain_record`], which reads the
+/// record ID: a reader deciding whether a record may be treated as verification
+/// evidence must check BOTH.
+#[must_use]
+pub fn is_verification_domain_kind(record: &GraphRecord) -> bool {
+    matches!(record, GraphRecord::Node { kind, .. } if VERIFICATION_DOMAIN_KINDS.contains(kind))
 }
 
 /// Returns `true` when a verification record's recorded outcome is passing.
@@ -1060,6 +1105,22 @@ mod tests {
         assert_eq!(
             verification_outcome(&run("v", Some("fail"), Some(0))),
             VerificationOutcome::Failing
+        );
+        // An UNRECOGNIZED status plus a non-zero exit code is still a failure —
+        // a crashed or cancelled run must not be filed as merely inconclusive.
+        assert_eq!(
+            verification_outcome(&run("v", Some("cancelled"), Some(137))),
+            VerificationOutcome::Failing
+        );
+        assert_eq!(
+            verification_outcome(&run("v", Some("unknown"), Some(101))),
+            VerificationOutcome::Failing
+        );
+        // ...but a ZERO exit code never manufactures a pass the status did not
+        // claim.
+        assert_eq!(
+            verification_outcome(&run("v", Some("inconclusive"), Some(0))),
+            VerificationOutcome::Inconclusive
         );
     }
 

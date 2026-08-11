@@ -46,24 +46,54 @@ The verbatim disclaimer appears in every report.
 
 ## Trust separation (the load-bearing rule)
 
-`proven` derives **only** from a live `CLOSES_ACCEPTANCE_CRITERION` link to a
-record that provably lives in the **verification domain** — proven by its
-`verification:v<N>:` record-ID prefix, the same gate `src/query/trust.rs` applies —
-whose recorded outcome is **passing**.
+`proven` means exactly one thing: **the criterion is closed by a live
+`CLOSES_ACCEPTANCE_CRITERION` link to a verification record whose recorded
+outcome is passing.**
+
+Being a verification record takes **three checks, not one**:
+
+1. the record ID is verification-domain (`verification:v<N>:`);
+2. the `NodeKind` is one the verification domain permits — the *same* list the
+   daemon write path enforces (`CommandRun`, `Verification`, `TestRun`,
+   `CIStatus`, `BenchmarkRun`, `CoverageReport`, `ProofResult`);
+3. the handle is not the criterion's own record ID.
+
+The ID prefix alone is not sufficient, because the embedded ingest path does not
+run the daemon's `validate_verification_domain_records`: a store really can hold
+a node with a `verification:v1:` ID and an `Observation`, `Task`, or even
+`AcceptanceCriterion` kind. Anything failing any of the three lands in
+`non_verification_evidence`.
 
 A criterion is **never** counted proven from:
 
 - `Task.status` — a human toggle in an issue tracker;
 - its own `AcceptanceCriterion.status: verified` — a claim. It is echoed on the
   row as `criterion_status` for citation, but never read for bucketing;
-- an agent observation, a commit message, prose, or semantic similarity.
+- a commit message, prose, or semantic similarity;
+- an `agent_memory:v<N>:` record whatever its kind — notably the
+  `NodeKind::CommandEvidence` that `eg command-evidence` mints from an
+  agent-supplied `--exit-code`.
 
-The domain gate closes a **self-certification** hole. `eg command-evidence` mints
-`NodeKind::CommandEvidence` under an `agent_memory:v1:` id, with a status derived
-purely from an agent-supplied `--exit-code`. Without the gate an agent could write
-its own proof and have Egregore certify a criterion from it. Such a link lands in
-`non_verification_evidence` — fully reported, with the claimed status visible,
-but never counted. An agent-authored claim is never evidence for itself.
+## What the gate does NOT establish
+
+**`proven` does not mean "someone independently confirmed this works."** The gate
+proves the closing record was *minted as verification evidence*; it does not
+prove the outcome was independently observed. Concretely, on trunk today:
+
+| Writer | Mints | Outcome comes from |
+| --- | --- | --- |
+| `eg capture-tests` | `verification:v1:` `TestRun` | a parsed libtest artifact — an independent observation |
+| `eg write verification --status pass` | `verification:v1:` `Verification` | **its caller**, verbatim |
+| Claude Code / Antigravity transcript importers | `verification:v1:` `Verification` / `CommandRun` | what an agent transcript *said* a command did |
+| `eg command-evidence` | `agent_memory:v1:` `CommandEvidence` | an agent-supplied `--exit-code` — correctly **excluded** |
+
+Rather than silently rank writers, every closing link discloses the
+`producer_kind` that wrote it, so a reader can see whether a `proven` rests on a
+captured test run or on an agent's own account of one. **Honest limit:**
+`producer_kind` does not fully discriminate — `eg capture-tests` and
+`eg write verification` both record `observation_writer`. Treat a `proven` row as
+*"there is a passing verification record here"* and read its `producer_kind`
+before treating it as more.
 
 ## Buckets (closed set, mutually exclusive)
 
@@ -75,8 +105,8 @@ to `total_criteria`.
 | `proven` | Closed by a resolvable verification-domain record with a **passing** outcome. |
 | `failed_evidence` | A closing link resolves to a verification-domain record whose outcome is **failing**. |
 | `dangling_evidence` | A closing handle resolves to **no live record** (absent, or tombstoned). The original handle is preserved. |
-| `non_verification_evidence` | A closing link resolves to a live record **outside** the verification domain — reported, never counted proven, never merged into `unverified`. |
-| `inconclusive_evidence` | A closing link resolves to a verification-domain record whose outcome is **neither** passing nor failing (e.g. `skip`, an unrecognized status, or no status and no exit code). |
+| `non_verification_evidence` | A closing link resolves to a live record that is **not a verification record** (wrong domain, wrong `NodeKind`, or the criterion itself) — reported, never counted proven, never merged into `unverified`. |
+| `inconclusive_evidence` | A closing link resolves to a verification record whose outcome is **neither** passing nor failing (e.g. `skip`, or no status and no exit code), **or** whose live physical versions disagree about the outcome (`ambiguous_versions`). |
 | `unverified` | **No** closing verification evidence at all. |
 
 The issue's three named ratios are `proven`, `unverified`, and `failed_evidence`;
@@ -93,13 +123,13 @@ present the **most alarming wins**, so a passing link can never mask a failing o
 dangling one:
 
 ```
-failed_evidence > dangling_evidence > non_verification_evidence
-                > inconclusive_evidence > proven > unverified
+failed_evidence > dangling_evidence > ambiguous_versions
+                > non_verification_evidence > inconclusive_evidence
+                > proven > unverified
 ```
 
 Every handle is listed on the row in `closing_links` with its own `resolution`
-(`passing` / `failing` / `inconclusive` / `non_verification_domain` /
-`unresolved`), so the derivation is auditable rather than asserted.
+(`passing` / `failing` / `inconclusive` / `not_verification_record` / `ambiguous_versions` / `unresolved`), so the derivation is auditable rather than asserted.
 
 ## Outcome vocabulary
 
@@ -114,6 +144,13 @@ Pass/fail is the **single shared rule** in `src/query/trust.rs`
   `error`/`timeout` are failing because the check *ran and did not succeed*.
 - **Inconclusive**: everything else — including `skip` (a skipped check proves
   nothing either way) and a record with neither field.
+
+An **unrecognized** status paired with a **non-zero** `exit_code` still reports
+failing: a `status: "cancelled", exit_code: 137` or a panicking `exit_code: 101`
+is hard evidence the check did not succeed, and filing it as merely inconclusive
+would conceal the severity of a store full of crashed runs. A *zero* exit code
+under an unrecognized status stays inconclusive — overriding the record's own
+summary would manufacture a pass it never claimed.
 
 A disjointness test pins the two vocabularies apart.
 
@@ -146,7 +183,7 @@ reported as `criterion_parent_task_conflict` rather than silently resolved.
 | --- | --- |
 | 0 | Every threshold met (`ok: true`). A store with **zero** acceptance criteria is a vacuous pass carrying `no_acceptance_criteria`. |
 | 1 | A threshold was breached (`ok: false`). The full report is still printed, with a `breaches` array naming each metric, its observed value, and the bound, plus the stable diagnostics `below_proven_ratio_threshold` / `above_claimed_done_unproven_threshold`. A store over the proof-gap line is **never** reported as ready. |
-| 2 | Usage/load error: both input flags (`conflicting_input_flags`), neither (`missing_input_flag`), out-of-range `--min-proven-ratio` (`invalid_min_proven_ratio`), out-of-range `--limit` (`invalid_limit`), or an empty/unreadable graph or store (`empty_evidence_input`). |
+| 2 | Usage/load error: both input flags (`conflicting_input_flags`), neither (`missing_input_flag`), out-of-range `--min-proven-ratio` (`invalid_min_proven_ratio`), out-of-range `--limit` (`invalid_limit`), an input holding zero records (`empty_evidence_input`), an unreadable/unparseable `--graph` (`graph_read_error` / `graph_parse_error`), or a missing/invalid `--data-dir` (a plain-text diagnostic naming the path, not a JSON envelope). |
 
 An out-of-range or non-finite threshold is an error rather than a clamp, so the
 gate can never be silently disabled or inverted.
@@ -168,17 +205,21 @@ fabricated `0.0` — alongside the stable `no_acceptance_criteria` diagnostic.
 | Code | Meaning |
 | --- | --- |
 | `no_acceptance_criteria` | Zero live criteria; ratios have a zero denominator. Not a failure. |
-| `dangling_closing_evidence` | Names every criterion whose closing handle resolves to no live record. |
+| `dangling_closing_evidence` | Names every criterion carrying a closing handle that resolves to no live record — including one masked by a higher-precedence bucket. |
 | `criterion_parent_task_conflict` | `OWNED_BY_TASK` target ≠ `parent_task_id`; the field wins. |
 | `criterion_parent_task_unresolved` | The owning `Task` does not resolve to a live `Task`. Still counted in the census, but can never enter the claimed-done set. |
+| `superseded_criteria_counted` | Names criteria recorded `status: superseded`, which ARE counted in the proof gap — disclosed because the symmetric argument excludes `closed_dropped` tasks. |
 | `results_truncated` | `--limit` truncated a row list; counts stay pre-truncation. |
 | `below_proven_ratio_threshold` | Gate breach, naming the ratio and the bound. |
 | `above_claimed_done_unproven_threshold` | Gate breach, naming the count, the bound, and every failing criterion ID. |
 
 ## JSON contract
 
-`--format json` (the default) is the agent contract; `--format text` mirrors it
-field for field. Abridged:
+`--format json` (the default) is the agent contract. `--format text` is a
+deterministic human-readable rendering of the same report carrying the same
+citable evidence per row (record ID, parent task, bucket, every closing link with
+its resolution and producer, the proving record, path/span, and source handles);
+the JSON remains the complete contract. Abridged:
 
 ```json
 {
@@ -207,10 +248,13 @@ field for field. Abridged:
           "handle": "verification:v1:fail1",
           "origins": ["closes_edge"],
           "resolution": "failing",
+          "node_kind": "TestRun",
           "verification_kind": "TestRun",
-          "status": "fail"
+          "status": "fail",
+          "producer_kind": "observation_writer"
         }
       ],
+      "proving_verification_id": null,
       "source_handle": "tasks.jsonl:ac-f1:abc123",
       "claimed_done_unproven": true
     }
@@ -229,14 +273,41 @@ Every row carries a citable `record_id`, its `parent_task_id`, and — where
 present — `repo_relative_path`/`span` and the source-system `source_handle` /
 `external_link_id`. **No row exists only as prose.**
 
+`proving_verification_id` names the deciding passing record, and is present ONLY
+on a `proven` row: naming one on any other bucket would call evidence proof.
+`parent_task_id` serializes as an explicit `null` when the owning `Task` does not
+resolve to a live `Task` record — the case `criterion_parent_task_unresolved`
+reports. `node_kind` is the trusted closed vocabulary; `verification_kind` and
+`status` are free text read back from the store and are sanitized and
+length-capped (see below).
+
 ## Redaction & safety
 
-Output is **allow-list only**: record IDs, handles, status/outcome enums, kinds,
-spans, paths, counts, ratios, bounded messages, and stable diagnostic codes. It
-never includes criterion `text`, task titles or bodies, transcript text,
-command/test output, patch hunks, issue/PR bodies, env values, or tokens — pinned
-by a test that plants sentinel strings in every prose field of the fixture and
-asserts they never appear in either output format.
+Output is **allow-list only** by field name: record IDs, handles, statuses,
+kinds, spans, paths, counts, ratios, bounded messages, and stable diagnostic
+codes. It never includes criterion `text`, task titles or bodies, transcript
+text, command/test output, patch hunks, issue/PR bodies, env values, or tokens —
+pinned by a test that plants sentinel strings in every prose field of the fixture
+and asserts they never appear in either output format.
+
+Some emitted VALUES are nonetheless operator- or attacker-controlled, because
+they are read back from a store no writer fully validates. `status` in particular
+is documented as a **free string with no enum enforcement at v1**, and a dangling
+closing `handle` is reported with its original text precisely because nothing
+validated it. Two rules apply, in the pure core so both transports inherit them:
+
+- **Free text** (`status`, `verification_kind`, `criterion_status`,
+  `parent_task_status`) is control-character-sanitized and length-capped at
+  `CRITERIA_FIELD_MAX_CHARS` with a visible `…` marker, delegating to the same
+  hardened helper the #104 semantic-index refusal path uses.
+- **Handles** (record IDs, `handle`, `repo_relative_path`, `source_handle`,
+  `external_link_id`, diagnostic `record_ids`) are control-character-sanitized
+  but deliberately **not truncated**: a truncated handle is no longer a citation,
+  and a prefix of a record ID silently reads like a valid one.
+
+Without this, a crafted record could forge an entire extra `bucket=proven` row in
+`--format text` output and emit an ANSI escape that clears the reader's terminal.
+A test plants exactly that payload and asserts neither happens.
 
 ## Determinism & read-only
 
@@ -253,11 +324,23 @@ Liveness is the shared latest-write-wins `Liveness` gate, so `--graph` and
 re-ingested after its own tombstone is live again, and a retracted closing edge
 stops proving.
 
-**Transport note.** The ingest write path enforces referential integrity, so an
-edge whose target node was *never written* cannot exist in an embedded store —
-the absent-target flavour of `dangling_evidence` is reachable only over
-`--graph`. The tombstoned-target flavour (a record written, then retracted) is
-reachable on both, and is what the `--data-dir` parity fixture exercises.
+**Transport note.** The ingest write path enforces referential integrity for
+*edges*, so a `CLOSES_ACCEPTANCE_CRITERION` **edge** whose target node was never
+written cannot exist in an embedded store — that flavour of `dangling_evidence`
+is reachable only over `--graph`. The same never-written handle carried in the
+denormalized `verification_link_id` **field** ingests cleanly and *is* reachable
+over `--data-dir`, as is the tombstoned-target flavour (a record written, then
+retracted); the latter is what the `--data-dir` parity fixture exercises.
+
+**Ordering limit.** Egregore writes graph JSONL with lexicographically **sorted**
+lines (`Graph::to_jsonl`, `eg export`), so over `--graph` the relative order of
+two physical writes of one record ID carries no information about which is
+current. This lane therefore never decides an outcome by position: when live
+versions of a closing record disagree, the link resolves `ambiguous_versions` and
+the criterion is never reported `proven`. The residual limit is liveness — a
+record tombstoned and later re-added cannot be distinguished from one merely
+tombstoned in a sorted graph, so it is reported deleted. **`--data-dir` is the
+authoritative current-state read.**
 
 ## Scope
 
@@ -272,3 +355,15 @@ code-symbol verification gaps (#109), agent-memory health (#94), commit-range
 change context (#62), new test-result semantics, and code line/branch coverage
 (`CoverageReport`) — which measures what fraction of *code lines* ran, a
 different question from what fraction of *acceptance criteria* are proven.
+
+## See also
+
+- [`docs/cli/task-queries.md`](task-queries.md) — `eg query task`, the per-task
+  drill-down this census tells you *when* to run.
+- [`docs/cli/verification-coverage.md`](verification-coverage.md) — the
+  code-**symbol** verification-coverage lane (#109).
+- [`docs/cli/verification-freshness.md`](verification-freshness.md) — ages the
+  verification evidence this lane counts.
+- [`docs/cli/memory-health.md`](memory-health.md) — agent-memory health (#94).
+- [`docs/schema/project-graph.md`](../schema/project-graph.md) — the
+  `AcceptanceCriterion` / `Task` shapes and the edge registry this lane reads.
