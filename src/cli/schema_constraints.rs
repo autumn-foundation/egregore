@@ -23,10 +23,14 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::schema_constraints::{ConstraintAction, ConstraintProfile, SchemaConstraintReport};
+// Scanning/rendering types are reachable only from the embedded lane; importing
+// them unconditionally would warn in a `--no-default-features` build, where the
+// command is a usage-error stub.
+#[cfg(feature = "embedded-aletheiadb")]
 use crate::schema_constraints::{
-    ConformanceStatus, ConstraintAction, ConstraintProfile, EntityKindToken, LabelConformance,
-    SchemaConstraintReport, unknown_edge_types, unknown_node_labels, writable_edge_types,
-    writable_node_labels,
+    ConformanceStatus, EntityKindToken, LabelConformance, unknown_edge_types, unknown_node_labels,
+    writable_edge_types, writable_node_labels,
 };
 
 use super::OutputFormat;
@@ -52,6 +56,7 @@ pub(crate) fn audit_schema_constraints_cmd(
     profile: &str,
     declare: bool,
     drop: bool,
+    include_foreign: bool,
     format: OutputFormat,
 ) -> Result<()> {
     if declare && drop {
@@ -82,7 +87,14 @@ pub(crate) fn audit_schema_constraints_cmd(
         ConstraintAction::Report
     };
 
-    run(data_dir, profile, action, format)
+    if include_foreign && !drop {
+        usage_exit(
+            "unsupported_combination",
+            "--include-foreign only applies to --drop",
+        );
+    }
+
+    run(data_dir, profile, action, include_foreign, format)
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
@@ -90,6 +102,7 @@ fn run(
     data_dir: &Path,
     profile: ConstraintProfile,
     action: ConstraintAction,
+    include_foreign: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let mut report = SchemaConstraintReport {
@@ -101,7 +114,11 @@ fn run(
         unknown_edge_types: Vec::new(),
         declared_constraints: Vec::new(),
         declared_labels: 0,
+        declaration_refusal: None,
         dropped_labels: 0,
+        dropped_constraints: Vec::new(),
+        foreign_constraints_retained: Vec::new(),
+        conformance_evaluated: false,
     };
 
     match action {
@@ -111,7 +128,7 @@ fn run(
             let (store_root, _guard) = super::readonly_audit_store(data_dir)
                 .unwrap_or_else(|error| usage_exit("store_unreadable", &error.to_string()));
             let sink = open_store(&store_root, data_dir, false);
-            collect_conformance(&sink, profile, &mut report)?;
+            collect_conformance(&sink, profile, &mut report);
             report.declared_constraints = sink.declared_schema_constraints();
         }
         ConstraintAction::Declare => {
@@ -121,47 +138,59 @@ fn run(
             let sink = open_store(data_dir, data_dir, true);
             // Report conformance first, so a refusal is explained by the same
             // rows the read-only report would have shown.
-            collect_conformance(&sink, profile, &mut report)?;
+            collect_conformance(&sink, profile, &mut report);
             if !report.ok() {
                 report.declared_constraints = sink.declared_schema_constraints();
-                report.canonicalize();
-                emit(&report, format);
-                std::process::exit(1);
+                finish(&mut report, format, 1);
             }
             let nodes = writable_node_labels();
             let edges = writable_edge_types();
-            report.declared_labels = sink
-                .declare_schema_constraints(profile, EntityKindToken::Node, &nodes)
-                .and_then(|node_count| {
-                    sink.declare_schema_constraints(profile, EntityKindToken::Edge, &edges)
-                        .map(|edge_count| node_count + edge_count)
-                })
-                .unwrap_or_else(|error| {
-                    // A refusal here means current state changed under us or a
-                    // label upstream rejects; report it and leave whatever
-                    // landed for `--drop` to clean.
-                    usage_exit("declaration_refused", &error.to_string())
-                });
+            let node_outcome =
+                sink.declare_schema_constraints(profile, EntityKindToken::Node, &nodes);
+            report.declared_labels = node_outcome.declared;
+            report.declaration_refusal = node_outcome.refusal;
+            if report.declaration_refusal.is_none() {
+                let edge_outcome =
+                    sink.declare_schema_constraints(profile, EntityKindToken::Edge, &edges);
+                report.declared_labels += edge_outcome.declared;
+                report.declaration_refusal = edge_outcome.refusal;
+            }
+            // Declaration is not atomic across labels, so a refusal can leave the
+            // store half-constrained. Always read the store's real posture back
+            // and PRINT the full report: an operator who cannot see which labels
+            // landed cannot clean up, and a bare stderr line would hide it.
             report.declared_constraints = sink.declared_schema_constraints();
         }
         ConstraintAction::Drop => {
             validate_store_path(data_dir);
             let sink = open_store(data_dir, data_dir, true);
-            report.dropped_labels = sink
-                .drop_all_schema_constraints()
+            let outcome = sink
+                .drop_schema_constraints(include_foreign)
                 .unwrap_or_else(|error| usage_exit("drop_failed", &error.to_string()));
+            report.dropped_labels = outcome.dropped.len();
+            // The before-image: upstream atomically rewrites the sidecar on every
+            // drop, so without this a mistaken `--drop` is unrecoverable by
+            // inspection - you cannot re-declare what you can no longer read.
+            report.dropped_constraints = outcome.dropped;
+            report.foreign_constraints_retained = outcome.foreign_retained;
             report.declared_constraints = sink.declared_schema_constraints();
         }
     }
 
+    let code = i32::from(!report.ok());
+    finish(&mut report, format, code);
+}
+
+/// Canonicalizes, prints, and exits with `code`.
+///
+/// Every terminal path goes through here so the full report is ALWAYS printed
+/// before exit - including a refused or partial `--declare`, where the report is
+/// the only record of which labels actually landed.
+#[cfg(feature = "embedded-aletheiadb")]
+fn finish(report: &mut SchemaConstraintReport, format: OutputFormat, code: i32) -> ! {
     report.canonicalize();
-    let ok = report.ok();
-    emit(&report, format);
-    if ok {
-        Ok(())
-    } else {
-        std::process::exit(1);
-    }
+    emit(report, format);
+    std::process::exit(code);
 }
 
 /// Opens an embedded store, reporting failures against the ORIGINAL path.
@@ -183,8 +212,18 @@ fn open_store(
         crate::adapters::EmbeddedAletheiaSink::open_unleased(store_root)
     };
     opened.unwrap_or_else(|error| {
+        // A lease held by another live writer is its own documented condition
+        // (issue #200) with its own remedy - route through the daemon, or retry.
+        // Collapsing it into `store_unreadable` would bury that remedy in free
+        // text under a misleading machine-readable code.
+        let code = match error {
+            crate::adapters::AdapterError::Contended { .. } => {
+                crate::adapters::STORE_CONTENDED_CODE
+            }
+            _ => "store_unreadable",
+        };
         usage_exit(
-            "store_unreadable",
+            code,
             &format!(
                 "failed to open embedded store {}: {error}",
                 reported_path.display()
@@ -213,10 +252,16 @@ fn collect_conformance(
     sink: &crate::adapters::EmbeddedAletheiaSink,
     profile: ConstraintProfile,
     report: &mut SchemaConstraintReport,
-) -> Result<()> {
-    let (observed_nodes, observed_edges) = sink
-        .observed_labels()
-        .map_err(|error| anyhow::anyhow!("failed to read store schema: {error}"))?;
+) {
+    // A store that cannot be READ is a load error (exit 2), never a conformance
+    // gate failure (exit 1): a CI job keying on exit 1 must never be told
+    // "schema violations found" for what is actually an I/O failure.
+    let (observed_nodes, observed_edges) = sink.observed_labels().unwrap_or_else(|error| {
+        usage_exit(
+            "store_unreadable",
+            &format!("failed to read store schema: {error}"),
+        )
+    });
 
     report.unknown_node_labels = unknown_node_labels(&observed_nodes);
     report.unknown_edge_types = unknown_edge_types(&observed_edges);
@@ -237,10 +282,20 @@ fn collect_conformance(
 
     report.rows = sink
         .schema_constraint_dry_run(profile, EntityKindToken::Node, &scan_nodes)
-        .map_err(|error| anyhow::anyhow!("node conformance scan failed: {error}"))?;
+        .unwrap_or_else(|error| {
+            usage_exit(
+                "conformance_scan_failed",
+                &format!("node conformance scan failed: {error}"),
+            )
+        });
     report.rows.extend(
         sink.schema_constraint_dry_run(profile, EntityKindToken::Edge, &scan_edges)
-            .map_err(|error| anyhow::anyhow!("edge conformance scan failed: {error}"))?,
+            .unwrap_or_else(|error| {
+                usage_exit(
+                    "conformance_scan_failed",
+                    &format!("edge conformance scan failed: {error}"),
+                )
+            }),
     );
 
     // Every inventoried label the store holds nothing of is reported
@@ -271,7 +326,7 @@ fn collect_conformance(
             .all(|row| row.status != ConformanceStatus::NotPresent || row.checked == 0)
     );
 
-    Ok(())
+    report.conformance_evaluated = true;
 }
 
 #[cfg(not(feature = "embedded-aletheiadb"))]
@@ -279,6 +334,7 @@ fn run(
     _data_dir: &Path,
     _profile: ConstraintProfile,
     _action: ConstraintAction,
+    _include_foreign: bool,
     _format: OutputFormat,
 ) -> Result<()> {
     usage_exit(
@@ -287,6 +343,7 @@ fn run(
     );
 }
 
+#[cfg(feature = "embedded-aletheiadb")]
 fn emit(report: &SchemaConstraintReport, format: OutputFormat) {
     match format {
         OutputFormat::Json => {

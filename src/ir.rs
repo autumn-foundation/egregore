@@ -3233,10 +3233,13 @@ impl NodeKind {
     ///
     /// The embedded adapter writes one store-side node label per kind
     /// (`node_label(kind) == kind.as_str()`), so this doubles as the inventory
-    /// of node labels Egregore can ever write (issue #486). A `kind_drift_guard`
-    /// unit test pins it exhaustive: adding a `NodeKind` variant fails to
-    /// compile until the guard's wildcard-free `match` classifies it, and the
-    /// guard then asserts the variant is present here.
+    /// of node labels Egregore can ever write (issue #486).
+    ///
+    /// `node_kind_all_matches_the_enum_definition` pins it exhaustive against an
+    /// INDEPENDENT oracle: `serde`'s unknown-variant error, which the derive
+    /// macro regenerates from the enum definition itself. Adding a variant
+    /// without listing it here fails that test. (A guard that merely iterated
+    /// this array would be circular and could not fail.)
     pub const ALL: [Self; 60] = [
         Self::Repository,
         Self::File,
@@ -3507,8 +3510,9 @@ impl EdgeLabel {
     ///
     /// The embedded adapter writes one store-side edge type per label
     /// (`create_edge(.., label.as_str(), ..)`), so this doubles as the inventory
-    /// of edge types Egregore can ever write (issue #486). A `label_drift_guard`
-    /// unit test pins it exhaustive the same way [`NodeKind::ALL`] is pinned.
+    /// of edge types Egregore can ever write (issue #486).
+    /// `edge_label_all_matches_the_enum_definition` pins it exhaustive against
+    /// the same independent `serde` oracle [`NodeKind::ALL`] uses.
     pub const ALL: [Self; 49] = [
         Self::Contains,
         Self::Defines,
@@ -3979,159 +3983,102 @@ mod strip_prefix_tests {
 mod label_inventory_tests {
     use super::{EdgeLabel, NodeKind};
 
-    /// Compile-time completeness guard for [`NodeKind::ALL`] (issue #486).
+    /// Recovers the enum's TRUE variant list from `serde`'s unknown-variant
+    /// error, which the derive macro regenerates from the enum definition
+    /// itself.
     ///
-    /// The `match` below has NO wildcard arm, so adding a `NodeKind` variant
-    /// fails to compile here until it is deliberately classified — and the
-    /// assertion then fails until the variant is also added to `ALL`. Together
-    /// these make the written-label inventory derived rather than
-    /// hand-maintained, so it can never silently drift from `node_label()`.
-    #[test]
-    fn node_kind_all_is_exhaustive() {
-        fn is_listed(kind: NodeKind) -> bool {
-            // Force an exhaustive match so a new variant breaks the build.
-            match kind {
-                NodeKind::Repository
-                | NodeKind::File
-                | NodeKind::Module
-                | NodeKind::Symbol
-                | NodeKind::Import
-                | NodeKind::Diagnostic
-                | NodeKind::PanicRiskSite
-                | NodeKind::DebtMarker
-                | NodeKind::UnsafeSite
-                | NodeKind::DependencyDeclaration
-                | NodeKind::ScanCoverage
-                | NodeKind::Commit
-                | NodeKind::Change
-                | NodeKind::SemanticDrift
-                | NodeKind::EmbeddingModel
-                | NodeKind::EmbeddingVector
-                | NodeKind::Agent
-                | NodeKind::AgentSession
-                | NodeKind::Observation
-                | NodeKind::Task
-                | NodeKind::AcceptanceCriterion
-                | NodeKind::ExternalLink
-                | NodeKind::Product
-                | NodeKind::Project
-                | NodeKind::Plan
-                | NodeKind::GitHubIssue
-                | NodeKind::PR
-                | NodeKind::Review
-                | NodeKind::ExternalIdentity
-                | NodeKind::ReviewStateTransition
-                | NodeKind::LocalTask
-                | NodeKind::Artifact
-                | NodeKind::Verification
-                | NodeKind::CommandEvidence
-                | NodeKind::AgentRun
-                | NodeKind::AgentTurn
-                | NodeKind::ToolCall
-                | NodeKind::CommandRun
-                | NodeKind::FileEdit
-                | NodeKind::PatchArtifact
-                | NodeKind::Failure
-                | NodeKind::Decision
-                | NodeKind::TestRun
-                | NodeKind::CIStatus
-                | NodeKind::BenchmarkRun
-                | NodeKind::CoverageReport
-                | NodeKind::ProofResult
-                | NodeKind::PromoteCandidate
-                | NodeKind::PromotionPrompt
-                | NodeKind::PromotionDecision
-                | NodeKind::Preference
-                | NodeKind::WorkflowRule
-                | NodeKind::NamingDecision
-                | NodeKind::Constraint
-                | NodeKind::CostUsage
-                | NodeKind::Retraction
-                | NodeKind::LogSource
-                | NodeKind::ErrorSignature
-                | NodeKind::LogEvent
-                | NodeKind::LogOccurrenceBucket => NodeKind::ALL.contains(&kind),
-            }
-        }
-
-        for kind in NodeKind::ALL {
-            assert!(is_listed(kind), "{} missing from ALL", kind.as_str());
-        }
-
-        // No duplicates: `ALL.len()` is the real distinct-label count.
-        let mut labels: Vec<&str> = NodeKind::ALL.iter().map(|k| k.as_str()).collect();
-        labels.sort_unstable();
-        let distinct = labels.len();
-        labels.dedup();
-        assert_eq!(labels.len(), distinct, "NodeKind::ALL holds a duplicate");
+    /// This is the INDEPENDENT ORACLE the inventory guards need. An earlier
+    /// version of these tests iterated `ALL` and asserted each element was in
+    /// `ALL` — circular, and it could not fail: adding a variant and extending
+    /// only the wildcard-free `match` (which the compiler does force) left
+    /// `ALL` silently short, so the "exhaustive" inventory would omit a real
+    /// store label and `--declare` would leave it unconstrained. Deriving the
+    /// expectation from `serde` instead means nothing a developer hand-writes
+    /// is on both sides of the assertion.
+    fn serde_variants<T>() -> Vec<String>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let error = serde_json::from_str::<T>("\"__no_such_variant__\"")
+            .err()
+            .expect("a bogus variant must fail to deserialize");
+        let message = error.to_string();
+        let (_, listed) = message
+            .split_once("expected one of ")
+            .expect("serde should enumerate the expected variants");
+        listed
+            .split(" at line ")
+            .next()
+            .unwrap_or(listed)
+            .split(", ")
+            .map(|token| token.trim().trim_matches('`').to_owned())
+            .filter(|token| !token.is_empty())
+            .collect()
     }
 
-    /// Compile-time completeness guard for [`EdgeLabel::ALL`] (issue #486).
+    /// [`NodeKind::ALL`] must list every variant the enum defines, because the
+    /// embedded adapter writes one store-side node label per kind and issue
+    /// #486's inventory (and `--declare`) is derived from it.
     #[test]
-    fn edge_label_all_is_exhaustive() {
-        fn is_listed(label: EdgeLabel) -> bool {
-            match label {
-                EdgeLabel::Contains
-                | EdgeLabel::Defines
-                | EdgeLabel::Imports
-                | EdgeLabel::References
-                | EdgeLabel::Calls
-                | EdgeLabel::Implements
-                | EdgeLabel::Mentions
-                | EdgeLabel::ChangedIn
-                | EdgeLabel::ParentOf
-                | EdgeLabel::DriftsFrom
-                | EdgeLabel::DriftsPrior
-                | EdgeLabel::MeasuredBy
-                | EdgeLabel::SessionOf
-                | EdgeLabel::AuthoredBy
-                | EdgeLabel::HasEvidence
-                | EdgeLabel::Observes
-                | EdgeLabel::MentionsSymbol
-                | EdgeLabel::TouchedFile
-                | EdgeLabel::ProducedPatch
-                | EdgeLabel::ProducedEvidence
-                | EdgeLabel::ValidatedBy
-                | EdgeLabel::ClosesAcceptanceCriterion
-                | EdgeLabel::OwnedByTask
-                | EdgeLabel::ExternalHandle
-                | EdgeLabel::TouchesFile
-                | EdgeLabel::MergedAs
-                | EdgeLabel::ReviewsCommit
-                | EdgeLabel::ReviewedBy
-                | EdgeLabel::RequestedReviewFrom
-                | EdgeLabel::TransitionsReview
-                | EdgeLabel::FailedOn
-                | EdgeLabel::ExplainsChange
-                | EdgeLabel::ReferencesTask
-                | EdgeLabel::Contradicts
-                | EdgeLabel::Supersedes
-                | EdgeLabel::ProposedBy
-                | EdgeLabel::PromptedFor
-                | EdgeLabel::DecidedOn
-                | EdgeLabel::MaterializedAs
-                | EdgeLabel::RevokedBy
-                | EdgeLabel::ScopedToRepo
-                | EdgeLabel::RelatesTo
-                | EdgeLabel::FingerprintedAs
-                | EdgeLabel::CapturedFrom
-                | EdgeLabel::Aggregates
-                | EdgeLabel::FrameResolvesTo
-                | EdgeLabel::EmittedDuring
-                | EdgeLabel::Constructs
-                | EdgeLabel::RegistersRoute => EdgeLabel::ALL.contains(&label),
-            }
-        }
+    fn node_kind_all_matches_the_enum_definition() {
+        let expected = serde_variants::<NodeKind>();
+        let actual: Vec<String> = NodeKind::ALL
+            .iter()
+            .map(|kind| (*kind).as_str().to_owned())
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "NodeKind::ALL must list every variant, in declaration order - \
+             a missing kind silently drops a store label from the #486 inventory"
+        );
+    }
 
-        for label in EdgeLabel::ALL {
-            assert!(is_listed(label), "{} missing from ALL", label.as_str());
-        }
+    /// The same independent check for [`EdgeLabel::ALL`].
+    #[test]
+    fn edge_label_all_matches_the_enum_definition() {
+        let expected = serde_variants::<EdgeLabel>();
+        let actual: Vec<String> = EdgeLabel::ALL
+            .iter()
+            .map(|label| (*label).as_str().to_owned())
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "EdgeLabel::ALL must list every variant, in declaration order"
+        );
+    }
 
-        let mut labels: Vec<&str> = EdgeLabel::ALL.iter().map(|l| l.as_str()).collect();
-        labels.sort_unstable();
-        let distinct = labels.len();
-        labels.dedup();
-        assert_eq!(labels.len(), distinct, "EdgeLabel::ALL holds a duplicate");
+    /// The oracle itself must be able to fail. If `serde_variants` ever returns
+    /// an empty or degenerate list (a serde message-format change), the two
+    /// tests above would silently pass against nothing.
+    #[test]
+    fn serde_variant_oracle_is_not_degenerate() {
+        let kinds = serde_variants::<NodeKind>();
+        assert!(
+            kinds.len() > 50,
+            "oracle returned {} variants - serde's error format likely changed, \
+             which would silently disarm the inventory guards",
+            kinds.len()
+        );
+        assert!(kinds.contains(&"Repository".to_owned()));
+        assert!(kinds.iter().all(|k| !k.contains('`')));
+        assert!(kinds.iter().all(|k| !k.contains("line ")));
+    }
+
+    /// Both listings must be duplicate-free, so `ALL.len()` is the real
+    /// distinct-label count the report publishes.
+    #[test]
+    fn listings_are_duplicate_free() {
+        let mut node: Vec<&str> = NodeKind::ALL.iter().map(|k| k.as_str()).collect();
+        node.sort_unstable();
+        let node_total = node.len();
+        node.dedup();
+        assert_eq!(node.len(), node_total, "NodeKind::ALL holds a duplicate");
+
+        let mut edge: Vec<&str> = EdgeLabel::ALL.iter().map(|l| l.as_str()).collect();
+        edge.sort_unstable();
+        let edge_total = edge.len();
+        edge.dedup();
+        assert_eq!(edge.len(), edge_total, "EdgeLabel::ALL holds a duplicate");
     }
 
     /// Every listed label round-trips through the wire parser, so the inventory

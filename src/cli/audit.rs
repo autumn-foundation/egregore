@@ -117,8 +117,16 @@ pub(crate) fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
             profile,
             declare,
             drop,
+            include_foreign,
             format,
-        } => audit_schema_constraints_cmd(&data_dir, &profile, declare, drop, format),
+        } => audit_schema_constraints_cmd(
+            &data_dir,
+            &profile,
+            declare,
+            drop,
+            include_foreign,
+            format,
+        ),
     }
 }
 

@@ -657,8 +657,10 @@ fn a_declared_store_refuses_a_write_that_violates_the_spine() {
 // AC7 - stable operator-facing error surfaces
 // ---------------------------------------------------------------------------
 
-#[test]
-fn missing_store_is_a_usage_error() {
+/// Runs the command against a `--data-dir` that does not exist, returning the
+/// exit code and stderr. Shared by the two configuration-specific assertions
+/// below, which differ in WHICH exit-2 diagnostic is correct.
+fn missing_store_run() -> (Option<i32>, String) {
     let temp = tempfile::tempdir().expect("temp dir");
     let missing = temp.path().join("nope");
     let output = Command::cargo_bin("egregore")
@@ -671,11 +673,42 @@ fn missing_store_is_a_usage_error() {
         ])
         .output()
         .expect("run");
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn missing_store_is_a_usage_error() {
+    let (code, stderr) = missing_store_run();
+    assert_eq!(code, Some(2));
     assert!(
         stderr.contains("nope"),
         "the diagnostic must name the path; got {stderr}"
+    );
+    assert!(
+        stderr.contains("store_unreadable"),
+        "the diagnostic must carry its stable code; got {stderr}"
+    );
+}
+
+/// Built without the embedded adapter there is no store to read, so the command
+/// must say exactly that — a stable, distinct code — rather than reporting a
+/// missing path it never actually looked for. Same exit code, different truth.
+#[cfg(not(feature = "embedded-aletheiadb"))]
+#[test]
+fn missing_embedded_adapter_is_a_distinct_usage_error() {
+    let (code, stderr) = missing_store_run();
+    assert_eq!(code, Some(2));
+    assert!(
+        stderr.contains("embedded_adapter_unavailable"),
+        "the diagnostic must name the absent feature; got {stderr}"
+    );
+    assert!(
+        !stderr.contains("store_unreadable"),
+        "must not claim it failed to read a store it never opened; got {stderr}"
     );
 }
 
@@ -711,4 +744,400 @@ fn text_format_renders_the_same_findings() {
     assert!(stdout.contains("profile: spine"));
     assert!(stdout.contains("one_label_per_node_kind"));
     assert!(!stdout.contains(RAW_PAYLOAD_SENTINEL));
+}
+
+// ---------------------------------------------------------------------------
+// Review round 1 - gaps the four review passes identified
+// ---------------------------------------------------------------------------
+
+/// A violating record that HAS a `codegraph_id` must be cited by that handle.
+/// The original fixture plants a record with no handle at all, so it could only
+/// ever exercise the `unresolved_samples` branch - the resolution path that
+/// turns an engine entity id back into a record handle was dead in every test.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn violations_cite_offending_records_by_codegraph_id() {
+    let (_temp, data_dir) = seeded_store();
+    aletheia_egregore::adapters::fixtures::plant_citable_nonconforming_node(
+        &data_dir,
+        "Symbol",
+        "codegraph:v8:planted-citable",
+    )
+    .expect("planting should succeed");
+
+    let output = run(&[
+        "audit",
+        "schema-constraints",
+        "--data-dir",
+        data_dir.to_str().expect("utf8"),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output.stdout).expect("utf8").trim()).expect("json");
+
+    let symbol = report["conformance"]["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row["label"].as_str() == Some("Symbol"))
+        .expect("Symbol row")
+        .clone();
+    let violations = symbol["violations"].as_array().expect("violations");
+    let cited: Vec<&str> = violations
+        .iter()
+        .flat_map(|v| v["sample_record_ids"].as_array().expect("ids"))
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        cited.contains(&"codegraph:v8:planted-citable"),
+        "the offending record must be cited by its handle; got {cited:?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .all(|v| v["sample_complete"].as_bool() == Some(true)),
+        "a sample below the engine bound is provably complete"
+    );
+}
+
+/// A record with NO handle is counted, never leaked as an engine entity id.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn unciteable_violations_are_counted_not_leaked() {
+    let (_temp, data_dir) = seeded_store();
+    aletheia_egregore::adapters::fixtures::plant_nonconforming_node(
+        &data_dir,
+        "Symbol",
+        "PLANTED-NONCONFORMING",
+    )
+    .expect("planting should succeed");
+
+    let output = run(&[
+        "audit",
+        "schema-constraints",
+        "--data-dir",
+        data_dir.to_str().expect("utf8"),
+    ]);
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json");
+    let symbol = report["conformance"]["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row["label"].as_str() == Some("Symbol"))
+        .expect("Symbol row")
+        .clone();
+    let violations = symbol["violations"].as_array().expect("violations");
+    assert!(
+        violations
+            .iter()
+            .any(|v| v["unresolved_samples"].as_u64().unwrap_or(0) >= 1),
+        "a handle-less offender must be counted under unresolved_samples"
+    );
+    // The planted marker is a record PROPERTY: it must never be echoed, and
+    // neither may a bare engine entity id.
+    assert!(
+        !stdout.contains("PLANTED-NONCONFORMING"),
+        "record property values must never reach the report"
+    );
+    for row in violations {
+        for id in row["sample_record_ids"].as_array().expect("ids") {
+            let id = id.as_str().expect("string id");
+            assert!(
+                id.contains(':'),
+                "every cited id must be an Egregore record handle, never a raw engine id; got {id:?}"
+            );
+        }
+    }
+}
+
+/// A store-controlled value must not be able to drive the operator's terminal
+/// or forge report rows in `--format text` (the #104 doctrine, mirroring the
+/// `eg audit control-catalog` precedent).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn text_output_neutralizes_control_characters_in_store_controlled_values() {
+    let (_temp, data_dir) = seeded_store();
+    // A foreign writer controls both the LABEL and the `codegraph_id`; both
+    // reach `--format text`.
+    aletheia_egregore::adapters::fixtures::plant_citable_nonconforming_node(
+        &data_dir,
+        "Symbol",
+        "aa\n    forged - missing required key [codegraph:v8:not-real]\u{1b}[2Jbb",
+    )
+    .expect("planting should succeed");
+
+    let output = run(&[
+        "audit",
+        "schema-constraints",
+        "--data-dir",
+        data_dir.to_str().expect("utf8"),
+        "--format",
+        "text",
+    ]);
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "an ANSI escape from a store value must be neutralized"
+    );
+    // The payload's text may still appear INLINE - that is harmless, and
+    // truncating a record handle would destroy its value as a citation. What
+    // must not happen is a forged ROW: the embedded newline is neutralized, so
+    // no output LINE can begin with attacker-authored content.
+    assert!(
+        stdout
+            .lines()
+            .all(|line| !line.trim_start().starts_with("forged")),
+        "a store value must not be able to start a new report line; got:\n{stdout}"
+    );
+    // The planted record violates more than one required key, so it is legitimately
+    // cited on more than one line. What matters is that EVERY line carrying it is a
+    // real, indented violation-detail row emitted by the renderer - never a line the
+    // payload manufactured for itself.
+    for line in stdout.lines().filter(|line| line.contains("forged")) {
+        assert!(
+            line.starts_with("    ") && line.contains(" - "),
+            "payload appeared outside a violation-detail row: {line:?}"
+        );
+    }
+}
+
+/// A label Egregore cannot write must be surfaced as unknown, end to end -
+/// previously this was only unit-tested against a hand-written vector, which
+/// tested set subtraction rather than that the store is actually read.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn a_foreign_label_is_reported_as_unknown_and_is_never_scanned() {
+    let (_temp, data_dir) = seeded_store();
+    aletheia_egregore::adapters::fixtures::plant_nonconforming_node(
+        &data_dir,
+        "FutureForeignKind",
+        "irrelevant",
+    )
+    .expect("planting should succeed");
+
+    let report = report_json(&data_dir, &[]);
+    assert_eq!(
+        report["observed"]["unknown_node_labels"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>(),
+        vec!["FutureForeignKind"]
+    );
+    // It is outside the inventory, so it is NOT scanned - and the report must
+    // say so rather than let a passing verdict imply the store is all clean.
+    assert!(
+        !report["conformance"]["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .any(|row| row["label"].as_str() == Some("FutureForeignKind")),
+        "a foreign label is never scanned"
+    );
+    assert_eq!(report["unchecked_unknown_labels"].as_bool(), Some(true));
+    assert!(
+        report["disclaimer"]
+            .as_str()
+            .expect("disclaimer")
+            .contains("unknown_node_labels"),
+        "the disclaimer must name unknown labels as unchecked"
+    );
+}
+
+/// `--drop` evaluates no profile, so it must not ship a zeroed conformance
+/// block that reads as "this store conforms".
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn drop_reports_no_conformance_verdict() {
+    let (_temp, data_dir) = seeded_store();
+    let dir = data_dir.to_str().expect("utf8");
+    let output = run(&["audit", "schema-constraints", "--data-dir", dir, "--drop"]);
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output.stdout).expect("utf8").trim()).expect("json");
+
+    assert_eq!(report["action"].as_str(), Some("drop"));
+    assert_eq!(report["conformance_evaluated"].as_bool(), Some(false));
+    assert!(
+        report.get("conformance").is_none(),
+        "a run that evaluated nothing must not publish a conformance block"
+    );
+    assert!(
+        report.get("profile_properties").is_none(),
+        "a run that applied no profile must not publish its properties"
+    );
+    // Idempotent: dropping when nothing is declared is a clean no-op.
+    assert_eq!(report["dropped_labels"].as_u64(), Some(0));
+}
+
+/// `--drop` is the inverse of `--declare`, and `--declare` only ever touches
+/// Egregore's own labels. A declaration on any other label was made by
+/// something else and must be retained and reported, not silently destroyed.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn drop_records_a_before_image_so_a_mistake_is_recoverable() {
+    let (_temp, data_dir) = seeded_store();
+    let dir = data_dir.to_str().expect("utf8");
+    run(&[
+        "audit",
+        "schema-constraints",
+        "--data-dir",
+        dir,
+        "--declare",
+    ]);
+
+    let output = run(&["audit", "schema-constraints", "--data-dir", dir, "--drop"]);
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output.stdout).expect("utf8").trim()).expect("json");
+
+    let dropped = report["dropped_constraints"].as_array().expect("array");
+    assert!(
+        !dropped.is_empty(),
+        "the drop must record what it removed - upstream rewrites the sidecar,          so this is the only way to re-declare afterwards"
+    );
+    assert_eq!(
+        report["dropped_labels"].as_u64(),
+        Some(dropped.len() as u64)
+    );
+    // Each entry must be enough to reconstruct the declaration.
+    let first = &dropped[0];
+    assert!(first["label"].as_str().is_some());
+    assert!(first["entity_kind"].as_str().is_some());
+    assert!(!first["properties"].as_array().expect("props").is_empty());
+}
+
+/// The declared count must be the whole writable surface, not merely "a lot".
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn declare_covers_the_entire_writable_inventory() {
+    let (_temp, data_dir) = seeded_store();
+    let dir = data_dir.to_str().expect("utf8");
+    let output = run(&[
+        "audit",
+        "schema-constraints",
+        "--data-dir",
+        dir,
+        "--declare",
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output.stdout).expect("utf8").trim()).expect("json");
+
+    let expected = NodeKind::ALL.len() + 1 + EdgeLabel::ALL.len();
+    assert_eq!(
+        report["declared_labels"].as_u64(),
+        Some(expected as u64),
+        "every writable label - including ones the store holds nothing of yet"
+    );
+    assert_eq!(report["declaration_refusal"], serde_json::Value::Null);
+    assert_eq!(
+        report["declared_constraints"]
+            .as_array()
+            .expect("array")
+            .len(),
+        expected
+    );
+}
+
+/// Open question 3, EXECUTED rather than asserted: a declared store must still
+/// accept a record whose per-domain `schema_version` has been BUMPED, because
+/// the constraint declares the TYPE (`Integer`) and a bump only changes the
+/// VALUE. This is the one executable proof of the schema-versioning table's
+/// first row.
+///
+/// It writes through the raw fixture rather than `eg ingest` deliberately:
+/// Egregore's own reader rejects an unknown future `(domain, kind, version)`
+/// tuple at the JSONL parse gate, so an ingest would prove the READER's
+/// behaviour, not the constraint's.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn a_declared_store_accepts_a_bumped_schema_version() {
+    let (_temp, data_dir) = seeded_store();
+    let dir = data_dir.to_str().expect("utf8");
+    let declared = run(&[
+        "audit",
+        "schema-constraints",
+        "--data-dir",
+        dir,
+        "--declare",
+    ]);
+    assert_eq!(
+        declared.status.code(),
+        Some(0),
+        "declaration must succeed before the bump can be tested"
+    );
+
+    aletheia_egregore::adapters::fixtures::plant_spine_node_at_version(
+        &data_dir,
+        "Symbol",
+        "codegraph:v999:future-symbol",
+        i64::from(SCHEMA_VERSION) + 1,
+    )
+    .expect("a bumped schema_version must not violate a constraint on its TYPE");
+
+    // And the store still reports clean afterwards.
+    let report = report_json(&data_dir, &[]);
+    assert_eq!(
+        report["conformance"]["entities_non_conforming"].as_u64(),
+        Some(0)
+    );
+}
+
+/// An unknown `--profile` is a usage error naming the known profiles.
+#[test]
+fn unknown_profile_is_a_usage_error() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let output = Command::cargo_bin("egregore")
+        .expect("binary")
+        .args([
+            "audit",
+            "schema-constraints",
+            "--data-dir",
+            temp.path().to_str().expect("utf8"),
+            "--profile",
+            "not-a-profile",
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown_profile"), "got {stderr}");
+    assert!(stderr.contains("spine"), "must list the known profiles");
+}
+
+/// `--declare` and `--drop` must be byte-identical across repeated runs too -
+/// previously only the report action was pinned.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn declare_and_drop_output_is_byte_identical_across_runs() {
+    // One store, two full cycles: the report echoes `data_dir`, so two DIFFERENT
+    // temp stores would differ for an uninteresting reason.
+    let (_temp, data_dir) = seeded_store();
+    let dir = data_dir.to_str().expect("utf8").to_owned();
+    let cycle = || {
+        let declared = run(&[
+            "audit",
+            "schema-constraints",
+            "--data-dir",
+            &dir,
+            "--declare",
+        ]);
+        let dropped = run(&["audit", "schema-constraints", "--data-dir", &dir, "--drop"]);
+        assert_eq!(declared.status.code(), Some(0));
+        assert_eq!(dropped.status.code(), Some(0));
+        (declared.stdout, dropped.stdout)
+    };
+    let (first_declare, first_drop) = cycle();
+    let (second_declare, second_drop) = cycle();
+    assert_eq!(
+        first_declare, second_declare,
+        "declare output must be stable across runs"
+    );
+    assert_eq!(
+        first_drop, second_drop,
+        "drop output must be stable across runs"
+    );
 }

@@ -3971,10 +3971,13 @@ pub(crate) enum AuditSubcommand {
     ///
     /// Exit codes:
     ///   0 — report produced with no violation, or declare/drop succeeded.
-    ///   1 — non-conforming entities found (the full report is still printed),
-    ///       or `--declare` was refused by non-conforming current state.
-    ///   2 — usage/load error (missing store, both mode flags, build without
-    ///       the embedded adapter).
+    ///   1 — non-conforming entities found, or `--declare` was refused (either
+    ///       up front by non-conforming current state, or part-way by the
+    ///       store). The FULL report is printed in every case, so a partial
+    ///       declaration is always visible.
+    ///   2 — usage/load error (missing or unreadable store, unreadable schema,
+    ///       both mode flags, unknown profile, build without the embedded
+    ///       adapter).
     ///
     /// See `docs/cli/schema-constraints.md`.
     SchemaConstraints {
@@ -3987,9 +3990,17 @@ pub(crate) enum AuditSubcommand {
         /// Declare the profile on every writable label (opt-in, takes the write lease).
         #[arg(long)]
         declare: bool,
-        /// Retract every schema constraint declared on the store.
+        /// Retract the schema constraints declared on the store.
+        ///
+        /// Scoped by default to labels Egregore itself can write - the exact
+        /// inverse of `--declare`. A declaration on any other label was made by
+        /// something else and is retained and reported, not silently destroyed.
         #[arg(long)]
         drop: bool,
+        /// Widen `--drop` to retract declarations on labels outside Egregore's
+        /// writable inventory too.
+        #[arg(long)]
+        include_foreign: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,

@@ -269,7 +269,7 @@ change to the adapter's universal `base_properties` keys is not. Concretely:
 | change | effect on a declared store | required action |
 |---|---|---|
 | bump a per-domain `SCHEMA_VERSION` | **none** — the bump changes the `schema_version` VALUE, and the constraint declares its TYPE (`Integer`) | none |
-| add a `NodeKind` (and therefore a new store-side node label) | **none** — the new label carries no declaration and is fully schemaless upstream | none |
+| add a `NodeKind` (and therefore a new store-side node label) | **none** — the new label carries no declaration and is fully schemaless upstream | none for correctness, but the backstop silently NARROWS: the new label is unconstrained until `--declare` is re-run |
 | add an `EdgeLabel` | **none**, same reason | none |
 | add a new optional per-kind payload field | **none** — no profile declares a per-kind payload field, by construction and by test | none |
 | **rename or remove a `base_properties` key** (`codegraph_id`, `record_type`, `schema_version`, `summary`) | **breaking** — every write of every label aborts at the commit hook | `eg audit schema-constraints --drop` on every declared store **before** shipping the change; re-declare after |
@@ -287,9 +287,25 @@ row 1 safe.
 
 Declaration is **opt-in and reversible**: the default `eg audit
 schema-constraints` action is a read-only report that declares nothing, and
-`--drop` retracts every declared constraint. Nothing in Egregore's write path
-declares constraints automatically, so an undeclared store — the default — is
-entirely unaffected by this section.
+`--drop` retracts. Nothing in Egregore's write path declares constraints
+automatically, so an undeclared store — the default — is entirely unaffected by
+this section.
+
+Two upstream properties bound how much a declared constraint can be relied on,
+and neither is a defect to be fixed here:
+
+* **Durability rides on index persistence.** The `schema_constraints.dat`
+  sidecar is written only when `persistence.enabled` (which
+  `durable_config_for_data_dir` sets, so it holds for every Egregore store) — but
+  a store opened without it keeps declarations in memory only.
+* **A corrupt sidecar is quarantined, not fatal.** Upstream renames it aside and
+  starts with **no** constraints rather than bricking startup, so enforcement can
+  silently disappear.
+
+Together these make a declared constraint a **backstop that catches mistakes**,
+never a proof obligation the rest of the system may lean on. `eg validate`, the
+adapter's read-back verification, and the citation audits remain the primary
+enforcement of this contract.
 
 See [`docs/cli/schema-constraints.md`](../cli/schema-constraints.md) for the
 full Phase 1 findings, the profile definitions, and the output contract.

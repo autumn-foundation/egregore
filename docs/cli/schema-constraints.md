@@ -18,11 +18,18 @@ cargo run -- audit schema-constraints --data-dir .egregore --drop
 
 `eg validate` (issue #103) is a **pre-ingest gate over a JSONL file**. It asserts
 reference closure between `scan` and `ingest`, and it is the right tool for that
-job — but it cannot see a bad write that reaches an embedded store by any other
-path: a hand-edited store, a foreign writer sharing the data dir, an adapter
-regression. The adapter's own invariants live only as adapter code, which is
-precisely the wrong place for a backstop: code that is wrong cannot catch itself
-being wrong.
+job — but it cannot see a bad record that reaches an embedded store by any other
+path: a foreign writer sharing the data dir, an adapter regression, a
+hand-edited store. The adapter's own invariants live only as adapter code, which
+is precisely the wrong place for a backstop: code that is wrong cannot catch
+itself being wrong.
+
+The two halves of this command address two different halves of that problem, and
+it is worth being precise about which does what. **Enforcement** (`--declare`)
+sits at the pre-apply commit hook, so it catches a bad write *performed through
+the engine* — a foreign writer, an adapter regression. It cannot catch a store
+edited outside the engine, because no transaction ever runs. **The report** is
+what catches that case, by reading what is actually there.
 
 `AletheiaDB` 0.2.0 ships opt-in, per-label schema constraints enforced at the
 **pre-apply commit hook**. A violation aborts the whole transaction with zero
@@ -54,11 +61,19 @@ The report emits the full sorted list under `inventory.node_labels` /
 `inventory.edge_types`, and states the partition finding machine-readably as
 `inventory.label_partition: "one_label_per_node_kind"`.
 
-The inventory is **derived, never hand-maintained**. `NodeKind::ALL` and
-`EdgeLabel::ALL` are each pinned by a unit test whose `match` has **no wildcard
-arm**, so adding a variant fails to compile until it is deliberately classified,
-and the test then fails until it is also listed. The inventory therefore cannot
-silently drift from `node_label()`.
+The inventory is **derived, never hand-maintained**, and pinned by three tests
+that each use an oracle independent of the thing under test:
+
+* `node_kind_all_matches_the_enum_definition` / `edge_label_all_matches_the_enum_definition`
+  recover the enum's true variant list from `serde`'s unknown-variant error —
+  which the derive macro regenerates from the enum definition itself — and
+  compare it to `ALL`. A guard that merely iterated `ALL` and asserted membership
+  in `ALL` would be circular and could not fail; this one does.
+* `node_label_is_exactly_the_kind_string_for_every_kind` pins the remaining link
+  at the write site: that the adapter really does write `kind.as_str()` as the
+  store-side label. Without it, a future variant given its own `node_label` arm
+  returning a different literal would silently desync the inventory from what is
+  written.
 
 ### 2 - Which properties are genuinely universal?
 
@@ -73,7 +88,9 @@ unconditionally — there is no code path that writes a record without them:
 | `schema_version` | Int | the per-domain version integer |
 | `summary` | String | a display string; always present, possibly empty |
 
-Edges add four more, also unconditionally:
+Edges are written by `write_edge`, which adds four more routing keys
+unconditionally (note that `egregore_seq` is written on nodes and tombstones too;
+only the *declaration* of it is edge-scoped, for the reason below):
 
 | property | type | notes |
 |---|---|---|
@@ -116,10 +133,15 @@ the constraints first.
 
 ### 4 - Does a real store conform?
 
-Run the report and find out — that is the whole point of the default action. On
-a store written only by Egregore the answer is yes by construction, because the
-declared keys are the ones `base_properties` writes unconditionally. The report
-is the evidence, not the assumption.
+Run the report and find out — that is the whole point of the default action, and
+the issue was explicit that this must be measured rather than assumed.
+
+Measured against this repository's own graph (`eg scan .` → `eg ingest --adapter
+embedded`), the `spine` profile reports **zero non-conforming entities**; see
+[the recorded run](#recorded-phase-1-run) below. That is the expected result —
+the declared keys are exactly the ones `base_properties` writes unconditionally —
+but it is now evidence rather than an assumption, and the report is how you check
+any *other* store, including one a foreign writer has touched.
 
 ### 5 - How does a violation surface?
 
@@ -141,13 +163,30 @@ declaration would cost against real data before anyone commits to it.
 | `full-base` | spine + `summary` | spine edge keys + `egregore_seq` |
 
 `spine` is the recommended declaration: it constrains exactly the keys every read
-path dispatches on, and nothing else. `full-base` is equally true of every record
-Egregore has ever written, but `summary` is a display string rather than
-something a read path dispatches on — so it buys less invariant for the same
+path dispatches on, and nothing else.
+
+`full-base` is true of every record written by **current** Egregore — but not
+necessarily of an old one. The adapter documents legacy edges predating the
+`egregore_seq` system that carry no such property, so `--declare --profile
+full-base` on a store holding them is **refused**. That refusal is the report
+doing its job, and running the report first is how you find out. `summary` is
+also a display string rather than something a read path dispatches on — so it
+buys less invariant for the same
 future-bump exposure. Both are declarable; pick with `--profile`.
 
 Every declared key is `require_typed` (required **and** typed). No profile uses
 optional-but-typed constraints in this slice.
+
+## Flags
+
+| flag | default | meaning |
+|---|---|---|
+| `--data-dir <dir>` | *(required)* | the embedded store. There is no `--graph` form: a JSONL file has no store-side labels to constrain, and `eg validate` already gates that. |
+| `--profile <spine\|full-base>` | `spine` | which candidate profile to evaluate or declare |
+| `--declare` | off | declare the profile (opt-in; takes the write lease) |
+| `--drop` | off | retract declarations (takes the write lease) |
+| `--include-foreign` | off | widen `--drop` past Egregore's own labels |
+| `--format <json\|text>` | `json` | JSON is the complete contract; text is a summary view |
 
 ## Actions
 
@@ -176,17 +215,33 @@ conformance scan first, and on any violation prints the identical report and
 exits 1 without declaring anything.
 
 Declaration covers **every** writable label, including ones the store holds
-nothing of yet — declaring before the data exists is the highest-value case, and
-costs nothing.
+nothing of yet — declaring before the data exists is the highest-value case.
+
+Two costs to know about. At **write** time a declared label costs one property
+check per write and an undeclared one costs nothing, so the steady-state overhead
+is negligible. At **declaration** time it is not free: upstream's `enable()` runs
+its own conformance scan per label, and an edge-type scan walks every edge, so
+`--declare` performs one pass per inventoried label — including the many that are
+empty — all while holding the exclusive write lease. On a large store, plan for
+it.
 
 ### `--drop`
 
-Retracts every schema constraint declared on the store, restoring the fully
-schemaless posture. It retracts what is actually **declared** (read back from the
-store) rather than what the current inventory would declare, so a store declared
-by an older or newer Egregore is still fully cleaned.
+Retracts declarations, restoring the schemaless posture.
 
-`--declare` and `--drop` are mutually exclusive (exit 2).
+**Scoped by default.** `--drop` is the inverse of `--declare`, and `--declare`
+only ever touches labels in Egregore's own inventory. A declaration on any other
+label was made by something else sharing the data dir, so it is **retained** and
+reported under `foreign_constraints_retained` rather than silently destroyed.
+`--include-foreign` widens the retraction to everything.
+
+**It records what it removed.** Upstream atomically rewrites the sidecar on every
+drop, so without a before-image a mistaken `--drop` would be unrecoverable by
+inspection — you cannot re-declare what you can no longer enumerate. The report's
+`dropped_constraints` carries the full descriptor of every retracted declaration.
+
+`--declare` and `--drop` are mutually exclusive (exit 2), and `--include-foreign`
+without `--drop` is the same error.
 
 ## Output contract
 
@@ -200,8 +255,12 @@ an unchanged store.
   "data_dir": ".egregore",
   "profile": "spine",
   "profile_properties": {
-    "node": [{"property": "codegraph_id", "declared_type": "string", "required": true}],
-    "edge": []
+    "node": [
+      {"property": "codegraph_id", "declared_type": "string", "required": true},
+      {"property": "record_type", "declared_type": "string", "required": true},
+      {"property": "schema_version", "declared_type": "int", "required": true}
+    ],
+    "edge": ["... the three node specs, plus label / source_codegraph_id / target_codegraph_id ..."]
   },
   "inventory": {
     "label_partition": "one_label_per_node_kind",
@@ -244,11 +303,15 @@ an unchanged store.
   current-state entity of this label). `not_present` is reported distinctly and
   never as a vacuous `conforms`: a label with nothing in it proves nothing, and
   calling it conforming would overstate what the audit actually checked.
-* **`checked` is a CURRENT-STATE count.** Upstream scans the current-state view,
-  so superseded record versions are not checked. On a re-ingested or
-  `scan-history` store these totals will be lower than `eg inspect --data-dir`'s
-  physical record counts. That is not a discrepancy — it is what enforcement
-  covers, since enforcement is forward-only.
+* **`checked` counts store entities, not deduplicated Egregore records.**
+  Upstream scans its current-state view — the set of live *engine* entities.
+  Egregore's embedded adapter is **append-only**: every record version is its own
+  `create_node` / `create_edge` (the sole `update_node` is the embedding
+  backfill), so an Egregore-*superseded* version is a distinct live engine entity
+  and **is** scanned. These totals therefore track `eg inspect --data-dir`'s
+  physical record counts for the label. Upstream's "superseded versions are not
+  re-scanned" rule is about *engine* entity versions, which Egregore barely
+  creates.
 * **`violations[].sample_record_ids`** cite offending entities by their Egregore
   `codegraph_id`. Upstream samples engine-internal `u64` entity ids; those are
   neither citable nor stable across a re-ingest, so each is resolved back to a
@@ -269,8 +332,34 @@ an unchanged store.
 | code | meaning |
 |---|---|
 | 0 | report produced with no violation, or `--declare` / `--drop` succeeded |
-| 1 | non-conforming entities found (the **full report is still printed**), or `--declare` was refused by non-conforming current state |
-| 2 | usage/load error: missing or unreadable `--data-dir`, both mode flags, unknown `--profile`, or a build without the `embedded-aletheiadb` feature |
+| 1 | non-conforming entities found, **or** `--declare` was refused — either up front by non-conforming current state, or part-way through by the store. The **full report is printed in every case**, so a partial declaration is always visible. |
+| 2 | usage/load error (see the code table below) |
+
+### Usage/load diagnostics
+
+Every exit-2 path prints one JSON object on **stderr** carrying a stable `code`:
+
+| code | meaning |
+|---|---|
+| `unsupported_combination` | `--declare` and `--drop` together, or `--include-foreign` without `--drop` |
+| `unknown_profile` | `--profile` is not `spine` or `full-base`; the message lists the known profiles |
+| `store_unreadable` | the `--data-dir` is missing, empty, or cannot be opened, or its schema summary cannot be read |
+| `store_contended` | another live writer (embedded peer or daemon) holds the write lease — see [`embedded-concurrency.md`](embedded-concurrency.md) |
+| `conformance_scan_failed` | the store opened but a conformance scan itself failed |
+| `drop_failed` | a retraction failed |
+| `embedded_adapter_unavailable` | built without the `embedded-aletheiadb` feature |
+
+A **read or scan failure is never exit 1**. Exit 1 means the gate found something;
+a CI job keying on it must never be told "schema violations found" for an I/O
+failure.
+
+### Declaration is not atomic across labels
+
+Upstream's `enable()` is atomic *per label*, not across the whole run. A refusal
+part-way therefore leaves the store constrained on the labels that already
+landed. The report always names both halves of that state — `declared_labels`
+counts what landed and `declaration_refusal` names the refusing label and
+upstream's reason — and `--drop` retracts whatever did.
 
 ## Epistemic boundary
 

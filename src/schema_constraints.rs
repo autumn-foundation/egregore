@@ -17,7 +17,8 @@
 //! The issue's blocking question was whether the store-side label partition is
 //! coarse enough to make constraints near-trivial. It is not: the embedded
 //! adapter writes ONE store-side node label per [`NodeKind`]
-//! (`node_label(kind) == kind.as_str()`), plus the literal [`TOMBSTONE_LABEL`]
+//! (`node_label(kind) == kind.as_str()`, pinned by a test at the write site),
+//! plus the literal [`TOMBSTONE_LABEL`]
 //! for tombstone records, and ONE edge type per [`EdgeLabel`]. `Symbol` and
 //! `Task` do NOT share a label. The partition therefore lines up exactly with
 //! the kinds the schema contract is written against.
@@ -76,6 +77,57 @@ pub const LABEL_PARTITION: &str = "one_label_per_node_kind";
 /// Upstream already bounds its own sample at 16; this is Egregore's own cap on
 /// what it renders, so the report stays bounded even if upstream's changes.
 pub const MAX_SAMPLE_RECORD_IDS: usize = 8;
+
+/// Upstream's own per-violation sample bound
+/// (`aletheiadb::core::constraint::MAX_CONFORMANCE_SAMPLE_IDS`).
+///
+/// Mirrored here because it is load-bearing for DETERMINISM, not merely for
+/// output size. See [`ViolationRow::sample_complete`].
+pub const ENGINE_SAMPLE_BOUND: usize = 16;
+
+/// Maximum foreign labels enumerated per unknown-label list.
+///
+/// The lists are built from labels read out of the store, so their length is
+/// controlled by whoever wrote to it; without a cap a store carrying many
+/// foreign labels would produce an unbounded report.
+pub const MAX_UNKNOWN_LABELS: usize = 32;
+
+/// Maximum declarations enumerated in `declared_constraints`.
+///
+/// Comfortably above the real ceiling (one per writable label), so a normal
+/// declared store is never truncated, while a crafted `schema_constraints.dat`
+/// sidecar cannot produce an unbounded report.
+pub const MAX_DECLARED_CONSTRAINTS: usize = 256;
+
+/// Sanitizes one HANDLE value (a record ID) read back from the store, **without**
+/// truncating it.
+///
+/// Control characters are neutralized — a `codegraph_id` is an ordinary node
+/// property that nothing validates on write, so a foreign writer can plant one
+/// carrying newlines that forge extra `--format text` rows or the ESC that
+/// starts an ANSI sequence. The length cap is deliberately NOT applied: a
+/// truncated handle is no longer a citation, and a prefix of a record ID
+/// silently reads like a valid one. Mirrors `criteria_coverage::handle_field`
+/// and the `evidence_pack` two-tier split.
+#[must_use]
+pub fn handle_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect()
+}
+
+/// Sanitizes and length-caps one FREE-TEXT value read back from the store or its
+/// sidecar.
+///
+/// Delegates to the single hardened #104 implementation
+/// ([`crate::embeddings::bounded_identity_field`]) so this lane, the
+/// semantic-index refusal path, the control-catalog envelope, and the
+/// criteria-coverage census all share one rule.
+#[must_use]
+pub fn bounded_field(value: &str) -> String {
+    crate::embeddings::bounded_identity_field(value)
+}
 
 /// The subset of `DeclaredType` Egregore actually declares.
 ///
@@ -168,10 +220,15 @@ pub enum ConstraintProfile {
     /// The full `base_properties` set: the spine plus `summary`, and on edges
     /// the write-sequence key.
     ///
-    /// Stricter, and equally true of every record the adapter has ever
-    /// written — but `summary` is a display string rather than something a read
-    /// path dispatches on, so requiring it buys less invariant for the same
-    /// future-bump exposure.
+    /// Stricter, and true of every record written by CURRENT Egregore — but not
+    /// necessarily of an old one: the adapter itself documents legacy edges
+    /// predating `egregore_seq` that carry no such property, so declaring
+    /// `full-base` on a store holding them is REFUSED. That refusal is the
+    /// report doing its job, not a defect.
+    ///
+    /// `summary` is also a display string rather than something a read path
+    /// dispatches on, so requiring it buys less invariant for the same
+    /// future-bump exposure. Hence `spine` is the default.
     FullBase,
 }
 
@@ -239,9 +296,11 @@ impl ConstraintProfile {
 
 /// Every node label the embedded adapter can write, sorted.
 ///
-/// Derived from [`NodeKind::ALL`] (itself pinned exhaustive by a wildcard-free
-/// compile-time guard) plus [`TOMBSTONE_LABEL`], so it can never drift from
-/// `adapters::aletheiadb::node_label`.
+/// Derived from [`NodeKind::ALL`] (pinned exhaustive against `serde`'s own
+/// variant list) plus [`TOMBSTONE_LABEL`] (which the tombstone write site now
+/// uses directly). `node_label_is_exactly_the_kind_string_for_every_kind` pins
+/// the remaining link — that the adapter really does write `kind.as_str()` as
+/// the store-side label — so this cannot drift from what is written.
 #[must_use]
 pub fn writable_node_labels() -> Vec<&'static str> {
     let mut labels: Vec<&'static str> = NodeKind::ALL.iter().map(|kind| kind.as_str()).collect();
@@ -305,18 +364,53 @@ pub struct ViolationRow {
     /// where the record has no `codegraph_id` to cite, and emitting the raw
     /// engine id would put an unstable internal identifier in the report.
     pub unresolved_samples: usize,
+    /// Whether the engine's sample was the COMPLETE set of offenders for this
+    /// violation — and therefore whether citations can be emitted at all.
+    ///
+    /// Upstream keeps only the first [`ENGINE_SAMPLE_BOUND`] offending ids per
+    /// `(property, reason)` group, in the iteration order of a `DashMap` whose
+    /// hasher is seeded per PROCESS. When a group has more offenders than that
+    /// bound, the SUBSET upstream samples therefore differs between runs — so
+    /// sorting it does not rescue determinism, and the resulting handful of ids
+    /// would in any case be a misleading citation ("these 8 records" when it is
+    /// an arbitrary 8 of thousands).
+    ///
+    /// So the citations are emitted only when they are provably complete, which
+    /// is exactly when the engine returned FEWER ids than its own bound. The
+    /// counts (`checked` / `non_conforming`) are unaffected — those are exact
+    /// and order-independent either way — so the gate verdict never depends on
+    /// this, only the citations do.
+    pub sample_complete: bool,
 }
 
 impl ViolationRow {
     /// The JSON shape rendered in the report.
+    ///
+    /// Handles are control-sanitized but never truncated; a truncated record ID
+    /// stops being a citation. When the engine's sample was incomplete the ids
+    /// are omitted entirely (see [`ViolationRow::sample_complete`]).
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
-            "property": self.property,
-            "reason": self.reason,
-            "sample_record_ids": self.sample_record_ids,
+            "property": self.property.as_deref().map(bounded_field),
+            "reason": bounded_field(&self.reason),
+            "sample_record_ids": self.citable_record_ids(),
             "unresolved_samples": self.unresolved_samples,
+            "sample_complete": self.sample_complete,
         })
+    }
+
+    /// The record ids safe to publish: sanitized, and empty when the engine's
+    /// sample was not provably complete.
+    #[must_use]
+    pub fn citable_record_ids(&self) -> Vec<String> {
+        if !self.sample_complete {
+            return Vec::new();
+        }
+        self.sample_record_ids
+            .iter()
+            .map(|id| handle_field(id))
+            .collect()
     }
 }
 
@@ -329,11 +423,15 @@ pub struct LabelConformance {
     pub label: String,
     /// The scan outcome.
     pub status: ConformanceStatus,
-    /// Current-state entities of this label the scan checked.
+    /// Store entities of this label the scan checked.
     ///
-    /// This is a CURRENT-STATE count: upstream scans the current-state view, so
-    /// superseded record versions are not checked and this will be lower than
-    /// `eg inspect --data-dir`'s physical record totals on a re-ingested store.
+    /// Upstream scans its CURRENT-STATE view — the set of live engine entities.
+    /// Egregore's embedded adapter is APPEND-ONLY (every record version is its
+    /// own `create_node` / `create_edge`; the only `update_node` is the
+    /// embedding backfill), so an Egregore-superseded record version is a
+    /// distinct live engine entity and IS scanned. This count therefore tracks
+    /// `eg inspect --data-dir`'s physical record totals for the label, not a
+    /// deduplicated current-record count.
     pub checked: usize,
     /// How many of them do not conform.
     pub non_conforming: usize,
@@ -374,6 +472,30 @@ impl LabelConformance {
     }
 }
 
+/// The result of a `--declare` run, including a refusal's partial progress.
+///
+/// Declaration is per-label and NOT atomic across labels, so a refusal can leave
+/// the store half-constrained. Returning the landed count ALONGSIDE the refusal
+/// (rather than an `Err` that discards it) is what lets the CLI print the full
+/// report and name the exact state the operator now has to clean up.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct DeclarationOutcome {
+    /// How many labels were declared before the run stopped.
+    pub declared: usize,
+    /// Upstream's refusal, or `None` when every label declared.
+    pub refusal: Option<String>,
+}
+
+/// The result of a `--drop` run.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct DropOutcome {
+    /// Declarations actually retracted, captured before the drop.
+    pub dropped: Vec<DeclaredConstraint>,
+    /// Declarations deliberately left in place because their label is outside
+    /// Egregore's writable inventory (or carries an unrecognized entity kind).
+    pub foreign_retained: Vec<DeclaredConstraint>,
+}
+
 /// A constraint declaration read back from the store.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DeclaredConstraint {
@@ -390,9 +512,13 @@ impl DeclaredConstraint {
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
-            "entity_kind": self.entity_kind,
-            "label": self.label,
-            "properties": self.properties,
+            "entity_kind": bounded_field(&self.entity_kind),
+            "label": bounded_field(&self.label),
+            "properties": self
+                .properties
+                .iter()
+                .map(|property| bounded_field(property))
+                .collect::<Vec<_>>(),
         })
     }
 }
@@ -422,11 +548,13 @@ impl ConstraintAction {
 }
 
 /// The verbatim epistemic boundary carried on every report.
-pub const DISCLAIMER: &str = "conformance is a structural check of property presence and type on \
-current-state entities only; it is never proof that a record's content is correct, that its \
-domain schema version is semantically compatible, or that extraction was complete. superseded \
-record versions are not scanned. a label reported not_present holds no current-state entity and \
-was therefore not checked.";
+pub const DISCLAIMER: &str = "conformance is a structural check of property presence and type; it \
+is never proof that a record's content is correct, that its domain schema version is semantically \
+compatible, or that extraction was complete. only labels egregore itself can write are scanned - \
+entities under a label listed in observed.unknown_node_labels or observed.unknown_edge_types were \
+NOT checked, so a passing verdict says nothing about them. a label reported not_present holds no \
+entity of that label and was therefore not checked. enforcement is forward-only: a declaration \
+constrains future writes and never re-validates history.";
 
 /// The complete report.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -450,9 +578,37 @@ pub struct SchemaConstraintReport {
     /// Constraints the store currently has declared, sorted.
     pub declared_constraints: Vec<DeclaredConstraint>,
     /// Labels a `--declare` run declared on.
+    ///
+    /// Set even when the run was refused part-way, so a partially-constrained
+    /// store is always visible rather than inferred.
     pub declared_labels: usize,
+    /// The `(entity_kind, label)` at which a `--declare` run was refused, and
+    /// upstream's reason.
+    ///
+    /// Declaration is per-label and NOT atomic across labels, so a refusal can
+    /// leave the store half-constrained. Naming the refusing label makes that
+    /// state actionable instead of merely detectable.
+    pub declaration_refusal: Option<String>,
     /// Labels a `--drop` run retracted.
     pub dropped_labels: usize,
+    /// The declarations a `--drop` run removed, captured BEFORE the drop.
+    ///
+    /// Upstream atomically rewrites the sidecar on every drop, so without this
+    /// before-image a mistaken `--drop` would be unrecoverable by inspection:
+    /// you cannot re-declare what you can no longer enumerate.
+    pub dropped_constraints: Vec<DeclaredConstraint>,
+    /// Declarations a `--drop` run deliberately LEFT in place because their
+    /// label is outside Egregore's writable inventory.
+    ///
+    /// `--drop` is the inverse of `--declare`, and `--declare` only ever touches
+    /// Egregore's own labels; silently destroying another tool's constraints
+    /// would exceed that inverse.
+    pub foreign_constraints_retained: Vec<DeclaredConstraint>,
+    /// Whether a conformance scan actually ran.
+    ///
+    /// `--drop` evaluates no profile, so its zeroed conformance block must not
+    /// read as "this store conforms".
+    pub conformance_evaluated: bool,
 }
 
 impl SchemaConstraintReport {
@@ -465,15 +621,31 @@ impl SchemaConstraintReport {
         for row in &mut self.rows {
             for violation in &mut row.violations {
                 violation.sample_record_ids.sort();
-                violation.sample_record_ids.truncate(MAX_SAMPLE_RECORD_IDS);
+                violation.sample_record_ids.dedup();
+                // Truncating a COMPLETE sample would make it incomplete without
+                // saying so, so the cap also clears the completeness marker.
+                if violation.sample_record_ids.len() > MAX_SAMPLE_RECORD_IDS {
+                    violation.sample_record_ids.truncate(MAX_SAMPLE_RECORD_IDS);
+                    violation.sample_complete = false;
+                }
             }
             row.violations
                 .sort_by(|a, b| (&a.property, &a.reason).cmp(&(&b.property, &b.reason)));
         }
-        self.unknown_node_labels.sort();
-        self.unknown_edge_types.sort();
-        self.declared_constraints
-            .sort_by(|a, b| (&a.entity_kind, &a.label).cmp(&(&b.entity_kind, &b.label)));
+        for labels in [&mut self.unknown_node_labels, &mut self.unknown_edge_types] {
+            labels.sort();
+            labels.dedup();
+            labels.truncate(MAX_UNKNOWN_LABELS);
+        }
+        for declarations in [
+            &mut self.declared_constraints,
+            &mut self.dropped_constraints,
+            &mut self.foreign_constraints_retained,
+        ] {
+            declarations
+                .sort_by(|a, b| (&a.entity_kind, &a.label).cmp(&(&b.entity_kind, &b.label)));
+            declarations.truncate(MAX_DECLARED_CONSTRAINTS);
+        }
     }
 
     /// Total current-state entities checked across every scanned label.
@@ -506,10 +678,33 @@ impl SchemaConstraintReport {
             .count()
     }
 
-    /// Whether the gate passes: no scanned entity violates the profile.
+    /// Whether the gate passes.
+    ///
+    /// A run that evaluated no profile (`--drop`) or was refused mid-declaration
+    /// does not pass VACUOUSLY: `conformance_evaluated == false` would otherwise
+    /// let an empty `rows` read as "this store conforms", which is exactly the
+    /// false statement this lane exists to avoid.
     #[must_use]
     pub fn ok(&self) -> bool {
+        if self.declaration_refusal.is_some() {
+            return false;
+        }
+        if !self.conformance_evaluated {
+            // Nothing was checked, so there is nothing to fail - but the report
+            // must say so rather than imply conformance. See `to_json`, which
+            // omits the conformance block entirely in this case.
+            return true;
+        }
         self.entities_non_conforming() == 0
+    }
+
+    /// Whether the store holds entities under labels this lane did not scan.
+    ///
+    /// A foreign label is outside Egregore's inventory, so its entities are
+    /// never evaluated; a passing verdict says nothing about them.
+    #[must_use]
+    pub const fn has_unchecked_labels(&self) -> bool {
+        !self.unknown_node_labels.is_empty() || !self.unknown_edge_types.is_empty()
     }
 
     /// The deterministic single-line JSON contract documented in
@@ -518,10 +713,12 @@ impl SchemaConstraintReport {
     pub fn to_json(&self) -> serde_json::Value {
         let node_labels = writable_node_labels();
         let edge_types = writable_edge_types();
-        serde_json::json!({
+        let mut report = serde_json::json!({
             "ok": self.ok(),
             "action": self.action.as_str(),
             "data_dir": self.data_dir,
+            "conformance_evaluated": self.conformance_evaluated,
+            "unchecked_unknown_labels": self.has_unchecked_labels(),
             "profile": self.profile.as_str(),
             "profile_properties": {
                 "node": self
@@ -560,10 +757,32 @@ impl SchemaConstraintReport {
                 .iter()
                 .map(DeclaredConstraint::to_json)
                 .collect::<Vec<_>>(),
+            "declaration_refusal": self.declaration_refusal.as_deref().map(bounded_field),
             "declared_labels": self.declared_labels,
             "dropped_labels": self.dropped_labels,
+            "dropped_constraints": self
+                .dropped_constraints
+                .iter()
+                .map(DeclaredConstraint::to_json)
+                .collect::<Vec<_>>(),
+            "foreign_constraints_retained": self
+                .foreign_constraints_retained
+                .iter()
+                .map(DeclaredConstraint::to_json)
+                .collect::<Vec<_>>(),
             "disclaimer": DISCLAIMER,
-        })
+        });
+
+        // A run that evaluated no profile must not ship a zeroed conformance
+        // block a consumer could read as "this store conforms", nor a
+        // profile_properties block for a profile it never applied.
+        if !self.conformance_evaluated
+            && let Some(object) = report.as_object_mut()
+        {
+            object.remove("conformance");
+            object.remove("profile_properties");
+        }
+        report
     }
 
     /// The human-readable rendering. The JSON remains the complete contract.
@@ -599,18 +818,25 @@ impl SchemaConstraintReport {
                 out,
                 "  {} {}: {} ({} checked, {} non-conforming)",
                 row.entity_kind.as_str(),
-                row.label,
+                bounded_field(&row.label),
                 row.status.as_str(),
                 row.checked,
                 row.non_conforming
             );
             for violation in &row.violations {
+                // Every value here is either ours or read back from the store,
+                // and the store-read ones are operator-controlled. They go
+                // through the SAME sanitizers the JSON path uses, so a crafted
+                // record can neither forge a report row nor drive the terminal.
                 let _ = writeln!(
                     out,
                     "    {} - {} [{}]",
-                    violation.property.as_deref().unwrap_or("(entity)"),
-                    violation.reason,
-                    violation.sample_record_ids.join(", ")
+                    violation
+                        .property
+                        .as_deref()
+                        .map_or_else(|| "(entity)".to_owned(), bounded_field),
+                    bounded_field(&violation.reason),
+                    violation.citable_record_ids().join(", ")
                 );
             }
         }
@@ -619,14 +845,22 @@ impl SchemaConstraintReport {
             let _ = writeln!(
                 out,
                 "unknown node labels in store: {}",
-                self.unknown_node_labels.join(", ")
+                self.unknown_node_labels
+                    .iter()
+                    .map(|label| bounded_field(label))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         if !self.unknown_edge_types.is_empty() {
             let _ = writeln!(
                 out,
                 "unknown edge types in store: {}",
-                self.unknown_edge_types.join(", ")
+                self.unknown_edge_types
+                    .iter()
+                    .map(|label| bounded_field(label))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         let _ = writeln!(
@@ -855,12 +1089,14 @@ mod tests {
                             reason: "missing required key".to_owned(),
                             sample_record_ids: vec!["z".to_owned(), "a".to_owned()],
                             unresolved_samples: 1,
+                            sample_complete: true,
                         },
                         ViolationRow {
                             property: Some("codegraph_id".to_owned()),
                             reason: "missing required key".to_owned(),
                             sample_record_ids: vec!["a".to_owned()],
                             unresolved_samples: 0,
+                            sample_complete: true,
                         },
                     ],
                 },
@@ -870,7 +1106,11 @@ mod tests {
             unknown_edge_types: Vec::new(),
             declared_constraints: Vec::new(),
             declared_labels: 0,
+            declaration_refusal: None,
             dropped_labels: 0,
+            dropped_constraints: Vec::new(),
+            foreign_constraints_retained: Vec::new(),
+            conformance_evaluated: true,
         }
     }
 

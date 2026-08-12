@@ -24,8 +24,8 @@ use crate::{
         TemporalMetadata, UserContextFields,
     },
     schema_constraints::{
-        ConformanceStatus, ConstraintProfile, DeclaredConstraint, DeclaredTypeToken,
-        EntityKindToken, LabelConformance, ViolationRow,
+        ConformanceStatus, ConstraintProfile, DeclarationOutcome, DeclaredConstraint,
+        DeclaredTypeToken, DropOutcome, EntityKindToken, LabelConformance, ViolationRow,
     },
 };
 use ::aletheiadb::api::transaction::WriteOps;
@@ -1424,26 +1424,31 @@ impl EmbeddedAletheiaSink {
     ///
     /// Returns [`AdapterError::Rejected`] naming the refusing label when the
     /// store's current state does not conform.
+    #[must_use]
     pub fn declare_schema_constraints(
         &self,
         profile: ConstraintProfile,
         entity_kind: EntityKindToken,
         labels: &[&str],
-    ) -> AdapterResult<usize> {
+    ) -> DeclarationOutcome {
         let mut declared = 0usize;
         for label in labels {
-            self.run_schema_constraint(profile, entity_kind, label, false)
-                .map_err(|error| AdapterError::Rejected {
-                    record_id: (*label).to_owned(),
-                    message: format!(
+            if let Err(error) = self.run_schema_constraint(profile, entity_kind, label, false) {
+                return DeclarationOutcome {
+                    declared,
+                    refusal: Some(format!(
                         "declaring the {} profile on {} {label} was refused: {error}",
                         profile.as_str(),
                         entity_kind.as_str()
-                    ),
-                })?;
+                    )),
+                };
+            }
             declared += 1;
         }
-        Ok(declared)
+        DeclarationOutcome {
+            declared,
+            refusal: None,
+        }
     }
 
     /// Drops every schema constraint declared on this store, returning how many
@@ -1456,13 +1461,25 @@ impl EmbeddedAletheiaSink {
     /// # Errors
     ///
     /// Returns an error if a retraction fails.
-    pub fn drop_all_schema_constraints(&self) -> AdapterResult<usize> {
-        let mut dropped = 0usize;
+    pub fn drop_schema_constraints(&self, include_foreign: bool) -> AdapterResult<DropOutcome> {
+        let mut outcome = DropOutcome::default();
         for descriptor in self.declared_schema_constraints() {
             let kind = match descriptor.entity_kind.as_str() {
+                "node" => ::aletheiadb::EntityKind::Node,
                 "edge" => ::aletheiadb::EntityKind::Edge,
-                _ => ::aletheiadb::EntityKind::Node,
+                // Upstream's tokens are exactly `node`/`edge`. Anything else
+                // came from a crafted or future sidecar; guessing `Node` would
+                // silently fail to drop a real constraint and under-report, so
+                // it is retained and disclosed instead.
+                _ => {
+                    outcome.foreign_retained.push(descriptor);
+                    continue;
+                }
             };
+            if !include_foreign && !Self::is_writable_label(&descriptor) {
+                outcome.foreign_retained.push(descriptor);
+                continue;
+            }
             let removed = self
                 .db
                 .drop_schema_constraint(kind, &descriptor.label)
@@ -1471,10 +1488,19 @@ impl EmbeddedAletheiaSink {
                     message: format!("dropping schema constraints failed: {error}"),
                 })?;
             if removed {
-                dropped += 1;
+                outcome.dropped.push(descriptor);
             }
         }
-        Ok(dropped)
+        Ok(outcome)
+    }
+
+    /// Whether a declaration sits on a label Egregore itself can write.
+    fn is_writable_label(descriptor: &DeclaredConstraint) -> bool {
+        let inventory = match descriptor.entity_kind.as_str() {
+            "edge" => crate::schema_constraints::writable_edge_types(),
+            _ => crate::schema_constraints::writable_node_labels(),
+        };
+        inventory.contains(&descriptor.label.as_str())
     }
 
     /// Builds and runs the upstream constraint declaration for one
@@ -1544,11 +1570,20 @@ impl EmbeddedAletheiaSink {
                 }
                 sample_record_ids.sort();
                 sample_record_ids.dedup();
+                // Upstream keeps only the first `MAX_CONFORMANCE_SAMPLE_IDS`
+                // offenders per group, in the iteration order of a per-process
+                // randomly-seeded `DashMap`. Hitting that bound therefore means
+                // the SUBSET is arbitrary and varies between runs; falling short
+                // of it means every offender was captured, so the sorted list is
+                // stable. Only the latter is citable.
+                let sample_complete =
+                    violation.sample_ids.len() < crate::schema_constraints::ENGINE_SAMPLE_BOUND;
                 ViolationRow {
                     property: violation.property.clone(),
                     reason: violation.reason.clone(),
                     sample_record_ids,
                     unresolved_samples,
+                    sample_complete,
                 }
             })
             .collect();
@@ -3083,7 +3118,7 @@ impl EmbeddedAletheiaSink {
         let properties = builder.build();
         let node_id = self
             .db
-            .create_node("Tombstone", properties)
+            .create_node(crate::schema_constraints::TOMBSTONE_LABEL, properties)
             .map_err(|error| AdapterError::Rejected {
                 record_id: id.clone(),
                 message: error.to_string(),
@@ -5370,8 +5405,12 @@ mod embedded_store_gate {
 
 /// Fixture affordances for tests that must simulate a NON-Egregore writer.
 ///
-/// Not part of the supported API — hidden from the docs and never called by any
-/// `eg` command. It exists because the whole point of the issue #486 backstop is
+/// Gated behind the non-default `test-fixtures` feature, so it is compiled ONLY
+/// for the test target and is absent from any production build of the published
+/// crate — `#[doc(hidden)]` hides a symbol from rustdoc, it does not remove it,
+/// and this module can write a record that bypasses every Egregore invariant.
+///
+/// It exists because the whole point of the issue #486 backstop is
 /// a bad write that reaches the store by a path `eg validate` cannot gate (a
 /// hand-edited store, a foreign writer, an adapter regression), and there is no
 /// way to produce that condition through Egregore's own write path, which always
@@ -5379,6 +5418,7 @@ mod embedded_store_gate {
 /// both halves of the contract: that the audit REPORTS such a record, and that a
 /// declared store REFUSES it at the commit hook.
 #[doc(hidden)]
+#[cfg(feature = "test-fixtures")]
 pub mod fixtures {
     use std::path::Path;
 
@@ -5400,16 +5440,82 @@ pub mod fixtures {
         label: &str,
         marker: &str,
     ) -> AdapterResult<()> {
-        let sink = EmbeddedAletheiaSink::open(data_dir.as_ref())?;
         // Deliberately NO `codegraph_id` / `record_type` / `schema_version`:
-        // this is the shape a foreign writer produces.
+        // this is the shape a foreign writer produces, and it is unciteable by
+        // construction (there is no handle to resolve).
+        plant_raw_node(data_dir, label, &[("planted_marker", marker)])
+    }
+
+    /// Writes a raw node that HAS a `codegraph_id` but still violates the spine.
+    ///
+    /// The distinction matters: `plant_nonconforming_node` produces a record
+    /// with no handle at all, so it can only ever land in `unresolved_samples`.
+    /// This one is citable, so it exercises the sample-resolution path that
+    /// turns an engine-internal entity id back into a record handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be opened, or if a declared schema
+    /// constraint refuses the write.
+    pub fn plant_citable_nonconforming_node(
+        data_dir: impl AsRef<Path>,
+        label: &str,
+        codegraph_id: &str,
+    ) -> AdapterResult<()> {
+        // Carries the identity key but NOT `record_type` / `schema_version`.
+        plant_raw_node(data_dir, label, &[("codegraph_id", codegraph_id)])
+    }
+
+    /// Writes a raw node carrying the FULL identity spine at an arbitrary
+    /// `schema_version`.
+    ///
+    /// Exists to test the schema-bump contract at the level the constraint
+    /// actually operates. `eg ingest` cannot be used for this: Egregore's own
+    /// reader rejects an unknown future `(domain, kind, version)` tuple at the
+    /// JSONL parse gate, long before any store write, so it would prove the
+    /// reader's behaviour rather than the constraint's.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be opened, or if a declared schema
+    /// constraint refuses the write — which is exactly the assertion: a bumped
+    /// VALUE must not violate a constraint that declares the TYPE.
+    pub fn plant_spine_node_at_version(
+        data_dir: impl AsRef<Path>,
+        label: &str,
+        codegraph_id: &str,
+        schema_version: i64,
+    ) -> AdapterResult<()> {
+        let sink = EmbeddedAletheiaSink::open(data_dir.as_ref())?;
         let properties = ::aletheiadb::PropertyMapBuilder::new()
-            .insert("planted_marker", marker)
+            .insert("codegraph_id", codegraph_id)
+            .insert("record_type", "node")
+            .insert("schema_version", schema_version)
+            .insert("summary", "spine node at an arbitrary schema version")
             .build();
         sink.db
             .create_node(label, properties)
             .map_err(|error| super::AdapterError::Rejected {
-                record_id: marker.to_owned(),
+                record_id: codegraph_id.to_owned(),
+                message: error.to_string(),
+            })?;
+        Ok(())
+    }
+
+    fn plant_raw_node(
+        data_dir: impl AsRef<Path>,
+        label: &str,
+        properties: &[(&str, &str)],
+    ) -> AdapterResult<()> {
+        let sink = EmbeddedAletheiaSink::open(data_dir.as_ref())?;
+        let mut builder = ::aletheiadb::PropertyMapBuilder::new();
+        for (key, value) in properties {
+            builder = builder.insert(key, *value);
+        }
+        sink.db
+            .create_node(label, builder.build())
+            .map_err(|error| super::AdapterError::Rejected {
+                record_id: label.to_owned(),
                 message: error.to_string(),
             })?;
         Ok(())
@@ -7875,6 +7981,55 @@ mod tests {
         assert_eq!(
             classify_open_error(Path::new("/srv/.egregore"), upstream),
             upstream
+        );
+    }
+
+    /// The #486 inventory is derived from `NodeKind::ALL` on the ASSUMPTION
+    /// that the adapter writes one store-side label per kind, named exactly
+    /// `kind.as_str()`. `node_label` is a private `const fn` with one combined
+    /// arm today, but a future variant given its own arm returning a different
+    /// literal would silently desync the inventory from what is actually
+    /// written — the report would then misfile a real label as a foreign
+    /// writer's, and `--declare` would leave it unconstrained. This pins the
+    /// assumption at the write site.
+    #[test]
+    fn node_label_is_exactly_the_kind_string_for_every_kind() {
+        for kind in NodeKind::ALL {
+            assert_eq!(
+                node_label(kind),
+                kind.as_str(),
+                "node_label({kind:?}) must equal its kind string, or the #486 \
+                 label inventory no longer describes what the adapter writes"
+            );
+        }
+    }
+
+    /// The tombstone label the adapter writes must be the same constant the
+    /// inventory publishes, or tombstones fall outside the declared surface.
+    #[test]
+    fn tombstone_label_matches_the_inventory_constant() {
+        assert_eq!(crate::schema_constraints::TOMBSTONE_LABEL, "Tombstone");
+        assert!(
+            !NodeKind::ALL
+                .iter()
+                .any(|kind| kind.as_str() == crate::schema_constraints::TOMBSTONE_LABEL)
+        );
+    }
+
+    /// Egregore's own sample bound must stay at or below upstream's, or
+    /// `sample_complete` would claim completeness it cannot establish.
+    #[test]
+    fn egregore_sample_cap_does_not_exceed_the_engine_bound() {
+        const _: () = assert!(
+            crate::schema_constraints::MAX_SAMPLE_RECORD_IDS
+                <= crate::schema_constraints::ENGINE_SAMPLE_BOUND,
+            "egregore's render cap must not exceed the engine's sample bound"
+        );
+        assert_eq!(
+            crate::schema_constraints::ENGINE_SAMPLE_BOUND,
+            ::aletheiadb::core::constraint::MAX_CONFORMANCE_SAMPLE_IDS,
+            "the mirrored engine sample bound drifted from upstream, which would \
+             silently break the sample_complete determinism rule"
         );
     }
 
