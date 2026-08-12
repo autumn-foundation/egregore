@@ -3215,11 +3215,12 @@ pub(crate) enum QuerySubcommand {
     /// extractor-minted Import nodes are considered, a doc-comment or string
     /// mention of the path is invisible — the precision win over `grep`.
     ///
-    /// The graph carries no per-file owning-crate name, so `crate::`-relative
-    /// and absolute `<crate>::` imports are DISTINCT by default. Pass
-    /// `--crate <name>` to rewrite a leading `crate::` (in the query and in
-    /// imports) to that crate name so the two forms unify. This is
-    /// caller-supplied ground truth, never guessed.
+    /// `crate::`-relative and absolute `<crate>::` imports are DISTINCT by
+    /// default. Pass `--crate <name>` to rewrite a leading `crate::` (in the
+    /// query and in imports) to that crate name so the two forms unify. This is
+    /// caller-supplied ground truth, never guessed — and it is NOT the same
+    /// flag as `eg query symbol --package` (issue #117), which scopes by the
+    /// Cargo package that OWNS a file rather than rewriting a module path.
     ///
     /// Every row carries a stable record ID plus the repo-relative importing
     /// file/span handle. Output is deterministic and byte-identical across runs

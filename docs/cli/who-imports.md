@@ -73,10 +73,15 @@ is exercised at runtime.
 
 ### crate-unification boundary
 
-The graph carries **no per-source-file owning-crate name**: a `File` node
-records a repo-relative path and a `Repository` node records a repo identity,
-but neither maps a source file to the Cargo crate that compiles it. This lane
-therefore does **not** guess a `crate::` ↔ `<crate_name>::` unification.
+Since issue #117 the graph **does** carry an owning-Cargo-package attribution
+on every code fact (`crate_attribution`, resolved from the nearest enclosing
+`Cargo.toml`). This lane does **not** consume it: attribution names the package
+that *owns the file by directory containment*, which is not the same as the
+crate-path prefix a `use` statement resolves against — a `[lib] path` override,
+a `#[path]` module, or a re-export chain can put the two apart. This lane
+therefore still does **not** guess a `crate::` ↔ `<crate_name>::` unification;
+deriving `--crate` from the owning-package attribution is a follow-up, gated on
+establishing that the two agree.
 
 - **By default**, segments are matched literally. A `crate`-relative import
   (`crate::foo::Bar`) and an absolute external import (`mycrate::foo::Bar`) are

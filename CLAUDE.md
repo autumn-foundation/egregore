@@ -344,6 +344,81 @@ nodes, and URL matching. Bumps codegraph `SCHEMA_VERSION` 7→8 and
 `CACHE_SCHEMA_VERSION` 24→25. See `docs/schema/schema-versioning.md` and the
 `REGISTERS_ROUTE` row in `docs/prd/0001-codebase-knowledge-graph.md`.
 
+Every code fact now records WHICH CARGO PACKAGE OWNS IT (issue #117). Every
+path-bearing code-graph node (`File`, `Module`, `Symbol`, `Import`, `Diagnostic`,
+`PanicRiskSite`, `DebtMarker`, `UnsafeSite`, `DependencyDeclaration`) carries an
+additive optional `crate_attribution`: the owning package NAME plus the
+repo-relative path of the owning `Cargo.toml`, or a closed-set reason no package
+owns it. Before this the graph was a flat pool of files — every fact had a
+`repo_relative_path` but nothing named the package — so an agent in a workspace
+monorepo fell back to path-prefix guessing (#83), which conflates a directory
+with a package and cannot name it. The rule is NEAREST ENCLOSING MANIFEST: the
+ancestor-directory walk runs nearest-first to the repo root and resolves at the
+first `Cargo.toml`, so a crate vendored inside another crate owns its own
+subtree; containment is SEGMENT-AWARE, so `crates/alpha` never claims
+`crates/alphabet/x.rs`. A VIRTUAL workspace root (`[workspace]`, no `[package]`)
+declares no package and is WALKED PAST, matching Cargo; every other manifest form
+STOPS the walk FAIL-CLOSED (`unnamed_package` / `unparseable_manifest` /
+`manifest_unreadable`), because inheriting an ancestor's name across a broken or
+nameless boundary would FABRICATE a package attribution — the one thing the issue
+forbids outright. The name is READ from `[package].name`, never derived from a
+directory name and never sanitized from a Cargo-invalid one. ABSENT-FIELD ≠
+UNATTRIBUTED: an absent field means the record predates #117 (attribution
+UNKNOWN), while a present `status: unattributed` means it WAS computed and there
+is provably no owner — collapsing the two would turn every legacy record into a
+fabricated "proven ownerless" claim, the same distinction
+`embedding_identity_unrecorded` exists to draw. Presence is a TOTAL function over
+node kind (an exhaustive no-wildcard `match`, the #247 completeness invariant),
+which is what makes that inference sound; repo-scoped kinds
+(`Repository`/`Commit`/`Change`/`ScanCoverage`) carry no path and are never
+attributed. `crate_attribution` is NEVER an identity input, so no record ID moves
+and ADR-0004's cross-crate-identity deferral stands. One PURE resolver
+(`src/crate_attribution.rs` — no `std::fs`, no `Command`, no clock, pinned by
+test) serves all three producers, so the working-tree harvest and the Git-object
+harvest cannot disagree about the rule: `eg scan` and `eg refresh` stamp it as a
+post-extraction pass after every `File`-producing extractor, and `eg scan-history`
+resolves against EACH COMMIT'S OWN manifest tree, applied to that commit's slice
+only (a whole-graph pass would stamp every historical version with the last
+commit's packages), from a SINGLE `ls-tree` per commit with a blob-OID parse memo.
+Attribution is deliberately NOT cached — a source file byte-identical to its
+cached version whose `Cargo.toml` was renamed still re-attributes on refresh, so
+`eg refresh` and a full `eg scan` of one tree agree exactly. `eg query symbol`
+and `eg query symbols` gain `--package <NAME>` (spelled `--package`, NOT
+`--crate`: `eg query who-imports --crate` already means module-path unification),
+matched EXACTLY with no case folding or `-`/`_` normalization. A selector no
+package carries exits 1 with `unknown_package_selector` + sorted
+`known_packages`, DISTINCT from exit 2 "known package, zero matching rows", so a
+typo is never a silent empty answer; a name owned by ≥2 repositories in a shared
+store exits 1 `ambiguous_package_selector` rather than silently merging them; and
+`--package --daemon` exits 1 `unsupported_combination` (the daemon's symbol
+projection carries no attribution and already omits
+`visibility`/`signature`/`doc`) rather than answering a different question. The
+#447 sidecar-index fast path stays ENABLED under `--package`; only the
+zero-row error path cold-reloads, to enumerate `known_packages`. Rows appear in
+both `--format json` and `--format text` (an absent field prints NOTHING — never
+"unattributed", which would fabricate a negative fact), are allow-list only
+(package name, manifest path, closed-set reason — a TOML parse-error message is
+DROPPED because it can echo manifest body text), strictly read-only and local
+(no `cargo build`/`check`/`metadata`, no network; history reads Git objects
+without touching the checkout), and byte-identical across runs, across record
+order, and across the repository's absolute location. EPISTEMIC LIMIT, stated
+verbatim in the docs and carried as `crate_attribution_disclaimer` on every
+`--package`-scoped row: attribution is nearest-enclosing-manifest directory
+containment, never proof the file is compiled into that package — so a
+`[lib]/[[bin]] path` override or `#[path]` module escaping the package directory
+is misattributed by containment, an orphan `.rs` no `mod` reaches is attributed
+anyway, and a `.py`/`.ts`/`.go` file inside a crate dir IS attributed to that
+Cargo package. CAPTURED: the owning package name + manifest handle. NOT in this
+slice: cross-crate canonical symbol identity, workspace membership,
+versions/features/editions, Cargo target roles (lib/bin/test/bench/example),
+inter-crate dependency resolution, non-Cargo build systems, `--package` on other
+lanes, and daemon/MCP parity. Also fixes a latent history bug this would have
+inherited: `src/history.rs::git_output` set no `core.quotePath=false`, so
+`ls-tree` C-quoted a non-ASCII path (`crates/café/src/lib.rs`), the subsequent
+blob read failed, and an entire real directory vanished from the graph. Bumps
+codegraph `SCHEMA_VERSION` 8→9 and `CACHE_SCHEMA_VERSION` 25→26. See
+`docs/cli/crate-attribution.md` and `docs/cli/store-upgrade.md`.
+
 Query commands (local JSONL graph, no network):
 
 Corpus scope (issue #427): every query lane discloses the corpus its answer was computed over
@@ -407,6 +482,13 @@ cargo run -- query who-imports foo::bar --graph graph.jsonl           # segment-
 cargo run -- query who-imports mycrate::foo --crate mycrate --graph graph.jsonl  # unify crate:: with mycrate::
 cargo run -- query who-imports nonexistent::module --graph graph.jsonl  # exit 2 (no_match)
 cargo run -- query who-imports "" --graph graph.jsonl                 # exit 1 (malformed_module_path)
+
+# Scope a symbol answer to one owning Cargo package (issue #117)
+cargo run -- query symbol handle --graph graph.jsonl --package alpha   # exit 0 (one crate's rows)
+cargo run -- query symbols "*" --graph graph.jsonl --package alpha     # the crate's whole symbol surface
+cargo run -- query symbols "*" --data-dir .egregore --package util --repo acme/widget  # intersect with --repo
+cargo run -- query symbol handle --graph graph.jsonl --package alfa    # exit 1 (unknown_package_selector)
+cargo run -- query symbol only_in_alpha --graph graph.jsonl --package beta  # exit 2 (known package, no match)
 
 # Symbols that construct a type via a `Type { … }` literal (issue #471)
 cargo run -- query who-constructs Deal --graph graph.jsonl            # exit 0 (>=1 constructor)
@@ -782,11 +864,14 @@ import's first N segments, so `foo::bar` matches `foo::bar::Baz` and `foo::bar` 
 `foo::barbell`. Each import's path text is first reduced to its module prefix — a trailing
 ` as <alias>` is stripped, a group `a::b::{C, D}` and a glob `a::b::*` reduce to `a::b`.
 Because only real `Import` nodes are consulted, a doc-comment or string mention of the path
-produces NO match (the precision win over grep). The graph carries no per-file owning-crate
-name, so by default a `crate::`-relative import and an absolute `<crate>::` import are
-DISTINCT (and a leading `self`/`super` is matched literally); pass `--crate <name>` to
+produces NO match (the precision win over grep). By default a `crate::`-relative import and an
+absolute `<crate>::` import are DISTINCT (and a leading `self`/`super` is matched literally);
+pass `--crate <name>` to
 rewrite a leading `crate::` in BOTH the query and imports to `<name>::` so the two forms
-unify — caller-supplied ground truth, never guessed. A leading `pub`/visibility + `use` (or
+unify — caller-supplied ground truth, never guessed. Issue #117 gave the graph an owning-package
+attribution, but this lane deliberately does NOT consume it: containment-derived ownership is not
+the crate-path prefix a `use` resolves against, so `--crate` stays caller-supplied. A leading
+`pub`/visibility + `use` (or
 bare `use`) keyword prefix the extractor leaves on a re-export node's `name`
 (`pub use crate::internal::Widget`) is stripped before matching, so `crate::…` re-export sites
 are found (issue #449). Liveness follows the shared

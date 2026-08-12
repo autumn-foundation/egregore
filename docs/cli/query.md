@@ -5,10 +5,10 @@ Query an existing graph JSONL for symbols, files, who last changed a symbol, sem
 ## Synopsis
 
 ```text
-eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
-eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
-eg query symbols  <PATTERN> --graph <PATH>  [--case-insensitive] [--repo <SELECTOR>] [--format json|text]
-eg query symbols  <PATTERN> --data-dir <DIR> [--case-insensitive] [--repo <SELECTOR>] [--format json|text]
+eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--package <NAME>] [--repo-path <DIR>] [--format json|text]
+eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--package <NAME>] [--repo-path <DIR>] [--format json|text]
+eg query symbols  <PATTERN> --graph <PATH>  [--case-insensitive] [--repo <SELECTOR>] [--package <NAME>] [--format json|text]
+eg query symbols  <PATTERN> --data-dir <DIR> [--case-insensitive] [--repo <SELECTOR>] [--package <NAME>] [--format json|text]
 eg query file     <PATH>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query file     <PATH>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query who      <NAME>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
@@ -439,6 +439,42 @@ Egregore guarantees cross-platform and cross-producer byte-for-byte stable scans
 - **VS. Extraction Accuracy (issue #93)**: Portable spans guarantee structural identity and portability of spans across platforms; they do not impact the linguistic precision or syntax coverage of the language-specific extractors.
 
 ---
+
+## Owning-package scope (`--package`, issue #117)
+
+Every code fact carries `crate_attribution` — the owning Cargo package's name
+plus the repo-relative path of the owning `Cargo.toml`, resolved from the
+nearest enclosing manifest — so `eg query symbol` and `eg query symbols` rows
+name their crate, and two same-named symbols in different member crates are
+distinguishable without reading a manifest.
+
+```powershell
+eg query symbol handle --graph graph.jsonl --package alpha
+eg query symbols "*" --graph graph.jsonl --package alpha
+```
+
+- Matching is **exact**: no case folding, no `-`/`_` normalization.
+- An unknown selector exits **1** with
+  `{"code":"unknown_package_selector","known_packages":[…]}`; a known package
+  with zero matching rows exits **2**. A typo is never a silent empty answer.
+- A package name owned by two or more repositories in a shared store exits **1**
+  with `ambiguous_package_selector`; add `--repo` to disambiguate. `--package`
+  and `--repo` compose as an intersection.
+- `--package` with `--daemon` exits **1** (`unsupported_combination`): the
+  daemon's symbol projection carries no attribution, so the flag is refused
+  rather than silently ignored.
+- Spelled `--package`, **not** `--crate` — `eg query who-imports --crate` means
+  something unrelated (module-path unification).
+
+An **absent** `crate_attribution` key means the record predates issue #117
+(attribution unknown), which is a different fact from a present value carrying
+`status: "unattributed"` (computed, and provably no owner). In `--format text`
+an absent field prints nothing.
+
+Attribution is nearest-enclosing-manifest **directory containment**, never proof
+the file is compiled into that package. Full contract, including the closed
+unattributed-reason set and every documented limit, in
+[`crate-attribution.md`](crate-attribution.md).
 
 ## Repository scope (`--repo`, issue #67)
 
