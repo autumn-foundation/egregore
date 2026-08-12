@@ -1145,9 +1145,13 @@ pub fn run_criteria_coverage(
         diagnostics.push(CriteriaCoverageDiagnostic {
             code: "criterion_parent_task_unresolved".to_owned(),
             record_ids: parent_unresolved_ids,
-            detail: "criterion(s) whose owning Task does not resolve to a live Task record; they \
-                     are still counted in the census but can never enter the \
-                     claimed-done-but-unproven set"
+            detail: "criterion(s) for which SOME candidate parent — the recorded parent_task_id \
+                     or an OWNED_BY_TASK edge target — does not resolve to a live Task record. \
+                     They are still counted in the census. A criterion whose OTHER candidate \
+                     resolves to a done task DOES enter the claimed-done-but-unproven set: the \
+                     broken representation is reported here without suppressing what the live \
+                     one establishes. Only a criterion with NO live done candidate stays out of \
+                     that set"
                 .to_owned(),
         });
     }
@@ -2671,6 +2675,24 @@ mod tests {
                 .any(|d| d.code == "criterion_parent_task_unresolved"
                     && d.record_ids.contains(&AC_U1.to_owned())),
             "a broken required ownership representation must not vanish from the report"
+        );
+        // ...and the diagnostic must not contradict the row it accompanies: this
+        // criterion IS unresolved AND IS claimed-done, so wording claiming such
+        // criteria can never be claimed-done would make the report disagree with
+        // itself.
+        let detail = &report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "criterion_parent_task_unresolved")
+            .expect("unresolved diagnostic present")
+            .detail;
+        assert!(
+            !detail.contains("can never enter"),
+            "the detail contradicts the row it accompanies: {detail}"
+        );
+        assert!(
+            detail.contains("DOES enter"),
+            "the detail must state that a live done candidate still counts: {detail}"
         );
     }
 

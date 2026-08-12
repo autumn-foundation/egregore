@@ -235,7 +235,7 @@ fabricated `0.0` — alongside the stable `no_acceptance_criteria` diagnostic.
 | `dangling_closing_evidence` | Names every criterion carrying a closing handle that resolves to no live record — including one masked by a higher-precedence bucket. |
 | `criterion_parent_task_conflict` | Contested ownership: more than one distinct parent `Task` participates in the gate (field vs edge, several edges, or a matching edge plus an extra one). |
 | `parent_task_status_ambiguous` | Some candidate parent `Task` has several CURRENT-CANDIDATE versions recording DIFFERENT statuses (a missing status is a distinct state); the claimed-done test counts the criterion when any current **candidate** is done. Which versions are candidates depends on whether recency resolved — see [Claimed-done-but-unproven](#claimed-done-but-unproven). |
-| `criterion_parent_task_unresolved` | The owning `Task` does not resolve to a live `Task`. Still counted in the census, but can never enter the claimed-done set. |
+| `criterion_parent_task_unresolved` | Some candidate parent — the recorded `parent_task_id` or an `OWNED_BY_TASK` edge target — does not resolve to a live `Task`. Still counted in the census. If another candidate resolves to a done task the criterion DOES enter the claimed-done set: the broken representation is reported without suppressing what the live one establishes. |
 | `superseded_criteria_counted` | Names criteria recorded `status: superseded`, which ARE counted in the proof gap — disclosed because the symmetric argument excludes `closed_dropped` tasks. |
 | `results_truncated` | `--limit` truncated a row list; counts stay pre-truncation. |
 | `below_proven_ratio_threshold` | Gate breach, naming the ratio and the bound. |
