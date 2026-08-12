@@ -1141,3 +1141,110 @@ fn declare_and_drop_output_is_byte_identical_across_runs() {
         "drop output must be stable across runs"
     );
 }
+
+/// `--drop` must not destroy a declaration Egregore did not make. It is the
+/// inverse of `--declare`, and `--declare` only ever touches labels in
+/// Egregore's own inventory; another tool sharing the data dir owns its own.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn drop_retains_a_foreign_declaration_unless_explicitly_widened() {
+    let (_temp, data_dir) = seeded_store();
+    let dir = data_dir.to_str().expect("utf8");
+
+    run(&[
+        "audit",
+        "schema-constraints",
+        "--data-dir",
+        dir,
+        "--declare",
+    ]);
+    aletheia_egregore::adapters::fixtures::declare_foreign_constraint(
+        &data_dir,
+        "SomeOtherToolsLabel",
+        "their_property",
+    )
+    .expect("a foreign tool declares its own constraint");
+
+    // Default drop: Egregore's own go, the foreign one stays and is reported.
+    let output = run(&["audit", "schema-constraints", "--data-dir", dir, "--drop"]);
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output.stdout).expect("utf8").trim()).expect("json");
+
+    let retained: Vec<&str> = report["foreign_constraints_retained"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|entry| entry["label"].as_str())
+        .collect();
+    assert_eq!(
+        retained,
+        vec!["SomeOtherToolsLabel"],
+        "a declaration outside Egregore's inventory must be retained and reported"
+    );
+    assert!(
+        report["dropped_constraints"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .all(|entry| entry["label"].as_str() != Some("SomeOtherToolsLabel"))
+    );
+    // It really is still declared.
+    let after = report_json(&data_dir, &[]);
+    assert!(
+        after["declared_constraints"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|entry| entry["label"].as_str() == Some("SomeOtherToolsLabel"))
+    );
+
+    // `--include-foreign` widens the retraction to everything.
+    let widened = run(&[
+        "audit",
+        "schema-constraints",
+        "--data-dir",
+        dir,
+        "--drop",
+        "--include-foreign",
+    ]);
+    assert_eq!(widened.status.code(), Some(0));
+    let widened_report: serde_json::Value =
+        serde_json::from_str(String::from_utf8(widened.stdout).expect("utf8").trim())
+            .expect("json");
+    assert!(
+        widened_report["dropped_constraints"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|entry| entry["label"].as_str() == Some("SomeOtherToolsLabel")),
+        "--include-foreign must retract it"
+    );
+    let final_report = report_json(&data_dir, &[]);
+    assert!(
+        final_report["declared_constraints"]
+            .as_array()
+            .expect("array")
+            .is_empty()
+    );
+}
+
+/// `--include-foreign` is meaningless without `--drop` and must be refused
+/// rather than silently ignored.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn include_foreign_without_drop_is_a_usage_error() {
+    let (_temp, data_dir) = seeded_store();
+    let output = run(&[
+        "audit",
+        "schema-constraints",
+        "--data-dir",
+        data_dir.to_str().expect("utf8"),
+        "--include-foreign",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unsupported_combination"),
+        "must carry the stable code"
+    );
+}

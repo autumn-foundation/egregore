@@ -152,6 +152,54 @@ offending property) is preserved verbatim in the message, so the diagnostic is
 usable rather than an opaque commit abort. `enable()` over non-conforming state
 returns `NonConformingOnEnable` and declares **nothing** — atomic.
 
+### Recorded Phase 1 run
+
+Against a real store built from this repository (`eg scan src/query` →
+`eg ingest --adapter embedded`, 8,838 records), `--format text`:
+
+```
+action: report
+profile: spine
+label_partition: one_label_per_node_kind
+writable labels: 61 node, 49 edge
+conformance: 16 labels scanned, 16 conforming, 8838 entities checked, 0 non-conforming
+  node DebtMarker: conforms (4 checked, 0 non-conforming)
+  node Diagnostic: conforms (1321 checked, 0 non-conforming)
+  node File: conforms (48 checked, 0 non-conforming)
+  node Import: conforms (275 checked, 0 non-conforming)
+  node Module: conforms (76 checked, 0 non-conforming)
+  node PanicRiskSite: conforms (100 checked, 0 non-conforming)
+  node Repository: conforms (1 checked, 0 non-conforming)
+  node ScanCoverage: conforms (1 checked, 0 non-conforming)
+  node Symbol: conforms (996 checked, 0 non-conforming)
+  edge CALLS: conforms (3747 checked, 0 non-conforming)
+  edge CONSTRUCTS: conforms (213 checked, 0 non-conforming)
+  edge CONTAINS: conforms (229 checked, 0 non-conforming)
+  edge DEFINES: conforms (996 checked, 0 non-conforming)
+  edge IMPLEMENTS: conforms (31 checked, 0 non-conforming)
+  edge IMPORTS: conforms (275 checked, 0 non-conforming)
+  edge REFERENCES: conforms (525 checked, 0 non-conforming)
+declared constraints: 0
+```
+
+Four things this run establishes that the unit tests cannot:
+
+* **The store conforms.** Both `spine` and `full-base` report zero
+  non-conforming entities, so `--declare` is not blocked on trunk's own data.
+* **`entities_checked` (8,838) equals the record count ingested (8,838).** This
+  is the direct evidence for the counting note above: because the adapter is
+  append-only, every record is its own scanned entity — the scan does not
+  deduplicate to current records, and the total is not "lower than
+  `eg inspect`".
+* **16 of the 110 writable labels are actually populated** by a code-graph-only
+  scan. The other 94 are reported `not_present` — not conforming — which is
+  exactly the distinction the status set exists to preserve.
+* **Output is byte-identical across repeated runs**, verified by diffing two
+  invocations against the unchanged store.
+
+`--declare` on the same store declared all 110 labels with no refusal and
+persisted the sidecar.
+
 ## Profiles
 
 Two candidate profiles exist so the report can quantify what a stricter

@@ -5502,6 +5502,38 @@ pub mod fixtures {
         Ok(())
     }
 
+    /// Declares a schema constraint on an arbitrary label, simulating another
+    /// tool that shares the data dir.
+    ///
+    /// Exists so the `--drop` scoping contract is testable: Egregore's own
+    /// declaration path only ever touches labels in its inventory, so without
+    /// this there is no way to create the foreign declaration that `--drop` must
+    /// RETAIN rather than destroy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be opened or the declaration is
+    /// refused.
+    pub fn declare_foreign_constraint(
+        data_dir: impl AsRef<Path>,
+        label: &str,
+        property: &str,
+    ) -> AdapterResult<()> {
+        let sink = EmbeddedAletheiaSink::open(data_dir.as_ref())?;
+        sink.db
+            .schema_constraint(::aletheiadb::EntityKind::Node, label)
+            .typed(
+                property,
+                ::aletheiadb::core::constraint::DeclaredType::String,
+            )
+            .enable()
+            .map_err(|error| super::AdapterError::Rejected {
+                record_id: label.to_owned(),
+                message: error.to_string(),
+            })?;
+        Ok(())
+    }
+
     fn plant_raw_node(
         data_dir: impl AsRef<Path>,
         label: &str,
