@@ -499,7 +499,7 @@ every verb but `symbol_by_name` (see §2).
 ```json
 {
   "verb": "agent_sessions_for_repo",
-  "repository_id": "codegraph:v8:...",
+  "repository_id": "codegraph:v9:...",
   "repository": "repo-a",
   "disclaimer": "rows are recorded agent-authored memory and project-state facts; ...",
   "unsupported_count_kinds": ["lesson"],

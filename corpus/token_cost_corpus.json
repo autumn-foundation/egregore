@@ -13,7 +13,7 @@
       "class": "exact_symbol",
       "description": "Where is the symbol parse_config defined?",
       "eg_query": "config::parse_config",
-      "expected_record_id": "codegraph:v8:7d2569b7c37b5af3d5aa6bfc1ff8e4bd229d7a6aa987c5e6409f4be932526be8",
+      "expected_record_id": "codegraph:v9:ce64ebcf8f39eead2ed060621988245ed5fa86db7c14887967641cb634c45eac",
       "baseline_pattern": "parse_config",
       "baseline_match_kind": "word_across_corpus"
     },
@@ -22,7 +22,7 @@
       "class": "file_defines",
       "description": "What does src/config.rs define?",
       "eg_query": "src/config.rs",
-      "expected_record_id": "codegraph:v8:7d2569b7c37b5af3d5aa6bfc1ff8e4bd229d7a6aa987c5e6409f4be932526be8",
+      "expected_record_id": "codegraph:v9:ce64ebcf8f39eead2ed060621988245ed5fa86db7c14887967641cb634c45eac",
       "baseline_pattern": "src/config.rs",
       "baseline_match_kind": "read_file"
     },
@@ -31,7 +31,7 @@
       "class": "semantic",
       "description": "validate raw settings text into a typed configuration",
       "eg_query": "validate raw settings text into a typed configuration",
-      "expected_record_id": "codegraph:v8:7d2569b7c37b5af3d5aa6bfc1ff8e4bd229d7a6aa987c5e6409f4be932526be8",
+      "expected_record_id": "codegraph:v9:ce64ebcf8f39eead2ed060621988245ed5fa86db7c14887967641cb634c45eac",
       "baseline_pattern": "settings",
       "baseline_patterns": ["settings", "config", "parse", "validate", "typed"],
       "baseline_match_kind": "words_across_corpus",

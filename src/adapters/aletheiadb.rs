@@ -19,9 +19,9 @@ use crate::{
     daemon::StoreLease,
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
-        EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, IdentitySource, MetricKind, NodeKind,
-        Producer, RouteAnnotation, SelectionBasis, SemanticDriftMetadata, SourceSpan,
-        TemporalMetadata, UserContextFields,
+        CrateAttribution, EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, IdentitySource,
+        MetricKind, NodeKind, Producer, RouteAnnotation, SelectionBasis, SemanticDriftMetadata,
+        SourceSpan, TemporalMetadata, UserContextFields,
     },
 };
 use ::aletheiadb::api::transaction::WriteOps;
@@ -2286,6 +2286,7 @@ impl EmbeddedAletheiaSink {
             note,
             content_signature,
             route,
+            crate_attribution,
             temporal,
             semantic_drift,
             evidence_links,
@@ -2415,6 +2416,13 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(route)
         {
             builder = builder.insert("route_json", json.as_str());
+        }
+        // Owning-package attribution (issue #117). Paired with the read at
+        // `read_node_record_internal`; the two MUST stay symmetric.
+        if let Some(attribution) = crate_attribution
+            && let Ok(json) = serde_json::to_string(attribution)
+        {
+            builder = builder.insert("crate_attribution_json", json.as_str());
         }
         builder = insert_temporal(builder, temporal.as_ref());
         builder = insert_semantic_drift(builder, semantic_drift.as_deref());
@@ -3165,6 +3173,21 @@ impl EmbeddedAletheiaSink {
                 .map(serde_json::from_str::<Vec<RouteAnnotation>>)
                 .transpose()
                 .map_err(|e| read_back_error(record_id, format!("route_json invalid: {e}")))?,
+            // Owning-package attribution (issue #117). The read MUST mirror the
+            // write: `compare_node_record` is full structural equality of the
+            // reconstructed record, so a written-but-unread property would make
+            // every re-ingest write a new physical version forever.
+            crate_attribution: optional_str_property(
+                record_id,
+                "crate_attribution_json",
+                node.get_property("crate_attribution_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<CrateAttribution>)
+            .transpose()
+            .map_err(|e| {
+                read_back_error(record_id, format!("crate_attribution_json invalid: {e}"))
+            })?,
             temporal: temporal_from_properties(record_id, |key| node.get_property(key))?,
             semantic_drift: semantic_drift_from_properties(record_id, |key| {
                 node.get_property(key)

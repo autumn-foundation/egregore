@@ -1,0 +1,2337 @@
+#![allow(missing_docs)]
+//! Owning-Cargo-package attribution for code facts (issue #117).
+//!
+//! Every code-fact node must carry a deterministic attribution to the Cargo
+//! package that owns it — the package NAME plus the repo-relative path of the
+//! owning `Cargo.toml`, resolved from the NEAREST ENCLOSING manifest — so an
+//! agent can read one crate at a time and tell same-named symbols in different
+//! member crates apart without reading manifests itself.
+//!
+//! These tests are written against the emitted JSONL and the `eg` CLI, so they
+//! compile before the field or the `--package` flag exist.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+    process::{Command, Stdio},
+};
+
+use aletheia_egregore::{ir::SCHEMA_VERSION, scan_repository_at_with_override};
+use serde_json::Value;
+
+const FIXED_TIME: &str = "2026-06-14T00:00:00Z";
+const REPO_ID: &str = "crate-attribution-fixture";
+
+/// A manifest body carrying a sentinel comment, so a test can prove no manifest
+/// body text ever reaches the graph.
+const SENTINEL: &str = "SENTINEL_MANIFEST_BODY";
+
+// ── fixture ──────────────────────────────────────────────────────────────────
+
+/// The workspace fixture every scan-side test shares.
+///
+/// Shape (deliberately, one distinct hazard per entry):
+/// - a VIRTUAL workspace root (no `[package]`), so files directly under it are
+///   `virtual_manifest_only`, not owned by a fabricated root package;
+/// - `crates/alpha` — a lib crate that DECLARES dependencies (mints a manifest
+///   `File` node);
+/// - `crates/alphabet` — the sibling-prefix trap: a `starts_with` matcher would
+///   let `alpha` claim its files;
+/// - `crates/beta` — a bin crate with NO `[dependencies]`, so manifest
+///   extraction mints no record for it; it still owns its tree;
+/// - `crates/alpha/vendor/inner` — a nested crate inside a crate; the nearest
+///   manifest must win over the parent;
+/// - `crates/alpha/scripts/tool.py` — a non-Rust source inside a crate dir;
+/// - `scripts/gen.rs` — a stray `.rs` outside every crate;
+/// - `handle` defined identically in `alpha` and `beta` — the AC2 collision.
+fn write_workspace_fixture(root: &Path) {
+    write_fixture(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/alpha\", \"crates/alphabet\", \"crates/beta\"]\n",
+            ),
+            (
+                "crates/alpha/Cargo.toml",
+                &format!(
+                    "# {SENTINEL}\n[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n"
+                ),
+            ),
+            (
+                "crates/alpha/src/lib.rs",
+                "pub fn handle() -> u32 { 1 }\npub fn only_in_alpha() -> u32 { 2 }\n",
+            ),
+            (
+                "crates/alpha/scripts/tool.py",
+                "def helper():\n    return 1\n",
+            ),
+            (
+                "crates/alpha/vendor/inner/Cargo.toml",
+                "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "crates/alpha/vendor/inner/src/lib.rs",
+                "pub fn vendored() -> u32 { 3 }\n",
+            ),
+            (
+                "crates/alphabet/Cargo.toml",
+                "[package]\nname = \"alphabet\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "crates/alphabet/src/lib.rs",
+                "pub fn letters() -> u32 { 4 }\n",
+            ),
+            (
+                "crates/beta/Cargo.toml",
+                "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "crates/beta/src/main.rs",
+                "pub fn handle() -> u32 { 5 }\nfn main() {}\n",
+            ),
+            ("scripts/gen.rs", "pub fn generate() -> u32 { 6 }\n"),
+        ],
+    );
+}
+
+fn write_fixture(root: &Path, files: &[(&str, &str)]) {
+    for (relative, contents) in files {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().expect("fixture file should have a parent"))
+            .expect("fixture parent dir should be created");
+        fs::write(path, contents).expect("fixture file should be written");
+    }
+}
+
+fn scan_jsonl(root: &Path) -> String {
+    scan_repository_at_with_override(root, FIXED_TIME, Some(REPO_ID))
+        .expect("fixture repo should scan")
+        .to_jsonl()
+        .expect("graph should serialize")
+}
+
+fn parse_jsonl(jsonl: &str) -> Vec<Value> {
+    jsonl
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record should be valid JSON"))
+        .collect()
+}
+
+fn scan_fixture(root: &Path) -> Vec<Value> {
+    parse_jsonl(&scan_jsonl(root))
+}
+
+/// The `(package_name, manifest_path)` pair a record was attributed to, or the
+/// unattributed reason, rendered as a compact comparable string.
+fn attribution_of(record: &Value) -> Option<String> {
+    let attribution = record.get("crate_attribution")?;
+    let status = attribution["status"].as_str()?;
+    if status == "attributed" {
+        Some(format!(
+            "{}@{}",
+            attribution["package_name"].as_str().unwrap_or("?"),
+            attribution["manifest_repo_relative_path"]
+                .as_str()
+                .unwrap_or("?")
+        ))
+    } else {
+        Some(format!(
+            "unattributed:{}",
+            attribution["unattributed_reason"].as_str().unwrap_or("?")
+        ))
+    }
+}
+
+fn package_of(record: &Value) -> Option<&str> {
+    record
+        .get("crate_attribution")?
+        .get("package_name")?
+        .as_str()
+}
+
+/// Every node record of a path-bearing code-graph kind.
+fn code_fact_nodes(records: &[Value]) -> Vec<&Value> {
+    records
+        .iter()
+        .filter(|r| {
+            r["record_type"] == "node"
+                && r["repo_relative_path"].is_string()
+                && matches!(
+                    r["kind"].as_str(),
+                    Some(
+                        "File"
+                            | "Module"
+                            | "Symbol"
+                            | "Import"
+                            | "Diagnostic"
+                            | "PanicRiskSite"
+                            | "DebtMarker"
+                            | "UnsafeSite"
+                            | "DependencyDeclaration"
+                    )
+                )
+        })
+        .collect()
+}
+
+/// Path → attribution, over every path-bearing code-graph node.
+fn attribution_by_path(records: &[Value]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for record in code_fact_nodes(records) {
+        let path = record["repo_relative_path"]
+            .as_str()
+            .expect("filtered on string path")
+            .to_owned();
+        let attribution =
+            attribution_of(record).unwrap_or_else(|| "(attribution absent)".to_owned());
+        map.entry(path).or_default().insert(attribution);
+    }
+    map
+}
+
+/// Content snapshot of a directory tree: path → bytes, `.git` included.
+///
+/// Content-level, not mtime-level, so a rewrite-with-identical-bytes cannot
+/// masquerade as read-only.
+fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut snapshot = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = fs::read(&path) {
+                let key = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                snapshot.insert(key, bytes);
+            }
+        }
+    }
+    snapshot
+}
+
+fn git<const N: usize>(repo: &Path, args: [&str; N]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("git should execute");
+    assert!(
+        output.status.success(),
+        "git command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn init_git(repo: &Path) {
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git(repo, ["config", "user.name", "Codegraph Test"]);
+    git(repo, ["config", "core.autocrlf", "false"]);
+    git(repo, ["config", "commit.gpgsign", "false"]);
+}
+
+fn commit(repo: &Path, message: &str, date: &str) -> String {
+    git(repo, ["add", "-A"]);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "-m", message])
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .stdin(Stdio::null())
+        .output()
+        .expect("git commit should execute");
+    assert!(
+        output.status.success(),
+        "git commit failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rev = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("git rev-parse should execute");
+    String::from_utf8_lossy(&rev.stdout).trim().to_owned()
+}
+
+// ── fixture precondition ─────────────────────────────────────────────────────
+
+/// Guards the fixture itself: if a later edit collapses it, the attribution
+/// tests below would keep passing while proving nothing.
+#[test]
+fn fixture_shape_precondition() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let records = scan_fixture(temp.path());
+    let paths: BTreeSet<&str> = code_fact_nodes(&records)
+        .iter()
+        .filter_map(|r| r["repo_relative_path"].as_str())
+        .collect();
+
+    for required in [
+        "crates/alpha/src/lib.rs",
+        "crates/alphabet/src/lib.rs",
+        "crates/beta/src/main.rs",
+        "crates/alpha/vendor/inner/src/lib.rs",
+        "crates/alpha/scripts/tool.py",
+        "scripts/gen.rs",
+    ] {
+        assert!(
+            paths.contains(required),
+            "fixture must index {required}; indexed: {paths:?}"
+        );
+    }
+    // >= 2 member crates, >= 1 stray file outside every crate, >= 1 same-named
+    // symbol pair across crates (AC1 / AC2 preconditions).
+    let handles = records
+        .iter()
+        .filter(|r| {
+            r["kind"] == "Symbol"
+                && r["name"]
+                    .as_str()
+                    .is_some_and(|n| n.rsplit("::").next() == Some("handle"))
+        })
+        .count();
+    assert_eq!(
+        handles, 2,
+        "fixture must define `handle` in exactly two crates"
+    );
+}
+
+// ── AC1: every code fact carries attribution ─────────────────────────────────
+
+#[test]
+fn every_code_fact_node_carries_attribution() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let records = scan_fixture(temp.path());
+
+    let unattributed_field: Vec<&str> = code_fact_nodes(&records)
+        .iter()
+        .filter(|r| r.get("crate_attribution").is_none())
+        .filter_map(|r| r["repo_relative_path"].as_str())
+        .collect();
+    assert!(
+        unattributed_field.is_empty(),
+        "every path-bearing code-graph node must carry the field; missing on: {unattributed_field:?}"
+    );
+    assert!(
+        !code_fact_nodes(&records).is_empty(),
+        "the fixture must produce code-fact nodes"
+    );
+}
+
+/// Field presence must be a TOTAL function over node kind, never partial.
+///
+/// That totality is what makes an ABSENT field mean "produced before issue
+/// #117" rather than "this kind happens not to be covered".
+#[test]
+fn attribution_presence_is_total_over_node_kinds() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let records = scan_fixture(temp.path());
+
+    for record in records.iter().filter(|r| r["record_type"] == "node") {
+        let kind = record["kind"].as_str().unwrap_or_default();
+        let carrying = matches!(
+            kind,
+            "File"
+                | "Module"
+                | "Symbol"
+                | "Import"
+                | "Diagnostic"
+                | "PanicRiskSite"
+                | "DebtMarker"
+                | "UnsafeSite"
+                | "DependencyDeclaration"
+        );
+        let has_path = record["repo_relative_path"].is_string();
+        let has_field = record.get("crate_attribution").is_some();
+        assert_eq!(
+            has_field,
+            carrying && has_path,
+            "attribution presence must be total: kind={kind} path={} field={has_field}",
+            record["repo_relative_path"]
+        );
+    }
+    // Repository-scoped records must never claim a package owns them.
+    for kind in ["Repository", "ScanCoverage"] {
+        for record in records.iter().filter(|r| r["kind"] == kind) {
+            assert!(
+                record.get("crate_attribution").is_none(),
+                "{kind} must never carry crate attribution"
+            );
+        }
+    }
+    // Edges and tombstones never carry it.
+    for record in records.iter().filter(|r| r["record_type"] != "node") {
+        assert!(
+            record.get("crate_attribution").is_none(),
+            "only node records carry crate attribution"
+        );
+    }
+}
+
+/// The attribution of every fixture path, pinned as literal expected tuples.
+///
+/// Hand-pinned rather than snapshot-compared, so a wrong regeneration is
+/// visible in review rather than silently re-blessed.
+#[test]
+fn attribution_expectations_are_hand_pinned_tuples() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let records = scan_fixture(temp.path());
+    let observed = attribution_by_path(&records);
+
+    let expected: &[(&str, &str)] = &[
+        ("crates/alpha/Cargo.toml", "alpha@crates/alpha/Cargo.toml"),
+        ("crates/alpha/src/lib.rs", "alpha@crates/alpha/Cargo.toml"),
+        (
+            "crates/alpha/scripts/tool.py",
+            "alpha@crates/alpha/Cargo.toml",
+        ),
+        (
+            "crates/alpha/vendor/inner/src/lib.rs",
+            "inner@crates/alpha/vendor/inner/Cargo.toml",
+        ),
+        (
+            "crates/alphabet/src/lib.rs",
+            "alphabet@crates/alphabet/Cargo.toml",
+        ),
+        ("crates/beta/src/main.rs", "beta@crates/beta/Cargo.toml"),
+        ("scripts/gen.rs", "unattributed:virtual_manifest_only"),
+    ];
+    for (path, attribution) in expected {
+        let actual = observed
+            .get(*path)
+            .unwrap_or_else(|| panic!("no records for {path}; observed: {observed:#?}"));
+        assert_eq!(
+            actual.iter().cloned().collect::<Vec<_>>(),
+            vec![(*attribution).to_owned()],
+            "wrong attribution for {path}"
+        );
+    }
+}
+
+/// The nearest manifest wins, and the parent crate never claims the nested one.
+#[test]
+fn nested_vendor_crate_wins_over_parent() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let records = scan_fixture(temp.path());
+
+    let claimed_by_alpha: Vec<&str> = code_fact_nodes(&records)
+        .iter()
+        .filter(|r| package_of(r) == Some("alpha"))
+        .filter_map(|r| r["repo_relative_path"].as_str())
+        .filter(|p| p.starts_with("crates/alpha/vendor/inner/"))
+        .collect();
+    assert!(
+        claimed_by_alpha.is_empty(),
+        "the parent crate must not claim the nested crate's files: {claimed_by_alpha:?}"
+    );
+    assert!(
+        code_fact_nodes(&records)
+            .iter()
+            .any(|r| package_of(r) == Some("inner")),
+        "the nested crate must own its own files"
+    );
+}
+
+/// `crates/alpha` must never claim `crates/alphabet/**` — the sibling-prefix
+/// trap a `str::starts_with` matcher falls into.
+#[test]
+fn sibling_prefix_non_bleed_end_to_end() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let records = scan_fixture(temp.path());
+
+    for (package, foreign_prefix) in [("alpha", "crates/alphabet/"), ("alphabet", "crates/alpha/")]
+    {
+        // Anti-vacuity: an all-absent field would make the bleed check pass
+        // while proving nothing.
+        assert!(
+            code_fact_nodes(&records)
+                .iter()
+                .any(|r| package_of(r) == Some(package)),
+            "package `{package}` must own at least one record"
+        );
+        let bleeds: Vec<&str> = code_fact_nodes(&records)
+            .iter()
+            .filter(|r| package_of(r) == Some(package))
+            .filter_map(|r| r["repo_relative_path"].as_str())
+            .filter(|p| p.starts_with(foreign_prefix))
+            .collect();
+        assert!(
+            bleeds.is_empty(),
+            "package `{package}` bled into `{foreign_prefix}`: {bleeds:?}"
+        );
+    }
+}
+
+/// A member crate declaring NO dependencies mints no `DependencyDeclaration`
+/// and no manifest `File` node — yet it still owns its whole directory tree.
+///
+/// This is the case a query-time derivation from manifest records could never
+/// answer, and the reason attribution is stamped at scan time.
+#[test]
+fn dependency_free_member_crate_is_attributed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let records = scan_fixture(temp.path());
+
+    assert!(
+        !records
+            .iter()
+            .any(|r| r["repo_relative_path"] == "crates/beta/Cargo.toml"),
+        "precondition: the dependency-free manifest mints no graph record"
+    );
+    let beta_paths: BTreeSet<&str> = code_fact_nodes(&records)
+        .iter()
+        .filter(|r| package_of(r) == Some("beta"))
+        .filter_map(|r| r["repo_relative_path"].as_str())
+        .collect();
+    assert!(
+        beta_paths.contains("crates/beta/src/main.rs"),
+        "the dependency-free crate must still own its sources; got {beta_paths:?}"
+    );
+}
+
+/// The nearest enclosing manifest of a manifest is itself.
+#[test]
+fn manifest_file_node_self_attributes() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let records = scan_fixture(temp.path());
+
+    let manifest_node = records
+        .iter()
+        .find(|r| r["kind"] == "File" && r["repo_relative_path"] == "crates/alpha/Cargo.toml")
+        .expect("the dependency-declaring manifest mints a File node");
+    assert_eq!(
+        attribution_of(manifest_node).as_deref(),
+        Some("alpha@crates/alpha/Cargo.toml")
+    );
+}
+
+// ── AC4: unattributed markers ────────────────────────────────────────────────
+
+/// A stray `.rs` under a virtual workspace root is `virtual_manifest_only`, and
+/// carries no package name at all.
+#[test]
+fn stray_file_is_unattributed_with_virtual_manifest_only() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let records = scan_fixture(temp.path());
+
+    let strays: Vec<&Value> = code_fact_nodes(&records)
+        .into_iter()
+        .filter(|r| r["repo_relative_path"] == "scripts/gen.rs")
+        .collect();
+    assert!(!strays.is_empty(), "the stray file must be indexed");
+    for record in strays {
+        let attribution = record
+            .get("crate_attribution")
+            .expect("stray records still carry the computed field");
+        assert_eq!(attribution["status"], "unattributed");
+        assert_eq!(attribution["unattributed_reason"], "virtual_manifest_only");
+        assert!(
+            attribution.get("package_name").is_none(),
+            "an unattributed record must never carry a package name"
+        );
+        assert!(
+            attribution.get("manifest_repo_relative_path").is_none(),
+            "an unattributed record must never cite a manifest"
+        );
+    }
+}
+
+/// With no manifest anywhere, the reason is `no_enclosing_manifest` — a
+/// different fact from "under a virtual root".
+#[test]
+fn stray_with_no_manifest_anywhere_is_no_enclosing_manifest() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[("src/loose.rs", "pub fn loose() -> u32 { 1 }\n")],
+    );
+    let records = scan_fixture(temp.path());
+
+    let record = code_fact_nodes(&records)
+        .into_iter()
+        .find(|r| r["repo_relative_path"] == "src/loose.rs")
+        .expect("the loose file must be indexed");
+    assert_eq!(
+        attribution_of(record).as_deref(),
+        Some("unattributed:no_enclosing_manifest")
+    );
+}
+
+/// An unparseable manifest STOPS the walk: inheriting the root package's name
+/// across a broken boundary would fabricate an attribution.
+#[test]
+fn unparseable_manifest_stops_walk_and_never_inherits_ancestor() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn at_root() -> u32 { 1 }\n"),
+            (
+                "crates/broken/Cargo.toml",
+                "this is not = = valid toml [[[\n",
+            ),
+            ("crates/broken/src/lib.rs", "pub fn broken() -> u32 { 2 }\n"),
+        ],
+    );
+    let records = scan_fixture(temp.path());
+
+    let record = code_fact_nodes(&records)
+        .into_iter()
+        .find(|r| r["repo_relative_path"] == "crates/broken/src/lib.rs")
+        .expect("the file under the broken manifest must still be indexed");
+    assert_eq!(
+        attribution_of(record).as_deref(),
+        Some("unattributed:unparseable_manifest"),
+        "a broken manifest must fail closed, never inherit `root`"
+    );
+    // The healthy sibling is unaffected.
+    let root_record = code_fact_nodes(&records)
+        .into_iter()
+        .find(|r| r["repo_relative_path"] == "src/lib.rs")
+        .expect("root file indexed");
+    assert_eq!(
+        attribution_of(root_record).as_deref(),
+        Some("root@Cargo.toml")
+    );
+}
+
+/// A `[package]` whose name Cargo would reject is `unnamed_package` — a
+/// distinct, actionable fact from "virtual root", and never a sanitized name.
+#[test]
+fn unnamed_package_manifest_is_its_own_reason() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "crates/nameless/Cargo.toml",
+                "[package]\nname = \"bad name\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "crates/nameless/src/lib.rs",
+                "pub fn nameless() -> u32 { 1 }\n",
+            ),
+        ],
+    );
+    let records = scan_fixture(temp.path());
+
+    let record = code_fact_nodes(&records)
+        .into_iter()
+        .find(|r| r["repo_relative_path"] == "crates/nameless/src/lib.rs")
+        .expect("indexed");
+    assert_eq!(
+        attribution_of(record).as_deref(),
+        Some("unattributed:unnamed_package")
+    );
+    let jsonl = scan_jsonl(temp.path());
+    assert!(
+        !jsonl.contains("bad name") && !jsonl.contains("badname") && !jsonl.contains("bad_name"),
+        "an invalid package name must never be emitted, sanitized, or normalized"
+    );
+}
+
+/// A package name is read from the manifest, never derived from the directory.
+#[test]
+fn package_name_is_never_derived_from_the_directory_name() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            (
+                "crates/widget-dir/Cargo.toml",
+                "[package]\nname = \"totally-different\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/widget-dir/src/lib.rs", "pub fn w() -> u32 { 1 }\n"),
+        ],
+    );
+    let records = scan_fixture(temp.path());
+
+    let record = code_fact_nodes(&records)
+        .into_iter()
+        .find(|r| r["repo_relative_path"] == "crates/widget-dir/src/lib.rs")
+        .expect("indexed");
+    assert_eq!(
+        attribution_of(record).as_deref(),
+        Some("totally-different@crates/widget-dir/Cargo.toml")
+    );
+    let packages: BTreeSet<&str> = code_fact_nodes(&records)
+        .iter()
+        .filter_map(|r| package_of(r))
+        .collect();
+    assert!(
+        !packages.contains("widget-dir"),
+        "a directory name must never surface as a package"
+    );
+}
+
+// ── AC6: redaction-safety ────────────────────────────────────────────────────
+
+/// The manifest body never enters the graph — only the package name and the
+/// manifest's repo-relative path.
+#[test]
+fn no_manifest_body_text_in_scan_output() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let jsonl = scan_jsonl(temp.path());
+    assert!(
+        jsonl.contains("crate_attribution"),
+        "anti-vacuity: attribution must be present for this check to mean anything"
+    );
+    assert!(
+        !jsonl.contains(SENTINEL),
+        "manifest body text must never reach the graph"
+    );
+}
+
+/// Emitted manifest paths are repo-relative: never absolute, never escaping,
+/// never leaking the scanning machine's temp directory.
+#[test]
+fn manifest_paths_are_repo_relative_only() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let records = scan_fixture(temp.path());
+    let temp_component = temp
+        .path()
+        .file_name()
+        .expect("temp dir has a name")
+        .to_string_lossy()
+        .into_owned();
+
+    let mut checked = 0_usize;
+    for record in code_fact_nodes(&records) {
+        let Some(manifest) = record
+            .get("crate_attribution")
+            .and_then(|a| a.get("manifest_repo_relative_path"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        checked += 1;
+        assert!(!manifest.starts_with('/'), "absolute path: {manifest}");
+        assert!(!manifest.contains(".."), "escaping path: {manifest}");
+        assert!(!manifest.contains('\\'), "backslash path: {manifest}");
+        assert!(
+            !manifest.contains(temp_component.as_str()),
+            "temp-dir component leaked: {manifest}"
+        );
+        assert!(
+            manifest.ends_with("Cargo.toml"),
+            "manifest handle must name a Cargo.toml: {manifest}"
+        );
+    }
+    assert!(checked > 0, "no manifest handles were checked");
+}
+
+/// The ancestor walk is hard-bounded at the repository root: a `Cargo.toml`
+/// sitting in the scan root's PARENT directory must never be consulted.
+#[test]
+fn ancestor_walk_never_reads_above_repo_root() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(
+        temp.path().join("Cargo.toml"),
+        "[package]\nname = \"outside\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("outside manifest written");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_fixture(&repo, &[("src/lib.rs", "pub fn inner() -> u32 { 1 }\n")]);
+
+    let jsonl = scan_jsonl(&repo);
+    assert!(
+        !jsonl.contains("outside"),
+        "a manifest above the repository root must never be consulted"
+    );
+    let records = parse_jsonl(&jsonl);
+    let record = code_fact_nodes(&records)
+        .into_iter()
+        .find(|r| r["repo_relative_path"] == "src/lib.rs")
+        .expect("indexed");
+    assert_eq!(
+        attribution_of(record).as_deref(),
+        Some("unattributed:no_enclosing_manifest")
+    );
+}
+
+/// A `Cargo.toml` under `target/` is build output, never a manifest.
+#[test]
+fn manifests_under_target_are_ignored() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn at_root() -> u32 { 1 }\n"),
+            (
+                "target/ghostpkg/Cargo.toml",
+                "[package]\nname = \"ghost\"\nversion = \"0.1.0\"\n",
+            ),
+        ],
+    );
+    let jsonl = scan_jsonl(temp.path());
+    assert!(
+        !jsonl.contains("ghost"),
+        "a manifest under target/ must never be harvested"
+    );
+    // Anti-vacuity: the harvest DID run — the root manifest was found.
+    let records = parse_jsonl(&jsonl);
+    let record = code_fact_nodes(&records)
+        .into_iter()
+        .find(|r| r["repo_relative_path"] == "src/lib.rs")
+        .expect("indexed");
+    assert_eq!(attribution_of(record).as_deref(), Some("root@Cargo.toml"));
+}
+
+/// `cargo.toml` (lowercase) is not a Cargo manifest.
+#[test]
+fn lowercase_cargo_toml_is_not_a_manifest() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            ("crates/x/cargo.toml", "[package]\nname = \"lowercase\"\n"),
+            ("crates/x/src/lib.rs", "pub fn x() -> u32 { 1 }\n"),
+        ],
+    );
+    let jsonl = scan_jsonl(temp.path());
+    assert!(
+        !jsonl.contains("lowercase"),
+        "manifest matching is case-sensitive"
+    );
+    let records = parse_jsonl(&jsonl);
+    let record = code_fact_nodes(&records)
+        .into_iter()
+        .find(|r| r["repo_relative_path"] == "crates/x/src/lib.rs")
+        .expect("indexed");
+    assert_eq!(
+        attribution_of(record).as_deref(),
+        Some("unattributed:no_enclosing_manifest"),
+        "a lowercase cargo.toml owns nothing"
+    );
+}
+
+// ── AC8: determinism and read-only ───────────────────────────────────────────
+
+/// Byte-identical attribution and ordering across five consecutive scans.
+#[test]
+fn scan_attribution_byte_identical_across_five_runs() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let baseline = scan_jsonl(temp.path());
+    assert!(
+        baseline.contains("crate_attribution"),
+        "the determinism check must actually cover attribution"
+    );
+    for run in 1..5 {
+        assert_eq!(
+            scan_jsonl(temp.path()),
+            baseline,
+            "scan output diverged on run {run}"
+        );
+    }
+}
+
+/// The same fixture in two different temp roots yields identical attribution —
+/// catching absolute-path and wall-clock leaks in one assertion.
+#[test]
+fn same_fixture_in_two_tempdirs_yields_identical_attribution() {
+    let first = tempfile::tempdir().expect("temp dir");
+    let second = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(first.path());
+    write_workspace_fixture(second.path());
+    let left = attribution_by_path(&scan_fixture(first.path()));
+    assert!(!left.is_empty(), "anti-vacuity: the map must be populated");
+    assert!(
+        left.values().flatten().any(|a| a.contains('@')),
+        "anti-vacuity: at least one path must be attributed"
+    );
+    assert_eq!(
+        left,
+        attribution_by_path(&scan_fixture(second.path())),
+        "attribution must not depend on the repository's absolute location"
+    );
+}
+
+/// Scanning mutates nothing: not the sources, not the manifests, not `.git`.
+#[test]
+fn scan_does_not_mutate_the_working_tree() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    init_git(temp.path());
+    commit(temp.path(), "seed", "2026-06-14T00:00:00Z");
+
+    let before = snapshot_tree(temp.path());
+    let jsonl = scan_jsonl(temp.path());
+    assert!(
+        jsonl.contains("crate_attribution"),
+        "anti-vacuity: attribution must have been computed during this scan"
+    );
+    let after = snapshot_tree(temp.path());
+    assert_eq!(before, after, "the scan must not mutate the working tree");
+}
+
+// ── AC7: schema version ──────────────────────────────────────────────────────
+
+/// The pinned corpus record IDs track the current schema version, so a future
+/// bump cannot silently leave them stale.
+#[test]
+fn token_cost_corpus_ids_match_current_schema_version() {
+    let corpus = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/token_cost_corpus.json"),
+    )
+    .expect("corpus should be readable");
+    let corpus: Value = serde_json::from_str(&corpus).expect("corpus is JSON");
+    let prefix = format!("codegraph:v{SCHEMA_VERSION}:");
+    let questions = corpus["questions"].as_array().expect("questions array");
+    assert!(!questions.is_empty());
+    for question in questions {
+        let id = question["expected_record_id"]
+            .as_str()
+            .expect("expected_record_id is a string");
+        assert!(
+            id.starts_with(&prefix),
+            "pinned corpus id {id} is stale; expected prefix {prefix}"
+        );
+    }
+}
+
+// ── eg refresh: attribution is recomputed, never cached ──────────────────────
+
+fn refresh_attribution(root: &Path, cache: &Path, at: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let scan = aletheia_egregore::incremental::scan_repository_incremental_at(root, cache, at)
+        .expect("incremental scan should succeed");
+    let jsonl = scan.graph.to_jsonl().expect("graph should serialize");
+    attribution_by_path(&parse_jsonl(&jsonl))
+}
+
+/// A package RENAME with byte-identical sources must still re-attribute.
+///
+/// The per-file cache reuses records for unchanged sources, so attribution
+/// cannot be cached alongside them: `crates/alpha/src/lib.rs` does not change
+/// when `crates/alpha/Cargo.toml` renames its package, yet its owner does.
+#[test]
+fn refresh_reattributes_after_manifest_rename_with_unchanged_sources() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_workspace_fixture(&repo);
+    let cache = temp.path().join("cache.json");
+
+    let before = refresh_attribution(&repo, &cache, FIXED_TIME);
+    assert_eq!(
+        before.get("crates/alpha/src/lib.rs"),
+        Some(&BTreeSet::from(
+            ["alpha@crates/alpha/Cargo.toml".to_owned()]
+        ))
+    );
+
+    // Rename the package; leave every source file byte-identical.
+    let sources_before = fs::read_to_string(repo.join("crates/alpha/src/lib.rs")).expect("read");
+    fs::write(
+        repo.join("crates/alpha/Cargo.toml"),
+        format!("# {SENTINEL}\n[package]\nname = \"alpha-core\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n"),
+    )
+    .expect("manifest rewritten");
+    assert_eq!(
+        fs::read_to_string(repo.join("crates/alpha/src/lib.rs")).expect("read"),
+        sources_before,
+        "precondition: sources must be byte-identical across the rename"
+    );
+
+    let after = refresh_attribution(&repo, &cache, "2026-06-14T00:00:01Z");
+    assert_eq!(
+        after.get("crates/alpha/src/lib.rs"),
+        Some(&BTreeSet::from([
+            "alpha-core@crates/alpha/Cargo.toml".to_owned()
+        ])),
+        "attribution must be recomputed on refresh, never replayed from cache"
+    );
+}
+
+/// Adding a manifest carves a subtree out of its parent package.
+#[test]
+fn refresh_reattributes_after_manifest_addition_carves_subtree() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn at_root() -> u32 { 1 }\n"),
+            ("sub/src/lib.rs", "pub fn in_sub() -> u32 { 2 }\n"),
+        ],
+    );
+    let cache = temp.path().join("cache.json");
+
+    let before = refresh_attribution(&repo, &cache, FIXED_TIME);
+    assert_eq!(
+        before.get("sub/src/lib.rs"),
+        Some(&BTreeSet::from(["root@Cargo.toml".to_owned()]))
+    );
+
+    fs::write(
+        repo.join("sub/Cargo.toml"),
+        "[package]\nname = \"sub\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("manifest written");
+
+    let after = refresh_attribution(&repo, &cache, "2026-06-14T00:00:01Z");
+    assert_eq!(
+        after.get("sub/src/lib.rs"),
+        Some(&BTreeSet::from(["sub@sub/Cargo.toml".to_owned()])),
+        "a newly added manifest must carve its subtree out of the parent package"
+    );
+    assert_eq!(
+        after.get("src/lib.rs"),
+        Some(&BTreeSet::from(["root@Cargo.toml".to_owned()])),
+        "the parent package keeps everything outside the new manifest's subtree"
+    );
+}
+
+/// A refresh and a full scan of the same tree must agree exactly.
+#[test]
+fn refresh_and_full_scan_agree_on_attribution() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_workspace_fixture(&repo);
+    let cache = temp.path().join("cache.json");
+
+    // Seed the cache, then refresh again so the second run reuses it.
+    let _ = refresh_attribution(&repo, &cache, FIXED_TIME);
+    let refreshed = refresh_attribution(&repo, &cache, FIXED_TIME);
+    let scanned = attribution_by_path(&parse_jsonl(
+        &aletheia_egregore::scan_repository_at(&repo, FIXED_TIME)
+            .expect("full scan")
+            .to_jsonl()
+            .expect("serialize"),
+    ));
+    assert!(!refreshed.is_empty(), "anti-vacuity");
+    assert_eq!(
+        refreshed, scanned,
+        "the incremental and full-scan paths must attribute identically"
+    );
+}
+
+// ── eg scan-history: per-commit attribution from Git objects ─────────────────
+
+fn history_attribution(repo: &Path) -> BTreeMap<String, BTreeMap<String, BTreeSet<String>>> {
+    let jsonl = aletheia_egregore::scan_repository_history(repo)
+        .expect("history replay should succeed")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let records = parse_jsonl(&jsonl);
+    // commit sha -> path -> attribution
+    let mut map: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+    for record in code_fact_nodes(&records) {
+        let Some(sha) = record["temporal"]["git_commit"].as_str() else {
+            continue;
+        };
+        let path = record["repo_relative_path"]
+            .as_str()
+            .expect("filtered on string path")
+            .to_owned();
+        let attribution =
+            attribution_of(record).unwrap_or_else(|| "(attribution absent)".to_owned());
+        map.entry(sha.to_owned())
+            .or_default()
+            .entry(path)
+            .or_default()
+            .insert(attribution);
+    }
+    map
+}
+
+/// The load-bearing history test: attribution must be resolved against EACH
+/// COMMIT'S OWN manifest tree, not the last one replayed.
+///
+/// An ADR-0004 symbol ID carries no commit component, so the same stable record
+/// ID recurs across commits. Applying one commit's manifest index across the
+/// whole graph would stamp every historical version with the final tree's
+/// packages — a fabricated fact at a pinned historical point.
+#[test]
+fn history_attribution_is_per_commit_not_whole_graph() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+
+    write_fixture(
+        &repo,
+        &[
+            (
+                "crates/alpha/Cargo.toml",
+                "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/alpha/src/lib.rs", "pub fn stable() -> u32 { 1 }\n"),
+        ],
+    );
+    let first = commit(&repo, "seed alpha", "2026-06-01T00:00:00Z");
+
+    // Rename the package only; the source file stays byte-identical.
+    fs::write(
+        repo.join("crates/alpha/Cargo.toml"),
+        "[package]\nname = \"alpha-core\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("manifest rewritten");
+    let second = commit(&repo, "rename package", "2026-06-02T00:00:00Z");
+
+    let by_commit = history_attribution(&repo);
+    assert_eq!(
+        by_commit[&first]["crates/alpha/src/lib.rs"],
+        BTreeSet::from(["alpha@crates/alpha/Cargo.toml".to_owned()]),
+        "the first commit must carry the package name AS OF that commit"
+    );
+    assert_eq!(
+        by_commit[&second]["crates/alpha/src/lib.rs"],
+        BTreeSet::from(["alpha-core@crates/alpha/Cargo.toml".to_owned()]),
+        "the second commit must carry the renamed package"
+    );
+}
+
+/// A commit that ADDS a manifest changes ownership from that commit onward.
+#[test]
+fn history_attribution_when_manifest_is_added() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+
+    write_fixture(&repo, &[("src/lib.rs", "pub fn thing() -> u32 { 1 }\n")]);
+    let before = commit(&repo, "no manifest", "2026-06-01T00:00:00Z");
+
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"later\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("manifest written");
+    let after = commit(&repo, "add manifest", "2026-06-02T00:00:00Z");
+
+    let by_commit = history_attribution(&repo);
+    assert_eq!(
+        by_commit[&before]["src/lib.rs"],
+        BTreeSet::from(["unattributed:no_enclosing_manifest".to_owned()]),
+        "before the manifest existed, the file was owned by nothing"
+    );
+    assert_eq!(
+        by_commit[&after]["src/lib.rs"],
+        BTreeSet::from(["later@Cargo.toml".to_owned()])
+    );
+}
+
+/// A commit that REMOVES a manifest un-owns its tree from that commit onward.
+#[test]
+fn history_attribution_when_manifest_is_removed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"doomed\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn thing() -> u32 { 1 }\n"),
+        ],
+    );
+    let before = commit(&repo, "with manifest", "2026-06-01T00:00:00Z");
+
+    fs::remove_file(repo.join("Cargo.toml")).expect("manifest removed");
+    let after = commit(&repo, "drop manifest", "2026-06-02T00:00:00Z");
+
+    let by_commit = history_attribution(&repo);
+    assert_eq!(
+        by_commit[&before]["src/lib.rs"],
+        BTreeSet::from(["doomed@Cargo.toml".to_owned()])
+    );
+    assert_eq!(
+        by_commit[&after]["src/lib.rs"],
+        BTreeSet::from(["unattributed:no_enclosing_manifest".to_owned()]),
+        "removing the manifest must un-own the tree, not keep a stale package"
+    );
+}
+
+/// A committed `target/` manifest is build output, never an owner.
+#[test]
+fn history_manifest_listing_prunes_target() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"real\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn thing() -> u32 { 1 }\n"),
+            (
+                "target/ghostpkg/Cargo.toml",
+                "[package]\nname = \"ghost\"\nversion = \"0.1.0\"\n",
+            ),
+        ],
+    );
+    commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    let by_commit = history_attribution(&repo);
+    let attributions: BTreeSet<&String> = by_commit
+        .values()
+        .flat_map(BTreeMap::values)
+        .flatten()
+        .collect();
+    assert!(
+        !attributions.iter().any(|a| a.contains("ghost")),
+        "a committed target/ manifest must never own anything; got {attributions:?}"
+    );
+    // Anti-vacuity: the real manifest IS harvested.
+    assert!(
+        attributions.contains(&"real@Cargo.toml".to_owned()),
+        "the real manifest must still own the tree; got {attributions:?}"
+    );
+}
+
+/// `eg scan` at HEAD and `eg scan-history` at the HEAD commit must agree.
+#[test]
+fn history_and_scan_agree_at_head() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_workspace_fixture(&repo);
+    let head = commit(&repo, "seed workspace", "2026-06-01T00:00:00Z");
+
+    let by_commit = history_attribution(&repo);
+    let history_at_head = by_commit
+        .get(&head)
+        .expect("HEAD commit must be replayed")
+        .clone();
+    let scanned = attribution_by_path(&scan_fixture(&repo));
+
+    // The history path indexes only SOURCE files (it mints no manifest File or
+    // DependencyDeclaration records), so compare over the shared source paths.
+    let shared: BTreeSet<&String> = history_at_head
+        .keys()
+        .filter(|path| scanned.contains_key(*path))
+        .collect();
+    assert!(
+        shared.len() >= 5,
+        "anti-vacuity: too few shared paths to compare: {shared:?}"
+    );
+    for path in shared {
+        assert_eq!(
+            history_at_head[path], scanned[path],
+            "history and scan disagree on {path}"
+        );
+    }
+}
+
+/// A manifest whose blob is unparseable must not abort the replay.
+#[test]
+fn unparseable_manifest_blob_does_not_abort_replay() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_fixture(
+        &repo,
+        &[
+            ("crates/broken/Cargo.toml", "not = = toml [[[\n"),
+            ("crates/broken/src/lib.rs", "pub fn thing() -> u32 { 1 }\n"),
+        ],
+    );
+    let sha = commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    let by_commit = history_attribution(&repo);
+    assert_eq!(
+        by_commit[&sha]["crates/broken/src/lib.rs"],
+        BTreeSet::from(["unattributed:unparseable_manifest".to_owned()])
+    );
+}
+
+/// History replay reads Git objects only; the checkout is byte-identical after.
+#[test]
+fn history_attribution_does_not_mutate_working_tree() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_workspace_fixture(&repo);
+    commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    let before = snapshot_tree(&repo);
+    let jsonl = aletheia_egregore::scan_repository_history(&repo)
+        .expect("history replay")
+        .to_jsonl()
+        .expect("serialize");
+    assert!(
+        jsonl.contains("crate_attribution"),
+        "anti-vacuity: attribution must have been computed"
+    );
+    let after = snapshot_tree(&repo);
+    assert_eq!(
+        before, after,
+        "history replay must not mutate the checkout, including .git"
+    );
+}
+
+/// A manifest under a non-ASCII path must be harvested (depends on the
+/// `core.quotePath=false` pre-fix).
+#[test]
+fn history_attributes_non_ascii_manifest_paths() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_fixture(
+        &repo,
+        &[
+            (
+                "crates/café/Cargo.toml",
+                "[package]\nname = \"cafe-pkg\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/café/src/lib.rs", "pub fn brew() -> u32 { 1 }\n"),
+        ],
+    );
+    let sha = commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    let by_commit = history_attribution(&repo);
+    assert_eq!(
+        by_commit[&sha]["crates/café/src/lib.rs"],
+        BTreeSet::from(["cafe-pkg@crates/café/Cargo.toml".to_owned()]),
+        "a non-ASCII manifest path must resolve, not report unparseable"
+    );
+}
+
+// ── store round-trip: write and read MUST stay symmetric ─────────────────────
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn egregore_bin() -> assert_cmd::Command {
+    assert_cmd::Command::cargo_bin("egregore").expect("binary should run")
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn ingest_embedded(graph_path: &Path, data_dir: &Path) {
+    egregore_bin()
+        .arg("ingest")
+        .arg(graph_path)
+        .arg("--adapter")
+        .arg("embedded")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .assert()
+        .success();
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn export_store(data_dir: &Path, out: &Path) -> String {
+    egregore_bin()
+        .arg("export")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--out")
+        .arg(out)
+        .assert()
+        .success();
+    fs::read_to_string(out).expect("export should be readable")
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn inspect_store_stdout(data_dir: &Path) -> String {
+    let output = egregore_bin()
+        .arg("inspect")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output).expect("inspect output should be UTF-8")
+}
+
+/// Attribution must survive scan → ingest → export unchanged.
+///
+/// The store adapter maps node fields to properties BY HAND, so nothing is
+/// automatic here: a field written but never read back would round-trip to
+/// `None` and vanish from every store-backed answer.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn crate_attribution_survives_the_store_round_trip() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_workspace_fixture(&repo);
+
+    let graph_path = temp.path().join("graph.jsonl");
+    fs::write(&graph_path, scan_jsonl(&repo)).expect("graph written");
+    let data_dir = temp.path().join("store");
+    ingest_embedded(&graph_path, &data_dir);
+
+    let exported = export_store(&data_dir, &temp.path().join("export.jsonl"));
+    let exported_attribution = attribution_by_path(&parse_jsonl(&exported));
+    let scanned_attribution = attribution_by_path(&parse_jsonl(
+        &fs::read_to_string(&graph_path).expect("graph readable"),
+    ));
+
+    assert!(!scanned_attribution.is_empty(), "anti-vacuity");
+    assert_eq!(
+        exported_attribution, scanned_attribution,
+        "attribution must survive the store round-trip byte-for-byte"
+    );
+    // Every closed reason variant round-trips, not just the attributed shape.
+    assert!(
+        exported.contains("virtual_manifest_only"),
+        "an unattributed reason must survive the round-trip"
+    );
+}
+
+/// Re-ingesting the SAME graph must be idempotent.
+///
+/// `compare_node_record` is full structural equality of the record reconstructed
+/// from the store, so a property written but not read back makes every record
+/// compare unequal and mints a NEW physical version on every re-ingest —
+/// forever, silently, with no validator catching it.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn reingest_of_attributed_graph_is_idempotent() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_workspace_fixture(&repo);
+
+    let graph_path = temp.path().join("graph.jsonl");
+    let jsonl = scan_jsonl(&repo);
+    assert!(
+        jsonl.contains("crate_attribution"),
+        "anti-vacuity: the graph must carry attribution"
+    );
+    fs::write(&graph_path, &jsonl).expect("graph written");
+    let data_dir = temp.path().join("store");
+
+    ingest_embedded(&graph_path, &data_dir);
+    let after_first = inspect_store_stdout(&data_dir);
+    let export_first = export_store(&data_dir, &temp.path().join("export1.jsonl"));
+
+    ingest_embedded(&graph_path, &data_dir);
+    let after_second = inspect_store_stdout(&data_dir);
+    let export_second = export_store(&data_dir, &temp.path().join("export2.jsonl"));
+
+    assert_eq!(
+        after_first, after_second,
+        "a re-ingest of an unchanged graph must write no new physical versions"
+    );
+    assert_eq!(
+        export_first, export_second,
+        "exports must be byte-identical across a re-ingest"
+    );
+}
+
+/// Every carrying node kind that the fixture produces round-trips through the
+/// store — not just `Symbol`.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn every_carrying_node_kind_roundtrips_through_the_store() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_workspace_fixture(&repo);
+    // Add shapes that mint the other carrying kinds.
+    write_fixture(
+        &repo,
+        &[(
+            "crates/alpha/src/extra.rs",
+            "// TODO: debt marker here\nuse std::fmt::Debug;\npub fn risky(v: Option<u32>) -> u32 { v.unwrap() }\npub unsafe fn danger() {}\n",
+        )],
+    );
+
+    let graph_path = temp.path().join("graph.jsonl");
+    let jsonl = scan_jsonl(&repo);
+    fs::write(&graph_path, &jsonl).expect("graph written");
+    let data_dir = temp.path().join("store");
+    ingest_embedded(&graph_path, &data_dir);
+    let exported = export_store(&data_dir, &temp.path().join("export.jsonl"));
+
+    let kinds_in_scan = attributed_kinds(&parse_jsonl(&jsonl));
+    let kinds_in_export = attributed_kinds(&parse_jsonl(&exported));
+    assert!(
+        kinds_in_scan.len() >= 4,
+        "anti-vacuity: the fixture must exercise several carrying kinds, got {kinds_in_scan:?}"
+    );
+    assert_eq!(
+        kinds_in_scan, kinds_in_export,
+        "every carrying node kind must keep its attribution through the store"
+    );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn attributed_kinds(records: &[Value]) -> BTreeSet<String> {
+    records
+        .iter()
+        .filter(|r| r["record_type"] == "node" && r.get("crate_attribution").is_some())
+        .filter_map(|r| r["kind"].as_str().map(str::to_owned))
+        .collect()
+}
+
+// ── eg query symbol/symbols --package ────────────────────────────────────────
+
+fn write_graph(root: &Path) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_workspace_fixture(&repo);
+    let graph = root.join("graph.jsonl");
+    fs::write(&graph, scan_jsonl(&repo)).expect("graph written");
+    graph
+}
+
+struct CliRun {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_query(args: &[&str]) -> CliRun {
+    let output = assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(args)
+        .output()
+        .expect("egregore should execute");
+    CliRun {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+fn rows(stdout: &str) -> Vec<Value> {
+    stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("row should be JSON"))
+        .collect()
+}
+
+/// AC2: two symbols with the same qualified name in different member crates are
+/// distinguishable by their crate attribution in query output.
+#[test]
+fn same_qualified_name_in_two_crates_is_distinguishable_by_package() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let unscoped = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        graph.to_str().unwrap(),
+    ]);
+    assert_eq!(unscoped.code, 0, "stderr: {}", unscoped.stderr);
+    let unscoped_rows = rows(&unscoped.stdout);
+    assert_eq!(
+        unscoped_rows.len(),
+        2,
+        "both crates define `handle`: {}",
+        unscoped.stdout
+    );
+    let packages: BTreeSet<&str> = unscoped_rows
+        .iter()
+        .filter_map(|r| r["crate_attribution"]["package_name"].as_str())
+        .collect();
+    assert_eq!(
+        packages,
+        BTreeSet::from(["alpha", "beta"]),
+        "each row must name its own owning package"
+    );
+    let ids: BTreeSet<&str> = unscoped_rows
+        .iter()
+        .filter_map(|r| r["record_id"].as_str())
+        .collect();
+    assert_eq!(ids.len(), 2, "the two symbols are distinct records");
+
+    // Scoping to one package returns exactly one of them.
+    let scoped = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "alpha",
+    ]);
+    assert_eq!(scoped.code, 0, "stderr: {}", scoped.stderr);
+    let scoped_rows = rows(&scoped.stdout);
+    assert_eq!(scoped_rows.len(), 1);
+    assert_eq!(scoped_rows[0]["crate_attribution"]["package_name"], "alpha");
+}
+
+/// AC3: `--package` precision AND recall are both 100% against the crate's own
+/// file set — asserted as SET EQUALITY, plus empty intersection with every
+/// sibling crate.
+#[test]
+fn package_scope_precision_and_recall_are_both_100() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let scoped = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "alpha",
+    ]);
+    assert_eq!(scoped.code, 0, "stderr: {}", scoped.stderr);
+    let observed: BTreeSet<String> = rows(&scoped.stdout)
+        .iter()
+        .filter_map(|r| r["repo_relative_path"].as_str().map(str::to_owned))
+        .collect();
+
+    // The member crate's file set, derived from the documented manifest walk:
+    // every symbol-bearing file under `crates/alpha/` EXCEPT those under the
+    // nested `vendor/inner` package, which is its own crate.
+    //
+    // `scripts/tool.py` is included deliberately, pinning documented limit L6:
+    // attribution is directory containment, so a non-Rust source inside a crate
+    // directory IS attributed to that Cargo package even though Cargo never
+    // compiles it. A carve-out would make the rule non-uniform and more
+    // surprising than the uniform rule plus a stated limit.
+    let expected = BTreeSet::from([
+        "crates/alpha/src/lib.rs".to_owned(),
+        "crates/alpha/scripts/tool.py".to_owned(),
+    ]);
+    assert_eq!(
+        observed, expected,
+        "package scope must return exactly the crate's own symbol-bearing files"
+    );
+
+    // Zero facts from any sibling crate.
+    for sibling in ["crates/alphabet/", "crates/beta/", "crates/alpha/vendor/"] {
+        assert!(
+            !observed.iter().any(|p| p.starts_with(sibling)),
+            "sibling leakage from {sibling}: {observed:?}"
+        );
+    }
+    // Recall check the other way: every `alpha` symbol in the graph is returned.
+    let all = scan_fixture(&temp.path().join("repo"));
+    let expected_ids: BTreeSet<String> = all
+        .iter()
+        .filter(|r| r["kind"] == "Symbol" && package_of(r) == Some("alpha"))
+        .filter_map(|r| r["id"].as_str().map(str::to_owned))
+        .collect();
+    let observed_ids: BTreeSet<String> = rows(&scoped.stdout)
+        .iter()
+        .filter_map(|r| r["record_id"].as_str().map(str::to_owned))
+        .collect();
+    assert!(!expected_ids.is_empty(), "anti-vacuity");
+    assert_eq!(observed_ids, expected_ids, "recall must be 100%");
+}
+
+/// The nested crate is its own package, not part of its parent.
+#[test]
+fn package_scope_excludes_nested_child_package() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let inner = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "inner",
+    ]);
+    assert_eq!(inner.code, 0, "stderr: {}", inner.stderr);
+    let paths: BTreeSet<String> = rows(&inner.stdout)
+        .iter()
+        .filter_map(|r| r["repo_relative_path"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        paths,
+        BTreeSet::from(["crates/alpha/vendor/inner/src/lib.rs".to_owned()])
+    );
+}
+
+/// An unknown selector is a TYPO, reported as such with the known packages —
+/// never a silent empty answer.
+#[test]
+fn unknown_package_selector_exits_1_with_sorted_known_packages() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "no-such-pkg",
+    ]);
+    assert_eq!(run.code, 1, "stdout: {} stderr: {}", run.stdout, run.stderr);
+    let diagnostic: Value =
+        serde_json::from_str(run.stderr.trim()).expect("diagnostic should be one JSON line");
+    assert_eq!(diagnostic["code"], "unknown_package_selector");
+    assert_eq!(diagnostic["selector"], "no-such-pkg");
+    let known: Vec<&str> = diagnostic["known_packages"]
+        .as_array()
+        .expect("known_packages array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        known,
+        vec!["alpha", "alphabet", "beta", "inner"],
+        "known packages must be sorted and deduplicated"
+    );
+}
+
+/// A KNOWN package with zero matching symbols is exit 2 — distinguishable from
+/// the typo above.
+#[test]
+fn known_package_with_zero_matching_symbols_exits_2() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "only_in_alpha",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "beta",
+    ]);
+    assert_eq!(
+        run.code, 2,
+        "a known package with no matching symbol is a no-match, not a bad selector; stderr: {}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("unknown_package_selector"),
+        "must not be reported as a typo: {}",
+        run.stderr
+    );
+}
+
+/// Selector matching is exact: no case folding, no `-`/`_` normalization.
+#[test]
+fn package_selector_matches_exact_name_only() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"foo-bar\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn thing() -> u32 { 1 }\n"),
+        ],
+    );
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, scan_jsonl(&repo)).expect("graph written");
+
+    for wrong in ["foo_bar", "FOO-BAR", "foo"] {
+        let run = run_query(&[
+            "query",
+            "symbols",
+            "*",
+            "--graph",
+            graph.to_str().unwrap(),
+            "--package",
+            wrong,
+        ]);
+        assert_eq!(
+            run.code, 1,
+            "`{wrong}` must not fuzzy-match `foo-bar`; stderr: {}",
+            run.stderr
+        );
+        assert!(run.stderr.contains("unknown_package_selector"));
+    }
+    let right = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "foo-bar",
+    ]);
+    assert_eq!(right.code, 0, "stderr: {}", right.stderr);
+}
+
+/// There is no magic selector value: a package literally named `unattributed`
+/// resolves to itself, and never to the unattributed records.
+#[test]
+fn package_named_unattributed_resolves_to_itself() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_fixture(
+        &repo,
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/u\"]\n"),
+            (
+                "crates/u/Cargo.toml",
+                "[package]\nname = \"unattributed\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/u/src/lib.rs", "pub fn owned() -> u32 { 1 }\n"),
+            ("stray.rs", "pub fn orphan() -> u32 { 2 }\n"),
+        ],
+    );
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, scan_jsonl(&repo)).expect("graph written");
+
+    let run = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "unattributed",
+    ]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    let paths: BTreeSet<String> = rows(&run.stdout)
+        .iter()
+        .filter_map(|r| r["repo_relative_path"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        paths,
+        BTreeSet::from(["crates/u/src/lib.rs".to_owned()]),
+        "`unattributed` is a package name, not a magic value"
+    );
+}
+
+/// One package name owned by two repositories in a shared store is AMBIGUOUS —
+/// silently merging them would make the precision claim false.
+#[test]
+fn package_selector_ambiguous_across_repositories_exits_1() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut combined = String::new();
+    for repo_id in ["repo-a", "repo-b"] {
+        let repo = temp.path().join(repo_id);
+        fs::create_dir_all(&repo).expect("repo dir");
+        write_fixture(
+            &repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"shared\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    &format!(
+                        "pub fn from_{}() -> u32 {{ 1 }}\n",
+                        repo_id.replace('-', "_")
+                    ),
+                ),
+            ],
+        );
+        let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some(repo_id))
+            .expect("scan")
+            .to_jsonl()
+            .expect("serialize");
+        combined.push_str(&jsonl);
+        combined.push('\n');
+    }
+    let graph = temp.path().join("combined.jsonl");
+    fs::write(&graph, &combined).expect("graph written");
+
+    let run = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "shared",
+    ]);
+    assert_eq!(
+        run.code, 1,
+        "an ambiguous package must not silently merge repositories; stdout: {}",
+        run.stdout
+    );
+    let diagnostic: Value =
+        serde_json::from_str(run.stderr.trim()).expect("diagnostic should be one JSON line");
+    assert_eq!(diagnostic["code"], "ambiguous_package_selector");
+    assert_eq!(
+        diagnostic["candidates"]
+            .as_array()
+            .expect("candidates")
+            .len(),
+        2
+    );
+
+    // `--repo` disambiguates it.
+    let scoped = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "shared",
+        "--repo",
+        "repo-a",
+    ]);
+    assert_eq!(scoped.code, 0, "stderr: {}", scoped.stderr);
+    assert_eq!(rows(&scoped.stdout).len(), 1);
+}
+
+/// `--package` and `--repo` compose as an intersection.
+#[test]
+fn package_and_repo_scope_compose_as_intersection() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_workspace_fixture(&repo);
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, scan_jsonl(&repo)).expect("graph written");
+
+    let both = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "alpha",
+        "--repo",
+        REPO_ID,
+    ]);
+    assert_eq!(both.code, 0, "stderr: {}", both.stderr);
+    let with_repo: BTreeSet<String> = rows(&both.stdout)
+        .iter()
+        .filter_map(|r| r["record_id"].as_str().map(str::to_owned))
+        .collect();
+
+    let package_only = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "alpha",
+    ]);
+    let without_repo: BTreeSet<String> = rows(&package_only.stdout)
+        .iter()
+        .filter_map(|r| r["record_id"].as_str().map(str::to_owned))
+        .collect();
+    assert!(!with_repo.is_empty(), "anti-vacuity");
+    assert_eq!(with_repo, without_repo, "single-repo graph: same set");
+}
+
+/// AC6: the attribution appears in `--format text` as well as `--format json`,
+/// and the two agree.
+#[test]
+fn attribution_present_in_json_and_text_output() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let json = run_query(&[
+        "query",
+        "symbol",
+        "only_in_alpha",
+        "--graph",
+        graph.to_str().unwrap(),
+    ]);
+    assert_eq!(json.code, 0, "stderr: {}", json.stderr);
+    let json_rows = rows(&json.stdout);
+    assert_eq!(json_rows[0]["crate_attribution"]["package_name"], "alpha");
+    assert_eq!(
+        json_rows[0]["crate_attribution"]["manifest_repo_relative_path"],
+        "crates/alpha/Cargo.toml"
+    );
+
+    let text = run_query(&[
+        "query",
+        "symbol",
+        "only_in_alpha",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--format",
+        "text",
+    ]);
+    assert_eq!(text.code, 0, "stderr: {}", text.stderr);
+    assert!(
+        text.stdout
+            .contains("package: alpha (crates/alpha/Cargo.toml)"),
+        "text output must carry the same package and manifest: {}",
+        text.stdout
+    );
+}
+
+/// An unattributed row renders its reason, in both formats.
+#[test]
+fn unattributed_row_renders_its_reason_in_both_formats() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let json = run_query(&[
+        "query",
+        "symbol",
+        "generate",
+        "--graph",
+        graph.to_str().unwrap(),
+    ]);
+    assert_eq!(json.code, 0, "stderr: {}", json.stderr);
+    let row = &rows(&json.stdout)[0];
+    assert_eq!(row["crate_attribution"]["status"], "unattributed");
+    assert_eq!(
+        row["crate_attribution"]["unattributed_reason"],
+        "virtual_manifest_only"
+    );
+    assert!(
+        row["crate_attribution"].get("package_name").is_none(),
+        "an unattributed row must not carry a package name"
+    );
+
+    let text = run_query(&[
+        "query",
+        "symbol",
+        "generate",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--format",
+        "text",
+    ]);
+    assert!(
+        text.stdout
+            .contains("package: (unattributed: virtual_manifest_only)"),
+        "text output must state the reason: {}",
+        text.stdout
+    );
+}
+
+/// The epistemic caveat rides on every `--package`-scoped row.
+#[test]
+fn package_scoped_row_carries_containment_disclaimer() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let scoped = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "alpha",
+    ]);
+    for row in rows(&scoped.stdout) {
+        assert_eq!(
+            row["crate_attribution_disclaimer"],
+            "attribution is nearest-enclosing-manifest directory containment, never proof the file is compiled into that package"
+        );
+    }
+
+    // Unscoped rows carry no disclaimer: the manifest handle is self-evidencing.
+    let unscoped = run_query(&["query", "symbols", "*", "--graph", graph.to_str().unwrap()]);
+    for row in rows(&unscoped.stdout) {
+        assert!(
+            row.get("crate_attribution_disclaimer").is_none(),
+            "the disclaimer rides only on a scoped assertion"
+        );
+    }
+}
+
+/// Scoping never reorders: the scoped result is an order-preserving subsequence
+/// of the unscoped result.
+#[test]
+fn package_scope_preserves_unscoped_row_ordering() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let unscoped = run_query(&["query", "symbols", "*", "--graph", graph.to_str().unwrap()]);
+    let scoped = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "alpha",
+    ]);
+    let unscoped_ids: Vec<String> = rows(&unscoped.stdout)
+        .iter()
+        .filter_map(|r| r["record_id"].as_str().map(str::to_owned))
+        .collect();
+    let scoped_ids: Vec<String> = rows(&scoped.stdout)
+        .iter()
+        .filter_map(|r| r["record_id"].as_str().map(str::to_owned))
+        .collect();
+    assert!(!scoped_ids.is_empty(), "anti-vacuity");
+
+    let mut remaining = unscoped_ids.iter();
+    for id in &scoped_ids {
+        assert!(
+            remaining.any(|candidate| candidate == id),
+            "scoped rows must appear in unscoped order: {scoped_ids:?} vs {unscoped_ids:?}"
+        );
+    }
+}
+
+/// Five consecutive scoped queries produce byte-identical stdout, in both
+/// formats.
+#[test]
+fn query_symbol_package_scope_stdout_identical_across_five_runs() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    for format in ["json", "text"] {
+        let args = [
+            "query",
+            "symbols",
+            "*",
+            "--graph",
+            graph.to_str().unwrap(),
+            "--package",
+            "alpha",
+            "--format",
+            format,
+        ];
+        let baseline = run_query(&args);
+        assert_eq!(baseline.code, 0, "stderr: {}", baseline.stderr);
+        assert!(!baseline.stdout.trim().is_empty(), "anti-vacuity");
+        for run in 1..5 {
+            let repeat = run_query(&args);
+            assert_eq!(
+                repeat.stdout, baseline.stdout,
+                "--format {format} diverged on run {run}"
+            );
+        }
+    }
+}
+
+/// The sidecar index (#447) is a pure access-path optimization: a
+/// `--package`-scoped answer must be byte-identical with and without one, on
+/// both the success and the unknown-selector paths.
+#[test]
+fn package_scope_answers_identically_with_and_without_sidecar_index() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+    let graph_str = graph.to_str().unwrap();
+
+    let hit_cold = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        graph_str,
+        "--package",
+        "alpha",
+    ]);
+    let miss_cold = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        graph_str,
+        "--package",
+        "nope",
+    ]);
+
+    assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .args(["index", graph_str])
+        .assert()
+        .success();
+    assert!(
+        graph.with_extension("jsonl.idx").exists()
+            || Path::new(&format!("{graph_str}.idx")).exists(),
+        "the sidecar index must have been built"
+    );
+
+    let hit_indexed = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        graph_str,
+        "--package",
+        "alpha",
+    ]);
+    let miss_indexed = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        graph_str,
+        "--package",
+        "nope",
+    ]);
+
+    assert_eq!(
+        hit_cold.stdout, hit_indexed.stdout,
+        "indexed answer diverged"
+    );
+    assert_eq!(hit_cold.code, hit_indexed.code);
+    assert_eq!(
+        miss_cold.stderr, miss_indexed.stderr,
+        "the unknown-selector diagnostic must list the same known packages with and without an index"
+    );
+    assert_eq!(miss_cold.code, miss_indexed.code);
+}
+
+/// The daemon lane does not carry the field, so the flag is REFUSED there
+/// rather than silently ignored while returning unscoped rows.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn package_scope_with_daemon_exits_1_unsupported_combination() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("store");
+    fs::create_dir_all(&data_dir).expect("store dir");
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--daemon",
+        "--package",
+        "alpha",
+    ]);
+    assert_eq!(run.code, 1, "stdout: {} stderr: {}", run.stdout, run.stderr);
+    assert!(
+        run.stderr.contains("unsupported_combination"),
+        "the flag must be refused, never silently ignored: {}",
+        run.stderr
+    );
+}
+
+/// A legacy record (produced before issue #117) omits the key entirely — never
+/// `null`, and never a rendered "unattributed" line that would fabricate a
+/// negative fact.
+#[test]
+fn legacy_record_omits_the_key_and_prints_no_package_line() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+    // Strip the field from every record, simulating a pre-#117 producer.
+    let stripped: String = fs::read_to_string(&graph)
+        .expect("graph readable")
+        .lines()
+        .map(|line| {
+            let mut record: Value = serde_json::from_str(line).expect("JSON");
+            if let Some(object) = record.as_object_mut() {
+                object.remove("crate_attribution");
+            }
+            serde_json::to_string(&record).expect("serialize")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let legacy = temp.path().join("legacy.jsonl");
+    fs::write(&legacy, stripped).expect("legacy graph written");
+
+    let json = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        legacy.to_str().unwrap(),
+    ]);
+    assert_eq!(json.code, 0, "stderr: {}", json.stderr);
+    for row in rows(&json.stdout) {
+        assert!(
+            row.get("crate_attribution").is_none(),
+            "a legacy row must OMIT the key, never emit null: {row}"
+        );
+    }
+
+    let text = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        legacy.to_str().unwrap(),
+        "--format",
+        "text",
+    ]);
+    assert!(
+        !text.stdout.contains("package:"),
+        "absent attribution must print nothing — printing `unattributed` would fabricate a negative fact: {}",
+        text.stdout
+    );
+}
+
+/// No manifest body text reaches any query surface.
+#[test]
+fn no_manifest_body_text_in_query_output() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+    for args in [
+        vec!["query", "symbols", "*", "--graph", graph.to_str().unwrap()],
+        vec![
+            "query",
+            "symbols",
+            "*",
+            "--graph",
+            graph.to_str().unwrap(),
+            "--package",
+            "alpha",
+        ],
+        vec![
+            "query",
+            "symbols",
+            "*",
+            "--graph",
+            graph.to_str().unwrap(),
+            "--format",
+            "text",
+        ],
+    ] {
+        let run = run_query(&args);
+        assert!(
+            !run.stdout.contains(SENTINEL) && !run.stderr.contains(SENTINEL),
+            "manifest body text leaked into `{args:?}`"
+        );
+    }
+}

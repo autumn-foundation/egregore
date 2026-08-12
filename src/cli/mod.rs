@@ -1168,6 +1168,22 @@ pub(crate) enum QuerySubcommand {
         /// downgrade trust in the cited handle. Omitted → no freshness field.
         #[arg(long)]
         repo_path: Option<PathBuf>,
+        /// Scope results to one owning Cargo package by NAME (issue #117).
+        ///
+        /// The name is matched EXACTLY against the package attribution stamped
+        /// on each record at scan time (resolved from the nearest enclosing
+        /// `Cargo.toml`) — no case folding and no `-`/`_` normalization. A
+        /// selector no package in the corpus carries exits 1 with a
+        /// machine-readable `unknown_package_selector` naming the known
+        /// packages, so a typo is never a silent empty answer. A name owned by
+        /// more than one repository in a shared store exits 1
+        /// (`ambiguous_package_selector`); add `--repo` to disambiguate.
+        ///
+        /// Spelled `--package`, not `--crate`: `eg query who-imports --crate`
+        /// already means something else (rewriting a leading `crate::` in the
+        /// query and in import paths).
+        #[arg(long)]
+        package: Option<String>,
         /// Corpus selector (issue #456): head-anchor the current-state view to
         /// each repository's stamped HEAD, so a symbol removed at HEAD does not
         /// appear. This is the DEFAULT when a source snapshot exists; the flag
@@ -1207,6 +1223,22 @@ pub(crate) enum QuerySubcommand {
         /// Restrict results to one repository (see `eg query symbol --help`).
         #[arg(long)]
         repo: Option<String>,
+        /// Scope results to one owning Cargo package by NAME (issue #117).
+        ///
+        /// The name is matched EXACTLY against the package attribution stamped
+        /// on each record at scan time (resolved from the nearest enclosing
+        /// `Cargo.toml`) — no case folding and no `-`/`_` normalization. A
+        /// selector no package in the corpus carries exits 1 with a
+        /// machine-readable `unknown_package_selector` naming the known
+        /// packages, so a typo is never a silent empty answer. A name owned by
+        /// more than one repository in a shared store exits 1
+        /// (`ambiguous_package_selector`); add `--repo` to disambiguate.
+        ///
+        /// Spelled `--package`, not `--crate`: `eg query who-imports --crate`
+        /// already means something else (rewriting a leading `crate::` in the
+        /// query and in import paths).
+        #[arg(long)]
+        package: Option<String>,
         /// Match case-insensitively (default is case-sensitive).
         #[arg(long)]
         case_insensitive: bool,
@@ -4534,6 +4566,18 @@ pub(crate) struct SymbolResult<'a> {
     extraction_completeness: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<Vec<DiagnosticRef<'a>>>,
+    /// Owning Cargo package (issue #117): the package NAME plus the
+    /// repo-relative path of the owning `Cargo.toml`, or the closed-set reason
+    /// no package owns this record.
+    ///
+    /// OMITTED entirely for a record produced before issue #117 — attribution
+    /// UNKNOWN, which is a different fact from a present value carrying
+    /// `status: unattributed` (computed, and provably ownerless).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crate_attribution: Option<&'a crate::ir::CrateAttribution>,
+    /// The containment caveat, stamped only when `--package` scoped the answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crate_attribution_disclaimer: Option<&'static str>,
     /// Corpus this row was read from (issue #427). Present only on the
     /// `query symbol` lane (stamped by [`stamp_symbol_corpus`]); absent on the
     /// shared `query symbols` partial-name lane so its row shape is unchanged.
@@ -5390,11 +5434,16 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             as_of,
             tx_as_of,
             repo,
+            package,
             repo_path,
             at_head,
             all_history,
             format,
         } => {
+            #[cfg(feature = "embedded-aletheiadb")]
+            if daemon {
+                reject_package_with_daemon(package.as_deref());
+            }
             if let Some(tx) = tx_as_of.as_deref() {
                 // --repo-path is used to stamp freshness onto results.  TxSymbolRow
                 // has no freshness field and the tx-as-of path never computes one,
@@ -5504,6 +5553,26 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             let selected = selected.as_deref();
+            // Package scope (issue #117). The sidecar-index fast path narrows
+            // the loaded slice to one symbol's closure, so a selector missing
+            // from that slice is not yet proof of a typo: fall back to ONE cold
+            // whole-file load to build the authoritative catalog. That cost is
+            // paid only on the error path, so a hit keeps the indexed fast path.
+            if let Some(selector_name) = package.as_deref() {
+                let catalog = PackageCatalog::build(&records, &index);
+                if catalog.contains(selector_name) {
+                    resolve_package_scope(&catalog, selector_name, repo.is_some());
+                } else {
+                    let cold = load_records_selected(
+                        graph.as_deref(),
+                        data_dir.as_deref(),
+                        &crate::graph_index::Selector::Whole,
+                    )?;
+                    let cold_index = query::RepositoryIndex::build(&cold);
+                    let cold_catalog = PackageCatalog::build(&cold, &cold_index);
+                    resolve_package_scope(&cold_catalog, selector_name, repo.is_some());
+                }
+            }
             let freshness_code = query_freshness_code_with_hint(
                 &records,
                 repo_path.as_deref(),
@@ -5535,6 +5604,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                                 format,
                                 &index,
                                 selected,
+                                package.as_deref(),
                                 freshness_code.as_ref(),
                                 corpus_mode,
                                 corpus_mode_source,
@@ -5548,6 +5618,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                                 format,
                                 &index,
                                 selected,
+                                package.as_deref(),
                                 freshness_code.as_ref(),
                             )
                         },
@@ -5561,6 +5632,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         format,
                         &index,
                         selected,
+                        package.as_deref(),
                         freshness_code.as_ref(),
                     )
                 },
@@ -5571,6 +5643,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             graph,
             data_dir,
             repo,
+            package,
             case_insensitive,
             format,
         } => {
@@ -5584,6 +5657,12 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
+            // This lane always loads the whole corpus, so its catalog is
+            // authoritative with no cold-reload fallback (issue #117).
+            if let Some(selector_name) = package.as_deref() {
+                let catalog = PackageCatalog::build(&records, &index);
+                resolve_package_scope(&catalog, selector_name, repo.is_some());
+            }
             query_symbols_matching(
                 &records,
                 &pattern,
@@ -5591,6 +5670,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 format,
                 &index,
                 selected.as_deref(),
+                package.as_deref(),
             )
         }
         QuerySubcommand::Who {
@@ -7337,6 +7417,116 @@ pub(crate) fn symbol_handle_selector(handle: &str) -> crate::graph_index::Select
         crate::graph_index::Selector::ById(handle.to_owned())
     } else {
         crate::graph_index::Selector::ByName(handle.to_owned())
+    }
+}
+
+/// The epistemic caveat every `--package`-scoped row carries (issue #117).
+///
+/// Stated verbatim and identically in `docs/cli/crate-attribution.md`, in
+/// `CLAUDE.md`, and on the `CrateAttribution` type. Scoping is the assertion
+/// that needs it: an unscoped row's `manifest_repo_relative_path` already names
+/// exactly what the claim rests on.
+pub(crate) const CRATE_ATTRIBUTION_DISCLAIMER: &str = "attribution is nearest-enclosing-manifest directory containment, never proof the file is compiled into that package";
+
+/// Which packages the loaded corpus carries, and which repositories own each
+/// (issue #117).
+///
+/// Built from the `crate_attribution` stamped on records at scan time — never
+/// from manifest files on disk, so a query answers over the corpus it was given.
+#[derive(Debug, Default)]
+pub(crate) struct PackageCatalog {
+    by_package: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl PackageCatalog {
+    /// Indexes every attributed record's package and its owning repository.
+    pub(crate) fn build(records: &[GraphRecord], index: &query::RepositoryIndex) -> Self {
+        let mut by_package: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for record in records {
+            let Some(attribution) = record.crate_attribution() else {
+                continue;
+            };
+            let Some(name) = attribution.package_name.as_deref() else {
+                continue;
+            };
+            let entry = by_package.entry(name.to_owned()).or_default();
+            if let Some(repository_id) = index.owner_of(record.id()) {
+                entry.insert(repository_id.to_owned());
+            }
+        }
+        Self { by_package }
+    }
+
+    /// `true` when at least one record in the corpus is attributed to `name`.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.by_package.contains_key(name)
+    }
+
+    /// Every package owning at least one attributed record, sorted.
+    pub(crate) fn names(&self) -> Vec<&str> {
+        self.by_package.keys().map(String::as_str).collect()
+    }
+
+    /// The repositories owning records attributed to `name`, sorted.
+    fn owners(&self, name: &str) -> Vec<&str> {
+        self.by_package
+            .get(name)
+            .map(|owners| owners.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Validates a `--package` selector against the corpus, exiting 1 on a bad one.
+///
+/// Two distinct failures, deliberately NOT collapsed into an empty answer:
+/// a selector no package carries is a TYPO (`unknown_package_selector`, listing
+/// the known packages), and a name carried by several repositories in a shared
+/// store is AMBIGUOUS (`ambiguous_package_selector`) — silently merging two
+/// repositories' facts would make the scoped answer's precision claim false.
+/// A known, unambiguous selector that simply matches no row falls through to the
+/// lane's ordinary exit-2 no-match, so a typo stays distinguishable from an
+/// honest empty result.
+pub(crate) fn resolve_package_scope(catalog: &PackageCatalog, selector: &str, repo_scoped: bool) {
+    if !catalog.contains(selector) {
+        let diag = serde_json::json!({
+            "code": "unknown_package_selector",
+            "selector": selector,
+            "known_packages": catalog.names(),
+        });
+        eprintln!("{diag}");
+        std::process::exit(1);
+    }
+    let owners = catalog.owners(selector);
+    if !repo_scoped && owners.len() > 1 {
+        let diag = serde_json::json!({
+            "code": "ambiguous_package_selector",
+            "selector": selector,
+            "candidates": owners,
+            "message": "package name is owned by several repositories; rerun with --repo <SELECTOR>",
+        });
+        eprintln!("{diag}");
+        std::process::exit(1);
+    }
+}
+
+/// Refuses `--package` on the daemon lane (issue #117).
+///
+/// The daemon's symbol projection is an independent hand-built JSON map that
+/// carries no crate attribution (it already omits `visibility`, `signature`, and
+/// `doc`), so a scoped daemon query could only return UNSCOPED rows. Refusing is
+/// the honest outcome; silently ignoring the flag would answer a different
+/// question than the one asked.
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) fn reject_package_with_daemon(package: Option<&str>) {
+    if package.is_some() {
+        let diag = serde_json::json!({
+            "code": "unsupported_combination",
+            "flags": ["--package", "--daemon"],
+            "message": "--package is a local-CLI scope; the daemon symbol projection carries no crate attribution",
+        });
+        eprintln!("{diag}");
+        std::process::exit(1);
     }
 }
 

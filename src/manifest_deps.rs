@@ -25,6 +25,7 @@ use std::{
 };
 
 use crate::{
+    crate_attribution::{ManifestPackageFact, ManifestParseOutcome},
     error::Result,
     fs::discover_cargo_manifests,
     ir::{DependencyDeclarationPayload, EdgeLabel, GraphRecord, NodeKind, stable_id},
@@ -249,6 +250,16 @@ pub struct ManifestDependencies {
     /// the declared name is empty/whitespace-only (Cargo-invalid, PR #314
     /// review) — such names never attribute declarations.
     pub package_name: Option<String>,
+    /// `true` when the manifest carries a `[package]` table at all, regardless
+    /// of whether its `name` is usable.
+    ///
+    /// Crate attribution (issue #117) needs this to separate two manifest forms
+    /// that `package_name: None` collapses: a VIRTUAL workspace root (no
+    /// `[package]` — declares no package, so the nearest-manifest walk passes
+    /// it) from a manifest declaring a package Egregore cannot name (the walk
+    /// STOPS there, fail-closed, rather than inherit an ancestor's name and
+    /// fabricate an attribution).
+    pub package_table_present: bool,
     /// Declarations in documented order: table order (`normal`, `dev`,
     /// `build`), then crate name, then the declared-as manifest key.
     pub declarations: Vec<DeclaredDependency>,
@@ -270,9 +281,12 @@ pub fn parse_manifest_dependencies(
     let doc = manifest_text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| error.to_string())?;
-    let package_name = doc
-        .get("package")
-        .and_then(toml_edit::Item::as_table_like)
+    let package_table = doc.get("package").and_then(toml_edit::Item::as_table_like);
+    // Presence of the table, independent of whether the name is usable
+    // (issue #117): it separates a virtual workspace root from a package
+    // Egregore cannot name.
+    let package_table_present = package_table.is_some();
+    let package_name = package_table
         .and_then(|package| package.get("name"))
         .and_then(|name| name.as_str())
         // A name Cargo rejects — empty, or violating the package-name
@@ -315,6 +329,7 @@ pub fn parse_manifest_dependencies(
     }
     Ok(ManifestDependencies {
         package_name,
+        package_table_present,
         declarations,
         uninterpretable,
     })
@@ -909,6 +924,64 @@ fn unloadable_workspace_diagnostic(repository_id: &str, manifest_path: &str) -> 
         *symbol_kind = Some(UNLOADABLE_WORKSPACE_DIAGNOSTIC_KIND.to_owned());
     }
     record
+}
+
+/// Harvests one owning-package fact per `Cargo.toml` in the working tree
+/// (issue #117).
+///
+/// The current-tree half of crate attribution: it discovers manifests through
+/// the SAME [`discover_cargo_manifests`] walk `eg scan` already uses (so the
+/// `target/`, `.git`, and nested-worktree exclusions apply identically), reads
+/// each one, and reduces it to a closed [`ManifestParseOutcome`]. The pure
+/// resolver in `crate::crate_attribution` then answers per-path from these
+/// facts alone.
+///
+/// Deliberately distinct from [`scan_dependency_records`]: that function mints
+/// a `File` node only for a manifest that DECLARES dependencies, so a
+/// dependency-free member crate produces no graph record at all — yet it still
+/// owns its directory tree. Attribution must see every manifest, not only the
+/// dependency-declaring ones.
+///
+/// Reading, not building: no `cargo` invocation, no network, no lockfile.
+///
+/// # Errors
+///
+/// Returns an error only when manifest discovery itself fails. An individual
+/// manifest that cannot be read or parsed becomes a fact carrying
+/// [`ManifestParseOutcome::Unreadable`] / [`ManifestParseOutcome::Unparseable`],
+/// never an aborted scan.
+pub fn scan_manifest_package_facts(repo_root: &Path) -> Result<Vec<ManifestPackageFact>> {
+    let mut facts = Vec::new();
+    for manifest in discover_cargo_manifests(repo_root)? {
+        let outcome = std::fs::read_to_string(&manifest.path)
+            .map_or(ManifestParseOutcome::Unreadable, |text| {
+                manifest_package_outcome(&text)
+            });
+        facts.push(ManifestPackageFact::new(
+            manifest.repo_relative_path.clone(),
+            outcome,
+        ));
+    }
+    Ok(facts)
+}
+
+/// Reduces one manifest's TEXT to its closed owning-package outcome.
+///
+/// The single shared reduction: the working-tree harvest above and the
+/// history-replay harvest (which reads manifest bytes from Git objects) both
+/// call it, so the two paths cannot disagree about what a manifest declares.
+#[must_use]
+pub fn manifest_package_outcome(manifest_text: &str) -> ManifestParseOutcome {
+    match parse_manifest_dependencies(manifest_text) {
+        Ok(parsed) => match (parsed.package_table_present, parsed.package_name) {
+            (true, Some(name)) => ManifestParseOutcome::Package { name },
+            (true, None) => ManifestParseOutcome::UnnamedPackage,
+            (false, _) => ManifestParseOutcome::Virtual,
+        },
+        // The TOML error message is deliberately DROPPED, not carried: it can
+        // echo manifest body text, and no output surface may leak it.
+        Err(_) => ManifestParseOutcome::Unparseable,
+    }
 }
 
 /// Scans every `Cargo.toml` under `repo_root` into dependency records.
@@ -2196,6 +2269,40 @@ fn member_glob_match(pattern: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Crate attribution (issue #117) must tell a VIRTUAL workspace manifest
+    /// (no `[package]` table — declares no package, so the ancestor walk passes
+    /// it) apart from a manifest declaring a package whose name is unusable
+    /// (the walk STOPS, fail-closed, rather than inherit an ancestor's name).
+    /// `package_name` alone collapses both into `None`, so the parse must
+    /// report the `[package]` table's PRESENCE separately.
+    #[test]
+    fn manifest_dependencies_reports_package_table_presence() {
+        let named = parse_manifest_dependencies("[package]\nname = \"x\"\n").expect("parses");
+        assert!(named.package_table_present);
+        assert_eq!(named.package_name.as_deref(), Some("x"));
+
+        let unusable_name =
+            parse_manifest_dependencies("[package]\nname = \"bad name\"\n").expect("parses");
+        assert!(
+            unusable_name.package_table_present,
+            "a `[package]` table with an unusable name still declares a package"
+        );
+        assert_eq!(unusable_name.package_name, None);
+
+        let no_name =
+            parse_manifest_dependencies("[package]\nversion = \"0.1.0\"\n").expect("parses");
+        assert!(no_name.package_table_present);
+        assert_eq!(no_name.package_name, None);
+
+        let virtual_root =
+            parse_manifest_dependencies("[workspace]\nmembers = []\n").expect("parses");
+        assert!(
+            !virtual_root.package_table_present,
+            "a virtual workspace root declares no package"
+        );
+        assert_eq!(virtual_root.package_name, None);
+    }
 
     #[test]
     fn string_and_inline_table_requirements_are_captured_as_written() {

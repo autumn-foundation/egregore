@@ -366,6 +366,14 @@ struct SymbolAnswerRow<'a> {
     extraction_completeness: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<Vec<DiagnosticRef<'a>>>,
+    /// Owning-Cargo-package attribution carried by issue #117 code-graph
+    /// records. Mirrors the real `eg query symbol` row so the measured answer
+    /// cost is the cost of the answer a caller actually receives — a gate that
+    /// measured a leaner shape than the CLI emits would overstate the savings.
+    /// Rides the declaration surface: `eg query file` omits it (every row of a
+    /// file listing shares the file's one owning package), so the gate does too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crate_attribution: Option<&'a crate::ir::CrateAttribution>,
     /// Corpus-disclosure fields (issue #427), present on `eg query symbol` rows
     /// (which carry the declaration surface) and absent on `eg query file`
     /// listing rows — mirroring the real CLI output the gate measures.
@@ -551,6 +559,7 @@ where
             visibility,
             signature,
             doc,
+            crate_attribution,
             temporal,
             ..
         } = record
@@ -585,6 +594,9 @@ where
                 } else {
                     None
                 },
+                crate_attribution: crate_attribution
+                    .as_ref()
+                    .filter(|_| include_declaration_surface),
                 corpus_mode: symbol_corpus.as_ref().map(|c| c.0),
                 corpus_mode_source: symbol_corpus.as_ref().map(|c| c.1),
                 corpus_disclaimer: symbol_corpus.as_ref().map(|c| c.2.clone()),

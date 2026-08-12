@@ -72,6 +72,7 @@ pub(crate) fn query_symbol_all(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    package: Option<&str>,
     freshness_code: Option<&(String, &'static str)>,
     corpus_mode: query::CorpusMode,
     corpus_mode_source: query::CorpusModeSource,
@@ -149,6 +150,7 @@ pub(crate) fn query_symbol_all(
     if let Some(repo) = selected_repo {
         results.retain(|r| r.repository_id == Some(repo));
     }
+    retain_package_scope(&mut results, package);
 
     if results.is_empty() {
         eprintln!("error: no match found for symbol `{name}`");
@@ -166,6 +168,29 @@ pub(crate) fn query_symbol_all(
         print_result(result, format)?;
     }
     Ok(())
+}
+
+/// Narrows `results` to one owning Cargo package and stamps the containment
+/// caveat on the surviving rows (issue #117).
+///
+/// Runs AFTER row projection and BEFORE the empty check, and never touches the
+/// sort keys — so a scoped answer is an order-preserving subsequence of the
+/// unscoped one. The selector was already validated against the corpus
+/// catalog by `resolve_package_scope`, so reaching zero rows here means the
+/// package genuinely owns no matching symbol (the lane's ordinary exit-2
+/// no-match), never a typo.
+pub(crate) fn retain_package_scope(results: &mut Vec<SymbolResult<'_>>, package: Option<&str>) {
+    let Some(selector) = package else {
+        return;
+    };
+    results.retain(|row| {
+        row.crate_attribution
+            .and_then(|attribution| attribution.package_name.as_deref())
+            == Some(selector)
+    });
+    for row in results {
+        row.crate_attribution_disclaimer = Some(crate::cli::CRATE_ATTRIBUTION_DISCLAIMER);
+    }
 }
 
 pub(crate) fn symbol_result<'a>(
@@ -207,6 +232,7 @@ pub(crate) fn symbol_row<'a>(
         visibility,
         signature,
         doc,
+        crate_attribution,
         temporal,
         ..
     } = record
@@ -230,6 +256,8 @@ pub(crate) fn symbol_row<'a>(
         signature: signature.as_deref(),
         doc: doc.as_deref(),
         git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+        crate_attribution: crate_attribution.as_ref(),
+        crate_attribution_disclaimer: None,
         repository_id,
         repository: repository_id.and_then(|repo| index.display_of(repo)),
         freshness: None,
@@ -260,6 +288,7 @@ pub(crate) fn query_symbols_matching(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    package: Option<&str>,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
     let mut results: Vec<SymbolResult<'_>> = records
@@ -289,6 +318,7 @@ pub(crate) fn query_symbols_matching(
     if let Some(repo) = selected_repo {
         results.retain(|r| r.repository_id == Some(repo));
     }
+    retain_package_scope(&mut results, package);
 
     if results.is_empty() {
         eprintln!("error: no match found for pattern `{pattern}`");
@@ -312,6 +342,7 @@ pub(crate) fn query_symbols_matching(
 // query symbol --at <commit>
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn query_symbol_at(
     records: &[GraphRecord],
     name: &str,
@@ -319,6 +350,7 @@ pub(crate) fn query_symbol_at(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    package: Option<&str>,
     freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     // The ambiguity check is repository-scoped: a prefix that collides only
@@ -360,7 +392,13 @@ pub(crate) fn query_symbol_at(
         }
         Some(record) => {
             let deleted = current_deleted_ids(records);
-            if let Some(mut result) = symbol_result(record, name, index, records, &deleted) {
+            if let Some(result) = symbol_result(record, name, index, records, &deleted) {
+                let mut scoped = vec![result];
+                retain_package_scope(&mut scoped, package);
+                let Some(mut result) = scoped.pop() else {
+                    eprintln!("error: no match found for symbol `{name}` at commit `{prefix}`");
+                    std::process::exit(2);
+                };
                 stamp_freshness(std::slice::from_mut(&mut result), freshness_code);
                 // `--at` pins a single commit: the corpus is commit-pinned,
                 // chosen by the selector (issue #427).
@@ -398,6 +436,24 @@ impl PrintText for SymbolResult<'_> {
         }
         if let Some(doc) = self.doc {
             let _ = write!(text, "\n  doc: {doc}");
+        }
+        // Owning Cargo package (issue #117). An ABSENT field prints NOTHING:
+        // the record predates issue #117, so its attribution is unknown, and
+        // rendering "unattributed" would fabricate a negative fact.
+        if let Some(attribution) = self.crate_attribution {
+            match (
+                attribution.package_name.as_deref(),
+                attribution.manifest_repo_relative_path.as_deref(),
+                attribution.unattributed_reason,
+            ) {
+                (Some(name), Some(manifest), _) => {
+                    let _ = write!(text, "\n  package: {name} ({manifest})");
+                }
+                (_, _, Some(reason)) => {
+                    let _ = write!(text, "\n  package: (unattributed: {})", reason.as_str());
+                }
+                _ => {}
+            }
         }
         text
     }

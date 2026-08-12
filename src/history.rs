@@ -8,6 +8,7 @@ use std::{
 
 use crate::{
     PROCESS_STARTED_AT, code_graph_producer,
+    crate_attribution::{CrateAttributionIndex, ManifestPackageFact, ManifestParseOutcome},
     error::{CodegraphError, Result},
     fs::SourceFile,
     identity,
@@ -92,6 +93,10 @@ fn scan_repository_history_inner(
             .with_source_snapshot(snapshot),
     );
 
+    // Manifest-parse memo keyed by blob OID (issue #117): a `Cargo.toml` is
+    // typically unchanged across hundreds of commits, so each distinct manifest
+    // blob is read and parsed exactly once for the whole replay.
+    let mut manifest_outcome_memo: BTreeMap<String, ManifestParseOutcome> = BTreeMap::new();
     for commit in list_commits(repo_root)? {
         let commit_record = commit_record(&repository_id, &commit);
         let commit_id = commit_record.id().to_owned();
@@ -145,12 +150,22 @@ fn scan_repository_history_inner(
         }
 
         let mut facts_by_file = BTreeMap::new();
+        // One `ls-tree` pass yields both this commit's indexed sources and its
+        // Cargo manifests (issue #117), so adding attribution costs no extra
+        // Git invocation per commit.
+        let commit_tree = list_commit_tree(repo_root, &commit.sha)?;
+        let attribution = commit_crate_attribution_index(
+            repo_root,
+            &commit.sha,
+            &commit_tree.manifests,
+            &mut manifest_outcome_memo,
+        );
         // Records pushed from here on belong to this commit's replayed tree;
         // the same-file resolution labeling pass (issue #134) must only see
         // this commit's slice because the same stable edge ID can recur across
         // commits with different in-repo definition sets.
         let commit_records_start = graph.records().len();
-        for path in list_indexed_source_files(repo_root, &commit.sha)? {
+        for path in commit_tree.sources {
             let change_id = change_ids_by_path.get(&path);
             let bytes = git_blob_bytes(repo_root, &commit.sha, &path)?;
             let Ok(source) = std::str::from_utf8(&bytes) else {
@@ -247,6 +262,16 @@ fn scan_repository_history_inner(
         crate::languages::cross_file::apply_out_of_line_test_scope(
             &mut graph.records_mut()[commit_records_start..],
             &facts_by_file,
+        );
+        // Owning-Cargo-package attribution (issue #117), scoped to THIS
+        // COMMIT'S SLICE. Slice-scoping is mandatory, for the same reason the
+        // resolution-labeling pass above is scoped: an ADR-0004 symbol ID
+        // carries no commit component, so a whole-graph pass would stamp every
+        // historical version of a record with the LAST commit's manifest tree —
+        // a fabricated fact at a pinned historical point.
+        crate::crate_attribution::apply_crate_attribution(
+            &mut graph.records_mut()[commit_records_start..],
+            &attribution,
         );
     }
 
@@ -377,16 +402,104 @@ fn parse_change_line(line: &str) -> Option<GitChange> {
     })
 }
 
-fn list_indexed_source_files(repo_root: &Path, sha: &str) -> Result<Vec<String>> {
-    let output = git_output(repo_root, &["ls-tree", "-r", "--name-only", sha])?;
-    let mut files = output
-        .lines()
-        .map(str::trim)
-        .filter(|path| is_indexed_source(Path::new(path)))
-        .map(normalize_git_path)
-        .collect::<Vec<_>>();
-    files.sort();
-    Ok(files)
+/// One commit tree's indexed source files and Cargo manifests, from a SINGLE
+/// `git ls-tree` invocation (issue #117).
+#[derive(Debug, Default)]
+struct CommitTree {
+    /// Indexed source paths, sorted — the same set the pre-#117
+    /// `list_indexed_source_files` produced.
+    sources: Vec<String>,
+    /// `(repo-relative manifest path, blob OID)` for every `Cargo.toml`,
+    /// sorted by path. The OID lets the replay parse each distinct manifest
+    /// blob once instead of once per commit.
+    manifests: Vec<(String, String)>,
+}
+
+/// Lists a commit's indexed sources and Cargo manifests in one `ls-tree` pass.
+///
+/// Uses the full (non-`--name-only`) form so each entry carries its object TYPE
+/// and OID: the type filter drops submodule gitlinks — which are `commit`
+/// entries, not readable blobs — and the OID keys the manifest parse memo.
+///
+/// Both filters prune any path with a `target` component, mirroring
+/// [`is_indexed_source`], so committed build output never contributes sources
+/// or owning packages.
+fn list_commit_tree(repo_root: &Path, sha: &str) -> Result<CommitTree> {
+    let output = git_output(repo_root, &["ls-tree", "-r", sha])?;
+    let mut tree = CommitTree::default();
+    for line in output.lines() {
+        // `<mode> SP <type> SP <object> TAB <path>`
+        let Some((meta, path)) = line.split_once('\t') else {
+            continue;
+        };
+        let mut fields = meta.split_whitespace();
+        let (Some(_mode), Some(object_type), Some(oid)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if object_type != "blob" {
+            // A `commit` entry is a submodule gitlink: its content belongs to a
+            // different repository and cannot be read from this one.
+            continue;
+        }
+        let path = normalize_git_path(path.trim());
+        let as_path = Path::new(path.as_str());
+        if is_indexed_source(as_path) {
+            tree.sources.push(path);
+            continue;
+        }
+        if is_cargo_manifest_path(as_path) {
+            tree.manifests.push((path, oid.to_owned()));
+        }
+    }
+    tree.sources.sort();
+    tree.manifests.sort();
+    Ok(tree)
+}
+
+/// Matches the working-tree scanner's manifest set (`fs::discover_cargo_manifests`):
+/// the basename must be exactly `Cargo.toml` (case-sensitive), and the path must
+/// not sit under a `target/` build directory.
+fn is_cargo_manifest_path(path: &Path) -> bool {
+    path.file_name().and_then(std::ffi::OsStr::to_str) == Some("Cargo.toml")
+        && !path.components().any(|c| c.as_os_str() == "target")
+}
+
+/// Builds the crate-attribution index for one commit's tree (issue #117).
+///
+/// Reads each manifest blob through the same read-only `git show` plumbing the
+/// source replay uses, and reduces it with `manifest_deps::manifest_package_outcome`
+/// — the SAME reduction the working-tree harvest calls, so the two paths cannot
+/// disagree about what a manifest declares.
+///
+/// `memo` caches the reduction by blob OID across the whole replay: a manifest
+/// is typically unchanged for hundreds of commits, so this parses each distinct
+/// manifest blob exactly once.
+///
+/// A blob that cannot be read or decoded becomes an `Unreadable` fact, never an
+/// aborted replay — mirroring the non-UTF-8 source skip (issue #438).
+fn commit_crate_attribution_index(
+    repo_root: &Path,
+    sha: &str,
+    manifests: &[(String, String)],
+    memo: &mut BTreeMap<String, ManifestParseOutcome>,
+) -> CrateAttributionIndex {
+    let mut facts = Vec::with_capacity(manifests.len());
+    for (path, oid) in manifests {
+        let outcome = memo.get(oid).cloned().unwrap_or_else(|| {
+            let outcome = git_blob_bytes(repo_root, sha, path)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .map_or(ManifestParseOutcome::Unreadable, |text| {
+                    crate::manifest_deps::manifest_package_outcome(&text)
+                });
+            memo.insert(oid.clone(), outcome.clone());
+            outcome
+        });
+        facts.push(ManifestPackageFact::new(path.clone(), outcome));
+    }
+    CrateAttributionIndex::from_facts(facts)
 }
 
 /// Matches the live scanner's source set (`fs::discover_source_files`) so the history
@@ -478,6 +591,13 @@ const fn is_temporal_change_target(record: &GraphRecord) -> bool {
 
 fn git_output(repo_root: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
+        // `-c core.quotePath=false` keeps non-ASCII paths verbatim in
+        // `ls-tree`/`diff-tree` output instead of C-quoted octal escapes
+        // (`"crates/caf\303\251/src/lib.rs"`). Without it the replay feeds the
+        // quoted form back to `git show <sha>:<path>`, which fails — silently
+        // dropping an entire directory from the graph. Every other Git call
+        // site in the crate already sets it (`src/fs.rs`, `src/identity.rs`).
+        .args(["-c", "core.quotePath=false"])
         .arg("-C")
         .arg(repo_root)
         .args(args)

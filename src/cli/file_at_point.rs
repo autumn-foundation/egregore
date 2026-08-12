@@ -120,6 +120,11 @@ pub(crate) fn query_file(
             visibility: None,
             signature: None,
             doc: None,
+            // Crate attribution rides the symbol-contract lanes for the same
+            // reason (issue #117): `eg query file` lists a file's symbols, and
+            // every row of that listing shares the file's one owning package.
+            crate_attribution: None,
+            crate_attribution_disclaimer: None,
             git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
             repository_id,
             repository: repository_id.and_then(|repo| index.display_of(repo)),

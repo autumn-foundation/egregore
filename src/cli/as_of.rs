@@ -4,6 +4,7 @@ use super::*;
 // query symbol --as-of <instant>
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn query_symbol_as_of(
     records: &[GraphRecord],
     name: &str,
@@ -11,6 +12,7 @@ pub(crate) fn query_symbol_as_of(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    package: Option<&str>,
     freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     match query::symbol_as_of_valid_time_by_repo(records, name, as_of, index, selected_repo) {
@@ -38,6 +40,13 @@ pub(crate) fn query_symbol_as_of(
                 .iter()
                 .filter_map(|r| symbol_result(r, name, index, records, &deleted))
                 .collect();
+            // Package scope (issue #117), applied to the recorded attribution AT
+            // the resolved instant.
+            retain_package_scope(&mut symbol_results, package);
+            if symbol_results.is_empty() {
+                eprintln!("error: no match found for symbol `{name}` at or before `{as_of}`");
+                std::process::exit(2);
+            }
             stamp_freshness(&mut symbol_results, freshness_code);
             // `--as-of` pins a single valid-time instant: the corpus is
             // commit-pinned, chosen by the selector (issue #427).

@@ -197,6 +197,83 @@ fn scan_history_skips_non_utf8_blob_and_records_diagnostic() {
     let _ = commit_sha;
 }
 
+/// History replay must index a committed source file whose repo-relative path
+/// carries non-ASCII bytes (issue #117 pre-fix).
+///
+/// `git ls-tree` C-quotes any path with a byte outside the printable ASCII
+/// range unless `core.quotePath=false` is set, so `crates/café/src/lib.rs` is
+/// listed as the literal ten-character escape sequence
+/// `"crates/caf\303\251/src/lib.rs"` (quotes included). The replay then feeds
+/// that quoted string straight back to `git show <sha>:<path>`, which fails —
+/// so an entire real directory silently vanishes from the graph. Every other
+/// Git call site in the crate already sets the flag (`src/fs.rs:236,368,465`,
+/// `src/identity.rs:430,554`); `src/history.rs::git_output` was the one that
+/// did not.
+#[test]
+fn history_replay_indexes_non_ascii_paths_unquoted() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    git(&repo, ["init"]);
+    git(&repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git(&repo, ["config", "user.name", "Codegraph Test"]);
+    git(&repo, ["config", "core.autocrlf", "false"]);
+    git(&repo, ["config", "commit.gpgsign", "false"]);
+
+    write(
+        &repo,
+        "crates/café/src/lib.rs",
+        "pub fn accented() -> u32 { 1 }\n",
+    );
+    write(&repo, "src/plain.rs", "pub fn plain() -> u32 { 2 }\n");
+    commit(&repo, "add accented path", "2026-05-01T00:00:00Z");
+
+    let jsonl = scan_repository_history(&repo)
+        .expect("history replay must complete over a non-ASCII path")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let records = parse_jsonl(&jsonl);
+
+    // The accented file is indexed under its LITERAL repo-relative path — not a
+    // C-quoted escape, and not absent.
+    assert!(
+        records.iter().any(|r| {
+            r["record_type"] == "node"
+                && r["kind"] == "File"
+                && r["repo_relative_path"] == "crates/café/src/lib.rs"
+        }),
+        "the non-ASCII path must be indexed verbatim; got paths: {:?}",
+        records
+            .iter()
+            .filter(|r| r["kind"] == "File")
+            .map(|r| r["repo_relative_path"].clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        records.iter().any(|r| {
+            r["record_type"] == "node"
+                && r["kind"] == "Symbol"
+                && r["repo_relative_path"] == "crates/café/src/lib.rs"
+                && r["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with("accented"))
+        }),
+        "the symbol under the non-ASCII path must be extracted"
+    );
+    // No octal-escaped or quote-wrapped form leaks into the graph.
+    assert!(
+        !jsonl.contains(r"caf\303\251"),
+        "a C-quoted octal path must never reach the graph"
+    );
+    // The ASCII sibling is unaffected (characterization).
+    assert!(
+        records
+            .iter()
+            .any(|r| r["kind"] == "File" && r["repo_relative_path"] == "src/plain.rs"),
+        "ASCII paths must keep working"
+    );
+}
+
 fn seed_history_repo(repo: &Path) -> [String; 3] {
     git(repo, ["init"]);
     git(repo, ["config", "user.email", "codegraph@example.invalid"]);

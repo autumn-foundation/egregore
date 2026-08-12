@@ -9,7 +9,10 @@ use crate::error::Result;
 /// 7→8: issue #445 adds the `REGISTERS_ROUTE` route-registration edge label and
 /// the optional `route` route-annotation field (method + path) on `Symbol`
 /// nodes.
-pub const SCHEMA_VERSION: u32 = 8;
+/// 8→9: issue #117 adds the optional `crate_attribution` field (owning Cargo
+/// package name + the repo-relative path of the owning `Cargo.toml`) on every
+/// path-bearing code-graph node. Additive and never an identity input.
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Schema version for agent-memory records (`Agent`, `AgentSession`, `Observation`, etc.).
 /// Documented in `docs/schema/agent-memory.md`.
@@ -1205,6 +1208,22 @@ pub enum GraphRecord {
         /// `docs/schema/schema-versioning.md §2`; never an identity input.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route: Option<Vec<RouteAnnotation>>,
+        // ── Owning-Cargo-package attribution (issue #117) ─────────────────────
+        /// The Cargo package that owns this code fact, resolved from the
+        /// NEAREST ENCLOSING `Cargo.toml`, together with that manifest's
+        /// repo-relative path. Present on every path-bearing code-graph node
+        /// (`carries_crate_attribution` in `src/crate_attribution.rs` is the
+        /// exhaustive classifier); absent on repository-scoped and non-code-graph
+        /// kinds, and on any record produced before issue #117.
+        ///
+        /// ABSENT means attribution is UNKNOWN (a pre-#117 producer); a present
+        /// value with `status: unattributed` means it was computed and there is
+        /// provably no owning package. The two are never conflated.
+        ///
+        /// Additive per `docs/schema/schema-versioning.md §2`; never an identity
+        /// input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        crate_attribution: Option<CrateAttribution>,
         /// Git and bitemporal provenance for history-backed records.
         #[serde(skip_serializing_if = "Option::is_none")]
         temporal: Option<TemporalMetadata>,
@@ -1744,6 +1763,7 @@ impl GraphRecord {
             note: None,
             content_signature: None,
             route: None,
+            crate_attribution: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1872,6 +1892,7 @@ impl GraphRecord {
             note: None,
             content_signature: None,
             route: None,
+            crate_attribution: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1999,6 +2020,7 @@ impl GraphRecord {
             note: None,
             content_signature: None,
             route: None,
+            crate_attribution: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -2131,6 +2153,7 @@ impl GraphRecord {
             note: None,
             content_signature: None,
             route: None,
+            crate_attribution: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -2560,6 +2583,37 @@ impl GraphRecord {
     pub fn route(&self) -> Option<&[RouteAnnotation]> {
         match self {
             Self::Node { route, .. } => route.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Attaches owning-Cargo-package attribution to a node record (issue #117).
+    ///
+    /// Additive metadata per `docs/schema/schema-versioning.md §2`; it MUST NOT
+    /// contribute to stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub fn with_crate_attribution(mut self, attribution: CrateAttribution) -> Self {
+        if let Self::Node {
+            crate_attribution, ..
+        } = &mut self
+        {
+            *crate_attribution = Some(attribution);
+        }
+        self
+    }
+
+    /// Returns the owning-package attribution when present (issue #117).
+    ///
+    /// `None` means the record was produced before issue #117 (attribution
+    /// UNKNOWN), or that the node kind carries no path. It never means "no
+    /// package owns this" — that is a present value with
+    /// [`CrateAttributionStatus::Unattributed`].
+    #[must_use]
+    pub const fn crate_attribution(&self) -> Option<&CrateAttribution> {
+        match self {
+            Self::Node {
+                crate_attribution, ..
+            } => crate_attribution.as_ref(),
             Self::Edge { .. } | Self::Tombstone { .. } => None,
         }
     }
@@ -3620,6 +3674,131 @@ pub struct RouteAnnotation {
     pub method: String,
     /// Route path, the first string literal in the attribute.
     pub path: String,
+}
+
+/// Owning-Cargo-package attribution for one code-graph node (issue #117).
+///
+/// Additive per `docs/schema/schema-versioning.md` §2, and **never an identity
+/// input**: `stable_id`'s preimage is unchanged, so stamping attribution never
+/// moves a record ID. `docs/adr/0004-symbol-identity.md` sanctions exactly this
+/// — a Cargo descriptor may refine the repository namespace later without
+/// reintroducing source coordinates into symbol identity.
+///
+/// # Absent vs. unattributed
+///
+/// The field being **absent** on a node means the record was produced by a
+/// pre-#117 binary: attribution is UNKNOWN. A **present** value carrying
+/// `status: unattributed` means attribution was computed and there is provably
+/// no owning package. Collapsing the two would turn every legacy record into a
+/// fabricated "proven ownerless" claim, so no producer, reader, or renderer may
+/// conflate them.
+///
+/// # Epistemic limit
+///
+/// Attribution is nearest-enclosing-manifest directory containment, never proof
+/// the file is compiled into that package.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct CrateAttribution {
+    /// Whether an owning package was resolved.
+    pub status: CrateAttributionStatus,
+    /// The owning package's declared name, exactly as written in its manifest.
+    /// Present iff `status` is `attributed`; never guessed, never derived from
+    /// a directory name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
+    /// Repo-relative path of the owning `Cargo.toml`. Present iff `status` is
+    /// `attributed`, so every attribution cites the manifest it rests on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_repo_relative_path: Option<String>,
+    /// Why no package owns this node. Present iff `status` is `unattributed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unattributed_reason: Option<CrateAttributionReason>,
+}
+
+impl CrateAttribution {
+    /// Builds an attributed value citing the owning package and its manifest.
+    #[must_use]
+    pub fn attributed(
+        package_name: impl Into<String>,
+        manifest_repo_relative_path: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: CrateAttributionStatus::Attributed,
+            package_name: Some(package_name.into()),
+            manifest_repo_relative_path: Some(manifest_repo_relative_path.into()),
+            unattributed_reason: None,
+        }
+    }
+
+    /// Builds an unattributed value carrying the closed-set reason.
+    #[must_use]
+    pub const fn unattributed(reason: CrateAttributionReason) -> Self {
+        Self {
+            status: CrateAttributionStatus::Unattributed,
+            package_name: None,
+            manifest_repo_relative_path: None,
+            unattributed_reason: Some(reason),
+        }
+    }
+}
+
+/// Whether a node resolved to an owning Cargo package (issue #117).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrateAttributionStatus {
+    /// An owning package was resolved; `package_name` and
+    /// `manifest_repo_relative_path` are both present.
+    Attributed,
+    /// No package owns this node; `unattributed_reason` names why.
+    Unattributed,
+}
+
+impl CrateAttributionStatus {
+    /// The serialized status string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Attributed => "attributed",
+            Self::Unattributed => "unattributed",
+        }
+    }
+}
+
+/// Why a code-graph node has no owning Cargo package (issue #117).
+///
+/// A CLOSED vocabulary. Each variant is a named, operator-checkable fact about
+/// the manifest tree — never a guess, and never a carrier for raw error text.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrateAttributionReason {
+    /// No `Cargo.toml` sits in any ancestor directory: a stray source file
+    /// outside every crate.
+    NoEnclosingManifest,
+    /// Every enclosing manifest is a virtual workspace root (`[workspace]` with
+    /// no `[package]`), which declares no package and so cannot own a file.
+    VirtualManifestOnly,
+    /// The nearest enclosing manifest declares a `[package]` whose `name` is
+    /// absent or Cargo-invalid. A package exists; Egregore cannot name it, and
+    /// inheriting an ancestor's name would fabricate one.
+    UnnamedPackage,
+    /// The nearest enclosing manifest is not valid TOML.
+    UnparseableManifest,
+    /// The nearest enclosing manifest could not be read, or is not UTF-8.
+    ManifestUnreadable,
+}
+
+impl CrateAttributionReason {
+    /// The serialized reason string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoEnclosingManifest => "no_enclosing_manifest",
+            Self::VirtualManifestOnly => "virtual_manifest_only",
+            Self::UnnamedPackage => "unnamed_package",
+            Self::UnparseableManifest => "unparseable_manifest",
+            Self::ManifestUnreadable => "manifest_unreadable",
+        }
+    }
 }
 
 /// Source byte and line span for syntax-backed records.
