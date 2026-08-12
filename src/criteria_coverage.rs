@@ -62,7 +62,8 @@
 //! or dangling one:
 //!
 //! `failed_evidence` > `dangling_evidence` > `non_verification_evidence` >
-//! `inconclusive_evidence` > `proven` > `unverified`.
+//! `inconclusive_evidence` (which absorbs `ambiguous_versions`) > `proven` >
+//! `unverified`.
 //!
 //! Every handle is listed on the row with its own resolution, so the derivation
 //! is auditable rather than asserted.
@@ -636,16 +637,20 @@ fn bucket_for(resolutions: &[LinkResolution]) -> CriterionBucket {
         CriterionBucket::FailedEvidence
     } else if has(LinkResolution::Unresolved) {
         CriterionBucket::DanglingEvidence
-    } else if has(LinkResolution::AmbiguousVersions) {
-        // "Which version is current is unknown" is an inconclusive outcome, not
-        // a failure: reporting `failed_evidence` would fabricate a failure the
-        // store never recorded. Either way it is NOT proof.
-        CriterionBucket::InconclusiveEvidence
     } else if has(LinkResolution::NotVerificationRecord)
         || has(LinkResolution::MissingEvidenceHandle)
     {
+        // Invalid PROVENANCE outranks an unknown OUTCOME. A link that is not a
+        // legitimate verification record — wrong domain, wrong kind, the
+        // criterion itself, or citing no evidence at all — is a harder defect
+        // than one whose outcome merely cannot be pinned down, and filing it as
+        // `inconclusive_evidence` would understate invalid provenance in the
+        // aggregate ratios.
         CriterionBucket::NonVerificationEvidence
-    } else if has(LinkResolution::Inconclusive) {
+    } else if has(LinkResolution::AmbiguousVersions) || has(LinkResolution::Inconclusive) {
+        // "Which version is current is unknown" is an inconclusive outcome, not
+        // a failure: reporting `failed_evidence` would fabricate a failure the
+        // store never recorded. Either way it is NOT proof.
         CriterionBucket::InconclusiveEvidence
     } else {
         CriterionBucket::Proven
@@ -2517,6 +2522,51 @@ mod tests {
         ];
         let report = run_criteria_coverage(&bad, &CriteriaCoverageConfig::default());
         assert!(row(&report, AC_U1).claimed_done_unproven);
+    }
+
+    /// Invalid PROVENANCE outranks an unknown OUTCOME.
+    ///
+    /// A criterion carrying one link that is not a legitimate verification
+    /// record and another whose versions disagree must be filed under
+    /// `non_verification_evidence`: bucketing it as `inconclusive_evidence`
+    /// would understate invalid provenance in the aggregate ratios.
+    #[test]
+    fn invalid_provenance_outranks_an_unknown_outcome() {
+        // One target cites no evidence handle at all...
+        let bare = verification_without_handle("verification:v1:bare", "pass");
+        // ...another is a real record whose live versions disagree.
+        let records = vec![
+            task(TASK_DONE, "closed_completed"),
+            bare,
+            verification(VER_PASS_1, NodeKind::TestRun, Some("pass"), None),
+            verification(VER_PASS_1, NodeKind::TestRun, Some("fail"), None),
+            criterion(AC_P1, TASK_DONE, 0, "verified"),
+            closes(AC_P1, "verification:v1:bare"),
+            closes(AC_P1, VER_PASS_1),
+            owned_by(AC_P1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        let r = row(&report, AC_P1);
+        assert_eq!(
+            r.bucket, "non_verification_evidence",
+            "invalid provenance must not be filed as merely inconclusive"
+        );
+        // Both resolutions are still visible on the row, so the derivation stays
+        // auditable rather than collapsed to the winning one.
+        let resolutions: BTreeSet<&str> = r
+            .closing_links
+            .iter()
+            .map(|l| l.resolution.as_str())
+            .collect();
+        assert!(
+            resolutions.contains("missing_evidence_handle"),
+            "{resolutions:?}"
+        );
+        assert!(
+            resolutions.contains("ambiguous_versions"),
+            "{resolutions:?}"
+        );
+        assert!(r.proving_verification_id.is_none());
     }
 
     /// A tie at the newest instant with no done status must render

@@ -133,8 +133,8 @@ present the **most alarming wins**, so a passing link can never mask a failing o
 dangling one:
 
 ```
-failed_evidence > dangling_evidence > ambiguous_versions
-                > non_verification_evidence > inconclusive_evidence
+failed_evidence > dangling_evidence > non_verification_evidence
+                > inconclusive_evidence (incl. ambiguous_versions)
                 > proven > unverified
 ```
 
@@ -234,7 +234,7 @@ fabricated `0.0` — alongside the stable `no_acceptance_criteria` diagnostic.
 | `no_acceptance_criteria` | Zero live criteria; ratios have a zero denominator. Not a failure. |
 | `dangling_closing_evidence` | Names every criterion carrying a closing handle that resolves to no live record — including one masked by a higher-precedence bucket. |
 | `criterion_parent_task_conflict` | Contested ownership: more than one distinct parent `Task` participates in the gate (field vs edge, several edges, or a matching edge plus an extra one). |
-| `parent_task_status_ambiguous` | Some candidate parent `Task` has several live versions recording DIFFERENT statuses (a missing status is a distinct state); the claimed-done test counts the criterion when ANY version is done. |
+| `parent_task_status_ambiguous` | Some candidate parent `Task` has several CURRENT-CANDIDATE versions recording DIFFERENT statuses (a missing status is a distinct state); the claimed-done test counts the criterion when any current **candidate** is done. Which versions are candidates depends on whether recency resolved — see [Claimed-done-but-unproven](#claimed-done-but-unproven). |
 | `criterion_parent_task_unresolved` | The owning `Task` does not resolve to a live `Task`. Still counted in the census, but can never enter the claimed-done set. |
 | `superseded_criteria_counted` | Names criteria recorded `status: superseded`, which ARE counted in the proof gap — disclosed because the symmetric argument excludes `closed_dropped` tasks. |
 | `results_truncated` | `--limit` truncated a row list; counts stay pre-truncation. |
