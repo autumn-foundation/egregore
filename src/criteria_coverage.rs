@@ -881,13 +881,15 @@ pub fn run_criteria_coverage(
             .copied()
             .find(|parent| task_statuses_of(parent).iter().any(|s| is_done(s)));
 
-        // Ownership is contested when the record's own field disagrees with an
-        // edge, OR when several edges name different tasks and there is no field
-        // to arbitrate — the second case would otherwise pick one silently.
-        let ownership_contested = field_parent
-            .is_some_and(|field| !edge_parents.is_empty() && !edge_parents.contains(field))
-            || (field_parent.is_none() && edge_parents.len() > 1);
-        if ownership_contested {
+        // Ownership is contested exactly when MORE THAN ONE distinct parent
+        // participates in the gate. Stated over the candidate set rather than as
+        // a field-versus-edge comparison, because every candidate feeds
+        // `done_parent`: with `parent_task_id = A` and edges to both A and B, an
+        // agreeing-field check would report no conflict while B silently widened
+        // the gate. One rule covers every shape — field disagreeing with an edge,
+        // several edges with no field to arbitrate, and the mixed
+        // matching-plus-extra case.
+        if candidate_parents.len() > 1 {
             parent_conflict_ids.push(handle_field(id));
         }
 
@@ -2167,6 +2169,56 @@ mod tests {
                 .any(|d| d.code == "criterion_parent_task_conflict"
                     && d.record_ids.contains(&AC_U1.to_owned())),
             "picking one of several edge parents silently would hide the contest"
+        );
+    }
+
+    /// An edge that AGREES with the field does not make ownership uncontested
+    /// when a second edge names a different task.
+    ///
+    /// Every candidate feeds the gate, so a field-versus-edge comparison that
+    /// passes because the set merely CONTAINS the field would let the extra
+    /// parent widen the gate with no conflict reported.
+    #[test]
+    fn an_extra_edge_parent_alongside_a_matching_one_is_still_contested() {
+        let records = vec![
+            task(TASK_OPEN, "open"),
+            task(TASK_DONE, "closed_completed"),
+            // field = OPEN, edges = {OPEN (agrees), DONE (extra)}.
+            criterion(AC_U1, TASK_OPEN, 0, "unverified"),
+            owned_by(AC_U1, TASK_OPEN),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert!(
+            row(&report, AC_U1).claimed_done_unproven,
+            "the extra parent widens the gate"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "criterion_parent_task_conflict"
+                    && d.record_ids.contains(&AC_U1.to_owned())),
+            "...so the contest that widened it must be reported"
+        );
+    }
+
+    /// A single parent named by BOTH representations is not contested.
+    #[test]
+    fn one_parent_named_by_field_and_edge_is_uncontested() {
+        let records = vec![
+            task(TASK_DONE, "closed_completed"),
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert!(row(&report, AC_U1).claimed_done_unproven);
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "criterion_parent_task_conflict"),
+            "agreeing representations of ONE parent are not a conflict"
         );
     }
 

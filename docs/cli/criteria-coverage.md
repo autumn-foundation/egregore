@@ -186,8 +186,10 @@ is done. Narrowing that to the displayed parent would be fail-open in the one
 metric this command enforces. Because ambiguity widens the alarm, every input
 that widened it is disclosed: `parent_task_status_ambiguous` when any candidate
 has live versions recording different statuses, and
-`criterion_parent_task_conflict` when the field disagrees with an edge **or**
-several edges name different tasks with no field to arbitrate.
+`criterion_parent_task_conflict` whenever **more than one distinct parent
+participates** — the field disagreeing with an edge, several edges with no field
+to arbitrate, or an edge that agrees with the field alongside a second edge that
+does not. Agreeing representations of a single parent are not a conflict.
 
 The row then cites the **deciding** parent — the one whose done status fired the
 gate — so a `claimed_done_unproven` row can never contradict itself by
@@ -229,7 +231,7 @@ fabricated `0.0` — alongside the stable `no_acceptance_criteria` diagnostic.
 | --- | --- |
 | `no_acceptance_criteria` | Zero live criteria; ratios have a zero denominator. Not a failure. |
 | `dangling_closing_evidence` | Names every criterion carrying a closing handle that resolves to no live record — including one masked by a higher-precedence bucket. |
-| `criterion_parent_task_conflict` | Contested ownership: `OWNED_BY_TASK` target ≠ `parent_task_id`, or several edges name different tasks with no field to arbitrate. |
+| `criterion_parent_task_conflict` | Contested ownership: more than one distinct parent `Task` participates in the gate (field vs edge, several edges, or a matching edge plus an extra one). |
 | `parent_task_status_ambiguous` | Some candidate parent `Task` has several live versions recording DIFFERENT statuses; the claimed-done test counts the criterion when ANY version is done. |
 | `criterion_parent_task_unresolved` | The owning `Task` does not resolve to a live `Task`. Still counted in the census, but can never enter the claimed-done set. |
 | `superseded_criteria_counted` | Names criteria recorded `status: superseded`, which ARE counted in the proof gap — disclosed because the symmetric argument excludes `closed_dropped` tasks. |
