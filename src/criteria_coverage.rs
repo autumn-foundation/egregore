@@ -907,6 +907,14 @@ pub fn run_criteria_coverage(
             }
             versions.iter().map(|(_, status)| *status).collect()
         };
+        // ONE normalization, used by every comparison of a task status below.
+        // `is_done` trims and lowercases, so comparing raw strings anywhere else
+        // would make `open` and ` OPEN ` equivalent to the gate but DIFFERENT to
+        // the ambiguity check — a false `parent_task_status_ambiguous` claiming
+        // versions record different states when they record the same one.
+        let normalized = |status: Option<&String>| -> Option<String> {
+            status.map(|s| s.trim().to_ascii_lowercase())
+        };
         let is_done = |status: &str| {
             DONE_TASK_STATUSES.contains(&status.trim().to_ascii_lowercase().as_str())
         };
@@ -922,6 +930,8 @@ pub fn run_criteria_coverage(
         if candidate_parents.iter().any(|parent| {
             deciding_statuses_of(parent)
                 .iter()
+                .copied()
+                .map(normalized)
                 .collect::<BTreeSet<_>>()
                 .len()
                 > 1
@@ -965,17 +975,17 @@ pub fn run_criteria_coverage(
         //     fact the store does not support. `parent_task_status_ambiguous`
         //     carries that story instead.
         let parent_task_status = resolved_parent.and_then(|parent| {
-            let distinct: BTreeSet<Option<&String>> =
-                deciding_statuses_of(parent).into_iter().collect();
-            distinct
+            let deciding = deciding_statuses_of(parent);
+            // Distinctness is judged on the NORMALIZED status, matching the gate;
+            // the RECORDED text is what gets displayed, so the row echoes what the
+            // store actually says rather than a rewritten form.
+            let distinct: BTreeSet<Option<String>> =
+                deciding.iter().copied().map(normalized).collect();
+            let recorded: BTreeSet<&String> = deciding.iter().copied().flatten().collect();
+            recorded
                 .iter()
-                .flatten()
                 .find(|s| is_done(s))
-                .or_else(|| {
-                    (distinct.len() == 1)
-                        .then(|| distinct.iter().flatten().next())
-                        .flatten()
-                })
+                .or_else(|| (distinct.len() == 1).then(|| recorded.first()).flatten())
                 .map(|s| (*s).clone())
         });
         // Resolution is evaluated across EVERY candidate, not just the displayed
@@ -2571,6 +2581,67 @@ mod tests {
             "{resolutions:?}"
         );
         assert!(r.proving_verification_id.is_none());
+    }
+
+    /// Versions differing only by casing or whitespace record the SAME state.
+    ///
+    /// `is_done` trims and lowercases, so comparing raw strings in the ambiguity
+    /// check would emit a false `parent_task_status_ambiguous` — claiming the
+    /// versions disagree when they do not — and suppress the displayed status.
+    #[test]
+    fn statuses_differing_only_by_case_or_whitespace_are_not_ambiguous() {
+        // (a) Two current versions, same state, different spelling.
+        let records = vec![
+            task_at(TASK_OPEN, "open", "2026-01-01T00:00:00Z"),
+            task_at(TASK_OPEN, "  OPEN  ", "2026-01-01T00:00:00Z"),
+            criterion(AC_U1, TASK_OPEN, 0, "unverified"),
+            owned_by(AC_U1, TASK_OPEN),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous"),
+            "one state spelled two ways is not a disagreement"
+        );
+        assert!(
+            row(&report, AC_U1).parent_task_status.is_some(),
+            "an agreed status must still be displayed"
+        );
+        assert!(!row(&report, AC_U1).claimed_done_unproven);
+
+        // (b) The same, for a DONE state: still unambiguous, still claimed-done.
+        let done = vec![
+            task_at(TASK_DONE, "closed_completed", "2026-01-01T00:00:00Z"),
+            task_at(TASK_DONE, "CLOSED_COMPLETED", "2026-01-01T00:00:00Z"),
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&done, &CriteriaCoverageConfig::default());
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous")
+        );
+        assert!(row(&report, AC_U1).claimed_done_unproven);
+
+        // (c) A GENUINE disagreement is still reported.
+        let differing = vec![
+            task_at(TASK_OPEN, "open", "2026-01-01T00:00:00Z"),
+            task_at(TASK_OPEN, "blocked", "2026-01-01T00:00:00Z"),
+            criterion(AC_U1, TASK_OPEN, 0, "unverified"),
+            owned_by(AC_U1, TASK_OPEN),
+        ];
+        let report = run_criteria_coverage(&differing, &CriteriaCoverageConfig::default());
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous"),
+            "normalizing must not mask a real disagreement"
+        );
     }
 
     /// A tie at the newest instant with no done status must render
