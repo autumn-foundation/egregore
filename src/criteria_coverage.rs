@@ -844,7 +844,13 @@ pub fn run_criteria_coverage(
         // Picking one by position could show `open` for a task whose latest
         // transaction is `closed_completed`, dropping its unproven criteria out
         // of the gap set — fail-open in the one metric this command enforces.
-        let task_statuses_of = |parent: &str| -> Vec<&String> {
+        // A MISSING status is kept as a distinct state (`None`) rather than
+        // dropped: over this transport an absent status is not "no version", it
+        // is a version whose status is unknown. Discarding it would let a task
+        // with one `closed_completed` version and one status-less version look
+        // unanimous, and the criterion would be reported claimed-done with no
+        // ambiguity disclosure at all.
+        let task_status_versions_of = |parent: &str| -> Vec<Option<&String>> {
             node_versions
                 .get(parent)
                 .into_iter()
@@ -854,7 +860,7 @@ pub fn run_criteria_coverage(
                         kind: NodeKind::Task,
                         status,
                         ..
-                    } => status.as_ref(),
+                    } => Some(status.as_ref()),
                     _ => None,
                 })
                 .collect()
@@ -862,12 +868,17 @@ pub fn run_criteria_coverage(
         let is_done = |status: &str| {
             DONE_TASK_STATUSES.contains(&status.trim().to_ascii_lowercase().as_str())
         };
+        let has_done_version = |parent: &str| {
+            task_status_versions_of(parent)
+                .iter()
+                .any(|status| status.is_some_and(|s| is_done(s)))
+        };
         // Version ambiguity is evaluated over EVERY candidate parent, matching
         // exactly the set the gate reads. Checking only the displayed parent
         // would let a non-selected target's disagreeing versions drive
         // `claimed_done` while emitting no disclosure at all.
         if candidate_parents.iter().any(|parent| {
-            task_statuses_of(parent)
+            task_status_versions_of(parent)
                 .iter()
                 .collect::<BTreeSet<_>>()
                 .len()
@@ -879,7 +890,7 @@ pub fn run_criteria_coverage(
         let done_parent = candidate_parents
             .iter()
             .copied()
-            .find(|parent| task_statuses_of(parent).iter().any(|s| is_done(s)));
+            .find(|parent| has_done_version(parent));
 
         // Ownership is contested exactly when MORE THAN ONE distinct parent
         // participates in the gate. Stated over the candidate set rather than as
@@ -899,11 +910,15 @@ pub fn run_criteria_coverage(
         let resolved_parent: Option<&str> = done_parent
             .or(field_parent)
             .or_else(|| edge_parents.first().copied());
-        let parent_task_status = resolved_parent.map(&task_statuses_of).and_then(|statuses| {
-            statuses
+        let parent_task_status = resolved_parent.and_then(|parent| {
+            let recorded: Vec<&String> = task_status_versions_of(parent)
+                .into_iter()
+                .flatten()
+                .collect();
+            recorded
                 .iter()
                 .find(|s| is_done(s))
-                .or_else(|| statuses.last())
+                .or_else(|| recorded.last())
                 .map(|s| (*s).clone())
         });
         if resolved_parent.is_none_or(|parent| {
@@ -1024,8 +1039,12 @@ pub fn run_criteria_coverage(
         diagnostics.push(CriteriaCoverageDiagnostic {
             code: "criterion_parent_task_conflict".to_owned(),
             record_ids: parent_conflict_ids,
-            detail: "criterion(s) whose OWNED_BY_TASK edge target differs from parent_task_id; \
-                     the recorded field wins and the conflict is reported"
+            detail: "criterion(s) for which MORE THAN ONE distinct parent Task participates in \
+                     the claimed-done test (parent_task_id vs an OWNED_BY_TASK edge, several \
+                     edges, or a matching edge plus an extra one). Every candidate widens the \
+                     gate; the row cites the DECIDING parent — the one whose done status fired \
+                     it — falling back to the recorded parent_task_id, then the smallest edge \
+                     target"
                 .to_owned(),
         });
     }
@@ -2219,6 +2238,79 @@ mod tests {
                 .iter()
                 .any(|d| d.code == "criterion_parent_task_conflict"),
             "agreeing representations of ONE parent are not a conflict"
+        );
+    }
+
+    /// A version with NO recorded status is a distinct state, not an absence.
+    ///
+    /// Dropping it before comparing versions would let a task with one
+    /// `closed_completed` version and one status-less version look unanimous, so
+    /// the criterion would be reported claimed-done with no disclosure that the
+    /// transport cannot say which version is current.
+    #[test]
+    fn a_status_less_task_version_counts_as_parent_ambiguity() {
+        let mut statusless = task(TASK_DONE, "closed_completed");
+        if let GraphRecord::Node { status, .. } = &mut statusless {
+            *status = None;
+        }
+        let records = vec![
+            task(TASK_DONE, "closed_completed"),
+            statusless,
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert!(
+            row(&report, AC_U1).claimed_done_unproven,
+            "the done version still widens the gate"
+        );
+        assert_eq!(
+            row(&report, AC_U1).parent_task_status.as_deref(),
+            Some("closed_completed"),
+            "the recorded status is still displayed"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous"
+                    && d.record_ids.contains(&AC_U1.to_owned())),
+            "...but a missing status is a DISTINCT version state and must be disclosed"
+        );
+    }
+
+    /// The conflict diagnostic must describe the behaviour that actually runs.
+    ///
+    /// The row cites the DECIDING parent, so a detail claiming the recorded
+    /// field wins would hand operators two contradictory explanations of one
+    /// stable code.
+    #[test]
+    fn the_conflict_diagnostic_describes_deciding_parent_selection() {
+        let records = vec![
+            task(TASK_OPEN, "open"),
+            task(TASK_DONE, "closed_completed"),
+            criterion(AC_U1, TASK_OPEN, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        // The behaviour the detail must describe.
+        assert_eq!(
+            row(&report, AC_U1).parent_task_id.as_deref(),
+            Some(TASK_DONE)
+        );
+        let detail = &report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "criterion_parent_task_conflict")
+            .expect("conflict diagnostic present")
+            .detail;
+        assert!(
+            detail.contains("DECIDING"),
+            "the detail must describe deciding-parent selection: {detail}"
+        );
+        assert!(
+            !detail.contains("field wins"),
+            "the detail must not claim the field wins: {detail}"
         );
     }
 
