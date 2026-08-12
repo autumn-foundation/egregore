@@ -19,6 +19,10 @@ pub mod preflight;
 pub use aletheiadb::EmbeddedAletheiaSink;
 #[cfg(feature = "embeddings")]
 pub use aletheiadb::SemanticMatch;
+/// Test-only fixture affordances (issue #486). Not part of the supported API.
+#[cfg(feature = "embedded-aletheiadb")]
+#[doc(hidden)]
+pub use aletheiadb::fixtures;
 
 /// Result type for adapter operations.
 pub type AdapterResult<T> = std::result::Result<T, AdapterError>;

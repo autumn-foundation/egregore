@@ -99,6 +99,8 @@ pub mod repair;
 pub mod repo_evict;
 /// Standing citable review-coverage gate over merged PRs (issue #339).
 pub mod review_coverage;
+/// Commit-time schema-constraint evaluation and declaration (issue #486).
+pub mod schema_constraints;
 /// Record schema-version compatibility checks.
 pub mod schema_version;
 /// SCIP code-intelligence export (issue #233).

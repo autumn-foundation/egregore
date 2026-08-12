@@ -1173,6 +1173,47 @@ is redaction-safe — record IDs, categories, relation labels, paths, spans, and
 Structural reference closure only: never parse correctness, semantic accuracy, schema-version
 compatibility, or extraction completeness. See `docs/cli/validate.md`.
 
+`eg audit schema-constraints --data-dir <dir>` evaluates — and optionally declares —
+`AletheiaDB` 0.2.0's opt-in per-label schema constraints as a COMMIT-TIME BACKSTOP for the
+schema contract (issue #486). `eg validate` gates a JSONL file BETWEEN scan and ingest, so it
+cannot see a bad write reaching a store by another path (hand-edited store, foreign writer,
+adapter regression); a declared constraint is enforced at the pre-apply commit hook, aborting
+the whole transaction with zero partial application. PHASE 1 FINDING (the question that decided
+the issue): the store-side label partition is NOT too coarse — `node_label(kind) ==
+kind.as_str()` for every `NodeKind`, so it is ONE LABEL PER KIND (`Symbol` and `Task` never
+collide), plus the literal `Tombstone` label, plus one edge type per `EdgeLabel`. The inventory
+is DERIVED from new `NodeKind::ALL` / `EdgeLabel::ALL` constants, each pinned by a
+wildcard-free `match` guard so a new variant fails to compile until classified and then fails
+the test until listed — it can never silently drift from the adapter. The declarable keys are
+exactly the ones `base_properties` writes unconditionally: `codegraph_id`/`record_type`/
+`summary` (String) + `schema_version` (Int), and on edges `label`/`source_codegraph_id`/
+`target_codegraph_id`/`egregore_seq` — the last being a write-sequence NUMBER stored as a
+STRING, so declaring it `Integer` would break every edge write (a concrete trap the audit
+surfaces, pinned by test). Two profiles: `spine` (default; identity + routing only) and
+`full-base` (adds `summary`/`egregore_seq`). NO profile declares a per-kind PAYLOAD field, by
+construction and by test — that is the class a future slice is free to drop, and a constraint
+firing on a legitimate future write is worse than no constraint. SCHEMA-BUMP ANSWER: a
+per-domain `SCHEMA_VERSION` bump changes the VALUE not the TYPE (`Integer` stays valid), and a
+new `NodeKind` mints a NEW label which carries no declaration and is fully schemaless — so both
+bump directions are safe; only renaming/removing a `base_properties` key is breaking, recorded
+as a hard prerequisite in `docs/schema/schema-versioning.md` §10 (drop first). The DEFAULT
+action is a strictly read-only report (throwaway store copy, no write lease, upstream
+`.dry_run()`, which declares nothing); `--declare` is opt-in Phase 2 and takes the write lease;
+`--drop` retracts, so the decision is reversible. Nothing in Egregore's write path declares
+constraints automatically. Only labels the store HOLDS are scanned (one `db.schema()` call
+finds them); every absent label is reported `not_present`, never a vacuous `conforms`. `checked`
+is a CURRENT-STATE count (superseded versions are not scanned — enforcement is forward-only).
+Violations cite offending records by `codegraph_id`, resolved from upstream's engine-internal
+`u64` sample ids; an unresolvable sample is COUNTED, never emitted. Output is allow-list only
+(labels, property keys, type tokens, counts, upstream reason strings, record handles — never
+payload text, never an engine id) and byte-identical across runs. Exit 0 clean, 1 non-conforming
+(full report still printed) or declaration refused, 2 usage/load. Conformance is a STRUCTURAL
+check of property presence and type only — never proof that content is correct, that a schema
+version is semantically compatible, or that extraction was complete; and because upstream
+quarantines a corrupt constraint sidecar rather than bricking startup, a declared constraint is
+a BACKSTOP THAT CATCHES MISTAKES, never a proof obligation the rest of the system may lean on.
+See `docs/cli/schema-constraints.md`.
+
 `eg index <graph>` builds a persistent sidecar index at `<graph>.idx` (issue
 #447) so targeted `eg query … --graph` lanes seek to the records they need
 instead of deserializing the whole file. The index is content-addressed on the

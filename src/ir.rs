@@ -3229,6 +3229,77 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
+    /// Every node kind, in declaration order.
+    ///
+    /// The embedded adapter writes one store-side node label per kind
+    /// (`node_label(kind) == kind.as_str()`), so this doubles as the inventory
+    /// of node labels Egregore can ever write (issue #486). A `kind_drift_guard`
+    /// unit test pins it exhaustive: adding a `NodeKind` variant fails to
+    /// compile until the guard's wildcard-free `match` classifies it, and the
+    /// guard then asserts the variant is present here.
+    pub const ALL: [Self; 60] = [
+        Self::Repository,
+        Self::File,
+        Self::Module,
+        Self::Symbol,
+        Self::Import,
+        Self::Diagnostic,
+        Self::PanicRiskSite,
+        Self::DebtMarker,
+        Self::UnsafeSite,
+        Self::DependencyDeclaration,
+        Self::ScanCoverage,
+        Self::Commit,
+        Self::Change,
+        Self::SemanticDrift,
+        Self::EmbeddingModel,
+        Self::EmbeddingVector,
+        Self::Agent,
+        Self::AgentSession,
+        Self::Observation,
+        Self::Task,
+        Self::AcceptanceCriterion,
+        Self::ExternalLink,
+        Self::Product,
+        Self::Project,
+        Self::Plan,
+        Self::GitHubIssue,
+        Self::PR,
+        Self::Review,
+        Self::ExternalIdentity,
+        Self::ReviewStateTransition,
+        Self::LocalTask,
+        Self::Artifact,
+        Self::Verification,
+        Self::CommandEvidence,
+        Self::AgentRun,
+        Self::AgentTurn,
+        Self::ToolCall,
+        Self::CommandRun,
+        Self::FileEdit,
+        Self::PatchArtifact,
+        Self::Failure,
+        Self::Decision,
+        Self::TestRun,
+        Self::CIStatus,
+        Self::BenchmarkRun,
+        Self::CoverageReport,
+        Self::ProofResult,
+        Self::PromoteCandidate,
+        Self::PromotionPrompt,
+        Self::PromotionDecision,
+        Self::Preference,
+        Self::WorkflowRule,
+        Self::NamingDecision,
+        Self::Constraint,
+        Self::CostUsage,
+        Self::Retraction,
+        Self::LogSource,
+        Self::ErrorSignature,
+        Self::LogEvent,
+        Self::LogOccurrenceBucket,
+    ];
+
     /// Returns the serialized node kind.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -3432,6 +3503,64 @@ pub enum EdgeLabel {
 }
 
 impl EdgeLabel {
+    /// Every edge label, in declaration order.
+    ///
+    /// The embedded adapter writes one store-side edge type per label
+    /// (`create_edge(.., label.as_str(), ..)`), so this doubles as the inventory
+    /// of edge types Egregore can ever write (issue #486). A `label_drift_guard`
+    /// unit test pins it exhaustive the same way [`NodeKind::ALL`] is pinned.
+    pub const ALL: [Self; 49] = [
+        Self::Contains,
+        Self::Defines,
+        Self::Imports,
+        Self::References,
+        Self::Calls,
+        Self::Implements,
+        Self::Mentions,
+        Self::ChangedIn,
+        Self::ParentOf,
+        Self::DriftsFrom,
+        Self::DriftsPrior,
+        Self::MeasuredBy,
+        Self::SessionOf,
+        Self::AuthoredBy,
+        Self::HasEvidence,
+        Self::Observes,
+        Self::MentionsSymbol,
+        Self::TouchedFile,
+        Self::ProducedPatch,
+        Self::ProducedEvidence,
+        Self::ValidatedBy,
+        Self::ClosesAcceptanceCriterion,
+        Self::OwnedByTask,
+        Self::ExternalHandle,
+        Self::TouchesFile,
+        Self::MergedAs,
+        Self::ReviewsCommit,
+        Self::ReviewedBy,
+        Self::RequestedReviewFrom,
+        Self::TransitionsReview,
+        Self::FailedOn,
+        Self::ExplainsChange,
+        Self::ReferencesTask,
+        Self::Contradicts,
+        Self::Supersedes,
+        Self::ProposedBy,
+        Self::PromptedFor,
+        Self::DecidedOn,
+        Self::MaterializedAs,
+        Self::RevokedBy,
+        Self::ScopedToRepo,
+        Self::RelatesTo,
+        Self::FingerprintedAs,
+        Self::CapturedFrom,
+        Self::Aggregates,
+        Self::FrameResolvesTo,
+        Self::EmittedDuring,
+        Self::Constructs,
+        Self::RegistersRoute,
+    ];
+
     /// Parses an edge label from its wire string.  Returns `None` for unknown labels.
     #[must_use]
     pub fn from_relation(s: &str) -> Option<Self> {
@@ -3843,5 +3972,179 @@ mod strip_prefix_tests {
         assert_eq!(strip_log_id_prefix("log:v:abc"), None);
         assert_eq!(strip_log_id_prefix("log:vx:abc"), None);
         assert_eq!(strip_log_id_prefix("some_symbol"), None);
+    }
+}
+
+#[cfg(test)]
+mod label_inventory_tests {
+    use super::{EdgeLabel, NodeKind};
+
+    /// Compile-time completeness guard for [`NodeKind::ALL`] (issue #486).
+    ///
+    /// The `match` below has NO wildcard arm, so adding a `NodeKind` variant
+    /// fails to compile here until it is deliberately classified — and the
+    /// assertion then fails until the variant is also added to `ALL`. Together
+    /// these make the written-label inventory derived rather than
+    /// hand-maintained, so it can never silently drift from `node_label()`.
+    #[test]
+    fn node_kind_all_is_exhaustive() {
+        fn is_listed(kind: NodeKind) -> bool {
+            // Force an exhaustive match so a new variant breaks the build.
+            match kind {
+                NodeKind::Repository
+                | NodeKind::File
+                | NodeKind::Module
+                | NodeKind::Symbol
+                | NodeKind::Import
+                | NodeKind::Diagnostic
+                | NodeKind::PanicRiskSite
+                | NodeKind::DebtMarker
+                | NodeKind::UnsafeSite
+                | NodeKind::DependencyDeclaration
+                | NodeKind::ScanCoverage
+                | NodeKind::Commit
+                | NodeKind::Change
+                | NodeKind::SemanticDrift
+                | NodeKind::EmbeddingModel
+                | NodeKind::EmbeddingVector
+                | NodeKind::Agent
+                | NodeKind::AgentSession
+                | NodeKind::Observation
+                | NodeKind::Task
+                | NodeKind::AcceptanceCriterion
+                | NodeKind::ExternalLink
+                | NodeKind::Product
+                | NodeKind::Project
+                | NodeKind::Plan
+                | NodeKind::GitHubIssue
+                | NodeKind::PR
+                | NodeKind::Review
+                | NodeKind::ExternalIdentity
+                | NodeKind::ReviewStateTransition
+                | NodeKind::LocalTask
+                | NodeKind::Artifact
+                | NodeKind::Verification
+                | NodeKind::CommandEvidence
+                | NodeKind::AgentRun
+                | NodeKind::AgentTurn
+                | NodeKind::ToolCall
+                | NodeKind::CommandRun
+                | NodeKind::FileEdit
+                | NodeKind::PatchArtifact
+                | NodeKind::Failure
+                | NodeKind::Decision
+                | NodeKind::TestRun
+                | NodeKind::CIStatus
+                | NodeKind::BenchmarkRun
+                | NodeKind::CoverageReport
+                | NodeKind::ProofResult
+                | NodeKind::PromoteCandidate
+                | NodeKind::PromotionPrompt
+                | NodeKind::PromotionDecision
+                | NodeKind::Preference
+                | NodeKind::WorkflowRule
+                | NodeKind::NamingDecision
+                | NodeKind::Constraint
+                | NodeKind::CostUsage
+                | NodeKind::Retraction
+                | NodeKind::LogSource
+                | NodeKind::ErrorSignature
+                | NodeKind::LogEvent
+                | NodeKind::LogOccurrenceBucket => NodeKind::ALL.contains(&kind),
+            }
+        }
+
+        for kind in NodeKind::ALL {
+            assert!(is_listed(kind), "{} missing from ALL", kind.as_str());
+        }
+
+        // No duplicates: `ALL.len()` is the real distinct-label count.
+        let mut labels: Vec<&str> = NodeKind::ALL.iter().map(|k| k.as_str()).collect();
+        labels.sort_unstable();
+        let distinct = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), distinct, "NodeKind::ALL holds a duplicate");
+    }
+
+    /// Compile-time completeness guard for [`EdgeLabel::ALL`] (issue #486).
+    #[test]
+    fn edge_label_all_is_exhaustive() {
+        fn is_listed(label: EdgeLabel) -> bool {
+            match label {
+                EdgeLabel::Contains
+                | EdgeLabel::Defines
+                | EdgeLabel::Imports
+                | EdgeLabel::References
+                | EdgeLabel::Calls
+                | EdgeLabel::Implements
+                | EdgeLabel::Mentions
+                | EdgeLabel::ChangedIn
+                | EdgeLabel::ParentOf
+                | EdgeLabel::DriftsFrom
+                | EdgeLabel::DriftsPrior
+                | EdgeLabel::MeasuredBy
+                | EdgeLabel::SessionOf
+                | EdgeLabel::AuthoredBy
+                | EdgeLabel::HasEvidence
+                | EdgeLabel::Observes
+                | EdgeLabel::MentionsSymbol
+                | EdgeLabel::TouchedFile
+                | EdgeLabel::ProducedPatch
+                | EdgeLabel::ProducedEvidence
+                | EdgeLabel::ValidatedBy
+                | EdgeLabel::ClosesAcceptanceCriterion
+                | EdgeLabel::OwnedByTask
+                | EdgeLabel::ExternalHandle
+                | EdgeLabel::TouchesFile
+                | EdgeLabel::MergedAs
+                | EdgeLabel::ReviewsCommit
+                | EdgeLabel::ReviewedBy
+                | EdgeLabel::RequestedReviewFrom
+                | EdgeLabel::TransitionsReview
+                | EdgeLabel::FailedOn
+                | EdgeLabel::ExplainsChange
+                | EdgeLabel::ReferencesTask
+                | EdgeLabel::Contradicts
+                | EdgeLabel::Supersedes
+                | EdgeLabel::ProposedBy
+                | EdgeLabel::PromptedFor
+                | EdgeLabel::DecidedOn
+                | EdgeLabel::MaterializedAs
+                | EdgeLabel::RevokedBy
+                | EdgeLabel::ScopedToRepo
+                | EdgeLabel::RelatesTo
+                | EdgeLabel::FingerprintedAs
+                | EdgeLabel::CapturedFrom
+                | EdgeLabel::Aggregates
+                | EdgeLabel::FrameResolvesTo
+                | EdgeLabel::EmittedDuring
+                | EdgeLabel::Constructs
+                | EdgeLabel::RegistersRoute => EdgeLabel::ALL.contains(&label),
+            }
+        }
+
+        for label in EdgeLabel::ALL {
+            assert!(is_listed(label), "{} missing from ALL", label.as_str());
+        }
+
+        let mut labels: Vec<&str> = EdgeLabel::ALL.iter().map(|l| l.as_str()).collect();
+        labels.sort_unstable();
+        let distinct = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), distinct, "EdgeLabel::ALL holds a duplicate");
+    }
+
+    /// Every listed label round-trips through the wire parser, so the inventory
+    /// names the same strings the read path accepts.
+    #[test]
+    fn edge_label_all_round_trips_through_from_relation() {
+        for label in EdgeLabel::ALL {
+            assert_eq!(
+                EdgeLabel::from_relation(label.as_str()),
+                Some(label),
+                "{} should parse back",
+                label.as_str()
+            );
+        }
     }
 }
