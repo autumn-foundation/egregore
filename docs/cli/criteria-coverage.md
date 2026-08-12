@@ -365,11 +365,18 @@ lines (`Graph::to_jsonl`, `eg export`), so over `--graph` the relative order of
 two physical writes of one record ID carries no information about which is
 current. This lane therefore never decides an outcome by position: when live
 versions of a closing record disagree, the link resolves `ambiguous_versions` and
-the criterion is never reported `proven`. The same rule covers the owning `Task`, which is
-*mutable* (`open` → `closed_completed`): the claimed-done test reads **every**
-live version and counts the criterion when any of them is done, so a status
-mutation can never drop unproven criteria out of the gap set by line order.
-Disagreeing versions are disclosed as `parent_task_status_ambiguous`.
+the criterion is never reported `proven`. The owning `Task` is *mutable* (`open` → `closed_completed` → reopened), and it
+carries a **required RFC 3339 `transaction_time`**. So when every live version of
+a parent is stamped and parseable, recency IS knowable and **only the newest
+version decides** — a reopened task is not reported as a proof gap forever, which
+would trip the gate on work that is legitimately open again.
+
+The conservative reading applies exactly where recency **cannot** be established:
+a version missing or carrying an unparseable stamp, or several versions tied at
+the newest instant with different statuses. There the claimed-done test reads
+every version and counts the criterion when any is done, so a status mutation can
+never drop unproven criteria out of the gap set by line order, and
+`parent_task_status_ambiguous` discloses it.
 
 The residual limit is liveness — a record tombstoned and later re-added cannot be
 distinguished from one merely tombstoned in a sorted graph, so it is reported
