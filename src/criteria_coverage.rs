@@ -822,19 +822,18 @@ pub fn run_criteria_coverage(
             dangling_ids.push(handle_field(id));
         }
 
-        // Ownership from BOTH representations. The schema requires the
-        // `OWNED_BY_TASK` target to equal `parent_task_id`; when they disagree the
-        // field wins (it is the record's own claim) and the conflict is reported
-        // rather than silently resolved.
+        // Ownership from BOTH representations: the denormalized `parent_task_id`
+        // and every `OWNED_BY_TASK` edge target. The schema requires them to
+        // agree; when they do not, the disagreement is REPORTED rather than
+        // silently resolved.
         let edge_parents: BTreeSet<&str> = owning_edges.get(id).cloned().unwrap_or_default();
         let field_parent = parent_task_id.as_deref();
-        let resolved_parent: Option<&str> = field_parent.or_else(|| edge_parents.first().copied());
-        if let Some(field) = field_parent
-            && !edge_parents.is_empty()
-            && !edge_parents.contains(field)
-        {
-            parent_conflict_ids.push(handle_field(id));
-        }
+        // Every parent whose status participates in the gate. Sorted, so every
+        // selection below is deterministic.
+        let candidate_parents: BTreeSet<&str> = field_parent
+            .into_iter()
+            .chain(edge_parents.iter().copied())
+            .collect();
         // Reads the recorded statuses of one candidate parent across EVERY live
         // version, but only from versions that really are a `Task` — a non-Task
         // node never lends its `status` to a criterion.
@@ -863,25 +862,48 @@ pub fn run_criteria_coverage(
         let is_done = |status: &str| {
             DONE_TASK_STATUSES.contains(&status.trim().to_ascii_lowercase().as_str())
         };
-        // Display the DONE status when any version of the resolved parent is
-        // done, so the shown status agrees with the gate rather than
-        // contradicting it; otherwise the last recorded status.
-        let resolved_statuses = resolved_parent.map(&task_statuses_of);
-        let parent_task_status = resolved_statuses.as_ref().and_then(|statuses| {
+        // Version ambiguity is evaluated over EVERY candidate parent, matching
+        // exactly the set the gate reads. Checking only the displayed parent
+        // would let a non-selected target's disagreeing versions drive
+        // `claimed_done` while emitting no disclosure at all.
+        if candidate_parents.iter().any(|parent| {
+            task_statuses_of(parent)
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1
+        }) {
+            parent_status_ambiguous_ids.push(handle_field(id));
+        }
+        // The candidate whose status actually fires the gate, if any.
+        let done_parent = candidate_parents
+            .iter()
+            .copied()
+            .find(|parent| task_statuses_of(parent).iter().any(|s| is_done(s)));
+
+        // Ownership is contested when the record's own field disagrees with an
+        // edge, OR when several edges name different tasks and there is no field
+        // to arbitrate — the second case would otherwise pick one silently.
+        let ownership_contested = field_parent
+            .is_some_and(|field| !edge_parents.is_empty() && !edge_parents.contains(field))
+            || (field_parent.is_none() && edge_parents.len() > 1);
+        if ownership_contested {
+            parent_conflict_ids.push(handle_field(id));
+        }
+
+        // Display the DECIDING parent when one is done, so a row can never
+        // contradict its own `claimed_done_unproven` verdict by citing an `open`
+        // task; otherwise the record's own field, else the smallest edge target.
+        let resolved_parent: Option<&str> = done_parent
+            .or(field_parent)
+            .or_else(|| edge_parents.first().copied());
+        let parent_task_status = resolved_parent.map(&task_statuses_of).and_then(|statuses| {
             statuses
                 .iter()
                 .find(|s| is_done(s))
                 .or_else(|| statuses.last())
                 .map(|s| (*s).clone())
         });
-        // Disagreeing versions of one parent are disclosed, mirroring
-        // `ambiguous_versions` on the evidence side.
-        if resolved_statuses
-            .as_ref()
-            .is_some_and(|statuses| statuses.iter().collect::<BTreeSet<_>>().len() > 1)
-        {
-            parent_status_ambiguous_ids.push(handle_field(id));
-        }
         if resolved_parent.is_none_or(|parent| {
             !matches!(
                 live_nodes.get(parent),
@@ -895,23 +917,19 @@ pub fn run_criteria_coverage(
         }
 
         // The claimed-done test runs over EVERY candidate parent — the
-        // denormalized field AND every `OWNED_BY_TASK` edge target — not just the
-        // one displayed. When the two representations disagree, letting the
-        // displayed field alone decide would be FAIL-OPEN in the single metric
-        // this command exists to enforce: a criterion whose edge names a
-        // completed task would slip out of the gap set. The gate is the one
-        // place ambiguity must widen the alarm, not narrow it.
+        // denormalized field AND every `OWNED_BY_TASK` edge target, across every
+        // live version of each. Letting the displayed parent alone decide would
+        // be FAIL-OPEN in the single metric this command exists to enforce: a
+        // criterion whose edge names a completed task would slip out of the gap
+        // set. The gate is the one place ambiguity must widen the alarm, not
+        // narrow it — and `parent_status_ambiguous` / `parent_task_conflict`
+        // above disclose every input that widened it.
         //
-        // The comparison is trimmed and lowercased, matching the sibling
-        // `verification_outcome` rule, so a `--graph` (which no importer
+        // The comparison is trimmed and lowercased (see `is_done`), matching the
+        // sibling `verification_outcome` rule, so a `--graph` (which no importer
         // validated) cannot smuggle a criterion past the gate with
         // `"Closed_Completed"` or a stray leading space.
-        let claimed_done = field_parent
-            .into_iter()
-            .chain(edge_parents.iter().copied())
-            .flat_map(&task_statuses_of)
-            .any(|status| is_done(status))
-            && bucket != CriterionBucket::Proven;
+        let claimed_done = done_parent.is_some() && bucket != CriterionBucket::Proven;
 
         // A criterion recorded `superseded` was REPLACED, not left unproven —
         // the same argument that excludes `closed_dropped` from the done set.
@@ -2066,21 +2084,89 @@ mod tests {
         ];
         let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
         let r = row(&report, AC_U1);
-        assert_eq!(
-            r.parent_task_id.as_deref(),
-            Some(TASK_OPEN),
-            "the recorded field is displayed"
-        );
         assert!(
             r.claimed_done_unproven,
             "the edge's done task must still pull it into the gap set"
         );
+        assert_eq!(
+            r.parent_task_id.as_deref(),
+            Some(TASK_DONE),
+            "the row cites the DECIDING parent, so it cannot contradict its own verdict"
+        );
+        assert_eq!(r.parent_task_status.as_deref(), Some("closed_completed"));
         assert!(
             report
                 .diagnostics
                 .iter()
                 .any(|d| d.code == "criterion_parent_task_conflict"
                     && d.record_ids.contains(&AC_U1.to_owned()))
+        );
+    }
+
+    /// Ambiguity must be evaluated over every parent whose status feeds the
+    /// gate, not just the displayed one.
+    ///
+    /// Otherwise a NON-selected `OWNED_BY_TASK` target with disagreeing versions
+    /// could drive `claimed_done_unproven` while the report disclosed nothing.
+    #[test]
+    fn ambiguity_is_checked_on_every_candidate_parent() {
+        let records = vec![
+            // The displayed (field) parent is unambiguous and open...
+            task(TASK_OPEN, "open"),
+            // ...while a second, edge-named parent disagrees with itself.
+            task(TASK_DONE, "closed_completed"),
+            task(TASK_DONE, "open"),
+            criterion(AC_U1, TASK_OPEN, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert!(
+            row(&report, AC_U1).claimed_done_unproven,
+            "the ambiguous parent still widens the gate"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous"
+                    && d.record_ids.contains(&AC_U1.to_owned())),
+            "...and the ambiguity that widened it must be disclosed"
+        );
+    }
+
+    /// Several `OWNED_BY_TASK` edges naming different tasks, with NO field to
+    /// arbitrate, is contested ownership and must be reported.
+    #[test]
+    fn multiple_edge_parents_without_a_field_are_reported_as_contested() {
+        let mut ac = criterion(AC_U1, TASK_OPEN, 0, "unverified");
+        if let GraphRecord::Node { parent_task_id, .. } = &mut ac {
+            *parent_task_id = None;
+        }
+        let records = vec![
+            task(TASK_OPEN, "open"),
+            task(TASK_DONE, "closed_completed"),
+            ac,
+            owned_by(AC_U1, TASK_OPEN),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        let r = row(&report, AC_U1);
+        assert!(
+            r.claimed_done_unproven,
+            "the done edge parent widens the gate"
+        );
+        assert_eq!(
+            r.parent_task_id.as_deref(),
+            Some(TASK_DONE),
+            "the deciding parent is displayed, never an unrelated open one"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "criterion_parent_task_conflict"
+                    && d.record_ids.contains(&AC_U1.to_owned())),
+            "picking one of several edge parents silently would hide the contest"
         );
     }
 

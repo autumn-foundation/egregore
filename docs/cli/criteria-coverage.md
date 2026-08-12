@@ -178,8 +178,21 @@ dropped work.
 
 Ownership resolves from **both** representations the schema keeps in sync: the
 `OWNED_BY_TASK` edge and the denormalized `parent_task_id` field. Either alone is
-sufficient. When they disagree the recorded field wins and the conflict is
-reported as `criterion_parent_task_conflict` rather than silently resolved.
+sufficient.
+
+The gate reads **every** candidate parent — the field and every edge target,
+across every live version of each — and counts the criterion when *any* of them
+is done. Narrowing that to the displayed parent would be fail-open in the one
+metric this command enforces. Because ambiguity widens the alarm, every input
+that widened it is disclosed: `parent_task_status_ambiguous` when any candidate
+has live versions recording different statuses, and
+`criterion_parent_task_conflict` when the field disagrees with an edge **or**
+several edges name different tasks with no field to arbitrate.
+
+The row then cites the **deciding** parent — the one whose done status fired the
+gate — so a `claimed_done_unproven` row can never contradict itself by
+displaying an `open` task. With no done candidate it cites the record's own
+field, else the lexicographically smallest edge target.
 
 ## Gate & exit codes
 
@@ -216,8 +229,8 @@ fabricated `0.0` — alongside the stable `no_acceptance_criteria` diagnostic.
 | --- | --- |
 | `no_acceptance_criteria` | Zero live criteria; ratios have a zero denominator. Not a failure. |
 | `dangling_closing_evidence` | Names every criterion carrying a closing handle that resolves to no live record — including one masked by a higher-precedence bucket. |
-| `criterion_parent_task_conflict` | `OWNED_BY_TASK` target ≠ `parent_task_id`; the field wins. |
-| `parent_task_status_ambiguous` | The owning `Task` has several live versions recording DIFFERENT statuses; the claimed-done test counts the criterion when ANY version is done. |
+| `criterion_parent_task_conflict` | Contested ownership: `OWNED_BY_TASK` target ≠ `parent_task_id`, or several edges name different tasks with no field to arbitrate. |
+| `parent_task_status_ambiguous` | Some candidate parent `Task` has several live versions recording DIFFERENT statuses; the claimed-done test counts the criterion when ANY version is done. |
 | `criterion_parent_task_unresolved` | The owning `Task` does not resolve to a live `Task`. Still counted in the census, but can never enter the claimed-done set. |
 | `superseded_criteria_counted` | Names criteria recorded `status: superseded`, which ARE counted in the proof gap — disclosed because the symmetric argument excludes `closed_dropped` tasks. |
 | `results_truncated` | `--limit` truncated a row list; counts stay pre-truncation. |
