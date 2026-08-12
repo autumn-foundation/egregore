@@ -50,19 +50,29 @@ The verbatim disclaimer appears in every report.
 `CLOSES_ACCEPTANCE_CRITERION` link to a verification record whose recorded
 outcome is passing.**
 
-Being a verification record takes **three checks, not one**:
+Being a verification record takes **four checks, not one**:
 
 1. the record ID is verification-domain (`verification:v<N>:`);
-2. the `NodeKind` is one the verification domain permits — the *same* list the
-   daemon write path enforces (`CommandRun`, `Verification`, `TestRun`,
-   `CIStatus`, `BenchmarkRun`, `CoverageReport`, `ProofResult`);
-3. the handle is not the criterion's own record ID.
+2. the `NodeKind` is one a `CLOSES_ACCEPTANCE_CRITERION` edge may target —
+   `Verification`, `CommandRun`, `TestRun`. This is deliberately **narrower**
+   than the verification domain itself: a passing `CoverageReport` or
+   `BenchmarkRun` closing a criterion is a relationship the write API rejects,
+   so the reader must not accept it either;
+3. the record carries the **evidence handle** the schema requires
+   (`source_artifact_hash`, `source_artifact_path`, or an output-handle hash).
+   A bare `TestRun { status: "pass" }` claims an outcome while citing nothing,
+   and the daemon refuses to persist one (`MissingEvidenceHandle`);
+4. the handle is not the criterion's own record ID.
 
-The ID prefix alone is not sufficient, because the embedded ingest path does not
-run the daemon's `validate_verification_domain_records`: a store really can hold
-a node with a `verification:v1:` ID and an `Observation`, `Task`, or even
-`AcceptanceCriterion` kind. Anything failing any of the three lands in
-`non_verification_evidence`.
+Checks 2 and 3 exist because `--graph` reads and embedded ingest both **bypass**
+the daemon's `validate_verification_domain_records` and `validate_project_edge`.
+A store really can hold a node with a `verification:v1:` ID and an `Observation`
+kind, or a passing `TestRun` citing no artifact at all — each of which a
+prefix-only gate would certify as proof. Every rule here is the *same constant*
+the write path enforces (`CLOSURE_TARGET_KINDS`, `has_evidence_handle`), shared
+so a reader can never accept what a writer would refuse. Failures land in
+`non_verification_evidence` with a precise resolution
+(`not_verification_record` / `missing_evidence_handle`).
 
 A criterion is **never** counted proven from:
 
@@ -123,8 +133,8 @@ present the **most alarming wins**, so a passing link can never mask a failing o
 dangling one:
 
 ```
-failed_evidence > dangling_evidence > ambiguous_versions
-                > non_verification_evidence > inconclusive_evidence
+failed_evidence > dangling_evidence > non_verification_evidence
+                > inconclusive_evidence (incl. ambiguous_versions)
                 > proven > unverified
 ```
 
@@ -168,8 +178,25 @@ dropped work.
 
 Ownership resolves from **both** representations the schema keeps in sync: the
 `OWNED_BY_TASK` edge and the denormalized `parent_task_id` field. Either alone is
-sufficient. When they disagree the recorded field wins and the conflict is
-reported as `criterion_parent_task_conflict` rather than silently resolved.
+sufficient.
+
+The gate reads **every** candidate parent — the field and every edge target,
+across every live version of each — and counts the criterion when *any* of them
+is done. Narrowing that to the displayed parent would be fail-open in the one
+metric this command enforces. Because ambiguity widens the alarm, every input
+that widened it is disclosed: `parent_task_status_ambiguous` when any candidate
+has live versions recording different statuses — where a **missing** status
+counts as a distinct state, since an absent status is a version whose status is
+unknown, not the absence of a version — and
+`criterion_parent_task_conflict` whenever **more than one distinct parent
+participates** — the field disagreeing with an edge, several edges with no field
+to arbitrate, or an edge that agrees with the field alongside a second edge that
+does not. Agreeing representations of a single parent are not a conflict.
+
+The row then cites the **deciding** parent — the one whose done status fired the
+gate — so a `claimed_done_unproven` row can never contradict itself by
+displaying an `open` task. With no done candidate it cites the record's own
+field, else the lexicographically smallest edge target.
 
 ## Gate & exit codes
 
@@ -206,8 +233,9 @@ fabricated `0.0` — alongside the stable `no_acceptance_criteria` diagnostic.
 | --- | --- |
 | `no_acceptance_criteria` | Zero live criteria; ratios have a zero denominator. Not a failure. |
 | `dangling_closing_evidence` | Names every criterion carrying a closing handle that resolves to no live record — including one masked by a higher-precedence bucket. |
-| `criterion_parent_task_conflict` | `OWNED_BY_TASK` target ≠ `parent_task_id`; the field wins. |
-| `criterion_parent_task_unresolved` | The owning `Task` does not resolve to a live `Task`. Still counted in the census, but can never enter the claimed-done set. |
+| `criterion_parent_task_conflict` | Contested ownership: more than one distinct parent `Task` participates in the gate (field vs edge, several edges, or a matching edge plus an extra one). |
+| `parent_task_status_ambiguous` | Some candidate parent `Task` has several CURRENT-CANDIDATE versions recording DIFFERENT statuses (a missing status is a distinct state); the claimed-done test counts the criterion when any current **candidate** is done. Which versions are candidates depends on whether recency resolved — see [Claimed-done-but-unproven](#claimed-done-but-unproven). |
+| `criterion_parent_task_unresolved` | Some candidate parent — the recorded `parent_task_id` or an `OWNED_BY_TASK` edge target — does not resolve to a live `Task`. Still counted in the census. If another candidate resolves to a done task the criterion DOES enter the claimed-done set: the broken representation is reported without suppressing what the live one establishes. |
 | `superseded_criteria_counted` | Names criteria recorded `status: superseded`, which ARE counted in the proof gap — disclosed because the symmetric argument excludes `closed_dropped` tasks. |
 | `results_truncated` | `--limit` truncated a row list; counts stay pre-truncation. |
 | `below_proven_ratio_threshold` | Gate breach, naming the ratio and the bound. |
@@ -337,10 +365,35 @@ lines (`Graph::to_jsonl`, `eg export`), so over `--graph` the relative order of
 two physical writes of one record ID carries no information about which is
 current. This lane therefore never decides an outcome by position: when live
 versions of a closing record disagree, the link resolves `ambiguous_versions` and
-the criterion is never reported `proven`. The residual limit is liveness — a
-record tombstoned and later re-added cannot be distinguished from one merely
-tombstoned in a sorted graph, so it is reported deleted. **`--data-dir` is the
-authoritative current-state read.**
+the criterion is never reported `proven`. The owning `Task` is *mutable* (`open` → `closed_completed` → reopened), and it
+carries a **required RFC 3339 `transaction_time`**. So when every live version of
+a parent is stamped and parseable, recency IS knowable and **only the newest
+version decides** — a reopened task is not reported as a proof gap forever, which
+would trip the gate on work that is legitimately open again.
+
+Which versions are **current candidates** therefore depends on whether recency
+resolved:
+
+- **Recency resolved** (every version stamped and parseable) — only the versions
+  tied at the newest instant are candidates. An older done version does **not**
+  count, which is exactly what stops a reopened task from being a permanent gap.
+- **Recency unresolvable** (a version missing or carrying an unparseable stamp)
+  — **every** version is a candidate, so a status mutation can never drop
+  unproven criteria out of the gap set by line order.
+
+The claimed-done test counts the criterion when any **candidate** is done, and
+`parent_task_status_ambiguous` fires whenever the candidates disagree — including
+several tied at the newest instant.
+
+`parent_task_status` is chosen deterministically, never by line position: a done
+status wins (so the row agrees with the gate it fired), else the single status the
+candidates agree on, else **nothing is shown** — with several disagreeing
+candidates no one of them is the task's status, and naming one would assert a fact
+the store does not support.
+
+The residual limit is liveness — a record tombstoned and later re-added cannot be
+distinguished from one merely tombstoned in a sorted graph, so it is reported
+deleted. **`--data-dir` is the authoritative current-state read.**
 
 ## Scope
 

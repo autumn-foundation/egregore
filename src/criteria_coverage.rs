@@ -62,7 +62,8 @@
 //! or dangling one:
 //!
 //! `failed_evidence` > `dangling_evidence` > `non_verification_evidence` >
-//! `inconclusive_evidence` > `proven` > `unverified`.
+//! `inconclusive_evidence` (which absorbs `ambiguous_versions`) > `proven` >
+//! `unverified`.
 //!
 //! Every handle is listed on the row with its own resolution, so the derivation
 //! is auditable rather than asserted.
@@ -84,8 +85,8 @@ use serde::{Deserialize, Serialize};
 use crate::ir::{EdgeLabel, GraphRecord, NodeKind, SourceSpan};
 use crate::query::liveness::Liveness;
 use crate::query::{
-    VerificationOutcome, is_verification_domain_kind, is_verification_domain_record,
-    verification_outcome,
+    VerificationOutcome, has_evidence_handle, is_closure_target_kind, is_verification_domain_kind,
+    is_verification_domain_record, verification_outcome,
 };
 
 /// The verbatim report disclaimer.
@@ -172,10 +173,14 @@ pub enum LinkResolution {
     Failing,
     /// Live verification-domain record whose outcome is neither passing nor failing.
     Inconclusive,
-    /// Live record that is not a verification record: its ID is not
-    /// verification-domain, its `NodeKind` is not one the verification domain
-    /// permits, or it is the criterion itself.
+    /// Live record that is not a legal closure target: its ID is not
+    /// verification-domain, its `NodeKind` is not one a
+    /// `CLOSES_ACCEPTANCE_CRITERION` edge may target, or it is the criterion
+    /// itself.
     NotVerificationRecord,
+    /// Live verification record carrying NO evidence handle, which the write
+    /// path requires. It claims an outcome but cites nothing.
+    MissingEvidenceHandle,
     /// Several physical versions of the target disagree about the outcome, and
     /// this transport cannot say which is current. Never proof — see
     /// [`resolve_handle`].
@@ -186,11 +191,12 @@ pub enum LinkResolution {
 
 impl LinkResolution {
     /// Every resolution, in documentation order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Passing,
         Self::Failing,
         Self::Inconclusive,
         Self::NotVerificationRecord,
+        Self::MissingEvidenceHandle,
         Self::AmbiguousVersions,
         Self::Unresolved,
     ];
@@ -203,6 +209,7 @@ impl LinkResolution {
             Self::Failing => "failing",
             Self::Inconclusive => "inconclusive",
             Self::NotVerificationRecord => "not_verification_record",
+            Self::MissingEvidenceHandle => "missing_evidence_handle",
             Self::AmbiguousVersions => "ambiguous_versions",
             Self::Unresolved => "unresolved",
         }
@@ -574,10 +581,26 @@ fn resolve_handle(criterion_id: &str, versions: Option<&Vec<&GraphRecord>>) -> R
     // non-verification version is enough to refuse.
     let verification_record = !self_closing
         && is_verification_domain_record(versions[0])
-        && versions.iter().copied().all(is_verification_domain_kind);
+        && versions.iter().copied().all(is_verification_domain_kind)
+        // NARROWER than the domain list: `docs/schema/project-graph.md` §7 and
+        // the daemon's `validate_project_edge` let a
+        // `CLOSES_ACCEPTANCE_CRITERION` edge target only Verification /
+        // CommandRun / TestRun. Accepting a passing `CoverageReport` here would
+        // certify a relationship the write API rejects.
+        && versions.iter().copied().all(is_closure_target_kind);
     if !verification_record {
         return ResolvedLink {
             resolution: LinkResolution::NotVerificationRecord,
+            ..common
+        };
+    }
+    // A verification record with NO evidence handle claims an outcome while
+    // citing nothing. The daemon refuses to persist one (`MissingEvidenceHandle`),
+    // but `--graph` reads and embedded ingest bypass that validator, so a bare
+    // `TestRun { status: "pass" }` would otherwise report `proven` and exit 0.
+    if !versions.iter().copied().all(has_evidence_handle) {
+        return ResolvedLink {
+            resolution: LinkResolution::MissingEvidenceHandle,
             ..common
         };
     }
@@ -614,14 +637,20 @@ fn bucket_for(resolutions: &[LinkResolution]) -> CriterionBucket {
         CriterionBucket::FailedEvidence
     } else if has(LinkResolution::Unresolved) {
         CriterionBucket::DanglingEvidence
-    } else if has(LinkResolution::AmbiguousVersions) {
+    } else if has(LinkResolution::NotVerificationRecord)
+        || has(LinkResolution::MissingEvidenceHandle)
+    {
+        // Invalid PROVENANCE outranks an unknown OUTCOME. A link that is not a
+        // legitimate verification record — wrong domain, wrong kind, the
+        // criterion itself, or citing no evidence at all — is a harder defect
+        // than one whose outcome merely cannot be pinned down, and filing it as
+        // `inconclusive_evidence` would understate invalid provenance in the
+        // aggregate ratios.
+        CriterionBucket::NonVerificationEvidence
+    } else if has(LinkResolution::AmbiguousVersions) || has(LinkResolution::Inconclusive) {
         // "Which version is current is unknown" is an inconclusive outcome, not
         // a failure: reporting `failed_evidence` would fabricate a failure the
         // store never recorded. Either way it is NOT proof.
-        CriterionBucket::InconclusiveEvidence
-    } else if has(LinkResolution::NotVerificationRecord) {
-        CriterionBucket::NonVerificationEvidence
-    } else if has(LinkResolution::Inconclusive) {
         CriterionBucket::InconclusiveEvidence
     } else {
         CriterionBucket::Proven
@@ -721,6 +750,7 @@ pub fn run_criteria_coverage(
     let mut parent_conflict_ids: Vec<String> = Vec::new();
     let mut parent_unresolved_ids: Vec<String> = Vec::new();
     let mut superseded_ids: Vec<String> = Vec::new();
+    let mut parent_status_ambiguous_ids: Vec<String> = Vec::new();
     let mut bucket_counts: BTreeMap<String, usize> = CriterionBucket::ALL
         .iter()
         .map(|b| (b.as_wire().to_owned(), 0usize))
@@ -797,65 +827,201 @@ pub fn run_criteria_coverage(
             dangling_ids.push(handle_field(id));
         }
 
-        // Ownership from BOTH representations. The schema requires the
-        // `OWNED_BY_TASK` target to equal `parent_task_id`; when they disagree the
-        // field wins (it is the record's own claim) and the conflict is reported
-        // rather than silently resolved.
+        // Ownership from BOTH representations: the denormalized `parent_task_id`
+        // and every `OWNED_BY_TASK` edge target. The schema requires them to
+        // agree; when they do not, the disagreement is REPORTED rather than
+        // silently resolved.
         let edge_parents: BTreeSet<&str> = owning_edges.get(id).cloned().unwrap_or_default();
         let field_parent = parent_task_id.as_deref();
-        let resolved_parent: Option<&str> = field_parent.or_else(|| edge_parents.first().copied());
-        if let Some(field) = field_parent
-            && !edge_parents.is_empty()
-            && !edge_parents.contains(field)
-        {
+        // Every parent whose status participates in the gate. Sorted, so every
+        // selection below is deterministic.
+        let candidate_parents: BTreeSet<&str> = field_parent
+            .into_iter()
+            .chain(edge_parents.iter().copied())
+            .collect();
+        // Reads the recorded statuses of one candidate parent across EVERY live
+        // version, but only from versions that really are a `Task` — a non-Task
+        // node never lends its `status` to a criterion.
+        //
+        // All versions, not just one: a project `Task` is mutable (status moves
+        // `open` -> `closed_completed`), and over a lexicographically sorted
+        // graph the position of two writes says nothing about which is current.
+        // Picking one by position could show `open` for a task whose latest
+        // transaction is `closed_completed`, dropping its unproven criteria out
+        // of the gap set — fail-open in the one metric this command enforces.
+        // The statuses that DECIDE for one parent.
+        //
+        // A project `Task` carries a required RFC 3339 `transaction_time`
+        // (`validate_project_node_base`), so when EVERY live version is stamped
+        // and parseable, recency is genuinely knowable and only the newest
+        // version decides. That matters for a REOPENED task
+        // (`closed_completed` then `open`): treating every version as decisive
+        // would report its unproven criteria as a proof gap forever and trip the
+        // gate on work that is legitimately open again — a false alarm, and a
+        // gate that cries wolf stops being read.
+        //
+        // The conservative reading is kept for exactly the cases where recency
+        // CANNOT be established: a version missing or carrying an unparseable
+        // stamp, or several versions tied at the newest instant with different
+        // statuses. Those return every candidate status, so the gate widens and
+        // `parent_task_status_ambiguous` fires.
+        //
+        // A MISSING status is kept as a distinct state (`None`) rather than
+        // dropped: an absent status is not "no version", it is a version whose
+        // status is unknown. Discarding it would let a task with one
+        // `closed_completed` version and one status-less version look unanimous.
+        let deciding_statuses_of = |parent: &str| -> Vec<Option<&String>> {
+            let versions: Vec<(Option<&str>, Option<&String>)> = node_versions
+                .get(parent)
+                .into_iter()
+                .flatten()
+                .filter_map(|version| match version {
+                    GraphRecord::Node {
+                        kind: NodeKind::Task,
+                        status,
+                        transaction_time,
+                        ..
+                    } => Some((transaction_time.as_deref(), status.as_ref())),
+                    _ => None,
+                })
+                .collect();
+            let stamped: Option<Vec<_>> = versions
+                .iter()
+                .map(|(stamp, status)| {
+                    stamp
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|instant| (instant, *status))
+                })
+                .collect();
+            if let Some(stamped) = stamped
+                && let Some(newest) = stamped.iter().map(|(instant, _)| *instant).max()
+            {
+                // Every version is stamped: only the newest instant decides. A
+                // tie across DIFFERENT statuses is still unresolved, and falls
+                // through as several statuses so ambiguity fires below.
+                return stamped
+                    .iter()
+                    .filter(|(instant, _)| *instant == newest)
+                    .map(|(_, status)| *status)
+                    .collect();
+            }
+            versions.iter().map(|(_, status)| *status).collect()
+        };
+        // ONE normalization, used by every comparison of a task status below.
+        // `is_done` trims and lowercases, so comparing raw strings anywhere else
+        // would make `open` and ` OPEN ` equivalent to the gate but DIFFERENT to
+        // the ambiguity check — a false `parent_task_status_ambiguous` claiming
+        // versions record different states when they record the same one.
+        let normalized = |status: Option<&String>| -> Option<String> {
+            status.map(|s| s.trim().to_ascii_lowercase())
+        };
+        let is_done = |status: &str| {
+            DONE_TASK_STATUSES.contains(&status.trim().to_ascii_lowercase().as_str())
+        };
+        let has_done_version = |parent: &str| {
+            deciding_statuses_of(parent)
+                .iter()
+                .any(|status| status.is_some_and(|s| is_done(s)))
+        };
+        // Version ambiguity is evaluated over EVERY candidate parent, matching
+        // exactly the set the gate reads. Checking only the displayed parent
+        // would let a non-selected target's disagreeing versions drive
+        // `claimed_done` while emitting no disclosure at all.
+        if candidate_parents.iter().any(|parent| {
+            deciding_statuses_of(parent)
+                .iter()
+                .copied()
+                .map(normalized)
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1
+        }) {
+            parent_status_ambiguous_ids.push(handle_field(id));
+        }
+        // The candidate whose status actually fires the gate, if any.
+        let done_parent = candidate_parents
+            .iter()
+            .copied()
+            .find(|parent| has_done_version(parent));
+
+        // Ownership is contested exactly when MORE THAN ONE distinct parent
+        // participates in the gate. Stated over the candidate set rather than as
+        // a field-versus-edge comparison, because every candidate feeds
+        // `done_parent`: with `parent_task_id = A` and edges to both A and B, an
+        // agreeing-field check would report no conflict while B silently widened
+        // the gate. One rule covers every shape — field disagreeing with an edge,
+        // several edges with no field to arbitrate, and the mixed
+        // matching-plus-extra case.
+        if candidate_parents.len() > 1 {
             parent_conflict_ids.push(handle_field(id));
         }
-        // Reads the recorded status of one candidate parent, but only when that
-        // id really resolves to a live `Task` — a non-Task node never lends its
-        // `status` to a criterion.
-        let task_status_of = |parent: &str| -> Option<&String> {
-            match live_nodes.get(parent) {
-                Some(GraphRecord::Node {
-                    kind: NodeKind::Task,
-                    status,
-                    ..
-                }) => status.as_ref(),
-                _ => None,
-            }
-        };
-        let parent_task_status = resolved_parent.and_then(task_status_of).cloned();
-        if resolved_parent.is_none_or(|parent| {
-            !matches!(
+
+        // Display the DECIDING parent when one is done, so a row can never
+        // contradict its own `claimed_done_unproven` verdict by citing an `open`
+        // task; otherwise the record's own field, else the smallest edge target.
+        let resolved_parent: Option<&str> = done_parent
+            .or(field_parent)
+            .or_else(|| edge_parents.first().copied());
+        // Deterministic by construction. The deciding statuses are collected in
+        // slice order, so choosing one by POSITION (`last()`) would make the
+        // rendered report depend on input line order — breaking the
+        // byte-identical, order-independent contract in exactly the case where
+        // versions genuinely disagree. Instead:
+        //
+        //   * a DONE status wins, so the row agrees with the gate it fired;
+        //   * else, when the candidates agree, that single status is shown;
+        //   * else NOTHING is shown — several versions are current candidates and
+        //     no one of them is the task's status, so naming one would assert a
+        //     fact the store does not support. `parent_task_status_ambiguous`
+        //     carries that story instead.
+        let parent_task_status = resolved_parent.and_then(|parent| {
+            let deciding = deciding_statuses_of(parent);
+            // Distinctness is judged on the NORMALIZED status, matching the gate;
+            // the RECORDED text is what gets displayed, so the row echoes what the
+            // store actually says rather than a rewritten form.
+            let distinct: BTreeSet<Option<String>> =
+                deciding.iter().copied().map(normalized).collect();
+            let recorded: BTreeSet<&String> = deciding.iter().copied().flatten().collect();
+            recorded
+                .iter()
+                .find(|s| is_done(s))
+                .or_else(|| (distinct.len() == 1).then(|| recorded.first()).flatten())
+                .map(|s| (*s).clone())
+        });
+        // Resolution is evaluated across EVERY candidate, not just the displayed
+        // one. Selecting the deciding parent first would let a live edge target
+        // mask a `parent_task_id` naming a missing or non-Task record — a broken
+        // required ownership representation that would then appear nowhere in
+        // the report.
+        let resolves_to_live_task = |parent: &str| {
+            matches!(
                 live_nodes.get(parent),
                 Some(GraphRecord::Node {
                     kind: NodeKind::Task,
                     ..
                 })
             )
-        }) {
+        };
+        if candidate_parents.is_empty()
+            || !candidate_parents.iter().all(|p| resolves_to_live_task(p))
+        {
             parent_unresolved_ids.push(handle_field(id));
         }
 
         // The claimed-done test runs over EVERY candidate parent — the
-        // denormalized field AND every `OWNED_BY_TASK` edge target — not just the
-        // one displayed. When the two representations disagree, letting the
-        // displayed field alone decide would be FAIL-OPEN in the single metric
-        // this command exists to enforce: a criterion whose edge names a
-        // completed task would slip out of the gap set. The gate is the one
-        // place ambiguity must widen the alarm, not narrow it.
+        // denormalized field AND every `OWNED_BY_TASK` edge target, across every
+        // live version of each. Letting the displayed parent alone decide would
+        // be FAIL-OPEN in the single metric this command exists to enforce: a
+        // criterion whose edge names a completed task would slip out of the gap
+        // set. The gate is the one place ambiguity must widen the alarm, not
+        // narrow it — and `parent_status_ambiguous` / `parent_task_conflict`
+        // above disclose every input that widened it.
         //
-        // The comparison is trimmed and lowercased, matching the sibling
-        // `verification_outcome` rule, so a `--graph` (which no importer
+        // The comparison is trimmed and lowercased (see `is_done`), matching the
+        // sibling `verification_outcome` rule, so a `--graph` (which no importer
         // validated) cannot smuggle a criterion past the gate with
         // `"Closed_Completed"` or a stray leading space.
-        let claimed_done = field_parent
-            .into_iter()
-            .chain(edge_parents.iter().copied())
-            .filter_map(task_status_of)
-            .any(|status| {
-                DONE_TASK_STATUSES.contains(&status.trim().to_ascii_lowercase().as_str())
-            })
-            && bucket != CriterionBucket::Proven;
+        let claimed_done = done_parent.is_some() && bucket != CriterionBucket::Proven;
 
         // A criterion recorded `superseded` was REPLACED, not left unproven —
         // the same argument that excludes `closed_dropped` from the done set.
@@ -948,8 +1114,28 @@ pub fn run_criteria_coverage(
         diagnostics.push(CriteriaCoverageDiagnostic {
             code: "criterion_parent_task_conflict".to_owned(),
             record_ids: parent_conflict_ids,
-            detail: "criterion(s) whose OWNED_BY_TASK edge target differs from parent_task_id; \
-                     the recorded field wins and the conflict is reported"
+            detail: "criterion(s) for which MORE THAN ONE distinct parent Task participates in \
+                     the claimed-done test (parent_task_id vs an OWNED_BY_TASK edge, several \
+                     edges, or a matching edge plus an extra one). Every candidate widens the \
+                     gate; the row cites the DECIDING parent — the one whose done status fired \
+                     it — falling back to the recorded parent_task_id, then the smallest edge \
+                     target"
+                .to_owned(),
+        });
+    }
+    if !parent_status_ambiguous_ids.is_empty() {
+        parent_status_ambiguous_ids.sort();
+        diagnostics.push(CriteriaCoverageDiagnostic {
+            code: "parent_task_status_ambiguous".to_owned(),
+            record_ids: parent_status_ambiguous_ids,
+            detail: "criterion(s) whose owning Task has several CURRENT-CANDIDATE versions \
+                     recording DIFFERENT statuses. Which versions are candidates depends on \
+                     whether recency could be established: when every version carries a \
+                     parseable transaction_time, only those tied at the NEWEST instant are \
+                     candidates and an older done version does NOT count; otherwise EVERY \
+                     version is a candidate. The claimed-done test counts the criterion when any \
+                     CANDIDATE is done, and no single status is displayed unless one is done or \
+                     the candidates agree. Use --data-dir for an authoritative current-state read"
                 .to_owned(),
         });
     }
@@ -969,9 +1155,13 @@ pub fn run_criteria_coverage(
         diagnostics.push(CriteriaCoverageDiagnostic {
             code: "criterion_parent_task_unresolved".to_owned(),
             record_ids: parent_unresolved_ids,
-            detail: "criterion(s) whose owning Task does not resolve to a live Task record; they \
-                     are still counted in the census but can never enter the \
-                     claimed-done-but-unproven set"
+            detail: "criterion(s) for which SOME candidate parent — the recorded parent_task_id \
+                     or an OWNED_BY_TASK edge target — does not resolve to a live Task record. \
+                     They are still counted in the census. A criterion whose OTHER candidate \
+                     resolves to a done task DOES enter the claimed-done-but-unproven set: the \
+                     broken representation is reported here without suppressing what the live \
+                     one establishes. Only a criterion with NO live done candidate stays out of \
+                     that set"
                 .to_owned(),
         });
     }
@@ -1116,6 +1306,20 @@ mod tests {
         r
     }
 
+    /// A `Task` version stamped with an RFC 3339 `transaction_time`, as the
+    /// validated project write path requires.
+    fn task_at(id: &str, status: &str, transaction_time: &str) -> GraphRecord {
+        let mut r = task(id, status);
+        if let GraphRecord::Node {
+            transaction_time: tt,
+            ..
+        } = &mut r
+        {
+            *tt = Some(transaction_time.to_owned());
+        }
+        r
+    }
+
     fn criterion(id: &str, parent: &str, ordinal: u32, status: &str) -> GraphRecord {
         let mut r = GraphRecord::node(
             id.to_owned(),
@@ -1166,12 +1370,34 @@ mod tests {
             status: s,
             exit_code,
             text,
+            source_artifact_path,
+            source_artifact_hash,
             ..
         } = &mut r
         {
             *s = status.map(ToOwned::to_owned);
             *exit_code = code;
             *text = Some("SECRET-COMMAND-OUTPUT".to_owned());
+            // Every real writer populates an evidence handle; the write path
+            // refuses a verification record without one.
+            *source_artifact_path = Some("tests/run.sh".to_owned());
+            *source_artifact_hash = Some("blake3:fixture".to_owned());
+        }
+        r
+    }
+
+    /// A verification record with NO evidence handle — what the daemon refuses
+    /// to persist but a hand-authored graph can still contain.
+    fn verification_without_handle(id: &str, status: &str) -> GraphRecord {
+        let mut r = verification(id, NodeKind::TestRun, Some(status), None);
+        if let GraphRecord::Node {
+            source_artifact_path,
+            source_artifact_hash,
+            ..
+        } = &mut r
+        {
+            *source_artifact_path = None;
+            *source_artifact_hash = None;
         }
         r
     }
@@ -1976,21 +2202,568 @@ mod tests {
         ];
         let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
         let r = row(&report, AC_U1);
-        assert_eq!(
-            r.parent_task_id.as_deref(),
-            Some(TASK_OPEN),
-            "the recorded field is displayed"
-        );
         assert!(
             r.claimed_done_unproven,
             "the edge's done task must still pull it into the gap set"
         );
+        assert_eq!(
+            r.parent_task_id.as_deref(),
+            Some(TASK_DONE),
+            "the row cites the DECIDING parent, so it cannot contradict its own verdict"
+        );
+        assert_eq!(r.parent_task_status.as_deref(), Some("closed_completed"));
         assert!(
             report
                 .diagnostics
                 .iter()
                 .any(|d| d.code == "criterion_parent_task_conflict"
                     && d.record_ids.contains(&AC_U1.to_owned()))
+        );
+    }
+
+    /// Ambiguity must be evaluated over every parent whose status feeds the
+    /// gate, not just the displayed one.
+    ///
+    /// Otherwise a NON-selected `OWNED_BY_TASK` target with disagreeing versions
+    /// could drive `claimed_done_unproven` while the report disclosed nothing.
+    #[test]
+    fn ambiguity_is_checked_on_every_candidate_parent() {
+        let records = vec![
+            // The displayed (field) parent is unambiguous and open...
+            task(TASK_OPEN, "open"),
+            // ...while a second, edge-named parent disagrees with itself.
+            task(TASK_DONE, "closed_completed"),
+            task(TASK_DONE, "open"),
+            criterion(AC_U1, TASK_OPEN, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert!(
+            row(&report, AC_U1).claimed_done_unproven,
+            "the ambiguous parent still widens the gate"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous"
+                    && d.record_ids.contains(&AC_U1.to_owned())),
+            "...and the ambiguity that widened it must be disclosed"
+        );
+    }
+
+    /// Several `OWNED_BY_TASK` edges naming different tasks, with NO field to
+    /// arbitrate, is contested ownership and must be reported.
+    #[test]
+    fn multiple_edge_parents_without_a_field_are_reported_as_contested() {
+        let mut ac = criterion(AC_U1, TASK_OPEN, 0, "unverified");
+        if let GraphRecord::Node { parent_task_id, .. } = &mut ac {
+            *parent_task_id = None;
+        }
+        let records = vec![
+            task(TASK_OPEN, "open"),
+            task(TASK_DONE, "closed_completed"),
+            ac,
+            owned_by(AC_U1, TASK_OPEN),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        let r = row(&report, AC_U1);
+        assert!(
+            r.claimed_done_unproven,
+            "the done edge parent widens the gate"
+        );
+        assert_eq!(
+            r.parent_task_id.as_deref(),
+            Some(TASK_DONE),
+            "the deciding parent is displayed, never an unrelated open one"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "criterion_parent_task_conflict"
+                    && d.record_ids.contains(&AC_U1.to_owned())),
+            "picking one of several edge parents silently would hide the contest"
+        );
+    }
+
+    /// An edge that AGREES with the field does not make ownership uncontested
+    /// when a second edge names a different task.
+    ///
+    /// Every candidate feeds the gate, so a field-versus-edge comparison that
+    /// passes because the set merely CONTAINS the field would let the extra
+    /// parent widen the gate with no conflict reported.
+    #[test]
+    fn an_extra_edge_parent_alongside_a_matching_one_is_still_contested() {
+        let records = vec![
+            task(TASK_OPEN, "open"),
+            task(TASK_DONE, "closed_completed"),
+            // field = OPEN, edges = {OPEN (agrees), DONE (extra)}.
+            criterion(AC_U1, TASK_OPEN, 0, "unverified"),
+            owned_by(AC_U1, TASK_OPEN),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert!(
+            row(&report, AC_U1).claimed_done_unproven,
+            "the extra parent widens the gate"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "criterion_parent_task_conflict"
+                    && d.record_ids.contains(&AC_U1.to_owned())),
+            "...so the contest that widened it must be reported"
+        );
+    }
+
+    /// A single parent named by BOTH representations is not contested.
+    #[test]
+    fn one_parent_named_by_field_and_edge_is_uncontested() {
+        let records = vec![
+            task(TASK_DONE, "closed_completed"),
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert!(row(&report, AC_U1).claimed_done_unproven);
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "criterion_parent_task_conflict"),
+            "agreeing representations of ONE parent are not a conflict"
+        );
+    }
+
+    /// A version with NO recorded status is a distinct state, not an absence.
+    ///
+    /// Dropping it before comparing versions would let a task with one
+    /// `closed_completed` version and one status-less version look unanimous, so
+    /// the criterion would be reported claimed-done with no disclosure that the
+    /// transport cannot say which version is current.
+    #[test]
+    fn a_status_less_task_version_counts_as_parent_ambiguity() {
+        let mut statusless = task(TASK_DONE, "closed_completed");
+        if let GraphRecord::Node { status, .. } = &mut statusless {
+            *status = None;
+        }
+        let records = vec![
+            task(TASK_DONE, "closed_completed"),
+            statusless,
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert!(
+            row(&report, AC_U1).claimed_done_unproven,
+            "the done version still widens the gate"
+        );
+        assert_eq!(
+            row(&report, AC_U1).parent_task_status.as_deref(),
+            Some("closed_completed"),
+            "the recorded status is still displayed"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous"
+                    && d.record_ids.contains(&AC_U1.to_owned())),
+            "...but a missing status is a DISTINCT version state and must be disclosed"
+        );
+    }
+
+    /// The conflict diagnostic must describe the behaviour that actually runs.
+    ///
+    /// The row cites the DECIDING parent, so a detail claiming the recorded
+    /// field wins would hand operators two contradictory explanations of one
+    /// stable code.
+    #[test]
+    fn the_conflict_diagnostic_describes_deciding_parent_selection() {
+        let records = vec![
+            task(TASK_OPEN, "open"),
+            task(TASK_DONE, "closed_completed"),
+            criterion(AC_U1, TASK_OPEN, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        // The behaviour the detail must describe.
+        assert_eq!(
+            row(&report, AC_U1).parent_task_id.as_deref(),
+            Some(TASK_DONE)
+        );
+        let detail = &report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "criterion_parent_task_conflict")
+            .expect("conflict diagnostic present")
+            .detail;
+        assert!(
+            detail.contains("DECIDING"),
+            "the detail must describe deciding-parent selection: {detail}"
+        );
+        assert!(
+            !detail.contains("field wins"),
+            "the detail must not claim the field wins: {detail}"
+        );
+    }
+
+    /// A REOPENED task must not be reported as a proof gap forever.
+    ///
+    /// Project records carry a required RFC 3339 `transaction_time`, so when
+    /// every version is stamped recency IS knowable and only the newest decides.
+    /// Treating every version as decisive would trip the gate on work that is
+    /// legitimately open again — a false alarm, and a gate that cries wolf stops
+    /// being read.
+    #[test]
+    fn a_reopened_task_is_not_a_permanent_proof_gap() {
+        let records = vec![
+            task_at(TASK_DONE, "closed_completed", "2026-01-01T00:00:00Z"),
+            task_at(TASK_DONE, "open", "2026-02-01T00:00:00Z"),
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        let r = row(&report, AC_U1);
+        assert!(
+            !r.claimed_done_unproven,
+            "the newest version reopened the task, so there is no claimed-done gap"
+        );
+        assert_eq!(r.parent_task_status.as_deref(), Some("open"));
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous"),
+            "recency was knowable, so nothing is ambiguous"
+        );
+        // The criterion is still unproven — it just is not CLAIMED-DONE
+        // unproven, so the claimed-done gate must not fire.
+        assert_eq!(report.claimed_done_unproven_count, 0);
+        assert!(
+            !report
+                .breaches
+                .iter()
+                .any(|b| b.metric == "claimed_done_unproven"),
+            "breaches={:?}",
+            report.breaches
+        );
+    }
+
+    /// ...and the mirror: a task CLOSED after being open is claimed-done, with
+    /// no ambiguity, because recency resolves it.
+    #[test]
+    fn a_task_closed_after_being_open_is_claimed_done_without_ambiguity() {
+        let records = vec![
+            task_at(TASK_DONE, "open", "2026-01-01T00:00:00Z"),
+            task_at(TASK_DONE, "closed_completed", "2026-02-01T00:00:00Z"),
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert!(row(&report, AC_U1).claimed_done_unproven);
+        assert_eq!(
+            row(&report, AC_U1).parent_task_status.as_deref(),
+            Some("closed_completed")
+        );
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous")
+        );
+    }
+
+    /// Recency decides only when it CAN be established. A version with no
+    /// stamp, or a tie at the newest instant across different statuses, falls
+    /// back to the conservative widening plus its disclosure.
+    #[test]
+    fn unresolvable_recency_falls_back_to_the_conservative_reading() {
+        // (a) One version stamped, one not: no total order.
+        let partial = vec![
+            task_at(TASK_DONE, "closed_completed", "2026-01-01T00:00:00Z"),
+            task(TASK_DONE, "open"),
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&partial, &CriteriaCoverageConfig::default());
+        assert!(
+            row(&report, AC_U1).claimed_done_unproven,
+            "an unstamped version blocks recency, so the gate widens"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous")
+        );
+
+        // (b) Both stamped at the SAME instant with different statuses.
+        let tied = vec![
+            task_at(TASK_DONE, "closed_completed", "2026-01-01T00:00:00Z"),
+            task_at(TASK_DONE, "open", "2026-01-01T00:00:00Z"),
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&tied, &CriteriaCoverageConfig::default());
+        assert!(
+            row(&report, AC_U1).claimed_done_unproven,
+            "a tie at the newest instant is not a resolution"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous")
+        );
+
+        // (c) An UNPARSEABLE stamp is not a stamp.
+        let mut garbled = task(TASK_DONE, "open");
+        if let GraphRecord::Node {
+            transaction_time, ..
+        } = &mut garbled
+        {
+            *transaction_time = Some("not-a-timestamp".to_owned());
+        }
+        let bad = vec![
+            task_at(TASK_DONE, "closed_completed", "2026-01-01T00:00:00Z"),
+            garbled,
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&bad, &CriteriaCoverageConfig::default());
+        assert!(row(&report, AC_U1).claimed_done_unproven);
+    }
+
+    /// Invalid PROVENANCE outranks an unknown OUTCOME.
+    ///
+    /// A criterion carrying one link that is not a legitimate verification
+    /// record and another whose versions disagree must be filed under
+    /// `non_verification_evidence`: bucketing it as `inconclusive_evidence`
+    /// would understate invalid provenance in the aggregate ratios.
+    #[test]
+    fn invalid_provenance_outranks_an_unknown_outcome() {
+        // One target cites no evidence handle at all...
+        let bare = verification_without_handle("verification:v1:bare", "pass");
+        // ...another is a real record whose live versions disagree.
+        let records = vec![
+            task(TASK_DONE, "closed_completed"),
+            bare,
+            verification(VER_PASS_1, NodeKind::TestRun, Some("pass"), None),
+            verification(VER_PASS_1, NodeKind::TestRun, Some("fail"), None),
+            criterion(AC_P1, TASK_DONE, 0, "verified"),
+            closes(AC_P1, "verification:v1:bare"),
+            closes(AC_P1, VER_PASS_1),
+            owned_by(AC_P1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        let r = row(&report, AC_P1);
+        assert_eq!(
+            r.bucket, "non_verification_evidence",
+            "invalid provenance must not be filed as merely inconclusive"
+        );
+        // Both resolutions are still visible on the row, so the derivation stays
+        // auditable rather than collapsed to the winning one.
+        let resolutions: BTreeSet<&str> = r
+            .closing_links
+            .iter()
+            .map(|l| l.resolution.as_str())
+            .collect();
+        assert!(
+            resolutions.contains("missing_evidence_handle"),
+            "{resolutions:?}"
+        );
+        assert!(
+            resolutions.contains("ambiguous_versions"),
+            "{resolutions:?}"
+        );
+        assert!(r.proving_verification_id.is_none());
+    }
+
+    /// Versions differing only by casing or whitespace record the SAME state.
+    ///
+    /// `is_done` trims and lowercases, so comparing raw strings in the ambiguity
+    /// check would emit a false `parent_task_status_ambiguous` — claiming the
+    /// versions disagree when they do not — and suppress the displayed status.
+    #[test]
+    fn statuses_differing_only_by_case_or_whitespace_are_not_ambiguous() {
+        // (a) Two current versions, same state, different spelling.
+        let records = vec![
+            task_at(TASK_OPEN, "open", "2026-01-01T00:00:00Z"),
+            task_at(TASK_OPEN, "  OPEN  ", "2026-01-01T00:00:00Z"),
+            criterion(AC_U1, TASK_OPEN, 0, "unverified"),
+            owned_by(AC_U1, TASK_OPEN),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous"),
+            "one state spelled two ways is not a disagreement"
+        );
+        assert!(
+            row(&report, AC_U1).parent_task_status.is_some(),
+            "an agreed status must still be displayed"
+        );
+        assert!(!row(&report, AC_U1).claimed_done_unproven);
+
+        // (b) The same, for a DONE state: still unambiguous, still claimed-done.
+        let done = vec![
+            task_at(TASK_DONE, "closed_completed", "2026-01-01T00:00:00Z"),
+            task_at(TASK_DONE, "CLOSED_COMPLETED", "2026-01-01T00:00:00Z"),
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&done, &CriteriaCoverageConfig::default());
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous")
+        );
+        assert!(row(&report, AC_U1).claimed_done_unproven);
+
+        // (c) A GENUINE disagreement is still reported.
+        let differing = vec![
+            task_at(TASK_OPEN, "open", "2026-01-01T00:00:00Z"),
+            task_at(TASK_OPEN, "blocked", "2026-01-01T00:00:00Z"),
+            criterion(AC_U1, TASK_OPEN, 0, "unverified"),
+            owned_by(AC_U1, TASK_OPEN),
+        ];
+        let report = run_criteria_coverage(&differing, &CriteriaCoverageConfig::default());
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous"),
+            "normalizing must not mask a real disagreement"
+        );
+    }
+
+    /// A tie at the newest instant with no done status must render
+    /// deterministically and claim nothing.
+    ///
+    /// The deciding statuses are collected in slice order, so selecting one by
+    /// POSITION would make the report depend on input line order — the exact
+    /// contract this lane sells. With several current candidates and none done,
+    /// no single status is the task's status, so none is displayed.
+    #[test]
+    fn a_tie_with_no_done_status_renders_deterministically_and_claims_nothing() {
+        let build = |reversed: bool| {
+            let mut records = vec![
+                task_at(TASK_DONE, "closed_completed", "2026-01-01T00:00:00Z"),
+                task_at(TASK_DONE, "open", "2026-02-01T00:00:00Z"),
+                task_at(TASK_DONE, "blocked", "2026-02-01T00:00:00Z"),
+                criterion(AC_U1, TASK_DONE, 0, "unverified"),
+                owned_by(AC_U1, TASK_DONE),
+            ];
+            if reversed {
+                records.reverse();
+            }
+            run_criteria_coverage(&records, &CriteriaCoverageConfig::default())
+        };
+        let forward = build(false);
+        let backward = build(true);
+        assert_eq!(
+            serde_json::to_string(&forward).expect("a"),
+            serde_json::to_string(&backward).expect("b"),
+            "a disagreeing tie must not render differently by input order"
+        );
+        let r = row(&forward, AC_U1);
+        assert!(
+            r.parent_task_status.is_none(),
+            "no single status is current, so none may be claimed: {:?}",
+            r.parent_task_status
+        );
+        assert!(
+            !r.claimed_done_unproven,
+            "the OLDER done version is not a current candidate once recency resolved the newest"
+        );
+        assert!(
+            forward
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous")
+        );
+    }
+
+    /// The ambiguity diagnostic must describe BOTH candidate rules, since they
+    /// disagree about whether an older done version counts.
+    #[test]
+    fn the_ambiguity_diagnostic_distinguishes_both_candidate_rules() {
+        let records = vec![
+            task_at(TASK_DONE, "closed_completed", "2026-01-01T00:00:00Z"),
+            task_at(TASK_DONE, "open", "2026-02-01T00:00:00Z"),
+            task_at(TASK_DONE, "blocked", "2026-02-01T00:00:00Z"),
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        let detail = &report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "parent_task_status_ambiguous")
+            .expect("ambiguity diagnostic present")
+            .detail;
+        assert!(
+            detail.contains("NEWEST"),
+            "the newest-instant rule must be described: {detail}"
+        );
+        assert!(
+            detail.contains("EVERY"),
+            "the all-versions fallback must be described: {detail}"
+        );
+        assert!(
+            !detail.contains("ANY version is done"),
+            "the old wording contradicts the newest-tie behaviour: {detail}"
+        );
+    }
+
+    /// A broken `parent_task_id` must be reported even when a live edge parent
+    /// makes it the non-deciding representation.
+    #[test]
+    fn an_unresolvable_field_parent_is_reported_even_when_an_edge_resolves() {
+        let records = vec![
+            task(TASK_DONE, "closed_completed"),
+            // The field names a record that does not exist...
+            criterion(AC_U1, "project:v1:ghost-task", 0, "unverified"),
+            // ...while a live edge names a completed task.
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert!(
+            row(&report, AC_U1).claimed_done_unproven,
+            "the live done edge parent still fires the gate"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "criterion_parent_task_unresolved"
+                    && d.record_ids.contains(&AC_U1.to_owned())),
+            "a broken required ownership representation must not vanish from the report"
+        );
+        // ...and the diagnostic must not contradict the row it accompanies: this
+        // criterion IS unresolved AND IS claimed-done, so wording claiming such
+        // criteria can never be claimed-done would make the report disagree with
+        // itself.
+        let detail = &report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "criterion_parent_task_unresolved")
+            .expect("unresolved diagnostic present")
+            .detail;
+        assert!(
+            !detail.contains("can never enter"),
+            "the detail contradicts the row it accompanies: {detail}"
+        );
+        assert!(
+            detail.contains("DOES enter"),
+            "the detail must state that a live done candidate still counts: {detail}"
         );
     }
 
@@ -2117,6 +2890,116 @@ mod tests {
         assert!(diag.record_ids.contains(&AC_U1.to_owned()));
     }
 
+    /// A verification record citing NO evidence handle must not prove anything.
+    ///
+    /// The daemon refuses to persist one (`MissingEvidenceHandle`), but
+    /// `--graph` reads and embedded ingest bypass that validator, so a bare
+    /// `TestRun { status: "pass" }` would otherwise report `proven` at exit 0.
+    #[test]
+    fn a_verification_record_without_an_evidence_handle_is_not_proof() {
+        let records = vec![
+            task(TASK_DONE, "closed_completed"),
+            verification_without_handle(VER_PASS_1, "pass"),
+            criterion(AC_P1, TASK_DONE, 0, "verified"),
+            closes(AC_P1, VER_PASS_1),
+            owned_by(AC_P1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert_eq!(row(&report, AC_P1).bucket, "non_verification_evidence");
+        assert_eq!(
+            row(&report, AC_P1).closing_links[0].resolution,
+            "missing_evidence_handle"
+        );
+        assert!(row(&report, AC_P1).proving_verification_id.is_none());
+        assert!(!report.ok, "the gate must fail");
+    }
+
+    /// A kind the verification domain permits but a `CLOSES_ACCEPTANCE_CRITERION`
+    /// edge may NOT target cannot prove a criterion.
+    ///
+    /// The edge registry admits only `Verification` / `CommandRun` / `TestRun`, so a
+    /// passing `CoverageReport` closing a criterion is a relationship the write
+    /// API rejects.
+    #[test]
+    fn a_verification_kind_outside_the_closure_target_set_is_not_proof() {
+        for kind in [
+            NodeKind::CoverageReport,
+            NodeKind::BenchmarkRun,
+            NodeKind::CIStatus,
+            NodeKind::ProofResult,
+        ] {
+            let records = vec![
+                task(TASK_DONE, "closed_completed"),
+                verification(VER_PASS_1, kind, Some("pass"), None),
+                criterion(AC_P1, TASK_DONE, 0, "verified"),
+                closes(AC_P1, VER_PASS_1),
+                owned_by(AC_P1, TASK_DONE),
+            ];
+            let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+            assert_eq!(
+                row(&report, AC_P1).bucket,
+                "non_verification_evidence",
+                "{kind:?} is not a legal CLOSES_ACCEPTANCE_CRITERION target"
+            );
+            assert_eq!(
+                row(&report, AC_P1).closing_links[0].resolution,
+                "not_verification_record"
+            );
+        }
+        // ...while the three legal target kinds still prove.
+        for kind in [
+            NodeKind::Verification,
+            NodeKind::CommandRun,
+            NodeKind::TestRun,
+        ] {
+            let records = vec![
+                task(TASK_DONE, "closed_completed"),
+                verification(VER_PASS_1, kind, Some("pass"), None),
+                criterion(AC_P1, TASK_DONE, 0, "verified"),
+                closes(AC_P1, VER_PASS_1),
+                owned_by(AC_P1, TASK_DONE),
+            ];
+            let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+            assert_eq!(row(&report, AC_P1).bucket, "proven", "{kind:?} is legal");
+        }
+    }
+
+    /// A mutable `Task` with two live versions recording different statuses must
+    /// not let record order decide the gate.
+    #[test]
+    fn a_task_status_mutation_cannot_hide_a_criterion_from_the_gate() {
+        // The `open` version is written LAST, so a position-based read would
+        // show `open` and drop the criterion out of the gap set.
+        let records = vec![
+            task(TASK_DONE, "closed_completed"),
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+            task(TASK_DONE, "open"),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        assert!(
+            row(&report, AC_U1).claimed_done_unproven,
+            "a done version anywhere in the slice must hold the criterion in the gap set"
+        );
+        assert_eq!(
+            row(&report, AC_U1).parent_task_status.as_deref(),
+            Some("closed_completed"),
+            "the displayed status must agree with the gate, not contradict it"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous"),
+            "the ambiguity must be disclosed"
+        );
+        // Order-independent: the same slice reversed gives the same verdict.
+        let mut reversed = records;
+        reversed.reverse();
+        let flipped = run_criteria_coverage(&reversed, &CriteriaCoverageConfig::default());
+        assert!(row(&flipped, AC_U1).claimed_done_unproven);
+    }
+
     #[test]
     fn wire_names_are_pinned_exactly() {
         // Renaming any of these silently breaks the JSON contract, so pin the
@@ -2141,6 +3024,7 @@ mod tests {
                 "failing",
                 "inconclusive",
                 "not_verification_record",
+                "missing_evidence_handle",
                 "ambiguous_versions",
                 "unresolved",
             ]

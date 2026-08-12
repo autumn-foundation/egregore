@@ -541,6 +541,57 @@ pub const VERIFICATION_DOMAIN_KINDS: &[NodeKind] = &[
     NodeKind::ProofResult,
 ];
 
+/// The node kinds a `CLOSES_ACCEPTANCE_CRITERION` edge may target.
+///
+/// NARROWER than [`VERIFICATION_DOMAIN_KINDS`]: the project-graph edge registry
+/// (`docs/schema/project-graph.md` §7) and the daemon's `validate_project_edge`
+/// admit only these three, so a `CoverageReport` or `BenchmarkRun` closing a
+/// criterion is a relationship the write API REJECTS. Shared so a reader cannot
+/// accept a closure the writer would refuse.
+pub const CLOSURE_TARGET_KINDS: &[NodeKind] = &[
+    NodeKind::Verification,
+    NodeKind::CommandRun,
+    NodeKind::TestRun,
+];
+
+/// Returns `true` when `record` may legally be the target of a
+/// `CLOSES_ACCEPTANCE_CRITERION` edge.
+#[must_use]
+pub fn is_closure_target_kind(record: &GraphRecord) -> bool {
+    matches!(record, GraphRecord::Node { kind, .. } if CLOSURE_TARGET_KINDS.contains(kind))
+}
+
+/// Returns `true` when a verification-domain record carries the evidence handle
+/// `docs/schema/verification.md` requires.
+///
+/// The daemon write path refuses a verification record with no
+/// `source_artifact_hash`, `source_artifact_path`, or output-handle hash
+/// (`MissingEvidenceHandle`). `--graph` reads and embedded ingest bypass that
+/// validator, so a reader treating such a record as evidence would accept a bare
+/// `TestRun { status: "pass" }` the write API would never have stored. Shared so
+/// the two cannot fork.
+#[must_use]
+pub fn has_evidence_handle(record: &GraphRecord) -> bool {
+    let GraphRecord::Node {
+        source_artifact_hash,
+        source_artifact_path,
+        stdout_handle,
+        stderr_handle,
+        ..
+    } = record
+    else {
+        return false;
+    };
+    source_artifact_hash
+        .as_deref()
+        .is_some_and(|s| !s.is_empty())
+        || source_artifact_path
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        || stdout_handle.as_deref().is_some_and(|h| !h.hash.is_empty())
+        || stderr_handle.as_deref().is_some_and(|h| !h.hash.is_empty())
+}
+
 /// Returns `true` when `record` is a node whose kind is permitted under the
 /// verification domain.
 ///
