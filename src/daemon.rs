@@ -11853,7 +11853,7 @@ fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequ
     let mut chunk = [0_u8; 1024];
     let header_end = loop {
         set_request_read_timeout(stream, started)?;
-        let read = stream.read(&mut chunk)?;
+        let read = read_within_deadline(stream, &mut chunk)?;
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -11913,7 +11913,7 @@ fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequ
     let mut body = buffer[body_start..].to_vec();
     while body.len() < content_length {
         set_request_read_timeout(stream, started)?;
-        let read = stream.read(&mut chunk)?;
+        let read = read_within_deadline(stream, &mut chunk)?;
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -11929,6 +11929,32 @@ fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequ
         headers,
         body,
     })
+}
+
+/// Reads into `chunk`, reporting an expired read deadline as one stable error
+/// kind whatever the platform calls it.
+///
+/// A socket read that hits `SO_RCVTIMEO` surfaces as `WouldBlock` on Unix and
+/// `TimedOut` on Windows. Propagating the raw kind made the error a caller sees
+/// depend on WHERE the deadline landed: expiring between reads returns
+/// `TimedOut` (from [`set_request_read_timeout`]) while expiring *during* a read
+/// returned `WouldBlock` — the same condition reported two different ways,
+/// decided by a race. Both are normalized to [`request_read_timed_out`].
+fn read_within_deadline(stream: &mut TcpStream, chunk: &mut [u8]) -> io::Result<usize> {
+    match stream.read(chunk) {
+        Ok(read) => Ok(read),
+        Err(error) if is_read_deadline_expiry(&error) => Err(request_read_timed_out()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Returns `true` when an I/O error is a read-deadline expiry under either
+/// platform's spelling.
+fn is_read_deadline_expiry(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 fn set_request_read_timeout(stream: &TcpStream, started: Instant) -> io::Result<()> {
@@ -13126,6 +13152,49 @@ mod tests {
                 case.name
             );
         }
+        Ok(())
+    }
+
+    /// A read-deadline expiry must report ONE stable error kind, whatever the
+    /// platform calls it.
+    ///
+    /// `SO_RCVTIMEO` expiry surfaces as `WouldBlock` on Unix and `TimedOut` on
+    /// Windows. Propagating the raw kind made the error a caller sees depend on
+    /// WHERE the deadline landed — between reads (`TimedOut`, from
+    /// `set_request_read_timeout`) or during one (`WouldBlock`) — so the same
+    /// condition was reported two different ways, decided by a race. That is
+    /// what made `request_read_uses_total_deadline_for_slow_headers` flaky.
+    #[test]
+    fn read_deadline_expiry_is_normalized_to_timed_out() -> Result<()> {
+        // Both platform spellings are recognized; unrelated errors are not.
+        assert!(is_read_deadline_expiry(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
+        assert!(is_read_deadline_expiry(&io::Error::from(
+            io::ErrorKind::TimedOut
+        )));
+        assert!(!is_read_deadline_expiry(&io::Error::from(
+            io::ErrorKind::UnexpectedEof
+        )));
+
+        // ...and a real expiry through the socket path reports `TimedOut`
+        // whichever kind this OS produced. Deterministic: the client connects
+        // and never sends, so the deadline always expires mid-read.
+        let listener = TcpListener::bind("127.0.0.1:0").context("listener should bind")?;
+        let address = listener.local_addr().context("listener should have addr")?;
+        let _client = TcpStream::connect(address).context("client should connect")?;
+        let (mut server, _) = listener.accept().context("server should accept")?;
+        server
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .context("read timeout should be settable")?;
+        let mut chunk = [0_u8; 16];
+        let error = read_within_deadline(&mut server, &mut chunk)
+            .expect_err("a silent client must trip the read deadline");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::TimedOut,
+            "a read-deadline expiry must always surface as TimedOut"
+        );
         Ok(())
     }
 

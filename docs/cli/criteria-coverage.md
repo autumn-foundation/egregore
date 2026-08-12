@@ -371,12 +371,25 @@ a parent is stamped and parseable, recency IS knowable and **only the newest
 version decides** — a reopened task is not reported as a proof gap forever, which
 would trip the gate on work that is legitimately open again.
 
-The conservative reading applies exactly where recency **cannot** be established:
-a version missing or carrying an unparseable stamp, or several versions tied at
-the newest instant with different statuses. There the claimed-done test reads
-every version and counts the criterion when any is done, so a status mutation can
-never drop unproven criteria out of the gap set by line order, and
-`parent_task_status_ambiguous` discloses it.
+Which versions are **current candidates** therefore depends on whether recency
+resolved:
+
+- **Recency resolved** (every version stamped and parseable) — only the versions
+  tied at the newest instant are candidates. An older done version does **not**
+  count, which is exactly what stops a reopened task from being a permanent gap.
+- **Recency unresolvable** (a version missing or carrying an unparseable stamp)
+  — **every** version is a candidate, so a status mutation can never drop
+  unproven criteria out of the gap set by line order.
+
+The claimed-done test counts the criterion when any **candidate** is done, and
+`parent_task_status_ambiguous` fires whenever the candidates disagree — including
+several tied at the newest instant.
+
+`parent_task_status` is chosen deterministically, never by line position: a done
+status wins (so the row agrees with the gate it fired), else the single status the
+candidates agree on, else **nothing is shown** — with several disagreeing
+candidates no one of them is the task's status, and naming one would assert a fact
+the store does not support.
 
 The residual limit is liveness — a record tombstoned and later re-added cannot be
 distinguished from one merely tombstoned in a sorted graph, so it is reported

@@ -947,13 +947,30 @@ pub fn run_criteria_coverage(
         let resolved_parent: Option<&str> = done_parent
             .or(field_parent)
             .or_else(|| edge_parents.first().copied());
+        // Deterministic by construction. The deciding statuses are collected in
+        // slice order, so choosing one by POSITION (`last()`) would make the
+        // rendered report depend on input line order — breaking the
+        // byte-identical, order-independent contract in exactly the case where
+        // versions genuinely disagree. Instead:
+        //
+        //   * a DONE status wins, so the row agrees with the gate it fired;
+        //   * else, when the candidates agree, that single status is shown;
+        //   * else NOTHING is shown — several versions are current candidates and
+        //     no one of them is the task's status, so naming one would assert a
+        //     fact the store does not support. `parent_task_status_ambiguous`
+        //     carries that story instead.
         let parent_task_status = resolved_parent.and_then(|parent| {
-            let recorded: Vec<&String> =
-                deciding_statuses_of(parent).into_iter().flatten().collect();
-            recorded
+            let distinct: BTreeSet<Option<&String>> =
+                deciding_statuses_of(parent).into_iter().collect();
+            distinct
                 .iter()
+                .flatten()
                 .find(|s| is_done(s))
-                .or_else(|| recorded.last())
+                .or_else(|| {
+                    (distinct.len() == 1)
+                        .then(|| distinct.iter().flatten().next())
+                        .flatten()
+                })
                 .map(|s| (*s).clone())
         });
         // Resolution is evaluated across EVERY candidate, not just the displayed
@@ -1096,10 +1113,14 @@ pub fn run_criteria_coverage(
         diagnostics.push(CriteriaCoverageDiagnostic {
             code: "parent_task_status_ambiguous".to_owned(),
             record_ids: parent_status_ambiguous_ids,
-            detail: "criterion(s) whose owning Task has several live versions recording DIFFERENT \
-                     statuses; this transport cannot say which is current, so the claimed-done \
-                     test counts the criterion when ANY version is done. Use --data-dir for an \
-                     authoritative current-state read"
+            detail: "criterion(s) whose owning Task has several CURRENT-CANDIDATE versions \
+                     recording DIFFERENT statuses. Which versions are candidates depends on \
+                     whether recency could be established: when every version carries a \
+                     parseable transaction_time, only those tied at the NEWEST instant are \
+                     candidates and an older done version does NOT count; otherwise EVERY \
+                     version is a candidate. The claimed-done test counts the criterion when any \
+                     CANDIDATE is done, and no single status is displayed unless one is done or \
+                     the candidates agree. Use --data-dir for an authoritative current-state read"
                 .to_owned(),
         });
     }
@@ -2496,6 +2517,85 @@ mod tests {
         ];
         let report = run_criteria_coverage(&bad, &CriteriaCoverageConfig::default());
         assert!(row(&report, AC_U1).claimed_done_unproven);
+    }
+
+    /// A tie at the newest instant with no done status must render
+    /// deterministically and claim nothing.
+    ///
+    /// The deciding statuses are collected in slice order, so selecting one by
+    /// POSITION would make the report depend on input line order — the exact
+    /// contract this lane sells. With several current candidates and none done,
+    /// no single status is the task's status, so none is displayed.
+    #[test]
+    fn a_tie_with_no_done_status_renders_deterministically_and_claims_nothing() {
+        let build = |reversed: bool| {
+            let mut records = vec![
+                task_at(TASK_DONE, "closed_completed", "2026-01-01T00:00:00Z"),
+                task_at(TASK_DONE, "open", "2026-02-01T00:00:00Z"),
+                task_at(TASK_DONE, "blocked", "2026-02-01T00:00:00Z"),
+                criterion(AC_U1, TASK_DONE, 0, "unverified"),
+                owned_by(AC_U1, TASK_DONE),
+            ];
+            if reversed {
+                records.reverse();
+            }
+            run_criteria_coverage(&records, &CriteriaCoverageConfig::default())
+        };
+        let forward = build(false);
+        let backward = build(true);
+        assert_eq!(
+            serde_json::to_string(&forward).expect("a"),
+            serde_json::to_string(&backward).expect("b"),
+            "a disagreeing tie must not render differently by input order"
+        );
+        let r = row(&forward, AC_U1);
+        assert!(
+            r.parent_task_status.is_none(),
+            "no single status is current, so none may be claimed: {:?}",
+            r.parent_task_status
+        );
+        assert!(
+            !r.claimed_done_unproven,
+            "the OLDER done version is not a current candidate once recency resolved the newest"
+        );
+        assert!(
+            forward
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "parent_task_status_ambiguous")
+        );
+    }
+
+    /// The ambiguity diagnostic must describe BOTH candidate rules, since they
+    /// disagree about whether an older done version counts.
+    #[test]
+    fn the_ambiguity_diagnostic_distinguishes_both_candidate_rules() {
+        let records = vec![
+            task_at(TASK_DONE, "closed_completed", "2026-01-01T00:00:00Z"),
+            task_at(TASK_DONE, "open", "2026-02-01T00:00:00Z"),
+            task_at(TASK_DONE, "blocked", "2026-02-01T00:00:00Z"),
+            criterion(AC_U1, TASK_DONE, 0, "unverified"),
+            owned_by(AC_U1, TASK_DONE),
+        ];
+        let report = run_criteria_coverage(&records, &CriteriaCoverageConfig::default());
+        let detail = &report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "parent_task_status_ambiguous")
+            .expect("ambiguity diagnostic present")
+            .detail;
+        assert!(
+            detail.contains("NEWEST"),
+            "the newest-instant rule must be described: {detail}"
+        );
+        assert!(
+            detail.contains("EVERY"),
+            "the all-versions fallback must be described: {detail}"
+        );
+        assert!(
+            !detail.contains("ANY version is done"),
+            "the old wording contradicts the newest-tie behaviour: {detail}"
+        );
     }
 
     /// A broken `parent_task_id` must be reported even when a live edge parent
