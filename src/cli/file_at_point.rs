@@ -43,6 +43,7 @@ pub(crate) fn query_file_via_daemon(
 // query file
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn query_file(
     records: &[GraphRecord],
     path: &str,
@@ -76,6 +77,8 @@ pub(crate) fn query_file(
     let mut excluded_repos: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
 
     let mut is_first = true;
+    // The file's one owning package, carried once on the first EMITTED row.
+    let mut file_attribution: Option<&crate::ir::CrateAttribution> = None;
     for r in records {
         let GraphRecord::Node {
             id,
@@ -106,6 +109,9 @@ pub(crate) fn query_file(
             }
             continue;
         }
+        if file_attribution.is_none() {
+            file_attribution = r.crate_attribution();
+        }
         results.push(SymbolResult {
             record_id: id,
             schema_version: *schema_version,
@@ -120,9 +126,15 @@ pub(crate) fn query_file(
             visibility: None,
             signature: None,
             doc: None,
-            // Crate attribution rides the symbol-contract lanes for the same
-            // reason (issue #117): `eg query file` lists a file's symbols, and
-            // every row of that listing shares the file's one owning package.
+            // Crate attribution IS carried here, unlike the declaration-surface
+            // fields above (issue #117). Those differ per row, so omitting them
+            // only trims duplication a caller can recover with `eg query
+            // symbol`. Attribution is constant across a file listing and the
+            // lane has no envelope, so omitting it would drop the owning-package
+            // fact from the ENTIRE answer — and `docs/cli/query.md` promises
+            // these rows carry every `eg query symbol` field but those three.
+            // Stamped after the sort below, so it lands on the row that is
+            // actually emitted first.
             crate_attribution: None,
             crate_attribution_disclaimer: None,
             git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
@@ -158,6 +170,14 @@ pub(crate) fn query_file(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
+    // `crate_attribution` is a FILE-level fact (issue #117): every symbol in one
+    // file shares one owning package. Carry it once, on the first emitted row —
+    // the same shape the lane uses for file-level `diagnostics`. Omitting it
+    // entirely would drop the fact from the whole answer, since this lane has no
+    // envelope; repeating it per row measurably regresses the token-cost gate.
+    if let Some(first) = results.first_mut() {
+        first.crate_attribution = file_attribution;
+    }
     stamp_freshness(&mut results, freshness_code);
     for result in &results {
         print_result(result, format)?;

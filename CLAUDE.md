@@ -380,7 +380,10 @@ narrower: WITHIN ONE scan/refresh/replay, an absent field never means "this kind
 happens not to be covered". Repo-scoped kinds
 (`Repository`/`Commit`/`ScanCoverage`) carry no path and are never attributed;
 `Change` DOES carry a path and IS attributed. `crate_attribution` is NEVER an identity input, so no record ID moves
-and ADR-0004's cross-crate-identity deferral stands. One PURE resolver
+FOR THAT REASON and ADR-0004's cross-crate-identity deferral stands — though the
+paired `SCHEMA_VERSION` 8→9 bump does re-key every `codegraph:v<N>:` record, so
+re-ingesting into an existing v8 store adds a second generation rather than
+superseding it (`docs/cli/store-upgrade.md`). One PURE resolver
 (`src/crate_attribution.rs` — no `std::fs`, no `Command`, no clock, pinned by
 test) serves all three producers, so the working-tree harvest and the Git-object
 harvest cannot disagree about the rule: `eg scan` and `eg refresh` stamp it as a

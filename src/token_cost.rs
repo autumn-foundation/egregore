@@ -370,8 +370,8 @@ struct SymbolAnswerRow<'a> {
     /// records. Mirrors the real `eg query symbol` row so the measured answer
     /// cost is the cost of the answer a caller actually receives — a gate that
     /// measured a leaner shape than the CLI emits would overstate the savings.
-    /// Rides the declaration surface: `eg query file` omits it (every row of a
-    /// file listing shares the file's one owning package), so the gate does too.
+    /// Carried on BOTH lanes: unlike the declaration-surface fields, `eg query
+    /// file` returns attribution too, so the gate measures it on both.
     #[serde(skip_serializing_if = "Option::is_none")]
     crate_attribution: Option<&'a crate::ir::CrateAttribution>,
     /// Corpus-disclosure fields (issue #427), present on `eg query symbol` rows
@@ -548,6 +548,7 @@ where
     let mut has_expected = false;
     let mut expected_has_handle = false;
     let mut is_first = true;
+    let mut first_attribution = true;
     // Every element in `matched` is a Node variant (guaranteed by the filter above).
     for record in matched {
         if let GraphRecord::Node {
@@ -594,9 +595,14 @@ where
                 } else {
                     None
                 },
-                crate_attribution: crate_attribution
-                    .as_ref()
-                    .filter(|_| include_declaration_surface),
+                crate_attribution: if include_declaration_surface {
+                    crate_attribution.as_ref()
+                } else if first_attribution {
+                    first_attribution = false;
+                    crate_attribution.as_ref()
+                } else {
+                    None
+                },
                 corpus_mode: symbol_corpus.as_ref().map(|c| c.0),
                 corpus_mode_source: symbol_corpus.as_ref().map(|c| c.1),
                 corpus_disclaimer: symbol_corpus.as_ref().map(|c| c.2.clone()),

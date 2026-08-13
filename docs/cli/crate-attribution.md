@@ -255,7 +255,14 @@ Concretely:
 
 - **Cross-crate canonical symbol identity.** ADR-0004's deferral stands: this
   attributes facts to packages, it does not merge or re-key symbols across
-  crates. `crate_attribution` is never an identity input, so no record ID moves.
+  crates. `crate_attribution` is never an identity input, so adding it moves no
+  record ID **within a schema version**. Note that this release ALSO bumps
+  `SCHEMA_VERSION` 8 → 9 for the new field, and `stable_id` embeds the version in
+  every `codegraph:v<N>:` ID — so every code-graph record does get a new ID in
+  this release, for that reason rather than this one. See
+  [`store-upgrade.md`](store-upgrade.md#upgrading-a-store-across-a-codegraph-schema_version-bump):
+  re-ingesting into an existing v8 store adds a second generation rather than
+  superseding it, and the remedy is a fresh `--data-dir`.
 - **The inter-crate dependency graph**, crates.io resolution, and
   version/feature resolution. `eg query manifest-deps` (#180) already carries
   declared and lockfile-resolved dependency facts.

@@ -3513,3 +3513,50 @@ fn real_virtual_workspace_root_is_still_walked_past() {
         "a real [workspace] root declares no package and must not stop the walk"
     );
 }
+
+/// `eg query file` carries the owning package on its FIRST row.
+///
+/// The lane has no envelope, so omitting attribution entirely would drop the
+/// owning-package fact from the whole answer — not merely deduplicate it, the
+/// way omitting the per-row declaration-surface fields does. But every row of a
+/// file listing shares one package, so repeating it per row is pure duplication
+/// that measurably regresses the `eg audit token-cost` savings gate (the
+/// `file_defines` class falls from 3.16 to 2.92 against a 3.0 floor). Carrying
+/// it once, on the first row, is the same shape the lane already uses for
+/// file-level `diagnostics`.
+#[test]
+fn query_file_carries_attribution_once_on_the_first_row() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let run = run_query(&[
+        "query",
+        "file",
+        "crates/alpha/src/lib.rs",
+        "--graph",
+        graph.to_str().unwrap(),
+    ]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    let rows = rows(&run.stdout);
+    assert!(
+        rows.len() >= 2,
+        "the fixture file must define several symbols; got {}",
+        rows.len()
+    );
+
+    assert_eq!(
+        rows[0]["crate_attribution"]["package_name"], "alpha",
+        "the first row must name the owning package: {}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[0]["crate_attribution"]["manifest_repo_relative_path"],
+        "crates/alpha/Cargo.toml"
+    );
+    for row in &rows[1..] {
+        assert!(
+            row.get("crate_attribution").is_none(),
+            "later rows must not repeat the file-level fact: {row}"
+        );
+    }
+}
