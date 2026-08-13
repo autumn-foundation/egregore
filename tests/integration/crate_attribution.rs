@@ -2704,3 +2704,73 @@ fn graph_and_data_dir_agree_under_package_scope() {
         "--graph and --data-dir must produce byte-identical scoped answers"
     );
 }
+
+/// The epistemic caveat must be the SAME SENTENCE everywhere it is asserted.
+///
+/// It is stated in five places — the `CrateAttribution` doc comment, the
+/// resolver module docs, `docs/cli/crate-attribution.md`, `CLAUDE.md`, and the
+/// `crate_attribution_disclaimer` value on every scoped row. Prose copies drift;
+/// this pins them. Comparison normalizes line wrapping and the sentence-initial
+/// capital, because each site wraps to its own column and two of them open a
+/// sentence — nothing else may differ.
+#[test]
+fn containment_disclaimer_is_identical_everywhere_it_is_stated() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // The canonical wording, taken from the value the CLI actually emits.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+    let scoped = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "alpha",
+    ]);
+    let canonical = rows(&scoped.stdout)
+        .first()
+        .and_then(|row| {
+            row["crate_attribution_disclaimer"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .expect("a scoped row must carry the disclaimer");
+
+    // Collapse line wrapping, and compare case-insensitively so the two sites
+    // that open a sentence with "Attribution" still match the lowercase value
+    // the CLI emits mid-sentence. Nothing else may differ.
+    let normalize = |text: &str| {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let needle = normalize(&canonical);
+
+    for relative in [
+        "src/ir.rs",
+        "src/crate_attribution.rs",
+        "docs/cli/crate-attribution.md",
+        "CLAUDE.md",
+    ] {
+        let body = fs::read_to_string(repo_root.join(relative))
+            .unwrap_or_else(|_| panic!("{relative} should be readable"));
+        // Strip comment/quote markers so a wrapped `///`, `//!`, or `>` prefix
+        // does not break the match, then collapse whitespace.
+        let stripped: String = body
+            .lines()
+            .map(|line| {
+                line.trim_start()
+                    .trim_start_matches("//!")
+                    .trim_start_matches("///")
+                    .trim_start_matches('>')
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            normalize(&stripped).contains(&needle),
+            "{relative} does not state the disclaimer verbatim; expected: {needle}"
+        );
+    }
+}
