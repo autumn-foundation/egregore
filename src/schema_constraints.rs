@@ -1054,13 +1054,31 @@ impl SchemaConstraintReport {
             let _ = writeln!(out, "dropped labels: {}", self.dropped_labels);
             self.write_drop_before_image(&mut out);
         }
-        if self.foreign_constraints_retained_omitted > 0 {
+        // Reported whenever any were retained, NOT merely when the list was
+        // capped. "A foreign tool's declaration is retained and REPORTED" is the
+        // documented `--drop` scoping contract, and an operator who is told what
+        // was dropped but not what was deliberately left behind cannot tell a
+        // scoped drop from a total one. Naming the labels matters as much as the
+        // count: the whole point is which declarations were not Egregore's.
+        if !self.foreign_constraints_retained.is_empty() {
+            let labels = self
+                .foreign_constraints_retained
+                .iter()
+                .map(|declaration| bounded_field(&declaration.label))
+                .collect::<Vec<_>>()
+                .join(", ");
             let _ = writeln!(
                 out,
-                "foreign constraints retained: {} (+{} omitted)",
-                self.foreign_constraints_retained.len(),
-                self.foreign_constraints_retained_omitted
+                "foreign constraints retained: {} ({labels})",
+                self.foreign_constraints_retained.len()
             );
+            if self.foreign_constraints_retained_omitted > 0 {
+                let _ = writeln!(
+                    out,
+                    "  (+{} omitted)",
+                    self.foreign_constraints_retained_omitted
+                );
+            }
         }
         // A partial declare/drop exits nonzero. Without these, a text-mode
         // operator is told only how many labels landed - not which one failed or
@@ -1511,6 +1529,48 @@ mod tests {
         assert!(text.contains("384"), "{text}");
         assert!(text.contains("required"), "{text}");
         assert!(text.contains("non-null"), "{text}");
+    }
+
+    /// A scoped drop must name what it deliberately left behind.
+    ///
+    /// "Retained and REPORTED" is the documented `--drop` scoping contract. An
+    /// operator shown only what was dropped cannot distinguish a scoped drop
+    /// from a total one, and the retained declarations are precisely the ones
+    /// that are NOT Egregore's to rebuild.
+    #[test]
+    fn text_reports_retained_foreign_constraints_even_when_none_are_omitted() {
+        let mut report = sample_report();
+        report.action = ConstraintAction::Drop;
+        report.conformance_evaluated = false;
+        report.rows = Vec::new();
+        report.dropped_labels = 2;
+        report.foreign_constraints_retained = vec![DeclaredConstraint {
+            entity_kind: "node".to_owned(),
+            label: "SomeOtherToolsLabel".to_owned(),
+            properties: vec![DeclaredProperty {
+                property: "their_property".to_owned(),
+                declared_type: Some("string".to_owned()),
+                vector_dim: None,
+                required: false,
+                nullable: true,
+            }],
+        }];
+        report.canonicalize();
+        assert_eq!(
+            report.foreign_constraints_retained_omitted, 0,
+            "the list fits under the cap - this is the ordinary case"
+        );
+
+        let text = report.to_text();
+        assert!(
+            text.contains("foreign constraints retained: 1"),
+            "a retained declaration must be reported even with nothing \
+             truncated:\n{text}"
+        );
+        assert!(
+            text.contains("SomeOtherToolsLabel"),
+            "the retained label must be NAMED, not just counted:\n{text}"
+        );
     }
 
     /// A partial declare/drop must say WHICH label failed, in both formats.
