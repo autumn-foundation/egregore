@@ -214,14 +214,6 @@ fn finish(report: &mut SchemaConstraintReport, format: OutputFormat, code: i32) 
     std::process::exit(code);
 }
 
-/// Opens an embedded store, reporting failures against the ORIGINAL path.
-///
-/// The report action reads a throwaway copy, so `store_root` and the path the
-/// operator typed differ; the diagnostic must name the latter. `leased` selects
-/// the exclusive write lease: the read-only report must NOT take it (it would
-/// contend with a live writer for no reason), while `--declare`/`--drop` must
-/// (they persist the upstream sidecar into the real store).
-#[cfg(feature = "embedded-aletheiadb")]
 /// A `(stable code, message)` pair destined for [`usage_exit`].
 ///
 /// Returned rather than exited on so a caller holding a throwaway store copy can
@@ -263,35 +255,24 @@ fn try_open_store(
     })
 }
 
+/// Opens an embedded store, reporting failures against the ORIGINAL path.
+///
+/// The report action reads a throwaway copy, so `store_root` and the path the
+/// operator typed differ; the diagnostic must name the latter. `leased` selects
+/// the exclusive write lease: the read-only report must NOT take it (it would
+/// contend with a live writer for no reason), while `--declare`/`--drop` must
+/// (they persist the upstream sidecar into the real store).
+///
+/// Exits on failure. Callers holding a throwaway store copy must use
+/// [`try_open_store`] instead, so the copy is released before the process ends.
+#[cfg(feature = "embedded-aletheiadb")]
 fn open_store(
     store_root: &Path,
     reported_path: &Path,
     leased: bool,
 ) -> crate::adapters::EmbeddedAletheiaSink {
-    let opened = if leased {
-        crate::adapters::EmbeddedAletheiaSink::open(store_root)
-    } else {
-        crate::adapters::EmbeddedAletheiaSink::open_unleased(store_root)
-    };
-    opened.unwrap_or_else(|error| {
-        // A lease held by another live writer is its own documented condition
-        // (issue #200) with its own remedy - route through the daemon, or retry.
-        // Collapsing it into `store_unreadable` would bury that remedy in free
-        // text under a misleading machine-readable code.
-        let code = match error {
-            crate::adapters::AdapterError::Contended { .. } => {
-                crate::adapters::STORE_CONTENDED_CODE
-            }
-            _ => "store_unreadable",
-        };
-        usage_exit(
-            code,
-            &format!(
-                "failed to open embedded store {}: {error}",
-                reported_path.display()
-            ),
-        )
-    })
+    try_open_store(store_root, reported_path, leased)
+        .unwrap_or_else(|(code, message)| usage_exit(code, &message))
 }
 
 /// Rejects a missing or non-store `--data-dir` before any write lease is taken.
