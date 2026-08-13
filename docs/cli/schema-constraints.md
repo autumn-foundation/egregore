@@ -288,6 +288,19 @@ drop, so without a before-image a mistaken `--drop` would be unrecoverable by
 inspection — you cannot re-declare what you can no longer enumerate. The report's
 `dropped_constraints` carries the full descriptor of every retracted declaration.
 
+"Full descriptor" means every field needed to re-declare, not just the key names:
+`property`, `declared_type` (`null` meaning "any type"), `vector_dim`, `required`,
+and `nullable`. The distinction only bites for `--include-foreign`. For a label in
+Egregore's own inventory the key names would be enough, since re-running
+`--declare <profile>` regenerates the types and optionality from the profile; a
+foreign declaration is the one `--declare` can never rebuild, so the recorded
+descriptor is the only route back. `vector_dim` is carried separately because
+upstream's type token collapses every vector arm to `vector` — without it a
+restored constraint would silently widen to accept any dimension.
+
+The same descriptor shape is used by `declared_constraints` and
+`foreign_constraints_retained`.
+
 `--declare` and `--drop` are mutually exclusive (exit 2), and `--include-foreign`
 without `--drop` is the same error.
 

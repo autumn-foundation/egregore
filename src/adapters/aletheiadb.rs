@@ -25,7 +25,8 @@ use crate::{
     },
     schema_constraints::{
         ConformanceStatus, ConstraintProfile, DeclarationOutcome, DeclaredConstraint,
-        DeclaredTypeToken, DropOutcome, EntityKindToken, LabelConformance, ViolationRow,
+        DeclaredProperty, DeclaredTypeToken, DropOutcome, EntityKindToken, LabelConformance,
+        ViolationRow,
     },
 };
 use ::aletheiadb::api::transaction::WriteOps;
@@ -1354,12 +1355,31 @@ impl EmbeddedAletheiaSink {
             .list_schema_constraints()
             .into_iter()
             .map(|descriptor| {
-                let mut properties: Vec<String> = descriptor
+                // The COMPLETE descriptor, not just the key: `dropped_constraints`
+                // is a restorable before-image, and a foreign declaration retracted
+                // by `--drop --include-foreign` is one Egregore's own `--declare`
+                // can never rebuild. See `DeclaredProperty`.
+                let mut properties: Vec<DeclaredProperty> = descriptor
                     .properties
                     .into_iter()
-                    .map(|property| property.property)
+                    .map(|property| DeclaredProperty {
+                        property: property.property,
+                        declared_type: property
+                            .declared_type
+                            .map(|declared| declared.type_name().to_string()),
+                        // `type_name()` collapses `Vector { dim }` to `vector`,
+                        // so the pinned dimension is preserved separately.
+                        vector_dim: match property.declared_type {
+                            Some(::aletheiadb::core::constraint::DeclaredType::Vector { dim }) => {
+                                dim
+                            }
+                            _ => None,
+                        },
+                        required: property.required,
+                        nullable: property.nullable,
+                    })
                     .collect();
-                properties.sort();
+                properties.sort_by(|a, b| a.property.cmp(&b.property));
                 DeclaredConstraint {
                     entity_kind: descriptor.entity_kind,
                     label: descriptor.label,
@@ -5525,6 +5545,49 @@ pub mod fixtures {
             .typed(
                 property,
                 ::aletheiadb::core::constraint::DeclaredType::String,
+            )
+            .enable()
+            .map_err(|error| super::AdapterError::Rejected {
+                record_id: label.to_owned(),
+                message: error.to_string(),
+            })?;
+        Ok(())
+    }
+
+    /// Declares a foreign constraint whose descriptor is deliberately UNLIKE
+    /// anything Egregore's own profiles emit: a required `Integer` key and a
+    /// dimension-pinned `Vector` key.
+    ///
+    /// Exists so the before-image contract is testable at full fidelity. Every
+    /// Egregore-declared property is a non-required `String`/`Integer`, so a
+    /// before-image that silently dropped the type, the required flag, or the
+    /// vector dimension would still look correct against Egregore's own labels.
+    /// A foreign declaration is the only one `--declare` cannot rebuild, so it
+    /// is the only case where the recorded descriptor is the sole route back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be opened or the declaration is
+    /// refused.
+    pub fn declare_foreign_typed_constraint(
+        data_dir: impl AsRef<Path>,
+        label: &str,
+        required_int_property: &str,
+        vector_property: &str,
+        vector_dim: usize,
+    ) -> AdapterResult<()> {
+        let sink = EmbeddedAletheiaSink::open(data_dir.as_ref())?;
+        sink.db
+            .schema_constraint(::aletheiadb::EntityKind::Node, label)
+            .require_typed(
+                required_int_property,
+                ::aletheiadb::core::constraint::DeclaredType::Integer,
+            )
+            .typed(
+                vector_property,
+                ::aletheiadb::core::constraint::DeclaredType::Vector {
+                    dim: Some(vector_dim),
+                },
             )
             .enable()
             .map_err(|error| super::AdapterError::Rejected {

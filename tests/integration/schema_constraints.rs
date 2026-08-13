@@ -1002,11 +1002,127 @@ fn drop_records_a_before_image_so_a_mistake_is_recoverable() {
         report["dropped_labels"].as_u64(),
         Some(dropped.len() as u64)
     );
-    // Each entry must be enough to reconstruct the declaration.
+    // Each entry must be enough to reconstruct the declaration - which means the
+    // COMPLETE property descriptor, not merely the key names. A name-only entry
+    // cannot restore a declaration whose type or optionality is not Egregore's.
     let first = &dropped[0];
     assert!(first["label"].as_str().is_some());
     assert!(first["entity_kind"].as_str().is_some());
-    assert!(!first["properties"].as_array().expect("props").is_empty());
+    let properties = first["properties"].as_array().expect("props");
+    assert!(!properties.is_empty());
+    for property in properties {
+        assert!(
+            property["property"].as_str().is_some(),
+            "every descriptor names its key"
+        );
+        assert!(
+            property["declared_type"].is_string() || property["declared_type"].is_null(),
+            "the declared type is recorded (null meaning 'any type'), never omitted"
+        );
+        assert!(
+            property["required"].is_boolean(),
+            "optionality is part of the declaration and must survive the drop"
+        );
+        assert!(property["nullable"].is_boolean());
+    }
+}
+
+/// The before-image must be able to restore a declaration Egregore's own
+/// `--declare` can NEVER rebuild.
+///
+/// For a label in Egregore's inventory a bare key list would be enough - a
+/// re-run of `--declare <profile>` regenerates type and optionality from the
+/// profile. `--drop --include-foreign` is the case with no such fallback: the
+/// retracted declaration belongs to another tool, upstream rewrites the sidecar
+/// atomically, and `dropped_constraints` is the only surviving record of it.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn the_before_image_fully_describes_a_dropped_foreign_constraint() {
+    let (_temp, data_dir) = seeded_store();
+    let dir = data_dir.to_str().expect("utf8");
+
+    aletheia_egregore::adapters::fixtures::declare_foreign_typed_constraint(
+        &data_dir,
+        "SomeOtherToolsLabel",
+        "their_required_count",
+        "their_embedding",
+        384,
+    )
+    .expect("a foreign tool declares a typed constraint");
+
+    // What the store holds BEFORE the drop, as the operator would read it.
+    let before = report_json(&data_dir, &[]);
+    let declared = before["declared_constraints"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|entry| entry["label"].as_str() == Some("SomeOtherToolsLabel"))
+        .expect("the foreign declaration is visible before the drop")
+        .clone();
+
+    let output = run(&[
+        "audit",
+        "schema-constraints",
+        "--data-dir",
+        dir,
+        "--drop",
+        "--include-foreign",
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output.stdout).expect("utf8").trim()).expect("json");
+
+    let dropped = report["dropped_constraints"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|entry| entry["label"].as_str() == Some("SomeOtherToolsLabel"))
+        .expect("the foreign declaration was retracted and recorded");
+
+    assert_eq!(
+        dropped, &declared,
+        "the before-image must match what the store held, field for field - \
+         anything less cannot restore the declaration"
+    );
+
+    // Pin the specific fields a name-only before-image would have lost, so the
+    // equality above cannot pass vacuously with both sides degraded.
+    let properties = dropped["properties"].as_array().expect("props");
+    let by_key = |key: &str| {
+        properties
+            .iter()
+            .find(|property| property["property"].as_str() == Some(key))
+            .unwrap_or_else(|| panic!("descriptor for {key}"))
+            .clone()
+    };
+
+    let counted = by_key("their_required_count");
+    assert_eq!(counted["declared_type"].as_str(), Some("int"));
+    assert_eq!(
+        counted["required"].as_bool(),
+        Some(true),
+        "a required foreign key must not come back optional"
+    );
+
+    let embedding = by_key("their_embedding");
+    assert_eq!(embedding["declared_type"].as_str(), Some("vector"));
+    assert_eq!(
+        embedding["vector_dim"].as_u64(),
+        Some(384),
+        "the pinned dimension is lost by type_name() alone, so it is captured \
+         separately - without it a restored constraint silently widens to accept \
+         any dimension"
+    );
+
+    // And the store really is clear of it now.
+    let after = report_json(&data_dir, &[]);
+    assert!(
+        after["declared_constraints"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .all(|entry| entry["label"].as_str() != Some("SomeOtherToolsLabel"))
+    );
 }
 
 /// The declared count must be the whole writable surface, not merely "a lot".

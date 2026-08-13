@@ -496,6 +496,53 @@ pub struct DropOutcome {
     pub foreign_retained: Vec<DeclaredConstraint>,
 }
 
+/// One property descriptor within a constraint declaration read back from the
+/// store.
+///
+/// Carries the COMPLETE descriptor, not just the key name, because
+/// `dropped_constraints` is a before-image an operator must be able to restore
+/// from. For a label in Egregore's own inventory the name alone would do — a
+/// re-run of `--declare <profile>` regenerates the type and optionality from
+/// the profile — but `--drop --include-foreign` can retract a declaration made
+/// by another tool, and Egregore's `--declare` can never reconstruct that one.
+/// Recording only the key names there would leave the "recoverable" claim
+/// false in exactly the case the before-image exists for.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DeclaredProperty {
+    /// The property key.
+    pub property: String,
+    /// Upstream's stable type token (`string`, `int`, `float`, `bool`,
+    /// `temporal`, `bytes`, `vector`), or `None` when the declaration accepts
+    /// any type.
+    pub declared_type: Option<String>,
+    /// The required vector dimension, when `declared_type` is `vector` and the
+    /// declaration pins one. `type_name()` alone collapses every `Vector`
+    /// arm to `vector`, so the dimension is captured separately or a restored
+    /// declaration would silently widen to accept any dimension.
+    pub vector_dim: Option<usize>,
+    /// Whether the key must be present with a non-null value.
+    pub required: bool,
+    /// Whether an explicit null is permitted.
+    pub nullable: bool,
+}
+
+impl DeclaredProperty {
+    /// The JSON shape rendered in the report.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "property": bounded_field(&self.property),
+            "declared_type": self
+                .declared_type
+                .as_ref()
+                .map(|declared| bounded_field(declared)),
+            "vector_dim": self.vector_dim,
+            "required": self.required,
+            "nullable": self.nullable,
+        })
+    }
+}
+
 /// A constraint declaration read back from the store.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DeclaredConstraint {
@@ -503,8 +550,8 @@ pub struct DeclaredConstraint {
     pub entity_kind: String,
     /// The label the declaration is scoped to.
     pub label: String,
-    /// The declared property keys, sorted.
-    pub properties: Vec<String>,
+    /// The declared property descriptors, sorted by key.
+    pub properties: Vec<DeclaredProperty>,
 }
 
 impl DeclaredConstraint {
@@ -517,7 +564,7 @@ impl DeclaredConstraint {
             "properties": self
                 .properties
                 .iter()
-                .map(|property| bounded_field(property))
+                .map(DeclaredProperty::to_json)
                 .collect::<Vec<_>>(),
         })
     }

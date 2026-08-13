@@ -1204,7 +1204,14 @@ action is a strictly read-only report (throwaway store copy, no write lease, ups
 `--drop` retracts — scoped by default to Egregore's OWN labels (a foreign tool's declaration is
 retained and reported, `--include-foreign` widens) and recording a `dropped_constraints`
 before-image, since upstream rewrites the sidecar atomically and you cannot re-declare what you
-can no longer enumerate. Declaration is NOT atomic across labels, so a mid-run refusal prints
+can no longer enumerate. That before-image carries the COMPLETE property descriptor
+(`property`/`declared_type`/`vector_dim`/`required`/`nullable`), not just the key names: for an
+Egregore-owned label the names would suffice (re-running `--declare <profile>` regenerates type
+and optionality), but `--include-foreign` retracts declarations `--declare` can NEVER rebuild, so
+a name-only record would leave the "recoverable" claim false in exactly the case the before-image
+exists for. `vector_dim` rides separately because upstream's type token collapses every vector arm
+to `vector`, and a restored constraint missing it silently widens to accept any dimension.
+Declaration is NOT atomic across labels, so a mid-run refusal prints
 the FULL report with `declared_labels` + `declaration_refusal` naming exactly what landed. Nothing in Egregore's write path declares
 constraints automatically. Only labels the store HOLDS are scanned (one `db.schema()` call
 finds them); every absent label is reported `not_present`, never a vacuous `conforms`, and a label the store holds that Egregore CANNOT
