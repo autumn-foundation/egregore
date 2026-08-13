@@ -3430,3 +3430,86 @@ fn forged_attributed_value_carrying_a_reason_is_not_trusted() {
         text.stdout
     );
 }
+
+/// A `Cargo.toml` carrying neither `[package]` nor `[workspace]` is a manifest
+/// Cargo REJECTS, so the walk must stop there rather than treat it as a virtual
+/// workspace root and attribute the subtree to an outer package.
+///
+/// Cargo's own errors: "manifest is missing either a `[package]` or a
+/// `[workspace]`", and for a package-less manifest with dependencies, "this
+/// virtual manifest specifies a `dependencies` section, which is not allowed".
+/// Walking past such a boundary would attribute files across a manifest Cargo
+/// will not load — the fabrication this slice exists to prevent.
+#[test]
+fn manifest_with_neither_package_nor_workspace_stops_the_walk() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn at_root() -> u32 { 1 }\n"),
+            // Rejected by Cargo: dependencies with no [package] and no [workspace].
+            ("nested/Cargo.toml", "[dependencies]\nserde = \"1\"\n"),
+            ("nested/src/lib.rs", "pub fn nested() -> u32 { 2 }\n"),
+            // Also rejected: neither table at all.
+            ("bare/Cargo.toml", "[profile.release]\nopt-level = 3\n"),
+            ("bare/src/lib.rs", "pub fn bare() -> u32 { 3 }\n"),
+        ],
+    );
+    let records = scan_fixture(temp.path());
+    let by_path = attribution_by_path(&records);
+
+    for path in ["nested/src/lib.rs", "bare/src/lib.rs"] {
+        let attribution = by_path
+            .get(path)
+            .unwrap_or_else(|| panic!("{path} must be indexed; got {by_path:#?}"));
+        assert_eq!(
+            attribution.iter().cloned().collect::<Vec<_>>(),
+            vec!["unattributed:unusable_manifest".to_owned()],
+            "{path} must fail closed at the rejected manifest, never inherit `outer`"
+        );
+    }
+    // Anti-vacuity: the healthy root still attributes.
+    assert_eq!(
+        by_path.get("src/lib.rs"),
+        Some(&BTreeSet::from(["outer@Cargo.toml".to_owned()]))
+    );
+}
+
+/// A genuine virtual workspace root is still walked past.
+#[test]
+fn real_virtual_workspace_root_is_still_walked_past() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+            ),
+            // `[workspace]` with no `[package]`: Cargo accepts this.
+            ("group/Cargo.toml", "[workspace]\nmembers = [\"m\"]\n"),
+            (
+                "group/m/Cargo.toml",
+                "[package]\nname = \"m\"\nversion = \"0.1.0\"\n",
+            ),
+            ("group/m/src/lib.rs", "pub fn member() -> u32 { 1 }\n"),
+            ("group/loose.rs", "pub fn loose() -> u32 { 2 }\n"),
+        ],
+    );
+    let by_path = attribution_by_path(&scan_fixture(temp.path()));
+
+    assert_eq!(
+        by_path.get("group/m/src/lib.rs"),
+        Some(&BTreeSet::from(["m@group/m/Cargo.toml".to_owned()]))
+    );
+    // Directly under the virtual root: walked past, so the outer package owns it.
+    assert_eq!(
+        by_path.get("group/loose.rs"),
+        Some(&BTreeSet::from(["outer@Cargo.toml".to_owned()])),
+        "a real [workspace] root declares no package and must not stop the walk"
+    );
+}

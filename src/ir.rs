@@ -3810,6 +3810,11 @@ pub enum CrateAttributionReason {
     UnnamedPackage,
     /// The nearest enclosing manifest is not valid TOML.
     UnparseableManifest,
+    /// The nearest enclosing manifest parses but carries neither `[package]`
+    /// nor `[workspace]` — a form Cargo refuses to load. The boundary is real
+    /// but unusable, and walking past it would attribute the subtree to an
+    /// outer package across a manifest Cargo rejects.
+    UnusableManifest,
     /// The nearest enclosing manifest could not be read, or is not UTF-8.
     ManifestUnreadable,
 }
@@ -3823,6 +3828,7 @@ impl CrateAttributionReason {
             Self::VirtualManifestOnly => "virtual_manifest_only",
             Self::UnnamedPackage => "unnamed_package",
             Self::UnparseableManifest => "unparseable_manifest",
+            Self::UnusableManifest => "unusable_manifest",
             Self::ManifestUnreadable => "manifest_unreadable",
         }
     }

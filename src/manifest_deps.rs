@@ -260,6 +260,13 @@ pub struct ManifestDependencies {
     /// STOPS there, fail-closed, rather than inherit an ancestor's name and
     /// fabricate an attribution).
     pub package_table_present: bool,
+    /// `true` when the manifest carries a `[workspace]` table.
+    ///
+    /// A manifest with NEITHER `[package]` nor `[workspace]` is one Cargo
+    /// rejects outright ("manifest is missing either a `[package]` or a
+    /// `[workspace]`"), so crate attribution must not treat it as a virtual
+    /// workspace root and walk past it (issue #117).
+    pub workspace_table_present: bool,
     /// Declarations in documented order: table order (`normal`, `dev`,
     /// `build`), then crate name, then the declared-as manifest key.
     pub declarations: Vec<DeclaredDependency>,
@@ -282,6 +289,10 @@ pub fn parse_manifest_dependencies(
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| error.to_string())?;
     let package_table = doc.get("package").and_then(toml_edit::Item::as_table_like);
+    let workspace_table_present = doc
+        .get("workspace")
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some();
     // Presence of the table, independent of whether the name is usable
     // (issue #117): it separates a virtual workspace root from a package
     // Egregore cannot name.
@@ -330,6 +341,7 @@ pub fn parse_manifest_dependencies(
     Ok(ManifestDependencies {
         package_name,
         package_table_present,
+        workspace_table_present,
         declarations,
         uninterpretable,
     })
@@ -976,7 +988,13 @@ pub fn manifest_package_outcome(manifest_text: &str) -> ManifestParseOutcome {
         Ok(parsed) => match (parsed.package_table_present, parsed.package_name) {
             (true, Some(name)) => ManifestParseOutcome::Package { name },
             (true, None) => ManifestParseOutcome::UnnamedPackage,
-            (false, _) => ManifestParseOutcome::Virtual,
+            // Package-less: a VIRTUAL workspace root only when it really carries
+            // `[workspace]`. Without either table Cargo refuses to load the
+            // manifest at all, so the boundary is unusable and must not be
+            // walked past — doing so would attribute the subtree to an outer
+            // package across a manifest Cargo rejects.
+            (false, _) if parsed.workspace_table_present => ManifestParseOutcome::Virtual,
+            (false, _) => ManifestParseOutcome::UnusableManifest,
         },
         // The TOML error message is deliberately DROPPED, not carried: it can
         // echo manifest body text, and no output surface may leak it.
@@ -2301,7 +2319,15 @@ mod tests {
             !virtual_root.package_table_present,
             "a virtual workspace root declares no package"
         );
+        assert!(virtual_root.workspace_table_present);
         assert_eq!(virtual_root.package_name, None);
+
+        // Neither table: a manifest Cargo refuses to load. Crate attribution
+        // must be able to tell it apart from a real virtual root.
+        let unusable =
+            parse_manifest_dependencies("[dependencies]\nserde = \"1\"\n").expect("parses");
+        assert!(!unusable.package_table_present);
+        assert!(!unusable.workspace_table_present);
     }
 
     #[test]

@@ -114,6 +114,7 @@ does — so an absent field never means "this kind happens not to be covered".
 | `virtual_manifest_only` | Every enclosing manifest is a virtual workspace root, which declares no package. |
 | `unnamed_package` | The nearest manifest declares a `[package]` whose `name` is absent or Cargo-invalid. |
 | `unparseable_manifest` | The nearest manifest is not valid TOML. |
+| `unusable_manifest` | The nearest manifest parses but carries neither `[package]` nor `[workspace]` — a form Cargo refuses to load. |
 | `manifest_unreadable` | The nearest manifest could not be read, or is not UTF-8. |
 
 The reason carries no payload: a TOML parse-error message can echo manifest body

@@ -24,6 +24,7 @@
 //! | a usable package name | attributed to it                    | **stop**   |
 //! | `[package]`, no usable name | `unnamed_package`             | **stop**   |
 //! | TOML parse failure    | `unparseable_manifest`              | **stop**   |
+//! | no `[package]` and no `[workspace]` | `unusable_manifest`   | **stop**   |
 //! | unreadable / non-UTF-8 | `manifest_unreadable`              | **stop**   |
 //! | virtual (`[workspace]`, no `[package]`) | —                 | *continue* |
 //! | none                  | —                                   | *continue* |
@@ -73,9 +74,14 @@ pub enum ManifestParseOutcome {
     /// Cargo-invalid (empty, whitespace-bearing, or otherwise rejected). The
     /// manifest declares a package; Egregore just cannot name it.
     UnnamedPackage,
-    /// Parsed with no `[package]` table — a virtual workspace root. It declares
-    /// no package, so it owns nothing.
+    /// Parsed with a `[workspace]` table and no `[package]` — a virtual
+    /// workspace root. It declares no package, so it owns nothing, and the walk
+    /// passes it.
     Virtual,
+    /// Parsed, but carries NEITHER `[package]` nor `[workspace]` — a form Cargo
+    /// refuses to load. The boundary exists but is unusable, so the walk stops
+    /// rather than attributing the subtree to an outer package.
+    UnusableManifest,
     /// The manifest is not valid TOML.
     Unparseable,
     /// The manifest could not be read, or is not valid UTF-8.
@@ -196,6 +202,11 @@ impl CrateAttributionIndex {
                 ManifestParseOutcome::Unparseable => {
                     return CrateAttribution::unattributed(
                         CrateAttributionReason::UnparseableManifest,
+                    );
+                }
+                ManifestParseOutcome::UnusableManifest => {
+                    return CrateAttribution::unattributed(
+                        CrateAttributionReason::UnusableManifest,
                     );
                 }
                 ManifestParseOutcome::Unreadable => {
@@ -559,6 +570,29 @@ mod tests {
             Some(CrateAttributionReason::ManifestUnreadable)
         );
         assert_eq!(resolved(&index, "crates/foo/src/lib.rs"), None);
+    }
+
+    /// A manifest carrying neither `[package]` nor `[workspace]` is one Cargo
+    /// refuses to load, so it STOPS the walk rather than being treated as a
+    /// virtual root.
+    #[test]
+    fn unusable_manifest_stops_the_walk_unlike_a_real_virtual_root() {
+        let index = CrateAttributionIndex::from_facts(vec![
+            package("Cargo.toml", "root"),
+            ManifestPackageFact::new("nested/Cargo.toml", ManifestParseOutcome::UnusableManifest),
+            virtual_manifest("group/Cargo.toml"),
+        ]);
+        assert_eq!(
+            reason(&index, "nested/src/lib.rs"),
+            Some(CrateAttributionReason::UnusableManifest)
+        );
+        assert_eq!(
+            resolved(&index, "nested/src/lib.rs"),
+            None,
+            "an unusable boundary must never inherit the ancestor's package"
+        );
+        // A REAL virtual root still walks past to the ancestor package.
+        assert_eq!(resolved(&index, "group/loose.rs").as_deref(), Some("root"));
     }
 
     #[test]
