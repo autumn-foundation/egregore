@@ -421,15 +421,23 @@ struct CommitTree {
 /// and OID: the type filter drops submodule gitlinks — which are `commit`
 /// entries, not readable blobs — and the OID keys the manifest parse memo.
 ///
+/// `-z` is load-bearing, not a style choice. `core.quotePath=false` suppresses
+/// octal-escaping of NON-ASCII bytes only: `ls-tree` still C-quotes any path
+/// containing `"`, `\`, or a control character, wrapping it in literal quotes
+/// that no subsequent `git show <sha>:<path>` can resolve. The working-tree walk
+/// reads `git ls-files -z`, whose NUL-delimited output is never quoted, so
+/// without `-z` here a quote-bearing path is indexed by `eg scan` and silently
+/// ABSENT from `eg scan-history`. NUL-delimited output makes the two agree.
+///
 /// Both filters prune any path with a `target` component, mirroring
 /// [`is_indexed_source`], so committed build output never contributes sources
 /// or owning packages.
 fn list_commit_tree(repo_root: &Path, sha: &str) -> Result<CommitTree> {
-    let output = git_output(repo_root, &["ls-tree", "-r", sha])?;
+    let output = git_output(repo_root, &["ls-tree", "-r", "-z", sha])?;
     let mut tree = CommitTree::default();
-    for line in output.lines() {
+    for entry in output.split('\0') {
         // `<mode> SP <type> SP <object> TAB <path>`
-        let Some((meta, path)) = line.split_once('\t') else {
+        let Some((meta, path)) = entry.split_once('\t') else {
             continue;
         };
         let mut fields = meta.split_whitespace();
@@ -443,7 +451,10 @@ fn list_commit_tree(repo_root: &Path, sha: &str) -> Result<CommitTree> {
             // different repository and cannot be read from this one.
             continue;
         }
-        let path = normalize_git_path(path.trim());
+        // Only the metadata prefix is split off; the path is taken verbatim,
+        // since a NUL-delimited entry carries no trailing newline and a path
+        // may legitimately begin or end with whitespace.
+        let path = normalize_git_path(path);
         let as_path = Path::new(path.as_str());
         if is_indexed_source(as_path) {
             tree.sources.push(path);

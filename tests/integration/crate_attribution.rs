@@ -2335,3 +2335,66 @@ fn no_manifest_body_text_in_query_output() {
         );
     }
 }
+
+/// A path containing a `"` must be indexed and attributed by history replay,
+/// exactly as `eg scan` indexes it.
+///
+/// `core.quotePath=false` suppresses octal-escaping of NON-ASCII bytes only —
+/// `git ls-tree` still C-quotes any path containing `"`, `\`, or a control
+/// character. The working-tree walk uses `git ls-files -z`, whose NUL-delimited
+/// output is never quoted, so `eg scan` sees the real path. Unless the replay
+/// also reads NUL-delimited output, the two paths disagree: the file (and its
+/// crate's manifest) silently vanish from history.
+#[test]
+fn history_indexes_and_attributes_quote_bearing_paths() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_fixture(
+        &repo,
+        &[
+            (
+                "we\"ird/Cargo.toml",
+                "[package]\nname = \"quoted-pkg\"\nversion = \"0.1.0\"\n",
+            ),
+            ("we\"ird/src/lib.rs", "pub fn quoted() -> u32 { 1 }\n"),
+            (
+                "plain/Cargo.toml",
+                "[package]\nname = \"plain-pkg\"\nversion = \"0.1.0\"\n",
+            ),
+            ("plain/src/lib.rs", "pub fn plain() -> u32 { 2 }\n"),
+        ],
+    );
+    let sha = commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    let by_commit = history_attribution(&repo);
+    let at_head = &by_commit[&sha];
+    assert_eq!(
+        at_head.get("we\"ird/src/lib.rs"),
+        Some(&BTreeSet::from(
+            ["quoted-pkg@we\"ird/Cargo.toml".to_owned()]
+        )),
+        "a quote-bearing path must be indexed and attributed; got {at_head:?}"
+    );
+    // Anti-vacuity: the plain sibling works either way.
+    assert_eq!(
+        at_head.get("plain/src/lib.rs"),
+        Some(&BTreeSet::from(["plain-pkg@plain/Cargo.toml".to_owned()]))
+    );
+
+    // And `eg scan` and `eg scan-history` agree over the shared source paths.
+    let scanned = attribution_by_path(&scan_fixture(&repo));
+    for (path, attribution) in at_head {
+        if let Some(scanned_attribution) = scanned.get(path) {
+            assert_eq!(
+                attribution, scanned_attribution,
+                "scan and history disagree on {path}"
+            );
+        }
+    }
+    assert!(
+        scanned.contains_key("we\"ird/src/lib.rs"),
+        "precondition: eg scan indexes the quote-bearing path"
+    );
+}
