@@ -23,6 +23,11 @@ use crate::{
         MetricKind, NodeKind, Producer, RouteAnnotation, SelectionBasis, SemanticDriftMetadata,
         SourceSpan, TemporalMetadata, UserContextFields,
     },
+    schema_constraints::{
+        ConformanceStatus, ConstraintProfile, DeclarationOutcome, DeclaredConstraint,
+        DeclaredProperty, DeclaredTypeToken, DropOutcome, EntityKindToken, LabelConformance,
+        ViolationRow,
+    },
 };
 use ::aletheiadb::api::transaction::WriteOps;
 
@@ -1307,6 +1312,337 @@ impl EmbeddedAletheiaSink {
             .collect();
         records.extend(self.retained_log_observation_records()?);
         Ok(records)
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema constraints (issue #486)
+    // -----------------------------------------------------------------------
+
+    /// The store-side node labels and edge types actually present, sorted.
+    ///
+    /// Read from `AletheiaDB`'s own observed-schema summary in ONE call, so
+    /// discovering which of the inventoried labels a store contains costs a
+    /// single pass rather than one probe per label.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store's schema summary cannot be read.
+    pub fn observed_labels(&self) -> AdapterResult<(Vec<String>, Vec<String>)> {
+        let schema = self
+            .db
+            .schema()
+            .map_err(|error| read_back_error("observed_labels", error.to_string()))?;
+        let mut nodes: Vec<String> = schema
+            .node_labels
+            .into_iter()
+            .map(|entry| entry.label)
+            .collect();
+        let mut edges: Vec<String> = schema
+            .edge_types
+            .into_iter()
+            .map(|entry| entry.edge_type)
+            .collect();
+        nodes.sort();
+        edges.sort();
+        Ok((nodes, edges))
+    }
+
+    /// The schema constraints this store currently has declared, sorted.
+    #[must_use]
+    pub fn declared_schema_constraints(&self) -> Vec<DeclaredConstraint> {
+        let mut declared: Vec<DeclaredConstraint> = self
+            .db
+            .list_schema_constraints()
+            .into_iter()
+            .map(|descriptor| {
+                // The COMPLETE descriptor, not just the key: `dropped_constraints`
+                // is a restorable before-image, and a foreign declaration retracted
+                // by `--drop --include-foreign` is one Egregore's own `--declare`
+                // can never rebuild. See `DeclaredProperty`.
+                let mut properties: Vec<DeclaredProperty> = descriptor
+                    .properties
+                    .into_iter()
+                    .map(|property| DeclaredProperty {
+                        property: property.property,
+                        declared_type: property
+                            .declared_type
+                            .map(|declared| declared.type_name().to_string()),
+                        // `type_name()` collapses `Vector { dim }` to `vector`,
+                        // so the pinned dimension is preserved separately.
+                        vector_dim: match property.declared_type {
+                            Some(::aletheiadb::core::constraint::DeclaredType::Vector { dim }) => {
+                                dim
+                            }
+                            _ => None,
+                        },
+                        required: property.required,
+                        nullable: property.nullable,
+                    })
+                    .collect();
+                properties.sort_by(|a, b| a.property.cmp(&b.property));
+                DeclaredConstraint {
+                    entity_kind: descriptor.entity_kind,
+                    label: descriptor.label,
+                    properties,
+                }
+            })
+            .collect();
+        declared.sort_by(|a, b| (&a.entity_kind, &a.label).cmp(&(&b.entity_kind, &b.label)));
+        declared
+    }
+
+    /// Runs the upstream `.dry_run()` conformance scan for `profile` over every
+    /// label in `labels`, returning one row per label.
+    ///
+    /// `dry_run` computes the report and declares NOTHING, so this is safe on a
+    /// store opened without the write lease. Only labels the store actually
+    /// holds should be passed: upstream's scan is per-label, and a label with
+    /// no entities yields a vacuous zero-checked report the caller can
+    /// synthesise for free (see [`LabelConformance::not_present`]).
+    ///
+    /// Upstream samples offending entities by engine-internal `u64` id. Those
+    /// are neither citable nor stable across a re-ingest, so each is resolved
+    /// back to its `codegraph_id` here; a sample that has no resolvable handle
+    /// is COUNTED rather than emitted, so an unstable internal identifier never
+    /// reaches the report.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a conformance scan itself fails.
+    pub fn schema_constraint_dry_run(
+        &self,
+        profile: ConstraintProfile,
+        entity_kind: EntityKindToken,
+        labels: &[&str],
+    ) -> AdapterResult<Vec<LabelConformance>> {
+        let mut rows = Vec::with_capacity(labels.len());
+        for label in labels {
+            let report = self
+                .run_schema_constraint(profile, entity_kind, label, true)
+                .map_err(|error| {
+                    read_back_error(
+                        "schema_constraint_dry_run",
+                        format!("conformance scan of {label} failed: {error}"),
+                    )
+                })?;
+            rows.push(self.conformance_row(entity_kind, label, &report));
+        }
+        Ok(rows)
+    }
+
+    /// Declares `profile` on every label in `labels`, returning how many
+    /// declarations were made.
+    ///
+    /// Upstream's `enable()` is atomic per label: a non-conforming current
+    /// state declares nothing and returns `NonConformingOnEnable`. This method
+    /// declares labels one at a time and stops at the first refusal, so a
+    /// partial declaration is possible across labels; the caller reports the
+    /// count and the refusal together, and `drop_all_schema_constraints`
+    /// retracts whatever landed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::Rejected`] naming the refusing label when the
+    /// store's current state does not conform.
+    #[must_use]
+    pub fn declare_schema_constraints(
+        &self,
+        profile: ConstraintProfile,
+        entity_kind: EntityKindToken,
+        labels: &[&str],
+    ) -> DeclarationOutcome {
+        let mut declared = 0usize;
+        for label in labels {
+            if let Err(error) = self.run_schema_constraint(profile, entity_kind, label, false) {
+                return DeclarationOutcome {
+                    declared,
+                    refusal: Some(format!(
+                        "declaring the {} profile on {} {label} was refused: {error}",
+                        profile.as_str(),
+                        entity_kind.as_str()
+                    )),
+                };
+            }
+            declared += 1;
+        }
+        DeclarationOutcome {
+            declared,
+            refusal: None,
+        }
+    }
+
+    /// Drops every schema constraint declared on this store, returning how many
+    /// labels were retracted.
+    ///
+    /// Retracts what is actually DECLARED (read back from the store) rather
+    /// than what the current inventory would declare, so a store declared by an
+    /// older or newer Egregore is still fully cleaned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a retraction fails.
+    pub fn drop_schema_constraints(&self, include_foreign: bool) -> AdapterResult<DropOutcome> {
+        let mut outcome = DropOutcome::default();
+        for descriptor in self.declared_schema_constraints() {
+            let kind = match descriptor.entity_kind.as_str() {
+                "node" => ::aletheiadb::EntityKind::Node,
+                "edge" => ::aletheiadb::EntityKind::Edge,
+                // Upstream's tokens are exactly `node`/`edge`. Anything else
+                // came from a crafted or future sidecar; guessing `Node` would
+                // silently fail to drop a real constraint and under-report, so
+                // it is retained and disclosed instead.
+                _ => {
+                    outcome.foreign_retained.push(descriptor);
+                    continue;
+                }
+            };
+            if !include_foreign && !Self::is_writable_label(&descriptor) {
+                outcome.foreign_retained.push(descriptor);
+                continue;
+            }
+            // A failure here leaves every EARLIER label already retracted, and the
+            // sidecar rewritten. Bailing with `?` would drop `outcome` on the
+            // floor, destroying the only surviving before-image of those labels -
+            // the precise loss the before-image exists to prevent. Report the
+            // partial progress instead, mirroring the declaration path.
+            match self.db.drop_schema_constraint(kind, &descriptor.label) {
+                Ok(true) => outcome.dropped.push(descriptor),
+                Ok(false) => {}
+                Err(error) => {
+                    outcome.refusal = Some(format!(
+                        "dropping schema constraints failed at {}: {error}",
+                        descriptor.label
+                    ));
+                    return Ok(outcome);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Whether a declaration sits on a label Egregore itself can write.
+    fn is_writable_label(descriptor: &DeclaredConstraint) -> bool {
+        let inventory = match descriptor.entity_kind.as_str() {
+            "edge" => crate::schema_constraints::writable_edge_types(),
+            _ => crate::schema_constraints::writable_node_labels(),
+        };
+        inventory.contains(&descriptor.label.as_str())
+    }
+
+    /// Builds and runs the upstream constraint declaration for one
+    /// `(profile, kind, label)`, either as a dry run or for real.
+    ///
+    /// Single point of translation from Egregore's `PropertySpec` vocabulary to
+    /// upstream's, and the single point at which `dry_run` is chosen, so the
+    /// conformance scan and the real declaration can never evaluate different
+    /// constraint sets. (Upstream's builder type is not exported, so the
+    /// builder cannot be handed back to the two call sites separately.)
+    fn run_schema_constraint(
+        &self,
+        profile: ConstraintProfile,
+        entity_kind: EntityKindToken,
+        label: &str,
+        dry_run: bool,
+    ) -> ::aletheiadb::Result<::aletheiadb::core::constraint::ConformanceReport> {
+        let kind = match entity_kind {
+            EntityKindToken::Node => ::aletheiadb::EntityKind::Node,
+            EntityKindToken::Edge => ::aletheiadb::EntityKind::Edge,
+        };
+        let mut builder = self.db.schema_constraint(kind, label);
+        for spec in profile.specs(entity_kind) {
+            let declared = match spec.declared_type {
+                DeclaredTypeToken::String => ::aletheiadb::core::constraint::DeclaredType::String,
+                DeclaredTypeToken::Integer => ::aletheiadb::core::constraint::DeclaredType::Integer,
+            };
+            builder = if spec.required {
+                builder.require_typed(spec.property, declared)
+            } else {
+                builder.typed(spec.property, declared)
+            };
+        }
+        if dry_run {
+            builder = builder.dry_run();
+        }
+        builder.enable()
+    }
+
+    /// Translates an upstream conformance report into an Egregore row, citing
+    /// offending entities by `codegraph_id`.
+    fn conformance_row(
+        &self,
+        entity_kind: EntityKindToken,
+        label: &str,
+        report: &::aletheiadb::core::constraint::ConformanceReport,
+    ) -> LabelConformance {
+        let status = if report.total_checked == 0 {
+            ConformanceStatus::NotPresent
+        } else if report.conforms {
+            ConformanceStatus::Conforms
+        } else {
+            ConformanceStatus::Violates
+        };
+
+        let violations = report
+            .violations
+            .iter()
+            .map(|violation| {
+                let mut sample_record_ids = Vec::new();
+                let mut unresolved_samples = 0usize;
+                for id in &violation.sample_ids {
+                    match self.resolve_sample_record_id(entity_kind, *id) {
+                        Some(record_id) => sample_record_ids.push(record_id),
+                        None => unresolved_samples += 1,
+                    }
+                }
+                sample_record_ids.sort();
+                sample_record_ids.dedup();
+                // Upstream keeps only the first `MAX_CONFORMANCE_SAMPLE_IDS`
+                // offenders per group, in the iteration order of a per-process
+                // randomly-seeded `DashMap`. Hitting that bound therefore means
+                // the SUBSET is arbitrary and varies between runs; falling short
+                // of it means every offender was captured, so the sorted list is
+                // stable. Only the latter is citable.
+                let sample_complete =
+                    violation.sample_ids.len() < crate::schema_constraints::ENGINE_SAMPLE_BOUND;
+                ViolationRow {
+                    property: violation.property.clone(),
+                    reason: violation.reason.clone(),
+                    sample_record_ids,
+                    unresolved_samples,
+                    sample_complete,
+                }
+            })
+            .collect();
+
+        LabelConformance {
+            entity_kind,
+            label: label.to_owned(),
+            status,
+            checked: report.total_checked,
+            non_conforming: report.total_non_conforming,
+            violations,
+        }
+    }
+
+    /// Resolves one engine-internal entity id to its `codegraph_id` handle.
+    ///
+    /// Returns `None` when the entity carries no `codegraph_id` — which is the
+    /// common case here, since a MISSING `codegraph_id` is itself one of the
+    /// violations being reported.
+    fn resolve_sample_record_id(&self, entity_kind: EntityKindToken, id: u64) -> Option<String> {
+        let value = match entity_kind {
+            EntityKindToken::Node => {
+                let node_id = ::aletheiadb::NodeId::new(id).ok()?;
+                let node = self.db.get_node(node_id).ok()?;
+                node.get_property("codegraph_id")?.as_str()?.to_owned()
+            }
+            EntityKindToken::Edge => {
+                let edge_id = ::aletheiadb::EdgeId::new(id).ok()?;
+                let edge = self.db.get_edge(edge_id).ok()?;
+                edge.get_property("codegraph_id")?.as_str()?.to_owned()
+            }
+        };
+        Some(value)
     }
 
     /// Reads all physical records stored in the database for inspection.
@@ -2816,7 +3152,7 @@ impl EmbeddedAletheiaSink {
         let properties = builder.build();
         let node_id = self
             .db
-            .create_node("Tombstone", properties)
+            .create_node(crate::schema_constraints::TOMBSTONE_LABEL, properties)
             .map_err(|error| AdapterError::Rejected {
                 record_id: id.clone(),
                 message: error.to_string(),
@@ -7575,6 +7911,55 @@ mod tests {
         assert_eq!(
             classify_open_error(Path::new("/srv/.egregore"), upstream),
             upstream
+        );
+    }
+
+    /// The #486 inventory is derived from `NodeKind::ALL` on the ASSUMPTION
+    /// that the adapter writes one store-side label per kind, named exactly
+    /// `kind.as_str()`. `node_label` is a private `const fn` with one combined
+    /// arm today, but a future variant given its own arm returning a different
+    /// literal would silently desync the inventory from what is actually
+    /// written — the report would then misfile a real label as a foreign
+    /// writer's, and `--declare` would leave it unconstrained. This pins the
+    /// assumption at the write site.
+    #[test]
+    fn node_label_is_exactly_the_kind_string_for_every_kind() {
+        for kind in NodeKind::ALL {
+            assert_eq!(
+                node_label(kind),
+                kind.as_str(),
+                "node_label({kind:?}) must equal its kind string, or the #486 \
+                 label inventory no longer describes what the adapter writes"
+            );
+        }
+    }
+
+    /// The tombstone label the adapter writes must be the same constant the
+    /// inventory publishes, or tombstones fall outside the declared surface.
+    #[test]
+    fn tombstone_label_matches_the_inventory_constant() {
+        assert_eq!(crate::schema_constraints::TOMBSTONE_LABEL, "Tombstone");
+        assert!(
+            !NodeKind::ALL
+                .iter()
+                .any(|kind| kind.as_str() == crate::schema_constraints::TOMBSTONE_LABEL)
+        );
+    }
+
+    /// Egregore's own sample bound must stay at or below upstream's, or
+    /// `sample_complete` would claim completeness it cannot establish.
+    #[test]
+    fn egregore_sample_cap_does_not_exceed_the_engine_bound() {
+        const _: () = assert!(
+            crate::schema_constraints::MAX_SAMPLE_RECORD_IDS
+                <= crate::schema_constraints::ENGINE_SAMPLE_BOUND,
+            "egregore's render cap must not exceed the engine's sample bound"
+        );
+        assert_eq!(
+            crate::schema_constraints::ENGINE_SAMPLE_BOUND,
+            ::aletheiadb::core::constraint::MAX_CONFORMANCE_SAMPLE_IDS,
+            "the mirrored engine sample bound drifted from upstream, which would \
+             silently break the sample_complete determinism rule"
         );
     }
 

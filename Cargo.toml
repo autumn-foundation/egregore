@@ -32,6 +32,15 @@ embedded-aletheiadb = [
 ]
 embeddings = ["embedded-aletheiadb", "aletheiadb/embeddings", "dep:tokio"]
 nova = ["embedded-aletheiadb", "aletheiadb/nova"]
+# NOTE (issue #486): there is deliberately NO `test-fixtures` feature. Raw-write
+# store fixtures - which can plant a record bypassing every Egregore invariant,
+# precisely what the schema-constraint backstop exists to catch - live in the
+# integration test crate (`tests/integration/schema_constraints.rs`), not behind
+# a published feature. A Cargo feature is consumer-selectable, so gating them
+# that way would have made them reachable API of the published crate no matter
+# how the feature was documented; only test-crate code is genuinely unreachable
+# by a consumer. The fixtures open the store through `aletheiadb`'s own public
+# config helper, so they need no crate-private access.
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -95,6 +104,13 @@ libc = "0.2"
 assert_cmd = "2.1.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"
+# Direct store access for the integration-test fixtures (issue #486). Only the
+# test crate sees this, so the raw-write helpers it enables can never be reached
+# from the published library - unlike a Cargo feature, which any consumer may
+# select. `default-features = false` mirrors the lib's own dependency line; the
+# fixtures use only upstream's public `config::durable_config_for_data_dir` +
+# `AletheiaDB`, so no Egregore-private item is exposed to make them work.
+aletheiadb = { version = "0.2.0", default-features = false }
 
 [profile.dev]
 debug = 1
