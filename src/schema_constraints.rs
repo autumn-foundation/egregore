@@ -721,7 +721,12 @@ impl SchemaConstraintReport {
         ] {
             labels.sort();
             labels.dedup();
-            *omitted = labels.len().saturating_sub(MAX_UNKNOWN_LABELS);
+            // ACCUMULATE, never assign: `canonicalize` is public and idempotent,
+            // and a second call sees an ALREADY-truncated list whose recomputed
+            // overflow is zero. Assigning would reset a real count to 0 and hand
+            // the consumer a bounded list that claims to be complete - the exact
+            // failure this field exists to prevent. Adding 0 is a no-op.
+            *omitted += labels.len().saturating_sub(MAX_UNKNOWN_LABELS);
             labels.truncate(MAX_UNKNOWN_LABELS);
         }
         for (declarations, omitted) in [
@@ -736,7 +741,8 @@ impl SchemaConstraintReport {
         ] {
             declarations
                 .sort_by(|a, b| (&a.entity_kind, &a.label).cmp(&(&b.entity_kind, &b.label)));
-            *omitted = declarations.len().saturating_sub(MAX_DECLARED_CONSTRAINTS);
+            // Accumulated for the same reason as the unknown-label lists above.
+            *omitted += declarations.len().saturating_sub(MAX_DECLARED_CONSTRAINTS);
             declarations.truncate(MAX_DECLARED_CONSTRAINTS);
         }
         // `dropped_constraints` is deliberately NOT capped. The other lists
@@ -894,6 +900,83 @@ impl SchemaConstraintReport {
         report
     }
 
+    /// Renders the foreign-label lists, disclosing any capped tail.
+    ///
+    /// These name what the scan could NOT cover, so a bounded list rendered
+    /// without its omitted count reads as the complete set of unscanned
+    /// namespaces.
+    fn write_unknown_labels(&self, out: &mut String) {
+        use std::fmt::Write as _;
+
+        for (heading, labels, omitted) in [
+            (
+                "unknown node labels in store",
+                &self.unknown_node_labels,
+                self.unknown_node_labels_omitted,
+            ),
+            (
+                "unknown edge types in store",
+                &self.unknown_edge_types,
+                self.unknown_edge_types_omitted,
+            ),
+        ] {
+            if labels.is_empty() {
+                continue;
+            }
+            let rendered = labels
+                .iter()
+                .map(|label| bounded_field(label))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if omitted > 0 {
+                let _ = writeln!(out, "{heading}: {rendered} (+{omitted} omitted)");
+            } else {
+                let _ = writeln!(out, "{heading}: {rendered}");
+            }
+        }
+    }
+
+    /// Renders the `--drop` before-image in full.
+    ///
+    /// These declarations no longer exist anywhere else - upstream rewrote the
+    /// sidecar atomically - so a text-mode operator shown only a count has lost
+    /// them, and the documented "recoverable by inspection" claim would be false
+    /// for exactly the people reading this format. Every field needed to
+    /// re-declare is emitted: key, type, vector dimension, and optionality.
+    fn write_drop_before_image(&self, out: &mut String) {
+        use std::fmt::Write as _;
+
+        for declaration in &self.dropped_constraints {
+            let properties = declaration
+                .properties
+                .iter()
+                .map(|property| {
+                    let mut rendered = bounded_field(&property.property);
+                    if let Some(declared_type) = &property.declared_type {
+                        let _ = write!(rendered, ":{}", bounded_field(declared_type));
+                    }
+                    if let Some(dim) = property.vector_dim {
+                        let _ = write!(rendered, "[{dim}]");
+                    }
+                    if property.required {
+                        rendered.push_str(" required");
+                    }
+                    if !property.nullable {
+                        rendered.push_str(" non-null");
+                    }
+                    rendered
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "  dropped {} {}: {properties}",
+                bounded_field(&declaration.entity_kind),
+                bounded_field(&declaration.label)
+            );
+        }
+    }
+
     /// The human-readable rendering. The JSON remains the complete contract.
     #[must_use]
     pub fn to_text(&self) -> String {
@@ -910,14 +993,19 @@ impl SchemaConstraintReport {
             writable_node_labels().len(),
             writable_edge_types().len()
         );
-        let _ = writeln!(
-            out,
-            "conformance: {} labels scanned, {} conforming, {} entities checked, {} non-conforming",
-            self.labels_scanned(),
-            self.labels_conforming(),
-            self.entities_checked(),
-            self.entities_non_conforming()
-        );
+        // Mirrors `to_json`, which REMOVES the conformance block when no scan
+        // ran. Printing "0 labels scanned, 0 non-conforming" for a `--drop` reads
+        // as a clean bill of health on a destructive action that checked nothing.
+        if self.conformance_evaluated {
+            let _ = writeln!(
+                out,
+                "conformance: {} labels scanned, {} conforming, {} entities checked, {} non-conforming",
+                self.labels_scanned(),
+                self.labels_conforming(),
+                self.entities_checked(),
+                self.entities_non_conforming()
+            );
+        }
 
         for row in &self.rows {
             if row.status == ConformanceStatus::NotPresent {
@@ -950,38 +1038,39 @@ impl SchemaConstraintReport {
             }
         }
 
-        if !self.unknown_node_labels.is_empty() {
-            let _ = writeln!(
-                out,
-                "unknown node labels in store: {}",
-                self.unknown_node_labels
-                    .iter()
-                    .map(|label| bounded_field(label))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        if !self.unknown_edge_types.is_empty() {
-            let _ = writeln!(
-                out,
-                "unknown edge types in store: {}",
-                self.unknown_edge_types
-                    .iter()
-                    .map(|label| bounded_field(label))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
+        self.write_unknown_labels(&mut out);
         let _ = writeln!(
             out,
             "declared constraints: {}",
             self.declared_constraints.len()
         );
+        if self.declared_constraints_omitted > 0 {
+            let _ = writeln!(out, "  (+{} omitted)", self.declared_constraints_omitted);
+        }
         if self.action == ConstraintAction::Declare {
             let _ = writeln!(out, "declared labels: {}", self.declared_labels);
         }
         if self.action == ConstraintAction::Drop {
             let _ = writeln!(out, "dropped labels: {}", self.dropped_labels);
+            self.write_drop_before_image(&mut out);
+        }
+        if self.foreign_constraints_retained_omitted > 0 {
+            let _ = writeln!(
+                out,
+                "foreign constraints retained: {} (+{} omitted)",
+                self.foreign_constraints_retained.len(),
+                self.foreign_constraints_retained_omitted
+            );
+        }
+        // A partial declare/drop exits nonzero. Without these, a text-mode
+        // operator is told only how many labels landed - not which one failed or
+        // why - on precisely the non-atomic path where the store is now in a
+        // half-applied state they have to clean up by hand.
+        if let Some(refusal) = &self.declaration_refusal {
+            let _ = writeln!(out, "declaration refused: {}", bounded_field(refusal));
+        }
+        if let Some(refusal) = &self.drop_refusal {
+            let _ = writeln!(out, "drop refused: {}", bounded_field(refusal));
         }
         let _ = writeln!(out, "disclaimer: {DISCLAIMER}");
         out
@@ -1330,6 +1419,122 @@ mod tests {
         assert_eq!(report.declared_constraints.len(), 3);
         assert_eq!(report.declared_constraints_omitted, 0);
         assert_eq!(report.unknown_node_labels_omitted, 0);
+    }
+
+    /// `canonicalize` is public and documented idempotent, so an overflow count
+    /// must survive a second call.
+    ///
+    /// The second call sees an ALREADY-truncated list, so recomputing the
+    /// overflow from it yields zero. Assigning that would reset a real count and
+    /// hand the consumer a bounded list claiming to be complete - the precise
+    /// failure the field was added to prevent.
+    #[test]
+    fn omitted_counts_survive_a_second_canonicalize() {
+        let mut report = sample_report();
+        report.unknown_node_labels = (0..MAX_UNKNOWN_LABELS + 8)
+            .map(|index| format!("Foreign{index:04}"))
+            .collect();
+        report.declared_constraints = declarations(MAX_DECLARED_CONSTRAINTS + 5, "Declared");
+        report.foreign_constraints_retained =
+            declarations(MAX_DECLARED_CONSTRAINTS + 2, "Retained");
+
+        report.canonicalize();
+        let first = (
+            report.unknown_node_labels_omitted,
+            report.declared_constraints_omitted,
+            report.foreign_constraints_retained_omitted,
+        );
+        assert_eq!(first, (8, 5, 2));
+
+        report.canonicalize();
+        assert_eq!(
+            (
+                report.unknown_node_labels_omitted,
+                report.declared_constraints_omitted,
+                report.foreign_constraints_retained_omitted,
+            ),
+            first,
+            "a second canonicalize must not reset the omitted counts to zero"
+        );
+        assert_eq!(report.to_json(), {
+            let mut again = report.clone();
+            again.canonicalize();
+            again.to_json()
+        });
+    }
+
+    /// `--drop` scans nothing, so the text view must not print a conformance
+    /// line - `to_json` deliberately removes that block for the same reason.
+    #[test]
+    fn text_omits_the_conformance_line_when_nothing_was_scanned() {
+        let mut report = sample_report();
+        report.action = ConstraintAction::Drop;
+        report.conformance_evaluated = false;
+        report.rows = Vec::new();
+        report.canonicalize();
+
+        let text = report.to_text();
+        assert!(
+            !text.contains("conformance:"),
+            "a drop that scanned nothing must not print a conformance verdict, \
+             vacuous or otherwise:\n{text}"
+        );
+        assert!(report.to_json().get("conformance").is_none());
+    }
+
+    /// The text view must carry the before-image, not just its count.
+    #[test]
+    fn text_renders_the_full_drop_before_image() {
+        let mut report = sample_report();
+        report.action = ConstraintAction::Drop;
+        report.conformance_evaluated = false;
+        report.rows = Vec::new();
+        report.dropped_constraints = vec![DeclaredConstraint {
+            entity_kind: "node".to_owned(),
+            label: "SomeOtherToolsLabel".to_owned(),
+            properties: vec![DeclaredProperty {
+                property: "their_embedding".to_owned(),
+                declared_type: Some("vector".to_owned()),
+                vector_dim: Some(384),
+                required: true,
+                nullable: false,
+            }],
+        }];
+        report.dropped_labels = 1;
+        report.canonicalize();
+
+        let text = report.to_text();
+        // Every field needed to re-declare it must be present.
+        assert!(text.contains("SomeOtherToolsLabel"), "{text}");
+        assert!(text.contains("their_embedding"), "{text}");
+        assert!(text.contains("vector"), "{text}");
+        assert!(text.contains("384"), "{text}");
+        assert!(text.contains("required"), "{text}");
+        assert!(text.contains("non-null"), "{text}");
+    }
+
+    /// A partial declare/drop must say WHICH label failed, in both formats.
+    #[test]
+    fn text_renders_the_refusal_reason() {
+        let mut report = sample_report();
+        report.action = ConstraintAction::Drop;
+        report.conformance_evaluated = false;
+        report.rows = Vec::new();
+        report.dropped_labels = 3;
+        report.drop_refusal =
+            Some("dropping schema constraints failed at Symbol: disk full".to_owned());
+        report.canonicalize();
+
+        let text = report.to_text();
+        assert!(text.contains("drop refused"), "{text}");
+        assert!(text.contains("Symbol"), "{text}");
+        assert!(text.contains("dropped labels: 3"), "{text}");
+
+        let mut declaring = sample_report();
+        declaring.action = ConstraintAction::Declare;
+        declaring.declaration_refusal = Some("refused at CONTAINS: sidecar unwritable".to_owned());
+        declaring.canonicalize();
+        assert!(declaring.to_text().contains("declaration refused"));
     }
 
     /// A partial drop is a failure verdict, not a success with a note.
