@@ -84,14 +84,25 @@ pub enum ManifestShape {
 
 /// Sections Cargo forbids in a VIRTUAL manifest (`[workspace]`, no `[package]`).
 ///
-/// Each was verified against real `cargo metadata`, which rejects the manifest
-/// with "this virtual manifest specifies a `<section>` section, which is not
-/// allowed". `[profile]` and `[patch]` are accepted beside `[workspace]` and are
-/// deliberately NOT listed.
-const VIRTUAL_MANIFEST_FORBIDDEN_SECTIONS: [&str; 12] = [
+/// Cargo rejects such a manifest with "this virtual manifest specifies a
+/// `<section>` section, which is not allowed". Every entry was verified against
+/// the toolchain this repository pins (cargo 1.94.1); `[profile]`, `[patch]`,
+/// `[replace]`, and `[project]` were verified ACCEPTED and are deliberately
+/// absent.
+///
+/// A DENY-list, deliberately, even though it can lag: Cargo tolerates an
+/// unrecognized section in a virtual manifest (verified — an invented
+/// `[totally-made-up-section]` loads fine), so an allow-list would classify
+/// every manifest carrying a future or tool-specific key as unusable and
+/// silently un-attribute its whole subtree. The residual risk is the opposite
+/// direction — a section Cargo forbids in a LATER release is walked past here
+/// until this list is updated, exactly as `hints` was before it was added.
+const VIRTUAL_MANIFEST_FORBIDDEN_SECTIONS: [&str; 15] = [
     "dependencies",
     "dev-dependencies",
+    "dev_dependencies",
     "build-dependencies",
+    "build_dependencies",
     "features",
     "target",
     "lib",
@@ -101,8 +112,8 @@ const VIRTUAL_MANIFEST_FORBIDDEN_SECTIONS: [&str; 12] = [
     "example",
     "badges",
     "lints",
+    "hints",
 ];
-
 /// The three captured dependency tables in documented output order.
 const DEPENDENCY_KINDS: [DependencyKind; 3] = [
     DependencyKind::Normal,

@@ -77,14 +77,6 @@ pub(crate) fn query_file(
     let mut excluded_repos: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
 
     let mut is_first = true;
-    // The owning package per REPOSITORY: a repo-relative path is not globally
-    // unique, so a shared store can hold `src/lib.rs` in two repositories with
-    // different owners. Keyed on the repository so neither fact is lost and
-    // neither is attached to the other's rows.
-    let mut attribution_by_repo: std::collections::BTreeMap<
-        Option<&str>,
-        &crate::ir::CrateAttribution,
-    > = std::collections::BTreeMap::new();
     for r in records {
         let GraphRecord::Node {
             id,
@@ -115,11 +107,6 @@ pub(crate) fn query_file(
             }
             continue;
         }
-        if let Some(attribution) = r.crate_attribution() {
-            attribution_by_repo
-                .entry(repository_id)
-                .or_insert(attribution);
-        }
         results.push(SymbolResult {
             record_id: id,
             schema_version: *schema_version,
@@ -137,13 +124,15 @@ pub(crate) fn query_file(
             // Crate attribution IS carried here, unlike the declaration-surface
             // fields above (issue #117). Those differ per row, so omitting them
             // only trims duplication a caller can recover with `eg query
-            // symbol`. Attribution is constant across a file listing and the
-            // lane has no envelope, so omitting it would drop the owning-package
-            // fact from the ENTIRE answer — and `docs/cli/query.md` promises
-            // these rows carry every `eg query symbol` field but those three.
-            // Stamped after the sort below, so it lands on the row that is
-            // actually emitted first.
-            crate_attribution: None,
+            // symbol`; omitting attribution would drop the owning-package fact
+            // from the ENTIRE answer, since this lane has no envelope — and
+            // `docs/cli/query.md` promises these rows carry every `eg query
+            // symbol` field but those three.
+            //
+            // Every row takes its OWN record's attribution; duplicates are
+            // blanked after the sort below, so whatever survives is always a
+            // fact about the row it rides on.
+            crate_attribution: r.crate_attribution(),
             crate_attribution_disclaimer: None,
             git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
             repository_id,
@@ -178,21 +167,23 @@ pub(crate) fn query_file(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
-    // `crate_attribution` is a file-level fact (issue #117): every symbol in one
-    // file shares one owning package. Carry it once per REPOSITORY, on that
-    // repository's first emitted row — the same shape the lane uses for
-    // file-level `diagnostics`. Omitting it entirely would drop the fact from
-    // the whole answer, since this lane has no envelope; repeating it per row
-    // measurably regresses the token-cost gate. Per-repository rather than
-    // per-answer because a repo-relative path is not globally unique: an
-    // unscoped shared-store query can return two repositories' rows, and one
-    // repository's package must never ride on the other's row.
-    let mut stamped: std::collections::BTreeSet<Option<&str>> = std::collections::BTreeSet::new();
+    // `crate_attribution` is a file-level fact (issue #117), but "the file" is
+    // not globally unique: a repo-relative path can exist in several
+    // repositories, and over a `scan-history` graph its owning package can
+    // change between commits. So rather than pick one attribution for the whole
+    // answer, keep the FIRST occurrence of each DISTINCT one and blank the
+    // repeats. Every surviving value is then a fact about the row it rides on,
+    // every distinct package in the answer appears at least once, and the common
+    // single-package case still emits exactly one — repeating it on every row
+    // measurably regresses the `eg audit token-cost` savings gate.
+    let mut seen: std::collections::BTreeSet<(Option<&str>, &crate::ir::CrateAttribution)> =
+        std::collections::BTreeSet::new();
     for result in &mut results {
-        if stamped.insert(result.repository_id)
-            && let Some(attribution) = attribution_by_repo.get(&result.repository_id)
-        {
-            result.crate_attribution = Some(attribution);
+        let Some(attribution) = result.crate_attribution else {
+            continue;
+        };
+        if !seen.insert((result.repository_id, attribution)) {
+            result.crate_attribution = None;
         }
     }
     stamp_freshness(&mut results, freshness_code);

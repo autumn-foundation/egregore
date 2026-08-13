@@ -3580,6 +3580,11 @@ fn virtual_manifest_with_a_package_only_section_stops_the_walk() {
         "[features]\ndefault = []\n",
         "[lib]\nname = \"x\"\npath = \"src/lib.rs\"\n",
         "[badges]\nmaintenance = { status = \"active\" }\n",
+        // `hints` is a NEWER Cargo section; the underscore spellings are legacy
+        // aliases. All three are rejected beside `[workspace]`.
+        "[hints]\nmostly-unused = true\n",
+        "[dev_dependencies]\nserde = \"1\"\n",
+        "[build_dependencies]\nserde = \"1\"\n",
     ] {
         let temp = tempfile::tempdir().expect("temp dir");
         write_fixture(
@@ -3716,4 +3721,113 @@ fn query_file_carries_attribution_once_per_repository() {
         2,
         "each repository's owning package must appear: {seen_by_repo:?}"
     );
+}
+
+/// Over a `scan-history` graph, one file's owning package can CHANGE between
+/// commits, so `eg query file` must not collapse every snapshot's attribution
+/// to whichever row happened to come first.
+///
+/// The rows of a history graph span several commits. Carrying one attribution
+/// per repository would drop the later package fact entirely and — because rows
+/// are sorted after projection — could attach the old package to a row from a
+/// different commit.
+#[test]
+fn query_file_carries_each_distinct_attribution_over_history() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"before\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn one() -> u32 { 1 }\npub fn two() -> u32 { 2 }\n",
+            ),
+        ],
+    );
+    commit(&repo, "first", "2026-06-01T00:00:00Z");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"after\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("manifest renamed");
+    commit(&repo, "rename package", "2026-06-02T00:00:00Z");
+
+    let graph_path = temp.path().join("history.jsonl");
+    fs::write(
+        &graph_path,
+        aletheia_egregore::scan_repository_history(&repo)
+            .expect("history replay")
+            .to_jsonl()
+            .expect("serialize"),
+    )
+    .expect("graph written");
+
+    let run = run_query(&[
+        "query",
+        "file",
+        "src/lib.rs",
+        "--graph",
+        graph_path.to_str().unwrap(),
+    ]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    let rows = rows(&run.stdout);
+    assert!(
+        rows.len() >= 2,
+        "history rows across commits: {}",
+        rows.len()
+    );
+
+    let packages: BTreeSet<&str> = rows
+        .iter()
+        .filter_map(|r| r["crate_attribution"]["package_name"].as_str())
+        .collect();
+    assert_eq!(
+        packages,
+        BTreeSet::from(["before", "after"]),
+        "both snapshots' owning packages must survive the answer: {packages:?}"
+    );
+
+    // And every emitted attribution belongs to the row it rides on: a row's
+    // package must match the package that owned the file at ITS commit.
+    //
+    // Keyed on (record_id, commit): an ADR-0004 symbol ID carries no commit
+    // component, so the SAME id recurs across commits with different owners —
+    // keying on the id alone would collapse the two snapshots and make this
+    // oracle wrong rather than the code.
+    let all = parse_jsonl(&fs::read_to_string(&graph_path).expect("graph readable"));
+    let truth: BTreeMap<(&str, &str), &str> = all
+        .iter()
+        .filter(|r| r["kind"] == "Symbol" && r["repo_relative_path"] == "src/lib.rs")
+        .filter_map(|r| {
+            Some((
+                (r["id"].as_str()?, r["temporal"]["git_commit"].as_str()?),
+                package_of(r)?,
+            ))
+        })
+        .collect();
+    assert!(
+        truth.len() >= 4,
+        "anti-vacuity: {} truth entries",
+        truth.len()
+    );
+    for row in &rows {
+        let Some(package) = row["crate_attribution"]["package_name"].as_str() else {
+            continue;
+        };
+        let key = (
+            row["record_id"].as_str().expect("record_id"),
+            row["git_commit"].as_str().expect("git_commit"),
+        );
+        assert_eq!(
+            truth.get(&key),
+            Some(&package),
+            "a row's attribution must be its OWN record's at its own commit: {row}"
+        );
+    }
 }

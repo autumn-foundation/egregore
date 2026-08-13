@@ -823,7 +823,7 @@ eg query file <PATH> --graph <PATH> [--at <COMMIT> | --as-of <RFC3339>] [--forma
 
 Same fields as `eg query symbol` (see above), except the declaration-surface fields `visibility`, `signature`, and `doc`, which are omitted from file listing rows to keep the per-file answer lean — use `eg query symbol <NAME>` for a symbol's contract. Results are sorted by `span.start_line` ascending, then `record_id`.
 
-`crate_attribution` (issue #117) is a **file-level** fact — every symbol in one file shares one owning package — so it is carried **once per repository, on that repository's first row**, exactly as file-level `diagnostics` are. Per repository rather than per answer because a repo-relative path is not globally unique: an unscoped query over a shared store can return two repositories' rows for one path. It is not omitted: the lane has no envelope, so dropping it would remove the owning-package fact from the entire answer rather than merely deduplicating it.
+`crate_attribution` (issue #117) is a **file-level** fact — every symbol in one file shares one owning package — so it is carried on the **first row of each distinct value**, in the spirit of file-level `diagnostics`. Per distinct value rather than once per answer because "the file" is not globally unique: a repo-relative path can exist in several repositories, and over a `scan-history` graph its owning package can change between commits. Every emitted value is therefore a fact about the row it rides on. It is not omitted: the lane has no envelope, so dropping it would remove the owning-package fact from the entire answer rather than merely deduplicating it.
 
 ### File snapshot at a point in time (`--at` / `--as-of`, issue #158)
 

@@ -114,7 +114,7 @@ does — so an absent field never means "this kind happens not to be covered".
 | `virtual_manifest_only` | Every enclosing manifest is a virtual workspace root, which declares no package. |
 | `unnamed_package` | The nearest manifest declares a `[package]` whose `name` is absent or Cargo-invalid. |
 | `unparseable_manifest` | The nearest manifest is not valid TOML. |
-| `unusable_manifest` | The nearest manifest parses but is one Cargo refuses to load: it carries neither `[package]` nor `[workspace]`, or it is a virtual (`[workspace]`, no `[package]`) manifest carrying a package-only section (`dependencies`, `dev-dependencies`, `build-dependencies`, `features`, `target`, `lib`, `bin`, `bench`, `test`, `example`, `badges`, `lints`). |
+| `unusable_manifest` | The nearest manifest parses but is one Cargo refuses to load: it carries neither `[package]` nor `[workspace]`, or it is a virtual (`[workspace]`, no `[package]`) manifest carrying a package-only section (`dependencies`, `dev-dependencies`, `build-dependencies`, their legacy underscore spellings, `features`, `target`, `lib`, `bin`, `bench`, `test`, `example`, `badges`, `lints`, `hints`). That set is pinned to the toolchain this repository targets and can lag a newer Cargo: it is a deny-list because Cargo *tolerates* an unrecognized section in a virtual manifest, so an allow-list would un-attribute every subtree under a manifest carrying a future or tool-specific key. |
 | `manifest_unreadable` | The nearest manifest could not be read, or is not UTF-8. |
 
 The reason carries no payload: a TOML parse-error message can echo manifest body
@@ -158,9 +158,12 @@ Under `--package`, every row additionally carries
 Unscoped rows carry no disclaimer: their `manifest_repo_relative_path` already
 names exactly what the claim rests on.
 
-`eg query file` carries `crate_attribution` once per repository, on that
-repository's first emitted row: it is a file-level fact, the lane has no
-envelope, and a repo-relative path is not globally unique across a shared store.
+`eg query file` carries `crate_attribution` on the first row of each DISTINCT
+value: it is a file-level fact, but "the file" is not globally unique — a
+repo-relative path can exist in several repositories, and over a `scan-history`
+graph its owning package can change between commits. Every surviving value is a
+fact about the row it rides on, and the common single-package case still emits
+exactly one.
 
 ### `--format text`
 
