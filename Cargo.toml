@@ -32,6 +32,15 @@ embedded-aletheiadb = [
 ]
 embeddings = ["embedded-aletheiadb", "aletheiadb/embeddings", "dep:tokio"]
 nova = ["embedded-aletheiadb", "aletheiadb/nova"]
+# Test-only fixture affordances (issue #486). NEVER enable in a production
+# build: `adapters::fixtures` can write a record that bypasses every Egregore
+# invariant, which is exactly what the schema-constraint backstop exists to
+# catch. Enabled for the test target via the self dev-dependency below.
+#
+# Deliberately implies NOTHING. `adapters::fixtures` is gated on this feature
+# AND `embedded-aletheiadb`, so enabling it cannot drag the embedded adapter
+# into a `--no-default-features` run and quietly change what that config tests.
+test-fixtures = []
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -95,6 +104,13 @@ libc = "0.2"
 assert_cmd = "2.1.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"
+# Self dev-dependency so the test target - and ONLY the test target - sees the
+# `test-fixtures` feature (issue #486). Cargo unifies this with the lib under
+# test, so integration tests reach `adapters::fixtures` while a production
+# consumer of the published crate cannot. Carries `default-features = false` so
+# a `--no-default-features` run does not silently re-enable the embedded
+# adapter through the back door.
+aletheia-egregore = { path = ".", default-features = false, features = ["test-fixtures"] }
 
 [profile.dev]
 debug = 1
