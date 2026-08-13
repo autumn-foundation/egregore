@@ -3831,3 +3831,62 @@ fn query_file_carries_each_distinct_attribution_over_history() {
         );
     }
 }
+
+/// The walk only passes a manifest it can POSITIVELY confirm is a loadable
+/// virtual root; anything else stops it.
+///
+/// Walking past is the fail-OPEN direction — it can attribute a subtree to an
+/// outer package — so it must require confidence, not merely the absence of
+/// known-bad markers. Enumerating malformations is open-ended: a `package` key
+/// that is present but not a table reads as "no package" to a table-only lookup,
+/// yet Cargo rejects it (`invalid type: string "not-a-table", expected struct
+/// TomlPackage`). Requiring a confirmed shape closes that class rather than one
+/// instance of it.
+#[test]
+fn only_a_confirmed_virtual_root_is_walked_past() {
+    for (label, manifest) in [
+        // A top-level `package` key present but not a table: Cargo rejects it
+        // ("invalid type: string, expected struct TomlPackage"), and a
+        // table-only lookup would silently read it as package-less. The key must
+        // precede the `[workspace]` header to be top-level — after it, TOML
+        // nests it as `workspace.package`, which is the next case.
+        (
+            "top-level package = string",
+            "package = \"not-a-table\"\n\n[workspace]\nmembers = []\n",
+        ),
+        (
+            "top-level package = int",
+            "package = 42\n\n[workspace]\nmembers = []\n",
+        ),
+        // `[workspace].package` is the inheritance table; a non-table value
+        // there is equally rejected by Cargo.
+        (
+            "workspace.package = string",
+            "[workspace]\nmembers = []\n\npackage = \"not-a-table\"\n",
+        ),
+        // A `workspace` key that is present but not a table.
+        ("workspace = true", "workspace = true\n"),
+        ("workspace = string", "workspace = \"nope\"\n"),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                ("nested/Cargo.toml", manifest),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([
+                "unattributed:unusable_manifest".to_owned()
+            ])),
+            "`{label}` is not a confirmed virtual root and must stop the walk"
+        );
+    }
+}

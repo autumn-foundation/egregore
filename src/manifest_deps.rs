@@ -332,17 +332,36 @@ pub fn parse_manifest_dependencies(
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| error.to_string())?;
     let package_table = doc.get("package").and_then(toml_edit::Item::as_table_like);
-    // A `[workspace]` table alone does not make a manifest LOADABLE: Cargo
-    // rejects a virtual manifest that also carries any package-only section,
-    // with "this virtual manifest specifies a `<section>` section, which is not
-    // allowed". Each forbidden entry was verified against real `cargo metadata`;
-    // `[profile]` and `[patch]` are accepted and are deliberately absent.
+    // Classifying a manifest as a virtual root is the FAIL-OPEN direction: the
+    // attribution walk passes it and can attribute the subtree to an outer
+    // package. So it requires POSITIVE confirmation of a loadable virtual root,
+    // and every other shape falls through to `Unusable`, which stops the walk.
+    //
+    // Enumerating the ways a manifest can be malformed is open-ended — a
+    // `package` key present but not a table reads as "package-less" to a
+    // table-only lookup even though Cargo rejects it — so the default for the
+    // dangerous branch is deliberately inverted rather than patched per case.
+    //
+    // A confirmed virtual root has: no `package` key AT ALL (a present one, in
+    // any shape, means the manifest is trying to declare a package), a
+    // `workspace` TABLE, and none of the package-only sections Cargo forbids
+    // beside it ("this virtual manifest specifies a `<section>` section, which
+    // is not allowed" — each verified against real `cargo metadata`, while
+    // `[profile]`, `[patch]`, and `[replace]` were verified accepted).
     let shape = if package_table.is_some() {
         ManifestShape::Package
-    } else if doc
-        .get("workspace")
-        .and_then(toml_edit::Item::as_table_like)
-        .is_some()
+    } else if doc.get("package").is_none()
+        && doc
+            .get("workspace")
+            .and_then(toml_edit::Item::as_table_like)
+            .is_some_and(|workspace| {
+                // `[workspace.package]` is the inheritance table; a non-table
+                // value there is rejected by Cargo just as a non-table top-level
+                // `package` is.
+                workspace
+                    .get("package")
+                    .is_none_or(|inherited| inherited.as_table_like().is_some())
+            })
         && !VIRTUAL_MANIFEST_FORBIDDEN_SECTIONS
             .iter()
             .any(|section| doc.get(section).is_some())
