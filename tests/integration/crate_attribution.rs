@@ -2774,3 +2774,576 @@ fn containment_disclaimer_is_identical_everywhere_it_is_stated() {
         );
     }
 }
+
+/// `--package` must never be silently ignored on the transaction-time lane.
+///
+/// `--tx-as-of` returns through its own row type, which carries no crate
+/// attribution, so a scoped transaction-time query could only emit UNSCOPED
+/// rows — including records owned by other packages. Refusing is the honest
+/// outcome, matching the `--daemon` refusal.
+#[test]
+fn package_scope_with_tx_as_of_exits_1_unsupported_combination() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--tx-as-of",
+        "2026-06-14T00:00:00Z",
+        "--package",
+        "alpha",
+    ]);
+    assert_eq!(
+        run.code, 1,
+        "the flag must be refused, never silently ignored; stdout: {}",
+        run.stdout
+    );
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        combined.contains("unsupported_combination"),
+        "expected an unsupported_combination envelope; got stdout={} stderr={}",
+        run.stdout,
+        run.stderr
+    );
+    // And no unscoped rows leaked to stdout before the refusal.
+    assert!(
+        !run.stdout.contains("\"record_id\""),
+        "no rows may be emitted alongside the refusal: {}",
+        run.stdout
+    );
+}
+
+/// Cross-repository package ambiguity must be decided against the WHOLE
+/// corpus, not the sidecar index's narrowed symbol closure.
+///
+/// The #447 index is a pure access-path optimization: an answer must be
+/// byte-identical with and without one. A package owned by two repositories
+/// where only ONE of them defines the queried symbol is the case that breaks
+/// that: the narrowed closure sees a single owner and would happily return
+/// rows, while a cold scan reports `ambiguous_package_selector`.
+#[test]
+fn package_ambiguity_is_detected_even_with_a_sidecar_index() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut combined = String::new();
+    for (repo_id, symbol) in [("repo-a", "only_in_a"), ("repo-b", "only_in_b")] {
+        let repo = temp.path().join(repo_id);
+        fs::create_dir_all(&repo).expect("repo dir");
+        write_fixture(
+            &repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"shared\"\nversion = \"0.1.0\"\n",
+                ),
+                ("src/lib.rs", &format!("pub fn {symbol}() -> u32 {{ 1 }}\n")),
+            ],
+        );
+        combined.push_str(
+            &scan_repository_at_with_override(&repo, FIXED_TIME, Some(repo_id))
+                .expect("scan")
+                .to_jsonl()
+                .expect("serialize"),
+        );
+        combined.push('\n');
+    }
+    let graph = temp.path().join("combined.jsonl");
+    fs::write(&graph, &combined).expect("graph written");
+    let graph_str = graph.to_str().unwrap();
+
+    // `only_in_a` is defined by repo-a alone, but BOTH repositories own a
+    // package called `shared`.
+    let args = [
+        "query",
+        "symbol",
+        "only_in_a",
+        "--graph",
+        graph_str,
+        "--package",
+        "shared",
+    ];
+    let cold = run_query(&args);
+    assert_eq!(
+        cold.code, 1,
+        "cold: an ambiguous package must be refused; stdout: {}",
+        cold.stdout
+    );
+    assert!(cold.stderr.contains("ambiguous_package_selector"));
+
+    assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary")
+        .args(["index", graph_str])
+        .assert()
+        .success();
+
+    let indexed = run_query(&args);
+    assert_eq!(
+        indexed.code, cold.code,
+        "the sidecar index must not change the verdict; stdout: {}",
+        indexed.stdout
+    );
+    assert_eq!(
+        indexed.stderr, cold.stderr,
+        "the sidecar index must not change the diagnostic"
+    );
+    assert_eq!(indexed.stdout, cold.stdout);
+}
+
+/// History replay must not abort on a path whose bytes are not valid UTF-8.
+///
+/// Git stores paths as raw bytes. Reading NUL-delimited listings hands those
+/// bytes through unescaped, so an undecodable path must be SKIPPED with the
+/// rest of the tree still replayed — the issue-#438 precedent for an
+/// undecodable blob — never turned into a hard failure of the whole command.
+/// `eg scan` copes with such a repo, so `eg scan-history` must too.
+#[cfg(unix)]
+#[test]
+fn history_skips_non_utf8_paths_without_aborting() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("repo dir");
+    init_git(&repo);
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"ok\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn fine() -> u32 { 1 }\n"),
+        ],
+    );
+    // A Latin-1 `é` (0xE9) — a legal Git path, not valid UTF-8.
+    let bad = repo
+        .join("src")
+        .join(std::ffi::OsStr::from_bytes(b"caf\xe9.rs"));
+    fs::write(&bad, "pub fn latin() -> u32 { 2 }\n").expect("latin-1 path written");
+    commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    let graph = aletheia_egregore::scan_repository_history(&repo)
+        .expect("history replay must not abort on a non-UTF-8 path");
+    let jsonl = graph.to_jsonl().expect("serialize");
+    let records = parse_jsonl(&jsonl);
+
+    // The decodable sibling is still fully indexed and attributed.
+    let by_path = attribution_by_path(&records);
+    assert_eq!(
+        by_path.get("src/lib.rs"),
+        Some(&BTreeSet::from(["ok@Cargo.toml".to_owned()])),
+        "the decodable file must still replay"
+    );
+}
+
+/// Every `Change` node's path must be spelled the same way the `File` node for
+/// that path is, so history joins actually connect.
+///
+/// The tree listing and the change listing are two different Git commands. If
+/// only one reads NUL-delimited output, a path containing `"` or a tab is raw
+/// on one side and C-quoted on the other: the file is indexed, but its
+/// `CHANGED_IN` edges point at a path no `File` node has, silently dropping it
+/// from every history lane (`churn`, `coupling`, `deltas`, `lifeline`).
+#[test]
+fn change_and_file_node_paths_agree_for_special_characters() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"ok\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn plain() -> u32 { 1 }\n"),
+            ("src/qu\"ote.rs", "pub fn quoted() -> u32 { 2 }\n"),
+            ("src/with space.rs", "pub fn spaced() -> u32 { 3 }\n"),
+        ],
+    );
+    commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    let jsonl = aletheia_egregore::scan_repository_history(&repo)
+        .expect("history replay")
+        .to_jsonl()
+        .expect("serialize");
+    let records = parse_jsonl(&jsonl);
+
+    let file_paths: BTreeSet<&str> = records
+        .iter()
+        .filter(|r| r["kind"] == "File")
+        .filter_map(|r| r["repo_relative_path"].as_str())
+        .collect();
+    let change_paths: BTreeSet<&str> = records
+        .iter()
+        .filter(|r| r["kind"] == "Change")
+        .filter_map(|r| r["repo_relative_path"].as_str())
+        .collect();
+
+    for special in ["src/qu\"ote.rs", "src/with space.rs", "src/lib.rs"] {
+        assert!(
+            file_paths.contains(special),
+            "{special} must be indexed; got {file_paths:?}"
+        );
+        assert!(
+            change_paths.contains(special),
+            "{special} must have a Change node under the SAME spelling; got {change_paths:?}"
+        );
+    }
+    // No Change node may name a path that no File node has.
+    let orphans: Vec<&&str> = change_paths
+        .iter()
+        .filter(|p| {
+            Path::new(*p).extension().and_then(|e| e.to_str()) == Some("rs")
+                && !file_paths.contains(*p)
+        })
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "Change nodes name paths no File node has: {orphans:?}"
+    );
+}
+
+/// A record read back from a store or graph is operator-controlled, so the
+/// `attributed <=> name present` invariant must be re-checked on the READ path,
+/// not assumed from the write path.
+///
+/// A forged record claiming `status: unattributed` while carrying a
+/// `package_name` must not render as attributed, must not be matched by
+/// `--package`, and must not appear in `known_packages`. Trusting the name over
+/// the status would let a crafted graph assert an ownership fact the resolver
+/// never produced.
+#[test]
+fn forged_attribution_with_inconsistent_status_is_not_trusted() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let forged: String = fs::read_to_string(&graph)
+        .expect("graph readable")
+        .lines()
+        .map(|line| {
+            let mut record: Value = serde_json::from_str(line).expect("JSON");
+            if record["kind"] == "Symbol"
+                && record["name"]
+                    .as_str()
+                    .is_some_and(|n| n.ends_with("handle"))
+                && let Some(object) = record.as_object_mut()
+            {
+                object.insert(
+                    "crate_attribution".to_owned(),
+                    serde_json::json!({
+                        "status": "unattributed",
+                        "unattributed_reason": "no_enclosing_manifest",
+                        "package_name": "ghostpkg",
+                        "manifest_repo_relative_path": "nowhere/Cargo.toml",
+                    }),
+                );
+            }
+            serde_json::to_string(&record).expect("serialize")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let forged_path = temp.path().join("forged.jsonl");
+    fs::write(&forged_path, forged).expect("forged graph written");
+    let forged_str = forged_path.to_str().unwrap();
+
+    // The forged package is not a real package: scoping to it is a typo, not a
+    // match, and it never appears in `known_packages`.
+    let scoped = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        forged_str,
+        "--package",
+        "ghostpkg",
+    ]);
+    assert_eq!(
+        scoped.code, 1,
+        "a forged name must not become a scopable package; stdout: {}",
+        scoped.stdout
+    );
+    assert!(scoped.stderr.contains("unknown_package_selector"));
+    assert!(
+        !scoped.stderr.contains("ghostpkg\",\"known") && !scoped.stderr.contains("\"ghostpkg\"]"),
+        "the forged name must not be listed as known: {}",
+        scoped.stderr
+    );
+
+    // And the row renders as what it CLAIMS to be — unattributed — not as an
+    // attribution to a package no manifest declares.
+    let text = run_query(&[
+        "query", "symbol", "handle", "--graph", forged_str, "--format", "text",
+    ]);
+    assert_eq!(text.code, 0, "stderr: {}", text.stderr);
+    assert!(
+        !text.stdout.contains("ghostpkg"),
+        "an unattributed row must not render a package name: {}",
+        text.stdout
+    );
+    assert!(
+        text.stdout
+            .contains("package: (unattributed: no_enclosing_manifest)"),
+        "the row must render its declared status: {}",
+        text.stdout
+    );
+}
+
+/// A symlinked `Cargo.toml` must not be read as manifest TEXT.
+///
+/// A Git symlink is stored as a blob whose content is the link target, so a
+/// type-only filter reads `../real/Cargo.toml` as TOML, fails to parse it, and
+/// reports `unparseable_manifest` — a positive, operator-actionable claim about
+/// a manifest that is perfectly valid. It also stops the walk fail-closed, so
+/// the file loses the real attribution `eg scan` gives it.
+#[cfg(unix)]
+#[test]
+fn symlinked_manifest_is_not_parsed_as_manifest_text() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("linked/src")).expect("repo dir");
+    init_git(&repo);
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"rootpkg\"\nversion = \"0.1.0\"\n",
+            ),
+            ("linked/src/x.rs", "pub fn linked() -> u32 { 1 }\n"),
+        ],
+    );
+    std::os::unix::fs::symlink("../Cargo.toml", repo.join("linked/Cargo.toml"))
+        .expect("symlink created");
+    let sha = commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    let scanned = attribution_by_path(&scan_fixture(&repo));
+    let history = history_attribution(&repo);
+    let at_head = &history[&sha];
+
+    assert_eq!(
+        at_head.get("linked/src/x.rs"),
+        scanned.get("linked/src/x.rs"),
+        "scan and history must agree; a symlinked manifest is invisible to both"
+    );
+    assert!(
+        !at_head["linked/src/x.rs"]
+            .iter()
+            .any(|a| a.contains("unparseable")),
+        "a valid manifest must never be reported unparseable: {:?}",
+        at_head["linked/src/x.rs"]
+    );
+}
+
+/// `--package` must select among the candidates at a commit, not filter a
+/// winner already chosen without it.
+///
+/// With two same-named symbols in two crates, `--at`/`--as-of` pick one record
+/// first and then apply the package filter, so asking for the crate whose
+/// symbol did not happen to sort first yields a false "no match" for a symbol
+/// that demonstrably exists at that commit.
+#[test]
+fn package_scope_selects_among_candidates_at_a_commit() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_workspace_fixture(&repo);
+    let sha = commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    let graph_path = temp.path().join("history.jsonl");
+    fs::write(
+        &graph_path,
+        aletheia_egregore::scan_repository_history(&repo)
+            .expect("history replay")
+            .to_jsonl()
+            .expect("serialize"),
+    )
+    .expect("graph written");
+    let graph = graph_path.to_str().unwrap();
+
+    for package in ["alpha", "beta"] {
+        let run = run_query(&[
+            "query",
+            "symbol",
+            "handle",
+            "--graph",
+            graph,
+            "--at",
+            &sha,
+            "--package",
+            package,
+        ]);
+        assert_eq!(
+            run.code, 0,
+            "`handle` exists in `{package}` at {sha}; stderr: {}",
+            run.stderr
+        );
+        let rows = rows(&run.stdout);
+        assert_eq!(rows.len(), 1, "one row per package");
+        assert_eq!(rows[0]["crate_attribution"]["package_name"], package);
+    }
+}
+
+/// `Change` nodes carry a repo-relative path, so they must be attributed like
+/// every other path-bearing code-graph node.
+///
+/// The rule the whole design rests on is "a path-bearing code-graph node
+/// carries attribution". A `Change` that carries a path and no attribution
+/// would make that rule false, and with it the inference that an absent field
+/// means the record predates issue #117.
+#[test]
+fn change_nodes_are_attributed_like_every_other_path_bearing_node() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_workspace_fixture(&repo);
+    commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    let jsonl = aletheia_egregore::scan_repository_history(&repo)
+        .expect("history replay")
+        .to_jsonl()
+        .expect("serialize");
+    let records = parse_jsonl(&jsonl);
+
+    let changes: Vec<&Value> = records.iter().filter(|r| r["kind"] == "Change").collect();
+    assert!(
+        !changes.is_empty(),
+        "anti-vacuity: the commit changed files"
+    );
+    for change in &changes {
+        assert!(
+            change["repo_relative_path"].is_string(),
+            "precondition: Change nodes carry a path"
+        );
+        assert!(
+            change.get("crate_attribution").is_some(),
+            "a path-bearing Change node must be attributed: {change}"
+        );
+    }
+    // And the attribution matches the File node for the same path.
+    let by_path = attribution_by_path(&records);
+    let alpha_change = changes
+        .iter()
+        .find(|c| c["repo_relative_path"] == "crates/alpha/src/lib.rs")
+        .expect("the alpha source changed in the seed commit");
+    assert_eq!(
+        attribution_of(alpha_change).as_deref(),
+        Some("alpha@crates/alpha/Cargo.toml"),
+        "a Change must agree with the File node for its path: {by_path:?}"
+    );
+}
+
+/// The `--as-of` lane narrows candidates by package too.
+#[test]
+fn package_scope_selects_among_candidates_as_of_an_instant() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_workspace_fixture(&repo);
+    commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    let graph_path = temp.path().join("history.jsonl");
+    fs::write(
+        &graph_path,
+        aletheia_egregore::scan_repository_history(&repo)
+            .expect("history replay")
+            .to_jsonl()
+            .expect("serialize"),
+    )
+    .expect("graph written");
+    let graph = graph_path.to_str().unwrap();
+
+    for package in ["alpha", "beta"] {
+        let run = run_query(&[
+            "query",
+            "symbol",
+            "handle",
+            "--graph",
+            graph,
+            "--as-of",
+            "2026-12-01T00:00:00Z",
+            "--package",
+            package,
+        ]);
+        assert_eq!(
+            run.code, 0,
+            "`handle` exists in `{package}`; stderr: {}",
+            run.stderr
+        );
+        let rows = rows(&run.stdout);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["crate_attribution"]["package_name"], package);
+    }
+}
+
+/// A corpus carrying NO attribution at all must say so, not report a typo.
+///
+/// `unknown_package_selector` with an empty `known_packages` is the same shape
+/// a genuine typo produces, so an operator querying a pre-#117 store cannot
+/// tell "you misspelled it" from "this store predates the feature" — collapsing
+/// the absent-vs-unattributed distinction at the one surface where they would
+/// act on it. The remedy differs completely: fix the spelling, versus re-scan.
+#[test]
+fn corpus_with_no_attribution_reports_unavailable_not_a_typo() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+    let stripped: String = fs::read_to_string(&graph)
+        .expect("graph readable")
+        .lines()
+        .map(|line| {
+            let mut record: Value = serde_json::from_str(line).expect("JSON");
+            if let Some(object) = record.as_object_mut() {
+                object.remove("crate_attribution");
+            }
+            serde_json::to_string(&record).expect("serialize")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let legacy = temp.path().join("legacy.jsonl");
+    fs::write(&legacy, stripped).expect("legacy graph written");
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        legacy.to_str().unwrap(),
+        "--package",
+        "alpha",
+    ]);
+    assert_eq!(run.code, 1, "stdout: {}", run.stdout);
+    let diagnostic: Value =
+        serde_json::from_str(run.stderr.trim()).expect("one JSON diagnostic line");
+    assert_eq!(
+        diagnostic["code"], "crate_attribution_unavailable",
+        "a corpus with no attribution must be reported as such, not as a typo: {}",
+        run.stderr
+    );
+    assert!(
+        diagnostic["remedy"]
+            .as_str()
+            .is_some_and(|r| r.contains("re-scan") || r.contains("rescan")),
+        "the diagnostic must name the remedy: {}",
+        run.stderr
+    );
+
+    // Anti-vacuity: an attributed corpus still reports a real typo as a typo.
+    let typo = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "nope",
+    ]);
+    assert_eq!(typo.code, 1);
+    assert!(typo.stderr.contains("unknown_package_selector"));
+}

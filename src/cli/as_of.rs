@@ -15,6 +15,29 @@ pub(crate) fn query_symbol_as_of(
     package: Option<&str>,
     freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
+    // Package scope narrows the candidate records BEFORE the one-best-per-repo
+    // selection, for the same reason as the `--at` lane (issue #117): filtering
+    // afterwards would report "no match" for a symbol that exists in the
+    // requested package but lost the per-repository pick to a sibling.
+    let scoped_records: Option<Vec<GraphRecord>> = package.map(|selector| {
+        records
+            .iter()
+            .filter(|record| {
+                !matches!(
+                    record,
+                    GraphRecord::Node {
+                        kind: NodeKind::Symbol,
+                        ..
+                    }
+                ) || record
+                    .crate_attribution()
+                    .and_then(super::CrateAttributionExt::owning_package_name)
+                    == Some(selector)
+            })
+            .cloned()
+            .collect()
+    });
+    let records = scoped_records.as_deref().unwrap_or(records);
     match query::symbol_as_of_valid_time_by_repo(records, name, as_of, index, selected_repo) {
         Err(msg) => {
             eprintln!("error: {msg}");

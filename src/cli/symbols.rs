@@ -185,8 +185,8 @@ pub(crate) fn retain_package_scope(results: &mut Vec<SymbolResult<'_>>, package:
     };
     results.retain(|row| {
         row.crate_attribution
-            .and_then(|attribution| attribution.package_name.as_deref())
-            == Some(selector)
+            .and_then(|attribution| attribution.owning_package())
+            .is_some_and(|(name, _)| name == selector)
     });
     for row in results {
         row.crate_attribution_disclaimer = Some(crate::cli::CRATE_ATTRIBUTION_DISCLAIMER);
@@ -372,6 +372,17 @@ pub(crate) fn query_symbol_at(
     }
 
     let mut matches = query::symbols_at_commit(records, name, prefix);
+    // Package scope narrows the CANDIDATES, before a single winner is chosen
+    // (issue #117). Applying it afterwards would report "no match" for a symbol
+    // that demonstrably exists in the requested package, purely because a
+    // same-named symbol in another package sorted first.
+    if let Some(selector) = package {
+        matches.retain(|r| {
+            r.crate_attribution()
+                .and_then(super::CrateAttributionExt::owning_package_name)
+                == Some(selector)
+        });
+    }
     if let Some(repo) = selected_repo {
         matches.retain(|r| index.owner_of(r.id()) == Some(repo));
     } else {
@@ -393,6 +404,8 @@ pub(crate) fn query_symbol_at(
         Some(record) => {
             let deleted = current_deleted_ids(records);
             if let Some(result) = symbol_result(record, name, index, records, &deleted) {
+                // Candidates were already narrowed above; this stamps the
+                // containment caveat on the surviving row.
                 let mut scoped = vec![result];
                 retain_package_scope(&mut scoped, package);
                 let Some(mut result) = scoped.pop() else {
@@ -440,19 +453,15 @@ impl PrintText for SymbolResult<'_> {
         // Owning Cargo package (issue #117). An ABSENT field prints NOTHING:
         // the record predates issue #117, so its attribution is unknown, and
         // rendering "unattributed" would fabricate a negative fact.
+        // Rendered from `owning_package`, which re-checks the value's internal
+        // consistency: a record read back claiming `unattributed` while carrying
+        // a package name renders as unattributed, never as an ownership claim
+        // the resolver never made.
         if let Some(attribution) = self.crate_attribution {
-            match (
-                attribution.package_name.as_deref(),
-                attribution.manifest_repo_relative_path.as_deref(),
-                attribution.unattributed_reason,
-            ) {
-                (Some(name), Some(manifest), _) => {
-                    let _ = write!(text, "\n  package: {name} ({manifest})");
-                }
-                (_, _, Some(reason)) => {
-                    let _ = write!(text, "\n  package: (unattributed: {})", reason.as_str());
-                }
-                _ => {}
+            if let Some((name, manifest)) = attribution.owning_package() {
+                let _ = write!(text, "\n  package: {name} ({manifest})");
+            } else if let Some(reason) = attribution.unattributed_reason {
+                let _ = write!(text, "\n  package: (unattributed: {})", reason.as_str());
             }
         }
         text

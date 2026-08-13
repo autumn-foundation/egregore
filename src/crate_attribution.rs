@@ -142,9 +142,12 @@ pub struct CrateAttributionIndex {
 impl CrateAttributionIndex {
     /// Builds the index from harvested manifest facts.
     ///
-    /// Facts are sorted by manifest path first, so when two facts claim the
-    /// same directory the lexicographically smallest manifest path wins
-    /// deterministically. Facts whose path is not a usable repo-relative
+    /// Facts are sorted before insertion and the first fact for a directory
+    /// wins, so construction is order-independent. Both harvests accept only
+    /// the basename `Cargo.toml`, so two facts can claim one directory only by
+    /// carrying the IDENTICAL path — in which case the derived `Ord` breaks the
+    /// tie on [`ManifestParseOutcome`] rather than on the path. Either way the
+    /// winner is deterministic. Facts whose path is not a usable repo-relative
     /// manifest path are dropped.
     #[must_use]
     pub fn from_facts(mut facts: Vec<ManifestPackageFact>) -> Self {
@@ -278,12 +281,14 @@ pub const fn carries_crate_attribution(kind: NodeKind) -> bool {
         | NodeKind::PanicRiskSite
         | NodeKind::DebtMarker
         | NodeKind::UnsafeSite
-        | NodeKind::DependencyDeclaration => true,
-        // Repository-scoped code-graph records: they describe the repository or
-        // its history, not a file, so no package can own them.
+        | NodeKind::DependencyDeclaration
+        // A `Change` records that one path changed in one commit, so it names a
+        // file and its owning package is meaningful at that commit.
+        | NodeKind::Change => true,
+        // Repository- and commit-scoped records: they describe the repository or
+        // a commit as a whole, carry no path, and no package can own them.
         NodeKind::Repository
         | NodeKind::Commit
-        | NodeKind::Change
         | NodeKind::ScanCoverage
         // Every non-code-graph domain.
         | NodeKind::SemanticDrift
@@ -670,9 +675,12 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_dir_facts_resolve_to_lexicographically_smallest_manifest() {
+    fn duplicate_dir_facts_resolve_deterministically() {
         // Two facts claiming the same directory (only reachable via a caller
-        // bug or a case-insensitive filesystem); the winner must be stable.
+        // bug or a case-insensitive filesystem). Because both harvests accept
+        // only the basename `Cargo.toml`, such facts necessarily share a path,
+        // so the derived `Ord` decides on outcome — the point is that the
+        // winner is STABLE, whichever component breaks the tie.
         let facts = vec![
             package("crates/foo/Cargo.toml", "second"),
             ManifestPackageFact::new(

@@ -466,10 +466,11 @@ eg query symbols "*" --graph graph.jsonl --package alpha
 - Spelled `--package`, **not** `--crate` — `eg query who-imports --crate` means
   something unrelated (module-path unification).
 
-An **absent** `crate_attribution` key means the record predates issue #117
-(attribution unknown), which is a different fact from a present value carrying
-`status: "unattributed"` (computed, and provably no owner). In `--format text`
-an absent field prints nothing.
+An **absent** `crate_attribution` key means attribution is unknown — the record
+either predates issue #117 or was minted by a producer other than `eg scan` /
+`eg refresh` / `eg scan-history`. That is a different fact from a present value
+carrying `status: "unattributed"` (computed, and provably no owner). In
+`--format text` an absent field prints nothing.
 
 Attribution is nearest-enclosing-manifest **directory containment**, never proof
 the file is compiled into that package. Full contract, including the closed

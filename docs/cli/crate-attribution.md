@@ -77,23 +77,40 @@ slightly longer flag. `--package` is also Cargo's own spelling.
 
 | Field state | Meaning |
 |---|---|
-| `crate_attribution` **absent** | The record was produced before issue #117. Attribution is **UNKNOWN**. |
+| `crate_attribution` **absent** | Attribution is **UNKNOWN** — see the two causes below. |
 | present, `status: "attributed"` | An owning package was resolved; `package_name` and `manifest_repo_relative_path` are both present. |
 | present, `status: "unattributed"` | Attribution **was computed** and there is provably no owning package; `unattributed_reason` names why. |
 
-These are never conflated. Collapsing them would turn every pre-#117 record
-into a fabricated "proven ownerless" claim. In `--format text`, an absent field
-prints **nothing at all**.
+These are never conflated. Collapsing them would turn an unknown into a
+fabricated "proven ownerless" claim. In `--format text`, an absent field prints
+**nothing at all**.
 
-Within one scan, refresh, or replay, field presence is a **total function** over
-node kind — every path-bearing code-graph node carries it and no other node does
-— which is what makes the "absent ⇒ legacy" inference sound.
+An **absent** field has exactly two causes, and they are not distinguishable
+from the field alone:
+
+1. The record predates issue #117.
+2. The record was minted by a producer **other than** `eg scan`, `eg refresh`,
+   or `eg scan-history` — the only three that stamp attribution. `eg
+   capture-tests`, `eg resolve-frames`, and `eg import local` each mint
+   path-bearing `Diagnostic` records without it, because those diagnostics
+   describe an artifact outside the code-graph extraction pipeline.
+
+So a single store, written by a single current binary, can legitimately hold
+both attributed and attribution-less path-bearing records. To distinguish the
+two causes, read the record's producer envelope (issue #234): the inference
+"absent ⇒ predates #117" is sound only for records whose `producer_kind` is one
+of `code_graph_extractor`, `history_replay`, or `incremental_cache`.
+
+What the total-function property does guarantee is narrower and still useful:
+**within one scan, refresh, or replay**, field presence is a function of node
+kind alone — every path-bearing code-graph node carries it and no other node
+does — so an absent field never means "this kind happens not to be covered".
 
 ### Unattributed reasons (closed set)
 
 | Reason | Meaning |
 |---|---|
-| `no_enclosing_manifest` | No `Cargo.toml` in any ancestor directory: a stray source file outside every crate. |
+| `no_enclosing_manifest` | No `Cargo.toml` in any ancestor directory **within the repository**. Typically a stray source file outside every crate — though it also covers a scan rooted inside a crate, whose manifest sits above the scan root. |
 | `virtual_manifest_only` | Every enclosing manifest is a virtual workspace root, which declares no package. |
 | `unnamed_package` | The nearest manifest declares a `[package]` whose `name` is absent or Cargo-invalid. |
 | `unparseable_manifest` | The nearest manifest is not valid TOML. |
@@ -105,12 +122,12 @@ text, so it is dropped rather than forwarded.
 ### Which nodes carry it
 
 `File`, `Module`, `Symbol`, `Import`, `Diagnostic`, `PanicRiskSite`,
-`DebtMarker`, `UnsafeSite`, and `DependencyDeclaration` — every code-graph node
-that carries a `repo_relative_path`. The classifier is an exhaustive match with
+`DebtMarker`, `UnsafeSite`, `DependencyDeclaration`, and `Change` — every
+code-graph node that carries a `repo_relative_path`. The classifier is an exhaustive match with
 no wildcard arm, so a future node kind fails to compile until it is deliberately
 classified.
 
-`Repository`, `Commit`, `Change`, and `ScanCoverage` carry no path and are never
+`Repository`, `Commit`, and `ScanCoverage` carry no path and are never
 attributed; attributing them would claim the root package owns the repository
 itself. Edge and tombstone records never carry it.
 
@@ -164,6 +181,7 @@ The text form is a human view and is not a stable contract; parse the JSON.
 | At least one row after the package filter | 0 | — |
 | Package known to the corpus, zero matching rows | 2 | the lane's ordinary `no match found` |
 | Package unknown to the corpus | 1 | `{"code":"unknown_package_selector","selector":…,"known_packages":[…]}` |
+| No record in the corpus carries attribution at all | 1 | `{"code":"crate_attribution_unavailable","selector":…,"remedy":…}` |
 | Package name owned by two or more repositories, no `--repo` | 1 | `{"code":"ambiguous_package_selector","selector":…,"candidates":[…]}` |
 | `--package` with `--daemon` | 1 | `{"code":"unsupported_combination","flags":["--package","--daemon"]}` |
 
@@ -224,8 +242,9 @@ Concretely:
 - Workspace membership, versions, features, editions, and Cargo target roles
   (`lib`/`bin`/`test`/`bench`/`example`) are **not** captured and **not**
   inferred.
-- Symlinked manifests are invisible on both discovery paths, consistent with
-  what `eg scan` already indexes.
+- Symlinked manifests are invisible on both discovery paths (the working-tree
+  walk rejects non-regular files; history replay rejects Git mode `120000`),
+  consistent with what `eg scan` already indexes.
 - A nested checkout committed as plain tracked files (not a submodule gitlink)
   is excluded by `eg scan` but visible to `eg scan-history`, which cannot
   reconstruct nested-worktree sentinels from a tree listing. Submodules are

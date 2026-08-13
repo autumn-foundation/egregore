@@ -2604,8 +2604,9 @@ impl GraphRecord {
 
     /// Returns the owning-package attribution when present (issue #117).
     ///
-    /// `None` means the record was produced before issue #117 (attribution
-    /// UNKNOWN), or that the node kind carries no path. It never means "no
+    /// `None` means attribution is UNKNOWN: the node kind carries no path, the
+    /// record predates issue #117, or it was minted by a producer outside the
+    /// three code-graph extraction paths that stamp it. It never means "no
     /// package owns this" — that is a present value with
     /// [`CrateAttributionStatus::Unattributed`].
     #[must_use]
@@ -3686,12 +3687,14 @@ pub struct RouteAnnotation {
 ///
 /// # Absent vs. unattributed
 ///
-/// The field being **absent** on a node means the record was produced by a
-/// pre-#117 binary: attribution is UNKNOWN. A **present** value carrying
-/// `status: unattributed` means attribution was computed and there is provably
-/// no owning package. Collapsing the two would turn every legacy record into a
-/// fabricated "proven ownerless" claim, so no producer, reader, or renderer may
-/// conflate them.
+/// The field being **absent** on a node means attribution is UNKNOWN — either
+/// the record predates issue #117, or it was minted by a producer other than
+/// the three code-graph extraction paths (`eg scan`, `eg refresh`,
+/// `eg scan-history`), which are the only ones that stamp it. A **present**
+/// value carrying `status: unattributed` means attribution WAS computed and
+/// there is provably no owning package. Collapsing the two would turn an
+/// unknown into a fabricated "proven ownerless" claim, so no producer, reader,
+/// or renderer may conflate them.
 ///
 /// # Epistemic limit
 ///
@@ -3716,6 +3719,27 @@ pub struct CrateAttribution {
 }
 
 impl CrateAttribution {
+    /// The owning package name and manifest path, but ONLY when this value is
+    /// internally consistent — `status: attributed` with both fields present.
+    ///
+    /// Every consumer that renders or scopes on the attribution must go through
+    /// here rather than reading `package_name` directly. The write path upholds
+    /// the `attributed <=> name + manifest present` invariant, but a value read
+    /// back from a store or a graph is operator-controlled and re-checking it is
+    /// the difference between reporting what a record CLAIMS and asserting an
+    /// ownership fact the resolver never produced. Fail-closed: an inconsistent
+    /// value owns nothing.
+    #[must_use]
+    pub fn owning_package(&self) -> Option<(&str, &str)> {
+        if self.status != CrateAttributionStatus::Attributed {
+            return None;
+        }
+        Some((
+            self.package_name.as_deref()?,
+            self.manifest_repo_relative_path.as_deref()?,
+        ))
+    }
+
     /// Builds an attributed value citing the owning package and its manifest.
     #[must_use]
     pub fn attributed(

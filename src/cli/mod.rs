@@ -5446,6 +5446,20 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 reject_package_with_daemon(package.as_deref());
             }
             if let Some(tx) = tx_as_of.as_deref() {
+                // The transaction-time lane returns `TxSymbolRow`, which carries
+                // no crate attribution, so a scoped query here could only emit
+                // UNSCOPED rows — including records owned by other packages, and
+                // with no typo gate on the selector. Refuse the combination for
+                // the same reason `--daemon` is refused (issue #117): silently
+                // answering a different question is the one outcome ruled out.
+                if package.is_some() {
+                    print_tx_error(
+                        "unsupported_combination",
+                        "--package cannot be used with --tx-as-of; the transaction-time \
+                         row shape carries no crate attribution",
+                    )?;
+                    std::process::exit(1);
+                }
                 // --repo-path is used to stamp freshness onto results.  TxSymbolRow
                 // has no freshness field and the tx-as-of path never computes one,
                 // so accepting --repo-path here would silently drop the signal.
@@ -5544,35 +5558,36 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // unscoped `query symbol <name>`; `--repo`/`--at`/`--as-of` and
             // freshness stamping (`--repo-path`) need global topology or the
             // commit timeline and stay cold.
-            let selector =
-                if repo.is_none() && at.is_none() && as_of.is_none() && repo_path.is_none() {
-                    symbol_handle_selector(&name)
-                } else {
-                    crate::graph_index::Selector::Whole
-                };
+            let selector = if repo.is_none()
+                && package.is_none()
+                && at.is_none()
+                && as_of.is_none()
+                && repo_path.is_none()
+            {
+                symbol_handle_selector(&name)
+            } else {
+                crate::graph_index::Selector::Whole
+            };
             let records = load_records_selected(graph.as_deref(), data_dir.as_deref(), &selector)?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             let selected = selected.as_deref();
-            // Package scope (issue #117). The sidecar-index fast path narrows
-            // the loaded slice to one symbol's closure, so a selector missing
-            // from that slice is not yet proof of a typo: fall back to ONE cold
-            // whole-file load to build the authoritative catalog. That cost is
-            // paid only on the error path, so a hit keeps the indexed fast path.
+            // Package scope (issue #117) is resolved against the WHOLE corpus,
+            // which is why `--package` forces `Selector::Whole` above — the same
+            // conservatism `--repo` already applies.
+            //
+            // Both verdicts need global knowledge, and the #447 sidecar index
+            // supplies only one symbol's closure. Enumerating `known_packages`
+            // for a typo obviously does. So does cross-repository ambiguity, and
+            // that one is the trap: a package owned by two repositories where
+            // only ONE defines the queried symbol looks unambiguous inside the
+            // narrowed closure, so the lane would return rows where a cold scan
+            // refuses. An answer that changes depending on whether an index file
+            // exists breaks the index's documented contract of being a pure
+            // access-path optimization.
             if let Some(selector_name) = package.as_deref() {
                 let catalog = PackageCatalog::build(&records, &index);
-                if catalog.contains(selector_name) {
-                    resolve_package_scope(&catalog, selector_name, repo.is_some());
-                } else {
-                    let cold = load_records_selected(
-                        graph.as_deref(),
-                        data_dir.as_deref(),
-                        &crate::graph_index::Selector::Whole,
-                    )?;
-                    let cold_index = query::RepositoryIndex::build(&cold);
-                    let cold_catalog = PackageCatalog::build(&cold, &cold_index);
-                    resolve_package_scope(&cold_catalog, selector_name, repo.is_some());
-                }
+                resolve_package_scope(&catalog, selector_name, repo.is_some());
             }
             let freshness_code = query_freshness_code_with_hint(
                 &records,
@@ -7429,6 +7444,22 @@ pub(crate) fn symbol_handle_selector(handle: &str) -> crate::graph_index::Select
 /// exactly what the claim rests on.
 pub(crate) const CRATE_ATTRIBUTION_DISCLAIMER: &str = "attribution is nearest-enclosing-manifest directory containment, never proof the file is compiled into that package";
 
+/// Reads a record's owning package name, fail-closed on an inconsistent value.
+///
+/// An extension trait so the candidate-narrowing lanes (`--at` / `--as-of`),
+/// which filter `GraphRecord`s before a winner is chosen, use the SAME
+/// consistency check as the row filter and the renderer.
+pub(crate) trait CrateAttributionExt {
+    /// The owning package name, or `None` when unattributed or inconsistent.
+    fn owning_package_name(&self) -> Option<&str>;
+}
+
+impl CrateAttributionExt for crate::ir::CrateAttribution {
+    fn owning_package_name(&self) -> Option<&str> {
+        self.owning_package().map(|(name, _)| name)
+    }
+}
+
 /// Which packages the loaded corpus carries, and which repositories own each
 /// (issue #117).
 ///
@@ -7442,17 +7473,16 @@ pub(crate) struct PackageCatalog {
 impl PackageCatalog {
     /// Indexes every attributed record's package and its owning repository.
     ///
-    /// The names indexed here are read back from a store and are therefore
-    /// operator-controlled, and `known_packages` echoes them into a stderr
-    /// diagnostic. Unlike the free-string values `eg audit criteria-coverage`
-    /// and the #104 semantic-index refusal must sanitize, these need no
-    /// control-character scrubbing: a name only becomes a `package_name` by
-    /// passing `manifest_deps::package_name_is_valid`, whose `XID_Start` /
-    /// `XID_Continue` charset structurally excludes every control character (Cc),
-    /// format character including bidi overrides (Cf), whitespace (Zs), and
-    /// quote (Po). A crafted manifest cannot smuggle an ANSI escape or a
-    /// line break through that gate, so the diagnostic is safe by construction
-    /// rather than by scrubbing.
+    /// The names indexed here are read back from a store or graph and are
+    /// therefore operator-controlled, and `known_packages` echoes them into a
+    /// stderr diagnostic. `manifest_deps::package_name_is_valid` gates names at
+    /// PRODUCTION to the `XID_Start` / `XID_Continue` charset, but ingest does
+    /// not re-validate a deserialized payload, so that gate is not a guarantee
+    /// about what a reader sees — the #104 doctrine that store-read values are
+    /// attacker-controlled applies here too. What keeps the diagnostic safe is
+    /// that it is rendered as JSON, where `serde_json` escapes control
+    /// characters; the raw-text render path fails closed on
+    /// [`CrateAttribution::owning_package`] instead.
     pub(crate) fn build(records: &[GraphRecord], index: &query::RepositoryIndex) -> Self {
         let mut by_package: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
             std::collections::BTreeMap::new();
@@ -7460,7 +7490,10 @@ impl PackageCatalog {
             let Some(attribution) = record.crate_attribution() else {
                 continue;
             };
-            let Some(name) = attribution.package_name.as_deref() else {
+            // Fail-closed on an inconsistent read-back value: a record
+            // claiming `unattributed` while carrying a name owns nothing, and
+            // must never become a scopable package.
+            let Some((name, _manifest)) = attribution.owning_package() else {
                 continue;
             };
             let entry = by_package.entry(name.to_owned()).or_default();
@@ -7474,6 +7507,12 @@ impl PackageCatalog {
     /// `true` when at least one record in the corpus is attributed to `name`.
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.by_package.contains_key(name)
+    }
+
+    /// `true` when no record in the corpus carries any owning-package
+    /// attribution — a capability gap (a pre-#117 corpus), not an empty result.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_package.is_empty()
     }
 
     /// Every package owning at least one attributed record, sorted.
@@ -7502,6 +7541,21 @@ impl PackageCatalog {
 /// honest empty result.
 pub(crate) fn resolve_package_scope(catalog: &PackageCatalog, selector: &str, repo_scoped: bool) {
     if !catalog.contains(selector) {
+        // A corpus carrying NO attribution at all is a CAPABILITY gap, not a
+        // typo: the same `unknown_package_selector` shape would tell an operator
+        // querying a pre-#117 store to check their spelling, when the remedy is
+        // to re-scan. Reporting them identically would collapse
+        // absent-vs-unattributed at the one surface where they act on it.
+        if catalog.is_empty() {
+            let diag = serde_json::json!({
+                "code": "crate_attribution_unavailable",
+                "selector": selector,
+                "message": "no record in this corpus carries owning-package attribution",
+                "remedy": "re-scan with a build that records crate attribution (issue #117), then re-ingest",
+            });
+            eprintln!("{diag}");
+            std::process::exit(1);
+        }
         let diag = serde_json::json!({
             "code": "unknown_package_selector",
             "selector": selector,

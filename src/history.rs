@@ -127,6 +127,11 @@ fn scan_repository_history_inner(
             );
         }
 
+        // Attribution covers this commit's `Change` records too (they carry a
+        // path), so its slice opens BEFORE them — earlier than the
+        // resolution-labeling slice below, which must see only the replayed
+        // source records.
+        let commit_attribution_start = graph.records().len();
         let mut change_ids_by_path = BTreeMap::new();
         for change in list_changes(repo_root, &commit)? {
             let change_record = change_record(&repository_id, &commit, &change);
@@ -270,7 +275,7 @@ fn scan_repository_history_inner(
         // historical version of a record with the LAST commit's manifest tree —
         // a fabricated fact at a pinned historical point.
         crate::crate_attribution::apply_crate_attribution(
-            &mut graph.records_mut()[commit_records_start..],
+            &mut graph.records_mut()[commit_attribution_start..],
             &attribution,
         );
     }
@@ -368,8 +373,20 @@ fn normalize_timestamp(ts: &str) -> String {
         .map_or_else(|| ts.to_owned(), |s| format!("{s}Z"))
 }
 
+/// Lists the paths one commit changed, NUL-delimited.
+///
+/// `-z` must match [`list_commit_tree`]: the two listings are separate Git
+/// commands whose paths are joined by `CHANGED_IN` edges, so if only one reads
+/// unquoted output a path containing `"`, a tab, or a non-ASCII byte is spelled
+/// one way on the `File` node and another on the `Change` node — the file is
+/// indexed but silently orphaned from every history lane. Output is read as
+/// BYTES and decoded per token so an undecodable path is skipped, never fatal.
+///
+/// `--name-status -z` emits `status NUL path NUL`, except for rename/copy
+/// statuses (`R###` / `C###`), which emit `status NUL source NUL destination
+/// NUL`. The destination is the changed path.
 fn list_changes(repo_root: &Path, commit: &GitCommit) -> Result<Vec<GitChange>> {
-    let output = git_output(
+    let output = git_output_bytes(
         repo_root,
         &[
             "diff-tree",
@@ -377,29 +394,42 @@ fn list_changes(repo_root: &Path, commit: &GitCommit) -> Result<Vec<GitChange>> 
             "--no-commit-id",
             "--name-status",
             "-r",
+            "-z",
             "--root",
             &commit.sha,
         ],
     )?;
-    let mut seen = BTreeSet::new();
-    Ok(output
-        .lines()
-        .filter_map(parse_change_line)
-        .filter(|change| seen.insert(change.clone()))
-        .collect::<Vec<_>>())
-}
+    let mut tokens = output
+        .split(|byte| *byte == 0)
+        .map(|raw| std::str::from_utf8(raw).ok())
+        .filter(|token| token.is_none_or(|token| !token.is_empty()));
 
-fn parse_change_line(line: &str) -> Option<GitChange> {
-    let parts = line.split('\t').collect::<Vec<_>>();
-    let status = parts.first()?.trim();
-    let path = parts.last()?.trim();
-    if status.is_empty() || path.is_empty() {
-        return None;
+    let mut seen = BTreeSet::new();
+    let mut changes = Vec::new();
+    while let Some(status) = tokens.next() {
+        // A status token is always ASCII; an undecodable one means the stream
+        // is not where we think it is, so stop rather than mis-pair fields.
+        let Some(status) = status else { break };
+        // Rename and copy carry a source path before the destination.
+        let renamed = status.starts_with('R') || status.starts_with('C');
+        let first = tokens.next();
+        let path = if renamed { tokens.next() } else { first };
+        let Some(path) = path else { continue };
+        // An undecodable path is skipped; its status token was consumed above,
+        // so the stream stays aligned.
+        let Some(path) = path else { continue };
+        if status.is_empty() || path.is_empty() {
+            continue;
+        }
+        let change = GitChange {
+            status: status.to_owned(),
+            path: normalize_git_path(path),
+        };
+        if seen.insert(change.clone()) {
+            changes.push(change);
+        }
     }
-    Some(GitChange {
-        status: status.to_owned(),
-        path: normalize_git_path(path),
-    })
+    Ok(changes)
 }
 
 /// One commit tree's indexed source files and Cargo manifests, from a SINGLE
@@ -421,27 +451,35 @@ struct CommitTree {
 /// and OID: the type filter drops submodule gitlinks — which are `commit`
 /// entries, not readable blobs — and the OID keys the manifest parse memo.
 ///
-/// `-z` is load-bearing, not a style choice. `core.quotePath=false` suppresses
-/// octal-escaping of NON-ASCII bytes only: `ls-tree` still C-quotes any path
-/// containing `"`, `\`, or a control character, wrapping it in literal quotes
-/// that no subsequent `git show <sha>:<path>` can resolve. The working-tree walk
-/// reads `git ls-files -z`, whose NUL-delimited output is never quoted, so
-/// without `-z` here a quote-bearing path is indexed by `eg scan` and silently
-/// ABSENT from `eg scan-history`. NUL-delimited output makes the two agree.
+/// `-z` is load-bearing, not a style choice. Git C-quotes any path containing a
+/// non-ASCII byte, `"`, `\`, or a control character — wrapping it in literal
+/// quotes that no subsequent `git show <sha>:<path>` can resolve. (Setting
+/// `core.quotePath=false` suppresses only the NON-ASCII half, so it is not a
+/// sufficient fix.) The working-tree walk reads `git ls-files -z`, whose
+/// NUL-delimited output is never quoted, so without `-z` here a quote-bearing
+/// path is indexed by `eg scan` and silently ABSENT from `eg scan-history`.
+///
+/// Output is read as BYTES and decoded per entry: a Git path is a byte string
+/// and need not be UTF-8, so one undecodable path is skipped — mirroring the
+/// issue-#438 undecodable-blob skip — rather than aborting the whole replay.
 ///
 /// Both filters prune any path with a `target` component, mirroring
 /// [`is_indexed_source`], so committed build output never contributes sources
 /// or owning packages.
 fn list_commit_tree(repo_root: &Path, sha: &str) -> Result<CommitTree> {
-    let output = git_output(repo_root, &["ls-tree", "-r", "-z", sha])?;
+    let output = git_output_bytes(repo_root, &["ls-tree", "-r", "-z", sha])?;
     let mut tree = CommitTree::default();
-    for entry in output.split('\0') {
+    for raw in output.split(|byte| *byte == 0) {
+        let Ok(entry) = std::str::from_utf8(raw) else {
+            // A path whose bytes are not UTF-8: skip this entry, keep replaying.
+            continue;
+        };
         // `<mode> SP <type> SP <object> TAB <path>`
         let Some((meta, path)) = entry.split_once('\t') else {
             continue;
         };
         let mut fields = meta.split_whitespace();
-        let (Some(_mode), Some(object_type), Some(oid)) =
+        let (Some(mode), Some(object_type), Some(oid)) =
             (fields.next(), fields.next(), fields.next())
         else {
             continue;
@@ -449,6 +487,15 @@ fn list_commit_tree(repo_root: &Path, sha: &str) -> Result<CommitTree> {
         if object_type != "blob" {
             // A `commit` entry is a submodule gitlink: its content belongs to a
             // different repository and cannot be read from this one.
+            continue;
+        }
+        // A symlink IS a blob (mode 120000) whose content is the link target,
+        // not the file's. Reading one as manifest text would parse
+        // `../real/Cargo.toml` as TOML and report `unparseable_manifest` about a
+        // manifest that is perfectly valid. The working-tree walk excludes
+        // symlinks through `symlink_metadata(..).is_file()`; match it, so both
+        // discovery paths agree that a symlinked manifest is invisible.
+        if mode == "120000" {
             continue;
         }
         // Only the metadata prefix is split off; the path is taken verbatim,
@@ -602,13 +649,6 @@ const fn is_temporal_change_target(record: &GraphRecord) -> bool {
 
 fn git_output(repo_root: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
-        // `-c core.quotePath=false` keeps non-ASCII paths verbatim in
-        // `ls-tree`/`diff-tree` output instead of C-quoted octal escapes
-        // (`"crates/caf\303\251/src/lib.rs"`). Without it the replay feeds the
-        // quoted form back to `git show <sha>:<path>`, which fails — silently
-        // dropping an entire directory from the graph. Every other Git call
-        // site in the crate already sets it (`src/fs.rs`, `src/identity.rs`).
-        .args(["-c", "core.quotePath=false"])
         .arg("-C")
         .arg(repo_root)
         .args(args)

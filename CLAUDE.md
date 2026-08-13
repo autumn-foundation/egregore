@@ -363,15 +363,21 @@ STOPS the walk FAIL-CLOSED (`unnamed_package` / `unparseable_manifest` /
 nameless boundary would FABRICATE a package attribution — the one thing the issue
 forbids outright. The name is READ from `[package].name`, never derived from a
 directory name and never sanitized from a Cargo-invalid one. ABSENT-FIELD ≠
-UNATTRIBUTED: an absent field means the record predates #117 (attribution
-UNKNOWN), while a present `status: unattributed` means it WAS computed and there
-is provably no owner — collapsing the two would turn every legacy record into a
-fabricated "proven ownerless" claim, the same distinction
-`embedding_identity_unrecorded` exists to draw. Presence is a TOTAL function over
-node kind (an exhaustive no-wildcard `match`, the #247 completeness invariant),
-which is what makes that inference sound; repo-scoped kinds
-(`Repository`/`Commit`/`Change`/`ScanCoverage`) carry no path and are never
-attributed. `crate_attribution` is NEVER an identity input, so no record ID moves
+UNATTRIBUTED: an absent field means attribution is UNKNOWN, while a present
+`status: unattributed` means it WAS computed and there is provably no owner —
+collapsing the two would turn an unknown into a fabricated "proven ownerless"
+claim, the same distinction `embedding_identity_unrecorded` exists to draw.
+Absence has TWO causes and the field alone does not separate them: the record
+predates #117, OR it was minted by a producer other than the three stamping
+paths (`eg capture-tests`, `eg resolve-frames`, and `eg import local` each mint
+path-bearing `Diagnostic` records without attribution), so one store written by
+one current binary can hold both — read `producer_kind` (#234) to tell them
+apart. What presence being a TOTAL function over node kind (an exhaustive
+no-wildcard `match`, the #247 completeness invariant) does guarantee is
+narrower: WITHIN ONE scan/refresh/replay, an absent field never means "this kind
+happens not to be covered". Repo-scoped kinds
+(`Repository`/`Commit`/`ScanCoverage`) carry no path and are never attributed;
+`Change` DOES carry a path and IS attributed. `crate_attribution` is NEVER an identity input, so no record ID moves
 and ADR-0004's cross-crate-identity deferral stands. One PURE resolver
 (`src/crate_attribution.rs` — no `std::fs`, no `Command`, no clock, pinned by
 test) serves all three producers, so the working-tree harvest and the Git-object
@@ -387,7 +393,9 @@ and `eg query symbols` gain `--package <NAME>` (spelled `--package`, NOT
 `--crate`: `eg query who-imports --crate` already means module-path unification),
 matched EXACTLY with no case folding or `-`/`_` normalization. A selector no
 package carries exits 1 with `unknown_package_selector` + sorted
-`known_packages`, DISTINCT from exit 2 "known package, zero matching rows", so a
+`known_packages`, DISTINCT from exit 2 "known package, zero matching rows" AND
+from exit 1 `crate_attribution_unavailable` (a corpus carrying no attribution at
+all — a capability gap whose remedy is a re-scan, not a spelling fix), so a
 typo is never a silent empty answer; a name owned by ≥2 repositories in a shared
 store exits 1 `ambiguous_package_selector` rather than silently merging them; and
 `--package --daemon` exits 1 `unsupported_combination` (the daemon's symbol
