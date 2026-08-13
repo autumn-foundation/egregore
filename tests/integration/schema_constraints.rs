@@ -14,6 +14,165 @@
 
 #![allow(missing_docs)]
 
+/// Store fixtures that simulate a NON-Egregore writer.
+///
+/// These live in the TEST crate on purpose (issue #486). They plant records and
+/// declarations that bypass every Egregore invariant — exactly the class of
+/// write the schema-constraint backstop exists to catch — so they must not be
+/// reachable from the published library. A Cargo feature could not give that
+/// guarantee: features are consumer-selectable, so `adapters::fixtures` behind
+/// `test-fixtures` was public API of the crate for anyone who chose to enable
+/// it, regardless of `#[doc(hidden)]` or the comment claiming otherwise.
+///
+/// Nothing crate-private is needed to make them work: the store is opened
+/// through `aletheiadb`'s own public `config::durable_config_for_data_dir`, the
+/// same call `EmbeddedAletheiaSink::open` uses, with Egregore's public
+/// `MAX_INTERNED_STRINGS` pinned so the interner budget matches the adapter's
+/// (issue #439) rather than silently inheriting upstream's default.
+///
+/// Unlike the adapter's own open path these take NO write lease, which is
+/// correct here: the fixtures run between CLI subprocess invocations, never
+/// alongside one, and a fixture is not a writer the contention contract is
+/// written about.
+#[cfg(feature = "embedded-aletheiadb")]
+mod fixtures {
+    use std::path::Path;
+
+    use aletheia_egregore::adapters::preflight::MAX_INTERNED_STRINGS;
+
+    /// Opens the store the way the embedded adapter does, minus the lease.
+    fn open(data_dir: &Path) -> Result<aletheiadb::AletheiaDB, String> {
+        let mut config = aletheiadb::config::durable_config_for_data_dir(data_dir);
+        config.persistence.max_interned_strings =
+            usize::try_from(MAX_INTERNED_STRINGS).unwrap_or(usize::MAX);
+        aletheiadb::AletheiaDB::with_unified_config(config).map_err(|error| error.to_string())
+    }
+
+    fn plant_raw_node(
+        data_dir: impl AsRef<Path>,
+        label: &str,
+        properties: &[(&str, &str)],
+    ) -> Result<(), String> {
+        let db = open(data_dir.as_ref())?;
+        let mut builder = aletheiadb::PropertyMapBuilder::new();
+        for (key, value) in properties {
+            builder = builder.insert(*key, *value);
+        }
+        db.create_node(label, builder.build())
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Writes a raw node under `label` carrying none of the identity spine.
+    ///
+    /// Returns the store's error when schema constraints are declared and
+    /// reject it — which is what the enforcement test asserts on.
+    pub fn plant_nonconforming_node(
+        data_dir: impl AsRef<Path>,
+        label: &str,
+        marker: &str,
+    ) -> Result<(), String> {
+        // Deliberately NO `codegraph_id` / `record_type` / `schema_version`:
+        // this is the shape a foreign writer produces, and it is unciteable by
+        // construction (there is no handle to resolve).
+        plant_raw_node(data_dir, label, &[("planted_marker", marker)])
+    }
+
+    /// Writes a raw node that HAS a `codegraph_id` but still violates the spine.
+    ///
+    /// The distinction matters: `plant_nonconforming_node` produces a record
+    /// with no handle at all, so it can only ever land in `unresolved_samples`.
+    /// This one is citable, so it exercises the sample-resolution path that
+    /// turns an engine-internal entity id back into a record handle.
+    pub fn plant_citable_nonconforming_node(
+        data_dir: impl AsRef<Path>,
+        label: &str,
+        codegraph_id: &str,
+    ) -> Result<(), String> {
+        plant_raw_node(data_dir, label, &[("codegraph_id", codegraph_id)])
+    }
+
+    /// Writes a raw node carrying the FULL identity spine at an arbitrary
+    /// `schema_version`.
+    ///
+    /// Exists to test the schema-bump contract at the level the constraint
+    /// actually operates. `eg ingest` cannot be used for this: Egregore's own
+    /// reader rejects an unknown future `(domain, kind, version)` tuple at the
+    /// JSONL parse gate, long before any store write, so it would prove the
+    /// reader's behaviour rather than the constraint's.
+    pub fn plant_spine_node_at_version(
+        data_dir: impl AsRef<Path>,
+        label: &str,
+        codegraph_id: &str,
+        schema_version: i64,
+    ) -> Result<(), String> {
+        let db = open(data_dir.as_ref())?;
+        let properties = aletheiadb::PropertyMapBuilder::new()
+            .insert("codegraph_id", codegraph_id)
+            .insert("record_type", "node")
+            .insert("schema_version", schema_version)
+            .insert("summary", "spine node at an arbitrary schema version")
+            .build();
+        db.create_node(label, properties)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Declares a schema constraint on an arbitrary label, simulating another
+    /// tool that shares the data dir.
+    ///
+    /// Exists so the `--drop` scoping contract is testable: Egregore's own
+    /// declaration path only ever touches labels in its inventory, so without
+    /// this there is no way to create the foreign declaration that `--drop`
+    /// must RETAIN rather than destroy.
+    pub fn declare_foreign_constraint(
+        data_dir: impl AsRef<Path>,
+        label: &str,
+        property: &str,
+    ) -> Result<(), String> {
+        let db = open(data_dir.as_ref())?;
+        db.schema_constraint(aletheiadb::EntityKind::Node, label)
+            .typed(property, aletheiadb::core::constraint::DeclaredType::String)
+            .enable()
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Declares a foreign constraint whose descriptor is deliberately UNLIKE
+    /// anything Egregore's own profiles emit: a required `Integer` key and a
+    /// dimension-pinned `Vector` key.
+    ///
+    /// Exists so the before-image contract is testable at full fidelity. Every
+    /// Egregore-declared property is a non-required `String`/`Integer`, so a
+    /// before-image that silently dropped the type, the required flag, or the
+    /// vector dimension would still look correct against Egregore's own labels.
+    /// A foreign declaration is the only one `--declare` cannot rebuild, so it
+    /// is the only case where the recorded descriptor is the sole route back.
+    pub fn declare_foreign_typed_constraint(
+        data_dir: impl AsRef<Path>,
+        label: &str,
+        required_int_property: &str,
+        vector_property: &str,
+        vector_dim: usize,
+    ) -> Result<(), String> {
+        let db = open(data_dir.as_ref())?;
+        db.schema_constraint(aletheiadb::EntityKind::Node, label)
+            .require_typed(
+                required_int_property,
+                aletheiadb::core::constraint::DeclaredType::Integer,
+            )
+            .typed(
+                vector_property,
+                aletheiadb::core::constraint::DeclaredType::Vector {
+                    dim: Some(vector_dim),
+                },
+            )
+            .enable()
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 use std::{collections::BTreeMap, fs, path::Path, path::PathBuf};
 
@@ -443,12 +602,8 @@ fn non_conforming_store_fails_the_gate_and_cites_offending_records() {
     // Plant a node that is missing the identity spine, the way a hand-edited or
     // foreign writer could. `eg validate` cannot see this - it gates a JSONL
     // file, not the store - which is exactly the gap this issue is about.
-    aletheia_egregore::adapters::fixtures::plant_nonconforming_node(
-        &data_dir,
-        "Symbol",
-        "PLANTED-NONCONFORMING",
-    )
-    .expect("planting a raw node should succeed");
+    fixtures::plant_nonconforming_node(&data_dir, "Symbol", "PLANTED-NONCONFORMING")
+        .expect("planting a raw node should succeed");
     let _ = &temp;
 
     let dir = data_dir.to_str().expect("utf8 path");
@@ -496,12 +651,8 @@ fn non_conforming_store_fails_the_gate_and_cites_offending_records() {
 #[test]
 fn declare_refuses_a_non_conforming_store_without_writing_anything() {
     let (_temp, data_dir) = seeded_store();
-    aletheia_egregore::adapters::fixtures::plant_nonconforming_node(
-        &data_dir,
-        "Symbol",
-        "PLANTED-NONCONFORMING",
-    )
-    .expect("planting a raw node should succeed");
+    fixtures::plant_nonconforming_node(&data_dir, "Symbol", "PLANTED-NONCONFORMING")
+        .expect("planting a raw node should succeed");
 
     let dir = data_dir.to_str().expect("utf8 path");
     let output = run(&[
@@ -642,11 +793,7 @@ fn a_declared_store_refuses_a_write_that_violates_the_spine() {
         "--declare",
     ]);
 
-    let refusal = aletheia_egregore::adapters::fixtures::plant_nonconforming_node(
-        &data_dir,
-        "Symbol",
-        "PLANTED-NONCONFORMING",
-    );
+    let refusal = fixtures::plant_nonconforming_node(&data_dir, "Symbol", "PLANTED-NONCONFORMING");
     assert!(
         refusal.is_err(),
         "with constraints declared, a spine-violating raw write must be refused"
@@ -758,12 +905,8 @@ fn text_format_renders_the_same_findings() {
 #[test]
 fn violations_cite_offending_records_by_codegraph_id() {
     let (_temp, data_dir) = seeded_store();
-    aletheia_egregore::adapters::fixtures::plant_citable_nonconforming_node(
-        &data_dir,
-        "Symbol",
-        "codegraph:v8:planted-citable",
-    )
-    .expect("planting should succeed");
+    fixtures::plant_citable_nonconforming_node(&data_dir, "Symbol", "codegraph:v8:planted-citable")
+        .expect("planting should succeed");
 
     let output = run(&[
         "audit",
@@ -805,12 +948,8 @@ fn violations_cite_offending_records_by_codegraph_id() {
 #[test]
 fn unciteable_violations_are_counted_not_leaked() {
     let (_temp, data_dir) = seeded_store();
-    aletheia_egregore::adapters::fixtures::plant_nonconforming_node(
-        &data_dir,
-        "Symbol",
-        "PLANTED-NONCONFORMING",
-    )
-    .expect("planting should succeed");
+    fixtures::plant_nonconforming_node(&data_dir, "Symbol", "PLANTED-NONCONFORMING")
+        .expect("planting should succeed");
 
     let output = run(&[
         "audit",
@@ -860,7 +999,7 @@ fn text_output_neutralizes_control_characters_in_store_controlled_values() {
     let (_temp, data_dir) = seeded_store();
     // A foreign writer controls both the LABEL and the `codegraph_id`; both
     // reach `--format text`.
-    aletheia_egregore::adapters::fixtures::plant_citable_nonconforming_node(
+    fixtures::plant_citable_nonconforming_node(
         &data_dir,
         "Symbol",
         "aa\n    forged - missing required key [codegraph:v8:not-real]\u{1b}[2Jbb",
@@ -909,12 +1048,8 @@ fn text_output_neutralizes_control_characters_in_store_controlled_values() {
 #[test]
 fn a_foreign_label_is_reported_as_unknown_and_is_never_scanned() {
     let (_temp, data_dir) = seeded_store();
-    aletheia_egregore::adapters::fixtures::plant_nonconforming_node(
-        &data_dir,
-        "FutureForeignKind",
-        "irrelevant",
-    )
-    .expect("planting should succeed");
+    fixtures::plant_nonconforming_node(&data_dir, "FutureForeignKind", "irrelevant")
+        .expect("planting should succeed");
 
     let report = report_json(&data_dir, &[]);
     assert_eq!(
@@ -1041,7 +1176,7 @@ fn the_before_image_fully_describes_a_dropped_foreign_constraint() {
     let (_temp, data_dir) = seeded_store();
     let dir = data_dir.to_str().expect("utf8");
 
-    aletheia_egregore::adapters::fixtures::declare_foreign_typed_constraint(
+    fixtures::declare_foreign_typed_constraint(
         &data_dir,
         "SomeOtherToolsLabel",
         "their_required_count",
@@ -1186,7 +1321,7 @@ fn a_declared_store_accepts_a_bumped_schema_version() {
         "declaration must succeed before the bump can be tested"
     );
 
-    aletheia_egregore::adapters::fixtures::plant_spine_node_at_version(
+    fixtures::plant_spine_node_at_version(
         &data_dir,
         "Symbol",
         "codegraph:v999:future-symbol",
@@ -1274,12 +1409,8 @@ fn drop_retains_a_foreign_declaration_unless_explicitly_widened() {
         dir,
         "--declare",
     ]);
-    aletheia_egregore::adapters::fixtures::declare_foreign_constraint(
-        &data_dir,
-        "SomeOtherToolsLabel",
-        "their_property",
-    )
-    .expect("a foreign tool declares its own constraint");
+    fixtures::declare_foreign_constraint(&data_dir, "SomeOtherToolsLabel", "their_property")
+        .expect("a foreign tool declares its own constraint");
 
     // Default drop: Egregore's own go, the foreign one stays and is reported.
     let output = run(&["audit", "schema-constraints", "--data-dir", dir, "--drop"]);

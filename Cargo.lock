@@ -80,7 +80,6 @@ dependencies = [
 name = "aletheia-egregore"
 version = "0.1.0"
 dependencies = [
- "aletheia-egregore",
  "aletheiadb",
  "anyhow",
  "assert_cmd",

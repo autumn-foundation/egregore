@@ -32,15 +32,15 @@ embedded-aletheiadb = [
 ]
 embeddings = ["embedded-aletheiadb", "aletheiadb/embeddings", "dep:tokio"]
 nova = ["embedded-aletheiadb", "aletheiadb/nova"]
-# Test-only fixture affordances (issue #486). NEVER enable in a production
-# build: `adapters::fixtures` can write a record that bypasses every Egregore
-# invariant, which is exactly what the schema-constraint backstop exists to
-# catch. Enabled for the test target via the self dev-dependency below.
-#
-# Deliberately implies NOTHING. `adapters::fixtures` is gated on this feature
-# AND `embedded-aletheiadb`, so enabling it cannot drag the embedded adapter
-# into a `--no-default-features` run and quietly change what that config tests.
-test-fixtures = []
+# NOTE (issue #486): there is deliberately NO `test-fixtures` feature. Raw-write
+# store fixtures - which can plant a record bypassing every Egregore invariant,
+# precisely what the schema-constraint backstop exists to catch - live in the
+# integration test crate (`tests/integration/schema_constraints.rs`), not behind
+# a published feature. A Cargo feature is consumer-selectable, so gating them
+# that way would have made them reachable API of the published crate no matter
+# how the feature was documented; only test-crate code is genuinely unreachable
+# by a consumer. The fixtures open the store through `aletheiadb`'s own public
+# config helper, so they need no crate-private access.
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -104,13 +104,13 @@ libc = "0.2"
 assert_cmd = "2.1.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"
-# Self dev-dependency so the test target - and ONLY the test target - sees the
-# `test-fixtures` feature (issue #486). Cargo unifies this with the lib under
-# test, so integration tests reach `adapters::fixtures` while a production
-# consumer of the published crate cannot. Carries `default-features = false` so
-# a `--no-default-features` run does not silently re-enable the embedded
-# adapter through the back door.
-aletheia-egregore = { path = ".", default-features = false, features = ["test-fixtures"] }
+# Direct store access for the integration-test fixtures (issue #486). Only the
+# test crate sees this, so the raw-write helpers it enables can never be reached
+# from the published library - unlike a Cargo feature, which any consumer may
+# select. `default-features = false` mirrors the lib's own dependency line; the
+# fixtures use only upstream's public `config::durable_config_for_data_dir` +
+# `AletheiaDB`, so no Egregore-private item is exposed to make them work.
+aletheiadb = { version = "0.2.0", default-features = false }
 
 [profile.dev]
 debug = 1
