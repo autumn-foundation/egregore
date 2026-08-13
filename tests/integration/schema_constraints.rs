@@ -55,8 +55,8 @@ mod fixtures {
     ) -> Result<(), String> {
         let db = open(data_dir.as_ref())?;
         let mut builder = aletheiadb::PropertyMapBuilder::new();
-        for (key, value) in properties {
-            builder = builder.insert(*key, *value);
+        for &(key, value) in properties {
+            builder = builder.insert(key, value);
         }
         db.create_node(label, builder.build())
             .map_err(|error| error.to_string())?;
@@ -1160,6 +1160,81 @@ fn drop_records_a_before_image_so_a_mistake_is_recoverable() {
         );
         assert!(property["nullable"].is_boolean());
     }
+}
+
+/// The read-only report must leave no copy of the store behind.
+///
+/// The default action audits a byte-for-byte throwaway copy, and the command
+/// terminates via `std::process::exit`, which skips destructors. A `TempDir`
+/// guard still live at that point would strand a full copy of the store - graph
+/// payloads included - in the system temp dir on a lane whose entire promise is
+/// that it touches nothing, and repeated runs would accumulate them.
+///
+/// Asserts the property directly - the temp dir is empty afterwards - rather
+/// than the mechanism, and ignores the exit code so it stays valid whichever
+/// way each case resolves.
+///
+/// COVERAGE LIMIT, stated rather than implied: both cases below exit 0, so this
+/// pins the SUCCESS path only. The deep-exit paths the fix is really about (a
+/// failed store open, a failed conformance scan) need the store to fail after
+/// the copy already succeeded, and there is no fault-injection seam to force
+/// that - a store whose root files are overwritten with garbage still restores
+/// from `indexes/` and reports cleanly, and a non-store directory is simply
+/// initialised as an empty store. Those paths are handled structurally instead:
+/// `try_open_store` / `try_collect_conformance` return their diagnostic so the
+/// caller drops the guard before calling `usage_exit`, leaving no `process::exit`
+/// reachable while a copy is live. Same limitation as the failure-after-first-
+/// label declaration case.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn the_report_leaves_no_store_copy_in_the_temp_dir() {
+    let (_temp, data_dir) = seeded_store();
+    let scratch = tempfile::tempdir().expect("temp dir");
+
+    let residue = |label: &str| {
+        let left: Vec<String> = fs::read_dir(scratch.path())
+            .expect("scratch readable")
+            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "{label} left {} entrie(s) in the temp dir: {left:?} - a skipped \
+             destructor stranded the read-only store copy",
+            left.len()
+        );
+    };
+
+    // The success path.
+    let output = Command::cargo_bin("egregore")
+        .expect("binary")
+        .args([
+            "audit",
+            "schema-constraints",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .env("TMPDIR", scratch.path())
+        .output()
+        .expect("command runs");
+    assert_eq!(output.status.code(), Some(0));
+    residue("a successful report");
+
+    // A `--data-dir` that is non-empty but is not a store. Whichever way this
+    // resolves - a clean report or a deep `usage_exit` - the copy must be gone.
+    let bogus = tempfile::tempdir().expect("temp dir");
+    fs::write(bogus.path().join("not-a-store.txt"), b"junk").expect("write");
+    Command::cargo_bin("egregore")
+        .expect("binary")
+        .args([
+            "audit",
+            "schema-constraints",
+            "--data-dir",
+            bogus.path().to_str().expect("utf8"),
+        ])
+        .env("TMPDIR", scratch.path())
+        .output()
+        .expect("command runs");
+    residue("a report over a non-store directory");
 }
 
 /// The before-image must be able to restore a declaration Egregore's own

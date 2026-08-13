@@ -130,11 +130,23 @@ fn run(
         ConstraintAction::Report => {
             // Strictly read-only: the scan runs against a throwaway copy, so the
             // original store is never opened for writing and never re-persisted.
-            let (store_root, _guard) = super::readonly_audit_store(data_dir)
+            let (store_root, guard) = super::readonly_audit_store(data_dir)
                 .unwrap_or_else(|error| usage_exit("store_unreadable", &error.to_string()));
-            let sink = open_store(&store_root, data_dir, false);
-            collect_conformance(&sink, profile, &mut report);
-            report.declared_constraints = sink.declared_schema_constraints();
+            // Every failure below is REPORTED rather than exited on, so the
+            // throwaway copy is released first. `usage_exit` calls
+            // `std::process::exit`, which skips destructors: exiting from inside
+            // here while `guard` is live would strand a byte-for-byte copy of the
+            // store - graph payloads and all - in the system temp dir, on a lane
+            // whose whole promise is that it touches nothing.
+            let outcome = try_open_store(&store_root, data_dir, false).and_then(|sink| {
+                try_collect_conformance(&sink, profile, &mut report)?;
+                Ok(sink.declared_schema_constraints())
+            });
+            drop(guard);
+            match outcome {
+                Ok(declared) => report.declared_constraints = declared,
+                Err((code, message)) => usage_exit(code, &message),
+            }
         }
         ConstraintAction::Declare => {
             validate_store_path(data_dir);
@@ -210,6 +222,47 @@ fn finish(report: &mut SchemaConstraintReport, format: OutputFormat, code: i32) 
 /// contend with a live writer for no reason), while `--declare`/`--drop` must
 /// (they persist the upstream sidecar into the real store).
 #[cfg(feature = "embedded-aletheiadb")]
+/// A `(stable code, message)` pair destined for [`usage_exit`].
+///
+/// Returned rather than exited on so a caller holding a throwaway store copy can
+/// release it first: [`usage_exit`] calls `std::process::exit`, which skips
+/// every destructor.
+#[cfg(feature = "embedded-aletheiadb")]
+type ExitDiagnostic = (&'static str, String);
+
+/// [`open_store`], but reporting the failure instead of exiting on it.
+#[cfg(feature = "embedded-aletheiadb")]
+fn try_open_store(
+    store_root: &Path,
+    reported_path: &Path,
+    leased: bool,
+) -> Result<crate::adapters::EmbeddedAletheiaSink, ExitDiagnostic> {
+    let opened = if leased {
+        crate::adapters::EmbeddedAletheiaSink::open(store_root)
+    } else {
+        crate::adapters::EmbeddedAletheiaSink::open_unleased(store_root)
+    };
+    opened.map_err(|error| {
+        // A lease held by another live writer is its own documented condition
+        // (issue #200) with its own remedy - route through the daemon, or retry.
+        // Collapsing it into `store_unreadable` would bury that remedy in free
+        // text under a misleading machine-readable code.
+        let code = match error {
+            crate::adapters::AdapterError::Contended { .. } => {
+                crate::adapters::STORE_CONTENDED_CODE
+            }
+            _ => "store_unreadable",
+        };
+        (
+            code,
+            format!(
+                "failed to open embedded store {}: {error}",
+                reported_path.display()
+            ),
+        )
+    })
+}
+
 fn open_store(
     store_root: &Path,
     reported_path: &Path,
@@ -262,15 +315,26 @@ fn collect_conformance(
     profile: ConstraintProfile,
     report: &mut SchemaConstraintReport,
 ) {
+    try_collect_conformance(sink, profile, report)
+        .unwrap_or_else(|(code, message)| usage_exit(code, &message));
+}
+
+/// [`collect_conformance`], but reporting the failure instead of exiting on it.
+#[cfg(feature = "embedded-aletheiadb")]
+fn try_collect_conformance(
+    sink: &crate::adapters::EmbeddedAletheiaSink,
+    profile: ConstraintProfile,
+    report: &mut SchemaConstraintReport,
+) -> Result<(), ExitDiagnostic> {
     // A store that cannot be READ is a load error (exit 2), never a conformance
     // gate failure (exit 1): a CI job keying on exit 1 must never be told
     // "schema violations found" for what is actually an I/O failure.
-    let (observed_nodes, observed_edges) = sink.observed_labels().unwrap_or_else(|error| {
-        usage_exit(
+    let (observed_nodes, observed_edges) = sink.observed_labels().map_err(|error| {
+        (
             "store_unreadable",
-            &format!("failed to read store schema: {error}"),
+            format!("failed to read store schema: {error}"),
         )
-    });
+    })?;
 
     report.unknown_node_labels = unknown_node_labels(&observed_nodes);
     report.unknown_edge_types = unknown_edge_types(&observed_edges);
@@ -291,20 +355,20 @@ fn collect_conformance(
 
     report.rows = sink
         .schema_constraint_dry_run(profile, EntityKindToken::Node, &scan_nodes)
-        .unwrap_or_else(|error| {
-            usage_exit(
+        .map_err(|error| {
+            (
                 "conformance_scan_failed",
-                &format!("node conformance scan failed: {error}"),
+                format!("node conformance scan failed: {error}"),
             )
-        });
+        })?;
     report.rows.extend(
         sink.schema_constraint_dry_run(profile, EntityKindToken::Edge, &scan_edges)
-            .unwrap_or_else(|error| {
-                usage_exit(
+            .map_err(|error| {
+                (
                     "conformance_scan_failed",
-                    &format!("edge conformance scan failed: {error}"),
+                    format!("edge conformance scan failed: {error}"),
                 )
-            }),
+            })?,
     );
 
     // Every inventoried label the store holds nothing of is reported
@@ -336,6 +400,7 @@ fn collect_conformance(
     );
 
     report.conformance_evaluated = true;
+    Ok(())
 }
 
 #[cfg(not(feature = "embedded-aletheiadb"))]
