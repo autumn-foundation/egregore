@@ -3347,3 +3347,86 @@ fn corpus_with_no_attribution_reports_unavailable_not_a_typo() {
     assert_eq!(typo.code, 1);
     assert!(typo.stderr.contains("unknown_package_selector"));
 }
+
+/// The mirror of the forged-unattributed case: a record claiming
+/// `status: attributed` while ALSO carrying an `unattributed_reason` is
+/// internally contradictory and must own nothing.
+///
+/// The type contract is that the reason is present only for unattributed
+/// values, so a value carrying both is not a stricter attribution — it is a
+/// record no producer could have written. Fail-closed means rejecting it rather
+/// than picking the half that looks like an ownership fact.
+#[test]
+fn forged_attributed_value_carrying_a_reason_is_not_trusted() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let forged: String = fs::read_to_string(&graph)
+        .expect("graph readable")
+        .lines()
+        .map(|line| {
+            let mut record: Value = serde_json::from_str(line).expect("JSON");
+            if record["kind"] == "Symbol"
+                && record["name"]
+                    .as_str()
+                    .is_some_and(|n| n.ends_with("handle"))
+                && let Some(object) = record.as_object_mut()
+            {
+                object.insert(
+                    "crate_attribution".to_owned(),
+                    serde_json::json!({
+                        "status": "attributed",
+                        "package_name": "contradictory",
+                        "manifest_repo_relative_path": "nowhere/Cargo.toml",
+                        "unattributed_reason": "no_enclosing_manifest",
+                    }),
+                );
+            }
+            serde_json::to_string(&record).expect("serialize")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let forged_path = temp.path().join("contradictory.jsonl");
+    fs::write(&forged_path, forged).expect("forged graph written");
+    let forged_str = forged_path.to_str().unwrap();
+
+    let scoped = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        forged_str,
+        "--package",
+        "contradictory",
+    ]);
+    assert_eq!(
+        scoped.code, 1,
+        "a contradictory value must not become a scopable package; stdout: {}",
+        scoped.stdout
+    );
+    // The selector is legitimately echoed back; what must not appear is the
+    // name in `known_packages`.
+    let diagnostic: Value =
+        serde_json::from_str(scoped.stderr.trim()).expect("one JSON diagnostic line");
+    assert_eq!(diagnostic["code"], "unknown_package_selector");
+    let known: Vec<&str> = diagnostic["known_packages"]
+        .as_array()
+        .expect("known_packages array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        !known.contains(&"contradictory"),
+        "the contradictory name must not be listed as known: {known:?}"
+    );
+
+    let text = run_query(&[
+        "query", "symbol", "handle", "--graph", forged_str, "--format", "text",
+    ]);
+    assert_eq!(text.code, 0, "stderr: {}", text.stderr);
+    assert!(
+        !text.stdout.contains("contradictory"),
+        "a contradictory value must not render as an ownership claim: {}",
+        text.stdout
+    );
+}

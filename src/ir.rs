@@ -3731,7 +3731,10 @@ impl CrateAttribution {
     /// value owns nothing.
     #[must_use]
     pub fn owning_package(&self) -> Option<(&str, &str)> {
-        if self.status != CrateAttributionStatus::Attributed {
+        // ALL FOUR fields must agree. A value carrying both an attribution and
+        // an `unattributed_reason` is not a stricter claim — it is a shape no
+        // producer writes, so it owns nothing.
+        if self.status != CrateAttributionStatus::Attributed || self.unattributed_reason.is_some() {
             return None;
         }
         Some((
