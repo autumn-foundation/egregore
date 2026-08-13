@@ -427,9 +427,17 @@ upstream's reason — and `--drop` retracts whatever did.
 Conformance is a **structural** check of property presence and type on
 **current-state** entities only. It is never proof that a record's content is
 correct, that its domain schema version is semantically compatible, or that
-extraction was complete. Superseded record versions are not scanned. A label
-reported `not_present` holds no current-state entity and was therefore not
-checked.
+extraction was complete. A label reported `not_present` holds no current-state
+entity and was therefore not checked.
+
+**"Current-state" is the ENGINE's notion, not Egregore's.** The embedded adapter
+is append-only: superseding a record writes a NEW node rather than updating the
+old one, so an Egregore-superseded version remains a distinct live engine entity
+and IS scanned. Only entities superseded through the engine's own update
+mechanism are excluded. This is why `entities_checked` tracks the physical
+totals `eg inspect --data-dir` reports rather than a deduplicated record count —
+and why a declaration refusal can be caused by an OLD version of a record whose
+current version conforms perfectly.
 
 Enforcement is also **not a guarantee you can depend on**: upstream quarantines a
 corrupt `schema_constraints.dat` sidecar and starts with no constraints rather
