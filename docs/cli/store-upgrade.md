@@ -90,6 +90,12 @@ Egregore performs no automatic repair. Full contract in
 Record IDs, schema versions, the JSONL contract, query output, and determinism
 are all unaffected: this is a storage-substrate upgrade, not a schema change. A
 graph exported before the upgrade re-ingests byte-identically after it.
-`AletheiaDB` 0.2.0's new opt-in subsystems (namespaces, schema constraints,
-property indexes, changefeed, encryption, replication, multi-tenancy) are inert
-— Egregore does not enable any of them in this slice.
+`AletheiaDB` 0.2.0's new opt-in subsystems (namespaces, property indexes,
+changefeed, encryption, replication, multi-tenancy) are inert — Egregore does not
+enable any of them.
+
+**Schema constraints** are the one exception, and they are still off by default:
+no Egregore write path declares them, so an untouched store is fully schemaless
+exactly as before. An operator can opt in with
+[`eg audit schema-constraints --declare`](schema-constraints.md), and `--drop`
+retracts it.

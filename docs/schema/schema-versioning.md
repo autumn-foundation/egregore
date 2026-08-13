@@ -255,3 +255,57 @@ Executable fixtures live in `tests/integration/schema_versioning.rs`.
 - `additive_unknown_field_parses_and_inspects_without_warning` adds an unknown
   optional field to a current record. The reader accepts it, inspect succeeds,
   and stderr stays empty.
+
+## 10 - Declared Store Constraints and the Bump Rule
+
+`AletheiaDB` 0.2.0 ships opt-in, per-label schema constraints enforced at the
+pre-apply commit hook. `eg audit schema-constraints --declare` (issue #486) can
+declare them on an embedded store as a commit-time backstop for this contract.
+Doing so imposes one — and only one — additional obligation on a schema bump.
+
+**The rule.** A `schema_version` bump is unaffected by a declared store, but a
+change to the adapter's universal `base_properties` keys is not. Concretely:
+
+| change | effect on a declared store | required action |
+|---|---|---|
+| bump a per-domain `SCHEMA_VERSION` | **none** — the bump changes the `schema_version` VALUE, and the constraint declares its TYPE (`Integer`) | none |
+| add a `NodeKind` (and therefore a new store-side node label) | **none** — the new label carries no declaration and is fully schemaless upstream | none for correctness, but the backstop silently NARROWS: the new label is unconstrained until `--declare` is re-run |
+| add an `EdgeLabel` | **none**, same reason | none |
+| add a new optional per-kind payload field | **none** — no profile declares a per-kind payload field, by construction and by test | none |
+| **rename or remove a `base_properties` key** (`codegraph_id`, `record_type`, `schema_version`, `summary`) | **breaking** — every write of every label aborts at the commit hook | `eg audit schema-constraints --drop` on every declared store **before** shipping the change; re-declare after |
+| **change a `base_properties` key's stored type** (e.g. writing `schema_version` as a string) | **breaking**, same reason | as above |
+| rename or remove an edge routing key (`label`, `source_codegraph_id`, `target_codegraph_id`, `egregore_seq`) | **breaking** for edge writes | as above |
+
+The first four rows are why the declared profiles constrain **only** the
+universal identity/routing spine and never a per-kind payload field: a
+constraint that fires on a legitimate future write is worse than no constraint,
+because the whole transaction aborts with zero partial application. A unit test
+(`schema_constraints::tests::no_profile_declares_a_per_kind_payload_field`)
+prevents a profile from growing a payload-field constraint by accident, and
+`schema_version_is_declared_integer_in_every_profile` pins the type that makes
+row 1 safe.
+
+Declaration is **opt-in and reversible**: the default `eg audit
+schema-constraints` action is a read-only report that declares nothing, and
+`--drop` retracts. Nothing in Egregore's write path declares constraints
+automatically, so an undeclared store — the default — is entirely unaffected by
+this section.
+
+Two upstream properties bound how much a declared constraint can be relied on,
+and neither is a defect to be fixed here:
+
+* **Durability rides on index persistence.** The `schema_constraints.dat`
+  sidecar is written only when `persistence.enabled` (which
+  `durable_config_for_data_dir` sets, so it holds for every Egregore store) — but
+  a store opened without it keeps declarations in memory only.
+* **A corrupt sidecar is quarantined, not fatal.** Upstream renames it aside and
+  starts with **no** constraints rather than bricking startup, so enforcement can
+  silently disappear.
+
+Together these make a declared constraint a **backstop that catches mistakes**,
+never a proof obligation the rest of the system may lean on. `eg validate`, the
+adapter's read-back verification, and the citation audits remain the primary
+enforcement of this contract.
+
+See [`docs/cli/schema-constraints.md`](../cli/schema-constraints.md) for the
+full Phase 1 findings, the profile definitions, and the output contract.

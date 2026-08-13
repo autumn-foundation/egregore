@@ -3229,6 +3229,80 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
+    /// Every node kind, in declaration order.
+    ///
+    /// The embedded adapter writes one store-side node label per kind
+    /// (`node_label(kind) == kind.as_str()`), so this doubles as the inventory
+    /// of node labels Egregore can ever write (issue #486).
+    ///
+    /// `node_kind_all_matches_the_enum_definition` pins it exhaustive against an
+    /// INDEPENDENT oracle: `serde`'s unknown-variant error, which the derive
+    /// macro regenerates from the enum definition itself. Adding a variant
+    /// without listing it here fails that test. (A guard that merely iterated
+    /// this array would be circular and could not fail.)
+    pub const ALL: [Self; 60] = [
+        Self::Repository,
+        Self::File,
+        Self::Module,
+        Self::Symbol,
+        Self::Import,
+        Self::Diagnostic,
+        Self::PanicRiskSite,
+        Self::DebtMarker,
+        Self::UnsafeSite,
+        Self::DependencyDeclaration,
+        Self::ScanCoverage,
+        Self::Commit,
+        Self::Change,
+        Self::SemanticDrift,
+        Self::EmbeddingModel,
+        Self::EmbeddingVector,
+        Self::Agent,
+        Self::AgentSession,
+        Self::Observation,
+        Self::Task,
+        Self::AcceptanceCriterion,
+        Self::ExternalLink,
+        Self::Product,
+        Self::Project,
+        Self::Plan,
+        Self::GitHubIssue,
+        Self::PR,
+        Self::Review,
+        Self::ExternalIdentity,
+        Self::ReviewStateTransition,
+        Self::LocalTask,
+        Self::Artifact,
+        Self::Verification,
+        Self::CommandEvidence,
+        Self::AgentRun,
+        Self::AgentTurn,
+        Self::ToolCall,
+        Self::CommandRun,
+        Self::FileEdit,
+        Self::PatchArtifact,
+        Self::Failure,
+        Self::Decision,
+        Self::TestRun,
+        Self::CIStatus,
+        Self::BenchmarkRun,
+        Self::CoverageReport,
+        Self::ProofResult,
+        Self::PromoteCandidate,
+        Self::PromotionPrompt,
+        Self::PromotionDecision,
+        Self::Preference,
+        Self::WorkflowRule,
+        Self::NamingDecision,
+        Self::Constraint,
+        Self::CostUsage,
+        Self::Retraction,
+        Self::LogSource,
+        Self::ErrorSignature,
+        Self::LogEvent,
+        Self::LogOccurrenceBucket,
+    ];
+
     /// Returns the serialized node kind.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -3432,6 +3506,65 @@ pub enum EdgeLabel {
 }
 
 impl EdgeLabel {
+    /// Every edge label, in declaration order.
+    ///
+    /// The embedded adapter writes one store-side edge type per label
+    /// (`create_edge(.., label.as_str(), ..)`), so this doubles as the inventory
+    /// of edge types Egregore can ever write (issue #486).
+    /// `edge_label_all_matches_the_enum_definition` pins it exhaustive against
+    /// the same independent `serde` oracle [`NodeKind::ALL`] uses.
+    pub const ALL: [Self; 49] = [
+        Self::Contains,
+        Self::Defines,
+        Self::Imports,
+        Self::References,
+        Self::Calls,
+        Self::Implements,
+        Self::Mentions,
+        Self::ChangedIn,
+        Self::ParentOf,
+        Self::DriftsFrom,
+        Self::DriftsPrior,
+        Self::MeasuredBy,
+        Self::SessionOf,
+        Self::AuthoredBy,
+        Self::HasEvidence,
+        Self::Observes,
+        Self::MentionsSymbol,
+        Self::TouchedFile,
+        Self::ProducedPatch,
+        Self::ProducedEvidence,
+        Self::ValidatedBy,
+        Self::ClosesAcceptanceCriterion,
+        Self::OwnedByTask,
+        Self::ExternalHandle,
+        Self::TouchesFile,
+        Self::MergedAs,
+        Self::ReviewsCommit,
+        Self::ReviewedBy,
+        Self::RequestedReviewFrom,
+        Self::TransitionsReview,
+        Self::FailedOn,
+        Self::ExplainsChange,
+        Self::ReferencesTask,
+        Self::Contradicts,
+        Self::Supersedes,
+        Self::ProposedBy,
+        Self::PromptedFor,
+        Self::DecidedOn,
+        Self::MaterializedAs,
+        Self::RevokedBy,
+        Self::ScopedToRepo,
+        Self::RelatesTo,
+        Self::FingerprintedAs,
+        Self::CapturedFrom,
+        Self::Aggregates,
+        Self::FrameResolvesTo,
+        Self::EmittedDuring,
+        Self::Constructs,
+        Self::RegistersRoute,
+    ];
+
     /// Parses an edge label from its wire string.  Returns `None` for unknown labels.
     #[must_use]
     pub fn from_relation(s: &str) -> Option<Self> {
@@ -3843,5 +3976,122 @@ mod strip_prefix_tests {
         assert_eq!(strip_log_id_prefix("log:v:abc"), None);
         assert_eq!(strip_log_id_prefix("log:vx:abc"), None);
         assert_eq!(strip_log_id_prefix("some_symbol"), None);
+    }
+}
+
+#[cfg(test)]
+mod label_inventory_tests {
+    use super::{EdgeLabel, NodeKind};
+
+    /// Recovers the enum's TRUE variant list from `serde`'s unknown-variant
+    /// error, which the derive macro regenerates from the enum definition
+    /// itself.
+    ///
+    /// This is the INDEPENDENT ORACLE the inventory guards need. An earlier
+    /// version of these tests iterated `ALL` and asserted each element was in
+    /// `ALL` — circular, and it could not fail: adding a variant and extending
+    /// only the wildcard-free `match` (which the compiler does force) left
+    /// `ALL` silently short, so the "exhaustive" inventory would omit a real
+    /// store label and `--declare` would leave it unconstrained. Deriving the
+    /// expectation from `serde` instead means nothing a developer hand-writes
+    /// is on both sides of the assertion.
+    fn serde_variants<T>() -> Vec<String>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let error = serde_json::from_str::<T>("\"__no_such_variant__\"")
+            .err()
+            .expect("a bogus variant must fail to deserialize");
+        let message = error.to_string();
+        let (_, listed) = message
+            .split_once("expected one of ")
+            .expect("serde should enumerate the expected variants");
+        listed
+            .split(" at line ")
+            .next()
+            .unwrap_or(listed)
+            .split(", ")
+            .map(|token| token.trim().trim_matches('`').to_owned())
+            .filter(|token| !token.is_empty())
+            .collect()
+    }
+
+    /// [`NodeKind::ALL`] must list every variant the enum defines, because the
+    /// embedded adapter writes one store-side node label per kind and issue
+    /// #486's inventory (and `--declare`) is derived from it.
+    #[test]
+    fn node_kind_all_matches_the_enum_definition() {
+        let expected = serde_variants::<NodeKind>();
+        let actual: Vec<String> = NodeKind::ALL
+            .iter()
+            .map(|kind| (*kind).as_str().to_owned())
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "NodeKind::ALL must list every variant, in declaration order - \
+             a missing kind silently drops a store label from the #486 inventory"
+        );
+    }
+
+    /// The same independent check for [`EdgeLabel::ALL`].
+    #[test]
+    fn edge_label_all_matches_the_enum_definition() {
+        let expected = serde_variants::<EdgeLabel>();
+        let actual: Vec<String> = EdgeLabel::ALL
+            .iter()
+            .map(|label| (*label).as_str().to_owned())
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "EdgeLabel::ALL must list every variant, in declaration order"
+        );
+    }
+
+    /// The oracle itself must be able to fail. If `serde_variants` ever returns
+    /// an empty or degenerate list (a serde message-format change), the two
+    /// tests above would silently pass against nothing.
+    #[test]
+    fn serde_variant_oracle_is_not_degenerate() {
+        let kinds = serde_variants::<NodeKind>();
+        assert!(
+            kinds.len() > 50,
+            "oracle returned {} variants - serde's error format likely changed, \
+             which would silently disarm the inventory guards",
+            kinds.len()
+        );
+        assert!(kinds.contains(&"Repository".to_owned()));
+        assert!(kinds.iter().all(|k| !k.contains('`')));
+        assert!(kinds.iter().all(|k| !k.contains("line ")));
+    }
+
+    /// Both listings must be duplicate-free, so `ALL.len()` is the real
+    /// distinct-label count the report publishes.
+    #[test]
+    fn listings_are_duplicate_free() {
+        let mut node: Vec<&str> = NodeKind::ALL.iter().map(|k| k.as_str()).collect();
+        node.sort_unstable();
+        let node_total = node.len();
+        node.dedup();
+        assert_eq!(node.len(), node_total, "NodeKind::ALL holds a duplicate");
+
+        let mut edge: Vec<&str> = EdgeLabel::ALL.iter().map(|l| l.as_str()).collect();
+        edge.sort_unstable();
+        let edge_total = edge.len();
+        edge.dedup();
+        assert_eq!(edge.len(), edge_total, "EdgeLabel::ALL holds a duplicate");
+    }
+
+    /// Every listed label round-trips through the wire parser, so the inventory
+    /// names the same strings the read path accepts.
+    #[test]
+    fn edge_label_all_round_trips_through_from_relation() {
+        for label in EdgeLabel::ALL {
+            assert_eq!(
+                EdgeLabel::from_relation(label.as_str()),
+                Some(label),
+                "{} should parse back",
+                label.as_str()
+            );
+        }
     }
 }

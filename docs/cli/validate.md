@@ -232,3 +232,13 @@ The final stdout line is always a machine-readable summary:
   classification.
 - Parse/extraction-completeness signals (issue #87), semantic correctness,
   drift quality (issue #55), and agent-memory composition health (issue #94).
+
+## See also
+
+`eg validate` gates a graph JSONL file **between `scan` and `ingest`**, so it
+cannot see a bad record that reaches an embedded store by another path.
+[`eg audit schema-constraints`](schema-constraints.md) (issue #486) is the
+complementary surface: it evaluates — and optionally declares — `AletheiaDB`
+per-label schema constraints, which are enforced at the store's own pre-apply
+commit hook. The two are not substitutes: `eg validate` checks reference closure
+across a whole graph, which a per-label constraint cannot express.

@@ -57,6 +57,7 @@ mod repair_cmd;
 mod resolve_frames;
 mod scan;
 mod scan_logs;
+mod schema_constraints;
 mod semantic;
 mod subsystem;
 mod symbols;
@@ -138,6 +139,7 @@ pub(crate) use repair_cmd::*;
 pub(crate) use resolve_frames::*;
 pub(crate) use scan::*;
 pub(crate) use scan_logs::*;
+pub(crate) use schema_constraints::*;
 pub(crate) use semantic::*;
 pub(crate) use subsystem::*;
 pub(crate) use symbols::*;
@@ -3945,6 +3947,60 @@ pub(crate) enum AuditSubcommand {
         /// Embedded `AletheiaDB` store directory (mutually exclusive with `--graph`).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Evaluate `AletheiaDB` schema constraints against an embedded store (issue #486).
+    ///
+    /// `eg validate` (#103) gates a graph JSONL file BETWEEN scan and ingest, so
+    /// it cannot see a bad write that reaches a store by another path. 0.2.0's
+    /// opt-in per-label schema constraints put a backstop at the write boundary
+    /// itself; this command is how you evaluate and (optionally) declare them.
+    ///
+    /// The DEFAULT action is a strictly read-only Phase 1 report: the inventory
+    /// of node labels and edge types the embedded adapter can write, reconciled
+    /// against what the store actually holds, plus an upstream `.dry_run()`
+    /// conformance scan of the chosen profile. It declares nothing.
+    ///
+    /// `--declare` is the opt-in Phase 2 action; `--drop` retracts it. Both take
+    /// the exclusive write lease. A declaration covers only the universal
+    /// identity/routing spine — never a per-kind payload field, because a
+    /// constraint that fires on a legitimate future write is worse than no
+    /// constraint.
+    ///
+    /// Exit codes:
+    ///   0 — report produced with no violation, or declare/drop succeeded.
+    ///   1 — non-conforming entities found, or `--declare` was refused (either
+    ///       up front by non-conforming current state, or part-way by the
+    ///       store). The FULL report is printed in every case, so a partial
+    ///       declaration is always visible.
+    ///   2 — usage/load error (missing or unreadable store, unreadable schema,
+    ///       both mode flags, unknown profile, build without the embedded
+    ///       adapter).
+    ///
+    /// See `docs/cli/schema-constraints.md`.
+    SchemaConstraints {
+        /// Embedded `AletheiaDB` store directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Candidate constraint profile: `spine` (default) or `full-base`.
+        #[arg(long, default_value = "spine")]
+        profile: String,
+        /// Declare the profile on every writable label (opt-in, takes the write lease).
+        #[arg(long)]
+        declare: bool,
+        /// Retract the schema constraints declared on the store.
+        ///
+        /// Scoped by default to labels Egregore itself can write - the exact
+        /// inverse of `--declare`. A declaration on any other label was made by
+        /// something else and is retained and reported, not silently destroyed.
+        #[arg(long)]
+        drop: bool,
+        /// Widen `--drop` to retract declarations on labels outside Egregore's
+        /// writable inventory too.
+        #[arg(long)]
+        include_foreign: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
