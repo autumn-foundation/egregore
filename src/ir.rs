@@ -3720,27 +3720,50 @@ pub struct CrateAttribution {
 
 impl CrateAttribution {
     /// The owning package name and manifest path, but ONLY when this value is
-    /// internally consistent — `status: attributed` with both fields present.
+    /// one the resolver could actually have PRODUCED.
     ///
     /// Every consumer that renders or scopes on the attribution must go through
     /// here rather than reading `package_name` directly. The write path upholds
-    /// the `attributed <=> name + manifest present` invariant, but a value read
-    /// back from a store or a graph is operator-controlled and re-checking it is
-    /// the difference between reporting what a record CLAIMS and asserting an
-    /// ownership fact the resolver never produced. Fail-closed: an inconsistent
-    /// value owns nothing.
+    /// these invariants, but a value read back from a store or a graph is
+    /// operator-controlled (the #104 doctrine) and re-checking it is the
+    /// difference between reporting what a record CLAIMS and asserting an
+    /// ownership fact the resolver never produced. Fail-closed: a value failing
+    /// any check owns nothing, which reads downstream exactly like an absent
+    /// attribution — never like a proven-ownerless one.
+    ///
+    /// Three checks, each closing a distinct way a crafted record could assert
+    /// ownership the ancestor walk is structurally unable to reach:
+    ///
+    /// 1. **Internal consistency** — `status: attributed`, both strings
+    ///    present, and no `unattributed_reason`. A value carrying both an
+    ///    attribution and a reason is not a stricter claim; it is a shape no
+    ///    producer writes.
+    /// 2. **Package name** — the name is only ever READ from `[package].name`,
+    ///    gated by [`crate::manifest_deps::package_name_is_valid`] (the same
+    ///    rule, shared rather than re-derived). That charset admits no
+    ///    whitespace and no control characters, which is also what makes the
+    ///    name safe to interpolate into the one-line `--format text` render and
+    ///    to echo into a `known_packages` diagnostic.
+    /// 3. **Manifest citation** — the path is only ever one the walk reached,
+    ///    so it must have that shape:
+    ///    [`crate::crate_attribution::manifest_path_is_repo_relative`].
+    ///
+    /// The last two matter most on the raw-text path, where the value is
+    /// interpolated verbatim: without them a newline in either field forges an
+    /// entire additional output line.
     #[must_use]
     pub fn owning_package(&self) -> Option<(&str, &str)> {
-        // ALL FOUR fields must agree. A value carrying both an attribution and
-        // an `unattributed_reason` is not a stricter claim — it is a shape no
-        // producer writes, so it owns nothing.
         if self.status != CrateAttributionStatus::Attributed || self.unattributed_reason.is_some() {
             return None;
         }
-        Some((
-            self.package_name.as_deref()?,
-            self.manifest_repo_relative_path.as_deref()?,
-        ))
+        let name = self.package_name.as_deref()?;
+        let manifest = self.manifest_repo_relative_path.as_deref()?;
+        if !crate::manifest_deps::package_name_is_valid(name)
+            || !crate::crate_attribution::manifest_path_is_repo_relative(manifest)
+        {
+            return None;
+        }
+        Some((name, manifest))
     }
 
     /// Builds an attributed value citing the owning package and its manifest.

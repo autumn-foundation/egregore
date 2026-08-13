@@ -78,8 +78,8 @@ an index.
 ## Which lanes use it
 
 Migrated in v1 (fast path taken only for the plain current-state, unscoped
-invocation — `--repo`, `--at`, `--as-of`, and `--repo-path` keep the cold scan
-because they need global topology or the commit timeline):
+invocation — `--repo`, `--package`, `--at`, `--as-of`, and `--repo-path` keep
+the cold scan because they need global topology or the commit timeline):
 
 - `eg query deps <symbol>`
 - `eg query context <symbol>` and `eg query symbol <name>`

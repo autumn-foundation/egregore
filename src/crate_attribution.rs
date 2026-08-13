@@ -115,23 +115,65 @@ impl ManifestPackageFact {
     /// manifest, else the `/`-joined directory path with no trailing slash.
     ///
     /// Returns `None` when the path is not a usable repo-relative manifest
-    /// path (absolute, `..`-bearing, empty, or backslash-separated) — such a
-    /// fact is dropped rather than relocated across a manifest boundary.
+    /// path — such a fact is dropped rather than relocated across a manifest
+    /// boundary.
     fn directory_key(&self) -> Option<String> {
         let path = self.manifest_repo_relative_path.as_str();
-        if path.is_empty()
-            || path.starts_with('/')
-            || path.contains('\\')
-            || path
-                .split('/')
-                .any(|segment| segment == ".." || segment == ".")
-        {
+        if !manifest_path_is_repo_relative(path) {
             return None;
         }
         let mut segments: Vec<&str> = path.split('/').collect();
         segments.pop()?;
         Some(segments.join("/"))
     }
+}
+
+/// The file name every Cargo manifest carries, case-sensitively.
+///
+/// Cargo itself is case-sensitive here: a `cargo.toml` is not a manifest, which
+/// is why the scan's manifest discovery matches this exact name.
+const MANIFEST_FILE_NAME: &str = "Cargo.toml";
+
+/// Whether `path` has the shape of a repo-relative Cargo manifest path.
+///
+/// This is the shape the ancestor walk can PRODUCE: a non-empty, `/`-separated,
+/// relative path whose last segment is `Cargo.toml`, with no `.`/`..` segment,
+/// no empty interior segment, no leading `/`, no backslash, no Windows drive
+/// prefix, and no control characters.
+///
+/// One rule, two callers, deliberately: the producer drops a fact it cannot
+/// place ([`ManifestPackageFact::directory_key`]), and the reader refuses to
+/// present a claim resting on a citation of a shape the producer could never
+/// have written ([`crate::ir::CrateAttribution::owning_package`]). A value read
+/// back from a store or a hand-edited graph is operator-controlled, so the
+/// reader re-checking is what keeps "what a record claims" separate from "what
+/// the resolver proved".
+#[must_use]
+pub fn manifest_path_is_repo_relative(path: &str) -> bool {
+    if path.is_empty() || path.starts_with('/') || path.contains('\\') {
+        return false;
+    }
+    if path.chars().any(char::is_control) {
+        return false;
+    }
+    let mut segments = path.split('/');
+    // A Windows drive-absolute path (`C:/crates/Cargo.toml`) is not
+    // repo-relative. Only the FIRST segment can carry a drive prefix, so a
+    // colon elsewhere — legal in a POSIX directory name — is left alone rather
+    // than turned into a false negative.
+    if segments.next().is_some_and(|first| first.contains(':')) {
+        return false;
+    }
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments
+        .iter()
+        .any(|segment| segment.is_empty() || *segment == "." || *segment == "..")
+    {
+        return false;
+    }
+    // The path's job is to CITE the manifest the attribution rests on, so it
+    // must actually name one.
+    segments.last() == Some(&MANIFEST_FILE_NAME)
 }
 
 /// A deterministic map from directory to the manifest that sits in it.
@@ -834,6 +876,94 @@ mod tests {
                 "{path} already resolved at a deeper manifest"
             );
         }
+    }
+
+    /// The shape rule is shared by the producer (which drops a fact it cannot
+    /// place) and the reader (which refuses a claim resting on a citation the
+    /// walk could not have written), so it is pinned directly.
+    #[test]
+    fn manifest_path_shape_admits_only_walkable_citations() {
+        for accepted in [
+            "Cargo.toml",
+            "crates/alpha/Cargo.toml",
+            "crates/alpha/vendor/inner/Cargo.toml",
+            // Legal in a POSIX directory name and reachable by the walk, so it
+            // must not be a false negative: only a FIRST-segment colon is a
+            // Windows drive prefix.
+            "crates/a:b/Cargo.toml",
+            "crates/with space/Cargo.toml",
+            "crates/café/Cargo.toml",
+            "crates/..hidden/Cargo.toml",
+        ] {
+            assert!(
+                manifest_path_is_repo_relative(accepted),
+                "`{accepted}` is a path the walk produces"
+            );
+        }
+        for (label, rejected) in [
+            ("empty", ""),
+            ("absolute", "/etc/Cargo.toml"),
+            ("escaping", "../outside/Cargo.toml"),
+            ("interior escape", "crates/../../Cargo.toml"),
+            ("dot segment", "crates/./Cargo.toml"),
+            ("empty interior segment", "crates//Cargo.toml"),
+            ("trailing slash", "crates/x/Cargo.toml/"),
+            ("windows drive", "C:/crates/Cargo.toml"),
+            ("backslash", "crates\\x\\Cargo.toml"),
+            ("newline", "crates/x/Cargo.toml\nforged"),
+            ("nul", "crates/x/\u{0}Cargo.toml"),
+            ("ansi escape", "crates/\u{1b}[31m/Cargo.toml"),
+            ("not a manifest", "crates/x/src/lib.rs"),
+            ("case-shifted", "crates/x/cargo.toml"),
+            ("manifest-suffixed name", "crates/x/NotCargo.toml"),
+            ("bare directory", "crates/x"),
+        ] {
+            assert!(
+                !manifest_path_is_repo_relative(rejected),
+                "`{label}` is not a path the walk produces"
+            );
+        }
+    }
+
+    /// Every manifest path the resolver itself indexes must satisfy the shape
+    /// rule the reader enforces — otherwise the reader would reject a value the
+    /// producer legitimately wrote, silently dropping real attribution.
+    #[test]
+    fn every_indexed_manifest_path_satisfies_the_reader_shape_rule() {
+        let facts = vec![
+            ManifestPackageFact::new(
+                "Cargo.toml",
+                ManifestParseOutcome::Package {
+                    name: "root".to_owned(),
+                },
+            ),
+            ManifestPackageFact::new(
+                "crates/alpha/Cargo.toml",
+                ManifestParseOutcome::Package {
+                    name: "alpha".to_owned(),
+                },
+            ),
+            ManifestPackageFact::new("crates/beta/Cargo.toml", ManifestParseOutcome::Virtual),
+        ];
+        for fact in &facts {
+            assert!(
+                manifest_path_is_repo_relative(&fact.manifest_repo_relative_path),
+                "indexed `{}` must satisfy the reader's shape rule",
+                fact.manifest_repo_relative_path
+            );
+            assert!(
+                fact.directory_key().is_some(),
+                "indexed `{}` must be placeable",
+                fact.manifest_repo_relative_path
+            );
+        }
+        let index = CrateAttributionIndex::from_facts(facts);
+        let attribution = index.attribution_for("crates/alpha/src/lib.rs");
+        let (name, manifest) = attribution
+            .owning_package()
+            .expect("a resolver-produced attribution must survive the reader's checks");
+        assert_eq!(name, "alpha");
+        assert_eq!(manifest, "crates/alpha/Cargo.toml");
     }
 
     #[test]

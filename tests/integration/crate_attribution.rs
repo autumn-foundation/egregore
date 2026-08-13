@@ -3890,3 +3890,164 @@ fn only_a_confirmed_virtual_root_is_walked_past() {
         );
     }
 }
+
+/// A read-back attribution whose fields are individually well-formed JSON but
+/// could never have been PRODUCED by the resolver must own nothing.
+///
+/// `status: "attributed"` plus two present strings is not enough. The resolver
+/// only ever emits a package name it READ from `[package].name` (gated to the
+/// Cargo charset) and a repo-relative `.../Cargo.toml` path it WALKED to. A
+/// value read back from a store or a hand-edited graph is operator-controlled
+/// (the #104 doctrine), so trusting the shape alone lets a crafted record
+/// assert ownership the resolver could never have produced — and, on the
+/// `--format text` path where the value is interpolated verbatim, forge whole
+/// output lines.
+///
+/// Each case below is checked three ways: it must not be scopable via
+/// `--package`, it must not be listed in `known_packages`, and it must not
+/// render as an ownership claim in text output.
+#[test]
+fn forged_attribution_the_resolver_could_not_produce_owns_nothing() {
+    for (label, package_name, manifest_path) in [
+        // Names outside the Cargo charset. The space and the newline are the
+        // text-forgery vectors: `package: {name} ({manifest})` is one line, so a
+        // newline in the name manufactures a second.
+        ("space in name", "bad name", "crates/x/Cargo.toml"),
+        (
+            "newline in name",
+            "one\npackage: forged",
+            "crates/x/Cargo.toml",
+        ),
+        (
+            "ansi escape in name",
+            "evil\u{1b}[31m",
+            "crates/x/Cargo.toml",
+        ),
+        ("leading digit", "9lives", "crates/x/Cargo.toml"),
+        ("empty name", "", "crates/x/Cargo.toml"),
+        ("path separator in name", "crates/x", "crates/x/Cargo.toml"),
+        // Manifest paths that are not repo-relative citations. An absolute or
+        // escaping path names a manifest OUTSIDE the scanned tree, which the
+        // ancestor walk is structurally unable to reach.
+        ("absolute manifest path", "forged", "/etc/Cargo.toml"),
+        ("escaping manifest path", "forged", "../outside/Cargo.toml"),
+        ("dot segment manifest path", "forged", "crates/./Cargo.toml"),
+        (
+            "windows drive manifest path",
+            "forged",
+            "C:/crates/Cargo.toml",
+        ),
+        ("backslash manifest path", "forged", "crates\\x\\Cargo.toml"),
+        ("empty manifest path", "forged", ""),
+        ("empty interior segment", "forged", "crates//Cargo.toml"),
+        // A path that does not name a manifest at all: the citation is the
+        // whole point of carrying the path, so it must actually cite one.
+        ("not a manifest", "forged", "crates/x/src/lib.rs"),
+        ("manifest is a directory", "forged", "crates/x/Cargo.toml/"),
+        ("case-shifted manifest", "forged", "crates/x/cargo.toml"),
+        // Control characters in the manifest path: the other half of the text
+        // interpolation, and never present in a walked path.
+        (
+            "newline in manifest path",
+            "forged",
+            "crates/x/Cargo.toml\nforged",
+        ),
+    ] {
+        assert_forged_attribution_owns_nothing(label, package_name, manifest_path);
+    }
+}
+
+/// Stamps `(package_name, manifest_path)` onto every `handle` symbol as a
+/// well-formed `status: "attributed"` payload, then asserts the corpus treats it
+/// as owning nothing — not scopable, not catalogued, not rendered.
+fn assert_forged_attribution_owns_nothing(label: &str, package_name: &str, manifest_path: &str) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+
+    let forged: String = fs::read_to_string(&graph)
+        .expect("graph readable")
+        .lines()
+        .map(|line| {
+            let mut record: Value = serde_json::from_str(line).expect("JSON");
+            if record["kind"] == "Symbol"
+                && record["name"]
+                    .as_str()
+                    .is_some_and(|n| n.ends_with("handle"))
+                && let Some(object) = record.as_object_mut()
+            {
+                object.insert(
+                    "crate_attribution".to_owned(),
+                    serde_json::json!({
+                        "status": "attributed",
+                        "package_name": package_name,
+                        "manifest_repo_relative_path": manifest_path,
+                    }),
+                );
+            }
+            serde_json::to_string(&record).expect("serialize")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let forged_path = temp.path().join("forged.jsonl");
+    fs::write(&forged_path, forged).expect("forged graph written");
+    let forged_str = forged_path.to_str().unwrap();
+
+    // 1. Not scopable. The selector is a name no LEGITIMATE package carries, so
+    //    the lane must reject it rather than return rows.
+    if !package_name.is_empty() {
+        let scoped = run_query(&[
+            "query",
+            "symbol",
+            "handle",
+            "--graph",
+            forged_str,
+            "--package",
+            package_name,
+        ]);
+        assert_eq!(
+            scoped.code, 1,
+            "`{label}` must not be a scopable package; stdout: {}",
+            scoped.stdout
+        );
+    }
+
+    // 2. Not listed as known. `known_packages` is the operator-facing catalog;
+    //    a forged name appearing there presents it as real.
+    let listed = run_query(&[
+        "query",
+        "symbol",
+        "handle",
+        "--graph",
+        forged_str,
+        "--package",
+        "definitely-not-a-package",
+    ]);
+    assert_eq!(listed.code, 1, "stdout: {}", listed.stdout);
+    let diagnostic: Value =
+        serde_json::from_str(listed.stderr.trim()).expect("one JSON diagnostic line");
+    let known: Vec<&str> = diagnostic["known_packages"]
+        .as_array()
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(
+        !known.contains(&package_name),
+        "`{label}` must not be listed as a known package: {known:?}"
+    );
+
+    // 3. Not rendered. Text output interpolates the attribution verbatim, so an
+    //    unproducible value must print NOTHING rather than a claim.
+    let text = run_query(&[
+        "query", "symbol", "handle", "--graph", forged_str, "--format", "text",
+    ]);
+    assert_eq!(text.code, 0, "stderr: {}", text.stderr);
+    for forged_fragment in [package_name, manifest_path] {
+        if forged_fragment.is_empty() {
+            continue;
+        }
+        assert!(
+            !text.stdout.contains(forged_fragment),
+            "`{label}` must not render as an ownership claim: {}",
+            text.stdout
+        );
+    }
+}

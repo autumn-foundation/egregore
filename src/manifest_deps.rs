@@ -523,7 +523,12 @@ fn requirement_is_parseable(requirement: &str) -> bool {
 /// table keys, and `package = "…"` rename values alike — Cargo rejects all
 /// three the same way. Rejection-level rules only; crates.io publish-time
 /// restrictions and Cargo warnings are out of scope.
-fn package_name_is_valid(name: &str) -> bool {
+///
+/// Crate-visible so the attribution READER
+/// ([`crate::ir::CrateAttribution::owning_package`]) gates a package name read
+/// back from a store against the same rule that gated it at production —
+/// re-deriving the charset there would let the two drift.
+pub(crate) fn package_name_is_valid(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;

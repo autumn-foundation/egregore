@@ -202,6 +202,36 @@ which would make the scoped answer's precision claim false.
 the loaded corpus**. A package whose manifest exists but that owns no indexed
 record is not listed and resolves as `unknown_package_selector`.
 
+`--package` always loads the **whole corpus**, opting out of the
+[`eg index`](index.md) sidecar fast path exactly as `--repo` does. Both verdicts
+above need global knowledge a one-symbol index closure cannot supply: obviously
+so for enumerating `known_packages`, and — the trap — for cross-repository
+ambiguity, since a package owned by two repositories where only one defines the
+queried symbol looks unambiguous inside the narrowed closure. An answer that
+changed with the presence of an `.idx` file would break the index's contract of
+being a pure access-path optimization.
+
+### A record's attribution is re-checked before it is believed
+
+An attribution read back from a store or a graph is operator-controlled, so the
+reader re-derives whether the value is one the resolver could actually have
+**produced** before scoping or rendering on it. Three checks, all fail-closed:
+
+1. `status: attributed`, both strings present, no `unattributed_reason` — a
+   value carrying both an attribution and a reason is a shape no producer
+   writes.
+2. The package name satisfies Cargo's manifest-load charset — the same rule that
+   gated it at production, shared rather than re-derived.
+3. The manifest path has the shape the ancestor walk produces: a relative,
+   `/`-separated path with no `.`/`..` segment, no empty segment, no backslash,
+   no drive prefix, no control character, whose last segment is `Cargo.toml`.
+
+A value failing any check **owns nothing**: it is not scopable, never appears in
+`known_packages`, and renders nothing — indistinguishable downstream from an
+absent attribution, and never from a proven-ownerless one. This matters most on
+the text path, where the value is interpolated verbatim: without the last two
+checks a newline in either field forges an entire additional output line.
+
 ## Example
 
 ```console

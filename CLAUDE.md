@@ -407,8 +407,14 @@ store exits 1 `ambiguous_package_selector` rather than silently merging them; an
 `--package --daemon` exits 1 `unsupported_combination` (the daemon's symbol
 projection carries no attribution and already omits
 `visibility`/`signature`/`doc`) rather than answering a different question. The
-#447 sidecar-index fast path stays ENABLED under `--package`; only the
-zero-row error path cold-reloads, to enumerate `known_packages`. Rows appear in
+`--package` FORCES the whole-corpus load, opting out of the #447 sidecar-index
+fast path exactly as `--repo` does: both the `known_packages` enumeration and
+the cross-repository ambiguity verdict need global knowledge a one-symbol index
+closure cannot supply — a package owned by two repositories where only ONE
+defines the queried symbol looks unambiguous inside the narrowed closure, so the
+lane would return rows where a cold scan refuses, and an answer that changes
+with the presence of an `.idx` file would break the index's documented contract
+of being a pure access-path optimization. Rows appear in
 both `--format json` and `--format text` (an absent field prints NOTHING — never
 "unattributed", which would fabricate a negative fact), are allow-list only
 (package name, manifest path, closed-set reason — a TOML parse-error message is
