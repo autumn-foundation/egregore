@@ -494,6 +494,16 @@ pub struct DropOutcome {
     /// Declarations deliberately left in place because their label is outside
     /// Egregore's writable inventory (or carries an unrecognized entity kind).
     pub foreign_retained: Vec<DeclaredConstraint>,
+    /// The store error that stopped the run, or `None` when every candidate was
+    /// processed.
+    ///
+    /// Retraction is NOT atomic across labels, exactly as declaration is not, so
+    /// a failure partway through leaves the store already modified. Returning
+    /// this alongside the accumulated `dropped` — rather than discarding the
+    /// outcome with `?` — is what keeps the before-image of the labels that DID
+    /// drop; upstream rewrites the sidecar atomically, so a discarded outcome
+    /// would be the permanent loss of the only record of them.
+    pub refusal: Option<String>,
 }
 
 /// One property descriptor within a constraint declaration read back from the
@@ -620,10 +630,18 @@ pub struct SchemaConstraintReport {
     /// a newer Egregore — worth knowing before declaring anything, since those
     /// labels are outside the inventory a declaration would cover.
     pub unknown_node_labels: Vec<String>,
+    /// Node labels dropped from `unknown_node_labels` by the display cap, so a
+    /// bounded list is never mistaken for a complete one.
+    pub unknown_node_labels_omitted: usize,
     /// Edge types present in the store that Egregore cannot write, sorted.
     pub unknown_edge_types: Vec<String>,
+    /// Edge types dropped from `unknown_edge_types` by the display cap.
+    pub unknown_edge_types_omitted: usize,
     /// Constraints the store currently has declared, sorted.
     pub declared_constraints: Vec<DeclaredConstraint>,
+    /// Declarations dropped from `declared_constraints` by the display cap.
+    /// Re-readable from the store at any time, unlike `dropped_constraints`.
+    pub declared_constraints_omitted: usize,
     /// Labels a `--declare` run declared on.
     ///
     /// Set even when the run was refused part-way, so a partially-constrained
@@ -651,6 +669,15 @@ pub struct SchemaConstraintReport {
     /// Egregore's own labels; silently destroying another tool's constraints
     /// would exceed that inverse.
     pub foreign_constraints_retained: Vec<DeclaredConstraint>,
+    /// Declarations dropped from `foreign_constraints_retained` by the display
+    /// cap. These were RETAINED in the store, so they remain re-readable.
+    pub foreign_constraints_retained_omitted: usize,
+    /// The store error that stopped a `--drop` partway, or `None`.
+    ///
+    /// Set when retraction failed after at least one label had already been
+    /// retracted, so the report discloses that the store is now partially
+    /// dropped rather than reporting only a bare failure.
+    pub drop_refusal: Option<String>,
     /// Whether a conformance scan actually ran.
     ///
     /// `--drop` evaluates no profile, so its zeroed conformance block must not
@@ -679,20 +706,49 @@ impl SchemaConstraintReport {
             row.violations
                 .sort_by(|a, b| (&a.property, &a.reason).cmp(&(&b.property, &b.reason)));
         }
-        for labels in [&mut self.unknown_node_labels, &mut self.unknown_edge_types] {
+        // A bounded list that silently loses its tail reads as a COMPLETE list.
+        // These arrays name what the scan could not cover, so an undisclosed
+        // truncation hides exactly the namespaces the operator needs to see.
+        for (labels, omitted) in [
+            (
+                &mut self.unknown_node_labels,
+                &mut self.unknown_node_labels_omitted,
+            ),
+            (
+                &mut self.unknown_edge_types,
+                &mut self.unknown_edge_types_omitted,
+            ),
+        ] {
             labels.sort();
             labels.dedup();
+            *omitted = labels.len().saturating_sub(MAX_UNKNOWN_LABELS);
             labels.truncate(MAX_UNKNOWN_LABELS);
         }
-        for declarations in [
-            &mut self.declared_constraints,
-            &mut self.dropped_constraints,
-            &mut self.foreign_constraints_retained,
+        for (declarations, omitted) in [
+            (
+                &mut self.declared_constraints,
+                &mut self.declared_constraints_omitted,
+            ),
+            (
+                &mut self.foreign_constraints_retained,
+                &mut self.foreign_constraints_retained_omitted,
+            ),
         ] {
             declarations
                 .sort_by(|a, b| (&a.entity_kind, &a.label).cmp(&(&b.entity_kind, &b.label)));
+            *omitted = declarations.len().saturating_sub(MAX_DECLARED_CONSTRAINTS);
             declarations.truncate(MAX_DECLARED_CONSTRAINTS);
         }
+        // `dropped_constraints` is deliberately NOT capped. The other lists
+        // describe current state, which the store can always be re-read for; this
+        // one is a RECOVERY RECORD for declarations that no longer exist
+        // anywhere. Retraction has already happened by the time this runs and
+        // upstream rewrote the sidecar atomically, so a truncated entry is not a
+        // shortened report - it is a declaration that can never be rebuilt.
+        // Bounding it would cap the report at the cost of the contract it exists
+        // to serve.
+        self.dropped_constraints
+            .sort_by(|a, b| (&a.entity_kind, &a.label).cmp(&(&b.entity_kind, &b.label)));
     }
 
     /// Total current-state entities checked across every scanned label.
@@ -733,7 +789,7 @@ impl SchemaConstraintReport {
     /// false statement this lane exists to avoid.
     #[must_use]
     pub fn ok(&self) -> bool {
-        if self.declaration_refusal.is_some() {
+        if self.declaration_refusal.is_some() || self.drop_refusal.is_some() {
             return false;
         }
         if !self.conformance_evaluated {
@@ -790,7 +846,9 @@ impl SchemaConstraintReport {
             },
             "observed": {
                 "unknown_node_labels": self.unknown_node_labels,
+                "unknown_node_labels_omitted": self.unknown_node_labels_omitted,
                 "unknown_edge_types": self.unknown_edge_types,
+                "unknown_edge_types_omitted": self.unknown_edge_types_omitted,
             },
             "conformance": {
                 "labels_scanned": self.labels_scanned(),
@@ -805,18 +863,22 @@ impl SchemaConstraintReport {
                 .map(DeclaredConstraint::to_json)
                 .collect::<Vec<_>>(),
             "declaration_refusal": self.declaration_refusal.as_deref().map(bounded_field),
+            "declared_constraints_omitted": self.declared_constraints_omitted,
             "declared_labels": self.declared_labels,
             "dropped_labels": self.dropped_labels,
+            // Never truncated, so `dropped_labels` and this array always agree.
             "dropped_constraints": self
                 .dropped_constraints
                 .iter()
                 .map(DeclaredConstraint::to_json)
                 .collect::<Vec<_>>(),
+            "drop_refusal": self.drop_refusal.as_deref().map(bounded_field),
             "foreign_constraints_retained": self
                 .foreign_constraints_retained
                 .iter()
                 .map(DeclaredConstraint::to_json)
                 .collect::<Vec<_>>(),
+            "foreign_constraints_retained_omitted": self.foreign_constraints_retained_omitted,
             "disclaimer": DISCLAIMER,
         });
 
@@ -1150,15 +1212,140 @@ mod tests {
                 LabelConformance::not_present(EntityKindToken::Node, "Task"),
             ],
             unknown_node_labels: vec!["Zeta".to_owned(), "Alpha".to_owned()],
+            unknown_node_labels_omitted: 0,
             unknown_edge_types: Vec::new(),
+            unknown_edge_types_omitted: 0,
             declared_constraints: Vec::new(),
+            declared_constraints_omitted: 0,
             declared_labels: 0,
             declaration_refusal: None,
             dropped_labels: 0,
             dropped_constraints: Vec::new(),
+            drop_refusal: None,
             foreign_constraints_retained: Vec::new(),
+            foreign_constraints_retained_omitted: 0,
             conformance_evaluated: true,
         }
+    }
+
+    /// Builds `count` distinct declarations, labelled so sort order is stable.
+    fn declarations(count: usize, prefix: &str) -> Vec<DeclaredConstraint> {
+        (0..count)
+            .map(|index| DeclaredConstraint {
+                entity_kind: "node".to_owned(),
+                label: format!("{prefix}{index:04}"),
+                properties: vec![DeclaredProperty {
+                    property: "their_key".to_owned(),
+                    declared_type: Some("string".to_owned()),
+                    vector_dim: None,
+                    required: true,
+                    nullable: false,
+                }],
+            })
+            .collect()
+    }
+
+    /// The before-image must never be capped.
+    ///
+    /// By the time it is rendered the retraction has already happened and
+    /// upstream has rewritten the sidecar, so a truncated entry is not a
+    /// shortened report - it is a declaration nothing can rebuild. The other
+    /// lists describe current state and stay bounded.
+    #[test]
+    fn the_drop_before_image_is_never_truncated() {
+        let overflow = MAX_DECLARED_CONSTRAINTS + 47;
+        let mut report = sample_report();
+        report.dropped_constraints = declarations(overflow, "Dropped");
+        report.dropped_labels = overflow;
+        report.canonicalize();
+
+        assert_eq!(
+            report.dropped_constraints.len(),
+            overflow,
+            "capping the before-image would destroy declarations that no longer \
+             exist anywhere else"
+        );
+        assert_eq!(
+            report.dropped_constraints.len(),
+            report.dropped_labels,
+            "dropped_labels and dropped_constraints must never disagree - a \
+             consumer reading a short array against a larger count cannot tell \
+             which descriptors were lost"
+        );
+
+        // Still sorted, so output stays byte-identical across runs.
+        let labels: Vec<&str> = report
+            .dropped_constraints
+            .iter()
+            .map(|declaration| declaration.label.as_str())
+            .collect();
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        assert_eq!(labels, sorted);
+    }
+
+    /// A bounded list that loses its tail silently reads as a complete one.
+    #[test]
+    fn bounded_lists_disclose_what_they_omit() {
+        let mut report = sample_report();
+        report.unknown_node_labels = (0..MAX_UNKNOWN_LABELS + 8)
+            .map(|index| format!("Foreign{index:04}"))
+            .collect();
+        report.unknown_edge_types = (0..MAX_UNKNOWN_LABELS + 3)
+            .map(|index| format!("FOREIGN_EDGE_{index:04}"))
+            .collect();
+        report.declared_constraints = declarations(MAX_DECLARED_CONSTRAINTS + 5, "Declared");
+        report.foreign_constraints_retained =
+            declarations(MAX_DECLARED_CONSTRAINTS + 2, "Retained");
+        report.canonicalize();
+
+        assert_eq!(report.unknown_node_labels.len(), MAX_UNKNOWN_LABELS);
+        assert_eq!(report.unknown_node_labels_omitted, 8);
+        assert_eq!(report.unknown_edge_types.len(), MAX_UNKNOWN_LABELS);
+        assert_eq!(report.unknown_edge_types_omitted, 3);
+        assert_eq!(report.declared_constraints.len(), MAX_DECLARED_CONSTRAINTS);
+        assert_eq!(report.declared_constraints_omitted, 5);
+        assert_eq!(
+            report.foreign_constraints_retained.len(),
+            MAX_DECLARED_CONSTRAINTS
+        );
+        assert_eq!(report.foreign_constraints_retained_omitted, 2);
+
+        // And the counts reach the rendered report, not just the struct.
+        let json = report.to_json();
+        assert_eq!(json["observed"]["unknown_node_labels_omitted"], 8);
+        assert_eq!(json["observed"]["unknown_edge_types_omitted"], 3);
+        assert_eq!(json["declared_constraints_omitted"], 5);
+        assert_eq!(json["foreign_constraints_retained_omitted"], 2);
+    }
+
+    /// A list that fits under its cap must report nothing omitted, so a `0` is
+    /// meaningful rather than a default nobody maintains.
+    #[test]
+    fn a_list_within_its_cap_omits_nothing() {
+        let mut report = sample_report();
+        report.declared_constraints = declarations(3, "Declared");
+        report.canonicalize();
+
+        assert_eq!(report.declared_constraints.len(), 3);
+        assert_eq!(report.declared_constraints_omitted, 0);
+        assert_eq!(report.unknown_node_labels_omitted, 0);
+    }
+
+    /// A partial drop is a failure verdict, not a success with a note.
+    #[test]
+    fn a_partial_drop_fails_the_report() {
+        let mut report = sample_report();
+        report.rows = Vec::new();
+        report.conformance_evaluated = false;
+        assert!(report.ok(), "no refusal, nothing scanned - vacuously fine");
+
+        report.drop_refusal = Some("dropping schema constraints failed at X".to_owned());
+        assert!(
+            !report.ok(),
+            "a store left partially dropped must not exit 0"
+        );
+        assert!(report.to_json()["drop_refusal"].is_string());
     }
 
     #[test]

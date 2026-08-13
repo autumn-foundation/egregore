@@ -1500,15 +1500,21 @@ impl EmbeddedAletheiaSink {
                 outcome.foreign_retained.push(descriptor);
                 continue;
             }
-            let removed = self
-                .db
-                .drop_schema_constraint(kind, &descriptor.label)
-                .map_err(|error| AdapterError::Rejected {
-                    record_id: descriptor.label.clone(),
-                    message: format!("dropping schema constraints failed: {error}"),
-                })?;
-            if removed {
-                outcome.dropped.push(descriptor);
+            // A failure here leaves every EARLIER label already retracted, and the
+            // sidecar rewritten. Bailing with `?` would drop `outcome` on the
+            // floor, destroying the only surviving before-image of those labels -
+            // the precise loss the before-image exists to prevent. Report the
+            // partial progress instead, mirroring the declaration path.
+            match self.db.drop_schema_constraint(kind, &descriptor.label) {
+                Ok(true) => outcome.dropped.push(descriptor),
+                Ok(false) => {}
+                Err(error) => {
+                    outcome.refusal = Some(format!(
+                        "dropping schema constraints failed at {}: {error}",
+                        descriptor.label
+                    ));
+                    return Ok(outcome);
+                }
             }
         }
         Ok(outcome)

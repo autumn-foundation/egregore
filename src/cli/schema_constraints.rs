@@ -111,13 +111,18 @@ fn run(
         profile,
         rows: Vec::new(),
         unknown_node_labels: Vec::new(),
+        unknown_node_labels_omitted: 0,
         unknown_edge_types: Vec::new(),
+        unknown_edge_types_omitted: 0,
         declared_constraints: Vec::new(),
+        declared_constraints_omitted: 0,
         declared_labels: 0,
         declaration_refusal: None,
         dropped_labels: 0,
         dropped_constraints: Vec::new(),
+        drop_refusal: None,
         foreign_constraints_retained: Vec::new(),
+        foreign_constraints_retained_omitted: 0,
         conformance_evaluated: false,
     };
 
@@ -167,6 +172,10 @@ fn run(
             let outcome = sink
                 .drop_schema_constraints(include_foreign)
                 .unwrap_or_else(|error| usage_exit("drop_failed", &error.to_string()));
+            // A mid-run store failure is reported THROUGH the report, not as a
+            // bare `drop_failed`: the labels retracted before it are already gone
+            // from the store, and this report carries their only before-image.
+            report.drop_refusal = outcome.refusal;
             report.dropped_labels = outcome.dropped.len();
             // The before-image: upstream atomically rewrites the sidecar on every
             // drop, so without this a mistaken `--drop` is unrecoverable by
