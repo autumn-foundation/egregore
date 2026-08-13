@@ -63,6 +63,46 @@ impl DependencyKind {
     }
 }
 
+/// The loadable form a `Cargo.toml` takes (issue #117).
+///
+/// A closed set: each variant demands a different answer from the
+/// nearest-enclosing-manifest walk.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ManifestShape {
+    /// Declares a `[package]` table. Its `name` may still be absent or
+    /// Cargo-invalid; see `ManifestDependencies::package_name`.
+    Package,
+    /// A usable VIRTUAL workspace root: `[workspace]`, no `[package]`, and no
+    /// section Cargo forbids beside it. Declares no package, so it owns nothing
+    /// and the attribution walk passes it.
+    VirtualRoot,
+    /// A form Cargo REFUSES to load: neither `[package]` nor `[workspace]`, or a
+    /// virtual manifest carrying a package-only section. The boundary exists but
+    /// is unusable, so the attribution walk stops rather than crossing it.
+    Unusable,
+}
+
+/// Sections Cargo forbids in a VIRTUAL manifest (`[workspace]`, no `[package]`).
+///
+/// Each was verified against real `cargo metadata`, which rejects the manifest
+/// with "this virtual manifest specifies a `<section>` section, which is not
+/// allowed". `[profile]` and `[patch]` are accepted beside `[workspace]` and are
+/// deliberately NOT listed.
+const VIRTUAL_MANIFEST_FORBIDDEN_SECTIONS: [&str; 12] = [
+    "dependencies",
+    "dev-dependencies",
+    "build-dependencies",
+    "features",
+    "target",
+    "lib",
+    "bin",
+    "bench",
+    "test",
+    "example",
+    "badges",
+    "lints",
+];
+
 /// The three captured dependency tables in documented output order.
 const DEPENDENCY_KINDS: [DependencyKind; 3] = [
     DependencyKind::Normal,
@@ -250,23 +290,15 @@ pub struct ManifestDependencies {
     /// the declared name is empty/whitespace-only (Cargo-invalid, PR #314
     /// review) — such names never attribute declarations.
     pub package_name: Option<String>,
-    /// `true` when the manifest carries a `[package]` table at all, regardless
-    /// of whether its `name` is usable.
+    /// Which of the three loadable/unloadable forms this manifest takes.
     ///
-    /// Crate attribution (issue #117) needs this to separate two manifest forms
-    /// that `package_name: None` collapses: a VIRTUAL workspace root (no
-    /// `[package]` — declares no package, so the nearest-manifest walk passes
-    /// it) from a manifest declaring a package Egregore cannot name (the walk
-    /// STOPS there, fail-closed, rather than inherit an ancestor's name and
-    /// fabricate an attribution).
-    pub package_table_present: bool,
-    /// `true` when the manifest carries a `[workspace]` table.
-    ///
-    /// A manifest with NEITHER `[package]` nor `[workspace]` is one Cargo
-    /// rejects outright ("manifest is missing either a `[package]` or a
-    /// `[workspace]`"), so crate attribution must not treat it as a virtual
-    /// workspace root and walk past it (issue #117).
-    pub workspace_table_present: bool,
+    /// Crate attribution (issue #117) needs more than `package_name`: that field
+    /// is `None` for a virtual workspace root, for a `[package]` whose name is
+    /// unusable, AND for a manifest Cargo refuses to load outright. Those demand
+    /// different answers — walk past the first, stop fail-closed on the others —
+    /// so the shape is reported as a closed set rather than reconstructed from
+    /// a handful of booleans that could describe impossible combinations.
+    pub shape: ManifestShape,
     /// Declarations in documented order: table order (`normal`, `dev`,
     /// `build`), then crate name, then the declared-as manifest key.
     pub declarations: Vec<DeclaredDependency>,
@@ -289,14 +321,25 @@ pub fn parse_manifest_dependencies(
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| error.to_string())?;
     let package_table = doc.get("package").and_then(toml_edit::Item::as_table_like);
-    let workspace_table_present = doc
+    // A `[workspace]` table alone does not make a manifest LOADABLE: Cargo
+    // rejects a virtual manifest that also carries any package-only section,
+    // with "this virtual manifest specifies a `<section>` section, which is not
+    // allowed". Each forbidden entry was verified against real `cargo metadata`;
+    // `[profile]` and `[patch]` are accepted and are deliberately absent.
+    let shape = if package_table.is_some() {
+        ManifestShape::Package
+    } else if doc
         .get("workspace")
         .and_then(toml_edit::Item::as_table_like)
-        .is_some();
-    // Presence of the table, independent of whether the name is usable
-    // (issue #117): it separates a virtual workspace root from a package
-    // Egregore cannot name.
-    let package_table_present = package_table.is_some();
+        .is_some()
+        && !VIRTUAL_MANIFEST_FORBIDDEN_SECTIONS
+            .iter()
+            .any(|section| doc.get(section).is_some())
+    {
+        ManifestShape::VirtualRoot
+    } else {
+        ManifestShape::Unusable
+    };
     let package_name = package_table
         .and_then(|package| package.get("name"))
         .and_then(|name| name.as_str())
@@ -340,8 +383,7 @@ pub fn parse_manifest_dependencies(
     }
     Ok(ManifestDependencies {
         package_name,
-        package_table_present,
-        workspace_table_present,
+        shape,
         declarations,
         uninterpretable,
     })
@@ -985,16 +1027,11 @@ pub fn scan_manifest_package_facts(repo_root: &Path) -> Result<Vec<ManifestPacka
 #[must_use]
 pub fn manifest_package_outcome(manifest_text: &str) -> ManifestParseOutcome {
     match parse_manifest_dependencies(manifest_text) {
-        Ok(parsed) => match (parsed.package_table_present, parsed.package_name) {
-            (true, Some(name)) => ManifestParseOutcome::Package { name },
-            (true, None) => ManifestParseOutcome::UnnamedPackage,
-            // Package-less: a VIRTUAL workspace root only when it really carries
-            // `[workspace]`. Without either table Cargo refuses to load the
-            // manifest at all, so the boundary is unusable and must not be
-            // walked past — doing so would attribute the subtree to an outer
-            // package across a manifest Cargo rejects.
-            (false, _) if parsed.workspace_table_present => ManifestParseOutcome::Virtual,
-            (false, _) => ManifestParseOutcome::UnusableManifest,
+        Ok(parsed) => match (parsed.shape, parsed.package_name) {
+            (ManifestShape::Package, Some(name)) => ManifestParseOutcome::Package { name },
+            (ManifestShape::Package, None) => ManifestParseOutcome::UnnamedPackage,
+            (ManifestShape::VirtualRoot, _) => ManifestParseOutcome::Virtual,
+            (ManifestShape::Unusable, _) => ManifestParseOutcome::UnusableManifest,
         },
         // The TOML error message is deliberately DROPPED, not carried: it can
         // echo manifest body text, and no output surface may leak it.
@@ -2288,46 +2325,61 @@ fn member_glob_match(pattern: &str, path: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Crate attribution (issue #117) must tell a VIRTUAL workspace manifest
-    /// (no `[package]` table — declares no package, so the ancestor walk passes
-    /// it) apart from a manifest declaring a package whose name is unusable
-    /// (the walk STOPS, fail-closed, rather than inherit an ancestor's name).
-    /// `package_name` alone collapses both into `None`, so the parse must
-    /// report the `[package]` table's PRESENCE separately.
+    /// Crate attribution (issue #117) needs the manifest's SHAPE, not just its
+    /// package name: `package_name` is `None` for a virtual workspace root, for
+    /// a `[package]` whose name is unusable, and for a manifest Cargo refuses to
+    /// load — three cases the attribution walk must answer differently.
     #[test]
-    fn manifest_dependencies_reports_package_table_presence() {
+    fn manifest_dependencies_reports_the_manifest_shape() {
         let named = parse_manifest_dependencies("[package]\nname = \"x\"\n").expect("parses");
-        assert!(named.package_table_present);
+        assert_eq!(named.shape, ManifestShape::Package);
         assert_eq!(named.package_name.as_deref(), Some("x"));
 
         let unusable_name =
             parse_manifest_dependencies("[package]\nname = \"bad name\"\n").expect("parses");
-        assert!(
-            unusable_name.package_table_present,
+        assert_eq!(
+            unusable_name.shape,
+            ManifestShape::Package,
             "a `[package]` table with an unusable name still declares a package"
         );
         assert_eq!(unusable_name.package_name, None);
 
-        let no_name =
-            parse_manifest_dependencies("[package]\nversion = \"0.1.0\"\n").expect("parses");
-        assert!(no_name.package_table_present);
-        assert_eq!(no_name.package_name, None);
-
         let virtual_root =
             parse_manifest_dependencies("[workspace]\nmembers = []\n").expect("parses");
-        assert!(
-            !virtual_root.package_table_present,
-            "a virtual workspace root declares no package"
-        );
-        assert!(virtual_root.workspace_table_present);
+        assert_eq!(virtual_root.shape, ManifestShape::VirtualRoot);
         assert_eq!(virtual_root.package_name, None);
 
-        // Neither table: a manifest Cargo refuses to load. Crate attribution
-        // must be able to tell it apart from a real virtual root.
-        let unusable =
+        // `[profile]` is accepted beside `[workspace]`.
+        let with_profile = parse_manifest_dependencies(
+            "[workspace]\nmembers = []\n\n[profile.release]\nopt-level = 3\n",
+        )
+        .expect("parses");
+        assert_eq!(with_profile.shape, ManifestShape::VirtualRoot);
+
+        // Neither table: Cargo refuses to load it.
+        let neither =
             parse_manifest_dependencies("[dependencies]\nserde = \"1\"\n").expect("parses");
-        assert!(!unusable.package_table_present);
-        assert!(!unusable.workspace_table_present);
+        assert_eq!(neither.shape, ManifestShape::Unusable);
+
+        // `[workspace]` plus a package-only section: also refused. Every entry
+        // verified against real `cargo metadata`.
+        for section in [
+            "[dependencies]\nserde = \"1\"\n",
+            "[dev-dependencies]\nserde = \"1\"\n",
+            "[build-dependencies]\nserde = \"1\"\n",
+            "[features]\ndefault = []\n",
+            "[lib]\nname = \"x\"\npath = \"src/lib.rs\"\n",
+            "[badges]\nmaintenance = { status = \"active\" }\n",
+            "[lints.rust]\nunsafe_code = \"forbid\"\n",
+        ] {
+            let manifest = format!("[workspace]\nmembers = []\n\n{section}");
+            let parsed = parse_manifest_dependencies(&manifest).expect("parses");
+            assert_eq!(
+                parsed.shape,
+                ManifestShape::Unusable,
+                "a virtual manifest carrying `{section}` is rejected by Cargo"
+            );
+        }
     }
 
     #[test]

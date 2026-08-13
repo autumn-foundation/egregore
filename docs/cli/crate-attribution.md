@@ -114,7 +114,7 @@ does — so an absent field never means "this kind happens not to be covered".
 | `virtual_manifest_only` | Every enclosing manifest is a virtual workspace root, which declares no package. |
 | `unnamed_package` | The nearest manifest declares a `[package]` whose `name` is absent or Cargo-invalid. |
 | `unparseable_manifest` | The nearest manifest is not valid TOML. |
-| `unusable_manifest` | The nearest manifest parses but carries neither `[package]` nor `[workspace]` — a form Cargo refuses to load. |
+| `unusable_manifest` | The nearest manifest parses but is one Cargo refuses to load: it carries neither `[package]` nor `[workspace]`, or it is a virtual (`[workspace]`, no `[package]`) manifest carrying a package-only section (`dependencies`, `dev-dependencies`, `build-dependencies`, `features`, `target`, `lib`, `bin`, `bench`, `test`, `example`, `badges`, `lints`). |
 | `manifest_unreadable` | The nearest manifest could not be read, or is not UTF-8. |
 
 The reason carries no payload: a TOML parse-error message can echo manifest body
@@ -157,6 +157,10 @@ Under `--package`, every row additionally carries
 `crate_attribution_disclaimer` with the verbatim containment caveat below.
 Unscoped rows carry no disclaimer: their `manifest_repo_relative_path` already
 names exactly what the claim rests on.
+
+`eg query file` carries `crate_attribution` once per repository, on that
+repository's first emitted row: it is a file-level fact, the lane has no
+envelope, and a repo-relative path is not globally unique across a shared store.
 
 ### `--format text`
 

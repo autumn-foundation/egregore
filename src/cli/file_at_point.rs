@@ -77,8 +77,14 @@ pub(crate) fn query_file(
     let mut excluded_repos: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
 
     let mut is_first = true;
-    // The file's one owning package, carried once on the first EMITTED row.
-    let mut file_attribution: Option<&crate::ir::CrateAttribution> = None;
+    // The owning package per REPOSITORY: a repo-relative path is not globally
+    // unique, so a shared store can hold `src/lib.rs` in two repositories with
+    // different owners. Keyed on the repository so neither fact is lost and
+    // neither is attached to the other's rows.
+    let mut attribution_by_repo: std::collections::BTreeMap<
+        Option<&str>,
+        &crate::ir::CrateAttribution,
+    > = std::collections::BTreeMap::new();
     for r in records {
         let GraphRecord::Node {
             id,
@@ -109,8 +115,10 @@ pub(crate) fn query_file(
             }
             continue;
         }
-        if file_attribution.is_none() {
-            file_attribution = r.crate_attribution();
+        if let Some(attribution) = r.crate_attribution() {
+            attribution_by_repo
+                .entry(repository_id)
+                .or_insert(attribution);
         }
         results.push(SymbolResult {
             record_id: id,
@@ -170,13 +178,22 @@ pub(crate) fn query_file(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
-    // `crate_attribution` is a FILE-level fact (issue #117): every symbol in one
-    // file shares one owning package. Carry it once, on the first emitted row —
-    // the same shape the lane uses for file-level `diagnostics`. Omitting it
-    // entirely would drop the fact from the whole answer, since this lane has no
-    // envelope; repeating it per row measurably regresses the token-cost gate.
-    if let Some(first) = results.first_mut() {
-        first.crate_attribution = file_attribution;
+    // `crate_attribution` is a file-level fact (issue #117): every symbol in one
+    // file shares one owning package. Carry it once per REPOSITORY, on that
+    // repository's first emitted row — the same shape the lane uses for
+    // file-level `diagnostics`. Omitting it entirely would drop the fact from
+    // the whole answer, since this lane has no envelope; repeating it per row
+    // measurably regresses the token-cost gate. Per-repository rather than
+    // per-answer because a repo-relative path is not globally unique: an
+    // unscoped shared-store query can return two repositories' rows, and one
+    // repository's package must never ride on the other's row.
+    let mut stamped: std::collections::BTreeSet<Option<&str>> = std::collections::BTreeSet::new();
+    for result in &mut results {
+        if stamped.insert(result.repository_id)
+            && let Some(attribution) = attribution_by_repo.get(&result.repository_id)
+        {
+            result.crate_attribution = Some(attribution);
+        }
     }
     stamp_freshness(&mut results, freshness_code);
     for result in &results {

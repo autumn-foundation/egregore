@@ -3560,3 +3560,160 @@ fn query_file_carries_attribution_once_on_the_first_row() {
         );
     }
 }
+
+/// A `[workspace]` manifest carrying a package-only section is one Cargo
+/// REJECTS, so it must stop the walk rather than be treated as a usable
+/// virtual root.
+///
+/// `[workspace]` presence alone is not enough to make a manifest loadable.
+/// Verified against real `cargo metadata`: `dependencies`, `dev-dependencies`,
+/// `build-dependencies`, `features`, `target`, `lib`, `bin`, `bench`, `test`,
+/// `example`, `badges`, and `lints` are each rejected beside `[workspace]` with
+/// "this virtual manifest specifies a `<section>` section, which is not
+/// allowed". `[profile]` and `[patch]` are accepted.
+#[test]
+fn virtual_manifest_with_a_package_only_section_stops_the_walk() {
+    for section in [
+        "[dependencies]\nserde = \"1\"\n",
+        "[dev-dependencies]\nserde = \"1\"\n",
+        "[build-dependencies]\nserde = \"1\"\n",
+        "[features]\ndefault = []\n",
+        "[lib]\nname = \"x\"\npath = \"src/lib.rs\"\n",
+        "[badges]\nmaintenance = { status = \"active\" }\n",
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!("[workspace]\nmembers = []\n\n{section}"),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([
+                "unattributed:unusable_manifest".to_owned()
+            ])),
+            "a virtual manifest carrying `{}` is rejected by Cargo and must not be walked past",
+            section.lines().next().unwrap_or_default()
+        );
+    }
+}
+
+/// A `[workspace]` manifest carrying only sections Cargo ALLOWS is still a
+/// usable virtual root and is still walked past.
+#[test]
+fn virtual_manifest_with_allowed_sections_is_still_walked_past() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                // `[profile]` and `[patch]` are accepted beside `[workspace]`.
+                "nested/Cargo.toml",
+                "[workspace]\nmembers = []\n\n[profile.release]\nopt-level = 3\n",
+            ),
+            ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+        ],
+    );
+    let by_path = attribution_by_path(&scan_fixture(temp.path()));
+    assert_eq!(
+        by_path.get("nested/src/lib.rs"),
+        Some(&BTreeSet::from(["outer@Cargo.toml".to_owned()])),
+        "a loadable virtual root must still be walked past"
+    );
+}
+
+/// In a shared multi-repository store, one repo-relative path can exist in two
+/// repositories with different owning packages.
+///
+/// Carrying the file-level attribution once for the WHOLE result set would
+/// attach one repository's package to a row from another and drop the second
+/// repository's fact entirely — a repo-relative path is not globally unique.
+#[test]
+fn query_file_carries_attribution_once_per_repository() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut combined = String::new();
+    for (repo_id, package) in [("repo-a", "pkg-a"), ("repo-b", "pkg-b")] {
+        let repo = temp.path().join(repo_id);
+        fs::create_dir_all(&repo).expect("repo dir");
+        write_fixture(
+            &repo,
+            &[
+                (
+                    "Cargo.toml",
+                    &format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\n"),
+                ),
+                (
+                    "src/lib.rs",
+                    &format!(
+                        "pub fn one_{}() -> u32 {{ 1 }}\npub fn two_{}() -> u32 {{ 2 }}\n",
+                        repo_id.replace('-', "_"),
+                        repo_id.replace('-', "_")
+                    ),
+                ),
+            ],
+        );
+        combined.push_str(
+            &scan_repository_at_with_override(&repo, FIXED_TIME, Some(repo_id))
+                .expect("scan")
+                .to_jsonl()
+                .expect("serialize"),
+        );
+        combined.push('\n');
+    }
+    let graph = temp.path().join("combined.jsonl");
+    fs::write(&graph, &combined).expect("graph written");
+
+    let run = run_query(&[
+        "query",
+        "file",
+        "src/lib.rs",
+        "--graph",
+        graph.to_str().unwrap(),
+    ]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    let rows = rows(&run.stdout);
+    assert!(
+        rows.len() >= 4,
+        "both repositories' symbols: {}",
+        rows.len()
+    );
+
+    // Every attribution that IS emitted must match its own row's repository.
+    let mut seen_by_repo: BTreeMap<String, String> = BTreeMap::new();
+    for row in &rows {
+        let Some(package) = row["crate_attribution"]["package_name"].as_str() else {
+            continue;
+        };
+        let repository = row["repository"].as_str().unwrap_or("(none)").to_owned();
+        let expected = if repository.contains("repo-a") {
+            "pkg-a"
+        } else {
+            "pkg-b"
+        };
+        assert_eq!(
+            package, expected,
+            "a row's attribution must be its OWN repository's package: {row}"
+        );
+        seen_by_repo.insert(repository, package.to_owned());
+    }
+    // And BOTH repositories' facts survive.
+    assert_eq!(
+        seen_by_repo.len(),
+        2,
+        "each repository's owning package must appear: {seen_by_repo:?}"
+    );
+}
