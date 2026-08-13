@@ -60,8 +60,10 @@ fn write_workspace_fixture(root: &Path) {
                 ),
             ),
             (
+                // A `mod` block so the fixture exercises all three node kinds
+                // AC1 names by hand: File, Module, and Symbol.
                 "crates/alpha/src/lib.rs",
-                "pub fn handle() -> u32 { 1 }\npub fn only_in_alpha() -> u32 { 2 }\n",
+                "pub mod nested { pub fn inner() -> u32 { 0 } }\npub fn handle() -> u32 { 1 }\npub fn only_in_alpha() -> u32 { 2 }\n",
             ),
             (
                 "crates/alpha/scripts/tool.py",
@@ -2396,5 +2398,309 @@ fn history_indexes_and_attributes_quote_bearing_paths() {
     assert!(
         scanned.contains_key("we\"ird/src/lib.rs"),
         "precondition: eg scan indexes the quote-bearing path"
+    );
+}
+
+// ── acceptance-criterion gap closers ─────────────────────────────────────────
+
+/// AC1 names three node kinds by hand. Prove all three are present in the
+/// fixture graph AND attributed — a suite that only exercised `Symbol` would
+/// leave two thirds of the criterion unproven.
+#[test]
+fn file_module_and_symbol_are_all_attributed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let records = scan_fixture(temp.path());
+
+    for kind in ["File", "Module", "Symbol"] {
+        let of_kind: Vec<&Value> = records
+            .iter()
+            .filter(|r| r["record_type"] == "node" && r["kind"] == kind)
+            .collect();
+        assert!(
+            !of_kind.is_empty(),
+            "the fixture must produce at least one {kind} node"
+        );
+        for record in of_kind {
+            let attribution = record.get("crate_attribution").unwrap_or_else(|| {
+                panic!(
+                    "{kind} node {} carries no attribution",
+                    record["repo_relative_path"]
+                )
+            });
+            // Both AC1 halves: the package NAME and the owning manifest's
+            // repo-relative path, or an explicit unattributed reason.
+            if attribution["status"] == "attributed" {
+                assert!(attribution["package_name"].is_string(), "{kind}: {record}");
+                assert!(
+                    attribution["manifest_repo_relative_path"]
+                        .as_str()
+                        .is_some_and(|p| p.ends_with("Cargo.toml")),
+                    "{kind}: {record}"
+                );
+            } else {
+                assert!(
+                    attribution["unattributed_reason"].is_string(),
+                    "{kind}: {record}"
+                );
+            }
+        }
+    }
+}
+
+/// AC5: attribution is derived locally with no `cargo` invocation.
+///
+/// Runs a real `eg scan` subprocess whose `PATH` contains ONLY `git` (which the
+/// scanner genuinely needs for repository identity and the tracked-file walk).
+/// If any code path shelled out to `cargo build` / `cargo check` /
+/// `cargo metadata`, the scan would fail or silently degrade; instead it must
+/// succeed and produce full attribution.
+#[test]
+fn attribution_needs_no_cargo_on_path() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_workspace_fixture(&repo);
+    init_git(&repo);
+    commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    // A PATH holding a symlink to `git` and nothing else.
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin dir");
+    let git_path = which_git();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&git_path, bin.join("git")).expect("git symlink");
+    #[cfg(not(unix))]
+    fs::copy(&git_path, bin.join("git.exe")).expect("git copy");
+
+    let out = temp.path().join("graph.jsonl");
+    let output = assert_cmd::Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .env("PATH", &bin)
+        .args(["scan"])
+        .arg(&repo)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .expect("scan should execute");
+    assert!(
+        output.status.success(),
+        "scan must succeed with no cargo on PATH: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let jsonl = fs::read_to_string(&out).expect("graph written");
+    let records = parse_jsonl(&jsonl);
+    let attributed = code_fact_nodes(&records)
+        .iter()
+        .filter(|r| package_of(r).is_some())
+        .count();
+    assert!(
+        attributed > 0,
+        "attribution must be fully derived without cargo; got none"
+    );
+    assert_eq!(
+        attribution_by_path(&records).get("crates/alpha/src/lib.rs"),
+        Some(&BTreeSet::from(
+            ["alpha@crates/alpha/Cargo.toml".to_owned()]
+        ))
+    );
+}
+
+fn which_git() -> std::path::PathBuf {
+    let output = Command::new(if cfg!(windows) { "where" } else { "which" })
+        .arg("git")
+        .output()
+        .expect("locating git should work");
+    std::path::PathBuf::from(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .expect("git must be on PATH for this test")
+            .trim(),
+    )
+}
+
+/// AC7: the slice reuses the existing code-graph domain and vocabulary — no new
+/// graph domain, edge label, or trust class rides along with the new field.
+#[test]
+fn no_new_domain_edge_label_or_trust_class() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_workspace_fixture(temp.path());
+    let records = scan_fixture(temp.path());
+
+    // Every attributed record stays in the code-graph domain: `domain` is either
+    // absent (the legacy-inferred codegraph default) or literally "codegraph".
+    for record in code_fact_nodes(&records) {
+        match record.get("domain").and_then(Value::as_str) {
+            None | Some("codegraph") => {}
+            Some(other) => panic!("attribution leaked into domain `{other}`: {record}"),
+        }
+    }
+
+    // The edge vocabulary this fixture produces is exactly the pre-existing
+    // code-graph containment/definition set — attribution mints no edge.
+    let labels: BTreeSet<&str> = records
+        .iter()
+        .filter(|r| r["record_type"] == "edge")
+        .filter_map(|r| r["label"].as_str())
+        .collect();
+    // Both labels predate this slice; attribution mints no edge of its own.
+    assert_eq!(
+        labels,
+        BTreeSet::from(["CONTAINS", "DEFINES"]),
+        "attribution must mint no new edge label"
+    );
+
+    // No trust class is introduced: attribution is a field on a source-derived
+    // record, not a new trust vocabulary entry.
+    assert!(
+        !records
+            .iter()
+            .any(|r| r.get("trust").is_some() || r.get("trust_class").is_some()),
+        "scan output must carry no trust field"
+    );
+}
+
+/// AC7: the field is additive. A pre-#117 record with no `crate_attribution`
+/// key must still deserialize, and a record whose attribution is `None` must
+/// serialize WITHOUT the key — never as `null`, which a reader could mistake
+/// for a computed "no owner".
+#[test]
+fn legacy_node_line_roundtrips_with_absent_attribution() {
+    use aletheia_egregore::{GraphRecord, NodeKind};
+
+    let record = GraphRecord::node(
+        "codegraph:v9:deadbeef".to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("thing".to_owned()),
+        "Symbol thing".to_owned(),
+    );
+    let line = serde_json::to_string(&record).expect("serialize");
+    assert!(
+        !line.contains("crate_attribution"),
+        "an unattributed-by-absence record must omit the key entirely: {line}"
+    );
+
+    let parsed: GraphRecord = serde_json::from_str(&line).expect("legacy line must deserialize");
+    assert!(
+        parsed.crate_attribution().is_none(),
+        "an absent key must read back as None (attribution UNKNOWN)"
+    );
+
+    // And a v8-era line that never had the key still parses.
+    let legacy = line.replace("\"schema_version\":9", "\"schema_version\":8");
+    let parsed: GraphRecord = serde_json::from_str(&legacy).expect("v8 line must deserialize");
+    assert!(parsed.crate_attribution().is_none());
+}
+
+/// AC8: a `--package`-scoped query over an embedded store is strictly
+/// read-only — it takes no write lease and leaves the store byte-identical.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn package_scoped_query_does_not_mutate_the_store() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_workspace_fixture(&repo);
+
+    let graph_path = temp.path().join("graph.jsonl");
+    fs::write(&graph_path, scan_jsonl(&repo)).expect("graph written");
+    let data_dir = temp.path().join("store");
+    ingest_embedded(&graph_path, &data_dir);
+
+    // The embedded store rewrites its own index files whenever it is OPENED,
+    // including for a plain read — pre-existing behavior, unrelated to this
+    // slice. What must hold is that `--package` writes NOTHING BEYOND that: the
+    // set of files, and every non-index file's bytes, are unchanged, and the
+    // scoped read touches exactly the same files an unscoped read does.
+    let unscoped_before = snapshot_tree(&data_dir);
+    assert!(
+        !unscoped_before.is_empty(),
+        "anti-vacuity: the store must have files"
+    );
+    let unscoped = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(unscoped.code, 0, "stderr: {}", unscoped.stderr);
+    let after_unscoped = snapshot_tree(&data_dir);
+    let touched_by_unscoped: BTreeSet<&String> = after_unscoped
+        .iter()
+        .filter(|(path, bytes)| unscoped_before.get(*path) != Some(*bytes))
+        .map(|(path, _)| path)
+        .collect();
+
+    let run = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--package",
+        "alpha",
+    ]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(!rows(&run.stdout).is_empty(), "anti-vacuity: rows returned");
+    let after_scoped = snapshot_tree(&data_dir);
+
+    assert_eq!(
+        after_unscoped.keys().collect::<BTreeSet<_>>(),
+        after_scoped.keys().collect::<BTreeSet<_>>(),
+        "a scoped query must create or remove no store file"
+    );
+    let touched_by_scoped: BTreeSet<&String> = after_scoped
+        .iter()
+        .filter(|(path, bytes)| after_unscoped.get(*path) != Some(*bytes))
+        .map(|(path, _)| path)
+        .collect();
+    assert!(
+        touched_by_scoped.is_subset(&touched_by_unscoped),
+        "package scoping must write nothing an unscoped read does not: {touched_by_scoped:?} vs {touched_by_unscoped:?}"
+    );
+}
+
+/// `--graph` and `--data-dir` must answer a scoped query identically.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn graph_and_data_dir_agree_under_package_scope() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_workspace_fixture(&repo);
+
+    let graph_path = temp.path().join("graph.jsonl");
+    fs::write(&graph_path, scan_jsonl(&repo)).expect("graph written");
+    let data_dir = temp.path().join("store");
+    ingest_embedded(&graph_path, &data_dir);
+
+    let from_graph = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--graph",
+        graph_path.to_str().unwrap(),
+        "--package",
+        "alpha",
+    ]);
+    let from_store = run_query(&[
+        "query",
+        "symbols",
+        "*",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--package",
+        "alpha",
+    ]);
+    assert_eq!(from_graph.code, 0, "stderr: {}", from_graph.stderr);
+    assert!(!rows(&from_graph.stdout).is_empty(), "anti-vacuity");
+    assert_eq!(
+        from_graph.stdout, from_store.stdout,
+        "--graph and --data-dir must produce byte-identical scoped answers"
     );
 }

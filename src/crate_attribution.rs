@@ -452,6 +452,45 @@ mod tests {
         assert_eq!(bleeds, 0, "sibling prefix bleed detected");
     }
 
+    /// A FILE whose name string-extends a manifest DIRECTORY name must not be
+    /// claimed by that manifest.
+    ///
+    /// Distinct from `sibling_prefix_never_bleeds`, which pits two sibling
+    /// directories against each other: there the correct walk resolves at the
+    /// deeper manifest and never reaches a lenient comparison. Here NO manifest
+    /// encloses the file, so the walk falls through to the terminal reason —
+    /// which is exactly where a `str::starts_with` fallback would fire and
+    /// fabricate an owner.
+    #[test]
+    fn a_file_extending_a_manifest_dir_name_is_not_claimed_by_it() {
+        let index = CrateAttributionIndex::from_facts(vec![
+            virtual_manifest("Cargo.toml"),
+            package("crates/foo/Cargo.toml", "foo"),
+        ]);
+        for path in [
+            "crates/foobar.rs",
+            "crates/foo.rs",
+            "crates/foo_helper.rs",
+            "crates/foobar/src/lib.rs",
+        ] {
+            assert_eq!(
+                resolved(&index, path),
+                None,
+                "{path} is enclosed by no package and must not be claimed by `foo`"
+            );
+            assert_eq!(
+                reason(&index, path),
+                Some(CrateAttributionReason::VirtualManifestOnly),
+                "{path}"
+            );
+        }
+        // Anti-vacuity: the genuinely enclosed file still resolves.
+        assert_eq!(
+            resolved(&index, "crates/foo/src/lib.rs").as_deref(),
+            Some("foo")
+        );
+    }
+
     #[test]
     fn virtual_manifest_is_walked_past_to_ancestor_package() {
         let index = CrateAttributionIndex::from_facts(vec![

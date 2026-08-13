@@ -7441,6 +7441,18 @@ pub(crate) struct PackageCatalog {
 
 impl PackageCatalog {
     /// Indexes every attributed record's package and its owning repository.
+    ///
+    /// The names indexed here are read back from a store and are therefore
+    /// operator-controlled, and `known_packages` echoes them into a stderr
+    /// diagnostic. Unlike the free-string values `eg audit criteria-coverage`
+    /// and the #104 semantic-index refusal must sanitize, these need no
+    /// control-character scrubbing: a name only becomes a `package_name` by
+    /// passing `manifest_deps::package_name_is_valid`, whose `XID_Start` /
+    /// `XID_Continue` charset structurally excludes every control character (Cc),
+    /// format character including bidi overrides (Cf), whitespace (Zs), and
+    /// quote (Po). A crafted manifest cannot smuggle an ANSI escape or a
+    /// line break through that gate, so the diagnostic is safe by construction
+    /// rather than by scrubbing.
     pub(crate) fn build(records: &[GraphRecord], index: &query::RepositoryIndex) -> Self {
         let mut by_package: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
             std::collections::BTreeMap::new();
