@@ -5546,3 +5546,101 @@ fn a_commit_pinned_answer_ignores_undated_records_for_ambiguity() {
         "the row must come from the pinned commit"
     );
 }
+
+/// DECIDED LIMIT: the read-back checks are LOCAL, and do not establish that the
+/// cited manifest is the NEAREST one.
+///
+/// A record beneath a nested package, edited to cite a valid OUTER `Cargo.toml`,
+/// is accepted: the outer directory really does enclose it, and the pairing is
+/// one the resolver WOULD produce for a tree where the nested manifest is absent
+/// or unusable. Distinguishing the two needs the manifest tree, which a graph
+/// does not carry — a dependency-free `Cargo.toml` mints no `File` node, so the
+/// only evidence a nested manifest ever existed is the attribution on the
+/// records beneath it, which is precisely what an edited graph rewrites.
+///
+/// The detectable sliver (some sibling still cites the nearer manifest) is an
+/// internal-consistency signal, not a boundary — it is evaded by editing those
+/// siblings too, or by a package with a single file — and buying it means
+/// threading corpus-derived, snapshot-scoped state into per-row consumers whose
+/// false positives UN-ATTRIBUTE real records. That failure mode is the one this
+/// feature exists to prevent, so the trade is refused deliberately.
+///
+/// What the checks DO establish is pinned by the tests either side of this one:
+/// the value has a shape the resolver emits, and the cited manifest encloses the
+/// record. This test exists so the boundary is a decision with a name, not an
+/// untested gap.
+#[test]
+fn an_enclosing_but_not_nearest_manifest_is_accepted_by_the_local_checks() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn outer_fn() -> u32 { 1 }\n"),
+            (
+                "nested/Cargo.toml",
+                "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n",
+            ),
+            ("nested/src/lib.rs", "pub fn nested_fn() -> u32 { 2 }\n"),
+        ],
+    );
+
+    // Precondition, and the reason the check cannot be made sound: the nested
+    // manifest mints NO record of its own, so the graph's only witness to it is
+    // the attribution on the records under it.
+    let scanned = scan_fixture(temp.path());
+    assert!(
+        !scanned
+            .iter()
+            .any(|record| record["repo_relative_path"] == "nested/Cargo.toml"),
+        "a dependency-free manifest mints no node, so `nearest` is unknowable from the graph"
+    );
+
+    let mut lines: Vec<String> = Vec::new();
+    for mut record in scanned {
+        if record["kind"] == "Symbol"
+            && record["repo_relative_path"] == "nested/src/lib.rs"
+            && let Some(attribution) = record.get_mut("crate_attribution")
+        {
+            attribution["package_name"] = Value::from("outer");
+            attribution["manifest_repo_relative_path"] = Value::from("Cargo.toml");
+        }
+        lines.push(serde_json::to_string(&record).expect("serialize"));
+    }
+    let graph_path = temp.path().join("forged.jsonl");
+    fs::write(&graph_path, lines.join("\n")).expect("graph written");
+    let graph = graph_path.to_str().unwrap();
+
+    // Accepted — the citation is locally consistent, and the corpus holds no
+    // proof to the contrary.
+    let scoped = run_query(&[
+        "query",
+        "symbol",
+        "nested_fn",
+        "--graph",
+        graph,
+        "--package",
+        "outer",
+    ]);
+    assert_eq!(
+        scoped.code, 0,
+        "the local checks accept an enclosing citation; stderr: {}",
+        scoped.stderr
+    );
+
+    // The unforged neighbour is unaffected, which is what makes this a limit on
+    // detection rather than a hole in the enclosing rule.
+    let sibling = run_query(&[
+        "query",
+        "symbol",
+        "outer_fn",
+        "--graph",
+        graph,
+        "--package",
+        "outer",
+    ]);
+    assert_eq!(sibling.code, 0, "stderr: {}", sibling.stderr);
+}

@@ -315,6 +315,21 @@ reader re-derives whether the value is one the resolver could actually have
    manifest's own `File` node cites itself, and a repo-root manifest encloses
    every path.
 
+These checks are **local**: they establish that the value has a shape the
+resolver emits and that the cited manifest encloses the record. They do **not**
+establish that it is the *nearest* enclosing manifest. A record beneath a nested
+package, edited to cite a valid outer `Cargo.toml`, is accepted — that pairing is
+exactly what the resolver produces for a tree where the nested manifest is absent
+or unusable, and a graph cannot tell the two apart: a dependency-free
+`Cargo.toml` mints no `File` node, so the only witness to a nested manifest is
+the attribution on the records beneath it, which an edited graph rewrites. The
+detectable sliver — a sibling still citing the nearer manifest — is an
+internal-consistency signal rather than a boundary, since editing those siblings
+(or a package with a single file) evades it; buying it would mean threading
+corpus-derived, snapshot-scoped state into per-row consumers whose false
+positives un-attribute real records, which is the failure this feature exists to
+prevent. The limit is stated rather than papered over.
+
 A value failing any check **owns nothing**: it is not scopable, never appears in
 `known_packages`, and renders nothing — indistinguishable downstream from an
 absent attribution, and never from a proven-ownerless one.

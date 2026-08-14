@@ -394,6 +394,16 @@ fn ancestor_dirs(repo_relative_path: &str) -> Vec<String> {
 /// Two correct shapes that look unusual both pass: a manifest's own `File` node
 /// cites ITSELF (ancestry by equality), and a repo-root manifest (directory
 /// `""`) encloses every path in the repository.
+///
+/// # Limit
+///
+/// This is ENCLOSURE, not NEAREST enclosure. An outer manifest cited by a record
+/// inside a nested package passes, because that pairing is exactly what the
+/// resolver produces when the nested manifest is absent or unusable — and a
+/// graph cannot distinguish the cases: a dependency-free `Cargo.toml` mints no
+/// `File` node, so the only witness to a nested manifest is the attribution on
+/// the records beneath it. Deciding nearest-ness would need the manifest tree,
+/// which only the producer has.
 #[must_use]
 pub fn manifest_encloses(
     manifest_repo_relative_path: &str,
