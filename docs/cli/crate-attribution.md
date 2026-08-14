@@ -52,7 +52,11 @@ corpora:
   resolvable time, since those lanes can only return records stamped at the
   selected commit or instant — an undated record from a plain-`scan` repository
   sharing the name would contribute a repository that can never appear in the
-  answer.
+  answer. It also excludes tombstoned records: the lanes drop a retracted
+  non-temporal record, so counting its package would make a name look owned by
+  two repositories when only one can produce a row. Liveness is judged over the
+  whole record set, since a narrowed corpus can hold a record without the
+  tombstone that retracts it.
 
 `crate_attribution_unavailable` is reserved for a corpus carrying **no
 `crate_attribution` field at all** — a pre-#117 store, whose remedy really is a
@@ -329,6 +333,11 @@ internal-consistency signal rather than a boundary, since editing those siblings
 corpus-derived, snapshot-scoped state into per-row consumers whose false
 positives un-attribute real records, which is the failure this feature exists to
 prevent. The limit is stated rather than papered over.
+
+The **negative** claim carries the same record-path requirement as the positive
+one. The resolver never ran over a path no scanner emits, so it proved nothing
+about it in either direction — a forged path renders no `package:` line at all,
+not a proven-ownerless one.
 
 A value failing any check **owns nothing**: it is not scopable, never appears in
 `known_packages`, and renders nothing — indistinguishable downstream from an

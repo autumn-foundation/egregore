@@ -3941,6 +3941,25 @@ impl CrateAttribution {
         Some((name, manifest))
     }
 
+    /// [`Self::proven_unattributed_reason`], additionally requiring the record's
+    /// own path to be one a producer could emit.
+    ///
+    /// The negative mirror of [`Self::owning_package_for`], and it needs the
+    /// same gate for the same reason: the resolver never ran over a path no
+    /// scanner emits, so it proved nothing about it — positively OR negatively.
+    /// "Provably no owning package" is a FACT, and a fact about a path that
+    /// cannot exist is not one.
+    #[must_use]
+    pub fn proven_unattributed_reason_for(
+        &self,
+        record_repo_relative_path: &str,
+    ) -> Option<CrateAttributionReason> {
+        if !crate::crate_attribution::is_repo_relative_path(record_repo_relative_path) {
+            return None;
+        }
+        self.proven_unattributed_reason()
+    }
+
     /// The reason no package owns this node, but ONLY when this value is one
     /// the resolver could actually have PRODUCED.
     ///

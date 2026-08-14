@@ -484,7 +484,10 @@ impl PrintText for SymbolResult<'_> {
                 // production and read-back checks.
                 let manifest = crate::embeddings::sanitized_handle(manifest);
                 let _ = write!(text, "\n  package: {name} ({manifest})");
-            } else if let Some(reason) = attribution.proven_unattributed_reason() {
+            } else if let Some(reason) = self
+                .repo_relative_path
+                .and_then(|path| attribution.proven_unattributed_reason_for(path))
+            {
                 let _ = write!(text, "\n  package: (unattributed: {})", reason.as_str());
             }
         }

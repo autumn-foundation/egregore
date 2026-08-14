@@ -5644,3 +5644,125 @@ fn an_enclosing_but_not_nearest_manifest_is_accepted_by_the_local_checks() {
     ]);
     assert_eq!(sibling.code, 0, "stderr: {}", sibling.stderr);
 }
+
+/// A tombstoned record must not contribute an owner to the ambiguity verdict.
+///
+/// The lanes exclude deleted non-temporal records via `current_deleted_ids`, so
+/// a tombstoned symbol can never appear in an answer. Counting it in the
+/// ANSWERABLE catalog makes a package look owned by two repositories when only
+/// one can produce a row — the same false refusal the corpus-narrowing rounds
+/// fixed, reached through liveness instead of time.
+#[test]
+fn a_tombstoned_record_does_not_make_a_package_ambiguous() {
+    use std::fmt::Write as _;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut combined = String::new();
+
+    for (repo_id, tombstone) in [("repo-a", true), ("repo-b", false)] {
+        let repo = temp.path().join(repo_id);
+        fs::create_dir_all(&repo).expect("repo dir");
+        write_fixture(
+            &repo,
+            &[
+                (
+                    "crates/util/Cargo.toml",
+                    "[package]\nname = \"util\"\nversion = \"0.1.0\"\n",
+                ),
+                ("crates/util/src/lib.rs", "pub fn helper() -> u32 { 1 }\n"),
+            ],
+        );
+        let records = scan_repository_at_with_override(&repo, FIXED_TIME, Some(repo_id))
+            .expect("scan")
+            .to_jsonl()
+            .expect("serialize");
+        combined.push_str(&records);
+        combined.push('\n');
+        if tombstone {
+            // Retract repository A's every attributed record, so only B can
+            // answer.
+            for record in parse_jsonl(&records) {
+                if record["record_type"] == "node"
+                    && record["crate_attribution"]["status"] == "attributed"
+                {
+                    let id = record["id"].as_str().expect("record id");
+                    let _ = writeln!(
+                        combined,
+                        "{{\"record_type\":\"tombstone\",\"id\":\"tombstone:{id}\",\
+                         \"schema_version\":{SCHEMA_VERSION},\"deleted_id\":\"{id}\",\
+                         \"summary\":\"retracted for test\"}}"
+                    );
+                }
+            }
+        }
+    }
+
+    let graph = temp.path().join("combined.jsonl");
+    fs::write(&graph, &combined).expect("graph written");
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "helper",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "util",
+    ]);
+    assert_eq!(
+        run.code, 0,
+        "only the live repository can answer; stdout: {} stderr: {}",
+        run.stdout, run.stderr
+    );
+    let rows = rows(&run.stdout);
+    assert_eq!(rows.len(), 1, "one live row");
+    assert_eq!(rows[0]["crate_attribution"]["package_name"], "util");
+}
+
+/// The NEGATIVE claim needs the record-path gate too.
+///
+/// A path no scanner can emit makes "provably no owning package" as
+/// unbelievable as it makes a positive ownership claim: the resolver never ran
+/// over that path, so it proved nothing about it. The positive branch is gated
+/// through `manifest_encloses`; the fallback that renders the unattributed
+/// reason was not, so a record at `../outside.rs` still printed a
+/// resolver-produced fact.
+#[test]
+fn an_unattributed_reason_on_a_forged_record_path_is_not_rendered() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[("src/lib.rs", "pub fn orphan() -> u32 { 1 }\n")],
+    );
+    // No manifest anywhere, so the scan records a legitimate unattributed value.
+    let mut lines: Vec<String> = Vec::new();
+    let mut saw_reason = false;
+    for mut record in scan_fixture(temp.path()) {
+        if record["kind"] == "Symbol" {
+            saw_reason = record["crate_attribution"]["unattributed_reason"].is_string();
+            record["repo_relative_path"] = Value::from("../outside.rs");
+        }
+        lines.push(serde_json::to_string(&record).expect("serialize"));
+    }
+    assert!(
+        saw_reason,
+        "fixture must carry a real unattributed reason before the path is forged"
+    );
+    let graph_path = temp.path().join("forged.jsonl");
+    fs::write(&graph_path, lines.join("\n")).expect("graph written");
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "orphan",
+        "--graph",
+        graph_path.to_str().unwrap(),
+        "--format",
+        "text",
+    ]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        !run.stdout.contains("package:"),
+        "a forged record path proves nothing, positively or negatively: {:?}",
+        run.stdout
+    );
+}

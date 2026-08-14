@@ -5675,8 +5675,12 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     as_of.as_deref(),
                     filtered.as_deref(),
                 );
-                let catalog = PackageCatalog::build(&records, &index);
-                let answerable = PackageCatalog::build(&corpus, &index);
+                // Liveness is judged over the WHOLE record set for both
+                // catalogs: a narrowed corpus can hold a record without the
+                // tombstone that retracts it.
+                let deleted = current_deleted_ids(&records);
+                let catalog = PackageCatalog::build_with_liveness(&records, &index, &deleted);
+                let answerable = PackageCatalog::build_with_liveness(&corpus, &index, &deleted);
                 resolve_package_scope(&catalog, &answerable, selector_name, repo.is_some());
             }
             as_of.map_or_else(
@@ -7548,10 +7552,35 @@ impl PackageCatalog {
     /// characters; the raw-text render path fails closed on
     /// [`CrateAttribution::owning_package`] instead.
     pub(crate) fn build(records: &[GraphRecord], index: &query::RepositoryIndex) -> Self {
+        Self::build_with_liveness(records, index, &current_deleted_ids(records))
+    }
+
+    /// [`Self::build`] with a caller-supplied deletion set.
+    ///
+    /// Split out so the ANSWERABLE catalog can be built over a narrowed corpus
+    /// while liveness is still judged against the WHOLE record set — a
+    /// tombstone lives in the corpus alongside the record it retracts, and a
+    /// narrowed slice can contain the record without its tombstone.
+    pub(crate) fn build_with_liveness(
+        records: &[GraphRecord],
+        index: &query::RepositoryIndex,
+        deleted: &std::collections::BTreeSet<&str>,
+    ) -> Self {
         let mut by_package: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
             std::collections::BTreeMap::new();
         let mut attribution_observed = false;
         for record in records {
+            // A tombstoned non-temporal record can never appear in an answer —
+            // the lanes drop it via `current_deleted_ids` — so counting its
+            // package here makes a name look owned by two repositories when
+            // only one can produce a row. Mirrors the lanes' own liveness test
+            // exactly, including its restriction to non-temporal records: a
+            // commit-anchored version is history, not a current-state claim.
+            if matches!(record, GraphRecord::Node { temporal: None, .. })
+                && deleted.contains(record.id())
+            {
+                continue;
+            }
             // A `Change` is a COMMIT EVENT, not a current-state fact: it is
             // minted once per (commit, path) and so is never superseded, which
             // means it survives every corpus narrowing including HEAD
