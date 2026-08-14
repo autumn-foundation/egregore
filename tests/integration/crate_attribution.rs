@@ -157,26 +157,25 @@ fn package_of(record: &Value) -> Option<&str> {
 }
 
 /// Every node record of a path-bearing code-graph kind.
+/// Whether a node kind carries attribution, DERIVED from the classifier rather
+/// than restated.
+///
+/// A hand-maintained list here would be a fourth copy of the contract — and it
+/// had already drifted, omitting `Change`, which silently excluded every
+/// deletion and history `Change` record from these assertions.
+fn kind_carries_attribution(kind: &str) -> bool {
+    NodeKind::ALL.iter().any(|k| {
+        k.as_str() == kind && aletheia_egregore::crate_attribution::carries_crate_attribution(*k)
+    })
+}
+
 fn code_fact_nodes(records: &[Value]) -> Vec<&Value> {
     records
         .iter()
         .filter(|r| {
             r["record_type"] == "node"
                 && r["repo_relative_path"].is_string()
-                && matches!(
-                    r["kind"].as_str(),
-                    Some(
-                        "File"
-                            | "Module"
-                            | "Symbol"
-                            | "Import"
-                            | "Diagnostic"
-                            | "PanicRiskSite"
-                            | "DebtMarker"
-                            | "UnsafeSite"
-                            | "DependencyDeclaration"
-                    )
-                )
+                && r["kind"].as_str().is_some_and(kind_carries_attribution)
         })
         .collect()
 }
@@ -4694,4 +4693,104 @@ fn documented_attributed_kinds_match_the_code() {
             );
         }
     }
+}
+
+/// A deleted file's `Change` must be attributed to the package that OWNED it,
+/// not to whatever the walk finds after the manifest is gone.
+///
+/// Attribution resolves against each commit's own manifest tree, which is right
+/// for every record describing the tree AS IT IS. A deletion describes a path
+/// that is no longer there: when the commit removes the enclosing `Cargo.toml`
+/// along with its sources — a whole-package removal — the post-commit walk finds
+/// the OUTER manifest and claims the deleted file belonged to a package it never
+/// belonged to. The relevant tree for a deletion is the parent's.
+#[test]
+fn a_deleted_files_change_is_attributed_to_the_package_it_left() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn outer_fn() -> u32 { 1 }\n"),
+            (
+                "crates/inner/Cargo.toml",
+                "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "crates/inner/src/lib.rs",
+                "pub fn inner_fn() -> u32 { 2 }\n",
+            ),
+        ],
+    );
+    let added = commit(&repo, "add both packages", "2026-06-01T00:00:00Z");
+
+    // Whole-package removal: the manifest AND its sources go in one commit.
+    fs::remove_dir_all(repo.join("crates")).expect("remove the inner package");
+    let removed = commit(&repo, "remove the inner package", "2026-07-01T00:00:00Z");
+
+    let by_commit = history_attribution(&repo);
+
+    // Baseline: while it existed, the source belonged to `inner`.
+    assert_eq!(
+        by_commit[&added].get("crates/inner/src/lib.rs"),
+        Some(&BTreeSet::from(
+            ["inner@crates/inner/Cargo.toml".to_owned()]
+        )),
+        "the file belonged to `inner` when it existed: {by_commit:?}"
+    );
+
+    // The deletion must cite the package that LOST the file. `outer` never
+    // owned it, and reporting no enclosing manifest would erase which package
+    // shrank — either way a whole-package removal becomes unreadable.
+    assert_eq!(
+        by_commit[&removed].get("crates/inner/src/lib.rs"),
+        Some(&BTreeSet::from(
+            ["inner@crates/inner/Cargo.toml".to_owned()]
+        )),
+        "the deletion must be attributed to `inner`, not to the outer package \
+         the walk reaches once the manifest is gone: {by_commit:?}"
+    );
+}
+
+/// Deleting ONE file, leaving its manifest in place, is unchanged.
+///
+/// The parent-tree re-resolution must not become a second, divergent rule: for
+/// the common deletion the post-commit and parent trees agree, and both name
+/// the enclosing package. This pins that the fix is scoped to the case where
+/// the trees actually disagree.
+#[test]
+fn a_lone_file_deletion_keeps_its_enclosing_package() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_fixture(
+        &repo,
+        &[
+            (
+                "crates/inner/Cargo.toml",
+                "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/inner/src/lib.rs", "pub fn kept() -> u32 { 1 }\n"),
+            ("crates/inner/src/gone.rs", "pub fn gone() -> u32 { 2 }\n"),
+        ],
+    );
+    commit(&repo, "seed", "2026-06-01T00:00:00Z");
+    fs::remove_file(repo.join("crates/inner/src/gone.rs")).expect("remove one file");
+    let removed = commit(&repo, "remove one file", "2026-07-01T00:00:00Z");
+
+    let by_commit = history_attribution(&repo);
+    assert_eq!(
+        by_commit[&removed].get("crates/inner/src/gone.rs"),
+        Some(&BTreeSet::from(
+            ["inner@crates/inner/Cargo.toml".to_owned()]
+        )),
+        "the manifest survived, so both trees agree: {by_commit:?}"
+    );
 }

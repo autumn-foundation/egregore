@@ -135,6 +135,16 @@ itself. Edge and tombstone records never carry it.
 A manifest's own `File` node self-attributes: the nearest enclosing manifest of
 `crates/alpha/Cargo.toml` is itself, so it is attributed to `alpha`.
 
+A `Change` recording a **deletion** is resolved against the **parent** commit's
+manifest tree, not the commit's own. A deletion names a path that is no longer
+there, so the post-commit walk would find whatever manifest it reaches next —
+which is the enclosing package for a lone file deletion, but an **outer**
+package when the commit removes a manifest and its sources together. Resolving
+against the tree where the file last existed means a whole-package removal
+cites the package that lost the file. For a merge this reads the mainline
+(first) parent; a deletion reported only against a non-first parent keeps the
+post-commit answer.
+
 ## Output format
 
 ### `--format json`

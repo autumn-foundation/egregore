@@ -451,7 +451,28 @@ pub const fn carries_crate_attribution(kind: NodeKind) -> bool {
 /// commit's index across the whole graph would stamp every historical version
 /// of a record with the wrong tree's manifests.
 pub fn apply_crate_attribution(records: &mut [GraphRecord], index: &CrateAttributionIndex) {
+    apply_crate_attribution_where(records, index, |_| true);
+}
+
+/// [`apply_crate_attribution`], restricted to the records a predicate selects.
+///
+/// History replay needs this because not every record in a commit's slice
+/// describes that commit's tree. A `Change` recording a DELETION names a path
+/// that is no longer there, so resolving it against the post-commit tree finds
+/// whatever manifest the walk reaches next — the enclosing package for a lone
+/// file deletion, but an OUTER package when the commit removes a manifest and
+/// its sources together. Re-resolving just those records against the parent
+/// tree keeps one rule and one implementation, applied to the tree each record
+/// actually describes.
+pub fn apply_crate_attribution_where(
+    records: &mut [GraphRecord],
+    index: &CrateAttributionIndex,
+    mut selects: impl FnMut(&GraphRecord) -> bool,
+) {
     for record in records {
+        if !selects(record) {
+            continue;
+        }
         let GraphRecord::Node {
             kind,
             repo_relative_path,

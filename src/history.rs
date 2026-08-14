@@ -133,7 +133,13 @@ fn scan_repository_history_inner(
         // source records.
         let commit_attribution_start = graph.records().len();
         let mut change_ids_by_path = BTreeMap::new();
+        // Paths this commit DELETED. Their `Change` records describe the parent
+        // tree, not this one (issue #117), so they are re-attributed below.
+        let mut deleted_paths: BTreeSet<String> = BTreeSet::new();
         for change in list_changes(repo_root, &commit)? {
+            if change.status.starts_with('D') {
+                deleted_paths.insert(change.path.clone());
+            }
             let change_record = change_record(&repository_id, &commit, &change);
             let change_id = change_record.id().to_owned();
             change_ids_by_path.insert(change.path.clone(), change_id.clone());
@@ -278,6 +284,44 @@ fn scan_repository_history_inner(
             &mut graph.records_mut()[commit_attribution_start..],
             &attribution,
         );
+        // A DELETION's `Change` describes a path this commit no longer has, so
+        // the walk above resolved it against a tree the file is absent from. If
+        // the commit also removed the enclosing `Cargo.toml` — a whole-package
+        // removal — that walk reaches an OUTER manifest and claims the file
+        // belonged to a package it never belonged to. Re-resolve those records
+        // against the FIRST PARENT's tree, where the file last existed, so a
+        // deletion cites the package that lost it.
+        //
+        // Costs one extra `ls-tree` only for commits that delete something; the
+        // blob-OID parse memo is shared, so manifests already parsed at an
+        // earlier commit are not re-parsed. A root commit deletes nothing, and
+        // for a merge this reads the mainline parent — a deletion reported only
+        // against a non-first parent keeps the post-commit answer.
+        if !deleted_paths.is_empty()
+            && let Some(parent_sha) = commit.parents.first()
+        {
+            let parent_tree = list_commit_tree(repo_root, parent_sha)?;
+            let parent_attribution = commit_crate_attribution_index(
+                repo_root,
+                parent_sha,
+                &parent_tree.manifests,
+                &mut manifest_outcome_memo,
+            );
+            crate::crate_attribution::apply_crate_attribution_where(
+                &mut graph.records_mut()[commit_attribution_start..commit_records_start],
+                &parent_attribution,
+                |record| {
+                    matches!(
+                        record,
+                        GraphRecord::Node {
+                            kind: NodeKind::Change,
+                            repo_relative_path: Some(path),
+                            ..
+                        } if deleted_paths.contains(path)
+                    )
+                },
+            );
+        }
     }
 
     let languages = crate::languages_in_graph(&graph);

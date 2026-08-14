@@ -398,7 +398,12 @@ harvest cannot disagree about the rule: `eg scan` and `eg refresh` stamp it as a
 post-extraction pass after every `File`-producing extractor, and `eg scan-history`
 resolves against EACH COMMIT'S OWN manifest tree, applied to that commit's slice
 only (a whole-graph pass would stamp every historical version with the last
-commit's packages), from a SINGLE `ls-tree` per commit with a blob-OID parse memo.
+commit's packages), from a SINGLE `ls-tree` per commit with a blob-OID parse memo
+— EXCEPT a `Change` recording a DELETION, resolved against the FIRST PARENT's
+tree, since a deletion names a path the commit no longer has and a whole-package
+removal (manifest + sources in one commit) would otherwise inherit an OUTER
+package, claiming the file belonged to one it never did (one extra `ls-tree`,
+only for commits that delete; a merge reads the mainline parent).
 Attribution is deliberately NOT cached — a source file byte-identical to its
 cached version whose `Cargo.toml` was renamed still re-attributes on refresh, so
 `eg refresh` and a full `eg scan` of one tree agree exactly. `eg query symbol`
