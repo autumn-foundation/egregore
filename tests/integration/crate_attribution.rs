@@ -6286,3 +6286,80 @@ fn a_malformed_cargo_features_stops_the_walk() {
         );
     }
 }
+
+/// The JSON row must carry no attribution the checked accessors refuse.
+///
+/// JSON is the machine-facing contract, so it is where a fabricated ownership
+/// claim does the most damage: an agent consuming the row has no reason to
+/// re-derive the enclosure rule, and will simply believe the package name. It
+/// previously echoed the stored payload verbatim on the reasoning that a
+/// malformed shape should stay VISIBLE to a machine reader — but that left the
+/// two output formats disagreeing about the same record, with the safe answer
+/// only on the human-facing one.
+///
+/// The row itself is still returned; only the unbelievable CLAIM is dropped, so
+/// the field reads as absent — attribution UNKNOWN — which is exactly what it
+/// is. An operator inspecting a corrupt store still has `eg export` and the raw
+/// JSONL, which are the stored bytes rather than a derived answer.
+#[test]
+fn a_forged_attribution_is_absent_from_the_json_row_too() {
+    type Forge = fn(&mut Value);
+    let forgeries: [(&str, Forge); 3] = [
+        ("manifest does not enclose the record", |attribution| {
+            attribution["package_name"] = Value::from("alpha");
+            attribution["manifest_repo_relative_path"] = Value::from("crates/alpha/Cargo.toml");
+        }),
+        (
+            "attributed while carrying an unattributed reason",
+            |attribution| {
+                attribution["unattributed_reason"] = Value::from("no_enclosing_manifest");
+            },
+        ),
+        ("Cargo-invalid package name", |attribution| {
+            attribution["package_name"] = Value::from("bad name");
+        }),
+    ];
+    for (label, mutate) in forgeries {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "crates/beta/Cargo.toml",
+                    "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n",
+                ),
+                ("crates/beta/src/lib.rs", "pub fn owned() -> u32 { 1 }\n"),
+            ],
+        );
+        let mut lines: Vec<String> = Vec::new();
+        for mut record in scan_fixture(temp.path()) {
+            if record["kind"] == "Symbol"
+                && let Some(attribution) = record.get_mut("crate_attribution")
+            {
+                mutate(attribution);
+            }
+            lines.push(serde_json::to_string(&record).expect("serialize"));
+        }
+        let graph_path = temp.path().join("forged.jsonl");
+        fs::write(&graph_path, lines.join("\n")).expect("graph written");
+        let graph = graph_path.to_str().unwrap();
+
+        for lane in [
+            vec!["query", "symbol", "owned", "--graph", graph],
+            vec!["query", "file", "crates/beta/src/lib.rs", "--graph", graph],
+        ] {
+            let run = run_query(&lane);
+            assert_eq!(run.code, 0, "`{label}` {lane:?} stderr: {}", run.stderr);
+            for row in rows(&run.stdout) {
+                if row["name"] != "owned" {
+                    continue;
+                }
+                assert!(
+                    row.get("crate_attribution").is_none() || row["crate_attribution"].is_null(),
+                    "`{label}` {lane:?}: a claim the text path refuses must not \
+                     ship in JSON: {row}"
+                );
+            }
+        }
+    }
+}

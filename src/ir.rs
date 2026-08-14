@@ -3960,6 +3960,28 @@ impl CrateAttribution {
         self.proven_unattributed_reason()
     }
 
+    /// `true` when this value makes a claim the resolver could have PRODUCED
+    /// for a record at `record_repo_relative_path` — positively OR negatively.
+    ///
+    /// The gate for PRESENTING the value at all. Every surface that hands the
+    /// attribution to a caller uses it: the JSON projection, the text render,
+    /// the package catalog, and `--package` filtering. Without it the formats
+    /// disagreed — text refused a forged claim while JSON echoed it verbatim,
+    /// and JSON is the machine contract, so it is where a fabricated ownership
+    /// claim does the most damage.
+    ///
+    /// A value failing this reads downstream exactly like an ABSENT
+    /// attribution: UNKNOWN, which is what it is. The stored bytes remain
+    /// inspectable through `eg export` and the raw JSONL, neither of which is a
+    /// derived answer.
+    #[must_use]
+    pub fn is_presentable_for(&self, record_repo_relative_path: &str) -> bool {
+        self.owning_package_for(record_repo_relative_path).is_some()
+            || self
+                .proven_unattributed_reason_for(record_repo_relative_path)
+                .is_some()
+    }
+
     /// The reason no package owns this node, but ONLY when this value is one
     /// the resolver could actually have PRODUCED.
     ///

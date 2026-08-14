@@ -259,7 +259,14 @@ pub(crate) fn symbol_row<'a>(
         signature: signature.as_deref(),
         doc: doc.as_deref(),
         git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
-        crate_attribution: crate_attribution.as_ref(),
+        // Only a claim the resolver could have produced is presentable — the
+        // same gate the text render and the package catalog apply, so the two
+        // output formats cannot disagree about one record (issue #117).
+        crate_attribution: crate_attribution.as_ref().filter(|attribution| {
+            repo_relative_path
+                .as_deref()
+                .is_some_and(|path| attribution.is_presentable_for(path))
+        }),
         crate_attribution_disclaimer: None,
         repository_id,
         repository: repository_id.and_then(|repo| index.display_of(repo)),

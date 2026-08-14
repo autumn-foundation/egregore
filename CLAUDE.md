@@ -467,9 +467,13 @@ drive-prefix rules,
 and the NEGATIVE claim needs the full unattributed shape (status
 `unattributed`, a reason, and NEITHER string) — because "provably no owning
 package" is a FACT, not a fallback for a value that failed the positive check.
-A value failing either owns nothing AND proves nothing, printing exactly what an
-ABSENT attribution prints; `--format json` still echoes the stored payload
-verbatim so a malformed shape stays visible rather than silently rewritten.
+A value failing either owns nothing AND proves nothing, and is OMITTED from
+every surface that presents it — the text render, the package catalog,
+`--package` filtering, AND the `--format json` row — so it reads exactly like an
+ABSENT attribution (UNKNOWN). JSON is gated too because it is the MACHINE
+contract, where a fabricated ownership claim does the most damage: an agent
+consuming the row will not re-derive the enclosure rule. The stored bytes stay
+inspectable via `eg export`/raw JSONL, neither of which is a derived answer.
 Rows appear in
 both `--format json` and `--format text` (an absent field prints NOTHING — never
 "unattributed", which would fabricate a negative fact), are allow-list only

@@ -386,11 +386,14 @@ path. A record carrying an attribution *and* a reason, or a status of
 evidence for the negative claim than for the positive one, so it renders **no
 package line at all** — which is exactly how an absent attribution reads.
 
-`--format json` is unaffected in both directions: it echoes the stored payload
-verbatim, including a self-contradictory one, so the malformed shape stays
-visible to a machine reader rather than being silently rewritten. The checks
-above govern the **derived** claims — scoping, the package catalog, and the text
-render.
+`--format json` applies the **same** gate. It is the machine-facing contract, so
+it is where a fabricated ownership claim does the most damage: an agent
+consuming the row has no reason to re-derive the enclosure rule and will simply
+believe the package name. A value the checks refuse is therefore omitted from
+the JSON row too, which reads as absent — attribution UNKNOWN, which is what it
+is. The row itself is still returned; only the unbelievable claim is dropped,
+and the stored bytes stay inspectable through `eg export` and the raw JSONL,
+neither of which is a derived answer.
 
 ## Example
 
