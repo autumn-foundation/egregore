@@ -7581,18 +7581,33 @@ impl PackageCatalog {
         for record in records {
             // FIRST statement in the loop, ahead of EVERY skip below.
             //
-            // This is presence of the FIELD, not of an owner: a `status:
-            // unattributed` value proves attribution RAN over this corpus,
-            // which is what separates an ownerless corpus from a pre-#117 one.
-            // A record that is retracted, or a `Change` that no lane returns,
-            // still proves it ran — and no re-scan restores a deleted package
-            // or turns a `Change` into a current-state fact, so reporting the
-            // pre-#117 capability gap for such a corpus sends the operator
-            // after a remedy that cannot work.
+            // This asks whether attribution is USABLE here, not whether an
+            // owner was found: a `status: unattributed` value counts, because it
+            // proves attribution RAN over this corpus — which is what separates
+            // an ownerless corpus from a pre-#117 one. A record that is
+            // retracted, or a `Change` that no lane returns, still proves it
+            // ran, and no re-scan restores a deleted package or turns a `Change`
+            // into a current-state fact, so reporting the pre-#117 capability
+            // gap for those sends the operator after a remedy that cannot work.
+            //
+            // A value the checks REFUSE does not count. Everywhere else in this
+            // feature such a value owns nothing and proves nothing, reading
+            // exactly like an absent field; counting it as evidence of
+            // capability would make this the one surface where a forged value
+            // still buys something — and it would answer a wholly-unusable
+            // corpus with an empty `known_packages` list, blaming the caller's
+            // spelling when nothing in the store can answer at all.
             //
             // Placed first so a future exclusion cannot re-open that by adding
             // another `continue`: every skip below withholds OWNERSHIP only.
-            attribution_observed |= record.crate_attribution().is_some();
+            attribution_observed |= matches!(
+                record,
+                GraphRecord::Node {
+                    crate_attribution: Some(attribution),
+                    repo_relative_path: Some(path),
+                    ..
+                } if attribution.is_presentable_for(path)
+            );
             // A `Change` is a COMMIT EVENT, not a current-state fact: it is
             // minted once per (commit, path) and so is never superseded, which
             // means it survives every corpus narrowing including HEAD

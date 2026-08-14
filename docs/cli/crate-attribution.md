@@ -58,9 +58,13 @@ corpora:
   whole record set, since a narrowed corpus can hold a record without the
   tombstone that retracts it.
 
-`crate_attribution_unavailable` is reserved for a corpus carrying **no
-`crate_attribution` field at all** — a pre-#117 store, whose remedy really is a
-re-scan. Two corpora that look empty are *not* that case, and both answer
+`crate_attribution_unavailable` means the corpus carries **no usable
+`crate_attribution`** — a pre-#117 store, or one whose every attribution value
+fails the checks above and so owns nothing and proves nothing. Either way a
+re-scan is the honest remedy, and answering with an empty `known_packages` list
+would blame the caller's spelling for a store that cannot answer at all.
+
+Two corpora that *look* empty are **not** that case, and both answer
 `unknown_package_selector` with an empty `known_packages` list instead:
 
 - a freshly scanned repository with no `[package]` manifest (only a virtual

@@ -6705,3 +6705,73 @@ fn target_dependency_tables_are_typed_but_top_level_ones_are_tolerated() {
         );
     }
 }
+
+/// A corpus whose attribution is entirely UNUSABLE is a capability gap.
+///
+/// `attribution_observed` decides between "this store predates #117, re-scan"
+/// and "attribution ran, your selector is the problem". Counting raw field
+/// PRESENCE made a wholly-malformed corpus report the second: an empty
+/// `known_packages` list, inviting the caller to fix a spelling when nothing in
+/// the store can answer a package query at all.
+///
+/// That was also the one place a value failing the checks still counted for
+/// something, against the rule applied at every other surface — a value the
+/// resolver could not have produced owns nothing AND proves nothing. Counting
+/// only PRESENTABLE attribution makes the concept mean "attribution usable
+/// here", and a re-scan is the honest remedy.
+///
+/// Structurally valid `unattributed` values still count, which is what keeps an
+/// ownerless repository (verified by its own test) out of this bucket.
+#[test]
+fn a_wholly_unusable_attribution_corpus_is_a_capability_gap() {
+    for (label, mutate) in [
+        ("attributed with no manifest path", 0_u8),
+        ("attribution on an escaping record path", 1),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"real\"\nversion = \"0.1.0\"\n",
+                ),
+                ("src/lib.rs", "pub fn orphan() -> u32 { 1 }\n"),
+            ],
+        );
+        let mut lines: Vec<String> = Vec::new();
+        for mut record in scan_fixture(temp.path()) {
+            if record["crate_attribution"].is_object() {
+                if mutate == 0 {
+                    record["crate_attribution"]
+                        .as_object_mut()
+                        .expect("object")
+                        .remove("manifest_repo_relative_path");
+                } else {
+                    record["repo_relative_path"] = Value::from("../outside.rs");
+                }
+            }
+            lines.push(serde_json::to_string(&record).expect("serialize"));
+        }
+        let graph_path = temp.path().join("forged.jsonl");
+        fs::write(&graph_path, lines.join("\n")).expect("graph written");
+
+        let run = run_query(&[
+            "query",
+            "symbol",
+            "orphan",
+            "--graph",
+            graph_path.to_str().unwrap(),
+            "--package",
+            "real",
+        ]);
+        assert_eq!(run.code, 1, "`{label}` stdout: {}", run.stdout);
+        let diagnostic: Value =
+            serde_json::from_str(run.stderr.trim()).expect("one JSON diagnostic line");
+        assert_eq!(
+            diagnostic["code"], "crate_attribution_unavailable",
+            "`{label}`: nothing here can answer a package query, so the corpus is \
+             the problem, not the selector: {diagnostic}"
+        );
+    }
+}
