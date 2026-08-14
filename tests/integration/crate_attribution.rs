@@ -17,7 +17,10 @@ use std::{
     process::{Command, Stdio},
 };
 
-use aletheia_egregore::{ir::SCHEMA_VERSION, scan_repository_at_with_override};
+use aletheia_egregore::{
+    ir::{NodeKind, SCHEMA_VERSION},
+    scan_repository_at_with_override,
+};
 use serde_json::Value;
 
 const FIXED_TIME: &str = "2026-06-14T00:00:00Z";
@@ -4630,4 +4633,65 @@ fn a_nul_in_a_manifest_path_is_not_a_believable_citation() {
         "no row may be returned for the forged attribution: {:?}",
         scoped.stdout
     );
+}
+
+/// The DOCUMENTED list of attributed node kinds must match the code's total
+/// function, in both places it is enumerated.
+///
+/// `carries_crate_attribution` is an exhaustive no-wildcard match precisely so
+/// presence cannot drift into a partial function — but a prose list claiming to
+/// name "every path-bearing code-graph node" is a second, unchecked copy of
+/// that contract, and a schema consumer reading it would skip attribution
+/// handling for any kind the list forgot. `Change` was exactly that: attributed
+/// by the code, absent from both lists.
+///
+/// The check is scoped to the parenthesized enumeration rather than the whole
+/// file, so a kind merely mentioned elsewhere cannot satisfy it.
+#[test]
+fn documented_attributed_kinds_match_the_code() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let attributed: Vec<&str> = NodeKind::ALL
+        .iter()
+        .filter(|kind| aletheia_egregore::crate_attribution::carries_crate_attribution(**kind))
+        .map(|kind| kind.as_str())
+        .collect();
+    assert!(
+        attributed.len() > 1,
+        "the fixture is meaningless if nothing is attributed"
+    );
+
+    // Each list is delimited explicitly, so the check reads the ENUMERATION and
+    // not the whole file: a kind merely mentioned in nearby prose must not
+    // satisfy it.
+    for (doc, open_marker, close_marker) in [
+        (
+            "docs/schema/schema-versioning.md",
+            "on every path-bearing code-graph node (",
+            ")",
+        ),
+        ("CLAUDE.md", "Every path-bearing code-graph node (", ")"),
+        (
+            "docs/cli/crate-attribution.md",
+            "### Which nodes carry it",
+            "— every",
+        ),
+    ] {
+        let text = fs::read_to_string(repo_root.join(doc))
+            .unwrap_or_else(|e| panic!("{doc} should be readable: {e}"));
+        let flattened = text.replace('\n', " ");
+        let start = flattened
+            .find(open_marker)
+            .unwrap_or_else(|| panic!("{doc} should carry the enumeration anchor `{open_marker}`"));
+        let rest = &flattened[start + open_marker.len()..];
+        let end = rest
+            .find(close_marker)
+            .unwrap_or_else(|| panic!("{doc}: unterminated enumeration"));
+        let list = &rest[..end];
+        for kind in &attributed {
+            assert!(
+                list.contains(&format!("`{kind}`")),
+                "{doc} claims to enumerate every attributed kind but omits `{kind}`: {list}"
+            );
+        }
+    }
 }

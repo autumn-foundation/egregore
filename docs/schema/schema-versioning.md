@@ -79,7 +79,7 @@ regenerates every codegraph record under the current version deterministically.
 It was then bumped 8 → 9 by issue #117: the optional `crate_attribution` field
 on every path-bearing code-graph node (`File`, `Module`, `Symbol`, `Import`,
 `Diagnostic`, `PanicRiskSite`, `DebtMarker`, `UnsafeSite`,
-`DependencyDeclaration`), carrying the owning Cargo package's name and the
+`DependencyDeclaration`, `Change`), carrying the owning Cargo package's name and the
 repo-relative path of the owning `Cargo.toml`, or a closed-set reason no package
 owns the node. The addition is `additive`: the field is
 `#[serde(default, skip_serializing_if = "Option::is_none")]`, so a legacy v8 node

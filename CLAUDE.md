@@ -346,7 +346,7 @@ nodes, and URL matching. Bumps codegraph `SCHEMA_VERSION` 7→8 and
 
 Every code fact now records WHICH CARGO PACKAGE OWNS IT (issue #117). Every
 path-bearing code-graph node (`File`, `Module`, `Symbol`, `Import`, `Diagnostic`,
-`PanicRiskSite`, `DebtMarker`, `UnsafeSite`, `DependencyDeclaration`) carries an
+`PanicRiskSite`, `DebtMarker`, `UnsafeSite`, `DependencyDeclaration`, `Change`) carries an
 additive optional `crate_attribution`: the owning package NAME plus the
 repo-relative path of the owning `Cargo.toml`, or a closed-set reason no package
 owns it. Before this the graph was a flat pool of files — every fact had a
@@ -385,7 +385,9 @@ no-wildcard `match`, the #247 completeness invariant) does guarantee is
 narrower: WITHIN ONE scan/refresh/replay, an absent field never means "this kind
 happens not to be covered". Repo-scoped kinds
 (`Repository`/`Commit`/`ScanCoverage`) carry no path and are never attributed;
-`Change` DOES carry a path and IS attributed. `crate_attribution` is NEVER an identity input, so no record ID moves
+a `Change` names one path in one commit, so its owning package at that commit IS
+meaningful and it IS attributed (the enumeration above is pinned against the
+classifier by test, in all three docs that state it). `crate_attribution` is NEVER an identity input, so no record ID moves
 FOR THAT REASON and ADR-0004's cross-crate-identity deferral stands — though the
 paired `SCHEMA_VERSION` 8→9 bump does re-key every `codegraph:v<N>:` record, so
 re-ingesting into an existing v8 store adds a second generation rather than
