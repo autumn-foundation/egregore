@@ -2619,6 +2619,25 @@ impl GraphRecord {
         }
     }
 
+    /// The owning package this record can PROVE, or `None`.
+    ///
+    /// The record-level boundary for issue #117: it applies the shape checks AND
+    /// requires the cited manifest to enclose this record's own path, so a
+    /// forged pairing the nearest-enclosing walk could never produce asserts
+    /// nothing. Every consumer that acts on ownership goes through here.
+    #[must_use]
+    pub fn owning_package(&self) -> Option<(&str, &str)> {
+        let Self::Node {
+            crate_attribution: Some(attribution),
+            repo_relative_path: Some(path),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        attribution.owning_package_for(path)
+    }
+
     /// Attaches semantic drift metadata to a node record.
     #[must_use]
     pub fn with_semantic_drift(mut self, drift: SemanticDriftMetadata) -> Self {
@@ -3894,6 +3913,29 @@ impl CrateAttribution {
         if !crate::manifest_deps::package_name_is_valid(name)
             || !crate::crate_attribution::manifest_path_is_repo_relative(manifest)
         {
+            return None;
+        }
+        Some((name, manifest))
+    }
+
+    /// [`Self::owning_package`], additionally requiring the cited manifest to
+    /// ENCLOSE the record it rides on.
+    ///
+    /// Shape alone is not enough. Attribution comes from the nearest ENCLOSING
+    /// manifest, so a record at `crates/beta/src/lib.rs` citing
+    /// `crates/alpha/Cargo.toml` carries a pairing no walk could produce —
+    /// syntactically fine, and a forged ownership claim whose citation points
+    /// somewhere else entirely. Every consumer that ASSERTS ownership (the
+    /// package catalog, `--package` filtering, the text render) uses this one;
+    /// [`Self::owning_package`] remains for the rare caller with no record path
+    /// in hand.
+    ///
+    /// Containment is segment-aware and reuses the walk's own ancestor
+    /// enumeration, so it cannot drift from the rule it verifies.
+    #[must_use]
+    pub fn owning_package_for(&self, record_repo_relative_path: &str) -> Option<(&str, &str)> {
+        let (name, manifest) = self.owning_package()?;
+        if !crate::crate_attribution::manifest_encloses(manifest, record_repo_relative_path) {
             return None;
         }
         Some((name, manifest))

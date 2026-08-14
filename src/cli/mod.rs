@@ -7520,22 +7520,6 @@ pub(crate) fn symbol_handle_selector(handle: &str) -> crate::graph_index::Select
 /// exactly what the claim rests on.
 pub(crate) const CRATE_ATTRIBUTION_DISCLAIMER: &str = "attribution is nearest-enclosing-manifest directory containment, never proof the file is compiled into that package";
 
-/// Reads a record's owning package name, fail-closed on an inconsistent value.
-///
-/// An extension trait so the candidate-narrowing lanes (`--at` / `--as-of`),
-/// which filter `GraphRecord`s before a winner is chosen, use the SAME
-/// consistency check as the row filter and the renderer.
-pub(crate) trait CrateAttributionExt {
-    /// The owning package name, or `None` when unattributed or inconsistent.
-    fn owning_package_name(&self) -> Option<&str>;
-}
-
-impl CrateAttributionExt for crate::ir::CrateAttribution {
-    fn owning_package_name(&self) -> Option<&str> {
-        self.owning_package().map(|(name, _)| name)
-    }
-}
-
 /// Which packages the loaded corpus carries, and which repositories own each
 /// (issue #117).
 ///
@@ -7581,13 +7565,11 @@ impl PackageCatalog {
             ) {
                 continue;
             }
-            let Some(attribution) = record.crate_attribution() else {
-                continue;
-            };
-            // Fail-closed on an inconsistent read-back value: a record
-            // claiming `unattributed` while carrying a name owns nothing, and
+            // Fail-closed on a read-back value the resolver could not have
+            // produced: a record claiming `unattributed` while carrying a name,
+            // or citing a manifest that does not ENCLOSE it, owns nothing and
             // must never become a scopable package.
-            let Some((name, _manifest)) = attribution.owning_package() else {
+            let Some((name, _manifest)) = record.owning_package() else {
                 continue;
             };
             let entry = by_package.entry(name.to_owned()).or_default();

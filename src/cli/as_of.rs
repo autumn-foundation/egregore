@@ -149,10 +149,7 @@ pub(crate) fn query_symbol_as_of(
                     {
                         return false;
                     }
-                    record
-                        .crate_attribution()
-                        .and_then(super::CrateAttributionExt::owning_package_name)
-                        == Some(selector)
+                    record.owning_package().map(|(name, _)| name) == Some(selector)
                 })
                 .map(|(_, record)| record.clone())
                 .collect()

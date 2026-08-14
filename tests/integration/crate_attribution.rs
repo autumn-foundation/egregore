@@ -4487,39 +4487,38 @@ fn control_and_colon_directory_names_are_attributed() {
 
 /// Relaxing the producer-side check must not reopen the text-forgery hole.
 ///
-/// A newline in a manifest path is now RECORDABLE (it names a real directory),
-/// so the render — not the predicate — is what keeps one row to one line. The
-/// value is control-sanitized on the way out, exactly as every other
+/// A control character in a directory name is legal on Unix, so the path is
+/// RECORDABLE and the manifest legitimately encloses its own subtree. The
+/// render — not the predicate — is therefore what keeps one row to one line: the
+/// citation is control-sanitized on the way out, exactly as every other
 /// operator-controlled handle in this codebase is, and never truncated, because
 /// a truncated handle stops being a citation.
+///
+/// Built on a REAL directory rather than a forged attribution, so it exercises
+/// the path the resolver actually produces; a forged non-enclosing manifest is
+/// refused outright and would prove nothing about rendering.
+#[cfg(unix)]
 #[test]
 fn a_control_character_in_a_manifest_path_cannot_forge_a_text_line() {
     let temp = tempfile::tempdir().expect("temp dir");
+    // A legal Unix directory name carrying a newline, the text a forged line
+    // would use, and the ANSI escape that would clear a terminal.
+    let dir = "x\nsymbol: INJECTED\u{1b}[2J";
     write_fixture(
         temp.path(),
         &[
             (
-                "Cargo.toml",
+                &format!("{dir}/Cargo.toml"),
                 "[package]\nname = \"realpkg\"\nversion = \"0.1.0\"\n",
             ),
-            ("src/lib.rs", "pub fn forged_symbol() -> u32 { 1 }\n"),
+            (
+                &format!("{dir}/src/lib.rs"),
+                "pub fn forged_symbol() -> u32 { 1 }\n",
+            ),
         ],
     );
-    // Start from a REAL scanned record and rewrite only the manifest path, so
-    // the record is valid in every other respect and the test cannot pass by
-    // failing to load.
-    let mut lines: Vec<String> = Vec::new();
-    for mut record in scan_fixture(temp.path()) {
-        if record["kind"] == "Symbol"
-            && let Some(attribution) = record.get_mut("crate_attribution")
-        {
-            attribution["manifest_repo_relative_path"] =
-                Value::from("a\nsymbol: INJECTED\u{1b}[2J/Cargo.toml");
-        }
-        lines.push(serde_json::to_string(&record).expect("serialize"));
-    }
-    let graph_path = temp.path().join("forged.jsonl");
-    fs::write(&graph_path, lines.join("\n")).expect("graph written");
+    let graph_path = temp.path().join("graph.jsonl");
+    fs::write(&graph_path, scan_jsonl(temp.path())).expect("graph written");
 
     let run = run_query(&[
         "query",
@@ -4546,7 +4545,7 @@ fn a_control_character_in_a_manifest_path_cannot_forge_a_text_line() {
     // The citation still renders in full — sanitized, never truncated.
     assert!(
         run.stdout
-            .contains("package: realpkg (a.symbol: INJECTED.[2J/Cargo.toml)"),
+            .contains("package: realpkg (x.symbol: INJECTED.[2J/Cargo.toml)"),
         "the handle must stay whole and usable: {:?}",
         run.stdout
     );
@@ -5124,4 +5123,131 @@ fn a_package_created_after_the_as_of_instant_stays_known() {
     assert_eq!(after.code, 0, "stderr: {}", after.stderr);
     let rows = rows(&after.stdout);
     assert_eq!(rows[0]["crate_attribution"]["package_name"], "late");
+}
+
+/// A cited manifest that does not ENCLOSE the record could not have produced
+/// its attribution.
+///
+/// The shape checks accept any well-formed manifest path, but the resolver
+/// derives attribution from the NEAREST ENCLOSING manifest — so the cited
+/// manifest's directory is always an ancestor of (or equal to) the record's own
+/// directory. A record at `crates/beta/src/lib.rs` citing
+/// `crates/alpha/Cargo.toml` is a shape no walk produces, and believing it
+/// hands back a forged ownership claim with a citation that points somewhere
+/// else entirely.
+///
+/// Containment is segment-aware, so `crates/alpha` never encloses
+/// `crates/alphabet/x.rs` — the same rule the walk itself uses.
+#[test]
+fn a_manifest_that_does_not_enclose_the_record_is_not_trusted() {
+    for (label, forged_manifest) in [
+        ("a sibling package", "crates/alpha/Cargo.toml"),
+        (
+            "a deeper unrelated package",
+            "crates/alpha/inner/Cargo.toml",
+        ),
+        // Segment-aware: a prefix of the real directory name is not an ancestor.
+        ("a name-prefix neighbour", "crates/bet/Cargo.toml"),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "crates/beta/Cargo.toml",
+                    "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n",
+                ),
+                ("crates/beta/src/lib.rs", "pub fn owned() -> u32 { 1 }\n"),
+            ],
+        );
+        let mut lines: Vec<String> = Vec::new();
+        for mut record in scan_fixture(temp.path()) {
+            if record["kind"] == "Symbol"
+                && let Some(attribution) = record.get_mut("crate_attribution")
+            {
+                attribution["package_name"] = Value::from("alpha");
+                attribution["manifest_repo_relative_path"] = Value::from(forged_manifest);
+            }
+            lines.push(serde_json::to_string(&record).expect("serialize"));
+        }
+        let graph_path = temp.path().join("forged.jsonl");
+        fs::write(&graph_path, lines.join("\n")).expect("graph written");
+        let graph = graph_path.to_str().unwrap();
+
+        // Renders nothing: the claim is unbelievable, so it reads exactly as an
+        // absent attribution does.
+        let text = run_query(&[
+            "query", "symbol", "owned", "--graph", graph, "--format", "text",
+        ]);
+        assert_eq!(text.code, 0, "`{label}` stderr: {}", text.stderr);
+        assert!(
+            !text.stdout.contains("package:"),
+            "`{label}`: a non-enclosing manifest must not render a citation: {:?}",
+            text.stdout
+        );
+
+        // And `alpha` never enters the catalog, so it is not a scopable package.
+        let scoped = run_query(&[
+            "query",
+            "symbol",
+            "owned",
+            "--graph",
+            graph,
+            "--package",
+            "alpha",
+        ]);
+        assert_eq!(
+            scoped.code, 1,
+            "`{label}`: forged ownership must not make `alpha` selectable; stdout: {}",
+            scoped.stdout
+        );
+        assert!(
+            scoped.stderr.contains("unknown_package_selector")
+                || scoped.stderr.contains("crate_attribution_unavailable"),
+            "`{label}` stderr: {}",
+            scoped.stderr
+        );
+    }
+}
+
+/// The enclosing check must not reject what the resolver really produces.
+///
+/// Two shapes look unusual but are correct: a manifest's own `File` node cites
+/// ITSELF (its directory encloses it, by equality), and a repo-root manifest
+/// encloses every path in the repository.
+#[test]
+fn self_attribution_and_root_manifests_still_pass_the_enclosing_check() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"root\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+            ),
+            ("src/lib.rs", "pub fn at_root() -> u32 { 1 }\n"),
+            (
+                "crates/inner/Cargo.toml",
+                "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+            ),
+            ("crates/inner/src/lib.rs", "pub fn nested() -> u32 { 2 }\n"),
+        ],
+    );
+    let by_path = attribution_by_path(&scan_fixture(temp.path()));
+    // Root manifest encloses a deep path.
+    assert_eq!(
+        by_path.get("src/lib.rs"),
+        Some(&BTreeSet::from(["root@Cargo.toml".to_owned()]))
+    );
+    // A manifest's own File node cites itself.
+    assert_eq!(
+        by_path.get("crates/inner/Cargo.toml"),
+        Some(&BTreeSet::from(
+            ["inner@crates/inner/Cargo.toml".to_owned()]
+        ))
+    );
+    assert_eq!(
+        by_path.get("Cargo.toml"),
+        Some(&BTreeSet::from(["root@Cargo.toml".to_owned()]))
+    );
 }

@@ -277,6 +277,17 @@ reader re-derives whether the value is one the resolver could actually have
    the canonical absolute-path forgery shape is worth more than that
    vanishingly unlikely name.
 
+4. The cited manifest **encloses the record**. Attribution comes from the
+   nearest *enclosing* manifest, so its directory is always an ancestor of — or
+   equal to — the record's own directory. A node at `crates/beta/src/lib.rs`
+   citing `crates/alpha/Cargo.toml` is a pairing no walk produces: syntactically
+   fine, and a forged claim whose citation points somewhere else. Containment
+   reuses the walk's own ancestor enumeration, so it is segment-aware
+   (`crates/alpha` never encloses `crates/alphabet/x.rs`) and cannot drift from
+   the rule it verifies. Two correct shapes that look unusual both pass: a
+   manifest's own `File` node cites itself, and a repo-root manifest encloses
+   every path.
+
 A value failing any check **owns nothing**: it is not scopable, never appears in
 `known_packages`, and renders nothing — indistinguishable downstream from an
 absent attribution, and never from a proven-ownerless one.

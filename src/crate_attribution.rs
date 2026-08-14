@@ -358,6 +358,36 @@ fn ancestor_dirs(repo_relative_path: &str) -> Vec<String> {
     dirs
 }
 
+/// `true` when `manifest_repo_relative_path` could be the manifest the walk
+/// resolved for a record at `record_repo_relative_path`.
+///
+/// Attribution comes from the NEAREST ENCLOSING manifest, so the cited
+/// manifest's directory is always an ancestor of — or equal to — the record's
+/// own directory. A record at `crates/beta/src/lib.rs` citing
+/// `crates/alpha/Cargo.toml` is a shape no walk produces.
+///
+/// Reuses [`ancestor_dirs`], the SAME function the walk enumerates, so this
+/// check cannot drift from the rule it verifies; segment-awareness comes free
+/// with it (`crates/alpha` never encloses `crates/alphabet/x.rs`).
+///
+/// Two correct shapes that look unusual both pass: a manifest's own `File` node
+/// cites ITSELF (ancestry by equality), and a repo-root manifest (directory
+/// `""`) encloses every path in the repository.
+#[must_use]
+pub fn manifest_encloses(
+    manifest_repo_relative_path: &str,
+    record_repo_relative_path: &str,
+) -> bool {
+    let mut manifest_segments: Vec<&str> = manifest_repo_relative_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    // Drop the `Cargo.toml` component; what remains is the package directory.
+    manifest_segments.pop();
+    let manifest_dir = manifest_segments.join("/");
+    ancestor_dirs(record_repo_relative_path).contains(&manifest_dir)
+}
+
 /// `true` when nodes of `kind` carry crate attribution.
 ///
 /// An **exhaustive match with no wildcard arm** (the #247 completeness

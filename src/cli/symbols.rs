@@ -184,8 +184,11 @@ pub(crate) fn retain_package_scope(results: &mut Vec<SymbolResult<'_>>, package:
         return;
     };
     results.retain(|row| {
-        row.crate_attribution
-            .and_then(|attribution| attribution.owning_package())
+        // The manifest must enclose THIS row's path, so a forged pairing the
+        // nearest-enclosing walk could never produce is not scopable.
+        row.repo_relative_path
+            .zip(row.crate_attribution)
+            .and_then(|(path, attribution)| attribution.owning_package_for(path))
             .is_some_and(|(name, _)| name == selector)
     });
     for row in results {
@@ -377,11 +380,7 @@ pub(crate) fn query_symbol_at(
     // that demonstrably exists in the requested package, purely because a
     // same-named symbol in another package sorted first.
     if let Some(selector) = package {
-        matches.retain(|r| {
-            r.crate_attribution()
-                .and_then(super::CrateAttributionExt::owning_package_name)
-                == Some(selector)
-        });
+        matches.retain(|r| r.owning_package().map(|(name, _)| name) == Some(selector));
     }
     if let Some(repo) = selected_repo {
         matches.retain(|r| index.owner_of(r.id()) == Some(repo));
@@ -430,7 +429,16 @@ pub(crate) fn query_symbol_at(
 impl PrintText for SymbolResult<'_> {
     fn as_text(&self) -> String {
         use std::fmt::Write as _;
-        let path = self.repo_relative_path.unwrap_or("(unknown)");
+        // A repo-relative path is a real filesystem path, and on Unix that can
+        // contain a newline or an ESC. Sanitize it for the TEXT render at the
+        // same boundary the manifest citation below is sanitized at, so no row
+        // can forge an output line or drive the reader's terminal. Never
+        // truncated — a truncated path stops being a citation — and `--format
+        // json` still carries the exact bytes.
+        let path = self.repo_relative_path.map_or_else(
+            || "(unknown)".to_owned(),
+            crate::embeddings::sanitized_handle,
+        );
         let line = self.span.map_or(0, |s| s.start_line);
         let commit = self.git_commit.map_or(String::new(), |c| format!(" [{c}]"));
         let freshness = self
@@ -463,7 +471,10 @@ impl PrintText for SymbolResult<'_> {
         // absent-vs-unattributed contract says an absent field must NOT be read
         // as. A value failing either check prints nothing at all.
         if let Some(attribution) = self.crate_attribution {
-            if let Some((name, manifest)) = attribution.owning_package() {
+            if let Some((name, manifest)) = self
+                .repo_relative_path
+                .and_then(|path| attribution.owning_package_for(path))
+            {
                 // The manifest path is a real filesystem path, and on Unix that
                 // can contain a newline or an ESC — so the RENDER is what keeps
                 // one row to one line, not a producer-side refusal to record

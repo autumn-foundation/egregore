@@ -439,8 +439,11 @@ graph is operator-controlled (#104 doctrine), so every DERIVED claim — scoping
 the package catalog, the text render — re-checks that the value is one the
 resolver could have PRODUCED, in BOTH directions: an ownership claim needs a
 Cargo-valid package NAME (the same `package_name_is_valid` rule that gated it at
-production, shared not re-derived) plus a manifest path of the shape the
-ancestor walk produces (relative, `/`-separated, no `.`/`..`/empty segment, no
+production, shared not re-derived) plus a manifest path that both has the shape
+the ancestor walk produces AND actually ENCLOSES the record citing it (a node at
+`crates/beta/src/lib.rs` citing `crates/alpha/Cargo.toml` is a pairing no walk
+produces; containment reuses the walk's own segment-aware ancestor enumeration,
+so a manifest's self-attribution and a repo-root manifest both still pass) (relative, `/`-separated, no `.`/`..`/empty segment, no
 Windows drive prefix, last segment `Cargo.toml`) — the test being what the walk
 could have PRODUCED, so a backslash, a non-drive colon, and a control character
 are all ALLOWED, being ordinary Unix filename bytes the NUL-delimited git
