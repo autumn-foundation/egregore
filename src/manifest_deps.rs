@@ -554,27 +554,6 @@ pub fn parse_manifest_dependencies(
         item.as_array()
             .is_some_and(|values| values.iter().all(toml_edit::Value::is_str))
     });
-    let shape = if !cargo_features_well_typed {
-        ManifestShape::Unusable
-    } else if package_table.is_some() {
-        if package_well_typed {
-            ManifestShape::Package
-        } else {
-            ManifestShape::Unusable
-        }
-    } else if doc.get("package").is_none()
-        && doc
-            .get("workspace")
-            .and_then(toml_edit::Item::as_table_like)
-            .is_some_and(workspace_table_is_well_typed)
-        && !VIRTUAL_MANIFEST_FORBIDDEN_SECTIONS
-            .iter()
-            .any(|section| doc.get(section).is_some())
-    {
-        ManifestShape::VirtualRoot
-    } else {
-        ManifestShape::Unusable
-    };
     let package_name = package_table
         .and_then(|package| package.get("name"))
         .and_then(|name| name.as_str())
@@ -616,6 +595,42 @@ pub fn parse_manifest_dependencies(
         });
         declarations.extend(entries);
     }
+    // A `[workspace]` table is validated wherever it APPEARS, not only on a
+    // virtual root. A manifest carrying BOTH `[package]` and `[workspace]` — a
+    // root crate that is also the workspace root, a common real layout — takes
+    // the package branch below, and a malformed workspace table there makes the
+    // whole manifest unloadable just the same.
+    let workspace_well_typed = doc.get("workspace").is_none_or(|item| {
+        item.as_table_like()
+            .is_some_and(workspace_table_is_well_typed)
+    });
+    let shape = if !cargo_features_well_typed || !workspace_well_typed {
+        ManifestShape::Unusable
+    } else if package_table.is_some() {
+        // `uninterpretable` is set by `declared_dependency` for exactly the
+        // dependency forms Cargo REJECTS (a non-string/non-table entry, a table
+        // naming no usable source, a wrong-typed known key, an unparseable
+        // requirement, an invalid name). Such a manifest cannot be loaded, so
+        // the package it declares does not exist and must not own its subtree.
+        // Reusing that signal costs no second rule to keep in step.
+        if package_well_typed && !uninterpretable {
+            ManifestShape::Package
+        } else {
+            ManifestShape::Unusable
+        }
+    } else if doc.get("package").is_none()
+        && doc
+            .get("workspace")
+            .and_then(toml_edit::Item::as_table_like)
+            .is_some_and(workspace_table_is_well_typed)
+        && !VIRTUAL_MANIFEST_FORBIDDEN_SECTIONS
+            .iter()
+            .any(|section| doc.get(section).is_some())
+    {
+        ManifestShape::VirtualRoot
+    } else {
+        ManifestShape::Unusable
+    };
     Ok(ManifestDependencies {
         package_name,
         shape,

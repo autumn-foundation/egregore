@@ -6363,3 +6363,116 @@ fn a_forged_attribution_is_absent_from_the_json_row_too() {
         }
     }
 }
+
+/// A COMBINED `[package]` + `[workspace]` root must validate BOTH tables.
+///
+/// This layout — a root crate that is also the workspace root — is common in
+/// real repositories, and it takes the package branch, which checked only the
+/// package table. A malformed `[workspace]` beside a valid `[package]` makes
+/// the whole manifest unloadable, so the package it names does not exist and
+/// cannot own the subtree. Verified against real `cargo metadata`.
+#[test]
+fn a_combined_package_workspace_root_validates_both_tables() {
+    for (label, root, expected) in [
+        (
+            "workspace members malformed",
+            "[package]\nname = \"root\"\nversion = \"0.1.0\"\n\n[workspace]\nmembers = \"not-an-array\"\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "workspace resolver malformed",
+            "[package]\nname = \"root\"\nversion = \"0.1.0\"\n\n[workspace]\nmembers = []\nresolver = 2\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "both tables well-typed",
+            "[package]\nname = \"root\"\nversion = \"0.1.0\"\n\n[workspace]\nmembers = []\n",
+            "root@Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                ("Cargo.toml", root),
+                ("src/lib.rs", "pub fn at_root() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}`: {by_path:?}"
+        );
+    }
+}
+
+/// A dependency entry Cargo cannot interpret makes the manifest unloadable.
+///
+/// The parser ALREADY detects this — `declared_dependency` returns `None` for
+/// exactly the forms Cargo rejects (non-string/non-table entry, a table naming
+/// no usable source, a wrong-typed known key, an unparseable requirement, an
+/// invalid name) and the caller records it — but the shape reduction ignored the
+/// flag and still returned `Package`. Reusing the existing signal costs no new
+/// field list and cannot drift from the dependency rules it already encodes.
+#[test]
+fn an_uninterpretable_dependency_entry_stops_the_walk() {
+    for (label, deps, expected) in [
+        (
+            "bool entry",
+            "serde = true\n",
+            "unattributed:unusable_manifest",
+        ),
+        ("int entry", "serde = 1\n", "unattributed:unusable_manifest"),
+        (
+            "table naming no source",
+            "serde = { features = [\"derive\"] }\n",
+            "unattributed:unusable_manifest",
+        ),
+        // Every legitimate form must keep owning the subtree.
+        (
+            "version string",
+            "serde = \"1\"\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "path source",
+            "serde = { path = \"../serde\" }\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "workspace inheritance",
+            "serde = { workspace = true }\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "version plus features",
+            "serde = { version = \"1\", features = [\"derive\"] }\n",
+            "inner@nested/Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!(
+                        "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n\n[dependencies]\n{deps}"
+                    ),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}`: {by_path:?}"
+        );
+    }
+}
