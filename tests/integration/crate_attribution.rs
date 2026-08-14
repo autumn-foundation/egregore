@@ -5766,3 +5766,186 @@ fn an_unattributed_reason_on_a_forged_record_path_is_not_rendered() {
         run.stdout
     );
 }
+
+/// A `[package]` table Cargo REFUSES TO LOAD must not own its subtree.
+///
+/// The mirror of the `[workspace]` field type-checking: a wrong-typed known
+/// field makes the WHOLE manifest unloadable, so the package it names does not
+/// exist for Cargo, and attributing a subtree to it — and making the name
+/// selectable via `--package` — claims ownership by a package that cannot be
+/// built.
+///
+/// The accepted cases matter as much as the rejected ones. Workspace
+/// INHERITANCE (`version.workspace = true`) is a TABLE and is ubiquitous in
+/// real workspaces, so a naive "version must be a string" rule would
+/// un-attribute them wholesale. Every arm below was verified against real
+/// `cargo metadata --no-deps --format-version 1` on the pinned toolchain.
+#[test]
+fn malformed_package_fields_do_not_own_their_subtree() {
+    for (label, package, expected) in [
+        (
+            "version = int",
+            "[package]\nname = \"inner\"\nversion = 1\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "edition = int",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nedition = 1\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "authors = string",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nauthors = \"solo\"\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "keywords element = int",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nkeywords = [1]\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "links = int",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nlinks = 1\n",
+            "unattributed:unusable_manifest",
+        ),
+        // Cargo ACCEPTS all of these, so they must keep owning the subtree.
+        (
+            "version inherited from the workspace",
+            "[package]\nname = \"inner\"\nversion.workspace = true\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "version inherited, inline table",
+            "[package]\nname = \"inner\"\nversion = { workspace = true }\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "readme = false",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nreadme = false\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "publish = false",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\npublish = false\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "build = false",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nbuild = false\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "unknown key tolerated",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nfuture-key = \"x\"\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "control",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n",
+            "inner@nested/Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                ("nested/Cargo.toml", package),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}`: {by_path:?}"
+        );
+    }
+}
+
+/// DECIDED: `--package` must AGREE with the unscoped `--as-of` answer, including
+/// where that answer is itself debatable.
+///
+/// A symbol deleted outright, with no same-named replacement, still resolves to
+/// its final pre-deletion version — because `--as-of` means "the newest version
+/// at or before this instant" and history replay never tombstones a removed
+/// symbol, it simply stops re-emitting it. That is the lane's PRE-EXISTING
+/// contract, shared by the unscoped and `--repo` paths.
+///
+/// Issue #117's job is to make the SCOPED answer agree with the snapshot the
+/// unscoped lane already chooses, not to redefine what `--as-of` means. Making
+/// the scoped lane alone drop the row would put the two answers in conflict:
+/// `--package alpha` would report no match for a row `eg query symbol --as-of`
+/// hands back unscoped. Changing the deletion semantics is a change to a shipped
+/// lane's contract and belongs in its own issue, evaluated across every lane
+/// that shares the resolver.
+#[test]
+fn package_scope_as_of_agrees_with_the_unscoped_answer_after_a_deletion() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_fixture(
+        &repo,
+        &[
+            (
+                "crates/alpha/Cargo.toml",
+                "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/alpha/src/lib.rs", "pub fn doomed() -> u32 { 1 }\n"),
+        ],
+    );
+    commit(&repo, "seed", "2026-06-01T00:00:00Z");
+    fs::remove_file(repo.join("crates/alpha/src/lib.rs")).expect("delete");
+    fs::write(
+        repo.join("crates/alpha/src/other.rs"),
+        "pub fn survivor() -> u32 { 2 }\n",
+    )
+    .expect("write");
+    commit(&repo, "delete doomed", "2026-07-01T00:00:00Z");
+
+    let graph_path = temp.path().join("history.jsonl");
+    fs::write(
+        &graph_path,
+        aletheia_egregore::scan_repository_history(&repo)
+            .expect("history replay")
+            .to_jsonl()
+            .expect("serialize"),
+    )
+    .expect("graph written");
+    let graph = graph_path.to_str().unwrap();
+    let after = "2026-08-01T00:00:00Z";
+
+    let unscoped = run_query(&[
+        "query", "symbol", "doomed", "--graph", graph, "--as-of", after,
+    ]);
+    let scoped = run_query(&[
+        "query",
+        "symbol",
+        "doomed",
+        "--graph",
+        graph,
+        "--as-of",
+        after,
+        "--package",
+        "alpha",
+    ]);
+
+    assert_eq!(
+        unscoped.code, scoped.code,
+        "scoped and unscoped must agree; unscoped: {} scoped: {}",
+        unscoped.stdout, scoped.stdout
+    );
+    let unscoped_rows = rows(&unscoped.stdout);
+    let scoped_rows = rows(&scoped.stdout);
+    assert_eq!(unscoped_rows.len(), scoped_rows.len());
+    for (u, s) in unscoped_rows.iter().zip(scoped_rows.iter()) {
+        assert_eq!(
+            u["record_id"], s["record_id"],
+            "the scoped answer must be a subsequence of the unscoped one"
+        );
+    }
+}

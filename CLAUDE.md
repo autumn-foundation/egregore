@@ -361,7 +361,10 @@ declares no package and is WALKED PAST, matching Cargo; every other manifest for
 STOPS the walk FAIL-CLOSED (`unnamed_package` / `unparseable_manifest` /
 `manifest_unreadable` / `unusable_manifest` — the last covering the forms Cargo
 refuses to load: a manifest carrying NEITHER `[package]` nor `[workspace]`, a
-virtual manifest carrying a package-only section, and one whose `[workspace]`
+virtual manifest carrying a package-only section, one whose `[package]` table
+wrong-types a KNOWN field (the `x.workspace = true` INHERITANCE table is
+accepted wherever Cargo accepts it, since rejecting it would un-attribute every
+inheriting workspace), and one whose `[workspace]`
 table wrong-types a KNOWN field (`members`/`exclude`/`default-members` arrays of
 strings, `resolver` a string, `package`/`dependencies`/`lints` tables — each
 verified against real `cargo metadata`, while `metadata` takes any type and an

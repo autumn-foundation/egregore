@@ -178,7 +178,103 @@ fn workspace_table_is_well_typed(workspace: &dyn toml_edit::TableLike) -> bool {
     })
 }
 
-/// The three captured dependency tables in documented output order.
+/// The TOML shape a known `[package]` field must have for Cargo to load the
+/// manifest.
+///
+/// Several fields accept the workspace-INHERITANCE table (`version.workspace =
+/// true`), which is ubiquitous in real workspaces — a rule that demanded the
+/// direct type would un-attribute them wholesale, so every inheritable arm
+/// admits a table.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PackageFieldShape {
+    /// A string, with no inheritance form (`name`, `links`, `default-run`).
+    Str,
+    /// A string, or the inheritance table.
+    StrOrInherited,
+    /// An array whose every element is a string, or the inheritance table.
+    StringArrayOrInherited,
+    /// A string, a bool, or the inheritance table (`readme = false` is valid).
+    StrBoolOrInherited,
+    /// A bool, a string array, or the inheritance table (`publish`).
+    BoolArrayOrInherited,
+    /// A string or a bool, with no inheritance form (`build = false`).
+    StrOrBool,
+}
+
+/// Type contract for the known `[package]` fields.
+///
+/// Cargo type-checks these while parsing, so a wrong-typed one makes the WHOLE
+/// manifest unloadable — the package it names does not exist, and attributing a
+/// subtree to it would claim ownership by something that cannot be built. The
+/// `[workspace]` analog is [`WORKSPACE_FIELD_SHAPES`]; this is the same rule on
+/// the other table.
+///
+/// EVERY arm — accepted and rejected alike — was verified against real `cargo
+/// metadata --no-deps --format-version 1` on the pinned toolchain (cargo
+/// 1.94.1). The accepted ones matter as much: `readme = false`, `publish =
+/// false`, `build = false`, an unknown key, and every `x.workspace = true`
+/// inheritance form all load fine, and rejecting any of them would un-attribute
+/// a real crate.
+///
+/// HONEST BOUND, unchanged from the workspace table: this checks the TYPE of a
+/// known field, not its VALUE. Cargo also rejects `version = "notsemver"` and
+/// `edition = "1066"`, which this resolver does not evaluate — it confirms a
+/// manifest's shape rather than reimplementing Cargo's schema.
+const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 20] = [
+    ("name", PackageFieldShape::Str),
+    ("links", PackageFieldShape::Str),
+    ("default-run", PackageFieldShape::Str),
+    ("version", PackageFieldShape::StrOrInherited),
+    ("edition", PackageFieldShape::StrOrInherited),
+    ("rust-version", PackageFieldShape::StrOrInherited),
+    ("description", PackageFieldShape::StrOrInherited),
+    ("homepage", PackageFieldShape::StrOrInherited),
+    ("repository", PackageFieldShape::StrOrInherited),
+    ("license", PackageFieldShape::StrOrInherited),
+    ("license-file", PackageFieldShape::StrOrInherited),
+    ("documentation", PackageFieldShape::StrOrInherited),
+    ("readme", PackageFieldShape::StrBoolOrInherited),
+    ("authors", PackageFieldShape::StringArrayOrInherited),
+    ("keywords", PackageFieldShape::StringArrayOrInherited),
+    ("categories", PackageFieldShape::StringArrayOrInherited),
+    ("exclude", PackageFieldShape::StringArrayOrInherited),
+    ("include", PackageFieldShape::StringArrayOrInherited),
+    ("publish", PackageFieldShape::BoolArrayOrInherited),
+    ("build", PackageFieldShape::StrOrBool),
+];
+
+/// Whether every KNOWN field of a `[package]` table has a type Cargo accepts.
+///
+/// An absent field is fine; an unknown field is fine (Cargo tolerates it, as
+/// verified). Only a present, known, wrong-typed field is disqualifying.
+fn package_table_is_well_typed(package: &dyn toml_edit::TableLike) -> bool {
+    fn is_string_array(item: &toml_edit::Item) -> bool {
+        item.as_array()
+            .is_some_and(|values| values.iter().all(toml_edit::Value::is_str))
+    }
+    PACKAGE_FIELD_SHAPES.iter().all(|(field, shape)| {
+        package.get(field).is_none_or(|item| {
+            // The workspace-inheritance form is a table; accepting any table
+            // here is deliberate, since validating its contents is Cargo's job
+            // and a false rejection un-attributes a real crate.
+            let inherited = item.as_table_like().is_some();
+            match shape {
+                PackageFieldShape::Str => item.as_str().is_some(),
+                PackageFieldShape::StrOrInherited => item.as_str().is_some() || inherited,
+                PackageFieldShape::StringArrayOrInherited => is_string_array(item) || inherited,
+                PackageFieldShape::StrBoolOrInherited => {
+                    item.as_str().is_some() || item.as_bool().is_some() || inherited
+                }
+                PackageFieldShape::BoolArrayOrInherited => {
+                    item.as_bool().is_some() || is_string_array(item) || inherited
+                }
+                PackageFieldShape::StrOrBool => item.as_str().is_some() || item.as_bool().is_some(),
+            }
+        })
+    })
+}
+
+/// The three captured dependency tables in documented output order./// The three captured dependency tables in documented output order.
 const DEPENDENCY_KINDS: [DependencyKind; 3] = [
     DependencyKind::Normal,
     DependencyKind::Dev,
@@ -415,8 +511,17 @@ pub fn parse_manifest_dependencies(
     // `<section>` section, which is not allowed" — each verified against real
     // `cargo metadata`, while `[profile]`, `[patch]`, and `[replace]` were
     // verified accepted).
+    // A `[package]` whose known fields are wrong-typed is one Cargo refuses to
+    // load, so the package it names does not exist and its subtree must NOT be
+    // attributed to it — the same fail-closed treatment a malformed
+    // `[workspace]` gets.
+    let package_well_typed = package_table.is_some_and(package_table_is_well_typed);
     let shape = if package_table.is_some() {
-        ManifestShape::Package
+        if package_well_typed {
+            ManifestShape::Package
+        } else {
+            ManifestShape::Unusable
+        }
     } else if doc.get("package").is_none()
         && doc
             .get("workspace")
