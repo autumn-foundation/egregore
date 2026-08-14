@@ -566,6 +566,34 @@ pub fn parse_manifest_dependencies(
 
     let mut declarations = Vec::new();
     let mut uninterpretable = false;
+    // TARGET-SPECIFIC dependency tables (`[target.<spec>.dependencies]` and its
+    // dev/build siblings) are the only other place dependencies live, so
+    // scanning them CLOSES the set rather than adding another special case.
+    // Cargo validates entries there exactly as it does at the top level, and an
+    // invalid one makes the manifest unloadable — which is what attribution
+    // rests on. Emitting ROWS for them stays out of scope; this only decides
+    // whether the manifest loads.
+    if let Some(targets) = doc.get("target").and_then(toml_edit::Item::as_table_like) {
+        for (_, target) in targets.iter() {
+            let Some(target) = target.as_table_like() else {
+                continue;
+            };
+            for kind in DEPENDENCY_KINDS {
+                let Some(table) = target
+                    .get(kind.table())
+                    .and_then(toml_edit::Item::as_table_like)
+                else {
+                    continue;
+                };
+                if table
+                    .iter()
+                    .any(|(key, item)| declared_dependency(key, item, kind).is_none())
+                {
+                    uninterpretable = true;
+                }
+            }
+        }
+    }
     for kind in DEPENDENCY_KINDS {
         let Some(table) = doc
             .get(kind.table())

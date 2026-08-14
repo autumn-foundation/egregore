@@ -7579,6 +7579,20 @@ impl PackageCatalog {
             std::collections::BTreeMap::new();
         let mut attribution_observed = false;
         for record in records {
+            // FIRST statement in the loop, ahead of EVERY skip below.
+            //
+            // This is presence of the FIELD, not of an owner: a `status:
+            // unattributed` value proves attribution RAN over this corpus,
+            // which is what separates an ownerless corpus from a pre-#117 one.
+            // A record that is retracted, or a `Change` that no lane returns,
+            // still proves it ran — and no re-scan restores a deleted package
+            // or turns a `Change` into a current-state fact, so reporting the
+            // pre-#117 capability gap for such a corpus sends the operator
+            // after a remedy that cannot work.
+            //
+            // Placed first so a future exclusion cannot re-open that by adding
+            // another `continue`: every skip below withholds OWNERSHIP only.
+            attribution_observed |= record.crate_attribution().is_some();
             // A `Change` is a COMMIT EVENT, not a current-state fact: it is
             // minted once per (commit, path) and so is never superseded, which
             // means it survives every corpus narrowing including HEAD
@@ -7597,16 +7611,6 @@ impl PackageCatalog {
             ) {
                 continue;
             }
-            // Presence of the FIELD, not of an owner: a `status: unattributed`
-            // value proves attribution ran here, which is what separates an
-            // ownerless corpus from a pre-#117 one.
-            //
-            // Observed BEFORE the liveness skip below, deliberately. A retracted
-            // record still proves attribution RAN over this corpus, and no
-            // re-scan can restore a package that was deleted — so a store whose
-            // every attributed record is tombstoned must not be reported as the
-            // pre-#117 capability gap. Only OWNERSHIP is withheld.
-            attribution_observed |= record.crate_attribution().is_some();
             // A tombstoned non-temporal record can never appear in an answer —
             // the lanes drop it via `current_deleted_ids` — so counting its
             // package here makes a name look owned by two repositories when

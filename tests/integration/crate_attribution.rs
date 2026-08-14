@@ -6476,3 +6476,151 @@ fn an_uninterpretable_dependency_entry_stops_the_walk() {
         );
     }
 }
+
+/// A TARGET-SPECIFIC dependency entry counts toward manifest usability too.
+///
+/// `[target.'cfg(unix)'.dependencies]` and its dev/build siblings are the only
+/// other place dependencies live, so covering them CLOSES the set rather than
+/// adding one more case. Cargo rejects a malformed entry there exactly as it
+/// does at the top level, and an unloadable manifest declares no package.
+///
+/// Emitting rows for target-specific dependencies stays out of scope — this is
+/// about whether the manifest LOADS, which is what attribution rests on.
+#[test]
+fn a_malformed_target_specific_dependency_stops_the_walk() {
+    for (label, table, entry, expected) in [
+        (
+            "cfg dependencies",
+            "target.\"cfg(unix)\".dependencies",
+            "serde = true",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "cfg dev-dependencies",
+            "target.\"cfg(unix)\".dev-dependencies",
+            "serde = true",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "cfg build-dependencies",
+            "target.\"cfg(unix)\".build-dependencies",
+            "serde = true",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "named triple",
+            "target.x86_64-unknown-linux-gnu.dependencies",
+            "serde = true",
+            "unattributed:unusable_manifest",
+        ),
+        // Valid target-specific entries must keep owning the subtree.
+        (
+            "cfg dependencies, version string",
+            "target.\"cfg(unix)\".dependencies",
+            "serde = \"1\"",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "cfg dependencies, path source",
+            "target.\"cfg(unix)\".dependencies",
+            "serde = { path = \"../serde\" }",
+            "inner@nested/Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!(
+                        "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n\n[{table}]\n{entry}\n"
+                    ),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}`: {by_path:?}"
+        );
+    }
+}
+
+/// An all-`Change` corpus still ran attribution, so it is not a capability gap.
+///
+/// The sibling of the all-tombstoned case: the `Change` skip also ran before
+/// the field-presence observation. A history corpus whose only attributed
+/// records are `Change` nodes — a repository whose commits touch a
+/// dependency-free `Cargo.toml` and no supported source files — reported
+/// `crate_attribution_unavailable` and told the operator to re-scan, though the
+/// current producer demonstrably ran attribution.
+///
+/// The observation now happens before EVERY skip, so a future exclusion cannot
+/// re-open this by adding another `continue`.
+#[test]
+fn an_all_change_corpus_is_not_reported_as_a_capability_gap() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    // A dependency-free manifest mints no `File` node, and `.md` is not an
+    // indexed source — so the only attributed records are the `Change` nodes.
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"lonely\"\nversion = \"0.1.0\"\n",
+            ),
+            ("README.md", "# nothing indexed here\n"),
+        ],
+    );
+    commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    let graph_path = temp.path().join("history.jsonl");
+    fs::write(
+        &graph_path,
+        aletheia_egregore::scan_repository_history(&repo)
+            .expect("history replay")
+            .to_jsonl()
+            .expect("serialize"),
+    )
+    .expect("graph written");
+
+    // Precondition: attribution exists, and ONLY on `Change` records.
+    let records = parse_jsonl(&fs::read_to_string(&graph_path).expect("read"));
+    let attributed_kinds: BTreeSet<&str> = records
+        .iter()
+        .filter(|r| r["crate_attribution"].is_object())
+        .filter_map(|r| r["kind"].as_str())
+        .collect();
+    assert_eq!(
+        attributed_kinds,
+        BTreeSet::from(["Change"]),
+        "fixture must carry attribution only on Change records: {attributed_kinds:?}"
+    );
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "anything",
+        "--graph",
+        graph_path.to_str().unwrap(),
+        "--package",
+        "lonely",
+    ]);
+    assert_eq!(run.code, 1, "stdout: {}", run.stdout);
+    let diagnostic: Value =
+        serde_json::from_str(run.stderr.trim()).expect("one JSON diagnostic line");
+    assert_eq!(
+        diagnostic["code"], "unknown_package_selector",
+        "attribution ran here, so this is not the pre-#117 gap: {diagnostic}"
+    );
+}
