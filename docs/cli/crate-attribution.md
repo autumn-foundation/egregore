@@ -277,7 +277,15 @@ reader re-derives whether the value is one the resolver could actually have
    the canonical absolute-path forgery shape is worth more than that
    vanishingly unlikely name.
 
-4. The cited manifest **encloses the record**. Attribution comes from the
+4. The record's own path is one `normalize_path` could produce — relative,
+   `/`-separated, no `.`/`..` segment, no empty segment, no drive prefix, no
+   NUL. Ancestry is meaningless over a path no producer emits: the ancestor
+   walk always ends at the repository root, so a root manifest would "enclose"
+   `../outside.rs`, and a `..` segment reads as an ordinary ancestor, so
+   `crates/beta/../../outside.rs` would be enclosed by `crates/beta/Cargo.toml`
+   on its way out. It is the same rule as (3) minus the manifest-name
+   requirement, shared rather than restated.
+5. The cited manifest **encloses the record**. Attribution comes from the
    nearest *enclosing* manifest, so its directory is always an ancestor of — or
    equal to — the record's own directory. A node at `crates/beta/src/lib.rs`
    citing `crates/alpha/Cargo.toml` is a pairing no walk produces: syntactically

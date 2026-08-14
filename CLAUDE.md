@@ -440,7 +440,10 @@ the package catalog, the text render — re-checks that the value is one the
 resolver could have PRODUCED, in BOTH directions: an ownership claim needs a
 Cargo-valid package NAME (the same `package_name_is_valid` rule that gated it at
 production, shared not re-derived) plus a manifest path that both has the shape
-the ancestor walk produces AND actually ENCLOSES the record citing it (a node at
+the ancestor walk produces AND actually ENCLOSES the record citing it — the RECORD path being
+re-checked by the same shape rule first, since the ancestor walk ends at the
+repo root and a `..` segment reads as an ordinary ancestor, so an escaping path
+would otherwise be "enclosed" by the very directory it escapes (a node at
 `crates/beta/src/lib.rs` citing `crates/alpha/Cargo.toml` is a pairing no walk
 produces; containment reuses the walk's own segment-aware ancestor enumeration,
 so a manifest's self-attribution and a repo-root manifest both still pass) (relative, `/`-separated, no `.`/`..`/empty segment, no

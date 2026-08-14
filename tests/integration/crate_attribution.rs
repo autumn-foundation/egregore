@@ -5251,3 +5251,70 @@ fn self_attribution_and_root_manifests_still_pass_the_enclosing_check() {
         Some(&BTreeSet::from(["root@Cargo.toml".to_owned()]))
     );
 }
+
+/// A forged RECORD path is not owned by anything, end to end.
+///
+/// The mirror of the non-enclosing-manifest case: ancestry is meaningless over
+/// a path no producer emits. `ancestor_dirs` always ends at the repo root, so a
+/// root manifest would "enclose" `../outside.rs`; and a `..` segment reads as an
+/// ordinary ancestor, so `crates/beta/../../outside.rs` would be enclosed by
+/// `crates/beta/Cargo.toml` on its way out of the repository.
+#[test]
+fn a_forged_record_path_is_not_owned_by_the_cited_package() {
+    for (label, forged_path) in [
+        ("escapes the repository", "../outside.rs"),
+        (
+            "escapes through the cited directory",
+            "crates/beta/../../outside.rs",
+        ),
+        ("absolute", "/etc/passwd"),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "crates/beta/Cargo.toml",
+                    "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n",
+                ),
+                ("crates/beta/src/lib.rs", "pub fn owned() -> u32 { 1 }\n"),
+            ],
+        );
+        let mut lines: Vec<String> = Vec::new();
+        for mut record in scan_fixture(temp.path()) {
+            if record["kind"] == "Symbol" {
+                record["repo_relative_path"] = Value::from(forged_path);
+            }
+            lines.push(serde_json::to_string(&record).expect("serialize"));
+        }
+        let graph_path = temp.path().join("forged.jsonl");
+        fs::write(&graph_path, lines.join("\n")).expect("graph written");
+        let graph = graph_path.to_str().unwrap();
+
+        let text = run_query(&[
+            "query", "symbol", "owned", "--graph", graph, "--format", "text",
+        ]);
+        assert_eq!(text.code, 0, "`{label}` stderr: {}", text.stderr);
+        assert!(
+            !text.stdout.contains("package:"),
+            "`{label}`: a path the producer cannot emit owns nothing: {:?}",
+            text.stdout
+        );
+
+        // It is also not scopable under the package it still claims.
+        let scoped = run_query(&[
+            "query",
+            "symbol",
+            "owned",
+            "--graph",
+            graph,
+            "--package",
+            "beta",
+        ]);
+        assert_eq!(
+            scoped.code, 2,
+            "`{label}`: `beta` is real but owns no such row; stdout: {}",
+            scoped.stdout
+        );
+    }
+}

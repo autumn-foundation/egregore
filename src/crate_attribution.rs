@@ -179,6 +179,29 @@ const MANIFEST_FILE_NAME: &str = "Cargo.toml";
 /// the resolver proved".
 #[must_use]
 pub fn manifest_path_is_repo_relative(path: &str) -> bool {
+    // A manifest path is a repo-relative path that additionally CITES a
+    // manifest: its last segment must be exactly `Cargo.toml`, because the
+    // value's job is to name the manifest the attribution rests on.
+    is_repo_relative_path(path) && path.split('/').next_back() == Some(MANIFEST_FILE_NAME)
+}
+
+/// Whether `path` has the shape [`crate::normalize_path`] can PRODUCE.
+///
+/// That is: a non-empty, `/`-separated, relative path with no `.`/`..` segment,
+/// no empty segment, no leading `/`, no Windows drive prefix, and no NUL.
+///
+/// `normalize_path` keeps only `Component::Normal` and joins with `/`, so every
+/// one of those shapes is unreachable from any producer. The rule is shared
+/// rather than restated: [`manifest_path_is_repo_relative`] adds the
+/// manifest-name requirement on top, and [`manifest_encloses`] applies it to the
+/// RECORD path — where a `..` segment reads as an ordinary ancestor, so an
+/// escaping path could otherwise be "enclosed" by a directory it escapes out of.
+///
+/// See [`manifest_path_is_repo_relative`] for what is deliberately NOT
+/// disqualifying (backslashes, non-drive colons, control characters other than
+/// NUL) and why.
+#[must_use]
+pub fn is_repo_relative_path(path: &str) -> bool {
     if path.is_empty() || path.starts_with('/') {
         return false;
     }
@@ -215,9 +238,7 @@ pub fn manifest_path_is_repo_relative(path: &str) -> bool {
     {
         return false;
     }
-    // The path's job is to CITE the manifest the attribution rests on, so it
-    // must actually name one.
-    segments.last() == Some(&MANIFEST_FILE_NAME)
+    true
 }
 
 /// A deterministic map from directory to the manifest that sits in it.
@@ -378,6 +399,14 @@ pub fn manifest_encloses(
     manifest_repo_relative_path: &str,
     record_repo_relative_path: &str,
 ) -> bool {
+    // The RECORD path is operator-controlled too, and ancestry is meaningless
+    // over a path no producer emits: `ancestor_dirs` always ends at the repo
+    // root, so a root manifest would "enclose" `../outside.rs`, and a `..`
+    // segment reads as an ordinary ancestor, so `crates/a/../../outside.rs`
+    // would be enclosed by `crates/a/Cargo.toml` on its way out.
+    if !is_repo_relative_path(record_repo_relative_path) {
+        return false;
+    }
     let mut manifest_segments: Vec<&str> = manifest_repo_relative_path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -1090,6 +1119,70 @@ mod tests {
             .expect("a resolver-produced attribution must survive the reader's checks");
         assert_eq!(name, "alpha");
         assert_eq!(manifest, "crates/alpha/Cargo.toml");
+    }
+
+    /// A record path the producer could never emit must not be "enclosed" by
+    /// anything.
+    ///
+    /// `ancestor_dirs` always ends at the repo root, so a root manifest encloses
+    /// literally any string — including one that escapes the repository. And a
+    /// `..` segment appears as an ordinary ancestor, so an escaping path can
+    /// contain the cited directory on its way out. `normalize_path` keeps only
+    /// `Component::Normal`, so none of these shapes can be produced.
+    #[test]
+    fn a_malformed_record_path_is_enclosed_by_nothing() {
+        for (label, manifest, record) in [
+            (
+                "root manifest, escaping record",
+                "Cargo.toml",
+                "../outside.rs",
+            ),
+            (
+                "escape through the cited directory",
+                "crates/a/Cargo.toml",
+                "crates/a/../../outside.rs",
+            ),
+            ("absolute record path", "Cargo.toml", "/etc/passwd"),
+            ("empty interior segment", "Cargo.toml", "crates//x.rs"),
+            ("dot segment", "crates/a/Cargo.toml", "crates/a/./x.rs"),
+            ("empty record path", "Cargo.toml", ""),
+            ("nul in the record path", "Cargo.toml", "crates/\u{0}x.rs"),
+            (
+                "windows drive record path",
+                "Cargo.toml",
+                "C:/crates/a/x.rs",
+            ),
+        ] {
+            assert!(
+                !manifest_encloses(manifest, record),
+                "`{label}`: `{record}` is not a path the producer emits"
+            );
+        }
+    }
+
+    /// The record-path check must not reject what the producer really emits.
+    #[test]
+    fn a_normal_record_path_is_still_enclosed() {
+        for (manifest, record) in [
+            ("Cargo.toml", "src/lib.rs"),
+            ("Cargo.toml", "Cargo.toml"),
+            ("crates/a/Cargo.toml", "crates/a/src/lib.rs"),
+            ("crates/a/Cargo.toml", "crates/a/Cargo.toml"),
+            // Legal Unix filename bytes (issues #489 rounds 12-14).
+            ("crates/odd\\dir/Cargo.toml", "crates/odd\\dir/src/lib.rs"),
+            ("crates/od\td/Cargo.toml", "crates/od\td/src/lib.rs"),
+            ("vendor:patched/Cargo.toml", "vendor:patched/src/lib.rs"),
+        ] {
+            assert!(
+                manifest_encloses(manifest, record),
+                "`{manifest}` encloses `{record}`"
+            );
+        }
+        // Segment-aware in the record direction too.
+        assert!(!manifest_encloses(
+            "crates/alpha/Cargo.toml",
+            "crates/alphabet/src/x.rs"
+        ));
     }
 
     #[test]
