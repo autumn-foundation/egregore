@@ -231,7 +231,14 @@ reader re-derives whether the value is one the resolver could actually have
    the drive shape (`vendor:patched/…`), and a control character such as a tab
    or newline (`od\td/…`) are therefore **not** disqualifying: all three survive
    path normalization and the scan's NUL-delimited git listings, so they name
-   manifests the walk really reaches. Rejecting them dropped the manifest fact
+   manifests the walk really reaches.
+
+   **NUL is the exception**, and the only one: POSIX forbids it in a filename,
+   and it is the delimiter of the `-z` listings the harvest reads, so no
+   discovery path can deliver one. A NUL-bearing path provably names nothing,
+   so it is rejected — otherwise a crafted record could claim scopable
+   ownership and hand back a citation that sanitization silently rewrites into
+   a path that never existed. Rejecting them dropped the manifest fact
    and the subtree inherited an **outer** package — a fabricated attribution.
    Text-output safety is handled where the value is printed (below), not by
    refusing to record a real directory.

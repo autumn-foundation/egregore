@@ -429,7 +429,9 @@ ancestor walk produces (relative, `/`-separated, no `.`/`..`/empty segment, no
 Windows drive prefix, last segment `Cargo.toml`) — the test being what the walk
 could have PRODUCED, so a backslash, a non-drive colon, and a control character
 are all ALLOWED, being ordinary Unix filename bytes the NUL-delimited git
-listings deliver intact; rejecting them dropped the manifest fact and the
+listings deliver intact — NUL ALONE is rejected, being the one byte POSIX
+forbids in a filename and the delimiter of those listings, so it provably names
+nothing; rejecting them dropped the manifest fact and the
 subtree INHERITED AN OUTER PACKAGE, the fabrication this feature exists to
 prevent. Text-output safety is discharged at the RENDER (the manifest path is
 control-sanitized, never truncated), not by refusing to record a real

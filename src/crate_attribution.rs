@@ -182,6 +182,16 @@ pub fn manifest_path_is_repo_relative(path: &str) -> bool {
     if path.is_empty() || path.starts_with('/') {
         return false;
     }
+    // NUL is the ONE byte a POSIX filename cannot contain — it terminates the
+    // C string the kernel is handed, and it is the DELIMITER of the `-z` git
+    // listings the harvest reads, so no discovery path can deliver one. A tab
+    // or a newline names a real directory and is accepted (see above); a NUL
+    // provably names nothing, and accepting it would let a crafted record claim
+    // scopable ownership and hand back a citation that sanitization rewrites
+    // into a path that never existed.
+    if path.contains('\0') {
+        return false;
+    }
     let mut segments = path.split('/');
     // A Windows drive-absolute path (`C:/crates/Cargo.toml`) is not
     // repo-relative. Matched as the EXACT drive shape — one ASCII letter and a
@@ -970,7 +980,14 @@ mod tests {
                 "newline in the manifest name",
                 "crates/x/Cargo.toml\nforged",
             ),
+            // NUL is the exception among control characters: POSIX forbids it
+            // in a filename and it delimits the `-z` listings, so the walk can
+            // never produce one. Both positions are rejected — the second by
+            // the NUL rule ALONE, since its last segment is a valid manifest
+            // name and its first carries no drive prefix.
             ("nul in the manifest name", "crates/x/\u{0}Cargo.toml"),
+            ("nul in a directory segment", "crates/\u{0}x/Cargo.toml"),
+            ("nul alone", "crates/x\u{0}/Cargo.toml"),
             ("not a manifest", "crates/x/src/lib.rs"),
             ("case-shifted", "crates/x/cargo.toml"),
             ("manifest-suffixed name", "crates/x/NotCargo.toml"),

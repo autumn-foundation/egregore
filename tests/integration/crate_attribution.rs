@@ -4549,3 +4549,85 @@ fn a_control_character_in_a_manifest_path_cannot_forge_a_text_line() {
         run.stdout
     );
 }
+
+/// NUL is the ONE byte a POSIX path cannot contain, so a manifest path carrying
+/// one is provably not a value the walk produced.
+///
+/// This is the line the previous round's relaxation has to stop at. A tab or a
+/// newline names a REAL directory — the render displays it lossily but the
+/// stored value still resolves — whereas NUL terminates a C string, is
+/// forbidden in a filename by POSIX, and is the DELIMITER of the `-z` listings
+/// the harvest reads, so no discovery path can deliver it. Accepting one would
+/// let a crafted record claim scopable ownership and hand back a citation that
+/// sanitization silently rewrites into a path that never existed.
+#[test]
+fn a_nul_in_a_manifest_path_is_not_a_believable_citation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"realpkg\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn nul_target() -> u32 { 1 }\n"),
+        ],
+    );
+    let mut lines: Vec<String> = Vec::new();
+    for mut record in scan_fixture(temp.path()) {
+        if record["kind"] == "Symbol"
+            && let Some(attribution) = record.get_mut("crate_attribution")
+        {
+            // A NUL inside a DIRECTORY segment: the manifest name itself stays
+            // intact, so only the NUL rule can reject this.
+            attribution["manifest_repo_relative_path"] = Value::from("crates/\u{0}x/Cargo.toml");
+        }
+        lines.push(serde_json::to_string(&record).expect("serialize"));
+    }
+    let graph_path = temp.path().join("forged.jsonl");
+    fs::write(&graph_path, lines.join("\n")).expect("graph written");
+    let graph = graph_path.to_str().unwrap();
+
+    // It renders NOTHING — exactly what an absent attribution renders, never a
+    // sanitized citation to a path that cannot exist.
+    let text = run_query(&[
+        "query",
+        "symbol",
+        "nul_target",
+        "--graph",
+        graph,
+        "--format",
+        "text",
+    ]);
+    assert_eq!(text.code, 0, "stderr: {}", text.stderr);
+    assert!(
+        !text.stdout.contains("package:"),
+        "a NUL-bearing path must not render a citation: {:?}",
+        text.stdout
+    );
+
+    // And the forged row is not SCOPABLE under the package it names. `realpkg`
+    // is a real package here — the file and module records carry a legitimate
+    // attribution to it — so the honest verdict is the lane's ordinary "known
+    // package, zero matching rows" (exit 2), not an unknown selector. What must
+    // not happen is the forged symbol answering as if it belonged.
+    let scoped = run_query(&[
+        "query",
+        "symbol",
+        "nul_target",
+        "--graph",
+        graph,
+        "--package",
+        "realpkg",
+    ]);
+    assert_eq!(
+        scoped.code, 2,
+        "a forged attribution must not make the symbol scopable; stdout: {}",
+        scoped.stdout
+    );
+    assert!(
+        !scoped.stdout.contains("nul_target"),
+        "no row may be returned for the forged attribution: {:?}",
+        scoped.stdout
+    );
+}
