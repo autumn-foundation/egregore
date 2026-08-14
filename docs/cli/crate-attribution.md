@@ -198,7 +198,16 @@ crate that is also the workspace root) is unloadable if either table is
 malformed. And a dependency entry Cargo cannot interpret — a non-string,
 non-table value, a table naming no usable source, a wrong-typed known key, an
 unparseable requirement, or an invalid name — makes the manifest unloadable too,
-so the package it declares owns nothing. That covers the target-specific tables
+so the package it declares owns nothing. The known-key set was closed by probing
+the whole dependency-spec key space against real `cargo metadata`: beyond the
+source and feature keys it covers `artifact` (string or list of strings),
+`lib`/`public` (bool), and `target`/`registry-index`/`base` (string). Their
+types are context-free — a `[workspace.dependencies]` template loosens
+`workspace` and `optional`, but rejects each of these identically — and, as on
+the `[package]` table, only the TYPE disqualifies: `artifact`/`lib`/`target`
+need `-Z bindeps` and `base` needs path-bases, so a well-typed value is accepted
+even though stable Cargo refuses the manifest, since refusing it would
+un-attribute a real nightly crate. That covers the target-specific tables
 (`[target.<spec>.dependencies]` and its dev/build siblings) as well, which are
 the only other place dependencies live; emitting *rows* for them stays out of
 scope, since this only decides whether the manifest loads. Under `target` the

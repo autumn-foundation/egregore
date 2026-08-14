@@ -7272,3 +7272,105 @@ fn package_field_shapes_track_cargos_deserializer_not_its_feature_gates() {
         );
     }
 }
+
+/// A dependency SPEC's known fields are type-checked too.
+///
+/// `dependency_spec_is_loadable` matched thirteen keys and fell through to
+/// `_ => true` for the rest, treating six fields Cargo really does type-check as
+/// unknown keys. A manifest carrying `foo = { version = "1", artifact = 1 }` is
+/// one Cargo cannot load, so the package it names does not exist — but it was
+/// classified `Package` and its whole subtree attributed to it.
+///
+/// Probed the same way as the `[package]` table, which is how the two beyond
+/// the reported four turned up:
+///
+/// | field | accepted shape |
+/// |---|---|
+/// | `artifact` | string or list of strings |
+/// | `lib`, `public` | bool |
+/// | `target`, `registry-index`, `base` | string |
+///
+/// The well-typed values stay ACCEPTED under the rule established for the
+/// `[package]` table: `artifact`/`lib`/`target` need `-Z bindeps` and `base`
+/// needs path-bases, and modelling gates rather than the deserializer would
+/// un-attribute a real nightly crate. `public` and `registry-index` are not even
+/// gated — they load on stable. The type rules hold identically in a
+/// `[workspace.dependencies]` TEMPLATE, where the `workspace`/`optional` rules
+/// are looser, so this is checked in both contexts by one shared matcher.
+#[test]
+fn dependency_spec_known_fields_are_type_checked() {
+    for (label, spec_tail, expected) in [
+        (
+            "artifact int",
+            "artifact = 1",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "artifact non-string element",
+            "artifact = [1]",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "lib string",
+            "lib = \"yes\"",
+            "unattributed:unusable_manifest",
+        ),
+        ("target int", "target = 1", "unattributed:unusable_manifest"),
+        ("public int", "public = 1", "unattributed:unusable_manifest"),
+        (
+            "registry-index int",
+            "registry-index = 1",
+            "unattributed:unusable_manifest",
+        ),
+        ("base int", "base = 1", "unattributed:unusable_manifest"),
+        // Well-typed, gated or not: the manifest still names a package.
+        (
+            "artifact string",
+            "artifact = \"bin\"",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "artifact string list",
+            "artifact = [\"bin\"]",
+            "inner@nested/Cargo.toml",
+        ),
+        ("lib bool", "lib = true", "inner@nested/Cargo.toml"),
+        (
+            "target string",
+            "target = \"x86_64-unknown-linux-gnu\"",
+            "inner@nested/Cargo.toml",
+        ),
+        ("public bool", "public = true", "inner@nested/Cargo.toml"),
+        (
+            "registry-index string",
+            "registry-index = \"https://example.invalid\"",
+            "inner@nested/Cargo.toml",
+        ),
+        ("base string", "base = \"b\"", "inner@nested/Cargo.toml"),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!(
+                        "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n\n\
+                         [dependencies]\nfoo = {{ version = \"1\", {spec_tail} }}\n"
+                    ),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}` (`{spec_tail}`): {by_path:?}"
+        );
+    }
+}

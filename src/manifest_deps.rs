@@ -822,10 +822,21 @@ fn dependency_table_is_well_typed(
     {
         return false;
     }
+    // `registry-index`, `base`, `target`, `public`, `lib`, and `artifact` below
+    // are the rest of the type-checked spec keys, found by probing the whole
+    // dependency-spec key space against real `cargo metadata` rather than taking
+    // the reported ones. Their TYPES are context-free: a
+    // `[workspace.dependencies]` template loosens `workspace` and `optional`,
+    // but rejects every one of these identically, so they ride the plain arms.
+    //
+    // As in `PACKAGE_FIELD_SHAPES`, this models Cargo's DESERIALIZER and not its
+    // gates: `artifact`/`lib`/`target` need `-Z bindeps` and `base` needs
+    // path-bases, so their well-typed values are accepted here even though
+    // stable Cargo refuses the manifest — refusing them would un-attribute a
+    // real nightly crate. `public` and `registry-index` are not gated at all.
     spec.iter().all(|(key, item)| match key {
-        "version" | "path" | "git" | "registry" | "branch" | "tag" | "rev" | "package" => {
-            item.as_str().is_some()
-        }
+        "version" | "path" | "git" | "registry" | "branch" | "tag" | "rev" | "package"
+        | "registry-index" | "base" | "target" => item.as_str().is_some(),
         "workspace" => match context {
             DependencyTableContext::Member { .. } => item.as_bool() == Some(true),
             DependencyTableContext::Template => true,
@@ -840,10 +851,16 @@ fn dependency_table_is_well_typed(
             ),
             None => false,
         },
-        "default-features" | "default_features" => item.as_bool().is_some(),
+        "default-features" | "default_features" | "public" | "lib" => item.as_bool().is_some(),
         "features" => item
             .as_array()
             .is_some_and(|array| array.iter().all(|value| value.as_str().is_some())),
+        "artifact" => {
+            item.as_str().is_some()
+                || item
+                    .as_array()
+                    .is_some_and(|array| array.iter().all(|value| value.as_str().is_some()))
+        }
         _ => true,
     })
 }
