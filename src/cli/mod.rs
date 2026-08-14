@@ -5667,7 +5667,16 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // answer comes from a narrower one refuses an answerable HEAD query
             // whose only collision is historical, and calls a package known at
             // an instant before it existed.
-            if let Some(selector_name) = package.as_deref() {
+            // A malformed `--as-of` is diagnosed by the lane itself. Package
+            // validation must not pre-empt it: the corpus could not be narrowed
+            // to the requested instant, so any verdict computed over it answers
+            // a question the caller did not ask — and telling someone to
+            // disambiguate a package name while silently ignoring an
+            // uninterpretable timestamp points at the wrong input.
+            let as_of_is_malformed = as_of
+                .as_deref()
+                .is_some_and(|raw| chrono::DateTime::parse_from_rfc3339(raw).is_err());
+            if let Some(selector_name) = package.as_deref().filter(|_| !as_of_is_malformed) {
                 let corpus = package_catalog_corpus(
                     &records,
                     &index,

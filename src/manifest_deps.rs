@@ -225,8 +225,13 @@ enum PackageFieldShape {
 /// known field, not its VALUE. Cargo also rejects `version = "notsemver"` and
 /// `edition = "1066"`, which this resolver does not evaluate — it confirms a
 /// manifest's shape rather than reimplementing Cargo's schema.
-const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 25] = [
+const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 26] = [
     ("name", PackageFieldShape::Str),
+    // The workspace POINTER (`workspace = "../.."`), naming the root this
+    // package belongs to. Distinct from the `x.workspace = true` INHERITANCE
+    // form, which appears as a table inside another field; Cargo rejects a
+    // non-string here.
+    ("workspace", PackageFieldShape::Str),
     ("links", PackageFieldShape::Str),
     ("default-run", PackageFieldShape::Str),
     ("version", PackageFieldShape::StrOrInherited),
@@ -253,6 +258,15 @@ const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 25] = [
     ("autobenches", PackageFieldShape::Bool),
 ];
 
+/// SCOPE, verified rather than assumed: this checks the `[package]` TABLE's own
+/// fields. Wrong-typed TOP-LEVEL sections are NOT checked, because Cargo
+/// tolerates them — `lib = 1`, `bin = 1`, `features = 1`, `dependencies = 1`,
+/// `profile = 1`, `badges = 1`, and `target = 1` beside a valid `[package]` all
+/// load cleanly under `cargo metadata --no-deps` AND `cargo build` on the
+/// pinned toolchain (1.94.1). Only a well-formed SECTION with a bad inner value
+/// (`[lib]` with `name = 1`) is rejected, and that is value-level validation
+/// this resolver deliberately does not reimplement. Adding a top-level section
+/// check would reject manifests Cargo accepts and un-attribute real crates.
 /// Whether every KNOWN field of a `[package]` table has a type Cargo accepts.
 ///
 /// An absent field is fine; an unknown field is fine (Cargo tolerates it, as

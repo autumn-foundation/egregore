@@ -6065,3 +6065,151 @@ fn an_all_tombstoned_corpus_is_not_reported_as_a_capability_gap() {
         "attribution ran here; a re-scan cannot restore a retracted package: {diagnostic}"
     );
 }
+
+/// The `[package].workspace` POINTER is a string, and not inheritable.
+///
+/// It names the workspace root a package belongs to (`workspace = "../.."`).
+/// Cargo rejects a non-string with "invalid type: integer, expected a string",
+/// so a manifest carrying one cannot be loaded and must not own its subtree.
+/// Distinct from the `x.workspace = true` INHERITANCE form, which appears as a
+/// table INSIDE another field — this is a top-level `[package]` key.
+#[test]
+fn a_malformed_package_workspace_pointer_does_not_own_its_subtree() {
+    for (label, value, expected) in [
+        ("int", "1", "unattributed:unusable_manifest"),
+        ("bool", "true", "unattributed:unusable_manifest"),
+        ("string", "\"..\"", "inner@nested/Cargo.toml"),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!(
+                        "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nworkspace = {value}\n"
+                    ),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`workspace = {value}` ({label}): {by_path:?}"
+        );
+    }
+}
+
+/// A malformed `--as-of` must report ITS OWN error, not a package verdict.
+///
+/// Package validation runs before the lane parses the timestamp, so with an
+/// ambiguous package name the caller was told to disambiguate a selector while
+/// the actual problem — an unparseable instant — went unmentioned. The
+/// timestamp is the input that cannot be interpreted at all, so it must be
+/// diagnosed first; a package verdict computed over a corpus that could not be
+/// narrowed is not meaningful anyway.
+#[test]
+fn a_malformed_as_of_reports_the_timestamp_not_the_package() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut combined = String::new();
+    // Two repositories owning the same package name, so an unguarded package
+    // validation would exit 1 with `ambiguous_package_selector`.
+    for repo_id in ["repo-a", "repo-b"] {
+        let repo = temp.path().join(repo_id);
+        fs::create_dir_all(&repo).expect("repo dir");
+        write_fixture(
+            &repo,
+            &[
+                (
+                    "crates/shared/Cargo.toml",
+                    "[package]\nname = \"shared\"\nversion = \"0.1.0\"\n",
+                ),
+                ("crates/shared/src/lib.rs", "pub fn helper() -> u32 { 1 }\n"),
+            ],
+        );
+        combined.push_str(
+            &scan_repository_at_with_override(&repo, FIXED_TIME, Some(repo_id))
+                .expect("scan")
+                .to_jsonl()
+                .expect("serialize"),
+        );
+        combined.push('\n');
+    }
+    let graph = temp.path().join("combined.jsonl");
+    fs::write(&graph, &combined).expect("graph written");
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "helper",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--as-of",
+        "not-a-timestamp",
+        "--package",
+        "shared",
+    ]);
+    assert!(
+        !run.stderr.contains("ambiguous_package_selector"),
+        "the unparseable instant must be diagnosed, not the package: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("not-a-timestamp"),
+        "the diagnostic must name the bad timestamp: {}",
+        run.stderr
+    );
+}
+
+/// DECIDED: a wrong-typed TOP-LEVEL section does not disqualify a manifest,
+/// because Cargo accepts it.
+///
+/// Verified on the pinned toolchain (cargo 1.94.1): `lib = 1` beside a valid
+/// `[package]` loads cleanly under both `cargo metadata --no-deps
+/// --format-version 1` and `cargo build`. Only a well-formed `[lib]` TABLE with
+/// a bad inner value is rejected, which is value-level validation this resolver
+/// does not reimplement.
+///
+/// Rejecting these would un-attribute crates Cargo builds happily — the
+/// over-rejection failure this feature guards against — so the manifest stays a
+/// usable package and keeps owning its subtree.
+#[test]
+fn a_wrong_typed_top_level_section_still_owns_its_subtree() {
+    for section in [
+        "lib",
+        "bin",
+        "features",
+        "dependencies",
+        "profile",
+        "badges",
+        "target",
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!("[package]\nname = \"inner\"\nversion = \"0.1.0\"\n{section} = 1\n"),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from(["inner@nested/Cargo.toml".to_owned()])),
+            "`{section} = 1` is accepted by Cargo, so it must keep owning: {by_path:?}"
+        );
+    }
+}
