@@ -223,8 +223,15 @@ reader re-derives whether the value is one the resolver could actually have
 2. The package name satisfies Cargo's manifest-load charset — the same rule that
    gated it at production, shared rather than re-derived.
 3. The manifest path has the shape the ancestor walk produces: a relative,
-   `/`-separated path with no `.`/`..` segment, no empty segment, no backslash,
-   no drive prefix, no control character, whose last segment is `Cargo.toml`.
+   `/`-separated path with no `.`/`..` segment, no empty segment, no drive
+   prefix, no control character, whose last segment is `Cargo.toml`.
+
+   A backslash is **not** disqualifying. On Unix it is an ordinary filename
+   character that survives path normalization and the scan's NUL-delimited git
+   listings, so `crates/odd\dir/Cargo.toml` is a manifest the walk really
+   reaches — rejecting it would un-attribute a whole real subtree. A
+   Windows-*separated* path (`crates\x\Cargo.toml`) is still rejected by the
+   manifest-name rule: its only `/`-segment is the entire string.
 
 A value failing any check **owns nothing**: it is not scopable, never appears in
 `known_packages`, and renders nothing — indistinguishable downstream from an

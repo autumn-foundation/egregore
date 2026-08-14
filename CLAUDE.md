@@ -426,7 +426,9 @@ resolver could have PRODUCED, in BOTH directions: an ownership claim needs a
 Cargo-valid package NAME (the same `package_name_is_valid` rule that gated it at
 production, shared not re-derived) plus a manifest path of the shape the
 ancestor walk produces (relative, `/`-separated, no `.`/`..`/empty segment, no
-backslash, no drive prefix, no control character, last segment `Cargo.toml`),
+drive prefix, no control character, last segment `Cargo.toml` — a LITERAL
+backslash is allowed, being an ordinary Unix filename character the walk really
+reaches, while a backslash-SEPARATED path fails the last-segment rule),
 and the NEGATIVE claim needs the full unattributed shape (status
 `unattributed`, a reason, and NEITHER string) — because "provably no owning
 package" is a FACT, not a fallback for a value that failed the positive check.

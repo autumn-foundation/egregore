@@ -138,8 +138,17 @@ const MANIFEST_FILE_NAME: &str = "Cargo.toml";
 ///
 /// This is the shape the ancestor walk can PRODUCE: a non-empty, `/`-separated,
 /// relative path whose last segment is `Cargo.toml`, with no `.`/`..` segment,
-/// no empty interior segment, no leading `/`, no backslash, no Windows drive
-/// prefix, and no control characters.
+/// no empty interior segment, no leading `/`, no Windows drive prefix, and no
+/// control characters.
+///
+/// A backslash is NOT disqualifying. On Unix it is an ordinary filename
+/// character, `normalize_path` joins `Path::components()` with `/` and so
+/// preserves it inside a component, and the scan's NUL-delimited git listings
+/// carry it intact — so `crates/odd\dir/Cargo.toml` is a manifest the walk
+/// really does reach, and rejecting it would un-attribute a whole real subtree.
+/// A Windows-SEPARATED path (`crates\x\Cargo.toml`) is still rejected, by the
+/// rule that already governs it: its only `/`-segment is the entire string,
+/// which is not `Cargo.toml`.
 ///
 /// One rule, two callers, deliberately: the producer drops a fact it cannot
 /// place ([`ManifestPackageFact::directory_key`]), and the reader refuses to
@@ -150,7 +159,7 @@ const MANIFEST_FILE_NAME: &str = "Cargo.toml";
 /// the resolver proved".
 #[must_use]
 pub fn manifest_path_is_repo_relative(path: &str) -> bool {
-    if path.is_empty() || path.starts_with('/') || path.contains('\\') {
+    if path.is_empty() || path.starts_with('/') {
         return false;
     }
     if path.chars().any(char::is_control) {
@@ -894,6 +903,10 @@ mod tests {
             "crates/with space/Cargo.toml",
             "crates/café/Cargo.toml",
             "crates/..hidden/Cargo.toml",
+            // A backslash is an ordinary filename character on Unix, so this
+            // is a manifest the walk really reaches — rejecting it would
+            // un-attribute a real subtree.
+            "crates/odd\\dir/Cargo.toml",
         ] {
             assert!(
                 manifest_path_is_repo_relative(accepted),
@@ -909,7 +922,15 @@ mod tests {
             ("empty interior segment", "crates//Cargo.toml"),
             ("trailing slash", "crates/x/Cargo.toml/"),
             ("windows drive", "C:/crates/Cargo.toml"),
-            ("backslash", "crates\\x\\Cargo.toml"),
+            (
+                "windows drive, backslash-separated",
+                "C:\\crates\\Cargo.toml",
+            ),
+            // Backslash-SEPARATED, so its only `/`-segment is the whole string
+            // and the manifest-name rule rejects it — no blanket backslash ban
+            // needed, and none is applied.
+            ("backslash-separated", "crates\\x\\Cargo.toml"),
+            ("backslash-separated, single dir", "crates\\Cargo.toml"),
             ("newline", "crates/x/Cargo.toml\nforged"),
             ("nul", "crates/x/\u{0}Cargo.toml"),
             ("ansi escape", "crates/\u{1b}[31m/Cargo.toml"),

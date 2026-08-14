@@ -4358,3 +4358,84 @@ fn malformed_workspace_fields_stop_the_walk() {
         );
     }
 }
+
+/// On Unix a backslash is an ordinary FILENAME character, not a path
+/// separator, so a real package directory can contain one.
+///
+/// `normalize_path` joins `Path::components()` with `/`, which preserves a
+/// literal `\` inside a component, and the scan's `git ls-files -z` /
+/// `ls-tree -z` listings read NUL-delimited bytes, so such a path reaches the
+/// resolver intact. Rejecting every backslash-bearing manifest path therefore
+/// dropped a REAL manifest from the index, un-attributing its whole subtree and
+/// making its package unreachable via `--package`.
+///
+/// The forgery this guard was aimed at — a Windows-separated
+/// `crates\x\Cargo.toml` — is still rejected, by the rule that already governs
+/// it: the last `/`-segment must be exactly `Cargo.toml`, and a fully
+/// backslash-separated path has no such segment.
+#[cfg(unix)]
+#[test]
+fn a_literal_backslash_in_a_directory_name_is_attributed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/odd\"]\n"),
+            (
+                // Declares a dependency, so the manifest itself gets a `File`
+                // node (a dependency-free manifest mints none) and the
+                // assertion below can prove the package is really in the index
+                // rather than merely absent from the miss list.
+                "crates/odd\\dir/Cargo.toml",
+                "[package]\nname = \"oddball\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+            ),
+            ("crates/odd\\dir/src/lib.rs", "pub fn odd() -> u32 { 1 }\n"),
+        ],
+    );
+
+    let by_path = attribution_by_path(&scan_fixture(temp.path()));
+    assert_eq!(
+        by_path.get("crates/odd\\dir/src/lib.rs"),
+        Some(&BTreeSet::from([
+            "oddball@crates/odd\\dir/Cargo.toml".to_owned()
+        ])),
+        "a literal backslash is part of the directory NAME, not a separator: {by_path:?}"
+    );
+    // And the manifest node self-attributes, so the package is really in the
+    // index rather than merely absent from the miss list.
+    assert_eq!(
+        by_path.get("crates/odd\\dir/Cargo.toml"),
+        Some(&BTreeSet::from([
+            "oddball@crates/odd\\dir/Cargo.toml".to_owned()
+        ]))
+    );
+
+    // The Git-object harvest must agree with the working-tree one — the whole
+    // point of one shared resolver. History reads paths through `ls-tree -z`,
+    // whose NUL delimiters carry a backslash byte intact where the default
+    // C-quoting would not.
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    for (relative, contents) in [
+        ("Cargo.toml", "[workspace]\nmembers = [\"crates/odd\"]\n"),
+        (
+            "crates/odd\\dir/Cargo.toml",
+            "[package]\nname = \"oddball\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        ),
+        ("crates/odd\\dir/src/lib.rs", "pub fn odd() -> u32 { 1 }\n"),
+    ] {
+        let path = repo.join(relative);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        fs::write(path, contents).expect("write");
+    }
+    init_git(&repo);
+    let sha = commit(&repo, "seed", "2026-06-01T00:00:00Z");
+    let by_commit = history_attribution(&repo);
+    assert_eq!(
+        by_commit[&sha].get("crates/odd\\dir/src/lib.rs"),
+        Some(&BTreeSet::from([
+            "oddball@crates/odd\\dir/Cargo.toml".to_owned()
+        ])),
+        "history must agree with the working-tree harvest: {by_commit:?}"
+    );
+}
