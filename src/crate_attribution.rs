@@ -138,17 +138,37 @@ const MANIFEST_FILE_NAME: &str = "Cargo.toml";
 ///
 /// This is the shape the ancestor walk can PRODUCE: a non-empty, `/`-separated,
 /// relative path whose last segment is `Cargo.toml`, with no `.`/`..` segment,
-/// no empty interior segment, no leading `/`, no Windows drive prefix, and no
-/// control characters.
+/// no empty interior segment, no leading `/`, and no Windows drive prefix.
 ///
-/// A backslash is NOT disqualifying. On Unix it is an ordinary filename
-/// character, `normalize_path` joins `Path::components()` with `/` and so
-/// preserves it inside a component, and the scan's NUL-delimited git listings
-/// carry it intact — so `crates/odd\dir/Cargo.toml` is a manifest the walk
-/// really does reach, and rejecting it would un-attribute a whole real subtree.
-/// A Windows-SEPARATED path (`crates\x\Cargo.toml`) is still rejected, by the
-/// rule that already governs it: its only `/`-segment is the entire string,
-/// which is not `Cargo.toml`.
+/// # What is deliberately NOT disqualifying
+///
+/// The predicate tests whether the ancestor walk could have PRODUCED the value,
+/// and on Unix a filename may contain almost any byte. `normalize_path` joins
+/// `Path::components()` with `/`, and the scan's NUL-delimited `ls-files` /
+/// `ls-tree` listings are never C-quoted, so all of these survive into a real
+/// graph path and must keep owning their subtrees:
+///
+/// - a **backslash** (`crates/odd\dir/Cargo.toml`) — an ordinary character here,
+///   not a separator;
+/// - a **colon** outside the drive shape (`vendor:patched/Cargo.toml`);
+/// - a **control character**, tab or newline included (`od\td/Cargo.toml`).
+///
+/// Rejecting any of them dropped the manifest fact from the index, and the
+/// subtree then inherited an OUTER package — a fabricated attribution, the one
+/// outcome this feature exists to prevent. Text-output safety is a rendering
+/// concern, discharged where the value is printed (`sanitized_handle`), not by
+/// refusing to record a fact about a directory that really exists.
+///
+/// Windows-shaped forgeries are still rejected, by rules that already govern
+/// them: a backslash-SEPARATED path (`crates\x\Cargo.toml`) has one `/`-segment
+/// which is not `Cargo.toml`, and a drive prefix is matched as the exact
+/// letter-plus-colon first segment.
+///
+/// RESIDUAL, stated rather than hidden: a Unix directory named exactly like a
+/// drive letter (`C:/crates/Cargo.toml`) is rejected though the walk could
+/// reach it. That shape is the canonical absolute-path forgery and a
+/// vanishingly unlikely real directory name, so the guard is kept and the
+/// false negative accepted.
 ///
 /// One rule, two callers, deliberately: the producer drops a fact it cannot
 /// place ([`ManifestPackageFact::directory_key`]), and the reader refuses to
@@ -162,15 +182,20 @@ pub fn manifest_path_is_repo_relative(path: &str) -> bool {
     if path.is_empty() || path.starts_with('/') {
         return false;
     }
-    if path.chars().any(char::is_control) {
-        return false;
-    }
     let mut segments = path.split('/');
     // A Windows drive-absolute path (`C:/crates/Cargo.toml`) is not
-    // repo-relative. Only the FIRST segment can carry a drive prefix, so a
-    // colon elsewhere — legal in a POSIX directory name — is left alone rather
-    // than turned into a false negative.
-    if segments.next().is_some_and(|first| first.contains(':')) {
+    // repo-relative. Matched as the EXACT drive shape — one ASCII letter and a
+    // colon, as the whole first segment — because a colon is an ordinary
+    // character in a POSIX directory name: `vendor:patched/Cargo.toml` is a
+    // manifest the walk really reaches, and rejecting it would un-attribute its
+    // subtree.
+    if segments.next().is_some_and(|first| {
+        let mut chars = first.chars();
+        matches!(
+            (chars.next(), chars.next(), chars.next()),
+            (Some(letter), Some(':'), None) if letter.is_ascii_alphabetic()
+        )
+    }) {
         return false;
     }
     let segments: Vec<&str> = path.split('/').collect();
@@ -907,6 +932,13 @@ mod tests {
             // is a manifest the walk really reaches — rejecting it would
             // un-attribute a real subtree.
             "crates/odd\\dir/Cargo.toml",
+            // So are control characters. Perverse directory names, but legal
+            // ones the NUL-delimited git listings deliver intact; the text
+            // render sanitizes them on the way out (`sanitized_handle`) rather
+            // than the index refusing to hold the fact.
+            "crates/od\td/Cargo.toml",
+            "crates/od\nd/Cargo.toml",
+            "crates/\u{1b}[31m/Cargo.toml",
         ] {
             assert!(
                 manifest_path_is_repo_relative(accepted),
@@ -931,9 +963,14 @@ mod tests {
             // needed, and none is applied.
             ("backslash-separated", "crates\\x\\Cargo.toml"),
             ("backslash-separated, single dir", "crates\\Cargo.toml"),
-            ("newline", "crates/x/Cargo.toml\nforged"),
-            ("nul", "crates/x/\u{0}Cargo.toml"),
-            ("ansi escape", "crates/\u{1b}[31m/Cargo.toml"),
+            // A control character does not disqualify a path (see the accepted
+            // list); these two are rejected because the LAST SEGMENT is then no
+            // longer exactly `Cargo.toml`, so the value cites no manifest.
+            (
+                "newline in the manifest name",
+                "crates/x/Cargo.toml\nforged",
+            ),
+            ("nul in the manifest name", "crates/x/\u{0}Cargo.toml"),
             ("not a manifest", "crates/x/src/lib.rs"),
             ("case-shifted", "crates/x/cargo.toml"),
             ("manifest-suffixed name", "crates/x/NotCargo.toml"),

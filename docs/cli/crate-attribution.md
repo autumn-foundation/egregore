@@ -223,21 +223,37 @@ reader re-derives whether the value is one the resolver could actually have
 2. The package name satisfies Cargo's manifest-load charset — the same rule that
    gated it at production, shared rather than re-derived.
 3. The manifest path has the shape the ancestor walk produces: a relative,
-   `/`-separated path with no `.`/`..` segment, no empty segment, no drive
-   prefix, no control character, whose last segment is `Cargo.toml`.
+   `/`-separated path with no `.`/`..` segment, no empty segment, no Windows
+   drive prefix, whose last segment is `Cargo.toml`.
 
-   A backslash is **not** disqualifying. On Unix it is an ordinary filename
-   character that survives path normalization and the scan's NUL-delimited git
-   listings, so `crates/odd\dir/Cargo.toml` is a manifest the walk really
-   reaches — rejecting it would un-attribute a whole real subtree. A
-   Windows-*separated* path (`crates\x\Cargo.toml`) is still rejected by the
-   manifest-name rule: its only `/`-segment is the entire string.
+   The test is what the walk could have **produced**, and on Unix a filename may
+   contain almost any byte. A backslash (`crates/odd\dir/…`), a colon outside
+   the drive shape (`vendor:patched/…`), and a control character such as a tab
+   or newline (`od\td/…`) are therefore **not** disqualifying: all three survive
+   path normalization and the scan's NUL-delimited git listings, so they name
+   manifests the walk really reaches. Rejecting them dropped the manifest fact
+   and the subtree inherited an **outer** package — a fabricated attribution.
+   Text-output safety is handled where the value is printed (below), not by
+   refusing to record a real directory.
+
+   Windows-shaped forgeries are still rejected by rules that already cover them:
+   a backslash-*separated* path (`crates\x\Cargo.toml`) has one `/`-segment
+   that is not `Cargo.toml`, and a drive prefix is matched as the exact
+   letter-plus-colon first segment. One stated false negative remains: a Unix
+   directory named exactly `C:` is rejected though the walk could reach it —
+   the canonical absolute-path forgery shape is worth more than that
+   vanishingly unlikely name.
 
 A value failing any check **owns nothing**: it is not scopable, never appears in
 `known_packages`, and renders nothing — indistinguishable downstream from an
-absent attribution, and never from a proven-ownerless one. This matters most on
-the text path, where the value is interpolated verbatim: without the last two
-checks a newline in either field forges an entire additional output line.
+absent attribution, and never from a proven-ownerless one.
+
+Because a manifest path may legitimately carry a control character, `--format
+text` **sanitizes** it on the way out — control characters become `.`, so a
+newline cannot forge an output line and an ANSI escape cannot drive the reader's
+terminal. It is never truncated: a truncated handle stops being a citation. The
+package name needs no such pass, being charset-gated by the same Cargo
+name rule at both production and read-back.
 
 The **negative** claim is re-checked the same way. `status: unattributed` is a
 fact — *provably* no owning package — not a fallback for a value that failed the

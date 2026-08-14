@@ -4439,3 +4439,113 @@ fn a_literal_backslash_in_a_directory_name_is_attributed() {
         "history must agree with the working-tree harvest: {by_commit:?}"
     );
 }
+
+/// A tab or a colon in a directory name is ORDINARY on Unix, so the manifest
+/// under it must still own its subtree.
+///
+/// The NUL-delimited `ls-files`/`ls-tree` listings carry both bytes intact, so
+/// these are manifests the walk really reaches. Rejecting them dropped the fact
+/// from the index and the subtree either lost ownership or — worse — inherited
+/// an OUTER package, which is the fabrication this feature exists to prevent.
+///
+/// Text-output safety is a separate concern, handled where the value is
+/// rendered rather than by refusing to record the fact; see
+/// `a_control_character_in_a_manifest_path_cannot_forge_a_text_line`.
+#[cfg(unix)]
+#[test]
+fn control_and_colon_directory_names_are_attributed() {
+    for (label, dir) in [
+        ("tab", "od\td"),
+        ("newline", "od\nd"),
+        ("colon", "vendor:patched"),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    &format!("{dir}/Cargo.toml"),
+                    "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n",
+                ),
+                (&format!("{dir}/src/lib.rs"), "pub fn f() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get(&format!("{dir}/src/lib.rs")),
+            Some(&BTreeSet::from([format!("inner@{dir}/Cargo.toml")])),
+            "`{label}`: the nearest manifest owns it, and `outer` must NOT: {by_path:?}"
+        );
+    }
+}
+
+/// Relaxing the producer-side check must not reopen the text-forgery hole.
+///
+/// A newline in a manifest path is now RECORDABLE (it names a real directory),
+/// so the render — not the predicate — is what keeps one row to one line. The
+/// value is control-sanitized on the way out, exactly as every other
+/// operator-controlled handle in this codebase is, and never truncated, because
+/// a truncated handle stops being a citation.
+#[test]
+fn a_control_character_in_a_manifest_path_cannot_forge_a_text_line() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"realpkg\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn forged_symbol() -> u32 { 1 }\n"),
+        ],
+    );
+    // Start from a REAL scanned record and rewrite only the manifest path, so
+    // the record is valid in every other respect and the test cannot pass by
+    // failing to load.
+    let mut lines: Vec<String> = Vec::new();
+    for mut record in scan_fixture(temp.path()) {
+        if record["kind"] == "Symbol"
+            && let Some(attribution) = record.get_mut("crate_attribution")
+        {
+            attribution["manifest_repo_relative_path"] =
+                Value::from("a\nsymbol: INJECTED\u{1b}[2J/Cargo.toml");
+        }
+        lines.push(serde_json::to_string(&record).expect("serialize"));
+    }
+    let graph_path = temp.path().join("forged.jsonl");
+    fs::write(&graph_path, lines.join("\n")).expect("graph written");
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "forged_symbol",
+        "--graph",
+        graph_path.to_str().unwrap(),
+        "--format",
+        "text",
+    ]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        !run.stdout.contains('\u{1b}'),
+        "an ANSI escape must never reach the terminal: {:?}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("symbol: INJECTED")),
+        "the newline must not forge a second `symbol:` line: {:?}",
+        run.stdout
+    );
+    // The citation still renders in full — sanitized, never truncated.
+    assert!(
+        run.stdout
+            .contains("package: realpkg (a.symbol: INJECTED.[2J/Cargo.toml)"),
+        "the handle must stay whole and usable: {:?}",
+        run.stdout
+    );
+}

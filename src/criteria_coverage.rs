@@ -443,10 +443,7 @@ fn bounded_field(value: &str) -> String {
 /// usable. This mirrors the same two-tier split `crate::evidence_pack` draws
 /// between `sanitize_catalog_text` and `bounded_catalog_field`.
 fn handle_field(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| if c.is_control() { '.' } else { c })
-        .collect()
+    crate::embeddings::sanitized_handle(value)
 }
 
 /// Task statuses treated as a closed/done state for the

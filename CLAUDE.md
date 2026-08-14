@@ -426,9 +426,15 @@ resolver could have PRODUCED, in BOTH directions: an ownership claim needs a
 Cargo-valid package NAME (the same `package_name_is_valid` rule that gated it at
 production, shared not re-derived) plus a manifest path of the shape the
 ancestor walk produces (relative, `/`-separated, no `.`/`..`/empty segment, no
-drive prefix, no control character, last segment `Cargo.toml` — a LITERAL
-backslash is allowed, being an ordinary Unix filename character the walk really
-reaches, while a backslash-SEPARATED path fails the last-segment rule),
+Windows drive prefix, last segment `Cargo.toml`) — the test being what the walk
+could have PRODUCED, so a backslash, a non-drive colon, and a control character
+are all ALLOWED, being ordinary Unix filename bytes the NUL-delimited git
+listings deliver intact; rejecting them dropped the manifest fact and the
+subtree INHERITED AN OUTER PACKAGE, the fabrication this feature exists to
+prevent. Text-output safety is discharged at the RENDER (the manifest path is
+control-sanitized, never truncated), not by refusing to record a real
+directory; Windows-shaped forgeries still fail the last-segment and
+drive-prefix rules,
 and the NEGATIVE claim needs the full unattributed shape (status
 `unattributed`, a reason, and NEITHER string) — because "provably no owning
 package" is a FACT, not a fallback for a value that failed the positive check.

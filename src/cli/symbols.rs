@@ -464,6 +464,14 @@ impl PrintText for SymbolResult<'_> {
         // as. A value failing either check prints nothing at all.
         if let Some(attribution) = self.crate_attribution {
             if let Some((name, manifest)) = attribution.owning_package() {
+                // The manifest path is a real filesystem path, and on Unix that
+                // can contain a newline or an ESC — so the RENDER is what keeps
+                // one row to one line, not a producer-side refusal to record
+                // the fact. Sanitized, never truncated: a truncated handle
+                // stops being a citation. The package NAME needs no such pass,
+                // being charset-gated by `package_name_is_valid` at both the
+                // production and read-back checks.
+                let manifest = crate::embeddings::sanitized_handle(manifest);
                 let _ = write!(text, "\n  package: {name} ({manifest})");
             } else if let Some(reason) = attribution.proven_unattributed_reason() {
                 let _ = write!(text, "\n  package: (unattributed: {})", reason.as_str());
