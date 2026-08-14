@@ -164,6 +164,14 @@ const MANIFEST_FILE_NAME: &str = "Cargo.toml";
 /// which is not `Cargo.toml`, and a drive prefix is matched as the exact
 /// letter-plus-colon first segment.
 ///
+/// The rule is PLATFORM-INDEPENDENT by design. On Windows `normalize_path`
+/// treats `\` as a separator and emits `/`, so a Windows producer cannot write
+/// a literal backslash — but a graph is portable data, and a store scanned on
+/// Linux is a legitimate input to a query running on Windows. The test is
+/// therefore "a shape SOME producer could emit"; gating on the querying host
+/// would make one artifact answer differently on two machines and silently drop
+/// real attribution from a backslash-bearing subtree.
+///
 /// RESIDUAL, stated rather than hidden: a Unix directory named exactly like a
 /// drive letter (`C:/crates/Cargo.toml`) is rejected though the walk could
 /// reach it. That shape is the canonical absolute-path forgery and a
@@ -1129,6 +1137,38 @@ mod tests {
             .expect("a resolver-produced attribution must survive the reader's checks");
         assert_eq!(name, "alpha");
         assert_eq!(manifest, "crates/alpha/Cargo.toml");
+    }
+
+    /// DECIDED: the shape rules are PLATFORM-INDEPENDENT, deliberately.
+    ///
+    /// On Windows `normalize_path` treats `\` as a separator and emits `/`, so
+    /// a Windows producer cannot emit `crates\alpha/Cargo.toml` — which makes a
+    /// compile-time platform gate look tempting. It is refused because a graph
+    /// is PORTABLE DATA: a store scanned on Linux, where a backslash is an
+    /// ordinary filename character, is a legitimate input to a query running on
+    /// Windows. Gating on the querying platform would make one artifact answer
+    /// differently on two machines, and would silently drop real attribution
+    /// from a legitimately backslash-bearing subtree.
+    ///
+    /// The rule is therefore "a shape SOME producer could emit", not "a shape
+    /// THIS host's producer could emit". The residual is stated rather than
+    /// hidden: on Windows a backslash-bearing citation is not one the local
+    /// producer could have written, and is accepted anyway. It buys an attacker
+    /// almost nothing — such a citation can only pass `manifest_encloses` for a
+    /// record whose OWN path is equally impossible, and nothing in this feature
+    /// claims to validate that a record's path exists.
+    #[test]
+    fn shape_rules_do_not_depend_on_the_querying_platform() {
+        // Accepted on every host, including Windows.
+        assert!(manifest_path_is_repo_relative("crates/odd\\dir/Cargo.toml"));
+        assert!(is_repo_relative_path("crates/odd\\dir/src/lib.rs"));
+        assert!(manifest_encloses(
+            "crates/odd\\dir/Cargo.toml",
+            "crates/odd\\dir/src/lib.rs"
+        ));
+        // And a backslash-SEPARATED path stays rejected on every host, by the
+        // manifest-name rule rather than by a platform check.
+        assert!(!manifest_path_is_repo_relative("crates\\odd\\Cargo.toml"));
     }
 
     /// A record path the producer could never emit must not be "enclosed" by

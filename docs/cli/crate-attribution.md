@@ -292,6 +292,14 @@ reader re-derives whether the value is one the resolver could actually have
    Text-output safety is handled where the value is printed (below), not by
    refusing to record a real directory.
 
+   The rule is **platform-independent**. On Windows `normalize_path` treats `\`
+   as a separator and emits `/`, so a Windows producer cannot write a literal
+   backslash — but a graph is portable data, and a store scanned on Linux is a
+   legitimate input to a query on Windows. The test is "a shape *some* producer
+   could emit"; gating it on the querying host would make one artifact answer
+   differently on two machines and silently drop real attribution from a
+   backslash-bearing subtree.
+
    Windows-shaped forgeries are still rejected by rules that already cover them:
    a backslash-*separated* path (`crates\x\Cargo.toml`) has one `/`-segment
    that is not `Cargo.toml`, and a drive prefix is matched as the exact
