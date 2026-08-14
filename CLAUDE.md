@@ -409,7 +409,15 @@ cached version whose `Cargo.toml` was renamed still re-attributes on refresh, so
 `eg refresh` and a full `eg scan` of one tree agree exactly. `eg query symbol`
 and `eg query symbols` gain `--package <NAME>` (spelled `--package`, NOT
 `--crate`: `eg query who-imports --crate` already means module-path unification),
-matched EXACTLY with no case folding or `-`/`_` normalization. A selector no
+matched EXACTLY with no case folding or `-`/`_` normalization. The two verdicts read DIFFERENT
+corpora: KNOWN-NESS is typo protection evaluated CORPUS-WIDE (a real package
+owning nothing at the queried commit/instant stays known and yields the ordinary
+exit 2, since narrowing it would omit a package the store carries and blame a
+spelling that was right), while AMBIGUITY is silent-merge protection evaluated
+over the corpus the ANSWER is computed from and at the CURRENT version of each
+record (a package two repositories held at different times but only one holds at
+HEAD is not ambiguous for a HEAD-anchored answer; `--all-history` widens the
+corpus and refuses again). A selector no
 package carries exits 1 with `unknown_package_selector` + sorted
 `known_packages`, DISTINCT from exit 2 "known package, zero matching rows" AND
 from exit 1 `crate_attribution_unavailable` (a corpus carrying no attribution at

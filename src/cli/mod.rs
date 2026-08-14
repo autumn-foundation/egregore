@@ -5641,10 +5641,6 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // refuses. An answer that changes depending on whether an index file
             // exists breaks the index's documented contract of being a pure
             // access-path optimization.
-            if let Some(selector_name) = package.as_deref() {
-                let catalog = PackageCatalog::build(&records, &index);
-                resolve_package_scope(&catalog, selector_name, repo.is_some());
-            }
             let freshness_code = query_freshness_code_with_hint(
                 &records,
                 repo_path.as_deref(),
@@ -5665,6 +5661,24 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 at_head,
                 all_history,
             )?;
+            // Package validation runs AFTER corpus resolution, over the corpus
+            // the answer is computed from. Both of its verdicts are questions
+            // ABOUT A CORPUS: validating against the whole record set while the
+            // answer comes from a narrower one refuses an answerable HEAD query
+            // whose only collision is historical, and calls a package known at
+            // an instant before it existed.
+            if let Some(selector_name) = package.as_deref() {
+                let corpus = package_catalog_corpus(
+                    &records,
+                    &index,
+                    at.as_deref(),
+                    as_of.as_deref(),
+                    filtered.as_deref(),
+                );
+                let catalog = PackageCatalog::build(&records, &index);
+                let answerable = PackageCatalog::build(&corpus, &index);
+                resolve_package_scope(&catalog, &answerable, selector_name, repo.is_some());
+            }
             as_of.map_or_else(
                 || {
                     at.map_or_else(
@@ -5729,11 +5743,17 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
-            // This lane always loads the whole corpus, so its catalog is
-            // authoritative with no cold-reload fallback (issue #117).
+            // This lane always loads the whole corpus and offers no corpus
+            // selector, so the whole record set IS its corpus and the catalog is
+            // authoritative with no cold-reload fallback (issue #117). A package
+            // two repositories held at different times is genuinely ambiguous
+            // for a union answer, so the narrowing `query symbol` applies would
+            // be wrong here.
             if let Some(selector_name) = package.as_deref() {
                 let catalog = PackageCatalog::build(&records, &index);
-                resolve_package_scope(&catalog, selector_name, repo.is_some());
+                // No corpus selector on this lane, so the whole record set IS
+                // the answerable corpus: one catalog serves both verdicts.
+                resolve_package_scope(&catalog, &catalog, selector_name, repo.is_some());
             }
             query_symbols_matching(
                 &records,
@@ -7543,6 +7563,24 @@ impl PackageCatalog {
         let mut by_package: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
             std::collections::BTreeMap::new();
         for record in records {
+            // A `Change` is a COMMIT EVENT, not a current-state fact: it is
+            // minted once per (commit, path) and so is never superseded, which
+            // means it survives every corpus narrowing including HEAD
+            // anchoring. Counting it here made a package that a repository once
+            // held — but does not hold at HEAD — still contribute that
+            // repository to the ambiguity verdict, refusing an answerable
+            // query. No lane returns `Change` rows for `--package`, so the
+            // catalog describes the packages owning the records these lanes can
+            // actually return.
+            if matches!(
+                record,
+                GraphRecord::Node {
+                    kind: NodeKind::Change,
+                    ..
+                }
+            ) {
+                continue;
+            }
             let Some(attribution) = record.crate_attribution() else {
                 continue;
             };
@@ -7595,7 +7633,12 @@ impl PackageCatalog {
 /// A known, unambiguous selector that simply matches no row falls through to the
 /// lane's ordinary exit-2 no-match, so a typo stays distinguishable from an
 /// honest empty result.
-pub(crate) fn resolve_package_scope(catalog: &PackageCatalog, selector: &str, repo_scoped: bool) {
+pub(crate) fn resolve_package_scope(
+    catalog: &PackageCatalog,
+    answerable: &PackageCatalog,
+    selector: &str,
+    repo_scoped: bool,
+) {
     if !catalog.contains(selector) {
         // A corpus carrying NO attribution at all is a CAPABILITY gap, not a
         // typo: the same `unknown_package_selector` shape would tell an operator
@@ -7620,7 +7663,22 @@ pub(crate) fn resolve_package_scope(catalog: &PackageCatalog, selector: &str, re
         eprintln!("{diag}");
         std::process::exit(1);
     }
-    let owners = catalog.owners(selector);
+    // The two verdicts answer DIFFERENT questions, so they read different
+    // catalogs (issue #117).
+    //
+    // Known-ness is TYPO protection — "is this a package name this store carries
+    // at all?" — and stays corpus-wide. Narrowing it would report a real package
+    // that merely owns nothing at the queried instant as `unknown_package_
+    // selector` with a `known_packages` list, which is a lie about the store and
+    // steers the caller to fix a spelling that was never wrong; the lane's
+    // ordinary exit-2 "known package, zero rows" already says that honestly.
+    //
+    // Ambiguity is SILENT-MERGE protection — "would scoping here fold two
+    // repositories together?" — which is only meaningful over the corpus the
+    // answer is computed from. A package two repositories held at different
+    // times, but only one holds at HEAD, is not ambiguous for a HEAD answer, and
+    // refusing it withheld an answerable result.
+    let owners = answerable.owners(selector);
     if !repo_scoped && owners.len() > 1 {
         let diag = serde_json::json!({
             "code": "ambiguous_package_selector",
@@ -7900,6 +7958,143 @@ pub(crate) fn record_belongs_to_repo_for_commit_scan(
         }
         GraphRecord::Tombstone { .. } => false,
     }
+}
+
+/// The records the package catalog must be built from: the corpus the answer
+/// will actually be computed over (issue #117).
+///
+/// The catalog decides two things — `known_packages` for a typo, and
+/// cross-repository ambiguity — and both are questions ABOUT A CORPUS. Building
+/// it from the raw whole-corpus record set while the answer came from a narrower
+/// one produced two wrong verdicts: a package two repositories held at DIFFERENT
+/// times, but only one holds at HEAD, exited 1 `ambiguous_package_selector`
+/// though the HEAD answer is unambiguous; and a package introduced after an
+/// `--as-of` instant counted as known, yielding exit 2 "no rows" where the
+/// package simply did not exist yet.
+///
+/// The repository index stays whole-corpus deliberately: `owner_of` maps a
+/// record ID to its repository, which is an identity fact, not a corpus one.
+///
+/// Records carrying no resolvable time are KEPT. The catalog's failure mode is
+/// asymmetric — a missing package is a hard exit-1 refusal of an answerable
+/// question, while an extra one only widens a diagnostic — so undated records
+/// fail open. In a `scan-history` corpus every code record is dated, so this
+/// only affects mixed or current-tree graphs, where a temporal selector matches
+/// nothing anyway.
+fn package_catalog_corpus<'records>(
+    records: &'records [GraphRecord],
+    index: &query::RepositoryIndex,
+    at: Option<&str>,
+    as_of: Option<&str>,
+    filtered: Option<&'records [GraphRecord]>,
+) -> std::borrow::Cow<'records, [GraphRecord]> {
+    if let Some(prefix) = at {
+        return std::borrow::Cow::Owned(
+            records
+                .iter()
+                .filter(|record| {
+                    temporal_commit_if_prefix(record, prefix).is_some()
+                        || !record_has_temporal_commit(record)
+                })
+                .cloned()
+                .collect(),
+        );
+    }
+    if let Some(raw) = as_of {
+        let Ok(instant) = chrono::DateTime::parse_from_rfc3339(raw) else {
+            // A malformed timestamp is the lane's error to report; do not let
+            // catalog construction pre-empt it with a different diagnostic.
+            return std::borrow::Cow::Borrowed(records);
+        };
+        // The snapshot instant per repository — the newest stamped time any
+        // record reached there at or before the cutoff — mirroring how
+        // `query_symbol_as_of` resolves snapshot membership.
+        let mut snapshot: std::collections::HashMap<
+            Option<&str>,
+            chrono::DateTime<chrono::FixedOffset>,
+        > = std::collections::HashMap::new();
+        for record in records {
+            let Some(parsed) = record_valid_time_instant(record) else {
+                continue;
+            };
+            if parsed > instant {
+                continue;
+            }
+            let owner = index.owner_of(record.id());
+            snapshot
+                .entry(owner)
+                .and_modify(|latest| {
+                    if parsed > *latest {
+                        *latest = parsed;
+                    }
+                })
+                .or_insert(parsed);
+        }
+        return std::borrow::Cow::Owned(
+            records
+                .iter()
+                .filter(|record| {
+                    record_valid_time_instant(record).is_none_or(|parsed| {
+                        snapshot.get(&index.owner_of(record.id())) == Some(&parsed)
+                    })
+                })
+                .cloned()
+                .collect(),
+        );
+    }
+    // HEAD-anchored: `non_head_current_record_ids` drops IDs with no version at
+    // HEAD, but keeps every VERSION of the IDs that survive — lanes pick the
+    // current one themselves. The catalog reads one field off "the current
+    // record", so it needs the version-level test too: without it a superseded
+    // version's stale package name still speaks for the ID, which is exactly
+    // how a renamed-away package kept contributing its repository to the
+    // ambiguity verdict.
+    filtered.map_or_else(
+        || std::borrow::Cow::Borrowed(records),
+        |head_anchored| {
+            std::borrow::Cow::Owned(
+                query::head_current_versions(head_anchored, index)
+                    .into_iter()
+                    .cloned()
+                    .collect(),
+            )
+        },
+    )
+}
+
+/// Whether a record carries a temporal commit stamp at all.
+const fn record_has_temporal_commit(record: &GraphRecord) -> bool {
+    matches!(
+        record,
+        GraphRecord::Node {
+            temporal: Some(_),
+            ..
+        } | GraphRecord::Edge {
+            temporal: Some(_),
+            ..
+        }
+    )
+}
+
+/// A record's stamped valid time, parsed — the temporal block's when present,
+/// else a node's own `valid_time`.
+fn record_valid_time_instant(
+    record: &GraphRecord,
+) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let raw = match record {
+        GraphRecord::Node {
+            temporal: Some(t), ..
+        }
+        | GraphRecord::Edge {
+            temporal: Some(t), ..
+        } => t.valid_time.as_str(),
+        GraphRecord::Node {
+            valid_time: Some(vt),
+            ..
+        } => vt.as_str(),
+        _ => return None,
+    };
+    chrono::DateTime::parse_from_rfc3339(raw).ok()
 }
 
 pub(crate) fn temporal_commit_if_prefix<'a>(

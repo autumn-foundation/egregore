@@ -144,6 +144,46 @@ pub fn resolve_corpus_mode(
     }
 }
 
+/// The versions stamped at their own repository's HEAD commit.
+///
+/// [`non_head_current_record_ids`] drops IDs with no current version, but keeps
+/// every VERSION of the IDs that survive — lanes pick the current one
+/// themselves. A consumer that must read one field off "the current record"
+/// (the issue #117 package catalog) therefore needs this second, version-level
+/// test, or a superseded version's stale value speaks for the ID.
+///
+/// A record with no temporal stamp is current by fallback, matching
+/// [`non_head_current_record_ids`]; so is any record in a store with no stamped
+/// repository head at all.
+#[must_use]
+pub fn head_current_versions<'records>(
+    records: &'records [GraphRecord],
+    index: &RepositoryIndex,
+) -> Vec<&'records GraphRecord> {
+    let repo_heads = collect_repo_heads(records);
+    records
+        .iter()
+        .filter(|record| {
+            // No stamped head anywhere: every version is current by fallback,
+            // exactly as `non_head_current_record_ids` treats that store.
+            if repo_heads.is_empty() {
+                return true;
+            }
+            let Some(t) = record_temporal(record) else {
+                return true;
+            };
+            index.owner_of(record.id()).map_or_else(
+                || repo_heads.values().any(|head| *head == t.git_commit),
+                |owner| {
+                    repo_heads
+                        .get(owner)
+                        .is_none_or(|head| t.git_commit == **head)
+                },
+            )
+        })
+        .collect()
+}
+
 /// The stamped HEAD commit SHA of each live repository (`source_snapshot`,
 /// issue #82), keyed by `Repository` record ID. Tombstoned repositories and
 /// repositories with a non-`Commit` head (`no_git`/`unborn_head`) are absent.

@@ -33,6 +33,22 @@ eg query symbols "*" --data-dir .egregore --package util --repo acme/widget
 |---|---|
 | `--package <NAME>` | Return only rows attributed to this Cargo package. Matched **exactly** — no case folding, no `-`/`_` normalization. |
 
+The two validation verdicts answer different questions and read different
+corpora:
+
+- **Known-ness** (`unknown_package_selector`) is typo protection — "is this a
+  package name this store carries at all?" — and is evaluated **corpus-wide**. A
+  real package that owns nothing at the queried commit or instant is still
+  known, and yields the ordinary exit-2 "known package, zero rows". Narrowing it
+  would print a `known_packages` list omitting a package the store demonstrably
+  carries, and steer the caller to fix a spelling that was never wrong.
+- **Ambiguity** (`ambiguous_package_selector`) is silent-merge protection —
+  "would scoping fold two repositories together?" — and is evaluated over **the
+  corpus the answer is computed from**. A package two repositories held at
+  different times, but only one holds at HEAD, is not ambiguous for a
+  HEAD-anchored answer; refusing it would withhold an answerable result.
+  `--all-history` widens the corpus, so the same query refuses there.
+
 The flag is spelled `--package`, **not** `--crate`. `eg query who-imports
 --crate <name>` already exists and means something unrelated (rewriting a
 leading `crate::` in the query and in import paths so the two spellings unify);

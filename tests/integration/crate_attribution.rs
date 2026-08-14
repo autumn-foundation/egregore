@@ -4907,3 +4907,221 @@ fn package_scope_as_of_does_not_answer_from_a_package_the_symbol_left() {
     let before_rows = rows(&before.stdout);
     assert_eq!(before_rows[0]["crate_attribution"]["package_name"], "alpha");
 }
+
+/// A collision that exists ONLY in history must not refuse a HEAD answer.
+///
+/// The package catalog decides two things — `known_packages` for a typo, and
+/// cross-repository ambiguity — and it was built from the raw whole-corpus
+/// record set BEFORE the corpus mode narrowed to HEAD. So a package name that
+/// two repositories held at different times, but only ONE holds at HEAD, exited
+/// 1 `ambiguous_package_selector` even though the default HEAD-anchored answer
+/// is unambiguous: a refusal for a question with a well-defined answer.
+///
+/// The catalog must describe the corpus the answer is computed over.
+#[test]
+fn a_historical_only_package_collision_does_not_block_the_head_answer() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut combined = String::new();
+
+    // Repo A HELD `util`, then renamed it away. At HEAD it owns `util_a`.
+    let repo_a = temp.path().join("repo-a");
+    fs::create_dir_all(&repo_a).expect("repo dir");
+    init_git(&repo_a);
+    write_fixture(
+        &repo_a,
+        &[
+            (
+                "crates/util/Cargo.toml",
+                "[package]\nname = \"util\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/util/src/lib.rs", "pub fn helper() -> u32 { 1 }\n"),
+        ],
+    );
+    commit(&repo_a, "seed", "2026-06-01T00:00:00Z");
+    write_fixture(
+        &repo_a,
+        &[(
+            "crates/util/Cargo.toml",
+            "[package]\nname = \"util_a\"\nversion = \"0.1.0\"\n",
+        )],
+    );
+    commit(&repo_a, "rename util -> util_a", "2026-07-01T00:00:00Z");
+    combined.push_str(
+        &aletheia_egregore::scan_repository_history(&repo_a)
+            .expect("history replay")
+            .to_jsonl()
+            .expect("serialize"),
+    );
+    combined.push('\n');
+
+    // Repo B owns `util` throughout, including at HEAD.
+    let repo_b = temp.path().join("repo-b");
+    fs::create_dir_all(&repo_b).expect("repo dir");
+    init_git(&repo_b);
+    write_fixture(
+        &repo_b,
+        &[
+            (
+                "crates/util/Cargo.toml",
+                "[package]\nname = \"util\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/util/src/lib.rs", "pub fn helper() -> u32 { 2 }\n"),
+        ],
+    );
+    commit(&repo_b, "seed", "2026-06-15T00:00:00Z");
+    combined.push_str(
+        &aletheia_egregore::scan_repository_history(&repo_b)
+            .expect("history replay")
+            .to_jsonl()
+            .expect("serialize"),
+    );
+    combined.push('\n');
+
+    let graph = temp.path().join("combined.jsonl");
+    fs::write(&graph, &combined).expect("graph written");
+
+    // `query symbol` HEAD-anchors by default (issue #456), and at HEAD only
+    // repo B owns `util` — so this is answerable.
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "helper",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "util",
+    ]);
+    assert_eq!(
+        run.code, 0,
+        "only one repository owns `util` at HEAD; stdout: {} stderr: {}",
+        run.stdout, run.stderr
+    );
+    for row in rows(&run.stdout) {
+        assert_eq!(row["crate_attribution"]["package_name"], "util");
+    }
+
+    // The collision is genuine over the UNION corpus, so `--all-history` must
+    // still refuse rather than silently merge the two repositories.
+    let union = run_query(&[
+        "query",
+        "symbol",
+        "helper",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "util",
+        "--all-history",
+    ]);
+    assert_eq!(
+        union.code, 1,
+        "over the union corpus the collision is genuine; stdout: {}",
+        union.stdout
+    );
+    assert!(
+        union.stderr.contains("ambiguous_package_selector"),
+        "stderr: {}",
+        union.stderr
+    );
+}
+
+/// Known-ness is corpus-wide; only AMBIGUITY narrows to the queried corpus.
+///
+/// The two `--package` verdicts answer different questions. Ambiguity asks
+/// "would scoping fold two repositories together?", which is only meaningful
+/// over the corpus being answered from. Known-ness is TYPO protection — "is
+/// this a package name this store carries at all?" — and deliberately stays
+/// corpus-wide.
+///
+/// So a package created after the `--as-of` instant is still KNOWN, and the
+/// answer is the lane's ordinary exit-2 "known package, zero rows". Reporting
+/// `unknown_package_selector` instead would print a `known_packages` list that
+/// omits a package the store demonstrably carries, and steer the caller to fix
+/// a spelling that was never wrong. The catalog also cannot tell that case
+/// apart from a package whose last source file moved away — it still exists,
+/// but a source-less manifest leaves no attributed record — so narrowing
+/// known-ness would call a live package unknown too.
+#[test]
+fn a_package_created_after_the_as_of_instant_stays_known() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_fixture(
+        &repo,
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/early\"]\n"),
+            (
+                "crates/early/Cargo.toml",
+                "[package]\nname = \"early\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/early/src/lib.rs", "pub fn shared() -> u32 { 1 }\n"),
+        ],
+    );
+    commit(&repo, "seed", "2026-06-01T00:00:00Z");
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/early\", \"crates/late\"]\n",
+            ),
+            (
+                "crates/late/Cargo.toml",
+                "[package]\nname = \"late\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/late/src/lib.rs", "pub fn shared() -> u32 { 2 }\n"),
+        ],
+    );
+    commit(&repo, "add the late package", "2026-07-01T00:00:00Z");
+
+    let graph_path = temp.path().join("history.jsonl");
+    fs::write(
+        &graph_path,
+        aletheia_egregore::scan_repository_history(&repo)
+            .expect("history replay")
+            .to_jsonl()
+            .expect("serialize"),
+    )
+    .expect("graph written");
+    let graph = graph_path.to_str().unwrap();
+
+    // Before `late` existed: a real package name, no rows at that instant.
+    let before = run_query(&[
+        "query",
+        "symbol",
+        "shared",
+        "--graph",
+        graph,
+        "--as-of",
+        "2026-06-15T00:00:00Z",
+        "--package",
+        "late",
+    ]);
+    assert_eq!(
+        before.code, 2,
+        "`late` is a real package that owns nothing at this instant, not a typo; \
+         stdout: {} stderr: {}",
+        before.stdout, before.stderr
+    );
+    assert!(
+        !before.stderr.contains("unknown_package_selector"),
+        "a real package must not be reported as an unknown selector: {}",
+        before.stderr
+    );
+
+    // After it exists, the same query resolves normally.
+    let after = run_query(&[
+        "query",
+        "symbol",
+        "shared",
+        "--graph",
+        graph,
+        "--as-of",
+        "2026-08-01T00:00:00Z",
+        "--package",
+        "late",
+    ]);
+    assert_eq!(after.code, 0, "stderr: {}", after.stderr);
+    let rows = rows(&after.stdout);
+    assert_eq!(rows[0]["crate_attribution"]["package_name"], "late");
+}
