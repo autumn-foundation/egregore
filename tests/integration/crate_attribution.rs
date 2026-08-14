@@ -5458,3 +5458,91 @@ fn a_merge_deletion_resolves_against_the_parent_that_reported_it() {
          package the first-parent tree would reach: {by_commit:?}"
     );
 }
+
+/// A commit-pinned ambiguity verdict must ignore records the lane cannot return.
+///
+/// Since the known-ness/ambiguity split, the ambiguity catalog describes the
+/// corpus the ANSWER comes from. `--at` answers from `symbols_at_commit`, which
+/// returns only records stamped with the requested commit — so an undated
+/// record from a plain-scan repository sharing the package name adds a
+/// repository that could never appear in the answer, and turns an answerable
+/// query into a false `ambiguous_package_selector`.
+///
+/// Keeping undated records is still right for the CORPUS-WIDE known-ness
+/// catalog, which is what makes the package a real name rather than a typo.
+#[test]
+fn a_commit_pinned_answer_ignores_undated_records_for_ambiguity() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut combined = String::new();
+
+    // Repository A: real history, owns `shared`.
+    let repo_a = temp.path().join("repo-a");
+    fs::create_dir_all(&repo_a).expect("repo dir");
+    init_git(&repo_a);
+    write_fixture(
+        &repo_a,
+        &[
+            (
+                "crates/shared/Cargo.toml",
+                "[package]\nname = \"shared\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/shared/src/lib.rs", "pub fn helper() -> u32 { 1 }\n"),
+        ],
+    );
+    let sha = commit(&repo_a, "seed", "2026-06-01T00:00:00Z");
+    combined.push_str(
+        &aletheia_egregore::scan_repository_history(&repo_a)
+            .expect("history replay")
+            .to_jsonl()
+            .expect("serialize"),
+    );
+    combined.push('\n');
+
+    // Repository B: a plain scan — no commits, so every record is undated.
+    let repo_b = temp.path().join("repo-b");
+    fs::create_dir_all(&repo_b).expect("repo dir");
+    write_fixture(
+        &repo_b,
+        &[
+            (
+                "crates/shared/Cargo.toml",
+                "[package]\nname = \"shared\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/shared/src/lib.rs", "pub fn helper() -> u32 { 2 }\n"),
+        ],
+    );
+    combined.push_str(
+        &scan_repository_at_with_override(&repo_b, FIXED_TIME, Some("repo-b"))
+            .expect("scan")
+            .to_jsonl()
+            .expect("serialize"),
+    );
+    combined.push('\n');
+
+    let graph = temp.path().join("combined.jsonl");
+    fs::write(&graph, &combined).expect("graph written");
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "helper",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--at",
+        &sha,
+        "--package",
+        "shared",
+    ]);
+    assert_eq!(
+        run.code, 0,
+        "only repository A can answer at this commit; stdout: {} stderr: {}",
+        run.stdout, run.stderr
+    );
+    let rows = rows(&run.stdout);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["crate_attribution"]["package_name"], "shared");
+    assert_eq!(
+        rows[0]["repo_relative_path"], "crates/shared/src/lib.rs",
+        "the row must come from the pinned commit"
+    );
+}

@@ -44,7 +44,11 @@ corpora:
   carries, and steer the caller to fix a spelling that was never wrong.
 - **Ambiguity** (`ambiguous_package_selector`) is silent-merge protection —
   "would scoping fold two repositories together?" — and is evaluated over **the
-  corpus the answer is computed from**. A package two repositories held at
+  corpus the answer is computed from**, at the current version of each record.
+  Under `--at`/`--as-of` that excludes records carrying no resolvable time: the
+  pinned lanes can only return records stamped at the selected commit or
+  instant, so an undated record from a plain-`scan` repository sharing the name
+  would contribute a repository that could never appear in the answer. A package two repositories held at
   different times, but only one holds at HEAD, is not ambiguous for a
   HEAD-anchored answer; refusing it would withhold an answerable result.
   `--all-history` widens the corpus, so the same query refuses there.

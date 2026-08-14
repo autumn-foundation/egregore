@@ -7978,12 +7978,17 @@ pub(crate) fn record_belongs_to_repo_for_commit_scan(
 /// The repository index stays whole-corpus deliberately: `owner_of` maps a
 /// record ID to its repository, which is an identity fact, not a corpus one.
 ///
-/// Records carrying no resolvable time are KEPT. The catalog's failure mode is
-/// asymmetric — a missing package is a hard exit-1 refusal of an answerable
-/// question, while an extra one only widens a diagnostic — so undated records
-/// fail open. In a `scan-history` corpus every code record is dated, so this
-/// only affects mixed or current-tree graphs, where a temporal selector matches
-/// nothing anyway.
+/// Under a temporal selector, records carrying no resolvable time are DROPPED.
+/// This corpus feeds the AMBIGUITY verdict only — known-ness is evaluated
+/// corpus-wide and keeps them, which is what still makes a real package name a
+/// package rather than a typo. The pinned lanes can only return records stamped
+/// at the selected commit or instant (`symbols_at_commit` skips undated records
+/// outright; `symbol_as_of_valid_time_by_repo` requires a parseable
+/// `valid_time`), so an undated record contributes a repository that could
+/// never appear in the answer — turning an answerable query into a false
+/// `ambiguous_package_selector`. That is reachable on a shared graph combining
+/// a `scan-history` repository with a plain-`scan` one that shares a package
+/// name.
 fn package_catalog_corpus<'records>(
     records: &'records [GraphRecord],
     index: &query::RepositoryIndex,
@@ -7995,10 +8000,7 @@ fn package_catalog_corpus<'records>(
         return std::borrow::Cow::Owned(
             records
                 .iter()
-                .filter(|record| {
-                    temporal_commit_if_prefix(record, prefix).is_some()
-                        || !record_has_temporal_commit(record)
-                })
+                .filter(|record| temporal_commit_if_prefix(record, prefix).is_some())
                 .cloned()
                 .collect(),
         );
@@ -8037,7 +8039,7 @@ fn package_catalog_corpus<'records>(
             records
                 .iter()
                 .filter(|record| {
-                    record_valid_time_instant(record).is_none_or(|parsed| {
+                    record_valid_time_instant(record).is_some_and(|parsed| {
                         snapshot.get(&index.owner_of(record.id())) == Some(&parsed)
                     })
                 })
@@ -8062,20 +8064,6 @@ fn package_catalog_corpus<'records>(
                     .collect(),
             )
         },
-    )
-}
-
-/// Whether a record carries a temporal commit stamp at all.
-const fn record_has_temporal_commit(record: &GraphRecord) -> bool {
-    matches!(
-        record,
-        GraphRecord::Node {
-            temporal: Some(_),
-            ..
-        } | GraphRecord::Edge {
-            temporal: Some(_),
-            ..
-        }
     )
 }
 
