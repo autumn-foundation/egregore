@@ -124,8 +124,20 @@ enum WorkspaceFieldShape {
     StringArray,
     /// A plain string (`resolver`).
     Str,
-    /// A table (`package`, `dependencies`, `lints`).
+    /// A table (`package`, `lints`).
     Table,
+    /// The `[workspace.dependencies]` TEMPLATE table: a table whose every entry
+    /// is one Cargo can load.
+    ///
+    /// Validated with the TEMPLATE rules, not the member ones — a genuinely
+    /// different boundary, verified in both directions against real `cargo
+    /// metadata`. Cargo ACCEPTS a source-less table, an empty table, an
+    /// UNPARSEABLE version string, a `workspace` key, and unknown keys here,
+    /// all of which `declared_dependency` rejects for a member table; it
+    /// REJECTS a non-string/non-table value, a wrong-typed known key,
+    /// `optional = true`, and an invalid dependency name. Reusing the member
+    /// rule would un-attribute real workspaces.
+    DependencyTemplateTable,
 }
 
 /// Type contract for the known `[workspace]` fields.
@@ -158,11 +170,41 @@ const WORKSPACE_FIELD_SHAPES: [(&str, WorkspaceFieldShape); 7] = [
     // The inheritance table: a non-table here is rejected by Cargo just as a
     // non-table top-level `package` is.
     ("package", WorkspaceFieldShape::Table),
-    ("dependencies", WorkspaceFieldShape::Table),
+    ("dependencies", WorkspaceFieldShape::DependencyTemplateTable),
     ("lints", WorkspaceFieldShape::Table),
 ];
 
-/// Whether every KNOWN field of a `[workspace]` table has a type Cargo accepts.
+/// Whether every entry of a `[workspace.dependencies]` template is one Cargo
+/// can load.
+///
+/// A virtual root is WALKED PAST, so an unloadable one hands its subtree to an
+/// OUTER package — the fail-open direction, and the fabrication this feature
+/// exists to prevent. Hence the check.
+///
+/// Deliberately NOT `declared_dependency`: the template boundary is looser than
+/// a member table's, verified in both directions (see
+/// [`WorkspaceFieldShape::DependencyTemplateTable`]). What is checked here is
+/// exactly what Cargo rejects — a value that is neither a string nor a table, a
+/// table failing the TEMPLATE key rules (which already encode `optional = true`
+/// being disallowed and the `workspace` key being ignored), and a dependency
+/// name Cargo refuses.
+fn workspace_dependency_template_is_loadable(table: &dyn toml_edit::TableLike) -> bool {
+    table.iter().all(|(key, item)| {
+        if !package_name_is_valid(key) {
+            return false;
+        }
+        if item.as_str().is_some() {
+            // A version string. Cargo does NOT parse the requirement here
+            // (verified: `serde = "not-a-version"` loads), so neither do we.
+            return true;
+        }
+        item.as_table_like().is_some_and(|spec| {
+            dependency_table_is_well_typed(spec, DependencyTableContext::Template)
+        })
+    })
+}
+
+/// Whether every KNOWN field of a `[workspace]` table has a type Cargo accepts./// Whether every KNOWN field of a `[workspace]` table has a type Cargo accepts.
 ///
 /// An absent field is fine (all are optional); an unknown field is fine (Cargo
 /// tolerates it). Only a present, known, wrong-typed field is disqualifying.
@@ -174,6 +216,9 @@ fn workspace_table_is_well_typed(workspace: &dyn toml_edit::TableLike) -> bool {
                 .is_some_and(|values| values.iter().all(toml_edit::Value::is_str)),
             WorkspaceFieldShape::Str => item.as_str().is_some(),
             WorkspaceFieldShape::Table => item.as_table_like().is_some(),
+            WorkspaceFieldShape::DependencyTemplateTable => item
+                .as_table_like()
+                .is_some_and(workspace_dependency_template_is_loadable),
         })
     })
 }

@@ -6775,3 +6775,99 @@ fn a_wholly_unusable_attribution_corpus_is_a_capability_gap() {
         );
     }
 }
+
+/// A malformed `[workspace.dependencies]` entry stops the walk.
+///
+/// This is the FAIL-OPEN direction — a virtual root is WALKED PAST, so accepting
+/// an unloadable one hands the subtree to an OUTER package, the fabrication this
+/// feature exists to prevent. That is what makes it worth checking where a
+/// malformed package manifest merely kept owning its own subtree.
+///
+/// The acceptance boundary here is NOT the member-dependency one, verified
+/// against real `cargo metadata` in both directions. Cargo ACCEPTS a
+/// source-less table, an empty table, an UNPARSEABLE version string, a
+/// `workspace` key, and unknown keys inside `[workspace.dependencies]` — all of
+/// which `declared_dependency` rejects for a member table. Applying the member
+/// rule here would un-attribute real workspaces.
+#[test]
+fn a_malformed_workspace_dependency_stops_the_walk() {
+    for (label, entry, expected) in [
+        (
+            "bool value",
+            "serde = true",
+            "unattributed:unusable_manifest",
+        ),
+        ("int value", "serde = 1", "unattributed:unusable_manifest"),
+        (
+            "wrong-typed features",
+            "serde = { version = \"1\", features = 1 }",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "wrong-typed default-features",
+            "serde = { version = \"1\", default-features = 1 }",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "optional is rejected in a template",
+            "serde = { version = \"1\", optional = true }",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "invalid dependency name",
+            "\"1bad\" = \"1\"",
+            "unattributed:unusable_manifest",
+        ),
+        // Cargo ACCEPTS every one of these in a workspace template, so the walk
+        // must still pass the virtual root and reach the outer package.
+        ("version string", "serde = \"1\"", "outer@Cargo.toml"),
+        (
+            "path source",
+            "serde = { path = \"../serde\" }",
+            "outer@Cargo.toml",
+        ),
+        (
+            "table naming no source",
+            "serde = { features = [\"derive\"] }",
+            "outer@Cargo.toml",
+        ),
+        ("empty table", "serde = {}", "outer@Cargo.toml"),
+        (
+            "unparseable version is NOT checked here",
+            "serde = \"not-a-version\"",
+            "outer@Cargo.toml",
+        ),
+        (
+            "workspace key is ignored",
+            "serde = { version = \"1\", workspace = true }",
+            "outer@Cargo.toml",
+        ),
+        (
+            "unknown key tolerated",
+            "serde = { version = \"1\", future-key = 1 }",
+            "outer@Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!("[workspace]\nmembers = []\n\n[workspace.dependencies]\n{entry}\n"),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}`: {by_path:?}"
+        );
+    }
+}
