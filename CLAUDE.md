@@ -359,10 +359,15 @@ subtree; containment is SEGMENT-AWARE, so `crates/alpha` never claims
 `crates/alphabet/x.rs`. A VIRTUAL workspace root (`[workspace]`, no `[package]`)
 declares no package and is WALKED PAST, matching Cargo; every other manifest form
 STOPS the walk FAIL-CLOSED (`unnamed_package` / `unparseable_manifest` /
-`manifest_unreadable` / `unusable_manifest` — the last covering both forms Cargo
-refuses to load: a manifest carrying NEITHER `[package]` nor `[workspace]`, and a
-virtual manifest carrying a package-only section, so `[workspace]` presence alone
-is NOT enough to be walked past), because inheriting an ancestor's name across a broken or
+`manifest_unreadable` / `unusable_manifest` — the last covering the forms Cargo
+refuses to load: a manifest carrying NEITHER `[package]` nor `[workspace]`, a
+virtual manifest carrying a package-only section, and one whose `[workspace]`
+table wrong-types a KNOWN field (`members`/`exclude`/`default-members` arrays of
+strings, `resolver` a string, `package`/`dependencies`/`lints` tables — each
+verified against real `cargo metadata`, while `metadata` takes any type and an
+unknown key is tolerated), so `[workspace]` presence alone is NOT enough to be
+walked past; the residual is VALUE-level validation, which this resolver does
+not reimplement), because inheriting an ancestor's name across a broken or
 nameless boundary would FABRICATE a package attribution — the one thing the issue
 forbids outright. The name is READ from `[package].name`, never derived from a
 directory name and never sanitized from a Cargo-invalid one. ABSENT-FIELD ≠

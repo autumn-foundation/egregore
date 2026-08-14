@@ -4,6 +4,60 @@ use super::*;
 // query symbol --as-of <instant>
 // ---------------------------------------------------------------------------
 
+/// Indexes, per record ID, the position of the `symbol_name` version current at
+/// `instant` — the newest `valid_time` at or before it.
+///
+/// Mirrors `query::symbol_as_of_valid_time_by_repo`'s own selection rule
+/// (strictly-greater `valid_time` wins, so an exact tie keeps the earlier
+/// position) restricted to ONE identity, so collapsing an identity here can
+/// never disagree with the winner that function would pick. A record with no
+/// parseable `valid_time`, or one later than the instant, is not current and is
+/// therefore absent from the map.
+fn current_symbol_versions_at<'records>(
+    records: &'records [GraphRecord],
+    symbol_name: &str,
+    instant: chrono::DateTime<chrono::FixedOffset>,
+) -> std::collections::HashMap<&'records str, usize> {
+    let mut best: std::collections::HashMap<&str, (usize, chrono::DateTime<chrono::FixedOffset>)> =
+        std::collections::HashMap::new();
+    for (position, record) in records.iter().enumerate() {
+        let GraphRecord::Node {
+            kind: NodeKind::Symbol,
+            id,
+            name,
+            temporal,
+            valid_time,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if name.as_deref() != Some(symbol_name) {
+            continue;
+        }
+        let Some(parsed) = temporal
+            .as_ref()
+            .map(|t| t.valid_time.as_str())
+            .or(valid_time.as_deref())
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        else {
+            continue;
+        };
+        if parsed > instant {
+            continue;
+        }
+        if best
+            .get(id.as_str())
+            .is_none_or(|(_, previous)| parsed > *previous)
+        {
+            best.insert(id.as_str(), (position, parsed));
+        }
+    }
+    best.into_iter()
+        .map(|(id, (position, _))| (id, position))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn query_symbol_as_of(
     records: &[GraphRecord],
@@ -19,24 +73,49 @@ pub(crate) fn query_symbol_as_of(
     // selection, for the same reason as the `--at` lane (issue #117): filtering
     // afterwards would report "no match" for a symbol that exists in the
     // requested package but lost the per-repository pick to a sibling.
-    let scoped_records: Option<Vec<GraphRecord>> = package.map(|selector| {
-        records
-            .iter()
-            .filter(|record| {
-                !matches!(
-                    record,
-                    GraphRecord::Node {
+    //
+    // But the SNAPSHOT is resolved first, per symbol identity. Removing a
+    // record from `symbol_as_of_valid_time_by_repo`'s input can PROMOTE another
+    // one — it picks a single winner per repository across every record
+    // carrying the queried name — so when a symbol keeps its stable ID while
+    // its enclosing manifest is renamed, a bare package filter deletes the
+    // current version and lets the SUPERSEDED one win, asserting ownership that
+    // ended before the queried instant. Collapsing each identity to the version
+    // current AT the instant first makes the two concerns independent: the
+    // instant decides WHICH version, and the selector then decides whether that
+    // version's owner matches.
+    let as_of_instant = chrono::DateTime::parse_from_rfc3339(as_of).ok();
+    let scoped_records: Option<Vec<GraphRecord>> =
+        package.zip(as_of_instant).map(|(selector, instant)| {
+            let current = current_symbol_versions_at(records, name, instant);
+            records
+                .iter()
+                .enumerate()
+                .filter(|(position, record)| {
+                    let GraphRecord::Node {
                         kind: NodeKind::Symbol,
+                        name: node_name,
                         ..
+                    } = record
+                    else {
+                        return true;
+                    };
+                    // A same-named symbol survives only as the version current
+                    // at the instant; every other version of that identity is
+                    // out of view and must not be promoted by the filter.
+                    if node_name.as_deref() == Some(name)
+                        && current.get(record.id()) != Some(position)
+                    {
+                        return false;
                     }
-                ) || record
-                    .crate_attribution()
-                    .and_then(super::CrateAttributionExt::owning_package_name)
-                    == Some(selector)
-            })
-            .cloned()
-            .collect()
-    });
+                    record
+                        .crate_attribution()
+                        .and_then(super::CrateAttributionExt::owning_package_name)
+                        == Some(selector)
+                })
+                .map(|(_, record)| record.clone())
+                .collect()
+        });
     let records = scoped_records.as_deref().unwrap_or(records);
     match query::symbol_as_of_valid_time_by_repo(records, name, as_of, index, selected_repo) {
         Err(msg) => {

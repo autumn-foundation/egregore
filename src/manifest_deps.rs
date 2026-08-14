@@ -114,6 +114,70 @@ const VIRTUAL_MANIFEST_FORBIDDEN_SECTIONS: [&str; 15] = [
     "lints",
     "hints",
 ];
+
+/// The TOML shape a known `[workspace]` field must have for Cargo to load the
+/// manifest at all.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum WorkspaceFieldShape {
+    /// An array whose every element is a string (`members`, `exclude`,
+    /// `default-members`).
+    StringArray,
+    /// A plain string (`resolver`).
+    Str,
+    /// A table (`package`, `dependencies`, `lints`).
+    Table,
+}
+
+/// Type contract for the known `[workspace]` fields.
+///
+/// Cargo type-checks each of these while parsing, so a wrong-typed one makes
+/// the WHOLE manifest unloadable — not merely that field ignored. That matters
+/// here because classifying a manifest as a virtual root is the FAIL-OPEN
+/// direction: the walk passes it and the subtree inherits an outer package,
+/// when in reality Cargo can load neither the workspace nor anything under it.
+///
+/// Every row was verified against real `cargo metadata --no-deps
+/// --format-version 1` on the pinned toolchain (cargo 1.94.1), which rejects
+/// each violation with `invalid type: … expected …`. Two fields are
+/// deliberately ABSENT because Cargo accepts any type for them: `metadata`
+/// (arbitrary user data), and every unrecognized key (a `future-tool-key`
+/// loads fine) — rejecting either would un-attribute a real subtree.
+///
+/// HONEST BOUND: this checks the TYPE of a known field, not its VALUE. Cargo
+/// validates deeper still — `[workspace.package] version = 1` is rejected as
+/// "expected semver version", and `resolver = "9"` as an unknown resolver — and
+/// re-implementing Cargo's manifest loader is out of scope for a local,
+/// deterministic, `cargo`-free resolver. A manifest malformed in one of those
+/// deeper ways is still walked past, exactly as the deny-list above can lag a
+/// newer Cargo.
+const WORKSPACE_FIELD_SHAPES: [(&str, WorkspaceFieldShape); 7] = [
+    ("members", WorkspaceFieldShape::StringArray),
+    ("exclude", WorkspaceFieldShape::StringArray),
+    ("default-members", WorkspaceFieldShape::StringArray),
+    ("resolver", WorkspaceFieldShape::Str),
+    // The inheritance table: a non-table here is rejected by Cargo just as a
+    // non-table top-level `package` is.
+    ("package", WorkspaceFieldShape::Table),
+    ("dependencies", WorkspaceFieldShape::Table),
+    ("lints", WorkspaceFieldShape::Table),
+];
+
+/// Whether every KNOWN field of a `[workspace]` table has a type Cargo accepts.
+///
+/// An absent field is fine (all are optional); an unknown field is fine (Cargo
+/// tolerates it). Only a present, known, wrong-typed field is disqualifying.
+fn workspace_table_is_well_typed(workspace: &dyn toml_edit::TableLike) -> bool {
+    WORKSPACE_FIELD_SHAPES.iter().all(|(field, shape)| {
+        workspace.get(field).is_none_or(|item| match shape {
+            WorkspaceFieldShape::StringArray => item
+                .as_array()
+                .is_some_and(|values| values.iter().all(toml_edit::Value::is_str)),
+            WorkspaceFieldShape::Str => item.as_str().is_some(),
+            WorkspaceFieldShape::Table => item.as_table_like().is_some(),
+        })
+    })
+}
+
 /// The three captured dependency tables in documented output order.
 const DEPENDENCY_KINDS: [DependencyKind; 3] = [
     DependencyKind::Normal,
@@ -344,24 +408,20 @@ pub fn parse_manifest_dependencies(
     //
     // A confirmed virtual root has: no `package` key AT ALL (a present one, in
     // any shape, means the manifest is trying to declare a package), a
-    // `workspace` TABLE, and none of the package-only sections Cargo forbids
-    // beside it ("this virtual manifest specifies a `<section>` section, which
-    // is not allowed" — each verified against real `cargo metadata`, while
-    // `[profile]`, `[patch]`, and `[replace]` were verified accepted).
+    // `workspace` TABLE whose every KNOWN field is well-typed
+    // ([`WORKSPACE_FIELD_SHAPES`] — a wrong-typed one makes the whole manifest
+    // unloadable, not merely that field ignored), and none of the package-only
+    // sections Cargo forbids beside it ("this virtual manifest specifies a
+    // `<section>` section, which is not allowed" — each verified against real
+    // `cargo metadata`, while `[profile]`, `[patch]`, and `[replace]` were
+    // verified accepted).
     let shape = if package_table.is_some() {
         ManifestShape::Package
     } else if doc.get("package").is_none()
         && doc
             .get("workspace")
             .and_then(toml_edit::Item::as_table_like)
-            .is_some_and(|workspace| {
-                // `[workspace.package]` is the inheritance table; a non-table
-                // value there is rejected by Cargo just as a non-table top-level
-                // `package` is.
-                workspace
-                    .get("package")
-                    .is_none_or(|inherited| inherited.as_table_like().is_some())
-            })
+            .is_some_and(workspace_table_is_well_typed)
         && !VIRTUAL_MANIFEST_FORBIDDEN_SECTIONS
             .iter()
             .any(|section| doc.get(section).is_some())

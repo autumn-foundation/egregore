@@ -4177,3 +4177,184 @@ fn consistent_unattributed_value_still_renders_its_reason() {
         text.stdout
     );
 }
+
+/// A package rename must not let `--as-of` resurrect the SUPERSEDED owner.
+///
+/// `symbol_as_of_valid_time_by_repo` picks ONE winner per repository across
+/// every record carrying the queried name, so removing a record from its input
+/// can PROMOTE a different one. When a symbol keeps its stable ID while its
+/// enclosing manifest is renamed, filtering on the package BEFORE the snapshot
+/// is resolved deletes the current version and lets the superseded one win — an
+/// answer asserting ownership that ended before the queried instant.
+///
+/// The instant decides the owner: before the rename the symbol is `alpha`,
+/// after it the symbol is `beta`, and `--package alpha` after the rename is an
+/// honest no-match.
+#[test]
+fn package_scope_as_of_does_not_resurrect_a_renamed_packages_ownership() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    // One crate, one symbol. The SOURCE never changes, so the symbol keeps its
+    // stable ID across both commits; only the manifest's package name moves.
+    write_fixture(
+        &repo,
+        &[
+            (
+                "crates/only/Cargo.toml",
+                "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "crates/only/src/lib.rs",
+                "pub fn renamed_owner() -> u32 { 1 }\n",
+            ),
+        ],
+    );
+    commit(&repo, "seed", "2026-06-01T00:00:00Z");
+    write_fixture(
+        &repo,
+        &[(
+            "crates/only/Cargo.toml",
+            "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n",
+        )],
+    );
+    commit(&repo, "rename the package", "2026-07-01T00:00:00Z");
+
+    let graph_path = temp.path().join("history.jsonl");
+    fs::write(
+        &graph_path,
+        aletheia_egregore::scan_repository_history(&repo)
+            .expect("history replay")
+            .to_jsonl()
+            .expect("serialize"),
+    )
+    .expect("graph written");
+    let graph = graph_path.to_str().unwrap();
+
+    let as_of_query = |instant: &str, package: &str| {
+        run_query(&[
+            "query",
+            "symbol",
+            "renamed_owner",
+            "--graph",
+            graph,
+            "--as-of",
+            instant,
+            "--package",
+            package,
+        ])
+    };
+
+    // BEFORE the rename the owner is `alpha` — a real match.
+    let before = as_of_query("2026-06-15T00:00:00Z", "alpha");
+    assert_eq!(before.code, 0, "stderr: {}", before.stderr);
+    let before_rows = rows(&before.stdout);
+    assert_eq!(before_rows.len(), 1);
+    assert_eq!(before_rows[0]["crate_attribution"]["package_name"], "alpha");
+
+    // AFTER the rename the owner is `beta`.
+    let after_beta = as_of_query("2026-08-01T00:00:00Z", "beta");
+    assert_eq!(after_beta.code, 0, "stderr: {}", after_beta.stderr);
+    let after_rows = rows(&after_beta.stdout);
+    assert_eq!(after_rows.len(), 1);
+    assert_eq!(after_rows[0]["crate_attribution"]["package_name"], "beta");
+
+    // And `alpha` after the rename owns nothing at that instant. Returning the
+    // pre-rename version here would present ownership that had already ended.
+    let after_alpha = as_of_query("2026-08-01T00:00:00Z", "alpha");
+    assert_eq!(
+        after_alpha.code, 2,
+        "`alpha` no longer owns the symbol at this instant; stdout: {}",
+        after_alpha.stdout
+    );
+}
+
+/// A `[workspace]` table Cargo REFUSES TO LOAD must stop the walk.
+///
+/// Classifying a manifest as a virtual root is the fail-open direction: the
+/// walk passes it and the subtree inherits an outer package. Cargo type-checks
+/// every known `[workspace]` field, so a wrong-typed one makes the whole
+/// manifest unloadable — nothing there declares a package, and no outer package
+/// owns those files either.
+///
+/// Each rejected case below was verified against real `cargo metadata
+/// --no-deps --format-version 1` on Cargo 1.94.1, as was each ACCEPTED one:
+/// `metadata` takes any type and an unknown key is tolerated, so neither may
+/// un-attribute a subtree.
+#[test]
+fn malformed_workspace_fields_stop_the_walk() {
+    for (label, workspace, expected) in [
+        (
+            "members = string",
+            "[workspace]\nmembers = \"not-an-array\"\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "members element = int",
+            "[workspace]\nmembers = [1]\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "exclude = string",
+            "[workspace]\nmembers = []\nexclude = \"nope\"\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "default-members = string",
+            "[workspace]\nmembers = []\ndefault-members = \"nope\"\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "resolver = int",
+            "[workspace]\nmembers = []\nresolver = 2\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "dependencies = string",
+            "[workspace]\nmembers = []\ndependencies = \"nope\"\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "lints = string",
+            "[workspace]\nmembers = []\nlints = \"nope\"\n",
+            "unattributed:unusable_manifest",
+        ),
+        // Cargo ACCEPTS these, so they stay walked past — a false rejection
+        // would un-attribute a real subtree.
+        (
+            "metadata = string (any type accepted)",
+            "[workspace]\nmembers = []\nmetadata = \"anything\"\n",
+            "outer@Cargo.toml",
+        ),
+        (
+            "unknown key tolerated",
+            "[workspace]\nmembers = []\nfuture-tool-key = \"whatever\"\n",
+            "outer@Cargo.toml",
+        ),
+        (
+            "well-typed control",
+            "[workspace]\nmembers = []\n",
+            "outer@Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                ("nested/Cargo.toml", workspace),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}`"
+        );
+    }
+}
