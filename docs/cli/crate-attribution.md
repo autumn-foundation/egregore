@@ -162,7 +162,12 @@ rejects a table there; the workspace POINTER `workspace = "../.."`, a string,
 distinct from the `x.workspace = true` inheritance form; and `resolver` /
 `forced-target` / `im-a-teapot`, also non-inheritable). That list is **closed**
 against the pinned Cargo version: every remaining `[package]` key is either
-`metadata`, which accepts any type, or unknown, which Cargo tolerates. Wrong-typed
+`metadata`, which accepts any type, or unknown, which Cargo tolerates.
+
+An inheritance value must actually BE one: `{ workspace = true }`. Cargo rejects
+a wrong-typed `workspace` key, `workspace = false`, and its absence, so those
+make the manifest unloadable; extra keys alongside it are tolerated and stay
+accepted. Wrong-typed
 **top-level sections** are deliberately NOT checked: `lib = 1`, `bin = 1`,
 `features = 1`, `dependencies = 1`, `profile = 1`, `badges = 1`, and
 `target = 1` beside a valid `[package]` all load cleanly under both

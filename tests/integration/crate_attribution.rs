@@ -6947,3 +6947,77 @@ fn the_remaining_type_checked_package_fields_are_covered() {
         );
     }
 }
+
+/// An inheritance table must actually BE one: `{ workspace = true }`.
+///
+/// The package-field validator accepted any table as the inheritance form, on
+/// the reasoning that validating its contents was Cargo's job. That was wrong
+/// in the same way the JSON-projection reasoning was: it is the same
+/// type-level check applied to every other field, it is cheap, and Cargo does
+/// reject the malformed forms — verified here in all four directions.
+///
+/// Extra keys alongside `workspace = true` are ACCEPTED by Cargo, so they must
+/// keep owning the subtree; only the `workspace` key itself is constrained.
+#[test]
+fn an_inheritance_table_must_be_the_workspace_true_shape() {
+    for (label, field_line, expected) in [
+        (
+            "workspace = string",
+            "version = { workspace = \"yes\" }",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "workspace = false",
+            "version = { workspace = false }",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "missing workspace key",
+            "version = {}",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "array field, workspace = string",
+            "version = \"0.1.0\"\nauthors = { workspace = \"yes\" }",
+            "unattributed:unusable_manifest",
+        ),
+        // Cargo ACCEPTS these.
+        (
+            "workspace = true",
+            "version = { workspace = true }",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "workspace = true with an extra key",
+            "version = { workspace = true, extra = 1 }",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "array field inherited",
+            "version = \"0.1.0\"\nauthors = { workspace = true }",
+            "inner@nested/Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!("[package]\nname = \"inner\"\n{field_line}\n"),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}`: {by_path:?}"
+        );
+    }
+}

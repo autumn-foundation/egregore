@@ -331,10 +331,18 @@ fn package_table_is_well_typed(package: &dyn toml_edit::TableLike) -> bool {
     }
     PACKAGE_FIELD_SHAPES.iter().all(|(field, shape)| {
         package.get(field).is_none_or(|item| {
-            // The workspace-inheritance form is a table; accepting any table
-            // here is deliberate, since validating its contents is Cargo's job
-            // and a false rejection un-attributes a real crate.
-            let inherited = item.as_table_like().is_some();
+            // The workspace-INHERITANCE form, which must actually be one:
+            // Cargo requires the `workspace` key present and equal to boolean
+            // `true`, rejecting a wrong type ("expected a boolean"), `false`
+            // ("`workspace` cannot be false"), and its absence ("missing field
+            // `workspace`") — all verified. EXTRA keys alongside it are
+            // tolerated, so only `workspace` itself is constrained; rejecting
+            // the rest would un-attribute real crates.
+            let inherited = item.as_table_like().is_some_and(|spec| {
+                spec.get("workspace")
+                    .and_then(toml_edit::Item::as_bool)
+                    .unwrap_or(false)
+            });
             match shape {
                 PackageFieldShape::Str => item.as_str().is_some(),
                 PackageFieldShape::StrOrInherited => item.as_str().is_some() || inherited,
