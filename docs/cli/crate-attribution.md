@@ -232,6 +232,21 @@ absent attribution, and never from a proven-ownerless one. This matters most on
 the text path, where the value is interpolated verbatim: without the last two
 checks a newline in either field forges an entire additional output line.
 
+The **negative** claim is re-checked the same way. `status: unattributed` is a
+fact — *provably* no owning package — not a fallback for a value that failed the
+checks above, so rendering it requires the full unattributed shape: status
+`unattributed`, a reason present, and **neither** a package name nor a manifest
+path. A record carrying an attribution *and* a reason, or a status of
+`attributed` with neither string, is a shape no producer writes; it is no better
+evidence for the negative claim than for the positive one, so it renders **no
+package line at all** — which is exactly how an absent attribution reads.
+
+`--format json` is unaffected in both directions: it echoes the stored payload
+verbatim, including a self-contradictory one, so the malformed shape stays
+visible to a machine reader rather than being silently rewritten. The checks
+above govern the **derived** claims — scoping, the package catalog, and the text
+render.
+
 ## Example
 
 ```console

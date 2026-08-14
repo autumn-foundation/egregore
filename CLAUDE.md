@@ -414,7 +414,21 @@ closure cannot supply — a package owned by two repositories where only ONE
 defines the queried symbol looks unambiguous inside the narrowed closure, so the
 lane would return rows where a cold scan refuses, and an answer that changes
 with the presence of an `.idx` file would break the index's documented contract
-of being a pure access-path optimization. Rows appear in
+of being a pure access-path optimization. A value READ BACK from a store or
+graph is operator-controlled (#104 doctrine), so every DERIVED claim — scoping,
+the package catalog, the text render — re-checks that the value is one the
+resolver could have PRODUCED, in BOTH directions: an ownership claim needs a
+Cargo-valid package NAME (the same `package_name_is_valid` rule that gated it at
+production, shared not re-derived) plus a manifest path of the shape the
+ancestor walk produces (relative, `/`-separated, no `.`/`..`/empty segment, no
+backslash, no drive prefix, no control character, last segment `Cargo.toml`),
+and the NEGATIVE claim needs the full unattributed shape (status
+`unattributed`, a reason, and NEITHER string) — because "provably no owning
+package" is a FACT, not a fallback for a value that failed the positive check.
+A value failing either owns nothing AND proves nothing, printing exactly what an
+ABSENT attribution prints; `--format json` still echoes the stored payload
+verbatim so a malformed shape stays visible rather than silently rewritten.
+Rows appear in
 both `--format json` and `--format text` (an absent field prints NOTHING — never
 "unattributed", which would fabricate a negative fact), are allow-list only
 (package name, manifest path, closed-set reason — a TOML parse-error message is
