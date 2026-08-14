@@ -5949,3 +5949,119 @@ fn package_scope_as_of_agrees_with_the_unscoped_answer_after_a_deletion() {
         );
     }
 }
+
+/// Cargo's automatic-target `auto*` fields are bool-only, and NOT inheritable.
+///
+/// They were missing from the package shape table, so a wrong-typed one read as
+/// an unknown key and the manifest stayed a usable package — attributing the
+/// subtree to a package Cargo cannot load. Unlike every other checked field
+/// these take no `x.workspace = true` form: Cargo rejects a table with
+/// "invalid type: map, expected a boolean", verified alongside the rest.
+#[test]
+fn malformed_auto_target_fields_do_not_own_their_subtree() {
+    for field in [
+        "autolib",
+        "autobins",
+        "autoexamples",
+        "autotests",
+        "autobenches",
+    ] {
+        for (label, value, expected) in [
+            ("string", "\"bad\"", "unattributed:unusable_manifest"),
+            // Not inheritable: a table is a type error here, unlike `version`.
+            (
+                "inheritance table",
+                "{ workspace = true }",
+                "unattributed:unusable_manifest",
+            ),
+            ("bool", "true", "inner@nested/Cargo.toml"),
+        ] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            write_fixture(
+                temp.path(),
+                &[
+                    (
+                        "Cargo.toml",
+                        "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                    ),
+                    (
+                        "nested/Cargo.toml",
+                        &format!(
+                            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n{field} = {value}\n"
+                        ),
+                    ),
+                    ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+                ],
+            );
+            let by_path = attribution_by_path(&scan_fixture(temp.path()));
+            assert_eq!(
+                by_path.get("nested/src/lib.rs"),
+                Some(&BTreeSet::from([expected.to_owned()])),
+                "`{field} = {value}` ({label}): {by_path:?}"
+            );
+        }
+    }
+}
+
+/// An ALL-TOMBSTONED corpus still ran attribution, so it is not a capability gap.
+///
+/// The liveness skip must not swallow the field-presence observation: a store
+/// whose every attributed record has been retracted does carry current-schema
+/// attribution, and no re-scan can restore a deleted package. Reporting
+/// `crate_attribution_unavailable` there re-opens the absent-vs-unattributed
+/// collapse that the ownerless-corpus fix closed, just through liveness instead
+/// of an empty manifest tree.
+#[test]
+fn an_all_tombstoned_corpus_is_not_reported_as_a_capability_gap() {
+    use std::fmt::Write as _;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"gone\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn orphan() -> u32 { 1 }\n"),
+        ],
+    );
+    let scanned = scan_repository_at_with_override(&repo, FIXED_TIME, Some("repo"))
+        .expect("scan")
+        .to_jsonl()
+        .expect("serialize");
+    let mut combined = scanned.clone();
+    combined.push('\n');
+    for record in parse_jsonl(&scanned) {
+        if record["record_type"] == "node" && record["crate_attribution"].is_object() {
+            let id = record["id"].as_str().expect("record id");
+            let _ = writeln!(
+                combined,
+                "{{\"record_type\":\"tombstone\",\"id\":\"tombstone:{id}\",\
+                 \"schema_version\":{SCHEMA_VERSION},\"deleted_id\":\"{id}\",\
+                 \"summary\":\"retracted for test\"}}"
+            );
+        }
+    }
+    let graph = temp.path().join("combined.jsonl");
+    fs::write(&graph, &combined).expect("graph written");
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "orphan",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--package",
+        "gone",
+    ]);
+    assert_eq!(run.code, 1, "stdout: {}", run.stdout);
+    let diagnostic: Value =
+        serde_json::from_str(run.stderr.trim()).expect("one JSON diagnostic line");
+    assert_eq!(
+        diagnostic["code"], "unknown_package_selector",
+        "attribution ran here; a re-scan cannot restore a retracted package: {diagnostic}"
+    );
+}

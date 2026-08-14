@@ -7570,17 +7570,6 @@ impl PackageCatalog {
             std::collections::BTreeMap::new();
         let mut attribution_observed = false;
         for record in records {
-            // A tombstoned non-temporal record can never appear in an answer —
-            // the lanes drop it via `current_deleted_ids` — so counting its
-            // package here makes a name look owned by two repositories when
-            // only one can produce a row. Mirrors the lanes' own liveness test
-            // exactly, including its restriction to non-temporal records: a
-            // commit-anchored version is history, not a current-state claim.
-            if matches!(record, GraphRecord::Node { temporal: None, .. })
-                && deleted.contains(record.id())
-            {
-                continue;
-            }
             // A `Change` is a COMMIT EVENT, not a current-state fact: it is
             // minted once per (commit, path) and so is never superseded, which
             // means it survives every corpus narrowing including HEAD
@@ -7602,7 +7591,24 @@ impl PackageCatalog {
             // Presence of the FIELD, not of an owner: a `status: unattributed`
             // value proves attribution ran here, which is what separates an
             // ownerless corpus from a pre-#117 one.
+            //
+            // Observed BEFORE the liveness skip below, deliberately. A retracted
+            // record still proves attribution RAN over this corpus, and no
+            // re-scan can restore a package that was deleted — so a store whose
+            // every attributed record is tombstoned must not be reported as the
+            // pre-#117 capability gap. Only OWNERSHIP is withheld.
             attribution_observed |= record.crate_attribution().is_some();
+            // A tombstoned non-temporal record can never appear in an answer —
+            // the lanes drop it via `current_deleted_ids` — so counting its
+            // package here makes a name look owned by two repositories when
+            // only one can produce a row. Mirrors the lanes' own liveness test
+            // exactly, including its restriction to non-temporal records: a
+            // commit-anchored version is history, not a current-state claim.
+            if matches!(record, GraphRecord::Node { temporal: None, .. })
+                && deleted.contains(record.id())
+            {
+                continue;
+            }
             // Fail-closed on a read-back value the resolver could not have
             // produced: a record claiming `unattributed` while carrying a name,
             // or citing a manifest that does not ENCLOSE it, owns nothing and

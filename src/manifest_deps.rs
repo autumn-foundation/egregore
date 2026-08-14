@@ -199,6 +199,11 @@ enum PackageFieldShape {
     BoolArrayOrInherited,
     /// A string or a bool, with no inheritance form (`build = false`).
     StrOrBool,
+    /// A bool ONLY — no string, no inheritance table. Cargo's automatic-target
+    /// switches (`autolib`, `autobins`, …) reject a table with "invalid type:
+    /// map, expected a boolean", so they are the one checked family taking no
+    /// `x.workspace = true` form.
+    Bool,
 }
 
 /// Type contract for the known `[package]` fields.
@@ -220,7 +225,7 @@ enum PackageFieldShape {
 /// known field, not its VALUE. Cargo also rejects `version = "notsemver"` and
 /// `edition = "1066"`, which this resolver does not evaluate — it confirms a
 /// manifest's shape rather than reimplementing Cargo's schema.
-const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 20] = [
+const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 25] = [
     ("name", PackageFieldShape::Str),
     ("links", PackageFieldShape::Str),
     ("default-run", PackageFieldShape::Str),
@@ -241,6 +246,11 @@ const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 20] = [
     ("include", PackageFieldShape::StringArrayOrInherited),
     ("publish", PackageFieldShape::BoolArrayOrInherited),
     ("build", PackageFieldShape::StrOrBool),
+    ("autolib", PackageFieldShape::Bool),
+    ("autobins", PackageFieldShape::Bool),
+    ("autoexamples", PackageFieldShape::Bool),
+    ("autotests", PackageFieldShape::Bool),
+    ("autobenches", PackageFieldShape::Bool),
 ];
 
 /// Whether every KNOWN field of a `[package]` table has a type Cargo accepts.
@@ -269,6 +279,7 @@ fn package_table_is_well_typed(package: &dyn toml_edit::TableLike) -> bool {
                     item.as_bool().is_some() || is_string_array(item) || inherited
                 }
                 PackageFieldShape::StrOrBool => item.as_str().is_some() || item.as_bool().is_some(),
+                PackageFieldShape::Bool => item.as_bool().is_some(),
             }
         })
     })
