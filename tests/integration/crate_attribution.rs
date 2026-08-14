@@ -4794,3 +4794,116 @@ fn a_lone_file_deletion_keeps_its_enclosing_package() {
         "the manifest survived, so both trees agree: {by_commit:?}"
     );
 }
+
+/// A symbol MOVED between packages must not answer from the package it left.
+///
+/// Round eleven collapsed each symbol IDENTITY to the version current at the
+/// instant, which fixes a manifest rename (the ID is stable, so there is one
+/// identity and its current version carries the new package). A file MOVE is
+/// different: the path is part of the ADR-0004 preimage, so the old and new
+/// locations are DISTINCT identities. Collapsing per identity keeps the old
+/// one's last version alive forever, and the package filter — which removes the
+/// current row — then lets that stale row win.
+///
+/// Snapshot membership has to be resolved first: at an instant after the move
+/// the symbol exists only in `beta`, so `--package alpha` is an honest no-match.
+#[test]
+fn package_scope_as_of_does_not_answer_from_a_package_the_symbol_left() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/alpha\", \"crates/beta\"]\n",
+            ),
+            (
+                "crates/alpha/Cargo.toml",
+                "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/alpha/src/lib.rs", "pub fn moved() -> u32 { 1 }\n"),
+            (
+                "crates/beta/Cargo.toml",
+                "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/beta/src/lib.rs", "pub fn stays() -> u32 { 2 }\n"),
+        ],
+    );
+    commit(&repo, "seed", "2026-06-01T00:00:00Z");
+
+    // The move: same symbol, new owning package, so a NEW stable ID.
+    fs::remove_file(repo.join("crates/alpha/src/lib.rs")).expect("remove");
+    fs::write(
+        repo.join("crates/beta/src/lib.rs"),
+        "pub fn stays() -> u32 { 2 }\npub fn moved() -> u32 { 1 }\n",
+    )
+    .expect("write");
+    commit(&repo, "move moved() to beta", "2026-07-01T00:00:00Z");
+
+    let graph_path = temp.path().join("history.jsonl");
+    fs::write(
+        &graph_path,
+        aletheia_egregore::scan_repository_history(&repo)
+            .expect("history replay")
+            .to_jsonl()
+            .expect("serialize"),
+    )
+    .expect("graph written");
+    let graph = graph_path.to_str().unwrap();
+    let after_move = "2026-08-01T00:00:00Z";
+
+    // After the move the symbol lives in `beta`.
+    let beta = run_query(&[
+        "query",
+        "symbol",
+        "moved",
+        "--graph",
+        graph,
+        "--as-of",
+        after_move,
+        "--package",
+        "beta",
+    ]);
+    assert_eq!(beta.code, 0, "stderr: {}", beta.stderr);
+    let beta_rows = rows(&beta.stdout);
+    assert_eq!(beta_rows.len(), 1);
+    assert_eq!(beta_rows[0]["crate_attribution"]["package_name"], "beta");
+
+    // And `alpha` owns nothing at that instant. Returning the pre-move row here
+    // would answer from a file that no longer exists.
+    let alpha = run_query(&[
+        "query",
+        "symbol",
+        "moved",
+        "--graph",
+        graph,
+        "--as-of",
+        after_move,
+        "--package",
+        "alpha",
+    ]);
+    assert_eq!(
+        alpha.code, 2,
+        "`alpha` no longer holds `moved` at this instant; stdout: {}",
+        alpha.stdout
+    );
+
+    // Before the move it really was in `alpha` — the fix must not erase that.
+    let before = run_query(&[
+        "query",
+        "symbol",
+        "moved",
+        "--graph",
+        graph,
+        "--as-of",
+        "2026-06-15T00:00:00Z",
+        "--package",
+        "alpha",
+    ]);
+    assert_eq!(before.code, 0, "stderr: {}", before.stderr);
+    let before_rows = rows(&before.stdout);
+    assert_eq!(before_rows[0]["crate_attribution"]["package_name"], "alpha");
+}

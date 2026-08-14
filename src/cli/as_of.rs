@@ -4,19 +4,41 @@ use super::*;
 // query symbol --as-of <instant>
 // ---------------------------------------------------------------------------
 
-/// Indexes, per record ID, the position of the `symbol_name` version current at
-/// `instant` — the newest `valid_time` at or before it.
+/// Indexes, per record ID, the position of the `symbol_name` record that is part
+/// of the snapshot at `instant`.
 ///
-/// Mirrors `query::symbol_as_of_valid_time_by_repo`'s own selection rule
-/// (strictly-greater `valid_time` wins, so an exact tie keeps the earlier
-/// position) restricted to ONE identity, so collapsing an identity here can
-/// never disagree with the winner that function would pick. A record with no
-/// parseable `valid_time`, or one later than the instant, is not current and is
-/// therefore absent from the map.
+/// Two steps, and BOTH are needed before a package filter may run:
+///
+/// 1. Each IDENTITY collapses to its newest `valid_time` at or before the
+///    instant. This mirrors `query::symbol_as_of_valid_time_by_repo`'s own rule
+///    (strictly-greater wins, so an exact tie keeps the earlier position)
+///    restricted to one identity, so it can never disagree with the winner that
+///    function would pick. It is what makes a manifest RENAME correct: the ID is
+///    stable, so there is one identity, and its current version carries the new
+///    package.
+/// 2. Identities absent from the snapshot are DROPPED. A file MOVE changes the
+///    stable ID (the path is part of the ADR-0004 preimage), so the old and new
+///    locations are distinct identities; step 1 alone would keep the old one's
+///    final version alive forever, and a package filter that removes the current
+///    row would then let that stale row win — answering from a file that no
+///    longer exists. History replay re-emits every live record at every commit,
+///    so an identity present in the snapshot carries that snapshot's
+///    `valid_time`; one whose newest version is older was not there.
+///
+/// The snapshot instant is computed PER REPOSITORY, grouped exactly as
+/// `symbol_as_of_valid_time_by_repo` groups (including the shared unattributed
+/// group), so one repository's commit timeline never evicts another's current
+/// records.
+///
+/// Deletion semantics are deliberately unchanged: a symbol removed outright
+/// still resolves to its last recorded version, exactly as the unscoped lane
+/// resolves it. This function only makes the SCOPED answer agree with the
+/// snapshot the unscoped lane would already have chosen.
 fn current_symbol_versions_at<'records>(
     records: &'records [GraphRecord],
     symbol_name: &str,
     instant: chrono::DateTime<chrono::FixedOffset>,
+    index: &query::RepositoryIndex,
 ) -> std::collections::HashMap<&'records str, usize> {
     let mut best: std::collections::HashMap<&str, (usize, chrono::DateTime<chrono::FixedOffset>)> =
         std::collections::HashMap::new();
@@ -53,7 +75,26 @@ fn current_symbol_versions_at<'records>(
             best.insert(id.as_str(), (position, parsed));
         }
     }
+    // Step 2: the snapshot instant per repository — the newest version any
+    // identity of this name reached there — then keep only the identities that
+    // actually reach it.
+    let mut snapshot: std::collections::HashMap<
+        Option<&str>,
+        chrono::DateTime<chrono::FixedOffset>,
+    > = std::collections::HashMap::new();
+    for (id, (_, parsed)) in &best {
+        let owner = index.owner_of(id);
+        snapshot
+            .entry(owner)
+            .and_modify(|latest| {
+                if *parsed > *latest {
+                    *latest = *parsed;
+                }
+            })
+            .or_insert(*parsed);
+    }
     best.into_iter()
+        .filter(|(id, (_, parsed))| snapshot.get(&index.owner_of(id)) == Some(parsed))
         .map(|(id, (position, _))| (id, position))
         .collect()
 }
@@ -87,7 +128,7 @@ pub(crate) fn query_symbol_as_of(
     let as_of_instant = chrono::DateTime::parse_from_rfc3339(as_of).ok();
     let scoped_records: Option<Vec<GraphRecord>> =
         package.zip(as_of_instant).map(|(selector, instant)| {
-            let current = current_symbol_versions_at(records, name, instant);
+            let current = current_symbol_versions_at(records, name, instant, index);
             records
                 .iter()
                 .enumerate()
