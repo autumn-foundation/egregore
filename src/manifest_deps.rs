@@ -270,7 +270,7 @@ enum PackageFieldShape {
 /// known field, not its VALUE. Cargo also rejects `version = "notsemver"` and
 /// `edition = "1066"`, which this resolver does not evaluate — it confirms a
 /// manifest's shape rather than reimplementing Cargo's schema.
-const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 26] = [
+const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 29] = [
     ("name", PackageFieldShape::Str),
     // The workspace POINTER (`workspace = "../.."`), naming the root this
     // package belongs to. Distinct from the `x.workspace = true` INHERITANCE
@@ -301,6 +301,14 @@ const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 26] = [
     ("autoexamples", PackageFieldShape::Bool),
     ("autotests", PackageFieldShape::Bool),
     ("autobenches", PackageFieldShape::Bool),
+    // The last type-checked fields of Cargo 1.94.1's package table. None is
+    // inheritable — a `x.workspace = true` table is rejected for all three —
+    // so they take the non-inheritable shapes. With these the table is CLOSED
+    // against that version: every remaining key is either `metadata` (any type)
+    // or unknown, both of which Cargo tolerates.
+    ("resolver", PackageFieldShape::Str),
+    ("forced-target", PackageFieldShape::Str),
+    ("im-a-teapot", PackageFieldShape::Bool),
 ];
 
 /// SCOPE, verified rather than assumed: this checks the `[package]` TABLE's own

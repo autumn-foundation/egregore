@@ -6871,3 +6871,79 @@ fn a_malformed_workspace_dependency_stops_the_walk() {
         );
     }
 }
+
+/// The remaining type-checked `[package]` fields, closing that table.
+///
+/// `resolver`, `forced-target`, and `im-a-teapot` are the last fields of Cargo
+/// 1.94.1's package table that it type-checks and this validator did not cover.
+/// None is inheritable — a `x.workspace = true` table is rejected for all three
+/// ("expected a string" / "expected a boolean"), unlike `version` and its
+/// siblings — so they take the non-inheritable shapes.
+///
+/// `metadata` is deliberately absent: Cargo accepts ANY type there, as it does
+/// an unknown key, so checking either would un-attribute real crates. With
+/// these three, the `[package]` table is closed against that Cargo version.
+#[test]
+fn the_remaining_type_checked_package_fields_are_covered() {
+    for (label, extra, expected) in [
+        (
+            "resolver = int",
+            "resolver = 1\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "forced-target = int",
+            "forced-target = 1\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "im-a-teapot = int",
+            "im-a-teapot = 1\n",
+            "unattributed:unusable_manifest",
+        ),
+        // Not inheritable: a table is a type error for all three.
+        (
+            "resolver inheritance table",
+            "resolver = { workspace = true }\n",
+            "unattributed:unusable_manifest",
+        ),
+        // Cargo ACCEPTS these, so they keep owning the subtree.
+        (
+            "resolver = string",
+            "resolver = \"2\"\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "metadata takes any type",
+            "metadata = 1\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "unknown key tolerated",
+            "totally-unknown = 1\n",
+            "inner@nested/Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!("[package]\nname = \"inner\"\nversion = \"0.1.0\"\n{extra}"),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}`: {by_path:?}"
+        );
+    }
+}

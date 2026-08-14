@@ -158,8 +158,11 @@ does — so an absent field never means "this kind happens not to be covered".
 | `unusable_manifest` (malformed `[package]`) | The nearest manifest declares a `[package]` that wrong-types a known field (`name`/`links`/`default-run` strings; `version`/`edition`/`rust-version`/`description`/`homepage`/`repository`/`license`/`license-file`/`documentation` a string or the `x.workspace = true` inheritance table; `authors`/`keywords`/`categories`/`exclude`/`include` string arrays or inherited; `readme` a string, bool, or inherited; `publish` a bool, string array, or inherited; `build` a string or bool; and the
 automatic-target switches `autolib`/`autobins`/`autoexamples`/`autotests`/`autobenches`
 bools, which are the one checked family that takes NO inheritance form — Cargo
-rejects a table there; and the workspace POINTER `workspace = "../.."`, a
-string, distinct from the `x.workspace = true` inheritance form). Wrong-typed
+rejects a table there; the workspace POINTER `workspace = "../.."`, a string,
+distinct from the `x.workspace = true` inheritance form; and `resolver` /
+`forced-target` / `im-a-teapot`, also non-inheritable). That list is **closed**
+against the pinned Cargo version: every remaining `[package]` key is either
+`metadata`, which accepts any type, or unknown, which Cargo tolerates. Wrong-typed
 **top-level sections** are deliberately NOT checked: `lib = 1`, `bin = 1`,
 `features = 1`, `dependencies = 1`, `profile = 1`, `badges = 1`, and
 `target = 1` beside a valid `[package]` all load cleanly under both
