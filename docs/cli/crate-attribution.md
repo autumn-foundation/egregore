@@ -59,14 +59,17 @@ corpora:
   tombstone that retracts it.
 
 `crate_attribution_unavailable` is reserved for a corpus carrying **no
-`crate_attribution` field at all** — including a corpus whose every attributed
-record has been *retracted*, which still proves attribution ran and which no
-re-scan can undo — a pre-#117 store, whose remedy really is a
-re-scan. A freshly scanned repository with no `[package]` manifest (only a
-virtual workspace, or none) is *not* that case: every path-bearing record
-carries a present `status: unattributed`, attribution ran, and re-scanning
-cannot create a package. That corpus answers `unknown_package_selector` with an
-empty `known_packages` list.
+`crate_attribution` field at all** — a pre-#117 store, whose remedy really is a
+re-scan. Two corpora that look empty are *not* that case, and both answer
+`unknown_package_selector` with an empty `known_packages` list instead:
+
+- a freshly scanned repository with no `[package]` manifest (only a virtual
+  workspace, or none) — every path-bearing record carries a present
+  `status: unattributed`, so attribution ran, and re-scanning cannot create a
+  package;
+- a corpus whose every attributed record has been **retracted** — the field is
+  still there, so attribution demonstrably ran, and no re-scan restores a
+  deleted package.
 
 The flag is spelled `--package`, **not** `--crate`. `eg query who-imports
 --crate <name>` already exists and means something unrelated (rewriting a
