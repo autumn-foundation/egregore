@@ -7590,24 +7590,20 @@ impl PackageCatalog {
             // into a current-state fact, so reporting the pre-#117 capability
             // gap for those sends the operator after a remedy that cannot work.
             //
-            // A value the checks REFUSE does not count. Everywhere else in this
-            // feature such a value owns nothing and proves nothing, reading
-            // exactly like an absent field; counting it as evidence of
-            // capability would make this the one surface where a forged value
-            // still buys something — and it would answer a wholly-unusable
-            // corpus with an empty `known_packages` list, blaming the caller's
-            // spelling when nothing in the store can answer at all.
+            // A value the checks REFUSE does not count — including one riding a
+            // node kind the resolver never stamps, which
+            // `presentable_crate_attribution` refuses for both arms at once.
+            // Everywhere else in this feature such a value owns nothing and
+            // proves nothing, reading exactly like an absent field; counting it
+            // as evidence of capability would make this the one surface where a
+            // forged value still buys something — and it would answer a
+            // wholly-unusable corpus with an empty `known_packages` list,
+            // blaming the caller's spelling when nothing in the store can answer
+            // at all.
             //
             // Placed first so a future exclusion cannot re-open that by adding
             // another `continue`: every skip below withholds OWNERSHIP only.
-            attribution_observed |= matches!(
-                record,
-                GraphRecord::Node {
-                    crate_attribution: Some(attribution),
-                    repo_relative_path: Some(path),
-                    ..
-                } if attribution.is_presentable_for(path)
-            );
+            attribution_observed |= record.presentable_crate_attribution().is_some();
             // A `Change` is a COMMIT EVENT, not a current-state fact: it is
             // minted once per (commit, path) and so is never superseded, which
             // means it survives every corpus narrowing including HEAD

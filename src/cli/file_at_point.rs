@@ -132,11 +132,9 @@ pub(crate) fn query_file(
             // Every row takes its OWN record's attribution; duplicates are
             // blanked after the sort below, so whatever survives is always a
             // fact about the row it rides on.
-            crate_attribution: r.crate_attribution().filter(|attribution| {
-                repo_relative_path
-                    .as_deref()
-                    .is_some_and(|path| attribution.is_presentable_for(path))
-            }),
+            // Read through the ONE record-level boundary, so this lane cannot
+            // drift from the package catalog's gate (issue #117).
+            crate_attribution: r.presentable_crate_attribution().map(|(a, _)| a),
             crate_attribution_disclaimer: None,
             git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
             repository_id,

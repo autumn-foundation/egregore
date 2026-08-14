@@ -235,7 +235,6 @@ pub(crate) fn symbol_row<'a>(
         visibility,
         signature,
         doc,
-        crate_attribution,
         temporal,
         ..
     } = record
@@ -259,14 +258,13 @@ pub(crate) fn symbol_row<'a>(
         signature: signature.as_deref(),
         doc: doc.as_deref(),
         git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
-        // Only a claim the resolver could have produced is presentable — the
-        // same gate the text render and the package catalog apply, so the two
-        // output formats cannot disagree about one record (issue #117).
-        crate_attribution: crate_attribution.as_ref().filter(|attribution| {
-            repo_relative_path
-                .as_deref()
-                .is_some_and(|path| attribution.is_presentable_for(path))
-        }),
+        // Only a claim the resolver could have produced is presentable, read
+        // through the ONE record-level boundary the text render and the package
+        // catalog also use, so no two surfaces can disagree about one record and
+        // no future caller can inherit a weaker gate (issue #117). This row is
+        // statically a `Symbol`, so the boundary's kind check is a no-op here —
+        // it is the shared entry point that matters.
+        crate_attribution: record.presentable_crate_attribution().map(|(a, _)| a),
         crate_attribution_disclaimer: None,
         repository_id,
         repository: repository_id.and_then(|repo| index.display_of(repo)),

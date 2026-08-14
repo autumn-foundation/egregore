@@ -7021,3 +7021,150 @@ fn an_inheritance_table_must_be_the_workspace_true_shape() {
         );
     }
 }
+
+/// A node kind the resolver never stamps must not participate in package scope.
+///
+/// The read-back ladder asks one question — could the resolver have PRODUCED
+/// this value? — and asks it of the status/name/manifest shape, of whether the
+/// manifest ENCLOSES the record, and of whether the record's own path is one a
+/// scanner emits. The node KIND was the single input it never asked about, even
+/// though `carries_crate_attribution` states EXHAUSTIVELY which kinds carry
+/// attribution at all. A `ScanCoverage`, `Commit`, `Repository`, or
+/// `Observation` bearing the field is therefore exactly as un-producible as a
+/// manifest that encloses nothing, and was trusted anyway.
+///
+/// It is not inert. Repository-scoped nodes resolve through
+/// `RepositoryIndex::owner_of` like every other record, so a forged one in
+/// repository B added B as an owner of a package only repository A holds — and
+/// the AMBIGUITY verdict, which exists to prevent a silent cross-repository
+/// merge, then REFUSED a query that was perfectly answerable. One un-writable
+/// field turns a working answer into `ambiguous_package_selector`.
+#[test]
+fn an_ineligible_node_kind_cannot_own_a_package() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut lines: Vec<String> = Vec::new();
+    for (repo_id, package) in [("repo-a", "shared"), ("repo-b", "other")] {
+        let repo = temp.path().join(repo_id);
+        fs::create_dir_all(&repo).expect("repo dir");
+        write_fixture(
+            &repo,
+            &[
+                (
+                    "crates/shared/Cargo.toml",
+                    &format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\n"),
+                ),
+                ("crates/shared/src/lib.rs", "pub fn helper() -> u32 { 1 }\n"),
+            ],
+        );
+        let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some(repo_id))
+            .expect("scan")
+            .to_jsonl()
+            .expect("serialize");
+        for mut record in parse_jsonl(&jsonl) {
+            // Only repository B is forged: it holds no package named `shared`,
+            // so every `shared` row the lane can return comes from A.
+            if repo_id == "repo-b" && record["kind"] == "ScanCoverage" {
+                record["repo_relative_path"] = Value::from("crates/shared/src/lib.rs");
+                record["crate_attribution"] = serde_json::json!({
+                    "status": "attributed",
+                    "package_name": "shared",
+                    "manifest_repo_relative_path": "crates/shared/Cargo.toml",
+                });
+            }
+            lines.push(serde_json::to_string(&record).expect("serialize"));
+        }
+    }
+    let graph_path = temp.path().join("forged.jsonl");
+    fs::write(&graph_path, lines.join("\n")).expect("graph written");
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "helper",
+        "--graph",
+        graph_path.to_str().unwrap(),
+        "--package",
+        "shared",
+    ]);
+    assert!(
+        !run.stderr.contains("ambiguous_package_selector"),
+        "a kind the resolver never stamps must not make a package look \
+         cross-repository: {}",
+        run.stderr
+    );
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    let returned: Vec<String> = rows(&run.stdout)
+        .iter()
+        .filter_map(|row| row["repository"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        returned,
+        vec!["repo-a".to_owned()],
+        "only the repository that really owns `shared` may answer: {}",
+        run.stdout
+    );
+}
+
+/// ...nor prove that attribution was ever computed over the corpus.
+///
+/// The capability verdict is the other half of the same read: `--package` over
+/// a corpus carrying NO attribution reports `crate_attribution_unavailable`
+/// with a re-scan remedy, precisely so a pre-issue-#117 store is never mistaken
+/// for one where the package simply does not exist. That flag is set from the
+/// same unguarded read, so a single forged ineligible node silently converted
+/// the capability gap into `unknown_package_selector`/no-match — the operator
+/// is told their spelling is wrong, or that the package owns no matching row,
+/// when in truth nothing in the corpus can answer at all and the remedy is a
+/// re-scan.
+#[test]
+fn an_ineligible_node_kind_cannot_prove_the_attribution_capability() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            (
+                "crates/shared/Cargo.toml",
+                "[package]\nname = \"shared\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/shared/src/lib.rs", "pub fn helper() -> u32 { 1 }\n"),
+        ],
+    );
+    let mut lines: Vec<String> = Vec::new();
+    for mut record in scan_fixture(temp.path()) {
+        // A pre-#117 corpus: strip the field everywhere it was legitimately
+        // stamped, then forge it onto the one kind that can never carry it.
+        record
+            .as_object_mut()
+            .expect("node object")
+            .remove("crate_attribution");
+        if record["kind"] == "ScanCoverage" {
+            record["repo_relative_path"] = Value::from("crates/shared/src/lib.rs");
+            record["crate_attribution"] = serde_json::json!({
+                "status": "attributed",
+                "package_name": "shared",
+                "manifest_repo_relative_path": "crates/shared/Cargo.toml",
+            });
+        }
+        lines.push(serde_json::to_string(&record).expect("serialize"));
+    }
+    let graph_path = temp.path().join("pre117.jsonl");
+    fs::write(&graph_path, lines.join("\n")).expect("graph written");
+
+    let run = run_query(&[
+        "query",
+        "symbol",
+        "helper",
+        "--graph",
+        graph_path.to_str().unwrap(),
+        "--package",
+        "shared",
+    ]);
+    assert_eq!(run.code, 1, "stdout: {} stderr: {}", run.stdout, run.stderr);
+    let diagnostic: Value =
+        serde_json::from_str(run.stderr.trim()).expect("one JSON diagnostic line");
+    assert_eq!(
+        diagnostic["code"], "crate_attribution_unavailable",
+        "a forged ineligible node must not stand in for attribution the \
+         corpus never carried: {diagnostic}"
+    );
+}

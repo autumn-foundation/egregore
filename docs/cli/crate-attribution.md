@@ -318,7 +318,7 @@ being a pure access-path optimization.
 
 An attribution read back from a store or a graph is operator-controlled, so the
 reader re-derives whether the value is one the resolver could actually have
-**produced** before scoping or rendering on it. Three checks, all fail-closed:
+**produced** before scoping or rendering on it. Six checks, all fail-closed:
 
 1. `status: attributed`, both strings present, no `unattributed_reason` — a
    value carrying both an attribution and a reason is a shape no producer
@@ -380,6 +380,21 @@ reader re-derives whether the value is one the resolver could actually have
    the rule it verifies. Two correct shapes that look unusual both pass: a
    manifest's own `File` node cites itself, and a repo-root manifest encloses
    every path.
+6. The record's **node kind** is one the resolver stamps, per the same
+   exhaustive `carries_crate_attribution` classifier that decides presence at
+   production. The other five checks interrogate the value; this one
+   interrogates the record carrying it, and it is the same question: a
+   `Commit`, `Repository`, `ScanCoverage`, or `Observation` bearing the field is
+   as un-producible as a manifest that encloses nothing.
+
+   Ineligible kinds are not inert. They resolve to an owning repository like any
+   other record, so one forged in repository B added B as an owner of a package
+   only repository A holds — and the **ambiguity** verdict, which exists to
+   prevent a silent cross-repository merge, then refused a query that was
+   answerable. The same read sets the capability flag, so a single forged node
+   could equally mask a pre-#117 corpus (remedy: re-scan) as a mere spelling
+   miss. Both arms read through one record-level boundary, so the check cannot
+   be applied to one and forgotten on the other.
 
 These checks are **local**: they establish that the value has a shape the
 resolver emits and that the cited manifest encloses the record. They do **not**

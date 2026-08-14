@@ -443,7 +443,17 @@ with the presence of an `.idx` file would break the index's documented contract
 of being a pure access-path optimization. A value READ BACK from a store or
 graph is operator-controlled (#104 doctrine), so every DERIVED claim — scoping,
 the package catalog, the text render — re-checks that the value is one the
-resolver could have PRODUCED, in BOTH directions: an ownership claim needs a
+resolver could have PRODUCED, in BOTH directions. That question is asked of the
+RECORD as well as the value: the node KIND must be one the resolver stamps, per
+the same exhaustive `carries_crate_attribution` classifier that decides presence
+at production, because a repo-scoped `Commit`/`ScanCoverage`/`Repository` (or any
+agent-authored node) bearing the field is as un-producible as a manifest that
+encloses nothing — and NOT inert, since it resolves to an owning repository like
+any other record, so one forged in repo B added B as an owner of a package only
+repo A holds and the AMBIGUITY verdict then REFUSED an answerable query, while
+the same read could mask a pre-#117 corpus as a mere spelling miss (both arms go
+through ONE record-level boundary so the check cannot be applied to one and
+forgotten on the other). An ownership claim further needs a
 Cargo-valid package NAME (the same `package_name_is_valid` rule that gated it at
 production, shared not re-derived) plus a manifest path that both has the shape
 the ancestor walk produces AND actually ENCLOSES the record citing it — the RECORD path being

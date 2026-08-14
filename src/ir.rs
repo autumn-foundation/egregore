@@ -2619,15 +2619,32 @@ impl GraphRecord {
         }
     }
 
-    /// The owning package this record can PROVE, or `None`.
+    /// The attribution this record can PRESENT, paired with its own path.
     ///
-    /// The record-level boundary for issue #117: it applies the shape checks AND
-    /// requires the cited manifest to enclose this record's own path, so a
-    /// forged pairing the nearest-enclosing walk could never produce asserts
-    /// nothing. Every consumer that acts on ownership goes through here.
+    /// The record-level boundary for issue #117, and the only place the KIND is
+    /// checked. Every other gate in this feature asks whether a value is one the
+    /// resolver could have PRODUCED — the status/name/manifest shape, the
+    /// manifest ENCLOSING the record, the record's own path being one a scanner
+    /// emits — and the node kind is that same question asked of the record
+    /// itself: [`crate::crate_attribution::carries_crate_attribution`] states
+    /// EXHAUSTIVELY which kinds the three stamping paths reach, so a
+    /// `ScanCoverage`, `Commit`, `Repository`, or `Observation` bearing the field
+    /// is exactly as un-producible as a manifest that encloses nothing.
+    ///
+    /// Ineligible kinds are not inert. They resolve through
+    /// [`crate::query::RepositoryIndex::owner_of`] like any other record, so one
+    /// forged in repository B added B as an owner of a package only repository A
+    /// holds, and the ambiguity verdict — silent-merge protection — then refused
+    /// an answerable query. The same read sets the capability flag, so it could
+    /// equally mask a pre-#117 corpus, whose remedy is a re-scan, as a mere
+    /// spelling miss.
+    ///
+    /// Both arms go through here so the kind check cannot be added to one and
+    /// forgotten on the other.
     #[must_use]
-    pub fn owning_package(&self) -> Option<(&str, &str)> {
+    pub fn presentable_crate_attribution(&self) -> Option<(&CrateAttribution, &str)> {
         let Self::Node {
+            kind,
             crate_attribution: Some(attribution),
             repo_relative_path: Some(path),
             ..
@@ -2635,6 +2652,21 @@ impl GraphRecord {
         else {
             return None;
         };
+        if !crate::crate_attribution::carries_crate_attribution(*kind) {
+            return None;
+        }
+        attribution
+            .is_presentable_for(path)
+            .then_some((attribution, path.as_str()))
+    }
+
+    /// The owning package this record can PROVE, or `None`.
+    ///
+    /// [`Self::presentable_crate_attribution`] narrowed to the POSITIVE claim.
+    /// Every consumer that acts on ownership goes through here.
+    #[must_use]
+    pub fn owning_package(&self) -> Option<(&str, &str)> {
+        let (attribution, path) = self.presentable_crate_attribution()?;
         attribution.owning_package_for(path)
     }
 
