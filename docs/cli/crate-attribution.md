@@ -155,14 +155,28 @@ does — so an absent field never means "this kind happens not to be covered".
 | `no_enclosing_manifest` | No `Cargo.toml` in any ancestor directory **within the repository**. Typically a stray source file outside every crate — though it also covers a scan rooted inside a crate, whose manifest sits above the scan root. |
 | `virtual_manifest_only` | Every enclosing manifest is a virtual workspace root, which declares no package. |
 | `unnamed_package` | The nearest manifest declares a `[package]` whose `name` is absent or Cargo-invalid. |
-| `unusable_manifest` (malformed `[package]`) | The nearest manifest declares a `[package]` that wrong-types a known field (`name`/`links`/`default-run` strings; `version`/`edition`/`rust-version`/`description`/`homepage`/`repository`/`license`/`license-file`/`documentation` a string or the `x.workspace = true` inheritance table; `authors`/`keywords`/`categories`/`exclude`/`include` string arrays or inherited; `readme` a string, bool, or inherited; `publish` a bool, string array, or inherited; `build` a string or bool; and the
+| `unusable_manifest` (malformed `[package]`) | The nearest manifest declares a `[package]` that wrong-types a known field (`name`/`links`/`default-run` strings; `version`/`edition`/`rust-version`/`description`/`homepage`/`repository`/`license`/`license-file`/`documentation` a string or the `x.workspace = true` inheritance table; `authors`/`keywords`/`categories`/`exclude`/`include` string arrays or inherited; `readme` a string, bool, or inherited; `publish` a bool, string array, or inherited; `build` a string, bool, or string
+array; and the
 automatic-target switches `autolib`/`autobins`/`autoexamples`/`autotests`/`autobenches`
 bools, which are the one checked family that takes NO inheritance form — Cargo
 rejects a table there; the workspace POINTER `workspace = "../.."`, a string,
 distinct from the `x.workspace = true` inheritance form; and `resolver` /
-`forced-target` / `im-a-teapot`, also non-inheritable). That list is **closed**
-against the pinned Cargo version: every remaining `[package]` key is either
+`forced-target` / `default-target` / `metabuild` / `im-a-teapot`, also
+non-inheritable). That list is **closed**
+against the pinned Cargo version, verified by probing every documented
+`[package]` key with a wrong type: every remaining key is either
 `metadata`, which accepts any type, or unknown, which Cargo tolerates.
+
+The table models Cargo's **deserializer**, not its feature gates. Cargo
+type-checks the manifest before applying gates, so a wrong-typed known field
+fails with `invalid type: …` while a well-typed but nightly-gated one fails with
+"feature `x` is required". Only the first is modelled: `default-target`,
+`metabuild`, and `build`'s array form are all nightly-gated, and a scan has no
+way to know which channel or `cargo-features` a crate builds under, so refusing
+their well-typed values would un-attribute real nightly crates. This is why the
+first two were missed when the list was previously called closed — on stable
+*every* value of a gated field fails, so only the wrong-typed one, which fails
+earlier and differently, distinguishes it from an unknown key.
 
 An inheritance value must actually BE one: `{ workspace = true }`. Cargo rejects
 a wrong-typed `workspace` key, `workspace = false`, and its absence, so those

@@ -364,7 +364,12 @@ refuses to load: a manifest carrying NEITHER `[package]` nor `[workspace]`, a
 virtual manifest carrying a package-only section, one whose `[package]` table
 wrong-types a KNOWN field (the `x.workspace = true` INHERITANCE table is
 accepted wherever Cargo accepts it, since rejecting it would un-attribute every
-inheriting workspace), and one whose `[workspace]`
+inheriting workspace; the field table models Cargo's DESERIALIZER and not its
+feature gates, because Cargo type-checks BEFORE gating and a scan cannot know
+which channel or `cargo-features` a crate builds under — so the nightly-gated
+`default-target`/`metabuild` and `build`'s `multiple-build-scripts` array are
+type-checked but their well-typed values ACCEPTED, since refusing them would
+un-attribute real nightly crates), and one whose `[workspace]`
 table wrong-types a KNOWN field (`members`/`exclude`/`default-members` arrays of
 strings, `resolver` a string, `package`/`dependencies`/`lints` tables — each
 verified against real `cargo metadata`, while `metadata` takes any type and an

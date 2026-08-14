@@ -242,8 +242,15 @@ enum PackageFieldShape {
     StrBoolOrInherited,
     /// A bool, a string array, or the inheritance table (`publish`).
     BoolArrayOrInherited,
-    /// A string or a bool, with no inheritance form (`build = false`).
-    StrOrBool,
+    /// A string, a bool, or a string array, with no inheritance form (`build`).
+    ///
+    /// The array is the `multiple-build-scripts` form. It is nightly-GATED, not
+    /// wrong-typed: Cargo's deserializer accepts it and the gate rejects it
+    /// afterwards, so treating it as a type error would make the whole manifest
+    /// `unusable_manifest` and un-attribute a real nightly crate.
+    StrBoolOrStringArray,
+    /// A string or a string array, with no inheritance form (`metabuild`).
+    StrOrStringArray,
     /// A bool ONLY — no string, no inheritance table. Cargo's automatic-target
     /// switches (`autolib`, `autobins`, …) reject a table with "invalid type:
     /// map, expected a boolean", so they are the one checked family taking no
@@ -270,7 +277,7 @@ enum PackageFieldShape {
 /// known field, not its VALUE. Cargo also rejects `version = "notsemver"` and
 /// `edition = "1066"`, which this resolver does not evaluate — it confirms a
 /// manifest's shape rather than reimplementing Cargo's schema.
-const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 29] = [
+const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 31] = [
     ("name", PackageFieldShape::Str),
     // The workspace POINTER (`workspace = "../.."`), naming the root this
     // package belongs to. Distinct from the `x.workspace = true` INHERITANCE
@@ -295,20 +302,34 @@ const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 29] = [
     ("exclude", PackageFieldShape::StringArrayOrInherited),
     ("include", PackageFieldShape::StringArrayOrInherited),
     ("publish", PackageFieldShape::BoolArrayOrInherited),
-    ("build", PackageFieldShape::StrOrBool),
+    ("build", PackageFieldShape::StrBoolOrStringArray),
     ("autolib", PackageFieldShape::Bool),
     ("autobins", PackageFieldShape::Bool),
     ("autoexamples", PackageFieldShape::Bool),
     ("autotests", PackageFieldShape::Bool),
     ("autobenches", PackageFieldShape::Bool),
     // The last type-checked fields of Cargo 1.94.1's package table. None is
-    // inheritable — a `x.workspace = true` table is rejected for all three —
-    // so they take the non-inheritable shapes. With these the table is CLOSED
-    // against that version: every remaining key is either `metadata` (any type)
-    // or unknown, both of which Cargo tolerates.
+    // inheritable — a `x.workspace = true` table is rejected for every one of
+    // them — so they take the non-inheritable shapes.
     ("resolver", PackageFieldShape::Str),
     ("forced-target", PackageFieldShape::Str),
     ("im-a-teapot", PackageFieldShape::Bool),
+    // NIGHTLY-GATED, and type-checked BEFORE the gate runs. These were missed
+    // when the table was first called closed, precisely because the gate hides
+    // them: on stable EVERY value fails, so only the wrong-typed one — which
+    // fails earlier, with `invalid type` — distinguishes them from an unknown
+    // key. `default-target` is the literal twin of `forced-target` above (one
+    // Cargo error message names the two together) and shipped without it.
+    //
+    // Their well-typed forms are accepted here even though stable Cargo refuses
+    // the manifest, because this table models Cargo's DESERIALIZER and not its
+    // feature gates: a nightly crate that really does enable
+    // `per-package-target` or `metabuild` must keep its attribution, and
+    // modelling gates would mean tracking which channel and which
+    // `cargo-features` a scan ran under. The same reasoning widened `build`
+    // above to admit the gated `multiple-build-scripts` array.
+    ("default-target", PackageFieldShape::Str),
+    ("metabuild", PackageFieldShape::StrOrStringArray),
 ];
 
 /// SCOPE, verified rather than assumed: this checks the `[package]` TABLE's own
@@ -353,7 +374,12 @@ fn package_table_is_well_typed(package: &dyn toml_edit::TableLike) -> bool {
                 PackageFieldShape::BoolArrayOrInherited => {
                     item.as_bool().is_some() || is_string_array(item) || inherited
                 }
-                PackageFieldShape::StrOrBool => item.as_str().is_some() || item.as_bool().is_some(),
+                PackageFieldShape::StrBoolOrStringArray => {
+                    item.as_str().is_some() || item.as_bool().is_some() || is_string_array(item)
+                }
+                PackageFieldShape::StrOrStringArray => {
+                    item.as_str().is_some() || is_string_array(item)
+                }
                 PackageFieldShape::Bool => item.as_bool().is_some(),
             }
         })

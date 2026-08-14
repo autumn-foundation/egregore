@@ -7168,3 +7168,107 @@ fn an_ineligible_node_kind_cannot_prove_the_attribution_capability() {
          corpus never carried: {diagnostic}"
     );
 }
+
+/// The `[package]` type table must match Cargo's DESERIALIZER, not its gates.
+///
+/// Cargo type-checks the manifest before it applies feature gates, so a
+/// wrong-typed known field fails with `invalid type: …` while a well-typed but
+/// nightly-gated one fails with "feature `x` is required". This resolver models
+/// the FIRST of those and deliberately not the second — a nightly crate that
+/// really does enable the feature must keep its attribution.
+///
+/// The table claimed to be CLOSED against cargo 1.94.1 and was not: probing
+/// every documented `[package]` key with a wrong type finds two Cargo
+/// type-checks and this table did not carry, and both are nightly-gated, which
+/// is exactly why they were missed — the accepted case is invisible on stable.
+///
+/// | field | Cargo 1.94.1 |
+/// |---|---|
+/// | `default-target = 1` | `invalid type: integer, expected a string` |
+/// | `metabuild = 1` | `invalid type: integer, expected string or list of strings` |
+/// | `build = ["build.rs"]` | type-valid; `feature multiple-build-scripts is required` |
+///
+/// The third is the mirror image and the more dangerous one: `build` was
+/// `StrOrBool`, so the array form Cargo's deserializer ACCEPTS was refused as a
+/// type error and the whole manifest went `unusable_manifest`. On stable the
+/// verdict happened to match because the gate rejects it anyway; on nightly with
+/// `multiple-build-scripts` enabled it un-attributes a real crate — a false
+/// rejection, which is the worse error.
+#[test]
+fn package_field_shapes_track_cargos_deserializer_not_its_feature_gates() {
+    for (label, field_line, expected) in [
+        // Wrong-typed: Cargo cannot deserialize the manifest at all.
+        (
+            "default-target int",
+            "default-target = 1",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "metabuild int",
+            "metabuild = 1",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "metabuild non-string element",
+            "metabuild = [1]",
+            "unattributed:unusable_manifest",
+        ),
+        // Well-typed: gated on stable, but a shape the deserializer accepts, so
+        // the manifest still names a package and still owns its subtree.
+        (
+            "default-target string",
+            "default-target = \"x86_64-unknown-linux-gnu\"",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "metabuild string",
+            "metabuild = \"foo\"",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "metabuild string list",
+            "metabuild = [\"foo\"]",
+            "inner@nested/Cargo.toml",
+        ),
+        // `build` accepts three forms, not two.
+        (
+            "build string",
+            "build = \"build.rs\"",
+            "inner@nested/Cargo.toml",
+        ),
+        ("build bool", "build = false", "inner@nested/Cargo.toml"),
+        (
+            "build string array",
+            "build = [\"build.rs\"]",
+            "inner@nested/Cargo.toml",
+        ),
+        ("build int", "build = 1", "unattributed:unusable_manifest"),
+        (
+            "build non-string element",
+            "build = [1]",
+            "unattributed:unusable_manifest",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!("[package]\nname = \"inner\"\nversion = \"0.1.0\"\n{field_line}\n"),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}` (`{field_line}`): {by_path:?}"
+        );
+    }
+}
