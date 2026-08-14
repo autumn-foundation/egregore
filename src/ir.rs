@@ -3899,6 +3899,37 @@ impl CrateAttribution {
         Some((name, manifest))
     }
 
+    /// The reason no package owns this node, but ONLY when this value is one
+    /// the resolver could actually have PRODUCED.
+    ///
+    /// The negative mirror of [`Self::owning_package`], and it needs the same
+    /// re-derivation for the same reason. "Provably no owning package" is a
+    /// FACT, not a fallback: [`CrateAttribution`]'s absent-vs-unattributed
+    /// contract says an absent field means UNKNOWN, so rendering a reason
+    /// carried by a self-contradictory value would fabricate a proven-ownerless
+    /// claim out of a shape no producer writes — the same fabrication
+    /// [`Self::owning_package`] refuses in the positive direction.
+    ///
+    /// Consistency here means the full unattributed shape: `status:
+    /// unattributed`, a reason present, and NEITHER a package name nor a
+    /// manifest path. A value failing any of those owns nothing AND proves
+    /// nothing; it reads downstream exactly like an absent attribution.
+    ///
+    /// Deliberately NOT named after the field it guards: `x.unattributed_reason`
+    /// and `x.unattributed_reason()` would differ by two characters, so a
+    /// future edit dropping the parens would silently restore the fail-open
+    /// read this exists to close.
+    #[must_use]
+    pub fn proven_unattributed_reason(&self) -> Option<CrateAttributionReason> {
+        if self.status != CrateAttributionStatus::Unattributed
+            || self.package_name.is_some()
+            || self.manifest_repo_relative_path.is_some()
+        {
+            return None;
+        }
+        self.unattributed_reason
+    }
+
     /// Builds an attributed value citing the owning package and its manifest.
     #[must_use]
     pub fn attributed(

@@ -548,7 +548,19 @@ where
     let mut has_expected = false;
     let mut expected_has_handle = false;
     let mut is_first = true;
-    let mut first_attribution = true;
+    // `eg query file` keeps the FIRST occurrence of each DISTINCT
+    // `(repository_id, crate_attribution)` pair and blanks the repeats (issue
+    // #117), because a repo-relative path is not globally unique: it can exist
+    // in several repositories, and over a `scan-history` graph its owning
+    // package can change between commits. Modelling that as "first row only"
+    // would understate the real answer whenever a path has more than one owner,
+    // and this builder feeds a savings THRESHOLD — a response modelled smaller
+    // than the CLI returns can pass a gate the real answer would fail. Mirror
+    // the real key, not an approximation of it.
+    let mut seen_attributions: std::collections::BTreeSet<(
+        Option<&str>,
+        &crate::ir::CrateAttribution,
+    )> = std::collections::BTreeSet::new();
     // Every element in `matched` is a Node variant (guaranteed by the filter above).
     for record in matched {
         if let GraphRecord::Node {
@@ -597,11 +609,10 @@ where
                 },
                 crate_attribution: if include_declaration_surface {
                     crate_attribution.as_ref()
-                } else if first_attribution {
-                    first_attribution = false;
-                    crate_attribution.as_ref()
                 } else {
-                    None
+                    crate_attribution
+                        .as_ref()
+                        .filter(|value| seen_attributions.insert((repository_id, value)))
                 },
                 corpus_mode: symbol_corpus.as_ref().map(|c| c.0),
                 corpus_mode_source: symbol_corpus.as_ref().map(|c| c.1),
@@ -988,6 +999,68 @@ mod tests {
         // substring inside a longer identifier is not a whole-word match
         assert!(!line_has_word("parse_configuration()", "parse_config"));
         assert!(!line_has_word("xparse_config", "parse_config"));
+    }
+
+    /// The file-answer builder must model what `eg query file` ACTUALLY
+    /// returns: the first occurrence of each DISTINCT
+    /// `(repository_id, crate_attribution)` pair, not merely the first row.
+    ///
+    /// A repo-relative path is not globally unique — it can exist in several
+    /// repositories, and over a `scan-history` graph its owning package can
+    /// change between commits — so a first-row-only model understates the real
+    /// answer whenever a path has more than one owner. That direction of error
+    /// is the dangerous one here: this builder feeds a savings THRESHOLD, and
+    /// an under-counted Egregore answer inflates the ratio, letting the gate
+    /// pass where the real answer would fail.
+    #[test]
+    fn file_answer_keeps_every_distinct_attribution_like_the_real_lane() {
+        use crate::ir::{CrateAttribution, SourceSpan};
+
+        let symbol = |id: &str, line: usize, package: &str, manifest: &str| {
+            let mut record = GraphRecord::node(
+                id.to_owned(),
+                NodeKind::Symbol,
+                Some("src/lib.rs".to_owned()),
+                Some(SourceSpan {
+                    start_byte: 0,
+                    end_byte: 1,
+                    start_line: line,
+                    end_line: line,
+                }),
+                Some(format!("sym_{line}")),
+                "symbol".to_owned(),
+            );
+            if let GraphRecord::Node {
+                crate_attribution, ..
+            } = &mut record
+            {
+                *crate_attribution = Some(CrateAttribution::attributed(package, manifest));
+            }
+            record
+        };
+        // One path, three rows, TWO distinct owners — the shape a vendored
+        // crate or a mid-history manifest move produces.
+        let records = vec![
+            symbol("codegraph:a", 1, "alpha", "crates/alpha/Cargo.toml"),
+            symbol("codegraph:b", 2, "alpha", "crates/alpha/Cargo.toml"),
+            symbol("codegraph:c", 3, "beta", "crates/beta/Cargo.toml"),
+        ];
+        let index = RepositoryIndex::build(&records);
+        let answer = build_file_answer(&records, &index, "src/lib.rs", "codegraph:a");
+
+        assert_eq!(answer.row_count, 3);
+        assert_eq!(
+            answer.text.matches("crates/alpha/Cargo.toml").count(),
+            1,
+            "the repeated owner is emitted once: {}",
+            answer.text
+        );
+        assert_eq!(
+            answer.text.matches("crates/beta/Cargo.toml").count(),
+            1,
+            "the SECOND distinct owner must not be dropped: {}",
+            answer.text
+        );
     }
 
     #[test]

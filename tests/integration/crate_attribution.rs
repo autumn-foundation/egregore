@@ -3074,21 +3074,31 @@ fn forged_attribution_with_inconsistent_status_is_not_trusted() {
         scoped.stderr
     );
 
-    // And the row renders as what it CLAIMS to be — unattributed — not as an
-    // attribution to a package no manifest declares.
+    // And the row renders NOTHING — neither the ownership claim nor the
+    // `unattributed` one.
+    //
+    // An earlier round of this test asserted the row still rendered its
+    // DECLARED status, on the reading that falling back to the negative claim
+    // was the conservative move. It is not. "Provably no owning package" is
+    // itself a FACT, and this record's shape — a status of `unattributed`
+    // carrying a package name and a manifest path — is one no producer writes,
+    // so it is no better evidence for the negative claim than for the positive
+    // one. Rendering it would manufacture the proven-ownerless fact the
+    // absent-vs-unattributed contract exists to keep separate from an unknown.
+    // Printing nothing is exactly how an ABSENT attribution reads: unknown.
+    // See `forged_unattributed_reason_the_resolver_could_not_produce_renders_nothing`.
     let text = run_query(&[
         "query", "symbol", "handle", "--graph", forged_str, "--format", "text",
     ]);
     assert_eq!(text.code, 0, "stderr: {}", text.stderr);
     assert!(
         !text.stdout.contains("ghostpkg"),
-        "an unattributed row must not render a package name: {}",
+        "an inconsistent row must not render a package name: {}",
         text.stdout
     );
     assert!(
-        text.stdout
-            .contains("package: (unattributed: no_enclosing_manifest)"),
-        "the row must render its declared status: {}",
+        !text.stdout.contains("package:"),
+        "an inconsistent row proves nothing and must render no package line: {}",
         text.stdout
     );
 }
@@ -4050,4 +4060,120 @@ fn assert_forged_attribution_owns_nothing(label: &str, package_name: &str, manif
             text.stdout
         );
     }
+}
+
+/// A read-back attribution must not render a NEGATIVE ownership claim it could
+/// not have produced either.
+///
+/// The mirror of the positive case above, and it matters for the same reason:
+/// "provably no owning package" is a FACT, not a fallback. The
+/// absent-vs-unattributed contract says an ABSENT field means UNKNOWN, so
+/// rendering a reason carried by a self-contradictory value manufactures the
+/// proven-ownerless claim the contract exists to keep separate from an unknown.
+/// A value failing the consistency check must print NOTHING — neither an
+/// ownership claim nor a reason.
+#[test]
+fn forged_unattributed_reason_the_resolver_could_not_produce_renders_nothing() {
+    for (label, payload) in [
+        // `status: attributed` WITH a reason: refused as an ownership claim
+        // (the previous round), and it must not fall through to the negative
+        // render either.
+        (
+            "attributed carrying a reason",
+            serde_json::json!({
+                "status": "attributed",
+                "package_name": "contradictory",
+                "manifest_repo_relative_path": "crates/alpha/Cargo.toml",
+                "unattributed_reason": "no_enclosing_manifest",
+            }),
+        ),
+        // `status: unattributed` while still carrying an attribution: the
+        // producer writes one or the other, never both.
+        (
+            "unattributed carrying a package name",
+            serde_json::json!({
+                "status": "unattributed",
+                "package_name": "contradictory",
+                "unattributed_reason": "virtual_manifest_only",
+            }),
+        ),
+        (
+            "unattributed carrying a manifest path",
+            serde_json::json!({
+                "status": "unattributed",
+                "manifest_repo_relative_path": "crates/alpha/Cargo.toml",
+                "unattributed_reason": "virtual_manifest_only",
+            }),
+        ),
+        // `status: attributed` with NEITHER string: no ownership claim is
+        // possible, and there is no reason to fall back to.
+        (
+            "attributed carrying nothing",
+            serde_json::json!({ "status": "attributed" }),
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let graph = write_graph(temp.path());
+
+        let forged: String = fs::read_to_string(&graph)
+            .expect("graph readable")
+            .lines()
+            .map(|line| {
+                let mut record: Value = serde_json::from_str(line).expect("JSON");
+                if record["kind"] == "Symbol"
+                    && record["name"]
+                        .as_str()
+                        .is_some_and(|n| n.ends_with("handle"))
+                    && let Some(object) = record.as_object_mut()
+                {
+                    object.insert("crate_attribution".to_owned(), payload.clone());
+                }
+                serde_json::to_string(&record).expect("serialize")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let forged_path = temp.path().join("forged.jsonl");
+        fs::write(&forged_path, forged).expect("forged graph written");
+
+        let text = run_query(&[
+            "query",
+            "symbol",
+            "handle",
+            "--graph",
+            forged_path.to_str().unwrap(),
+            "--format",
+            "text",
+        ]);
+        assert_eq!(text.code, 0, "stderr: {}", text.stderr);
+        assert!(
+            !text.stdout.contains("package:"),
+            "`{label}` must render no package line at all: {}",
+            text.stdout
+        );
+    }
+}
+
+/// A LEGITIMATE unattributed value still renders its reason — the check above
+/// must not silence the honest negative fact it exists to protect.
+#[test]
+fn consistent_unattributed_value_still_renders_its_reason() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = write_graph(temp.path());
+    // `scripts/gen.rs` sits outside every package, under a virtual root only.
+    let text = run_query(&[
+        "query",
+        "symbol",
+        "generate",
+        "--graph",
+        graph.to_str().unwrap(),
+        "--format",
+        "text",
+    ]);
+    assert_eq!(text.code, 0, "stderr: {}", text.stderr);
+    assert!(
+        text.stdout
+            .contains("package: (unattributed: virtual_manifest_only)"),
+        "a resolver-produced unattributed value must still render: {}",
+        text.stdout
+    );
 }

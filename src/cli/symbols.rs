@@ -453,14 +453,19 @@ impl PrintText for SymbolResult<'_> {
         // Owning Cargo package (issue #117). An ABSENT field prints NOTHING:
         // the record predates issue #117, so its attribution is unknown, and
         // rendering "unattributed" would fabricate a negative fact.
-        // Rendered from `owning_package`, which re-checks the value's internal
-        // consistency: a record read back claiming `unattributed` while carrying
-        // a package name renders as unattributed, never as an ownership claim
-        // the resolver never made.
+        //
+        // BOTH branches read through a checked accessor rather than the raw
+        // fields, because a value read back from a store or a graph is
+        // operator-controlled and BOTH renders are claims. `owning_package`
+        // refuses an ownership claim the resolver could not have produced;
+        // `proven_unattributed_reason` refuses the negative one, which is
+        // equally a fact — "provably no owner" is exactly what this feature's
+        // absent-vs-unattributed contract says an absent field must NOT be read
+        // as. A value failing either check prints nothing at all.
         if let Some(attribution) = self.crate_attribution {
             if let Some((name, manifest)) = attribution.owning_package() {
                 let _ = write!(text, "\n  package: {name} ({manifest})");
-            } else if let Some(reason) = attribution.unattributed_reason {
+            } else if let Some(reason) = attribution.proven_unattributed_reason() {
                 let _ = write!(text, "\n  package: (unattributed: {})", reason.as_str());
             }
         }
