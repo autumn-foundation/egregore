@@ -6624,3 +6624,84 @@ fn an_all_change_corpus_is_not_reported_as_a_capability_gap() {
         "attribution ran here, so this is not the pre-#117 gap: {diagnostic}"
     );
 }
+
+/// Target-specific dependency TABLES are type-checked; top-level ones are not.
+///
+/// A genuine Cargo asymmetry, verified on the pinned toolchain rather than
+/// assumed symmetric:
+///
+/// - top-level `dependencies = 1` beside a valid `[package]` LOADS (Cargo
+///   tolerates the scalar), so rejecting it would un-attribute a real crate;
+/// - `[target."cfg(unix)"] dependencies = 1` is REJECTED ("expected a map"),
+///   as is a target SPEC that is not a table ("expected struct `TomlPlatform`").
+///
+/// The two loops therefore cannot be unified, and this test exists to make that
+/// concrete for anyone tempted to.
+#[test]
+fn target_dependency_tables_are_typed_but_top_level_ones_are_tolerated() {
+    for (label, nested_extra, expected) in [
+        (
+            "target dependencies = 1",
+            "\n[target.\"cfg(unix)\"]\ndependencies = 1\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "target dev-dependencies = 1",
+            "\n[target.\"cfg(unix)\"]\ndev-dependencies = 1\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "target build-dependencies = 1",
+            "\n[target.\"cfg(unix)\"]\nbuild-dependencies = 1\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "target spec is not a table",
+            "\n[target]\n\"cfg(unix)\" = 1\n",
+            "unattributed:unusable_manifest",
+        ),
+        // Cargo ACCEPTS these, so they must keep owning the subtree.
+        (
+            "top-level dependencies = 1 is tolerated",
+            "dependencies = 1\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "top-level dev-dependencies = 1 is tolerated",
+            "dev-dependencies = 1\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "unknown key under a target spec is tolerated",
+            "\n[target.\"cfg(unix)\"]\nfuture-key = 1\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "well-formed target dependencies",
+            "\n[target.\"cfg(unix)\".dependencies]\nserde = \"1\"\n",
+            "inner@nested/Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!("[package]\nname = \"inner\"\nversion = \"0.1.0\"\n{nested_extra}"),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}`: {by_path:?}"
+        );
+    }
+}

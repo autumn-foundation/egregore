@@ -575,14 +575,23 @@ pub fn parse_manifest_dependencies(
     // whether the manifest loads.
     if let Some(targets) = doc.get("target").and_then(toml_edit::Item::as_table_like) {
         for (_, target) in targets.iter() {
+            // A target SPEC must be a table ("expected struct TomlPlatform"),
+            // and each of its dependency tables must be a map — UNLIKE the
+            // top-level tables below, where Cargo tolerates a scalar
+            // (`dependencies = 1` beside a valid `[package]` loads fine,
+            // verified). That asymmetry is real, so the two loops cannot be
+            // unified: applying this rule at the top level would un-attribute
+            // crates Cargo builds.
             let Some(target) = target.as_table_like() else {
+                uninterpretable = true;
                 continue;
             };
             for kind in DEPENDENCY_KINDS {
-                let Some(table) = target
-                    .get(kind.table())
-                    .and_then(toml_edit::Item::as_table_like)
-                else {
+                let Some(entry) = target.get(kind.table()) else {
+                    continue;
+                };
+                let Some(table) = entry.as_table_like() else {
+                    uninterpretable = true;
                     continue;
                 };
                 if table
