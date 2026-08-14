@@ -6213,3 +6213,76 @@ fn a_wrong_typed_top_level_section_still_owns_its_subtree() {
         );
     }
 }
+
+/// Top-level `cargo-features` is type-checked by Cargo, unlike `lib = 1`.
+///
+/// It must be an array of strings, and the requirement applies to BOTH manifest
+/// shapes — a virtual workspace root with `cargo-features = 1` is equally
+/// unloadable, and must stop the walk rather than be passed over. Verified
+/// against real `cargo metadata --no-deps --format-version 1` on the pinned
+/// toolchain, which is also what separates this from the tolerated top-level
+/// sections: `lib = 1` loads, `cargo-features = 1` does not.
+///
+/// An unknown feature NAME (`cargo-features = ["totally-made-up"]`) is also a
+/// Cargo error, but that is VALUE-level validation — the documented bound this
+/// resolver does not cross — so it stays accepted here.
+#[test]
+fn a_malformed_cargo_features_stops_the_walk() {
+    for (label, prefix, nested_body, expected) in [
+        (
+            "package, int",
+            "cargo-features = 1\n",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "package, int element",
+            "cargo-features = [1]\n",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "virtual root, int",
+            "cargo-features = 1\n",
+            "[workspace]\nmembers = []\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "package, empty array",
+            "cargo-features = []\n",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "package, unknown feature name is VALUE-level",
+            "cargo-features = [\"totally-made-up\"]\n",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "virtual root, empty array walks past to outer",
+            "cargo-features = []\n",
+            "[workspace]\nmembers = []\n",
+            "outer@Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                ("nested/Cargo.toml", &format!("{prefix}{nested_body}")),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}`: {by_path:?}"
+        );
+    }
+}

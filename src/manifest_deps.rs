@@ -541,7 +541,22 @@ pub fn parse_manifest_dependencies(
     // attributed to it — the same fail-closed treatment a malformed
     // `[workspace]` gets.
     let package_well_typed = package_table.is_some_and(package_table_is_well_typed);
-    let shape = if package_table.is_some() {
+    // `cargo-features` is TOP-LEVEL and applies to BOTH shapes: Cargo requires
+    // an array of strings and rejects anything else with "expected a sequence",
+    // so a manifest carrying a malformed one is unloadable whether it declares a
+    // package or a virtual root. This is the one top-level field checked here —
+    // `lib`, `bin`, `features`, `dependencies`, `profile`, `badges`, and
+    // `target` are all TOLERATED as scalars by Cargo (verified), so rejecting
+    // them would un-attribute crates that build fine. An unknown feature NAME is
+    // also a Cargo error, but that is value-level validation this resolver does
+    // not cross.
+    let cargo_features_well_typed = doc.get("cargo-features").is_none_or(|item| {
+        item.as_array()
+            .is_some_and(|values| values.iter().all(toml_edit::Value::is_str))
+    });
+    let shape = if !cargo_features_well_typed {
+        ManifestShape::Unusable
+    } else if package_table.is_some() {
         if package_well_typed {
             ManifestShape::Package
         } else {
