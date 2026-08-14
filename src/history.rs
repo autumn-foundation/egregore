@@ -294,33 +294,62 @@ fn scan_repository_history_inner(
         //
         // Costs one extra `ls-tree` only for commits that delete something; the
         // blob-OID parse memo is shared, so manifests already parsed at an
-        // earlier commit are not re-parsed. A root commit deletes nothing, and
-        // for a merge this reads the mainline parent — a deletion reported only
-        // against a non-first parent keeps the post-commit answer.
-        if !deleted_paths.is_empty()
-            && let Some(parent_sha) = commit.parents.first()
-        {
-            let parent_tree = list_commit_tree(repo_root, parent_sha)?;
-            let parent_attribution = commit_crate_attribution_index(
-                repo_root,
-                parent_sha,
-                &parent_tree.manifests,
-                &mut manifest_outcome_memo,
-            );
-            crate::crate_attribution::apply_crate_attribution_where(
-                &mut graph.records_mut()[commit_attribution_start..commit_records_start],
-                &parent_attribution,
-                |record| {
-                    matches!(
-                        record,
-                        GraphRecord::Node {
-                            kind: NodeKind::Change,
-                            repo_relative_path: Some(path),
-                            ..
-                        } if deleted_paths.contains(path)
-                    )
-                },
-            );
+        // earlier commit are not re-parsed. A root commit deletes nothing.
+        //
+        // A MERGE needs the reporting parent, not the mainline one: `diff-tree
+        // -m` diffs against every parent and `--no-commit-id` discards which
+        // produced each entry, so a file deleted on a side branch — one the
+        // first parent never had — would be resolved against a tree with no
+        // nested manifest and inherit an outer package. Each parent is asked
+        // separately (only for merges; a single-parent commit reports all of
+        // its deletions by definition and pays no extra call).
+        if !deleted_paths.is_empty() {
+            let mut remaining = deleted_paths.clone();
+            for parent_sha in &commit.parents {
+                if remaining.is_empty() {
+                    break;
+                }
+                // Which of the remaining deletions THIS parent reports. A
+                // single-parent commit reports all of them by definition, so it
+                // pays no extra Git call; only a merge needs asking, because
+                // `diff-tree -m` discards which parent produced each entry and
+                // a file deleted on one branch may not exist on the other at
+                // all. First parent wins an overlap, deterministically.
+                let mine: BTreeSet<String> = if commit.parents.len() == 1 {
+                    remaining.clone()
+                } else {
+                    let reported = deletions_against_parent(repo_root, parent_sha, &commit.sha)?;
+                    remaining.intersection(&reported).cloned().collect()
+                };
+                if mine.is_empty() {
+                    continue;
+                }
+                let parent_tree = list_commit_tree(repo_root, parent_sha)?;
+                let parent_attribution = commit_crate_attribution_index(
+                    repo_root,
+                    parent_sha,
+                    &parent_tree.manifests,
+                    &mut manifest_outcome_memo,
+                );
+                crate::crate_attribution::apply_crate_attribution_where(
+                    &mut graph.records_mut()[commit_attribution_start..commit_records_start],
+                    &parent_attribution,
+                    |record| {
+                        matches!(
+                            record,
+                            GraphRecord::Node {
+                                kind: NodeKind::Change,
+                                repo_relative_path: Some(path),
+                                ..
+                            } if mine.contains(path)
+                        )
+                    },
+                );
+                remaining.retain(|path| !mine.contains(path));
+            }
+            // A deletion no parent reports (only reachable if Git's `-m` output
+            // and the per-parent diffs disagree) keeps the post-commit answer
+            // rather than being resolved against an arbitrary tree.
         }
     }
 
@@ -443,6 +472,42 @@ fn list_changes(repo_root: &Path, commit: &GitCommit) -> Result<Vec<GitChange>> 
             &commit.sha,
         ],
     )?;
+    Ok(parse_name_status_z(&output))
+}
+
+/// The paths one PARENT reports as deleted by `commit` (issue #117).
+///
+/// `diff-tree -m --no-commit-id` diffs a merge against every parent and
+/// discards which one produced a given entry, so a deletion can only be
+/// attributed to the tree it actually came from by asking each parent
+/// separately. Used ONLY to route merge deletions to the right parent tree;
+/// which `Change` records exist is still decided by [`list_changes`].
+fn deletions_against_parent(
+    repo_root: &Path,
+    parent_sha: &str,
+    commit_sha: &str,
+) -> Result<BTreeSet<String>> {
+    let output = git_output_bytes(
+        repo_root,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "-z",
+            parent_sha,
+            commit_sha,
+        ],
+    )?;
+    Ok(parse_name_status_z(&output)
+        .into_iter()
+        .filter(|change| change.status.starts_with('D'))
+        .map(|change| change.path)
+        .collect())
+}
+
+/// Parses `--name-status -z` output into de-duplicated changes.
+fn parse_name_status_z(output: &[u8]) -> Vec<GitChange> {
     let mut tokens = output
         .split(|byte| *byte == 0)
         .map(|raw| std::str::from_utf8(raw).ok())
@@ -473,7 +538,7 @@ fn list_changes(repo_root: &Path, commit: &GitCommit) -> Result<Vec<GitChange>> 
             changes.push(change);
         }
     }
-    Ok(changes)
+    changes
 }
 
 /// One commit tree's indexed source files and Cargo manifests, from a SINGLE

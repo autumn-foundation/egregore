@@ -5318,3 +5318,143 @@ fn a_forged_record_path_is_not_owned_by_the_cited_package() {
         );
     }
 }
+
+/// A corpus where attribution RAN but found no package is not a capability gap.
+///
+/// `crate_attribution_unavailable` exists for a pre-#117 corpus, and its remedy
+/// is "re-scan with a build that records attribution". A freshly scanned repo
+/// with no `[package]` manifest — only a virtual workspace, or none at all —
+/// carries a present `status: unattributed` on every record: attribution was
+/// computed and there is provably no owner. Re-scanning cannot create a package,
+/// so telling the operator to re-scan is the same absent-vs-unattributed
+/// collapse this feature exists to prevent, at the one surface they act on.
+#[test]
+fn an_all_unattributed_corpus_is_not_reported_as_a_capability_gap() {
+    for (label, files) in [
+        (
+            "virtual workspace only",
+            vec![
+                ("Cargo.toml", "[workspace]\nmembers = []\n"),
+                ("src/lib.rs", "pub fn orphan() -> u32 { 1 }\n"),
+            ],
+        ),
+        (
+            "no manifest at all",
+            vec![("src/lib.rs", "pub fn orphan() -> u32 { 1 }\n")],
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(temp.path(), &files);
+        let graph_path = temp.path().join("graph.jsonl");
+        fs::write(&graph_path, scan_jsonl(temp.path())).expect("graph written");
+
+        // Precondition: attribution really did run and record a reason.
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert!(
+            by_path
+                .get("src/lib.rs")
+                .is_some_and(|set| set.iter().all(|value| value.starts_with("unattributed:"))),
+            "`{label}`: fixture must be all-unattributed: {by_path:?}"
+        );
+
+        let run = run_query(&[
+            "query",
+            "symbol",
+            "orphan",
+            "--graph",
+            graph_path.to_str().unwrap(),
+            "--package",
+            "anything",
+        ]);
+        assert_eq!(run.code, 1, "`{label}` stdout: {}", run.stdout);
+        let diagnostic: Value =
+            serde_json::from_str(run.stderr.trim()).expect("one JSON diagnostic line");
+        assert_eq!(
+            diagnostic["code"], "unknown_package_selector",
+            "`{label}`: attribution ran, so this is not a capability gap: {diagnostic}"
+        );
+        assert_eq!(
+            diagnostic["known_packages"]
+                .as_array()
+                .expect("known_packages")
+                .len(),
+            0,
+            "`{label}`: no package owns anything here"
+        );
+    }
+}
+
+/// A merge deletion must resolve against the parent that REPORTED it.
+///
+/// `git diff-tree -m` diffs a merge against EACH parent, and `--no-commit-id`
+/// discards which one produced a given entry. Resolving every deletion against
+/// the FIRST parent is therefore wrong whenever the deleted file existed only
+/// on another branch: the first-parent tree has no nested manifest, the walk
+/// reaches the outer one, and the `Change` claims the file belonged to a
+/// package it never belonged to — the same fabrication the deletion fix exists
+/// to prevent, reached by a different route.
+#[test]
+fn a_merge_deletion_resolves_against_the_parent_that_reported_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git(&repo);
+    // main: an outer package only.
+    write_fixture(
+        &repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn outer_fn() -> u32 { 1 }\n"),
+        ],
+    );
+    commit(&repo, "seed main", "2026-06-01T00:00:00Z");
+    let main = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse")
+            .stdout,
+    )
+    .expect("utf-8")
+    .trim()
+    .to_owned();
+
+    // branch: adds a NESTED package that main never had.
+    git(&repo, ["checkout", "-q", "-b", "feature"]);
+    write_fixture(
+        &repo,
+        &[
+            (
+                "nested/Cargo.toml",
+                "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n",
+            ),
+            ("nested/src/lib.rs", "pub fn inner_fn() -> u32 { 2 }\n"),
+        ],
+    );
+    commit(&repo, "add the nested package", "2026-06-15T00:00:00Z");
+
+    // Merge into main, resolving by DROPPING the nested source but keeping its
+    // manifest. The deletion is then reported only against the second parent.
+    git(&repo, ["checkout", "-q", main.as_str()]);
+    git(&repo, ["checkout", "-q", "-B", "trunk"]);
+    git(&repo, ["merge", "--no-commit", "--no-ff", "-q", "feature"]);
+    fs::remove_file(repo.join("nested/src/lib.rs")).expect("drop the nested source");
+    let merged = commit(
+        &repo,
+        "merge feature, dropping the nested source",
+        "2026-07-01T00:00:00Z",
+    );
+
+    let by_commit = history_attribution(&repo);
+    assert_eq!(
+        by_commit[&merged].get("nested/src/lib.rs"),
+        Some(&BTreeSet::from(["inner@nested/Cargo.toml".to_owned()])),
+        "the deletion belongs to `inner`, the package it left — not to the outer \
+         package the first-parent tree would reach: {by_commit:?}"
+    );
+}

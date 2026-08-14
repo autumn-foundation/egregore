@@ -7527,6 +7527,10 @@ pub(crate) const CRATE_ATTRIBUTION_DISCLAIMER: &str = "attribution is nearest-en
 /// from manifest files on disk, so a query answers over the corpus it was given.
 #[derive(Debug, Default)]
 pub(crate) struct PackageCatalog {
+    /// Whether ANY record carried a `crate_attribution` field, owner or not.
+    /// Separates "attribution never ran" from "attribution ran and found no
+    /// package" — see [`PackageCatalog::is_empty`].
+    attribution_observed: bool,
     by_package: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
@@ -7546,6 +7550,7 @@ impl PackageCatalog {
     pub(crate) fn build(records: &[GraphRecord], index: &query::RepositoryIndex) -> Self {
         let mut by_package: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
             std::collections::BTreeMap::new();
+        let mut attribution_observed = false;
         for record in records {
             // A `Change` is a COMMIT EVENT, not a current-state fact: it is
             // minted once per (commit, path) and so is never superseded, which
@@ -7565,6 +7570,10 @@ impl PackageCatalog {
             ) {
                 continue;
             }
+            // Presence of the FIELD, not of an owner: a `status: unattributed`
+            // value proves attribution ran here, which is what separates an
+            // ownerless corpus from a pre-#117 one.
+            attribution_observed |= record.crate_attribution().is_some();
             // Fail-closed on a read-back value the resolver could not have
             // produced: a record claiming `unattributed` while carrying a name,
             // or citing a manifest that does not ENCLOSE it, owns nothing and
@@ -7577,7 +7586,10 @@ impl PackageCatalog {
                 entry.insert(repository_id.to_owned());
             }
         }
-        Self { by_package }
+        Self {
+            attribution_observed,
+            by_package,
+        }
     }
 
     /// `true` when at least one record in the corpus is attributed to `name`.
@@ -7585,10 +7597,19 @@ impl PackageCatalog {
         self.by_package.contains_key(name)
     }
 
-    /// `true` when no record in the corpus carries any owning-package
-    /// attribution — a capability gap (a pre-#117 corpus), not an empty result.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.by_package.is_empty()
+    /// `true` when the corpus carries NO `crate_attribution` at all — a
+    /// capability gap (a pre-#117 corpus), not an empty result.
+    ///
+    /// Deliberately NOT "no package was found". A freshly scanned repository
+    /// with no `[package]` manifest — only a virtual workspace, or none —
+    /// carries a present `status: unattributed` on every path-bearing record:
+    /// attribution RAN and there is provably no owner. Re-scanning cannot
+    /// create a package, so reporting that as the capability gap would repeat
+    /// the absent-vs-unattributed collapse this feature exists to prevent, at
+    /// the one surface an operator acts on. The two are tracked separately for
+    /// exactly that reason.
+    pub(crate) const fn is_empty(&self) -> bool {
+        !self.attribution_observed
     }
 
     /// Every package owning at least one attributed record, sorted.

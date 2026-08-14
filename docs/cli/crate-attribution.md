@@ -49,6 +49,14 @@ corpora:
   HEAD-anchored answer; refusing it would withhold an answerable result.
   `--all-history` widens the corpus, so the same query refuses there.
 
+`crate_attribution_unavailable` is reserved for a corpus carrying **no
+`crate_attribution` field at all** — a pre-#117 store, whose remedy really is a
+re-scan. A freshly scanned repository with no `[package]` manifest (only a
+virtual workspace, or none) is *not* that case: every path-bearing record
+carries a present `status: unattributed`, attribution ran, and re-scanning
+cannot create a package. That corpus answers `unknown_package_selector` with an
+empty `known_packages` list.
+
 The flag is spelled `--package`, **not** `--crate`. `eg query who-imports
 --crate <name>` already exists and means something unrelated (rewriting a
 leading `crate::` in the query and in import paths so the two spellings unify);
@@ -157,9 +165,15 @@ there, so the post-commit walk would find whatever manifest it reaches next —
 which is the enclosing package for a lone file deletion, but an **outer**
 package when the commit removes a manifest and its sources together. Resolving
 against the tree where the file last existed means a whole-package removal
-cites the package that lost the file. For a merge this reads the mainline
-(first) parent; a deletion reported only against a non-first parent keeps the
-post-commit answer.
+cites the package that lost the file.
+
+For a **merge**, each deletion is resolved against the parent that *reported*
+it. `git diff-tree -m` diffs against every parent and discards which one
+produced a given entry, so a file deleted on a side branch — one the first
+parent never had — would otherwise be resolved against a tree with no nested
+manifest and inherit an outer package. Parents are asked in order and the first
+reporting one wins; a single-parent commit reports all of its deletions by
+definition and pays no extra Git call.
 
 ## Output format
 
