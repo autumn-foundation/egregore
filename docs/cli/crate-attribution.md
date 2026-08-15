@@ -216,6 +216,24 @@ a map — which is a real Cargo asymmetry rather than an oversight at the top
 level: `dependencies = 1` beside a valid `[package]` *loads*, so applying the
 same rule there would un-attribute crates Cargo builds.
 
+`registry-index` is a **registry source**, so the cross-field source rules treat
+it as one: Cargo rejects it beside `git` ("Only one of `git` or `registry` is
+allowed") and beside `registry` ("Only one of `registry` or `registry-index`").
+It is *not* a conflict beside `version` or `path`, both of which Cargo accepts —
+the same asymmetry `registry` already has.
+
+Cargo's **underscore table aliases** `[dev_dependencies]` and
+`[build_dependencies]` are validated as well, at the top level and inside
+`[target.<spec>]`: Cargo really reads them, so a malformed spec in one makes the
+manifest unloadable. Probing every hyphenated key this resolver checks bounds
+the alias surface to exactly those two table names — no `[package]` or
+`[workspace]` field has an underscore alias, nor does the spec key
+`registry-index`, and `dependencies` is one word; `default_features` is the one
+aliased spec key and was already matched. Their *rows* are not emitted, matching
+the target-specific tables: this only decides whether the manifest loads, and
+since Cargo accepts both spellings side by side — even declaring the same name
+in each — emitting from both could mint a duplicate `DependencyDeclaration`.
+
 `[workspace.dependencies]` entries are validated too, and this one matters most:
 a virtual root is *walked past*, so accepting an unloadable one hands the
 subtree to an **outer** package. Its acceptance boundary is the workspace

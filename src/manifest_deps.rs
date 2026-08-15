@@ -61,6 +61,31 @@ impl DependencyKind {
             Self::Build => "build-dependencies",
         }
     }
+
+    /// Cargo's accepted UNDERSCORE spelling of [`Self::table`], when one exists.
+    ///
+    /// `[dev_dependencies]` and `[build_dependencies]` are tables Cargo really
+    /// reads: a valid spec in one resolves, a malformed one makes the manifest
+    /// unloadable, and both spellings may appear side by side. `dependencies`
+    /// is one word and has no alias.
+    ///
+    /// Probing every hyphenated key this file checks bounds the alias surface to
+    /// these two TABLE names — no `[package]` or `[workspace]` field has an
+    /// underscore alias, and neither does the spec key `registry-index`;
+    /// `default_features` is the one aliased spec key and is already matched.
+    ///
+    /// Used for VALIDATION only. Row emission stays hyphen-only, matching the
+    /// target-specific tables: this decides whether the manifest LOADS. Cargo
+    /// accepts both spellings at once — even declaring the same name in each —
+    /// so emitting from both could mint a duplicate `DependencyDeclaration`,
+    /// which is a `manifest-deps` question rather than an attribution one.
+    const fn alias_table(self) -> Option<&'static str> {
+        match self {
+            Self::Normal => None,
+            Self::Dev => Some("dev_dependencies"),
+            Self::Build => Some("build_dependencies"),
+        }
+    }
 }
 
 /// The loadable form a `Cargo.toml` takes (issue #117).
@@ -592,6 +617,74 @@ pub struct ManifestDependencies {
     pub uninterpretable: bool,
 }
 
+/// The dependency tables that are VALIDATED but never emit rows.
+///
+/// Two of them, split out from [`parse_manifest_dependencies`] so the emitting
+/// loop stays readable: the target-specific tables and the underscore aliases.
+/// Both decide only whether the manifest LOADS, which is what attribution rests
+/// on — see [`DependencyKind::alias_table`] for why their rows stay unemitted.
+///
+/// `true` means at least one entry is one Cargo cannot interpret.
+fn validation_only_dependency_tables_are_uninterpretable(doc: &toml_edit::DocumentMut) -> bool {
+    let mut uninterpretable = false;
+    // TARGET-SPECIFIC dependency tables (`[target.<spec>.dependencies]` and its
+    // dev/build siblings) are the only other place dependencies live, so
+    // scanning them CLOSES the set rather than adding another special case.
+    // Cargo validates entries there exactly as it does at the top level, and an
+    // invalid one makes the manifest unloadable.
+    if let Some(targets) = doc.get("target").and_then(toml_edit::Item::as_table_like) {
+        for (_, target) in targets.iter() {
+            // A target SPEC must be a table ("expected struct TomlPlatform"),
+            // and each of its dependency tables must be a map — UNLIKE the
+            // top-level tables, where Cargo tolerates a scalar
+            // (`dependencies = 1` beside a valid `[package]` loads fine,
+            // verified). That asymmetry is real, so the loops cannot be
+            // unified: applying this rule at the top level would un-attribute
+            // crates Cargo builds.
+            let Some(target) = target.as_table_like() else {
+                uninterpretable = true;
+                continue;
+            };
+            for kind in DEPENDENCY_KINDS {
+                for name in std::iter::once(kind.table()).chain(kind.alias_table()) {
+                    let Some(entry) = target.get(name) else {
+                        continue;
+                    };
+                    let Some(table) = entry.as_table_like() else {
+                        uninterpretable = true;
+                        continue;
+                    };
+                    if table
+                        .iter()
+                        .any(|(key, item)| declared_dependency(key, item, kind).is_none())
+                    {
+                        uninterpretable = true;
+                    }
+                }
+            }
+        }
+    }
+    // Top-level UNDERSCORE aliases. This mirrors the hyphenated emitting loop
+    // rather than the target loop above: at the top level Cargo TOLERATES a
+    // scalar table, so a non-table value is passed over instead of
+    // disqualifying the manifest.
+    for kind in DEPENDENCY_KINDS {
+        let Some(alias) = kind.alias_table() else {
+            continue;
+        };
+        let Some(table) = doc.get(alias).and_then(toml_edit::Item::as_table_like) else {
+            continue;
+        };
+        if table
+            .iter()
+            .any(|(key, item)| declared_dependency(key, item, kind).is_none())
+        {
+            uninterpretable = true;
+        }
+    }
+    uninterpretable
+}
+
 /// Parses the three captured dependency tables from a manifest body.
 ///
 /// # Errors
@@ -652,44 +745,7 @@ pub fn parse_manifest_dependencies(
         .map(str::to_owned);
 
     let mut declarations = Vec::new();
-    let mut uninterpretable = false;
-    // TARGET-SPECIFIC dependency tables (`[target.<spec>.dependencies]` and its
-    // dev/build siblings) are the only other place dependencies live, so
-    // scanning them CLOSES the set rather than adding another special case.
-    // Cargo validates entries there exactly as it does at the top level, and an
-    // invalid one makes the manifest unloadable — which is what attribution
-    // rests on. Emitting ROWS for them stays out of scope; this only decides
-    // whether the manifest loads.
-    if let Some(targets) = doc.get("target").and_then(toml_edit::Item::as_table_like) {
-        for (_, target) in targets.iter() {
-            // A target SPEC must be a table ("expected struct TomlPlatform"),
-            // and each of its dependency tables must be a map — UNLIKE the
-            // top-level tables below, where Cargo tolerates a scalar
-            // (`dependencies = 1` beside a valid `[package]` loads fine,
-            // verified). That asymmetry is real, so the two loops cannot be
-            // unified: applying this rule at the top level would un-attribute
-            // crates Cargo builds.
-            let Some(target) = target.as_table_like() else {
-                uninterpretable = true;
-                continue;
-            };
-            for kind in DEPENDENCY_KINDS {
-                let Some(entry) = target.get(kind.table()) else {
-                    continue;
-                };
-                let Some(table) = entry.as_table_like() else {
-                    uninterpretable = true;
-                    continue;
-                };
-                if table
-                    .iter()
-                    .any(|(key, item)| declared_dependency(key, item, kind).is_none())
-                {
-                    uninterpretable = true;
-                }
-            }
-        }
-    }
+    let mut uninterpretable = validation_only_dependency_tables_are_uninterpretable(&doc);
     for kind in DEPENDENCY_KINDS {
         let Some(table) = doc
             .get(kind.table())
@@ -815,8 +871,19 @@ fn dependency_table_is_well_typed(
         .iter()
         .filter(|key| has(key))
         .count();
+    // `registry-index` is a REGISTRY source, so it conflicts like one: Cargo
+    // rejects it beside `git` ("Only one of `git` or `registry` is allowed") and
+    // beside `registry` ("Only one of `registry` or `registry-index`"). It is
+    // NOT a conflict beside `version` or `path`, both of which Cargo accepts —
+    // the same asymmetry `registry` already has above, and rejecting them would
+    // un-attribute a real crate.
+    let registry_sources = ["registry", "registry-index"]
+        .iter()
+        .filter(|key| has(key))
+        .count();
     if (has("path") && has("git"))
-        || (has("git") && has("registry"))
+        || (has("git") && registry_sources > 0)
+        || registry_sources > 1
         || (git_refs > 0 && !has("git"))
         || git_refs > 1
     {

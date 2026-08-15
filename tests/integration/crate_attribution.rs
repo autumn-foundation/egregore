@@ -7374,3 +7374,145 @@ fn dependency_spec_known_fields_are_type_checked() {
         );
     }
 }
+
+/// `registry-index` is a REGISTRY source, so it conflicts like one.
+///
+/// Adding it as a type-checked key left the cross-field source rules behind:
+/// they knew only `registry`, so `git` beside `registry-index` type-checked
+/// clean and the manifest was classified `Package`. Verified on cargo 1.94.1:
+///
+/// | combination | Cargo |
+/// |---|---|
+/// | `git` + `registry-index` | ambiguous: "Only one of `git` or `registry`" |
+/// | `registry` + `registry-index` | ambiguous: "Only one of `registry` or `registry-index`" |
+/// | `path` + `registry-index` | **accepted** |
+/// | `version` + `registry-index` | **accepted** |
+///
+/// The two accepted rows are why this is not "treat it exactly like a source":
+/// `registry`/`registry-index` beside `version` or `path` is manifest-valid,
+/// exactly as the existing rule already documents for `registry`. Rejecting
+/// them would un-attribute a real crate.
+#[test]
+fn registry_index_conflicts_with_the_other_registry_sources() {
+    for (label, spec_tail, expected) in [
+        (
+            "git + registry-index",
+            "git = \"https://example.invalid/x\", registry-index = \"https://example.invalid/i\"",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "registry + registry-index",
+            "version = \"1\", registry = \"r\", registry-index = \"https://example.invalid/i\"",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "path + registry-index",
+            "path = \"../elsewhere\", registry-index = \"https://example.invalid/i\"",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "version + registry-index",
+            "version = \"1\", registry-index = \"https://example.invalid/i\"",
+            "inner@nested/Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!(
+                        "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n\n\
+                         [dependencies]\nfoo = {{ {spec_tail} }}\n"
+                    ),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}`: {by_path:?}"
+        );
+    }
+}
+
+/// Cargo's UNDERSCORE dependency-table aliases are validated too.
+///
+/// `[dev_dependencies]` and `[build_dependencies]` are tables Cargo really
+/// reads — a valid spec in one resolves, and a malformed one makes the manifest
+/// unloadable — but the scan looked only at the hyphenated names, so a manifest
+/// Cargo rejects was classified `Package` and its subtree given fabricated
+/// ownership.
+///
+/// Probing every hyphenated key this file checks bounds the alias surface to
+/// exactly these two TABLE names: no `[package]` field has an underscore alias
+/// (`rust_version`, `license_file`, `default_run`, `im_a_teapot`,
+/// `default_target`, `forced_target` are all merely unknown keys, as is
+/// `[workspace] default_members` and the spec key `registry_index`), and
+/// `dependencies` has no underscore form. `default_features` is the one aliased
+/// SPEC key and was already handled.
+///
+/// Row emission stays hyphen-only, matching how the target-specific tables are
+/// already treated: this decides whether the manifest LOADS. Cargo accepts both
+/// spellings side by side — even declaring the same name twice — so emitting
+/// from both could mint a duplicate `DependencyDeclaration`, which is a
+/// `manifest-deps` question rather than an attribution one.
+#[test]
+fn underscore_dependency_table_aliases_are_validated() {
+    for (label, table, expected) in [
+        (
+            "dev_dependencies malformed",
+            "[dev_dependencies]\nfoo = true",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "build_dependencies malformed",
+            "[build_dependencies]\nfoo = true",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "target-specific dev_dependencies malformed",
+            "[target.\"cfg(unix)\".dev_dependencies]\nfoo = true",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "dev_dependencies well-formed",
+            "[dev_dependencies]\nfoo = \"1\"",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "build_dependencies well-formed",
+            "[build_dependencies]\nfoo = \"1\"",
+            "inner@nested/Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!("[package]\nname = \"inner\"\nversion = \"0.1.0\"\n\n{table}\n"),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}`: {by_path:?}"
+        );
+    }
+}
