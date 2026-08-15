@@ -1170,6 +1170,22 @@ pub(crate) enum QuerySubcommand {
         /// downgrade trust in the cited handle. Omitted → no freshness field.
         #[arg(long)]
         repo_path: Option<PathBuf>,
+        /// Scope results to one owning Cargo package by NAME (issue #117).
+        ///
+        /// The name is matched EXACTLY against the package attribution stamped
+        /// on each record at scan time (resolved from the nearest enclosing
+        /// `Cargo.toml`) — no case folding and no `-`/`_` normalization. A
+        /// selector no package in the corpus carries exits 1 with a
+        /// machine-readable `unknown_package_selector` naming the known
+        /// packages, so a typo is never a silent empty answer. A name owned by
+        /// more than one repository in a shared store exits 1
+        /// (`ambiguous_package_selector`); add `--repo` to disambiguate.
+        ///
+        /// Spelled `--package`, not `--crate`: `eg query who-imports --crate`
+        /// already means something else (rewriting a leading `crate::` in the
+        /// query and in import paths).
+        #[arg(long)]
+        package: Option<String>,
         /// Corpus selector (issue #456): head-anchor the current-state view to
         /// each repository's stamped HEAD, so a symbol removed at HEAD does not
         /// appear. This is the DEFAULT when a source snapshot exists; the flag
@@ -1209,6 +1225,22 @@ pub(crate) enum QuerySubcommand {
         /// Restrict results to one repository (see `eg query symbol --help`).
         #[arg(long)]
         repo: Option<String>,
+        /// Scope results to one owning Cargo package by NAME (issue #117).
+        ///
+        /// The name is matched EXACTLY against the package attribution stamped
+        /// on each record at scan time (resolved from the nearest enclosing
+        /// `Cargo.toml`) — no case folding and no `-`/`_` normalization. A
+        /// selector no package in the corpus carries exits 1 with a
+        /// machine-readable `unknown_package_selector` naming the known
+        /// packages, so a typo is never a silent empty answer. A name owned by
+        /// more than one repository in a shared store exits 1
+        /// (`ambiguous_package_selector`); add `--repo` to disambiguate.
+        ///
+        /// Spelled `--package`, not `--crate`: `eg query who-imports --crate`
+        /// already means something else (rewriting a leading `crate::` in the
+        /// query and in import paths).
+        #[arg(long)]
+        package: Option<String>,
         /// Match case-insensitively (default is case-sensitive).
         #[arg(long)]
         case_insensitive: bool,
@@ -3185,11 +3217,12 @@ pub(crate) enum QuerySubcommand {
     /// extractor-minted Import nodes are considered, a doc-comment or string
     /// mention of the path is invisible — the precision win over `grep`.
     ///
-    /// The graph carries no per-file owning-crate name, so `crate::`-relative
-    /// and absolute `<crate>::` imports are DISTINCT by default. Pass
-    /// `--crate <name>` to rewrite a leading `crate::` (in the query and in
-    /// imports) to that crate name so the two forms unify. This is
-    /// caller-supplied ground truth, never guessed.
+    /// `crate::`-relative and absolute `<crate>::` imports are DISTINCT by
+    /// default. Pass `--crate <name>` to rewrite a leading `crate::` (in the
+    /// query and in imports) to that crate name so the two forms unify. This is
+    /// caller-supplied ground truth, never guessed — and it is NOT the same
+    /// flag as `eg query symbol --package` (issue #117), which scopes by the
+    /// Cargo package that OWNS a file rather than rewriting a module path.
     ///
     /// Every row carries a stable record ID plus the repo-relative importing
     /// file/span handle. Output is deterministic and byte-identical across runs
@@ -4590,6 +4623,18 @@ pub(crate) struct SymbolResult<'a> {
     extraction_completeness: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<Vec<DiagnosticRef<'a>>>,
+    /// Owning Cargo package (issue #117): the package NAME plus the
+    /// repo-relative path of the owning `Cargo.toml`, or the closed-set reason
+    /// no package owns this record.
+    ///
+    /// OMITTED entirely for a record produced before issue #117 — attribution
+    /// UNKNOWN, which is a different fact from a present value carrying
+    /// `status: unattributed` (computed, and provably ownerless).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crate_attribution: Option<&'a crate::ir::CrateAttribution>,
+    /// The containment caveat, stamped only when `--package` scoped the answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crate_attribution_disclaimer: Option<&'static str>,
     /// Corpus this row was read from (issue #427). Present only on the
     /// `query symbol` lane (stamped by [`stamp_symbol_corpus`]); absent on the
     /// shared `query symbols` partial-name lane so its row shape is unchanged.
@@ -5446,12 +5491,31 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             as_of,
             tx_as_of,
             repo,
+            package,
             repo_path,
             at_head,
             all_history,
             format,
         } => {
+            #[cfg(feature = "embedded-aletheiadb")]
+            if daemon {
+                reject_package_with_daemon(package.as_deref());
+            }
             if let Some(tx) = tx_as_of.as_deref() {
+                // The transaction-time lane returns `TxSymbolRow`, which carries
+                // no crate attribution, so a scoped query here could only emit
+                // UNSCOPED rows — including records owned by other packages, and
+                // with no typo gate on the selector. Refuse the combination for
+                // the same reason `--daemon` is refused (issue #117): silently
+                // answering a different question is the one outcome ruled out.
+                if package.is_some() {
+                    print_tx_error(
+                        "unsupported_combination",
+                        "--package cannot be used with --tx-as-of; the transaction-time \
+                         row shape carries no crate attribution",
+                    )?;
+                    std::process::exit(1);
+                }
                 // --repo-path is used to stamp freshness onto results.  TxSymbolRow
                 // has no freshness field and the tx-as-of path never computes one,
                 // so accepting --repo-path here would silently drop the signal.
@@ -5550,16 +5614,33 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // unscoped `query symbol <name>`; `--repo`/`--at`/`--as-of` and
             // freshness stamping (`--repo-path`) need global topology or the
             // commit timeline and stay cold.
-            let selector =
-                if repo.is_none() && at.is_none() && as_of.is_none() && repo_path.is_none() {
-                    symbol_handle_selector(&name)
-                } else {
-                    crate::graph_index::Selector::Whole
-                };
+            let selector = if repo.is_none()
+                && package.is_none()
+                && at.is_none()
+                && as_of.is_none()
+                && repo_path.is_none()
+            {
+                symbol_handle_selector(&name)
+            } else {
+                crate::graph_index::Selector::Whole
+            };
             let records = load_records_selected(graph.as_deref(), data_dir.as_deref(), &selector)?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             let selected = selected.as_deref();
+            // Package scope (issue #117) is resolved against the WHOLE corpus,
+            // which is why `--package` forces `Selector::Whole` above — the same
+            // conservatism `--repo` already applies.
+            //
+            // Both verdicts need global knowledge, and the #447 sidecar index
+            // supplies only one symbol's closure. Enumerating `known_packages`
+            // for a typo obviously does. So does cross-repository ambiguity, and
+            // that one is the trap: a package owned by two repositories where
+            // only ONE defines the queried symbol looks unambiguous inside the
+            // narrowed closure, so the lane would return rows where a cold scan
+            // refuses. An answer that changes depending on whether an index file
+            // exists breaks the index's documented contract of being a pure
+            // access-path optimization.
             let freshness_code = query_freshness_code_with_hint(
                 &records,
                 repo_path.as_deref(),
@@ -5580,6 +5661,37 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 at_head,
                 all_history,
             )?;
+            // Package validation runs AFTER corpus resolution, over the corpus
+            // the answer is computed from. Both of its verdicts are questions
+            // ABOUT A CORPUS: validating against the whole record set while the
+            // answer comes from a narrower one refuses an answerable HEAD query
+            // whose only collision is historical, and calls a package known at
+            // an instant before it existed.
+            // A malformed `--as-of` is diagnosed by the lane itself. Package
+            // validation must not pre-empt it: the corpus could not be narrowed
+            // to the requested instant, so any verdict computed over it answers
+            // a question the caller did not ask — and telling someone to
+            // disambiguate a package name while silently ignoring an
+            // uninterpretable timestamp points at the wrong input.
+            let as_of_is_malformed = as_of
+                .as_deref()
+                .is_some_and(|raw| chrono::DateTime::parse_from_rfc3339(raw).is_err());
+            if let Some(selector_name) = package.as_deref().filter(|_| !as_of_is_malformed) {
+                let corpus = package_catalog_corpus(
+                    &records,
+                    &index,
+                    at.as_deref(),
+                    as_of.as_deref(),
+                    filtered.as_deref(),
+                );
+                // Liveness is judged over the WHOLE record set for both
+                // catalogs: a narrowed corpus can hold a record without the
+                // tombstone that retracts it.
+                let deleted = current_deleted_ids(&records);
+                let catalog = PackageCatalog::build_with_liveness(&records, &index, &deleted);
+                let answerable = PackageCatalog::build_with_liveness(&corpus, &index, &deleted);
+                resolve_package_scope(&catalog, &answerable, selector_name, repo.is_some());
+            }
             as_of.map_or_else(
                 || {
                     at.map_or_else(
@@ -5591,6 +5703,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                                 format,
                                 &index,
                                 selected,
+                                package.as_deref(),
                                 freshness_code.as_ref(),
                                 corpus_mode,
                                 corpus_mode_source,
@@ -5604,6 +5717,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                                 format,
                                 &index,
                                 selected,
+                                package.as_deref(),
                                 freshness_code.as_ref(),
                             )
                         },
@@ -5617,6 +5731,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         format,
                         &index,
                         selected,
+                        package.as_deref(),
                         freshness_code.as_ref(),
                     )
                 },
@@ -5627,6 +5742,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             graph,
             data_dir,
             repo,
+            package,
             case_insensitive,
             format,
         } => {
@@ -5640,6 +5756,18 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
+            // This lane always loads the whole corpus and offers no corpus
+            // selector, so the whole record set IS its corpus and the catalog is
+            // authoritative with no cold-reload fallback (issue #117). A package
+            // two repositories held at different times is genuinely ambiguous
+            // for a union answer, so the narrowing `query symbol` applies would
+            // be wrong here.
+            if let Some(selector_name) = package.as_deref() {
+                let catalog = PackageCatalog::build(&records, &index);
+                // No corpus selector on this lane, so the whole record set IS
+                // the answerable corpus: one catalog serves both verdicts.
+                resolve_package_scope(&catalog, &catalog, selector_name, repo.is_some());
+            }
             query_symbols_matching(
                 &records,
                 &pattern,
@@ -5647,6 +5775,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 format,
                 &index,
                 selected.as_deref(),
+                package.as_deref(),
             )
         }
         QuerySubcommand::Who {
@@ -7396,6 +7525,254 @@ pub(crate) fn symbol_handle_selector(handle: &str) -> crate::graph_index::Select
     }
 }
 
+/// The epistemic caveat every `--package`-scoped row carries (issue #117).
+///
+/// Stated verbatim and identically in `docs/cli/crate-attribution.md`, in
+/// `CLAUDE.md`, and on the `CrateAttribution` type. Scoping is the assertion
+/// that needs it: an unscoped row's `manifest_repo_relative_path` already names
+/// exactly what the claim rests on.
+pub(crate) const CRATE_ATTRIBUTION_DISCLAIMER: &str = "attribution is nearest-enclosing-manifest directory containment, never proof the file is compiled into that package";
+
+/// Which packages the loaded corpus carries, and which repositories own each
+/// (issue #117).
+///
+/// Built from the `crate_attribution` stamped on records at scan time — never
+/// from manifest files on disk, so a query answers over the corpus it was given.
+#[derive(Debug, Default)]
+pub(crate) struct PackageCatalog {
+    /// Whether ANY record carried a `crate_attribution` field, owner or not.
+    /// Separates "attribution never ran" from "attribution ran and found no
+    /// package" — see [`PackageCatalog::is_empty`].
+    attribution_observed: bool,
+    by_package: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl PackageCatalog {
+    /// Indexes every attributed record's package and its owning repository.
+    ///
+    /// The names indexed here are read back from a store or graph and are
+    /// therefore operator-controlled, and `known_packages` echoes them into a
+    /// stderr diagnostic. `manifest_deps::package_name_is_valid` gates names at
+    /// PRODUCTION to the `XID_Start` / `XID_Continue` charset, but ingest does
+    /// not re-validate a deserialized payload, so that gate is not a guarantee
+    /// about what a reader sees — the #104 doctrine that store-read values are
+    /// attacker-controlled applies here too. What keeps the diagnostic safe is
+    /// that it is rendered as JSON, where `serde_json` escapes control
+    /// characters; the raw-text render path fails closed on
+    /// [`CrateAttribution::owning_package`] instead.
+    pub(crate) fn build(records: &[GraphRecord], index: &query::RepositoryIndex) -> Self {
+        Self::build_with_liveness(records, index, &current_deleted_ids(records))
+    }
+
+    /// [`Self::build`] with a caller-supplied deletion set.
+    ///
+    /// Split out so the ANSWERABLE catalog can be built over a narrowed corpus
+    /// while liveness is still judged against the WHOLE record set — a
+    /// tombstone lives in the corpus alongside the record it retracts, and a
+    /// narrowed slice can contain the record without its tombstone.
+    pub(crate) fn build_with_liveness(
+        records: &[GraphRecord],
+        index: &query::RepositoryIndex,
+        deleted: &std::collections::BTreeSet<&str>,
+    ) -> Self {
+        let mut by_package: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        let mut attribution_observed = false;
+        for record in records {
+            // FIRST statement in the loop, ahead of EVERY skip below.
+            //
+            // This asks whether attribution is USABLE here, not whether an
+            // owner was found: a `status: unattributed` value counts, because it
+            // proves attribution RAN over this corpus — which is what separates
+            // an ownerless corpus from a pre-#117 one. A record that is
+            // retracted, or a `Change` that no lane returns, still proves it
+            // ran, and no re-scan restores a deleted package or turns a `Change`
+            // into a current-state fact, so reporting the pre-#117 capability
+            // gap for those sends the operator after a remedy that cannot work.
+            //
+            // A value the checks REFUSE does not count — including one riding a
+            // node kind the resolver never stamps, which
+            // `presentable_crate_attribution` refuses for both arms at once.
+            // Everywhere else in this feature such a value owns nothing and
+            // proves nothing, reading exactly like an absent field; counting it
+            // as evidence of capability would make this the one surface where a
+            // forged value still buys something — and it would answer a
+            // wholly-unusable corpus with an empty `known_packages` list,
+            // blaming the caller's spelling when nothing in the store can answer
+            // at all.
+            //
+            // Placed first so a future exclusion cannot re-open that by adding
+            // another `continue`: every skip below withholds OWNERSHIP only.
+            attribution_observed |= record.presentable_crate_attribution().is_some();
+            // A `Change` is a COMMIT EVENT, not a current-state fact: it is
+            // minted once per (commit, path) and so is never superseded, which
+            // means it survives every corpus narrowing including HEAD
+            // anchoring. Counting it here made a package that a repository once
+            // held — but does not hold at HEAD — still contribute that
+            // repository to the ambiguity verdict, refusing an answerable
+            // query. No lane returns `Change` rows for `--package`, so the
+            // catalog describes the packages owning the records these lanes can
+            // actually return.
+            if matches!(
+                record,
+                GraphRecord::Node {
+                    kind: NodeKind::Change,
+                    ..
+                }
+            ) {
+                continue;
+            }
+            // A tombstoned non-temporal record can never appear in an answer —
+            // the lanes drop it via `current_deleted_ids` — so counting its
+            // package here makes a name look owned by two repositories when
+            // only one can produce a row. Mirrors the lanes' own liveness test
+            // exactly, including its restriction to non-temporal records: a
+            // commit-anchored version is history, not a current-state claim.
+            if matches!(record, GraphRecord::Node { temporal: None, .. })
+                && deleted.contains(record.id())
+            {
+                continue;
+            }
+            // Fail-closed on a read-back value the resolver could not have
+            // produced: a record claiming `unattributed` while carrying a name,
+            // or citing a manifest that does not ENCLOSE it, owns nothing and
+            // must never become a scopable package.
+            let Some((name, _manifest)) = record.owning_package() else {
+                continue;
+            };
+            let entry = by_package.entry(name.to_owned()).or_default();
+            if let Some(repository_id) = index.owner_of(record.id()) {
+                entry.insert(repository_id.to_owned());
+            }
+        }
+        Self {
+            attribution_observed,
+            by_package,
+        }
+    }
+
+    /// `true` when at least one record in the corpus is attributed to `name`.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.by_package.contains_key(name)
+    }
+
+    /// `true` when the corpus carries NO `crate_attribution` at all — a
+    /// capability gap (a pre-#117 corpus), not an empty result.
+    ///
+    /// Deliberately NOT "no package was found". A freshly scanned repository
+    /// with no `[package]` manifest — only a virtual workspace, or none —
+    /// carries a present `status: unattributed` on every path-bearing record:
+    /// attribution RAN and there is provably no owner. Re-scanning cannot
+    /// create a package, so reporting that as the capability gap would repeat
+    /// the absent-vs-unattributed collapse this feature exists to prevent, at
+    /// the one surface an operator acts on. The two are tracked separately for
+    /// exactly that reason.
+    pub(crate) const fn is_empty(&self) -> bool {
+        !self.attribution_observed
+    }
+
+    /// Every package owning at least one attributed record, sorted.
+    pub(crate) fn names(&self) -> Vec<&str> {
+        self.by_package.keys().map(String::as_str).collect()
+    }
+
+    /// The repositories owning records attributed to `name`, sorted.
+    fn owners(&self, name: &str) -> Vec<&str> {
+        self.by_package
+            .get(name)
+            .map(|owners| owners.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Validates a `--package` selector against the corpus, exiting 1 on a bad one.
+///
+/// Two distinct failures, deliberately NOT collapsed into an empty answer:
+/// a selector no package carries is a TYPO (`unknown_package_selector`, listing
+/// the known packages), and a name carried by several repositories in a shared
+/// store is AMBIGUOUS (`ambiguous_package_selector`) — silently merging two
+/// repositories' facts would make the scoped answer's precision claim false.
+/// A known, unambiguous selector that simply matches no row falls through to the
+/// lane's ordinary exit-2 no-match, so a typo stays distinguishable from an
+/// honest empty result.
+pub(crate) fn resolve_package_scope(
+    catalog: &PackageCatalog,
+    answerable: &PackageCatalog,
+    selector: &str,
+    repo_scoped: bool,
+) {
+    if !catalog.contains(selector) {
+        // A corpus carrying NO attribution at all is a CAPABILITY gap, not a
+        // typo: the same `unknown_package_selector` shape would tell an operator
+        // querying a pre-#117 store to check their spelling, when the remedy is
+        // to re-scan. Reporting them identically would collapse
+        // absent-vs-unattributed at the one surface where they act on it.
+        if catalog.is_empty() {
+            let diag = serde_json::json!({
+                "code": "crate_attribution_unavailable",
+                "selector": selector,
+                "message": "no record in this corpus carries owning-package attribution",
+                "remedy": "re-scan with a build that records crate attribution (issue #117), then re-ingest",
+            });
+            eprintln!("{diag}");
+            std::process::exit(1);
+        }
+        let diag = serde_json::json!({
+            "code": "unknown_package_selector",
+            "selector": selector,
+            "known_packages": catalog.names(),
+        });
+        eprintln!("{diag}");
+        std::process::exit(1);
+    }
+    // The two verdicts answer DIFFERENT questions, so they read different
+    // catalogs (issue #117).
+    //
+    // Known-ness is TYPO protection — "is this a package name this store carries
+    // at all?" — and stays corpus-wide. Narrowing it would report a real package
+    // that merely owns nothing at the queried instant as `unknown_package_
+    // selector` with a `known_packages` list, which is a lie about the store and
+    // steers the caller to fix a spelling that was never wrong; the lane's
+    // ordinary exit-2 "known package, zero rows" already says that honestly.
+    //
+    // Ambiguity is SILENT-MERGE protection — "would scoping here fold two
+    // repositories together?" — which is only meaningful over the corpus the
+    // answer is computed from. A package two repositories held at different
+    // times, but only one holds at HEAD, is not ambiguous for a HEAD answer, and
+    // refusing it withheld an answerable result.
+    let owners = answerable.owners(selector);
+    if !repo_scoped && owners.len() > 1 {
+        let diag = serde_json::json!({
+            "code": "ambiguous_package_selector",
+            "selector": selector,
+            "candidates": owners,
+            "message": "package name is owned by several repositories; rerun with --repo <SELECTOR>",
+        });
+        eprintln!("{diag}");
+        std::process::exit(1);
+    }
+}
+
+/// Refuses `--package` on the daemon lane (issue #117).
+///
+/// The daemon's symbol projection is an independent hand-built JSON map that
+/// carries no crate attribution (it already omits `visibility`, `signature`, and
+/// `doc`), so a scoped daemon query could only return UNSCOPED rows. Refusing is
+/// the honest outcome; silently ignoring the flag would answer a different
+/// question than the one asked.
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) fn reject_package_with_daemon(package: Option<&str>) {
+    if package.is_some() {
+        let diag = serde_json::json!({
+            "code": "unsupported_combination",
+            "flags": ["--package", "--daemon"],
+            "message": "--package is a local-CLI scope; the daemon symbol projection carries no crate attribution",
+        });
+        eprintln!("{diag}");
+        std::process::exit(1);
+    }
+}
+
 pub(crate) fn resolve_repo_scope(
     index: &query::RepositoryIndex,
     repo: Option<&str>,
@@ -7643,6 +8020,131 @@ pub(crate) fn record_belongs_to_repo_for_commit_scan(
         }
         GraphRecord::Tombstone { .. } => false,
     }
+}
+
+/// The records the package catalog must be built from: the corpus the answer
+/// will actually be computed over (issue #117).
+///
+/// The catalog decides two things — `known_packages` for a typo, and
+/// cross-repository ambiguity — and both are questions ABOUT A CORPUS. Building
+/// it from the raw whole-corpus record set while the answer came from a narrower
+/// one produced two wrong verdicts: a package two repositories held at DIFFERENT
+/// times, but only one holds at HEAD, exited 1 `ambiguous_package_selector`
+/// though the HEAD answer is unambiguous; and a package introduced after an
+/// `--as-of` instant counted as known, yielding exit 2 "no rows" where the
+/// package simply did not exist yet.
+///
+/// The repository index stays whole-corpus deliberately: `owner_of` maps a
+/// record ID to its repository, which is an identity fact, not a corpus one.
+///
+/// Under a temporal selector, records carrying no resolvable time are DROPPED.
+/// This corpus feeds the AMBIGUITY verdict only — known-ness is evaluated
+/// corpus-wide and keeps them, which is what still makes a real package name a
+/// package rather than a typo. The pinned lanes can only return records stamped
+/// at the selected commit or instant (`symbols_at_commit` skips undated records
+/// outright; `symbol_as_of_valid_time_by_repo` requires a parseable
+/// `valid_time`), so an undated record contributes a repository that could
+/// never appear in the answer — turning an answerable query into a false
+/// `ambiguous_package_selector`. That is reachable on a shared graph combining
+/// a `scan-history` repository with a plain-`scan` one that shares a package
+/// name.
+fn package_catalog_corpus<'records>(
+    records: &'records [GraphRecord],
+    index: &query::RepositoryIndex,
+    at: Option<&str>,
+    as_of: Option<&str>,
+    filtered: Option<&'records [GraphRecord]>,
+) -> std::borrow::Cow<'records, [GraphRecord]> {
+    if let Some(prefix) = at {
+        return std::borrow::Cow::Owned(
+            records
+                .iter()
+                .filter(|record| temporal_commit_if_prefix(record, prefix).is_some())
+                .cloned()
+                .collect(),
+        );
+    }
+    if let Some(raw) = as_of {
+        let Ok(instant) = chrono::DateTime::parse_from_rfc3339(raw) else {
+            // A malformed timestamp is the lane's error to report; do not let
+            // catalog construction pre-empt it with a different diagnostic.
+            return std::borrow::Cow::Borrowed(records);
+        };
+        // The snapshot instant per repository — the newest stamped time any
+        // record reached there at or before the cutoff — mirroring how
+        // `query_symbol_as_of` resolves snapshot membership.
+        let mut snapshot: std::collections::HashMap<
+            Option<&str>,
+            chrono::DateTime<chrono::FixedOffset>,
+        > = std::collections::HashMap::new();
+        for record in records {
+            let Some(parsed) = record_valid_time_instant(record) else {
+                continue;
+            };
+            if parsed > instant {
+                continue;
+            }
+            let owner = index.owner_of(record.id());
+            snapshot
+                .entry(owner)
+                .and_modify(|latest| {
+                    if parsed > *latest {
+                        *latest = parsed;
+                    }
+                })
+                .or_insert(parsed);
+        }
+        return std::borrow::Cow::Owned(
+            records
+                .iter()
+                .filter(|record| {
+                    record_valid_time_instant(record).is_some_and(|parsed| {
+                        snapshot.get(&index.owner_of(record.id())) == Some(&parsed)
+                    })
+                })
+                .cloned()
+                .collect(),
+        );
+    }
+    // HEAD-anchored: `non_head_current_record_ids` drops IDs with no version at
+    // HEAD, but keeps every VERSION of the IDs that survive — lanes pick the
+    // current one themselves. The catalog reads one field off "the current
+    // record", so it needs the version-level test too: without it a superseded
+    // version's stale package name still speaks for the ID, which is exactly
+    // how a renamed-away package kept contributing its repository to the
+    // ambiguity verdict.
+    filtered.map_or_else(
+        || std::borrow::Cow::Borrowed(records),
+        |head_anchored| {
+            std::borrow::Cow::Owned(
+                query::head_current_versions(head_anchored, index)
+                    .into_iter()
+                    .cloned()
+                    .collect(),
+            )
+        },
+    )
+}
+
+/// A record's stamped valid time, parsed — the temporal block's when present,
+/// else a node's own `valid_time`.
+fn record_valid_time_instant(
+    record: &GraphRecord,
+) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let raw = match record {
+        GraphRecord::Node {
+            temporal: Some(t), ..
+        }
+        | GraphRecord::Edge {
+            temporal: Some(t), ..
+        } => t.valid_time.as_str(),
+        GraphRecord::Node {
+            valid_time: Some(vt),
+            ..
+        } => vt.as_str(),
+        _ => return None,
+    };
+    chrono::DateTime::parse_from_rfc3339(raw).ok()
 }
 
 pub(crate) fn temporal_commit_if_prefix<'a>(

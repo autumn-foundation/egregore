@@ -5,10 +5,10 @@ Query an existing graph JSONL for symbols, files, who last changed a symbol, sem
 ## Synopsis
 
 ```text
-eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
-eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
-eg query symbols  <PATTERN> --graph <PATH>  [--case-insensitive] [--repo <SELECTOR>] [--format json|text]
-eg query symbols  <PATTERN> --data-dir <DIR> [--case-insensitive] [--repo <SELECTOR>] [--format json|text]
+eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--package <NAME>] [--repo-path <DIR>] [--format json|text]
+eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--package <NAME>] [--repo-path <DIR>] [--format json|text]
+eg query symbols  <PATTERN> --graph <PATH>  [--case-insensitive] [--repo <SELECTOR>] [--package <NAME>] [--format json|text]
+eg query symbols  <PATTERN> --data-dir <DIR> [--case-insensitive] [--repo <SELECTOR>] [--package <NAME>] [--format json|text]
 eg query file     <PATH>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query file     <PATH>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query who      <NAME>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
@@ -440,6 +440,43 @@ Egregore guarantees cross-platform and cross-producer byte-for-byte stable scans
 
 ---
 
+## Owning-package scope (`--package`, issue #117)
+
+Every code fact carries `crate_attribution` — the owning Cargo package's name
+plus the repo-relative path of the owning `Cargo.toml`, resolved from the
+nearest enclosing manifest — so `eg query symbol` and `eg query symbols` rows
+name their crate, and two same-named symbols in different member crates are
+distinguishable without reading a manifest.
+
+```powershell
+eg query symbol handle --graph graph.jsonl --package alpha
+eg query symbols "*" --graph graph.jsonl --package alpha
+```
+
+- Matching is **exact**: no case folding, no `-`/`_` normalization.
+- An unknown selector exits **1** with
+  `{"code":"unknown_package_selector","known_packages":[…]}`; a known package
+  with zero matching rows exits **2**. A typo is never a silent empty answer.
+- A package name owned by two or more repositories in a shared store exits **1**
+  with `ambiguous_package_selector`; add `--repo` to disambiguate. `--package`
+  and `--repo` compose as an intersection.
+- `--package` with `--daemon` exits **1** (`unsupported_combination`): the
+  daemon's symbol projection carries no attribution, so the flag is refused
+  rather than silently ignored.
+- Spelled `--package`, **not** `--crate` — `eg query who-imports --crate` means
+  something unrelated (module-path unification).
+
+An **absent** `crate_attribution` key means attribution is unknown — the record
+either predates issue #117 or was minted by a producer other than `eg scan` /
+`eg refresh` / `eg scan-history`. That is a different fact from a present value
+carrying `status: "unattributed"` (computed, and provably no owner). In
+`--format text` an absent field prints nothing.
+
+Attribution is nearest-enclosing-manifest **directory containment**, never proof
+the file is compiled into that package. Full contract, including the closed
+unattributed-reason set and every documented limit, in
+[`crate-attribution.md`](crate-attribution.md).
+
 ## Repository scope (`--repo`, issue #67)
 
 A shared local store can hold more than one repository, and two repositories
@@ -785,6 +822,8 @@ eg query file <PATH> --graph <PATH> [--at <COMMIT> | --as-of <RFC3339>] [--forma
 ### JSON output fields
 
 Same fields as `eg query symbol` (see above), except the declaration-surface fields `visibility`, `signature`, and `doc`, which are omitted from file listing rows to keep the per-file answer lean — use `eg query symbol <NAME>` for a symbol's contract. Results are sorted by `span.start_line` ascending, then `record_id`.
+
+`crate_attribution` (issue #117) is a **file-level** fact — every symbol in one file shares one owning package — so it is carried on the **first row of each distinct value**, in the spirit of file-level `diagnostics`. Per distinct value rather than once per answer because "the file" is not globally unique: a repo-relative path can exist in several repositories, and over a `scan-history` graph its owning package can change between commits. Every emitted value is therefore a fact about the row it rides on. It is not omitted: the lane has no envelope, so dropping it would remove the owning-package fact from the entire answer rather than merely deduplicating it.
 
 ### File snapshot at a point in time (`--at` / `--as-of`, issue #158)
 

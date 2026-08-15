@@ -1066,6 +1066,28 @@ pub fn bounded_identity_field(value: &str) -> String {
     out
 }
 
+/// Sanitizes one HANDLE value — a record ID, repo-relative path, or manifest
+/// citation — read back from a store or graph, **without** truncating it.
+///
+/// Control characters are neutralized for the same reason as in
+/// [`bounded_identity_field`]: the value is operator-controlled, and a newline
+/// or ANSI escape reaching a text render forges output lines or drives the
+/// reader's terminal. The length cap is deliberately NOT applied, because a
+/// truncated handle stops being a citation — an agent cannot look it up, and a
+/// prefix of a record ID silently reads like a valid one.
+///
+/// This is the shared implementation of the two-tier split this codebase draws
+/// everywhere it renders store-read values (compare
+/// `crate::criteria_coverage`'s `bounded_field` / `handle_field`, and
+/// `crate::evidence_pack`'s `sanitize_catalog_text` / `bounded_catalog_field`).
+#[must_use]
+pub fn sanitized_handle(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect()
+}
+
 /// Renders one identity as the allow-listed JSON object (AC7).
 ///
 /// Field values are bounded and sanitized via [`bounded_identity_field`]; only

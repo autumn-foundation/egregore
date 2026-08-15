@@ -72,6 +72,7 @@ pub(crate) fn query_symbol_all(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    package: Option<&str>,
     freshness_code: Option<&(String, &'static str)>,
     corpus_mode: query::CorpusMode,
     corpus_mode_source: query::CorpusModeSource,
@@ -149,6 +150,7 @@ pub(crate) fn query_symbol_all(
     if let Some(repo) = selected_repo {
         results.retain(|r| r.repository_id == Some(repo));
     }
+    retain_package_scope(&mut results, package);
 
     if results.is_empty() {
         eprintln!("error: no match found for symbol `{name}`");
@@ -166,6 +168,32 @@ pub(crate) fn query_symbol_all(
         print_result(result, format)?;
     }
     Ok(())
+}
+
+/// Narrows `results` to one owning Cargo package and stamps the containment
+/// caveat on the surviving rows (issue #117).
+///
+/// Runs AFTER row projection and BEFORE the empty check, and never touches the
+/// sort keys — so a scoped answer is an order-preserving subsequence of the
+/// unscoped one. The selector was already validated against the corpus
+/// catalog by `resolve_package_scope`, so reaching zero rows here means the
+/// package genuinely owns no matching symbol (the lane's ordinary exit-2
+/// no-match), never a typo.
+pub(crate) fn retain_package_scope(results: &mut Vec<SymbolResult<'_>>, package: Option<&str>) {
+    let Some(selector) = package else {
+        return;
+    };
+    results.retain(|row| {
+        // The manifest must enclose THIS row's path, so a forged pairing the
+        // nearest-enclosing walk could never produce is not scopable.
+        row.repo_relative_path
+            .zip(row.crate_attribution)
+            .and_then(|(path, attribution)| attribution.owning_package_for(path))
+            .is_some_and(|(name, _)| name == selector)
+    });
+    for row in results {
+        row.crate_attribution_disclaimer = Some(crate::cli::CRATE_ATTRIBUTION_DISCLAIMER);
+    }
 }
 
 pub(crate) fn symbol_result<'a>(
@@ -230,6 +258,14 @@ pub(crate) fn symbol_row<'a>(
         signature: signature.as_deref(),
         doc: doc.as_deref(),
         git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+        // Only a claim the resolver could have produced is presentable, read
+        // through the ONE record-level boundary the text render and the package
+        // catalog also use, so no two surfaces can disagree about one record and
+        // no future caller can inherit a weaker gate (issue #117). This row is
+        // statically a `Symbol`, so the boundary's kind check is a no-op here —
+        // it is the shared entry point that matters.
+        crate_attribution: record.presentable_crate_attribution().map(|(a, _)| a),
+        crate_attribution_disclaimer: None,
         repository_id,
         repository: repository_id.and_then(|repo| index.display_of(repo)),
         freshness: None,
@@ -260,6 +296,7 @@ pub(crate) fn query_symbols_matching(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    package: Option<&str>,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
     let mut results: Vec<SymbolResult<'_>> = records
@@ -289,6 +326,7 @@ pub(crate) fn query_symbols_matching(
     if let Some(repo) = selected_repo {
         results.retain(|r| r.repository_id == Some(repo));
     }
+    retain_package_scope(&mut results, package);
 
     if results.is_empty() {
         eprintln!("error: no match found for pattern `{pattern}`");
@@ -312,6 +350,7 @@ pub(crate) fn query_symbols_matching(
 // query symbol --at <commit>
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn query_symbol_at(
     records: &[GraphRecord],
     name: &str,
@@ -319,6 +358,7 @@ pub(crate) fn query_symbol_at(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    package: Option<&str>,
     freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     // The ambiguity check is repository-scoped: a prefix that collides only
@@ -340,6 +380,13 @@ pub(crate) fn query_symbol_at(
     }
 
     let mut matches = query::symbols_at_commit(records, name, prefix);
+    // Package scope narrows the CANDIDATES, before a single winner is chosen
+    // (issue #117). Applying it afterwards would report "no match" for a symbol
+    // that demonstrably exists in the requested package, purely because a
+    // same-named symbol in another package sorted first.
+    if let Some(selector) = package {
+        matches.retain(|r| r.owning_package().map(|(name, _)| name) == Some(selector));
+    }
     if let Some(repo) = selected_repo {
         matches.retain(|r| index.owner_of(r.id()) == Some(repo));
     } else {
@@ -360,7 +407,15 @@ pub(crate) fn query_symbol_at(
         }
         Some(record) => {
             let deleted = current_deleted_ids(records);
-            if let Some(mut result) = symbol_result(record, name, index, records, &deleted) {
+            if let Some(result) = symbol_result(record, name, index, records, &deleted) {
+                // Candidates were already narrowed above; this stamps the
+                // containment caveat on the surviving row.
+                let mut scoped = vec![result];
+                retain_package_scope(&mut scoped, package);
+                let Some(mut result) = scoped.pop() else {
+                    eprintln!("error: no match found for symbol `{name}` at commit `{prefix}`");
+                    std::process::exit(2);
+                };
                 stamp_freshness(std::slice::from_mut(&mut result), freshness_code);
                 // `--at` pins a single commit: the corpus is commit-pinned,
                 // chosen by the selector (issue #427).
@@ -379,7 +434,16 @@ pub(crate) fn query_symbol_at(
 impl PrintText for SymbolResult<'_> {
     fn as_text(&self) -> String {
         use std::fmt::Write as _;
-        let path = self.repo_relative_path.unwrap_or("(unknown)");
+        // A repo-relative path is a real filesystem path, and on Unix that can
+        // contain a newline or an ESC. Sanitize it for the TEXT render at the
+        // same boundary the manifest citation below is sanitized at, so no row
+        // can forge an output line or drive the reader's terminal. Never
+        // truncated — a truncated path stops being a citation — and `--format
+        // json` still carries the exact bytes.
+        let path = self.repo_relative_path.map_or_else(
+            || "(unknown)".to_owned(),
+            crate::embeddings::sanitized_handle,
+        );
         let line = self.span.map_or(0, |s| s.start_line);
         let commit = self.git_commit.map_or(String::new(), |c| format!(" [{c}]"));
         let freshness = self
@@ -398,6 +462,39 @@ impl PrintText for SymbolResult<'_> {
         }
         if let Some(doc) = self.doc {
             let _ = write!(text, "\n  doc: {doc}");
+        }
+        // Owning Cargo package (issue #117). An ABSENT field prints NOTHING:
+        // the record predates issue #117, so its attribution is unknown, and
+        // rendering "unattributed" would fabricate a negative fact.
+        //
+        // BOTH branches read through a checked accessor rather than the raw
+        // fields, because a value read back from a store or a graph is
+        // operator-controlled and BOTH renders are claims. `owning_package`
+        // refuses an ownership claim the resolver could not have produced;
+        // `proven_unattributed_reason` refuses the negative one, which is
+        // equally a fact — "provably no owner" is exactly what this feature's
+        // absent-vs-unattributed contract says an absent field must NOT be read
+        // as. A value failing either check prints nothing at all.
+        if let Some(attribution) = self.crate_attribution {
+            if let Some((name, manifest)) = self
+                .repo_relative_path
+                .and_then(|path| attribution.owning_package_for(path))
+            {
+                // The manifest path is a real filesystem path, and on Unix that
+                // can contain a newline or an ESC — so the RENDER is what keeps
+                // one row to one line, not a producer-side refusal to record
+                // the fact. Sanitized, never truncated: a truncated handle
+                // stops being a citation. The package NAME needs no such pass,
+                // being charset-gated by `package_name_is_valid` at both the
+                // production and read-back checks.
+                let manifest = crate::embeddings::sanitized_handle(manifest);
+                let _ = write!(text, "\n  package: {name} ({manifest})");
+            } else if let Some(reason) = self
+                .repo_relative_path
+                .and_then(|path| attribution.proven_unattributed_reason_for(path))
+            {
+                let _ = write!(text, "\n  package: (unattributed: {})", reason.as_str());
+            }
         }
         text
     }

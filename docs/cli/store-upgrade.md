@@ -99,3 +99,45 @@ no Egregore write path declares them, so an untouched store is fully schemaless
 exactly as before. An operator can opt in with
 [`eg audit schema-constraints --declare`](schema-constraints.md), and `--drop`
 retracts it.
+
+## Upgrading a store across a codegraph `SCHEMA_VERSION` bump
+
+Separate from the `AletheiaDB` substrate upgrade above: when Egregore's own
+codegraph `SCHEMA_VERSION` bumps (most recently `8 → 9` for issue #117's
+owning-package attribution), **every `codegraph:v<N>:` record ID prefix
+changes**. `stable_id` formats the version into the ID, so the same symbol in
+the same file mints a different ID before and after the bump.
+
+That has one operator-visible consequence:
+
+- **Re-ingesting a v9 graph into a store that already holds v8 records adds
+  them alongside, it does not supersede them.** Supersession keys on record ID,
+  and the IDs differ, so the store ends up carrying two live generations of the
+  same facts. `eg inspect --data-dir` will show both under
+  `schema_version codegraph <Kind> v8` and `… v9`.
+
+- **There is no in-place migration.** The remedy is a **fresh `--data-dir`**:
+
+  ```powershell
+  eg scan . --out graph.jsonl
+  eg ingest graph.jsonl --adapter embedded --data-dir .egregore-v9
+  ```
+
+  Re-extraction from source regenerates every code-graph record deterministically
+  under the current version, so nothing is lost that a re-scan cannot rebuild.
+  Agent-memory, verification, project, artifact, and log records are versioned
+  per-domain and are **not** affected by a codegraph bump; `eg export` from the
+  old store and re-ingest into the new one carries them across.
+
+- **The incremental cache invalidates itself.** `CACHE_SCHEMA_VERSION` bumps in
+  lockstep, so the next `eg refresh` rebuilds from source rather than replaying
+  cached records that carry stale-prefix IDs.
+
+- **`eg query producer-drift` will report drift** for every pre-bump record in an
+  existing store, since the producer signature changed. Drift never changes the
+  command's exit code — it is a report of what re-extraction would change.
+
+The reader gate is a **range** (`1..=SCHEMA_VERSION`), so an older codegraph
+record is still readable after a bump; it is not rejected with
+`unknown_schema_version`. The duplication above is the cost of mixing
+generations, not a read failure.

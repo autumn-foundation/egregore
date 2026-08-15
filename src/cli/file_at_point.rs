@@ -43,6 +43,7 @@ pub(crate) fn query_file_via_daemon(
 // query file
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn query_file(
     records: &[GraphRecord],
     path: &str,
@@ -120,6 +121,21 @@ pub(crate) fn query_file(
             visibility: None,
             signature: None,
             doc: None,
+            // Crate attribution IS carried here, unlike the declaration-surface
+            // fields above (issue #117). Those differ per row, so omitting them
+            // only trims duplication a caller can recover with `eg query
+            // symbol`; omitting attribution would drop the owning-package fact
+            // from the ENTIRE answer, since this lane has no envelope — and
+            // `docs/cli/query.md` promises these rows carry every `eg query
+            // symbol` field but those three.
+            //
+            // Every row takes its OWN record's attribution; duplicates are
+            // blanked after the sort below, so whatever survives is always a
+            // fact about the row it rides on.
+            // Read through the ONE record-level boundary, so this lane cannot
+            // drift from the package catalog's gate (issue #117).
+            crate_attribution: r.presentable_crate_attribution().map(|(a, _)| a),
+            crate_attribution_disclaimer: None,
             git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
             repository_id,
             repository: repository_id.and_then(|repo| index.display_of(repo)),
@@ -153,6 +169,25 @@ pub(crate) fn query_file(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
+    // `crate_attribution` is a file-level fact (issue #117), but "the file" is
+    // not globally unique: a repo-relative path can exist in several
+    // repositories, and over a `scan-history` graph its owning package can
+    // change between commits. So rather than pick one attribution for the whole
+    // answer, keep the FIRST occurrence of each DISTINCT one and blank the
+    // repeats. Every surviving value is then a fact about the row it rides on,
+    // every distinct package in the answer appears at least once, and the common
+    // single-package case still emits exactly one — repeating it on every row
+    // measurably regresses the `eg audit token-cost` savings gate.
+    let mut seen: std::collections::BTreeSet<(Option<&str>, &crate::ir::CrateAttribution)> =
+        std::collections::BTreeSet::new();
+    for result in &mut results {
+        let Some(attribution) = result.crate_attribution else {
+            continue;
+        };
+        if !seen.insert((result.repository_id, attribution)) {
+            result.crate_attribution = None;
+        }
+    }
     stamp_freshness(&mut results, freshness_code);
     for result in &results {
         print_result(result, format)?;

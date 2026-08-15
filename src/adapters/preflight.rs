@@ -122,7 +122,7 @@ pub struct PreflightRefusal {
 //     payload (the adapter serializes each to a single JSON property value):
 //     temporal, semantic_drift, evidence_links, repository_identity,
 //     source_snapshot, dependency, log, scan_coverage, embedding_model,
-//     body_handle, route,
+//     body_handle, route, crate_attribution,
 //     assignees, labels, target_files, patch_handle, arguments_handle,
 //     result_handle, stdout_handle, stderr_handle, diff_hunk_handle,
 //     user_context, producer.
@@ -167,6 +167,7 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                 note,
                 content_signature,
                 route,
+                crate_attribution,
                 temporal,
                 semantic_drift,
                 evidence_links,
@@ -376,6 +377,7 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                 insert_json(&mut values, embedding_model.as_deref());
                 insert_json(&mut values, body_handle.as_deref());
                 insert_json(&mut values, route.as_ref());
+                insert_json(&mut values, crate_attribution.as_ref());
                 insert_json(&mut values, assignees.as_ref());
                 insert_json(&mut values, labels.as_ref());
                 insert_json(&mut values, target_files.as_ref());

@@ -387,3 +387,10 @@ scan, or rebuild the store into a new `--data-dir`.
 `docs/schema/schema-versioning.md §2`: old readers may ignore the new kind
 and field; new readers tolerate their absence. The facts are deterministic
 code-graph records — no agent-authored trust class, no network importer.
+
+## See also
+
+- [`crate-attribution.md`](crate-attribution.md) — the owning-Cargo-package
+  attribution stamped on every code fact (issue #117), resolved from the same
+  manifests this lane parses. That lane answers "which package owns this file";
+  this one answers "what does this package declare".

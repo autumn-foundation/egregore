@@ -129,11 +129,18 @@ use crate::{
 /// on Symbol facts change the cached per-file fact shape, so per-file caches
 /// must rebuild to emit the `REGISTERS_ROUTE` edges and route annotations instead
 /// of replaying pre-#445 facts that carried none.
+/// 25 -> 26: #117 owning-Cargo-package attribution. The paired codegraph
+/// `SCHEMA_VERSION` bump 8 -> 9 changes every `codegraph:v<N>:` record ID
+/// prefix, so a cache holding v8 IDs would replay records whose endpoints no
+/// longer match freshly-minted v9 ones. Attribution itself is deliberately NOT
+/// cached: it is recomputed on every refresh, so a source file byte-identical
+/// to its cached version whose owning `Cargo.toml` was added, renamed, or
+/// deleted is still re-attributed.
 ///
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 25;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 26;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -535,6 +542,21 @@ fn scan_repository_incremental_at_inner(
     for record in crate::manifest_deps::scan_dependency_records(repo_root, &repository_id)? {
         graph.push(record.with_valid_time_inferred(transaction_time));
     }
+
+    // Owning-Cargo-package attribution (issue #117), mirrored from the full-scan
+    // path. It runs after every File-producing extractor (per-file source
+    // extraction and manifest extraction above) and over the WHOLE assembled
+    // graph, cache-replayed records included.
+    //
+    // Attribution is deliberately NOT cached alongside per-file records: a
+    // source file byte-identical to its cached version (so the content-hash gate
+    // reuses it wholesale) can still change owner when its `Cargo.toml` is
+    // renamed, added, or deleted. Recomputing here — the same "never cached,
+    // always recomputed" class as `label_same_file_call_resolutions` — is what
+    // keeps a refresh and a full scan of the same tree in exact agreement.
+    let manifest_facts = crate::manifest_deps::scan_manifest_package_facts(repo_root)?;
+    let attribution = crate::crate_attribution::CrateAttributionIndex::from_facts(manifest_facts);
+    crate::crate_attribution::apply_crate_attribution(graph.records_mut(), &attribution);
 
     // Scan-coverage reconciliation (issue #135), previously emitted only by the
     // full-scan path (issue #403). Finalize the tally against the COMPLETE set of

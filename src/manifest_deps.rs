@@ -25,6 +25,7 @@ use std::{
 };
 
 use crate::{
+    crate_attribution::{ManifestPackageFact, ManifestParseOutcome},
     error::Result,
     fs::discover_cargo_manifests,
     ir::{DependencyDeclarationPayload, EdgeLabel, GraphRecord, NodeKind, stable_id},
@@ -60,9 +61,357 @@ impl DependencyKind {
             Self::Build => "build-dependencies",
         }
     }
+
+    /// Cargo's accepted UNDERSCORE spelling of [`Self::table`], when one exists.
+    ///
+    /// `[dev_dependencies]` and `[build_dependencies]` are tables Cargo really
+    /// reads: a valid spec in one resolves, a malformed one makes the manifest
+    /// unloadable, and both spellings may appear side by side. `dependencies`
+    /// is one word and has no alias.
+    ///
+    /// Probing every hyphenated key this file checks bounds the alias surface to
+    /// these two TABLE names — no `[package]` or `[workspace]` field has an
+    /// underscore alias, and neither does the spec key `registry-index`;
+    /// `default_features` is the one aliased spec key and is already matched.
+    ///
+    /// Used for VALIDATION only. Row emission stays hyphen-only, matching the
+    /// target-specific tables: this decides whether the manifest LOADS. Cargo
+    /// accepts both spellings at once — even declaring the same name in each —
+    /// so emitting from both could mint a duplicate `DependencyDeclaration`,
+    /// which is a `manifest-deps` question rather than an attribution one.
+    const fn alias_table(self) -> Option<&'static str> {
+        match self {
+            Self::Normal => None,
+            Self::Dev => Some("dev_dependencies"),
+            Self::Build => Some("build_dependencies"),
+        }
+    }
 }
 
-/// The three captured dependency tables in documented output order.
+/// The loadable form a `Cargo.toml` takes (issue #117).
+///
+/// A closed set: each variant demands a different answer from the
+/// nearest-enclosing-manifest walk.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ManifestShape {
+    /// Declares a `[package]` table. Its `name` may still be absent or
+    /// Cargo-invalid; see `ManifestDependencies::package_name`.
+    Package,
+    /// A usable VIRTUAL workspace root: `[workspace]`, no `[package]`, and no
+    /// section Cargo forbids beside it. Declares no package, so it owns nothing
+    /// and the attribution walk passes it.
+    VirtualRoot,
+    /// A form Cargo REFUSES to load: neither `[package]` nor `[workspace]`, or a
+    /// virtual manifest carrying a package-only section. The boundary exists but
+    /// is unusable, so the attribution walk stops rather than crossing it.
+    Unusable,
+}
+
+/// Sections Cargo forbids in a VIRTUAL manifest (`[workspace]`, no `[package]`).
+///
+/// Cargo rejects such a manifest with "this virtual manifest specifies a
+/// `<section>` section, which is not allowed". Every entry was verified against
+/// the toolchain this repository pins (cargo 1.94.1); `[profile]`, `[patch]`,
+/// `[replace]`, and `[project]` were verified ACCEPTED and are deliberately
+/// absent.
+///
+/// A DENY-list, deliberately, even though it can lag: Cargo tolerates an
+/// unrecognized section in a virtual manifest (verified — an invented
+/// `[totally-made-up-section]` loads fine), so an allow-list would classify
+/// every manifest carrying a future or tool-specific key as unusable and
+/// silently un-attribute its whole subtree. The residual risk is the opposite
+/// direction — a section Cargo forbids in a LATER release is walked past here
+/// until this list is updated, exactly as `hints` was before it was added.
+const VIRTUAL_MANIFEST_FORBIDDEN_SECTIONS: [&str; 15] = [
+    "dependencies",
+    "dev-dependencies",
+    "dev_dependencies",
+    "build-dependencies",
+    "build_dependencies",
+    "features",
+    "target",
+    "lib",
+    "bin",
+    "bench",
+    "test",
+    "example",
+    "badges",
+    "lints",
+    "hints",
+];
+
+/// The TOML shape a known `[workspace]` field must have for Cargo to load the
+/// manifest at all.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum WorkspaceFieldShape {
+    /// An array whose every element is a string (`members`, `exclude`,
+    /// `default-members`).
+    StringArray,
+    /// A plain string (`resolver`).
+    Str,
+    /// A table (`package`, `lints`).
+    Table,
+    /// The `[workspace.dependencies]` TEMPLATE table: a table whose every entry
+    /// is one Cargo can load.
+    ///
+    /// Validated with the TEMPLATE rules, not the member ones — a genuinely
+    /// different boundary, verified in both directions against real `cargo
+    /// metadata`. Cargo ACCEPTS a source-less table, an empty table, an
+    /// UNPARSEABLE version string, a `workspace` key, and unknown keys here,
+    /// all of which `declared_dependency` rejects for a member table; it
+    /// REJECTS a non-string/non-table value, a wrong-typed known key,
+    /// `optional = true`, and an invalid dependency name. Reusing the member
+    /// rule would un-attribute real workspaces.
+    DependencyTemplateTable,
+}
+
+/// Type contract for the known `[workspace]` fields.
+///
+/// Cargo type-checks each of these while parsing, so a wrong-typed one makes
+/// the WHOLE manifest unloadable — not merely that field ignored. That matters
+/// here because classifying a manifest as a virtual root is the FAIL-OPEN
+/// direction: the walk passes it and the subtree inherits an outer package,
+/// when in reality Cargo can load neither the workspace nor anything under it.
+///
+/// Every row was verified against real `cargo metadata --no-deps
+/// --format-version 1` on the pinned toolchain (cargo 1.94.1), which rejects
+/// each violation with `invalid type: … expected …`. Two fields are
+/// deliberately ABSENT because Cargo accepts any type for them: `metadata`
+/// (arbitrary user data), and every unrecognized key (a `future-tool-key`
+/// loads fine) — rejecting either would un-attribute a real subtree.
+///
+/// HONEST BOUND: this checks the TYPE of a known field, not its VALUE. Cargo
+/// validates deeper still — `[workspace.package] version = 1` is rejected as
+/// "expected semver version", and `resolver = "9"` as an unknown resolver — and
+/// re-implementing Cargo's manifest loader is out of scope for a local,
+/// deterministic, `cargo`-free resolver. A manifest malformed in one of those
+/// deeper ways is still walked past, exactly as the deny-list above can lag a
+/// newer Cargo.
+const WORKSPACE_FIELD_SHAPES: [(&str, WorkspaceFieldShape); 7] = [
+    ("members", WorkspaceFieldShape::StringArray),
+    ("exclude", WorkspaceFieldShape::StringArray),
+    ("default-members", WorkspaceFieldShape::StringArray),
+    ("resolver", WorkspaceFieldShape::Str),
+    // The inheritance table: a non-table here is rejected by Cargo just as a
+    // non-table top-level `package` is.
+    ("package", WorkspaceFieldShape::Table),
+    ("dependencies", WorkspaceFieldShape::DependencyTemplateTable),
+    ("lints", WorkspaceFieldShape::Table),
+];
+
+/// Whether every entry of a `[workspace.dependencies]` template is one Cargo
+/// can load.
+///
+/// A virtual root is WALKED PAST, so an unloadable one hands its subtree to an
+/// OUTER package — the fail-open direction, and the fabrication this feature
+/// exists to prevent. Hence the check.
+///
+/// Deliberately NOT `declared_dependency`: the template boundary is looser than
+/// a member table's, verified in both directions (see
+/// [`WorkspaceFieldShape::DependencyTemplateTable`]). What is checked here is
+/// exactly what Cargo rejects — a value that is neither a string nor a table, a
+/// table failing the TEMPLATE key rules (which already encode `optional = true`
+/// being disallowed and the `workspace` key being ignored), and a dependency
+/// name Cargo refuses.
+fn workspace_dependency_template_is_loadable(table: &dyn toml_edit::TableLike) -> bool {
+    table.iter().all(|(key, item)| {
+        if !package_name_is_valid(key) {
+            return false;
+        }
+        if item.as_str().is_some() {
+            // A version string. Cargo does NOT parse the requirement here
+            // (verified: `serde = "not-a-version"` loads), so neither do we.
+            return true;
+        }
+        item.as_table_like().is_some_and(|spec| {
+            dependency_table_is_well_typed(spec, DependencyTableContext::Template)
+        })
+    })
+}
+
+/// Whether every KNOWN field of a `[workspace]` table has a type Cargo accepts./// Whether every KNOWN field of a `[workspace]` table has a type Cargo accepts.
+///
+/// An absent field is fine (all are optional); an unknown field is fine (Cargo
+/// tolerates it). Only a present, known, wrong-typed field is disqualifying.
+fn workspace_table_is_well_typed(workspace: &dyn toml_edit::TableLike) -> bool {
+    WORKSPACE_FIELD_SHAPES.iter().all(|(field, shape)| {
+        workspace.get(field).is_none_or(|item| match shape {
+            WorkspaceFieldShape::StringArray => item
+                .as_array()
+                .is_some_and(|values| values.iter().all(toml_edit::Value::is_str)),
+            WorkspaceFieldShape::Str => item.as_str().is_some(),
+            WorkspaceFieldShape::Table => item.as_table_like().is_some(),
+            WorkspaceFieldShape::DependencyTemplateTable => item
+                .as_table_like()
+                .is_some_and(workspace_dependency_template_is_loadable),
+        })
+    })
+}
+
+/// The TOML shape a known `[package]` field must have for Cargo to load the
+/// manifest.
+///
+/// Several fields accept the workspace-INHERITANCE table (`version.workspace =
+/// true`), which is ubiquitous in real workspaces — a rule that demanded the
+/// direct type would un-attribute them wholesale, so every inheritable arm
+/// admits a table.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PackageFieldShape {
+    /// A string, with no inheritance form (`name`, `links`, `default-run`).
+    Str,
+    /// A string, or the inheritance table.
+    StrOrInherited,
+    /// An array whose every element is a string, or the inheritance table.
+    StringArrayOrInherited,
+    /// A string, a bool, or the inheritance table (`readme = false` is valid).
+    StrBoolOrInherited,
+    /// A bool, a string array, or the inheritance table (`publish`).
+    BoolArrayOrInherited,
+    /// A string, a bool, or a string array, with no inheritance form (`build`).
+    ///
+    /// The array is the `multiple-build-scripts` form. It is nightly-GATED, not
+    /// wrong-typed: Cargo's deserializer accepts it and the gate rejects it
+    /// afterwards, so treating it as a type error would make the whole manifest
+    /// `unusable_manifest` and un-attribute a real nightly crate.
+    StrBoolOrStringArray,
+    /// A string or a string array, with no inheritance form (`metabuild`).
+    StrOrStringArray,
+    /// A bool ONLY — no string, no inheritance table. Cargo's automatic-target
+    /// switches (`autolib`, `autobins`, …) reject a table with "invalid type:
+    /// map, expected a boolean", so they are the one checked family taking no
+    /// `x.workspace = true` form.
+    Bool,
+}
+
+/// Type contract for the known `[package]` fields.
+///
+/// Cargo type-checks these while parsing, so a wrong-typed one makes the WHOLE
+/// manifest unloadable — the package it names does not exist, and attributing a
+/// subtree to it would claim ownership by something that cannot be built. The
+/// `[workspace]` analog is [`WORKSPACE_FIELD_SHAPES`]; this is the same rule on
+/// the other table.
+///
+/// EVERY arm — accepted and rejected alike — was verified against real `cargo
+/// metadata --no-deps --format-version 1` on the pinned toolchain (cargo
+/// 1.94.1). The accepted ones matter as much: `readme = false`, `publish =
+/// false`, `build = false`, an unknown key, and every `x.workspace = true`
+/// inheritance form all load fine, and rejecting any of them would un-attribute
+/// a real crate.
+///
+/// HONEST BOUND, unchanged from the workspace table: this checks the TYPE of a
+/// known field, not its VALUE. Cargo also rejects `version = "notsemver"` and
+/// `edition = "1066"`, which this resolver does not evaluate — it confirms a
+/// manifest's shape rather than reimplementing Cargo's schema.
+const PACKAGE_FIELD_SHAPES: [(&str, PackageFieldShape); 31] = [
+    ("name", PackageFieldShape::Str),
+    // The workspace POINTER (`workspace = "../.."`), naming the root this
+    // package belongs to. Distinct from the `x.workspace = true` INHERITANCE
+    // form, which appears as a table inside another field; Cargo rejects a
+    // non-string here.
+    ("workspace", PackageFieldShape::Str),
+    ("links", PackageFieldShape::Str),
+    ("default-run", PackageFieldShape::Str),
+    ("version", PackageFieldShape::StrOrInherited),
+    ("edition", PackageFieldShape::StrOrInherited),
+    ("rust-version", PackageFieldShape::StrOrInherited),
+    ("description", PackageFieldShape::StrOrInherited),
+    ("homepage", PackageFieldShape::StrOrInherited),
+    ("repository", PackageFieldShape::StrOrInherited),
+    ("license", PackageFieldShape::StrOrInherited),
+    ("license-file", PackageFieldShape::StrOrInherited),
+    ("documentation", PackageFieldShape::StrOrInherited),
+    ("readme", PackageFieldShape::StrBoolOrInherited),
+    ("authors", PackageFieldShape::StringArrayOrInherited),
+    ("keywords", PackageFieldShape::StringArrayOrInherited),
+    ("categories", PackageFieldShape::StringArrayOrInherited),
+    ("exclude", PackageFieldShape::StringArrayOrInherited),
+    ("include", PackageFieldShape::StringArrayOrInherited),
+    ("publish", PackageFieldShape::BoolArrayOrInherited),
+    ("build", PackageFieldShape::StrBoolOrStringArray),
+    ("autolib", PackageFieldShape::Bool),
+    ("autobins", PackageFieldShape::Bool),
+    ("autoexamples", PackageFieldShape::Bool),
+    ("autotests", PackageFieldShape::Bool),
+    ("autobenches", PackageFieldShape::Bool),
+    // The last type-checked fields of Cargo 1.94.1's package table. None is
+    // inheritable — a `x.workspace = true` table is rejected for every one of
+    // them — so they take the non-inheritable shapes.
+    ("resolver", PackageFieldShape::Str),
+    ("forced-target", PackageFieldShape::Str),
+    ("im-a-teapot", PackageFieldShape::Bool),
+    // NIGHTLY-GATED, and type-checked BEFORE the gate runs. These were missed
+    // when the table was first called closed, precisely because the gate hides
+    // them: on stable EVERY value fails, so only the wrong-typed one — which
+    // fails earlier, with `invalid type` — distinguishes them from an unknown
+    // key. `default-target` is the literal twin of `forced-target` above (one
+    // Cargo error message names the two together) and shipped without it.
+    //
+    // Their well-typed forms are accepted here even though stable Cargo refuses
+    // the manifest, because this table models Cargo's DESERIALIZER and not its
+    // feature gates: a nightly crate that really does enable
+    // `per-package-target` or `metabuild` must keep its attribution, and
+    // modelling gates would mean tracking which channel and which
+    // `cargo-features` a scan ran under. The same reasoning widened `build`
+    // above to admit the gated `multiple-build-scripts` array.
+    ("default-target", PackageFieldShape::Str),
+    ("metabuild", PackageFieldShape::StrOrStringArray),
+];
+
+/// SCOPE, verified rather than assumed: this checks the `[package]` TABLE's own
+/// fields. Wrong-typed TOP-LEVEL sections are NOT checked, because Cargo
+/// tolerates them — `lib = 1`, `bin = 1`, `features = 1`, `dependencies = 1`,
+/// `profile = 1`, `badges = 1`, and `target = 1` beside a valid `[package]` all
+/// load cleanly under `cargo metadata --no-deps` AND `cargo build` on the
+/// pinned toolchain (1.94.1). Only a well-formed SECTION with a bad inner value
+/// (`[lib]` with `name = 1`) is rejected, and that is value-level validation
+/// this resolver deliberately does not reimplement. Adding a top-level section
+/// check would reject manifests Cargo accepts and un-attribute real crates.
+/// Whether every KNOWN field of a `[package]` table has a type Cargo accepts.
+///
+/// An absent field is fine; an unknown field is fine (Cargo tolerates it, as
+/// verified). Only a present, known, wrong-typed field is disqualifying.
+fn package_table_is_well_typed(package: &dyn toml_edit::TableLike) -> bool {
+    fn is_string_array(item: &toml_edit::Item) -> bool {
+        item.as_array()
+            .is_some_and(|values| values.iter().all(toml_edit::Value::is_str))
+    }
+    PACKAGE_FIELD_SHAPES.iter().all(|(field, shape)| {
+        package.get(field).is_none_or(|item| {
+            // The workspace-INHERITANCE form, which must actually be one:
+            // Cargo requires the `workspace` key present and equal to boolean
+            // `true`, rejecting a wrong type ("expected a boolean"), `false`
+            // ("`workspace` cannot be false"), and its absence ("missing field
+            // `workspace`") — all verified. EXTRA keys alongside it are
+            // tolerated, so only `workspace` itself is constrained; rejecting
+            // the rest would un-attribute real crates.
+            let inherited = item.as_table_like().is_some_and(|spec| {
+                spec.get("workspace")
+                    .and_then(toml_edit::Item::as_bool)
+                    .unwrap_or(false)
+            });
+            match shape {
+                PackageFieldShape::Str => item.as_str().is_some(),
+                PackageFieldShape::StrOrInherited => item.as_str().is_some() || inherited,
+                PackageFieldShape::StringArrayOrInherited => is_string_array(item) || inherited,
+                PackageFieldShape::StrBoolOrInherited => {
+                    item.as_str().is_some() || item.as_bool().is_some() || inherited
+                }
+                PackageFieldShape::BoolArrayOrInherited => {
+                    item.as_bool().is_some() || is_string_array(item) || inherited
+                }
+                PackageFieldShape::StrBoolOrStringArray => {
+                    item.as_str().is_some() || item.as_bool().is_some() || is_string_array(item)
+                }
+                PackageFieldShape::StrOrStringArray => {
+                    item.as_str().is_some() || is_string_array(item)
+                }
+                PackageFieldShape::Bool => item.as_bool().is_some(),
+            }
+        })
+    })
+}
+
+/// The three captured dependency tables in documented output order./// The three captured dependency tables in documented output order.
 const DEPENDENCY_KINDS: [DependencyKind; 3] = [
     DependencyKind::Normal,
     DependencyKind::Dev,
@@ -249,6 +598,15 @@ pub struct ManifestDependencies {
     /// the declared name is empty/whitespace-only (Cargo-invalid, PR #314
     /// review) — such names never attribute declarations.
     pub package_name: Option<String>,
+    /// Which of the three loadable/unloadable forms this manifest takes.
+    ///
+    /// Crate attribution (issue #117) needs more than `package_name`: that field
+    /// is `None` for a virtual workspace root, for a `[package]` whose name is
+    /// unusable, AND for a manifest Cargo refuses to load outright. Those demand
+    /// different answers — walk past the first, stop fail-closed on the others —
+    /// so the shape is reported as a closed set rather than reconstructed from
+    /// a handful of booleans that could describe impossible combinations.
+    pub shape: ManifestShape,
     /// Declarations in documented order: table order (`normal`, `dev`,
     /// `build`), then crate name, then the declared-as manifest key.
     pub declarations: Vec<DeclaredDependency>,
@@ -257,6 +615,74 @@ pub struct ManifestDependencies {
     /// Cargo rejects). The entry is skipped, never rendered as a row, and
     /// reported as a coverage hole (PR #314 review).
     pub uninterpretable: bool,
+}
+
+/// The dependency tables that are VALIDATED but never emit rows.
+///
+/// Two of them, split out from [`parse_manifest_dependencies`] so the emitting
+/// loop stays readable: the target-specific tables and the underscore aliases.
+/// Both decide only whether the manifest LOADS, which is what attribution rests
+/// on — see [`DependencyKind::alias_table`] for why their rows stay unemitted.
+///
+/// `true` means at least one entry is one Cargo cannot interpret.
+fn validation_only_dependency_tables_are_uninterpretable(doc: &toml_edit::DocumentMut) -> bool {
+    let mut uninterpretable = false;
+    // TARGET-SPECIFIC dependency tables (`[target.<spec>.dependencies]` and its
+    // dev/build siblings) are the only other place dependencies live, so
+    // scanning them CLOSES the set rather than adding another special case.
+    // Cargo validates entries there exactly as it does at the top level, and an
+    // invalid one makes the manifest unloadable.
+    if let Some(targets) = doc.get("target").and_then(toml_edit::Item::as_table_like) {
+        for (_, target) in targets.iter() {
+            // A target SPEC must be a table ("expected struct TomlPlatform"),
+            // and each of its dependency tables must be a map — UNLIKE the
+            // top-level tables, where Cargo tolerates a scalar
+            // (`dependencies = 1` beside a valid `[package]` loads fine,
+            // verified). That asymmetry is real, so the loops cannot be
+            // unified: applying this rule at the top level would un-attribute
+            // crates Cargo builds.
+            let Some(target) = target.as_table_like() else {
+                uninterpretable = true;
+                continue;
+            };
+            for kind in DEPENDENCY_KINDS {
+                for name in std::iter::once(kind.table()).chain(kind.alias_table()) {
+                    let Some(entry) = target.get(name) else {
+                        continue;
+                    };
+                    let Some(table) = entry.as_table_like() else {
+                        uninterpretable = true;
+                        continue;
+                    };
+                    if table
+                        .iter()
+                        .any(|(key, item)| declared_dependency(key, item, kind).is_none())
+                    {
+                        uninterpretable = true;
+                    }
+                }
+            }
+        }
+    }
+    // Top-level UNDERSCORE aliases. This mirrors the hyphenated emitting loop
+    // rather than the target loop above: at the top level Cargo TOLERATES a
+    // scalar table, so a non-table value is passed over instead of
+    // disqualifying the manifest.
+    for kind in DEPENDENCY_KINDS {
+        let Some(alias) = kind.alias_table() else {
+            continue;
+        };
+        let Some(table) = doc.get(alias).and_then(toml_edit::Item::as_table_like) else {
+            continue;
+        };
+        if table
+            .iter()
+            .any(|(key, item)| declared_dependency(key, item, kind).is_none())
+        {
+            uninterpretable = true;
+        }
+    }
+    uninterpretable
 }
 
 /// Parses the three captured dependency tables from a manifest body.
@@ -270,9 +696,59 @@ pub fn parse_manifest_dependencies(
     let doc = manifest_text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| error.to_string())?;
-    let package_name = doc
-        .get("package")
-        .and_then(toml_edit::Item::as_table_like)
+    let package_table = doc.get("package").and_then(toml_edit::Item::as_table_like);
+    // Classifying a manifest as a virtual root is the FAIL-OPEN direction: the
+    // attribution walk passes it and can attribute the subtree to an outer
+    // package. So it requires POSITIVE confirmation of a loadable virtual root,
+    // and every other shape falls through to `Unusable`, which stops the walk.
+    //
+    // Enumerating the ways a manifest can be malformed is open-ended — a
+    // `package` key present but not a table reads as "package-less" to a
+    // table-only lookup even though Cargo rejects it — so the default for the
+    // dangerous branch is deliberately inverted rather than patched per case.
+    //
+    // A confirmed virtual root has: no `package` key AT ALL (a present one, in
+    // any shape, means the manifest is trying to declare a package), a
+    // `workspace` TABLE whose every KNOWN field is well-typed
+    // ([`WORKSPACE_FIELD_SHAPES`] — a wrong-typed one makes the whole manifest
+    // unloadable, not merely that field ignored), and none of the package-only
+    // sections Cargo forbids beside it ("this virtual manifest specifies a
+    // `<section>` section, which is not allowed" — each verified against real
+    // `cargo metadata`, while `[profile]`, `[patch]`, and `[replace]` were
+    // verified accepted).
+    // A `[package]` whose known fields are wrong-typed is one Cargo refuses to
+    // load, so the package it names does not exist and its subtree must NOT be
+    // attributed to it — the same fail-closed treatment a malformed
+    // `[workspace]` gets.
+    let package_well_typed = package_table.is_some_and(package_table_is_well_typed);
+    // `cargo-features` is TOP-LEVEL and applies to BOTH shapes: Cargo requires
+    // an array of strings and rejects anything else with "expected a sequence",
+    // so a manifest carrying a malformed one is unloadable whether it declares a
+    // package or a virtual root. This is the one top-level field checked here —
+    // `lib`, `bin`, `features`, `dependencies`, `profile`, `badges`, and
+    // `target` are all TOLERATED as scalars by Cargo (verified), so rejecting
+    // them would un-attribute crates that build fine. An unknown feature NAME is
+    // also a Cargo error, but that is value-level validation this resolver does
+    // not cross.
+    let cargo_features_well_typed = doc.get("cargo-features").is_none_or(|item| {
+        item.as_array()
+            .is_some_and(|values| values.iter().all(toml_edit::Value::is_str))
+    });
+    // MISPLACED, which is a different failure from wrong-typed: Cargo rejects
+    // `cargo-features` inside `[package]` with "should be set at the top of
+    // Cargo.toml before any tables", for ANY value — so `cargo-features = 1`
+    // there fails on placement, never on type, and the root check above never
+    // sees it.
+    //
+    // Specific to `[package]`, verified in the accepting direction too:
+    // `[workspace]` has no such field, so Cargo tolerates it as an unknown key
+    // and a virtual root carrying one must stay walkable. Probing the other
+    // top-level names nested under `[package]` — `patch`, `profile`, `features`,
+    // `lints`, `badges`, `replace`, `dependencies`, `target`, `bin` — finds every
+    // one tolerated, so this is a one-member class.
+    let cargo_features_misplaced =
+        package_table.is_some_and(|package| package.get("cargo-features").is_some());
+    let package_name = package_table
         .and_then(|package| package.get("name"))
         .and_then(|name| name.as_str())
         // A name Cargo rejects — empty, or violating the package-name
@@ -283,7 +759,7 @@ pub fn parse_manifest_dependencies(
         .map(str::to_owned);
 
     let mut declarations = Vec::new();
-    let mut uninterpretable = false;
+    let mut uninterpretable = validation_only_dependency_tables_are_uninterpretable(&doc);
     for kind in DEPENDENCY_KINDS {
         let Some(table) = doc
             .get(kind.table())
@@ -313,8 +789,45 @@ pub fn parse_manifest_dependencies(
         });
         declarations.extend(entries);
     }
+    // A `[workspace]` table is validated wherever it APPEARS, not only on a
+    // virtual root. A manifest carrying BOTH `[package]` and `[workspace]` — a
+    // root crate that is also the workspace root, a common real layout — takes
+    // the package branch below, and a malformed workspace table there makes the
+    // whole manifest unloadable just the same.
+    let workspace_well_typed = doc.get("workspace").is_none_or(|item| {
+        item.as_table_like()
+            .is_some_and(workspace_table_is_well_typed)
+    });
+    let shape = if !cargo_features_well_typed || cargo_features_misplaced || !workspace_well_typed {
+        ManifestShape::Unusable
+    } else if package_table.is_some() {
+        // `uninterpretable` is set by `declared_dependency` for exactly the
+        // dependency forms Cargo REJECTS (a non-string/non-table entry, a table
+        // naming no usable source, a wrong-typed known key, an unparseable
+        // requirement, an invalid name). Such a manifest cannot be loaded, so
+        // the package it declares does not exist and must not own its subtree.
+        // Reusing that signal costs no second rule to keep in step.
+        if package_well_typed && !uninterpretable {
+            ManifestShape::Package
+        } else {
+            ManifestShape::Unusable
+        }
+    } else if doc.get("package").is_none()
+        && doc
+            .get("workspace")
+            .and_then(toml_edit::Item::as_table_like)
+            .is_some_and(workspace_table_is_well_typed)
+        && !VIRTUAL_MANIFEST_FORBIDDEN_SECTIONS
+            .iter()
+            .any(|section| doc.get(section).is_some())
+    {
+        ManifestShape::VirtualRoot
+    } else {
+        ManifestShape::Unusable
+    };
     Ok(ManifestDependencies {
         package_name,
+        shape,
         declarations,
         uninterpretable,
     })
@@ -361,28 +874,74 @@ fn dependency_table_is_well_typed(
     spec: &dyn toml_edit::TableLike,
     context: DependencyTableContext,
 ) -> bool {
-    // Cross-field source rules Cargo enforces (each verified against
-    // `cargo metadata`, PR #314 review): `path` and `git` are mutually
-    // exclusive, `git` and `registry` are mutually exclusive, and
-    // `branch`/`tag`/`rev` require `git` with at most one of the three.
-    // `registry` beside `version` or `path` is manifest-valid — Cargo only
-    // checks registry *configuration* later — and stays accepted.
     let has = |key: &str| spec.get(key).is_some();
-    let git_refs = ["branch", "tag", "rev"]
-        .iter()
-        .filter(|key| has(key))
-        .count();
-    if (has("path") && has("git"))
-        || (has("git") && has("registry"))
-        || (git_refs > 0 && !has("git"))
-        || git_refs > 1
-    {
-        return false;
-    }
-    spec.iter().all(|(key, item)| match key {
-        "version" | "path" | "git" | "registry" | "branch" | "tag" | "rev" | "package" => {
-            item.as_str().is_some()
+    // CROSS-FIELD rules are MEMBER-context rules. Cargo validates a
+    // `[workspace.dependencies]` template LAZILY, at inheritance time: an unused
+    // template holding `{ path, git }` loads fine, and "specification is
+    // ambiguous" fires only once a member writes `{ workspace = true }`. So none
+    // of these applies to a template — the same boundary
+    // `a_malformed_workspace_dependency_stops_the_walk` already draws, since
+    // applying member rules to a template un-attributes real workspaces.
+    //
+    // Residual, unavoidable per-manifest: a conflicting template that IS
+    // inherited breaks the workspace, and seeing that needs the member manifests
+    // this resolver never reads.
+    if matches!(context, DependencyTableContext::Member { .. }) {
+        // Source rules (each verified against `cargo metadata`, PR #314 review):
+        // `path` and `git` are mutually exclusive, `git` and `registry` are
+        // mutually exclusive, and `branch`/`tag`/`rev` require `git` with at most
+        // one of the three. `registry` beside `version` or `path` is
+        // manifest-valid — Cargo only checks registry *configuration* later —
+        // and stays accepted.
+        let git_refs = ["branch", "tag", "rev"]
+            .iter()
+            .filter(|key| has(key))
+            .count();
+        // `registry-index` is a REGISTRY source, so it conflicts like one: Cargo
+        // rejects it beside `git` ("Only one of `git` or `registry` is allowed")
+        // and beside `registry` ("Only one of `registry` or `registry-index`").
+        // It is NOT a conflict beside `version` or `path`, both of which Cargo
+        // accepts — the same asymmetry `registry` already has, and rejecting
+        // them would un-attribute a real crate.
+        let registry_sources = ["registry", "registry-index"]
+            .iter()
+            .filter(|key| has(key))
+            .count();
+        // COMPANION-key rules, the same shape as the git-ref rule above: a
+        // specifier that cannot appear without the key it qualifies. Verified on
+        // cargo 1.94.1 — "'target'/'lib' specifier cannot be used without an
+        // 'artifact = …' value" and "`base` can only be used with path
+        // dependencies". These are STRUCTURAL, not feature gates: with the
+        // companion present only the `-Z bindeps` / path-bases gate remains, and
+        // a gate is deliberately not modelled. `lib` is PRESENCE-based, so
+        // `lib = false` is rejected too.
+        let artifact_companions = has("target") || has("lib");
+        if (has("path") && has("git"))
+            || (has("git") && registry_sources > 0)
+            || registry_sources > 1
+            || (git_refs > 0 && !has("git"))
+            || git_refs > 1
+            || (artifact_companions && !has("artifact"))
+            || (has("base") && !has("path"))
+        {
+            return false;
         }
+    }
+    // `registry-index`, `base`, `target`, `public`, `lib`, and `artifact` below
+    // are the rest of the type-checked spec keys, found by probing the whole
+    // dependency-spec key space against real `cargo metadata` rather than taking
+    // the reported ones. Their TYPES are context-free: a
+    // `[workspace.dependencies]` template loosens `workspace` and `optional`,
+    // but rejects every one of these identically, so they ride the plain arms.
+    //
+    // As in `PACKAGE_FIELD_SHAPES`, this models Cargo's DESERIALIZER and not its
+    // gates: `artifact`/`lib`/`target` need `-Z bindeps` and `base` needs
+    // path-bases, so their well-typed values are accepted here even though
+    // stable Cargo refuses the manifest — refusing them would un-attribute a
+    // real nightly crate. `public` and `registry-index` are not gated at all.
+    spec.iter().all(|(key, item)| match key {
+        "version" | "path" | "git" | "registry" | "branch" | "tag" | "rev" | "package"
+        | "registry-index" | "base" | "target" => item.as_str().is_some(),
         "workspace" => match context {
             DependencyTableContext::Member { .. } => item.as_bool() == Some(true),
             DependencyTableContext::Template => true,
@@ -397,10 +956,16 @@ fn dependency_table_is_well_typed(
             ),
             None => false,
         },
-        "default-features" | "default_features" => item.as_bool().is_some(),
+        "default-features" | "default_features" | "public" | "lib" => item.as_bool().is_some(),
         "features" => item
             .as_array()
             .is_some_and(|array| array.iter().all(|value| value.as_str().is_some())),
+        "artifact" => {
+            item.as_str().is_some()
+                || item
+                    .as_array()
+                    .is_some_and(|array| array.iter().all(|value| value.as_str().is_some()))
+        }
         _ => true,
     })
 }
@@ -424,7 +989,12 @@ fn requirement_is_parseable(requirement: &str) -> bool {
 /// table keys, and `package = "…"` rename values alike — Cargo rejects all
 /// three the same way. Rejection-level rules only; crates.io publish-time
 /// restrictions and Cargo warnings are out of scope.
-fn package_name_is_valid(name: &str) -> bool {
+///
+/// Crate-visible so the attribution READER
+/// ([`crate::ir::CrateAttribution::owning_package`]) gates a package name read
+/// back from a store against the same rule that gated it at production —
+/// re-deriving the charset there would let the two drift.
+pub(crate) fn package_name_is_valid(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -909,6 +1479,65 @@ fn unloadable_workspace_diagnostic(repository_id: &str, manifest_path: &str) -> 
         *symbol_kind = Some(UNLOADABLE_WORKSPACE_DIAGNOSTIC_KIND.to_owned());
     }
     record
+}
+
+/// Harvests one owning-package fact per `Cargo.toml` in the working tree
+/// (issue #117).
+///
+/// The current-tree half of crate attribution: it discovers manifests through
+/// the SAME [`discover_cargo_manifests`] walk `eg scan` already uses (so the
+/// `target/`, `.git`, and nested-worktree exclusions apply identically), reads
+/// each one, and reduces it to a closed [`ManifestParseOutcome`]. The pure
+/// resolver in `crate::crate_attribution` then answers per-path from these
+/// facts alone.
+///
+/// Deliberately distinct from [`scan_dependency_records`]: that function mints
+/// a `File` node only for a manifest that DECLARES dependencies, so a
+/// dependency-free member crate produces no graph record at all — yet it still
+/// owns its directory tree. Attribution must see every manifest, not only the
+/// dependency-declaring ones.
+///
+/// Reading, not building: no `cargo` invocation, no network, no lockfile.
+///
+/// # Errors
+///
+/// Returns an error only when manifest discovery itself fails. An individual
+/// manifest that cannot be read or parsed becomes a fact carrying
+/// [`ManifestParseOutcome::Unreadable`] / [`ManifestParseOutcome::Unparseable`],
+/// never an aborted scan.
+pub fn scan_manifest_package_facts(repo_root: &Path) -> Result<Vec<ManifestPackageFact>> {
+    let mut facts = Vec::new();
+    for manifest in discover_cargo_manifests(repo_root)? {
+        let outcome = std::fs::read_to_string(&manifest.path)
+            .map_or(ManifestParseOutcome::Unreadable, |text| {
+                manifest_package_outcome(&text)
+            });
+        facts.push(ManifestPackageFact::new(
+            manifest.repo_relative_path.clone(),
+            outcome,
+        ));
+    }
+    Ok(facts)
+}
+
+/// Reduces one manifest's TEXT to its closed owning-package outcome.
+///
+/// The single shared reduction: the working-tree harvest above and the
+/// history-replay harvest (which reads manifest bytes from Git objects) both
+/// call it, so the two paths cannot disagree about what a manifest declares.
+#[must_use]
+pub fn manifest_package_outcome(manifest_text: &str) -> ManifestParseOutcome {
+    match parse_manifest_dependencies(manifest_text) {
+        Ok(parsed) => match (parsed.shape, parsed.package_name) {
+            (ManifestShape::Package, Some(name)) => ManifestParseOutcome::Package { name },
+            (ManifestShape::Package, None) => ManifestParseOutcome::UnnamedPackage,
+            (ManifestShape::VirtualRoot, _) => ManifestParseOutcome::Virtual,
+            (ManifestShape::Unusable, _) => ManifestParseOutcome::UnusableManifest,
+        },
+        // The TOML error message is deliberately DROPPED, not carried: it can
+        // echo manifest body text, and no output surface may leak it.
+        Err(_) => ManifestParseOutcome::Unparseable,
+    }
 }
 
 /// Scans every `Cargo.toml` under `repo_root` into dependency records.
@@ -2196,6 +2825,63 @@ fn member_glob_match(pattern: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Crate attribution (issue #117) needs the manifest's SHAPE, not just its
+    /// package name: `package_name` is `None` for a virtual workspace root, for
+    /// a `[package]` whose name is unusable, and for a manifest Cargo refuses to
+    /// load — three cases the attribution walk must answer differently.
+    #[test]
+    fn manifest_dependencies_reports_the_manifest_shape() {
+        let named = parse_manifest_dependencies("[package]\nname = \"x\"\n").expect("parses");
+        assert_eq!(named.shape, ManifestShape::Package);
+        assert_eq!(named.package_name.as_deref(), Some("x"));
+
+        let unusable_name =
+            parse_manifest_dependencies("[package]\nname = \"bad name\"\n").expect("parses");
+        assert_eq!(
+            unusable_name.shape,
+            ManifestShape::Package,
+            "a `[package]` table with an unusable name still declares a package"
+        );
+        assert_eq!(unusable_name.package_name, None);
+
+        let virtual_root =
+            parse_manifest_dependencies("[workspace]\nmembers = []\n").expect("parses");
+        assert_eq!(virtual_root.shape, ManifestShape::VirtualRoot);
+        assert_eq!(virtual_root.package_name, None);
+
+        // `[profile]` is accepted beside `[workspace]`.
+        let with_profile = parse_manifest_dependencies(
+            "[workspace]\nmembers = []\n\n[profile.release]\nopt-level = 3\n",
+        )
+        .expect("parses");
+        assert_eq!(with_profile.shape, ManifestShape::VirtualRoot);
+
+        // Neither table: Cargo refuses to load it.
+        let neither =
+            parse_manifest_dependencies("[dependencies]\nserde = \"1\"\n").expect("parses");
+        assert_eq!(neither.shape, ManifestShape::Unusable);
+
+        // `[workspace]` plus a package-only section: also refused. Every entry
+        // verified against real `cargo metadata`.
+        for section in [
+            "[dependencies]\nserde = \"1\"\n",
+            "[dev-dependencies]\nserde = \"1\"\n",
+            "[build-dependencies]\nserde = \"1\"\n",
+            "[features]\ndefault = []\n",
+            "[lib]\nname = \"x\"\npath = \"src/lib.rs\"\n",
+            "[badges]\nmaintenance = { status = \"active\" }\n",
+            "[lints.rust]\nunsafe_code = \"forbid\"\n",
+        ] {
+            let manifest = format!("[workspace]\nmembers = []\n\n{section}");
+            let parsed = parse_manifest_dependencies(&manifest).expect("parses");
+            assert_eq!(
+                parsed.shape,
+                ManifestShape::Unusable,
+                "a virtual manifest carrying `{section}` is rejected by Cargo"
+            );
+        }
+    }
 
     #[test]
     fn string_and_inline_table_requirements_are_captured_as_written() {

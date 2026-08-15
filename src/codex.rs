@@ -1532,6 +1532,7 @@ fn make_node(
         note: None,
         content_signature: None,
         route: None,
+        crate_attribution: None,
         temporal: None,
         semantic_drift: None,
         evidence_links: None,

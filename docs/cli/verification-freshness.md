@@ -186,7 +186,7 @@ can trigger it.
       "freshness_lead": "evidence basis moved since the record's anchor; a reason to re-verify, not proof the recorded result is now wrong",
       "anchor": { "git_commit": "c1", "executed_at": "2026-01-02T00:00:00Z" },
       "cited_handle": {
-        "target_record_id": "codegraph:v8:...",
+        "target_record_id": "codegraph:v9:...",
         "repo_relative_path": "src/a.rs",
         "span": { "start_line": 10, "end_line": 20, "start_byte": 0, "end_byte": 100 },
         "anchor_commit": "c1",

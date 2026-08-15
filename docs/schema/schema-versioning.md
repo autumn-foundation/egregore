@@ -76,6 +76,25 @@ paired incremental `CACHE_SCHEMA_VERSION` bumped 24 → 25 for the new
 `FileFacts.route_registration_sites` cached fact shape. Re-extraction from source
 regenerates every codegraph record under the current version deterministically.
 
+It was then bumped 8 → 9 by issue #117: the optional `crate_attribution` field
+on every path-bearing code-graph node (`File`, `Module`, `Symbol`, `Import`,
+`Diagnostic`, `PanicRiskSite`, `DebtMarker`, `UnsafeSite`,
+`DependencyDeclaration`, `Change`), carrying the owning Cargo package's name and the
+repo-relative path of the owning `Cargo.toml`, or a closed-set reason no package
+owns the node. The addition is `additive`: the field is
+`#[serde(default, skip_serializing_if = "Option::is_none")]`, so a legacy v8 node
+record with no `crate_attribution` key still deserializes (to `None`, meaning
+attribution UNKNOWN — never "provably unowned", which is the distinct present
+`status: unattributed` value), and it is **never an identity input**, so
+`stable_id`'s preimage is unchanged. The paired incremental
+`CACHE_SCHEMA_VERSION` bumped 25 → 26: the `SCHEMA_VERSION` bump changes every
+`codegraph:v<N>:` record-ID prefix, so a cache holding v8 IDs would replay
+records whose endpoints no longer match freshly-minted v9 ones. Attribution
+itself is deliberately NOT cached — it is recomputed on every refresh, so a
+source file byte-identical to its cached version whose owning `Cargo.toml` was
+renamed, added, or deleted is still re-attributed. Re-extraction from source
+regenerates every codegraph record under the current version deterministically.
+
 Rationale: per-domain and per-kind scoping lets #6, #11, #13, #14, and #15 land
 independently. A new project `Task` shape must not force a version bump for
 unrelated codegraph `Symbol` records in the same store. For the code-graph

@@ -20,6 +20,8 @@ pub mod claude_code;
 pub mod cli;
 /// Codex session/rollout JSONL importer (M3 agent-memory source).
 pub mod codex;
+/// Owning-Cargo-package attribution for code-graph facts (issue #117).
+pub mod crate_attribution;
 /// Acceptance-criterion verification-coverage census (issue #115).
 pub mod criteria_coverage;
 /// Local daemon for shared multi-agent store access.
@@ -351,6 +353,17 @@ fn scan_repository_at_with_override_inner(
     for record in manifest_deps::scan_dependency_records(repo_root, &repository_id)? {
         graph.push(record.with_valid_time_inferred(transaction_time));
     }
+
+    // Owning-Cargo-package attribution (issue #117): a post-extraction rewrite
+    // that stamps every path-bearing code-graph node with the package owning it,
+    // resolved from the NEAREST ENCLOSING `Cargo.toml`. It runs here because it
+    // must see EVERY `File`-producing extractor's output — per-file source
+    // extraction above and manifest extraction just now — the same ordering
+    // constraint `reconcile_scan_coverage` was placed for. Attribution is never
+    // an identity input, so no record ID moves.
+    let manifest_facts = manifest_deps::scan_manifest_package_facts(repo_root)?;
+    let attribution = crate_attribution::CrateAttributionIndex::from_facts(manifest_facts);
+    crate_attribution::apply_crate_attribution(graph.records_mut(), &attribution);
 
     // Scan-coverage reconciliation (issue #135): finalize the tally against the
     // COMPLETE set of `File` nodes the graph now carries, not source discovery

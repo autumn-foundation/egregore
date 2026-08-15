@@ -22,6 +22,7 @@ mod co_change_coupling;
 mod codex;
 mod control_catalog;
 mod corpus_flip_456;
+mod crate_attribution;
 mod criteria_coverage;
 mod cross_file_calls;
 mod cross_file_constructs;

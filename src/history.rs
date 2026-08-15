@@ -8,6 +8,7 @@ use std::{
 
 use crate::{
     PROCESS_STARTED_AT, code_graph_producer,
+    crate_attribution::{CrateAttributionIndex, ManifestPackageFact, ManifestParseOutcome},
     error::{CodegraphError, Result},
     fs::SourceFile,
     identity,
@@ -92,6 +93,10 @@ fn scan_repository_history_inner(
             .with_source_snapshot(snapshot),
     );
 
+    // Manifest-parse memo keyed by blob OID (issue #117): a `Cargo.toml` is
+    // typically unchanged across hundreds of commits, so each distinct manifest
+    // blob is read and parsed exactly once for the whole replay.
+    let mut manifest_outcome_memo: BTreeMap<String, ManifestParseOutcome> = BTreeMap::new();
     for commit in list_commits(repo_root)? {
         let commit_record = commit_record(&repository_id, &commit);
         let commit_id = commit_record.id().to_owned();
@@ -122,8 +127,19 @@ fn scan_repository_history_inner(
             );
         }
 
+        // Attribution covers this commit's `Change` records too (they carry a
+        // path), so its slice opens BEFORE them — earlier than the
+        // resolution-labeling slice below, which must see only the replayed
+        // source records.
+        let commit_attribution_start = graph.records().len();
         let mut change_ids_by_path = BTreeMap::new();
+        // Paths this commit DELETED. Their `Change` records describe the parent
+        // tree, not this one (issue #117), so they are re-attributed below.
+        let mut deleted_paths: BTreeSet<String> = BTreeSet::new();
         for change in list_changes(repo_root, &commit)? {
+            if change.status.starts_with('D') {
+                deleted_paths.insert(change.path.clone());
+            }
             let change_record = change_record(&repository_id, &commit, &change);
             let change_id = change_record.id().to_owned();
             change_ids_by_path.insert(change.path.clone(), change_id.clone());
@@ -145,12 +161,22 @@ fn scan_repository_history_inner(
         }
 
         let mut facts_by_file = BTreeMap::new();
+        // One `ls-tree` pass yields both this commit's indexed sources and its
+        // Cargo manifests (issue #117), so adding attribution costs no extra
+        // Git invocation per commit.
+        let commit_tree = list_commit_tree(repo_root, &commit.sha)?;
+        let attribution = commit_crate_attribution_index(
+            repo_root,
+            &commit.sha,
+            &commit_tree.manifests,
+            &mut manifest_outcome_memo,
+        );
         // Records pushed from here on belong to this commit's replayed tree;
         // the same-file resolution labeling pass (issue #134) must only see
         // this commit's slice because the same stable edge ID can recur across
         // commits with different in-repo definition sets.
         let commit_records_start = graph.records().len();
-        for path in list_indexed_source_files(repo_root, &commit.sha)? {
+        for path in commit_tree.sources {
             let change_id = change_ids_by_path.get(&path);
             let bytes = git_blob_bytes(repo_root, &commit.sha, &path)?;
             let Ok(source) = std::str::from_utf8(&bytes) else {
@@ -248,6 +274,83 @@ fn scan_repository_history_inner(
             &mut graph.records_mut()[commit_records_start..],
             &facts_by_file,
         );
+        // Owning-Cargo-package attribution (issue #117), scoped to THIS
+        // COMMIT'S SLICE. Slice-scoping is mandatory, for the same reason the
+        // resolution-labeling pass above is scoped: an ADR-0004 symbol ID
+        // carries no commit component, so a whole-graph pass would stamp every
+        // historical version of a record with the LAST commit's manifest tree —
+        // a fabricated fact at a pinned historical point.
+        crate::crate_attribution::apply_crate_attribution(
+            &mut graph.records_mut()[commit_attribution_start..],
+            &attribution,
+        );
+        // A DELETION's `Change` describes a path this commit no longer has, so
+        // the walk above resolved it against a tree the file is absent from. If
+        // the commit also removed the enclosing `Cargo.toml` — a whole-package
+        // removal — that walk reaches an OUTER manifest and claims the file
+        // belonged to a package it never belonged to. Re-resolve those records
+        // against the FIRST PARENT's tree, where the file last existed, so a
+        // deletion cites the package that lost it.
+        //
+        // Costs one extra `ls-tree` only for commits that delete something; the
+        // blob-OID parse memo is shared, so manifests already parsed at an
+        // earlier commit are not re-parsed. A root commit deletes nothing.
+        //
+        // A MERGE needs the reporting parent, not the mainline one: `diff-tree
+        // -m` diffs against every parent and `--no-commit-id` discards which
+        // produced each entry, so a file deleted on a side branch — one the
+        // first parent never had — would be resolved against a tree with no
+        // nested manifest and inherit an outer package. Each parent is asked
+        // separately (only for merges; a single-parent commit reports all of
+        // its deletions by definition and pays no extra call).
+        if !deleted_paths.is_empty() {
+            let mut remaining = deleted_paths.clone();
+            for parent_sha in &commit.parents {
+                if remaining.is_empty() {
+                    break;
+                }
+                // Which of the remaining deletions THIS parent reports. A
+                // single-parent commit reports all of them by definition, so it
+                // pays no extra Git call; only a merge needs asking, because
+                // `diff-tree -m` discards which parent produced each entry and
+                // a file deleted on one branch may not exist on the other at
+                // all. First parent wins an overlap, deterministically.
+                let mine: BTreeSet<String> = if commit.parents.len() == 1 {
+                    remaining.clone()
+                } else {
+                    let reported = deletions_against_parent(repo_root, parent_sha, &commit.sha)?;
+                    remaining.intersection(&reported).cloned().collect()
+                };
+                if mine.is_empty() {
+                    continue;
+                }
+                let parent_tree = list_commit_tree(repo_root, parent_sha)?;
+                let parent_attribution = commit_crate_attribution_index(
+                    repo_root,
+                    parent_sha,
+                    &parent_tree.manifests,
+                    &mut manifest_outcome_memo,
+                );
+                crate::crate_attribution::apply_crate_attribution_where(
+                    &mut graph.records_mut()[commit_attribution_start..commit_records_start],
+                    &parent_attribution,
+                    |record| {
+                        matches!(
+                            record,
+                            GraphRecord::Node {
+                                kind: NodeKind::Change,
+                                repo_relative_path: Some(path),
+                                ..
+                            } if mine.contains(path)
+                        )
+                    },
+                );
+                remaining.retain(|path| !mine.contains(path));
+            }
+            // A deletion no parent reports (only reachable if Git's `-m` output
+            // and the per-parent diffs disagree) keeps the post-commit answer
+            // rather than being resolved against an arbitrary tree.
+        }
     }
 
     let languages = crate::languages_in_graph(&graph);
@@ -343,8 +446,20 @@ fn normalize_timestamp(ts: &str) -> String {
         .map_or_else(|| ts.to_owned(), |s| format!("{s}Z"))
 }
 
+/// Lists the paths one commit changed, NUL-delimited.
+///
+/// `-z` must match [`list_commit_tree`]: the two listings are separate Git
+/// commands whose paths are joined by `CHANGED_IN` edges, so if only one reads
+/// unquoted output a path containing `"`, a tab, or a non-ASCII byte is spelled
+/// one way on the `File` node and another on the `Change` node — the file is
+/// indexed but silently orphaned from every history lane. Output is read as
+/// BYTES and decoded per token so an undecodable path is skipped, never fatal.
+///
+/// `--name-status -z` emits `status NUL path NUL`, except for rename/copy
+/// statuses (`R###` / `C###`), which emit `status NUL source NUL destination
+/// NUL`. The destination is the changed path.
 fn list_changes(repo_root: &Path, commit: &GitCommit) -> Result<Vec<GitChange>> {
-    let output = git_output(
+    let output = git_output_bytes(
         repo_root,
         &[
             "diff-tree",
@@ -352,41 +467,206 @@ fn list_changes(repo_root: &Path, commit: &GitCommit) -> Result<Vec<GitChange>> 
             "--no-commit-id",
             "--name-status",
             "-r",
+            "-z",
             "--root",
             &commit.sha,
         ],
     )?;
+    Ok(parse_name_status_z(&output))
+}
+
+/// The paths one PARENT reports as deleted by `commit` (issue #117).
+///
+/// `diff-tree -m --no-commit-id` diffs a merge against every parent and
+/// discards which one produced a given entry, so a deletion can only be
+/// attributed to the tree it actually came from by asking each parent
+/// separately. Used ONLY to route merge deletions to the right parent tree;
+/// which `Change` records exist is still decided by [`list_changes`].
+fn deletions_against_parent(
+    repo_root: &Path,
+    parent_sha: &str,
+    commit_sha: &str,
+) -> Result<BTreeSet<String>> {
+    let output = git_output_bytes(
+        repo_root,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "-z",
+            parent_sha,
+            commit_sha,
+        ],
+    )?;
+    Ok(parse_name_status_z(&output)
+        .into_iter()
+        .filter(|change| change.status.starts_with('D'))
+        .map(|change| change.path)
+        .collect())
+}
+
+/// Parses `--name-status -z` output into de-duplicated changes.
+fn parse_name_status_z(output: &[u8]) -> Vec<GitChange> {
+    let mut tokens = output
+        .split(|byte| *byte == 0)
+        .map(|raw| std::str::from_utf8(raw).ok())
+        .filter(|token| token.is_none_or(|token| !token.is_empty()));
+
     let mut seen = BTreeSet::new();
-    Ok(output
-        .lines()
-        .filter_map(parse_change_line)
-        .filter(|change| seen.insert(change.clone()))
-        .collect::<Vec<_>>())
-}
-
-fn parse_change_line(line: &str) -> Option<GitChange> {
-    let parts = line.split('\t').collect::<Vec<_>>();
-    let status = parts.first()?.trim();
-    let path = parts.last()?.trim();
-    if status.is_empty() || path.is_empty() {
-        return None;
+    let mut changes = Vec::new();
+    while let Some(status) = tokens.next() {
+        // A status token is always ASCII; an undecodable one means the stream
+        // is not where we think it is, so stop rather than mis-pair fields.
+        let Some(status) = status else { break };
+        // Rename and copy carry a source path before the destination.
+        let renamed = status.starts_with('R') || status.starts_with('C');
+        let first = tokens.next();
+        let path = if renamed { tokens.next() } else { first };
+        let Some(path) = path else { continue };
+        // An undecodable path is skipped; its status token was consumed above,
+        // so the stream stays aligned.
+        let Some(path) = path else { continue };
+        if status.is_empty() || path.is_empty() {
+            continue;
+        }
+        let change = GitChange {
+            status: status.to_owned(),
+            path: normalize_git_path(path),
+        };
+        if seen.insert(change.clone()) {
+            changes.push(change);
+        }
     }
-    Some(GitChange {
-        status: status.to_owned(),
-        path: normalize_git_path(path),
-    })
+    changes
 }
 
-fn list_indexed_source_files(repo_root: &Path, sha: &str) -> Result<Vec<String>> {
-    let output = git_output(repo_root, &["ls-tree", "-r", "--name-only", sha])?;
-    let mut files = output
-        .lines()
-        .map(str::trim)
-        .filter(|path| is_indexed_source(Path::new(path)))
-        .map(normalize_git_path)
-        .collect::<Vec<_>>();
-    files.sort();
-    Ok(files)
+/// One commit tree's indexed source files and Cargo manifests, from a SINGLE
+/// `git ls-tree` invocation (issue #117).
+#[derive(Debug, Default)]
+struct CommitTree {
+    /// Indexed source paths, sorted — the same set the pre-#117
+    /// `list_indexed_source_files` produced.
+    sources: Vec<String>,
+    /// `(repo-relative manifest path, blob OID)` for every `Cargo.toml`,
+    /// sorted by path. The OID lets the replay parse each distinct manifest
+    /// blob once instead of once per commit.
+    manifests: Vec<(String, String)>,
+}
+
+/// Lists a commit's indexed sources and Cargo manifests in one `ls-tree` pass.
+///
+/// Uses the full (non-`--name-only`) form so each entry carries its object TYPE
+/// and OID: the type filter drops submodule gitlinks — which are `commit`
+/// entries, not readable blobs — and the OID keys the manifest parse memo.
+///
+/// `-z` is load-bearing, not a style choice. Git C-quotes any path containing a
+/// non-ASCII byte, `"`, `\`, or a control character — wrapping it in literal
+/// quotes that no subsequent `git show <sha>:<path>` can resolve. (Setting
+/// `core.quotePath=false` suppresses only the NON-ASCII half, so it is not a
+/// sufficient fix.) The working-tree walk reads `git ls-files -z`, whose
+/// NUL-delimited output is never quoted, so without `-z` here a quote-bearing
+/// path is indexed by `eg scan` and silently ABSENT from `eg scan-history`.
+///
+/// Output is read as BYTES and decoded per entry: a Git path is a byte string
+/// and need not be UTF-8, so one undecodable path is skipped — mirroring the
+/// issue-#438 undecodable-blob skip — rather than aborting the whole replay.
+///
+/// Both filters prune any path with a `target` component, mirroring
+/// [`is_indexed_source`], so committed build output never contributes sources
+/// or owning packages.
+fn list_commit_tree(repo_root: &Path, sha: &str) -> Result<CommitTree> {
+    let output = git_output_bytes(repo_root, &["ls-tree", "-r", "-z", sha])?;
+    let mut tree = CommitTree::default();
+    for raw in output.split(|byte| *byte == 0) {
+        let Ok(entry) = std::str::from_utf8(raw) else {
+            // A path whose bytes are not UTF-8: skip this entry, keep replaying.
+            continue;
+        };
+        // `<mode> SP <type> SP <object> TAB <path>`
+        let Some((meta, path)) = entry.split_once('\t') else {
+            continue;
+        };
+        let mut fields = meta.split_whitespace();
+        let (Some(mode), Some(object_type), Some(oid)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if object_type != "blob" {
+            // A `commit` entry is a submodule gitlink: its content belongs to a
+            // different repository and cannot be read from this one.
+            continue;
+        }
+        // A symlink IS a blob (mode 120000) whose content is the link target,
+        // not the file's. Reading one as manifest text would parse
+        // `../real/Cargo.toml` as TOML and report `unparseable_manifest` about a
+        // manifest that is perfectly valid. The working-tree walk excludes
+        // symlinks through `symlink_metadata(..).is_file()`; match it, so both
+        // discovery paths agree that a symlinked manifest is invisible.
+        if mode == "120000" {
+            continue;
+        }
+        // Only the metadata prefix is split off; the path is taken verbatim,
+        // since a NUL-delimited entry carries no trailing newline and a path
+        // may legitimately begin or end with whitespace.
+        let path = normalize_git_path(path);
+        let as_path = Path::new(path.as_str());
+        if is_indexed_source(as_path) {
+            tree.sources.push(path);
+            continue;
+        }
+        if is_cargo_manifest_path(as_path) {
+            tree.manifests.push((path, oid.to_owned()));
+        }
+    }
+    tree.sources.sort();
+    tree.manifests.sort();
+    Ok(tree)
+}
+
+/// Matches the working-tree scanner's manifest set (`fs::discover_cargo_manifests`):
+/// the basename must be exactly `Cargo.toml` (case-sensitive), and the path must
+/// not sit under a `target/` build directory.
+fn is_cargo_manifest_path(path: &Path) -> bool {
+    path.file_name().and_then(std::ffi::OsStr::to_str) == Some("Cargo.toml")
+        && !path.components().any(|c| c.as_os_str() == "target")
+}
+
+/// Builds the crate-attribution index for one commit's tree (issue #117).
+///
+/// Reads each manifest blob through the same read-only `git show` plumbing the
+/// source replay uses, and reduces it with `manifest_deps::manifest_package_outcome`
+/// — the SAME reduction the working-tree harvest calls, so the two paths cannot
+/// disagree about what a manifest declares.
+///
+/// `memo` caches the reduction by blob OID across the whole replay: a manifest
+/// is typically unchanged for hundreds of commits, so this parses each distinct
+/// manifest blob exactly once.
+///
+/// A blob that cannot be read or decoded becomes an `Unreadable` fact, never an
+/// aborted replay — mirroring the non-UTF-8 source skip (issue #438).
+fn commit_crate_attribution_index(
+    repo_root: &Path,
+    sha: &str,
+    manifests: &[(String, String)],
+    memo: &mut BTreeMap<String, ManifestParseOutcome>,
+) -> CrateAttributionIndex {
+    let mut facts = Vec::with_capacity(manifests.len());
+    for (path, oid) in manifests {
+        let outcome = memo.get(oid).cloned().unwrap_or_else(|| {
+            let outcome = git_blob_bytes(repo_root, sha, path)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .map_or(ManifestParseOutcome::Unreadable, |text| {
+                    crate::manifest_deps::manifest_package_outcome(&text)
+                });
+            memo.insert(oid.clone(), outcome.clone());
+            outcome
+        });
+        facts.push(ManifestPackageFact::new(path.clone(), outcome));
+    }
+    CrateAttributionIndex::from_facts(facts)
 }
 
 /// Matches the live scanner's source set (`fs::discover_source_files`) so the history
