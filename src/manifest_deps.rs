@@ -860,34 +860,58 @@ fn dependency_table_is_well_typed(
     spec: &dyn toml_edit::TableLike,
     context: DependencyTableContext,
 ) -> bool {
-    // Cross-field source rules Cargo enforces (each verified against
-    // `cargo metadata`, PR #314 review): `path` and `git` are mutually
-    // exclusive, `git` and `registry` are mutually exclusive, and
-    // `branch`/`tag`/`rev` require `git` with at most one of the three.
-    // `registry` beside `version` or `path` is manifest-valid — Cargo only
-    // checks registry *configuration* later — and stays accepted.
     let has = |key: &str| spec.get(key).is_some();
-    let git_refs = ["branch", "tag", "rev"]
-        .iter()
-        .filter(|key| has(key))
-        .count();
-    // `registry-index` is a REGISTRY source, so it conflicts like one: Cargo
-    // rejects it beside `git` ("Only one of `git` or `registry` is allowed") and
-    // beside `registry` ("Only one of `registry` or `registry-index`"). It is
-    // NOT a conflict beside `version` or `path`, both of which Cargo accepts —
-    // the same asymmetry `registry` already has above, and rejecting them would
-    // un-attribute a real crate.
-    let registry_sources = ["registry", "registry-index"]
-        .iter()
-        .filter(|key| has(key))
-        .count();
-    if (has("path") && has("git"))
-        || (has("git") && registry_sources > 0)
-        || registry_sources > 1
-        || (git_refs > 0 && !has("git"))
-        || git_refs > 1
-    {
-        return false;
+    // CROSS-FIELD rules are MEMBER-context rules. Cargo validates a
+    // `[workspace.dependencies]` template LAZILY, at inheritance time: an unused
+    // template holding `{ path, git }` loads fine, and "specification is
+    // ambiguous" fires only once a member writes `{ workspace = true }`. So none
+    // of these applies to a template — the same boundary
+    // `a_malformed_workspace_dependency_stops_the_walk` already draws, since
+    // applying member rules to a template un-attributes real workspaces.
+    //
+    // Residual, unavoidable per-manifest: a conflicting template that IS
+    // inherited breaks the workspace, and seeing that needs the member manifests
+    // this resolver never reads.
+    if matches!(context, DependencyTableContext::Member { .. }) {
+        // Source rules (each verified against `cargo metadata`, PR #314 review):
+        // `path` and `git` are mutually exclusive, `git` and `registry` are
+        // mutually exclusive, and `branch`/`tag`/`rev` require `git` with at most
+        // one of the three. `registry` beside `version` or `path` is
+        // manifest-valid — Cargo only checks registry *configuration* later —
+        // and stays accepted.
+        let git_refs = ["branch", "tag", "rev"]
+            .iter()
+            .filter(|key| has(key))
+            .count();
+        // `registry-index` is a REGISTRY source, so it conflicts like one: Cargo
+        // rejects it beside `git` ("Only one of `git` or `registry` is allowed")
+        // and beside `registry` ("Only one of `registry` or `registry-index`").
+        // It is NOT a conflict beside `version` or `path`, both of which Cargo
+        // accepts — the same asymmetry `registry` already has, and rejecting
+        // them would un-attribute a real crate.
+        let registry_sources = ["registry", "registry-index"]
+            .iter()
+            .filter(|key| has(key))
+            .count();
+        // COMPANION-key rules, the same shape as the git-ref rule above: a
+        // specifier that cannot appear without the key it qualifies. Verified on
+        // cargo 1.94.1 — "'target'/'lib' specifier cannot be used without an
+        // 'artifact = …' value" and "`base` can only be used with path
+        // dependencies". These are STRUCTURAL, not feature gates: with the
+        // companion present only the `-Z bindeps` / path-bases gate remains, and
+        // a gate is deliberately not modelled. `lib` is PRESENCE-based, so
+        // `lib = false` is rejected too.
+        let artifact_companions = has("target") || has("lib");
+        if (has("path") && has("git"))
+            || (has("git") && registry_sources > 0)
+            || registry_sources > 1
+            || (git_refs > 0 && !has("git"))
+            || git_refs > 1
+            || (artifact_companions && !has("artifact"))
+            || (has("base") && !has("path"))
+        {
+            return false;
+        }
     }
     // `registry-index`, `base`, `target`, `public`, `lib`, and `artifact` below
     // are the rest of the type-checked spec keys, found by probing the whole

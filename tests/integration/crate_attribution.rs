@@ -7334,10 +7334,17 @@ fn dependency_spec_known_fields_are_type_checked() {
             "artifact = [\"bin\"]",
             "inner@nested/Cargo.toml",
         ),
-        ("lib bool", "lib = true", "inner@nested/Cargo.toml"),
+        // `lib`/`target` need their `artifact` companion and `base` needs
+        // `path`, so a well-typed value is shown WITH it — those cross-field
+        // rules are `cross_field_dependency_rules_apply_only_to_member_tables`.
+        (
+            "lib bool",
+            "artifact = \"bin\", lib = true",
+            "inner@nested/Cargo.toml",
+        ),
         (
             "target string",
-            "target = \"x86_64-unknown-linux-gnu\"",
+            "artifact = \"bin\", target = \"x86_64-unknown-linux-gnu\"",
             "inner@nested/Cargo.toml",
         ),
         ("public bool", "public = true", "inner@nested/Cargo.toml"),
@@ -7346,7 +7353,11 @@ fn dependency_spec_known_fields_are_type_checked() {
             "registry-index = \"https://example.invalid\"",
             "inner@nested/Cargo.toml",
         ),
-        ("base string", "base = \"b\"", "inner@nested/Cargo.toml"),
+        (
+            "base string",
+            "path = \"../elsewhere\", base = \"b\"",
+            "inner@nested/Cargo.toml",
+        ),
     ] {
         let temp = tempfile::tempdir().expect("temp dir");
         write_fixture(
@@ -7513,6 +7524,186 @@ fn underscore_dependency_table_aliases_are_validated() {
             by_path.get("nested/src/lib.rs"),
             Some(&BTreeSet::from([expected.to_owned()])),
             "`{label}`: {by_path:?}"
+        );
+    }
+}
+
+/// Cross-field dependency rules are MEMBER-context rules.
+///
+/// Two halves, both verified against real `cargo metadata` on cargo 1.94.1.
+///
+/// **In a member table** three companion-key constraints were missing.
+/// `target` and `lib` cannot appear without `artifact`, and `base` cannot appear
+/// without `path` — the same shape as the `branch`/`tag`/`rev`-require-`git`
+/// rule already enforced:
+///
+/// | spec | Cargo |
+/// |---|---|
+/// | `version, target = "x"` | "'target' specifier cannot be used without an 'artifact = …' value" |
+/// | `version, lib = true` | "'lib' specifier cannot be used without an 'artifact = …' value" |
+/// | `version, lib = false` | same — the rule is PRESENCE-based, not value-based |
+/// | `version, base = "b"` | "`base` can only be used with path dependencies" |
+/// | `version, artifact, target` | only the `-Z bindeps` gate remains — structurally fine |
+///
+/// I had this evidence in hand when `target`/`lib` were first typed and filed it
+/// under the feature gate: the probe bucketed every non-type error as "gated",
+/// and "cannot be used without" is a structural rule, not a gate. `base` is the
+/// third one, which the report did not name.
+///
+/// **In a `[workspace.dependencies]` template** none of them applies — and
+/// neither does any of the source-conflict rules already enforced. Cargo
+/// validates a template LAZILY, at inheritance time: an unused template holding
+/// `{ path, git }` loads fine, and the "specification is ambiguous" error fires
+/// only once a member writes `{ workspace = true }`. So the whole cross-field
+/// block belongs behind the member gate, matching the boundary
+/// `a_malformed_workspace_dependency_stops_the_walk` already establishes —
+/// applying member rules to a template un-attributes real workspaces.
+///
+/// The residual is a false ACCEPT that no per-manifest resolver can avoid: a
+/// conflicting template that IS inherited breaks the workspace, and seeing that
+/// needs the member manifests this resolver never reads.
+#[test]
+fn cross_field_dependency_rules_apply_only_to_member_tables() {
+    // Member tables: the companion-key rules bite.
+    for (label, spec_tail, expected) in [
+        (
+            "target without artifact",
+            "version = \"1\", target = \"x86_64-unknown-linux-gnu\"",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "lib true without artifact",
+            "version = \"1\", lib = true",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "lib false without artifact",
+            "version = \"1\", lib = false",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "base without path",
+            "version = \"1\", base = \"b\"",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "target with artifact",
+            "version = \"1\", artifact = \"bin\", target = \"x86_64-unknown-linux-gnu\"",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "lib with artifact",
+            "version = \"1\", artifact = \"bin\", lib = true",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "base with path",
+            "path = \"../elsewhere\", base = \"b\"",
+            "inner@nested/Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!(
+                        "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n\n\
+                         [dependencies]\nfoo = {{ {spec_tail} }}\n"
+                    ),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "member `{label}`: {by_path:?}"
+        );
+    }
+}
+
+/// ...and NONE of them applies to a `[workspace.dependencies]` template.
+///
+/// The other half of `cross_field_dependency_rules_apply_only_to_member_tables`.
+/// Cargo validates a template LAZILY, at inheritance time: an unused template
+/// holding `{ path, git }` loads fine, and "specification is ambiguous" fires
+/// only once a member writes `{ workspace = true }`. Verified in both
+/// directions on cargo 1.94.1 — including the source-conflict rules that were
+/// already enforced here and should not have been.
+///
+/// This is the fail-open direction, so it is worth being explicit: a virtual
+/// root is WALKED PAST, and calling a loadable one `Unusable` stops the walk and
+/// un-attributes the subtree instead. Same boundary
+/// `a_malformed_workspace_dependency_stops_the_walk` draws.
+#[test]
+fn cross_field_dependency_rules_never_apply_to_workspace_templates() {
+    // Cargo accepts every one of these, so the virtual root stays loadable and
+    // the walk must reach the OUTER package.
+    for (label, entry) in [
+        (
+            "path + git",
+            "foo = { path = \"m\", git = \"https://example.invalid/x\" }",
+        ),
+        (
+            "git + registry",
+            "foo = { git = \"https://example.invalid/x\", registry = \"r\" }",
+        ),
+        (
+            "git + registry-index",
+            "foo = { git = \"https://example.invalid/x\", registry-index = \"https://example.invalid/i\" }",
+        ),
+        (
+            "registry + registry-index",
+            "foo = { version = \"1\", registry = \"r\", registry-index = \"https://example.invalid/i\" }",
+        ),
+        (
+            "branch without git",
+            "foo = { version = \"1\", branch = \"b\" }",
+        ),
+        (
+            "two git refs",
+            "foo = { git = \"https://example.invalid/x\", branch = \"b\", tag = \"t\" }",
+        ),
+        (
+            "target without artifact",
+            "foo = { version = \"1\", target = \"x\" }",
+        ),
+        (
+            "lib without artifact",
+            "foo = { version = \"1\", lib = true }",
+        ),
+        (
+            "base without path",
+            "foo = { version = \"1\", base = \"b\" }",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "nested/Cargo.toml",
+                    &format!("[workspace]\nmembers = []\n\n[workspace.dependencies]\n{entry}\n"),
+                ),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from(["outer@Cargo.toml".to_owned()])),
+            "template `{label}`: {by_path:?}"
         );
     }
 }

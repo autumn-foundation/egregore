@@ -222,6 +222,26 @@ allowed") and beside `registry` ("Only one of `registry` or `registry-index`").
 It is *not* a conflict beside `version` or `path`, both of which Cargo accepts —
 the same asymmetry `registry` already has.
 
+Three **companion-key** rules have the same shape as the
+`branch`/`tag`/`rev`-require-`git` rule: `target` and `lib` cannot appear
+without `artifact` ("'target' specifier cannot be used without an `artifact = …`
+value"), and `base` cannot appear without `path` ("`base` can only be used with
+path dependencies"). These are *structural*, not feature gates — with the
+companion present only the `-Z bindeps` / path-bases gate remains, and gates are
+deliberately not modelled. `lib` is presence-based, so `lib = false` is rejected
+too.
+
+Every cross-field rule — the source conflicts and the companion keys alike — is
+a **member-table** rule. Cargo validates a `[workspace.dependencies]` template
+*lazily*, at inheritance time: an unused template holding `{ path, git }` loads
+fine, and "specification is ambiguous" fires only once a member writes
+`{ workspace = true }`. Applying member rules to a template would call a
+loadable virtual root unusable and stop the walk, un-attributing the subtree —
+the same boundary the rest of the template contract draws. The residual is a
+false *accept* no per-manifest resolver can avoid: a conflicting template that
+**is** inherited breaks the workspace, and seeing that needs the member
+manifests this resolver never reads.
+
 Cargo's **underscore table aliases** `[dev_dependencies]` and
 `[build_dependencies]` are validated as well, at the top level and inside
 `[target.<spec>]`: Cargo really reads them, so a malformed spec in one makes the
