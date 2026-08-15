@@ -192,6 +192,17 @@ strings, "expected a sequence" otherwise) and which applies to **both** manifest
 shapes — a virtual root carrying a malformed one is equally unloadable and stops
 the walk rather than being passed over.
 
+`cargo-features` is also checked for **placement**, which is a distinct failure
+from a wrong type. Cargo rejects it inside `[package]` — "the field
+`cargo-features` should be set at the top of Cargo.toml before any tables" — for
+*any* value, so `cargo-features = 1` there fails on placement and never reports
+`invalid type`. The rule is specific to `[package]`, verified in the accepting
+direction as well: at the document root it is correct, and inside `[workspace]`
+Cargo tolerates it as an unknown key, so a virtual root carrying one stays
+walkable. Probing the other top-level names nested under `[package]` — `patch`,
+`profile`, `features`, `lints`, `badges`, `replace`, `dependencies`, `target`,
+`bin` — finds every one tolerated, so this is a one-member class.
+
 A `[workspace]` table is validated **wherever it appears**, not only on a
 virtual root: a manifest carrying both `[package]` and `[workspace]` (a root
 crate that is also the workspace root) is unloadable if either table is

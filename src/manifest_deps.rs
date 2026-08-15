@@ -734,6 +734,20 @@ pub fn parse_manifest_dependencies(
         item.as_array()
             .is_some_and(|values| values.iter().all(toml_edit::Value::is_str))
     });
+    // MISPLACED, which is a different failure from wrong-typed: Cargo rejects
+    // `cargo-features` inside `[package]` with "should be set at the top of
+    // Cargo.toml before any tables", for ANY value — so `cargo-features = 1`
+    // there fails on placement, never on type, and the root check above never
+    // sees it.
+    //
+    // Specific to `[package]`, verified in the accepting direction too:
+    // `[workspace]` has no such field, so Cargo tolerates it as an unknown key
+    // and a virtual root carrying one must stay walkable. Probing the other
+    // top-level names nested under `[package]` — `patch`, `profile`, `features`,
+    // `lints`, `badges`, `replace`, `dependencies`, `target`, `bin` — finds every
+    // one tolerated, so this is a one-member class.
+    let cargo_features_misplaced =
+        package_table.is_some_and(|package| package.get("cargo-features").is_some());
     let package_name = package_table
         .and_then(|package| package.get("name"))
         .and_then(|name| name.as_str())
@@ -784,7 +798,7 @@ pub fn parse_manifest_dependencies(
         item.as_table_like()
             .is_some_and(workspace_table_is_well_typed)
     });
-    let shape = if !cargo_features_well_typed || !workspace_well_typed {
+    let shape = if !cargo_features_well_typed || cargo_features_misplaced || !workspace_well_typed {
         ManifestShape::Unusable
     } else if package_table.is_some() {
         // `uninterpretable` is set by `declared_dependency` for exactly the

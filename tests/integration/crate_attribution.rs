@@ -7707,3 +7707,95 @@ fn cross_field_dependency_rules_never_apply_to_workspace_templates() {
         );
     }
 }
+
+/// `cargo-features` inside `[package]` makes the manifest unloadable.
+///
+/// The existing check reads `cargo-features` only at the document root, and the
+/// package-field table tolerates unknown keys, so a manifest that puts it inside
+/// `[package]` passed both and was classified `Package` — attributing the
+/// subtree to a package Cargo cannot load.
+///
+/// Cargo 1.94.1 rejects it with "the field `cargo-features` should be set at the
+/// top of Cargo.toml before any tables", and does so for ANY value, so this is a
+/// PLACEMENT rule rather than a type rule — `cargo-features = 1` under
+/// `[package]` fails with the same message, never `invalid type`.
+///
+/// Two boundaries verified in the accepting direction, because both could
+/// otherwise turn into a false rejection:
+///
+/// - the same key at the document ROOT is correct and stays accepted;
+/// - inside `[workspace]` Cargo ACCEPTS it (that table has no such field, so it
+///   is merely an unknown key) — the rule is specific to `[package]`.
+///
+/// Probing the other top-level names nested under `[package]` — `patch`,
+/// `profile`, `features`, `lints`, `badges`, `replace`, `dependencies`,
+/// `target`, `bin` — finds every one TOLERATED, so `cargo-features` is the only
+/// member of this class.
+#[test]
+fn cargo_features_inside_the_package_table_is_unusable() {
+    for (label, manifest, expected) in [
+        (
+            "array under [package]",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\ncargo-features = [\"metabuild\"]\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "non-array under [package] is the same placement error",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\ncargo-features = 1\n",
+            "unattributed:unusable_manifest",
+        ),
+        (
+            "at the document root is correct",
+            "cargo-features = [\"metabuild\"]\n\n[package]\nname = \"inner\"\nversion = \"0.1.0\"\n",
+            "inner@nested/Cargo.toml",
+        ),
+        (
+            "an unknown top-level name under [package] stays tolerated",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nbadges = {}\n",
+            "inner@nested/Cargo.toml",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fixture(
+            temp.path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+                ),
+                ("nested/Cargo.toml", manifest),
+                ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+            ],
+        );
+        let by_path = attribution_by_path(&scan_fixture(temp.path()));
+        assert_eq!(
+            by_path.get("nested/src/lib.rs"),
+            Some(&BTreeSet::from([expected.to_owned()])),
+            "`{label}`: {by_path:?}"
+        );
+    }
+
+    // `[workspace]` has no `cargo-features` field, so Cargo tolerates it there.
+    // A virtual root must stay loadable and be WALKED PAST to the outer package.
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(
+        temp.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "nested/Cargo.toml",
+                "[workspace]\nmembers = []\ncargo-features = [\"metabuild\"]\n",
+            ),
+            ("nested/src/lib.rs", "pub fn nested() -> u32 { 1 }\n"),
+        ],
+    );
+    let by_path = attribution_by_path(&scan_fixture(temp.path()));
+    assert_eq!(
+        by_path.get("nested/src/lib.rs"),
+        Some(&BTreeSet::from(["outer@Cargo.toml".to_owned()])),
+        "inside [workspace] Cargo accepts it: {by_path:?}"
+    );
+}
