@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Evidence-backed agent observation recorded into the agent_memory domain (issue #183).",
+  "properties": {
+    "ok": {
+      "const": true
+    },
+    "record_id": {
+      "description": "Stable content-addressed ID of the new Observation node (agent_memory domain); the citable evidence handle.",
+      "type": "string"
+    },
+    "records_written": {
+      "description": "Records the daemon accepted in the write batch (Agent, AgentSession, Observation nodes plus SESSION_OF and AUTHORED_BY edges).",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "ok",
+    "record_id"
+  ],
+  "title": "Egregore MCP tool response: record_observation",
+  "type": "object"
+}

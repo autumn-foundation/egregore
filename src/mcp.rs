@@ -1,8 +1,8 @@
-//! MCP server for Egregore read-only tools — issue #53.
+//! MCP server for Egregore tools — issue #53.
 //!
 //! Implements the Model Context Protocol using the [`rmcp`] crate and exposes
 //! five read-only tools backed by the existing daemon query, symbol-context,
-//! task-evidence, and failure-history contracts:
+//! task-evidence, and failure-history contracts, plus one write tool:
 //!
 //! - **`inspect_store`** — store-inspection summary (record counts, domain breakdown).
 //! - **`symbol_context`** — evidence-backed symbol context, trust-separated by domain.
@@ -11,14 +11,20 @@
 //! - **`failure_history`** — prior failed attempts for a symbol, file, or task
 //!   handle, trust-separated into runtime failures, agent failures, and
 //!   superseding successes (issue #188).
+//! - **`record_observation`** — records an evidence-backed agent observation
+//!   into the `agent_memory` domain (issue #183). The first write tool on this
+//!   transport: it enforces the same provenance contract as
+//!   `eg write observation` (session id, body, confidence, at least one
+//!   evidence target with its domain), stamps an MCP-origin producer envelope,
+//!   and can never write into the deterministic `codegraph` domain.
 //!
 //! All tool responses carry machine-readable structured output with record IDs and
-//! citation handles. Successful responses additionally carry a `freshness`
+//! citation handles. Successful *read* responses additionally carry a `freshness`
 //! object (issue #220): the store-freshness verdict from the #186 contract
 //! (`fresh` / `stale_head` / `stale_dirty` / `unknown`), the stored
 //! source-snapshot identity the answer was derived from, and the working-tree
-//! state it was compared against — a trust signal, never suppression. No write
-//! tools ship in this slice.
+//! state it was compared against — a trust signal, never suppression. The
+//! write tool's success response carries the new `record_id` instead.
 //!
 //! ## Transport
 //!
@@ -59,8 +65,14 @@ use serde_json::{Value, json};
 
 use crate::{
     GraphRecord, NodeKind,
+    adapters::DanglingCitationPolicy,
     daemon::DaemonClient,
-    ir::EdgeLabel,
+    evidence::{
+        EvidenceProvenance, ObservationRequest, ProvenanceError,
+        build_observation_records_with_producer, mcp_observation_producer, now_rfc3339,
+        validate_observation_request,
+    },
+    ir::{EdgeLabel, EvidenceLink},
     mcp_contract::MCP_CONTRACT_VERSION,
     query,
     schema_version::{UnknownSchemaVersion, record_version, validate_record_version},
@@ -136,9 +148,57 @@ pub struct FailureHistoryArgs {
     pub repo_path: Option<String>,
 }
 
+/// One evidence target cited by a `record_observation` call.
+///
+/// Mirrors the CLI's `--evidence-target` / `--evidence-domain` pair
+/// (`eg write observation`): only `codegraph` (cited via `OBSERVES`) and
+/// `verification` (cited via `VALIDATED_BY`) targets are accepted — the same
+/// restriction the CLI enforces, because the daemon rejects any other
+/// relation/domain combination.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RecordObservationEvidenceTarget {
+    /// Stable record ID of the cited graph record (must be non-empty).
+    pub target_record_id: Option<String>,
+    /// Domain of the cited record: `codegraph` or `verification`
+    /// (must be non-empty).
+    pub target_domain: Option<String>,
+}
+
+/// Parameters for the `record_observation` write tool (issue #183).
+///
+/// Every required provenance field is `Option`-typed so that an *absent* field
+/// and an *empty* field are rejected identically with the structured
+/// `{"ok": false, "error": ...}` envelope — the tool never writes a partial
+/// or unprovenanced record. Fields the CLI defaults (`agent_kind`,
+/// `observed_at`) stay optional here too and default the same way.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RecordObservationArgs {
+    /// Stable agent identity; required, must be non-empty.
+    pub agent_id: Option<String>,
+    /// Agent kind from the published enum (`other`, `claude-code`,
+    /// `vantage`, `codex`, `rust-swe-agent`, `human`); defaults to `other`.
+    pub agent_kind: Option<String>,
+    /// Active session identifier; required, must be non-empty.
+    pub session_id: Option<String>,
+    /// RFC 3339 observation timestamp; defaults to now when absent.
+    pub observed_at: Option<String>,
+    /// Citable source artifact path or hash; required, must be non-empty.
+    pub source_handle: Option<String>,
+    /// Observation body text; required, must be non-empty.
+    pub text: Option<String>,
+    /// Extraction confidence in `[0.0, 1.0]`; required.
+    pub confidence: Option<f64>,
+    /// Evidence targets anchoring the claim; at least one is required, each
+    /// with a non-empty record ID and a `codegraph`/`verification` domain.
+    pub evidence: Option<Vec<RecordObservationEvidenceTarget>>,
+    /// `AletheiaDB` data directory (default: `.egregore`).
+    pub data_dir: Option<String>,
+}
+
 // ── MCP server ────────────────────────────────────────────────────────────────
 
-/// MCP server that exposes the four Egregore read-only evidence-query tools.
+/// MCP server that exposes the Egregore evidence-query tools plus the
+/// `record_observation` write tool (issue #183).
 ///
 /// Created by [`run_stdio`] or constructed directly for testing via
 /// [`EgregoreMcpServer::new`].
@@ -355,6 +415,110 @@ impl EgregoreMcpServer {
         stamp_freshness_on_payload(&mut payload, &records, &repo_path, Some(&data_dir));
         serde_json::to_string(&payload).unwrap_or_default()
     }
+
+    /// Records an evidence-backed agent observation into the `agent_memory`
+    /// domain of the store named by `data_dir` (issue #183).
+    ///
+    /// This is the first write tool on the MCP transport, closing the agent
+    /// learning loop (query → learn → persist with provenance) without leaving
+    /// the transport. It enforces the same provenance contract as
+    /// `eg write observation`: `agent_id`, `session_id`, `text`, `confidence`
+    /// in `[0.0, 1.0]`, `source_handle`, and at least one evidence target with
+    /// a `codegraph`/`verification` domain. Any missing or invalid field — or
+    /// zero evidence targets — is rejected with the structured
+    /// `{"ok": false, "error": ...}` envelope and nothing is written.
+    ///
+    /// The persisted records carry an MCP-origin producer envelope
+    /// (`producer_kind: observation_writer`, `producer_components.transport:
+    /// "mcp"`), distinct from CLI-originated writes. The write is ingested
+    /// under the `agent_memory` domain only — the tool has no domain parameter
+    /// and the daemon validates record IDs against the ingest domain, so
+    /// agent-authored observations can never land in the deterministic
+    /// `codegraph` domain. A dangling evidence target rejects the whole batch
+    /// atomically (`RejectBatch`): no partial record is ever persisted.
+    /// Requires a running local daemon.
+    #[tool(description = "Records an evidence-backed agent observation into \
+            the agent_memory domain of the Egregore store. Required: \
+            agent_id, session_id, text (observation body), confidence in \
+            [0.0, 1.0], source_handle (citable source artifact path or hash), \
+            and at least one evidence target, each with a target_record_id \
+            and a target_domain of codegraph (cited via OBSERVES) or \
+            verification (cited via VALIDATED_BY). Optional: agent_kind \
+            (defaults to other), observed_at in RFC 3339 (defaults to now). \
+            A call missing any required field or citing zero evidence targets \
+            is rejected with a structured ok:false error and writes nothing. \
+            The write can never target the deterministic codegraph domain, \
+            and a dangling evidence target rejects the whole batch \
+            atomically. On success the response carries the new record_id — \
+            the citable handle for the observation. Requires a running local \
+            daemon.")]
+    #[must_use]
+    pub fn record_observation(
+        &self,
+        Parameters(args): Parameters<RecordObservationArgs>,
+    ) -> String {
+        let req = match record_observation_request_from_args(&args) {
+            Ok(req) => req,
+            Err(error) => {
+                return serde_json::to_string(&provenance_error_payload(&error))
+                    .unwrap_or_default();
+            }
+        };
+        let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let client = match DaemonClient::from_data_dir(&data_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        // The builder re-validates every provenance field: the CLI and the
+        // MCP tool share one enforcement point, so the contract cannot drift.
+        let outcome = match build_observation_records_with_producer(
+            &req,
+            &mcp_observation_producer(&req.provenance.observed_at),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return serde_json::to_string(&provenance_error_payload(&error))
+                    .unwrap_or_default();
+            }
+        };
+        // The observation's content-addressed record ID is the idempotency
+        // key: an identical retry replays the daemon's cached response
+        // instead of duplicating records.
+        let idempotency_key = outcome.record_id.clone();
+        // The ingest domain is hardcoded to `agent_memory` inside
+        // `ingest_agent_memory_records` — the tool has no domain parameter,
+        // so observations can never land in the deterministic `codegraph`
+        // domain.
+        match client.ingest_agent_memory_records(
+            &outcome.records,
+            &req.provenance.agent_id,
+            &req.provenance.session_id,
+            &idempotency_key,
+            DanglingCitationPolicy::RejectBatch,
+        ) {
+            Ok(response) if response.failed == 0 => {
+                let payload = json!({
+                    "ok": true,
+                    "record_id": outcome.record_id,
+                    "records_written": response.succeeded,
+                });
+                serde_json::to_string(&payload).unwrap_or_default()
+            }
+            Ok(response) => {
+                let detail = response
+                    .failures
+                    .first()
+                    .map(|failure| failure.message.clone())
+                    .unwrap_or_default();
+                serde_json::to_string(&write_rejected_error(&detail)).unwrap_or_default()
+            }
+            Err(error) => {
+                serde_json::to_string(&write_failed_error(&error.to_string())).unwrap_or_default()
+            }
+        }
+    }
 }
 
 #[tool_handler]
@@ -363,7 +527,12 @@ impl ServerHandler for EgregoreMcpServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("egregore", env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
-                "Read-only Egregore knowledge graph tools. \
+                "Egregore knowledge graph tools: five read-only evidence-query \
+                tools plus `record_observation`, which records an \
+                evidence-backed agent observation into the `agent_memory` \
+                domain (it enforces the same provenance contract as \
+                `eg write observation` and can never write into the \
+                deterministic codegraph domain). \
                 Connect to a running local daemon (`eg daemon`) to query the \
                 code-graph, agent observations, and task evidence. \
                 All tools return structured JSON with `ok`, `error`, and \
@@ -1408,6 +1577,153 @@ fn daemon_error(msg: &str) -> Value {
     json!({
         "ok": false,
         "error": { "code": code, "message": msg }
+    })
+}
+
+/// Builds the [`ObservationRequest`] for the `record_observation` tool.
+///
+/// Pure: performs no I/O and contacts no daemon. An absent or empty required
+/// field is a [`ProvenanceError::missing`]; a target domain outside
+/// `codegraph`/`verification` is [`ProvenanceError::invalid`] (mirroring the
+/// CLI's `--evidence-domain` pre-check in `eg write observation`). The built
+/// request then validates through [`validate_observation_request`] — the same
+/// function the record builder uses — so malformed timestamps, unknown agent
+/// kinds, out-of-range confidence, and inconsistent evidence links are
+/// rejected here, before any daemon contact. The CLI and the MCP tool share
+/// one provenance contract, enforced by one function, so the two transports
+/// cannot drift apart.
+///
+/// The evidence relation is derived from the target domain exactly as the CLI
+/// derives it: `codegraph` → `OBSERVES`, `verification` → `VALIDATED_BY`.
+/// Each link carries the observation's confidence, also matching the CLI.
+///
+/// # Errors
+///
+/// Returns a [`ProvenanceError`] naming the first missing or invalid field:
+/// an absent or empty required field is `missing`, a target domain outside
+/// `codegraph`/`verification` is `invalid`, and anything the shared
+/// [`validate_observation_request`] contract rejects (malformed
+/// `observed_at`, unknown `agent_kind`, out-of-range confidence, inconsistent
+/// evidence links) is returned unchanged.
+pub fn record_observation_request_from_args(
+    args: &RecordObservationArgs,
+) -> Result<ObservationRequest, ProvenanceError> {
+    fn required(field: &str, value: Option<&str>) -> Result<String, ProvenanceError> {
+        match value {
+            Some(text) if !text.is_empty() => Ok(text.to_owned()),
+            _ => Err(ProvenanceError::missing(field)),
+        }
+    }
+    let confidence = args
+        .confidence
+        .ok_or_else(|| ProvenanceError::missing("confidence"))?;
+    let targets = args.evidence.as_deref().unwrap_or_default();
+    if targets.is_empty() {
+        return Err(ProvenanceError::missing("evidence"));
+    }
+    let evidence_links = targets
+        .iter()
+        .map(|target| record_observation_evidence_link(target, confidence))
+        .collect::<Result<Vec<_>, _>>()?;
+    let req = ObservationRequest {
+        provenance: EvidenceProvenance {
+            agent_id: required("agent_id", args.agent_id.as_deref())?,
+            agent_kind: args.agent_kind.clone().unwrap_or_default(),
+            session_id: required("session_id", args.session_id.as_deref())?,
+            observed_at: args.observed_at.clone().unwrap_or_else(now_rfc3339),
+            source_handle: Some(required("source_handle", args.source_handle.as_deref())?),
+        },
+        text: required("text", args.text.as_deref())?,
+        confidence,
+        evidence_links,
+        supersession: None,
+    };
+    // One shared provenance contract: the CLI's record builder validates
+    // through this same function.
+    validate_observation_request(&req)?;
+    Ok(req)
+}
+
+/// Builds one [`EvidenceLink`] for a `record_observation` evidence target.
+///
+/// Only `codegraph` and `verification` domains are accepted — the CLI rejects
+/// anything else before building, because the daemon rejects `OBSERVES` on
+/// non-codegraph targets and `VALIDATED_BY` on non-verification targets.
+fn record_observation_evidence_link(
+    target: &RecordObservationEvidenceTarget,
+    confidence: f64,
+) -> Result<EvidenceLink, ProvenanceError> {
+    let target_record_id = match target.target_record_id.as_deref() {
+        Some(id) if !id.is_empty() => id.to_owned(),
+        _ => return Err(ProvenanceError::missing("evidence.target_record_id")),
+    };
+    let target_domain = match target.target_domain.as_deref() {
+        Some(domain) if !domain.is_empty() => domain,
+        _ => return Err(ProvenanceError::missing("evidence.target_domain")),
+    };
+    let relation = match target_domain {
+        "codegraph" => EdgeLabel::Observes.as_str(),
+        "verification" => EdgeLabel::ValidatedBy.as_str(),
+        _ => return Err(ProvenanceError::invalid("evidence.target_domain")),
+    };
+    Ok(EvidenceLink {
+        target_record_id: Some(target_record_id),
+        target_domain: target_domain.to_owned(),
+        relation: relation.to_owned(),
+        confidence: confidence.to_string(),
+        as_of_commit: None,
+        target_repo_relative_path: None,
+        target_span: None,
+        target_git_commit: None,
+    })
+}
+
+/// Maps a [`ProvenanceError`] to the frozen structured error envelope.
+///
+/// The envelope names the offending field but never echoes payload text: the
+/// message carries only the stable code and the field path.
+#[must_use]
+pub fn provenance_error_payload(error: &ProvenanceError) -> Value {
+    let message = match error.code {
+        "missing_field" => format!("{} is required", error.field),
+        _ => format!("{} is invalid", error.field),
+    };
+    json!({
+        "ok": false,
+        "error": {
+            "code": error.code,
+            "field": error.field,
+            "message": message,
+        }
+    })
+}
+
+/// Structured error for a write the daemon refused after accepting the
+/// request (e.g. a dangling evidence target under `RejectBatch`).
+///
+/// The batch is atomic: when this error fires, nothing was persisted. `detail`
+/// carries the daemon's first per-record diagnostic (stable handles only —
+/// never payload text).
+fn write_rejected_error(detail: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": {
+            "code": "write_rejected",
+            "message": "the store rejected the write; nothing was persisted",
+            "detail": detail,
+        }
+    })
+}
+
+/// Structured error for a write that failed in transport (daemon unreachable
+/// mid-call, ingest HTTP failure, unparseable response).
+///
+/// `message` is the daemon client's own error text, which never contains
+/// payload values.
+fn write_failed_error(message: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": { "code": "write_failed", "message": message }
     })
 }
 

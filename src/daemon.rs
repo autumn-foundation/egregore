@@ -1714,6 +1714,8 @@ impl DaemonClient {
 
     /// Sends graph records to the daemon.
     ///
+    /// The records are ingested under the `codegraph` domain.
+    ///
     /// # Errors
     ///
     /// Returns an error if the daemon rejects the request or cannot be reached.
@@ -1725,6 +1727,63 @@ impl DaemonClient {
         idempotency_key: &str,
         dangling_citation_policy: DanglingCitationPolicy,
     ) -> Result<DaemonIngestResponse> {
+        self.ingest_records_in_domain(
+            records,
+            agent_id,
+            session_id,
+            idempotency_key,
+            dangling_citation_policy,
+            "codegraph",
+        )
+    }
+
+    /// Sends agent-memory records to the daemon.
+    ///
+    /// The domain is hardcoded to `agent_memory`: the MCP `record_observation`
+    /// tool (issue #183) has no domain parameter of its own, so
+    /// agent-authored observations cannot land in the deterministic
+    /// `codegraph` domain. The daemon validates every record ID against the
+    /// domain (`ensure_record_ids_match_domain`) as a second line of defense.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon rejects the request or cannot be reached.
+    pub fn ingest_agent_memory_records(
+        &self,
+        records: &[GraphRecord],
+        agent_id: &str,
+        session_id: &str,
+        idempotency_key: &str,
+        dangling_citation_policy: DanglingCitationPolicy,
+    ) -> Result<DaemonIngestResponse> {
+        self.ingest_records_in_domain(
+            records,
+            agent_id,
+            session_id,
+            idempotency_key,
+            dangling_citation_policy,
+            "agent_memory",
+        )
+    }
+
+    /// Sends graph records to the daemon under an explicit ingest domain.
+    ///
+    /// Private: domain selection is a per-caller-type decision, so each
+    /// caller type gets its own hardcoded-domain wrapper (`ingest_records`
+    /// for `codegraph`, `ingest_agent_memory_records` for `agent_memory`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon rejects the request or cannot be reached.
+    fn ingest_records_in_domain(
+        &self,
+        records: &[GraphRecord],
+        agent_id: &str,
+        session_id: &str,
+        idempotency_key: &str,
+        dangling_citation_policy: DanglingCitationPolicy,
+        domain: &str,
+    ) -> Result<DaemonIngestResponse> {
         self.health()
             .context("daemon health validation failed before ingest")?;
         let body = json!({
@@ -1732,7 +1791,7 @@ impl DaemonClient {
             "agent_id": agent_id,
             "session_id": session_id,
             "idempotency_key": idempotency_key,
-            "domain": "codegraph",
+            "domain": domain,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "payload": {
                 "records": records,

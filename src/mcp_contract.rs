@@ -44,14 +44,15 @@ use serde_json::{Value, json};
 pub const MCP_CONTRACT_VERSION: u32 = 1;
 
 /// Tool names covered by the frozen contract, in `tool_router` registration
-/// order. Any new MCP tool (e.g. #181, #182, #183) must extend this
+/// order. Any new MCP tool (e.g. #181, #182) must extend this
 /// list and register its schema here before it ships.
-pub const MCP_CONTRACT_TOOLS: [&str; 5] = [
+pub const MCP_CONTRACT_TOOLS: [&str; 6] = [
     "inspect_store",
     "symbol_context",
     "task_evidence",
     "store_freshness",
     "failure_history",
+    "record_observation",
 ];
 
 /// Returns the published JSON Schema (Draft 2020-12) for a shipped tool's
@@ -74,6 +75,7 @@ pub fn response_schema(tool_name: &str) -> Option<Value> {
         "task_evidence" => Some(task_evidence_schema()),
         "store_freshness" => Some(store_freshness_schema()),
         "failure_history" => Some(failure_history_schema()),
+        "record_observation" => Some(record_observation_schema()),
         _ => None,
     }
 }
@@ -819,6 +821,30 @@ fn failure_history_schema() -> Value {
             "diagnostics": { "type": "array", "items": failure_diagnostic_schema() },
             "safety_note": { "type": "string" },
             "freshness": freshness_schema()
+        }
+    });
+    merge_objects(schema, body)
+}
+
+fn record_observation_schema() -> Value {
+    let schema = schema_head(
+        "record_observation",
+        "Evidence-backed agent observation recorded into the agent_memory domain (issue #183).",
+    );
+    let body = json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["ok", "record_id"],
+        "properties": {
+            "ok": { "const": true },
+            "record_id": {
+                "type": "string",
+                "description": "Stable content-addressed ID of the new Observation node (agent_memory domain); the citable evidence handle."
+            },
+            "records_written": {
+                "type": "integer",
+                "description": "Records the daemon accepted in the write batch (Agent, AgentSession, Observation nodes plus SESSION_OF and AUTHORED_BY edges)."
+            }
         }
     });
     merge_objects(schema, body)

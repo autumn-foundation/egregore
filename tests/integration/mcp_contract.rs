@@ -268,7 +268,8 @@ fn every_shipped_tool_has_a_published_schema() {
             "symbol_context",
             "task_evidence",
             "store_freshness",
-            "failure_history"
+            "failure_history",
+            "record_observation"
         ],
         "contract covers exactly the shipped tools in registration order"
     );

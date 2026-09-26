@@ -591,7 +591,7 @@ fn evidence_links_hash(links: &[crate::ir::EvidenceLink]) -> String {
 }
 
 /// Returns the current UTC time as an RFC 3339 string for `ingested_at`.
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
@@ -612,13 +612,37 @@ fn evidence_producer() -> Producer {
     evidence_producer_at(&now_rfc3339())
 }
 
+/// Builds the MCP producer envelope for observation records (issue #183).
+///
+/// Same [`ProducerKind::ObservationWriter`] kind as the CLI writer, but
+/// `producer_components` carries `transport: "mcp"` so MCP-originated records
+/// are distinguishable from CLI-originated ones (which stamp empty
+/// components). The key is additive per `docs/schema/producer-version.md` §4.
+/// The timestamp is the request's deterministic `observed_at`, not the wall
+/// clock, so identical retries re-emit byte-identical records — the same
+/// idempotency contract the failure writer honors with `evidence_producer_at`
+/// (issue #264). A wall-clock `producer_started_at` would make every retry
+/// hash differently from the first write while keeping the same record ID,
+/// turning a harmless retry into an idempotency conflict.
+#[must_use]
+pub fn mcp_observation_producer(observed_at: &str) -> Producer {
+    Producer {
+        egregore_version: env!("CARGO_PKG_VERSION").to_owned(),
+        egregore_git: None,
+        producer_kind: ProducerKind::ObservationWriter,
+        producer_components: BTreeMap::from([("transport".to_owned(), "mcp".to_owned())]),
+        producer_started_at: observed_at.to_owned(),
+    }
+}
+
 /// Builds the producer envelope with an explicit `producer_started_at`.
 ///
 /// The failure writer uses the request's `observed_at` here instead of the
 /// wall clock: identical failure inputs must re-emit byte-identical records
 /// (the issue #264 idempotency contract), and `observed_at` is the only
-/// deterministic timestamp the request carries. Observation and other writers
-/// keep the wall-clock default.
+/// deterministic timestamp the request carries. The MCP observation writer
+/// follows the same contract via `mcp_observation_producer`; the CLI
+/// observation writer keeps the wall-clock default.
 fn evidence_producer_at(started_at: &str) -> Producer {
     Producer {
         egregore_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -954,27 +978,20 @@ fn build_authored_by_edge(record_id: &str, session_id: &str) -> GraphRecord {
 
 // ── Public builder functions ──────────────────────────────────────────────────
 
-/// Builds a typed `Observation` record batch from a provenance-bearing request.
+/// Validates an [`ObservationRequest`] against the provenance contract.
 ///
-/// Validates all required provenance fields and returns a [`ProvenanceError`]
-/// if any are missing or invalid. The error names the missing field and never
-/// echoes payload text.
-///
-/// On success, returns an [`EvidenceWriteOutcome`] containing:
-/// - A stable `agent_memory:v1:` record ID (the citable evidence handle)
-/// - All graph records: `Agent`, `AgentSession`, `Observation` nodes plus
-///   `SESSION_OF` and `AUTHORED_BY` edges — and, when `supersession` is set
-///   (issue #184), one `SUPERSEDES` or `CONTRADICTS` edge from the new
-///   observation to the prior one (the write is purely additive; the target
-///   record is never rewritten)
+/// This is the shared enforcement point for every transport that writes
+/// observations: the CLI (`eg write observation`, issue #44) and the MCP
+/// `record_observation` tool (issue #183) both validate through this one
+/// function, so the contract cannot drift between them. The error names the
+/// missing or invalid field and never echoes payload text.
 ///
 /// # Errors
 ///
 /// Returns a [`ProvenanceError`] when any required field is missing or invalid.
-#[allow(clippy::too_many_lines)]
-pub fn build_observation_records(
+pub(crate) fn validate_observation_request(
     req: &ObservationRequest,
-) -> Result<EvidenceWriteOutcome, ProvenanceError> {
+) -> Result<(), ProvenanceError> {
     validate_provenance_base(&req.provenance)?;
     validate_agent_kind(&req.provenance)?;
     validate_source_handle(&req.provenance)?;
@@ -1029,6 +1046,44 @@ pub fn build_observation_records(
             return Err(ProvenanceError::missing("supersession"));
         }
     }
+
+    Ok(())
+}
+
+/// Builds a typed `Observation` record batch from a provenance-bearing request,
+/// stamped with an explicit producer envelope.
+///
+/// This is the shared provenance-enforcing builder behind both the CLI
+/// (`eg write observation`, issue #44) and the MCP `record_observation` tool
+/// (issue #183): both transports validate through this one function, so the
+/// provenance contract cannot drift between them. The `producer` envelope is
+/// stamped on every record in the batch; per `docs/schema/producer-version.md`
+/// §5 it never contributes to stable ID composition, so the same request
+/// yields the same `record_id` regardless of transport.
+///
+/// Validates all required provenance fields and returns a [`ProvenanceError`]
+/// if any are missing or invalid. The error names the missing field and never
+/// echoes payload text.
+///
+/// On success, returns an [`EvidenceWriteOutcome`] containing:
+/// - A stable `agent_memory:v1:` record ID (the citable evidence handle)
+/// - All graph records: `Agent`, `AgentSession`, `Observation` nodes plus
+///   `SESSION_OF` and `AUTHORED_BY` edges — and, when `supersession` is set
+///   (issue #184), one `SUPERSEDES` or `CONTRADICTS` edge from the new
+///   observation to the prior one (the write is purely additive; the target
+///   record is never rewritten)
+///
+/// # Errors
+///
+/// Returns a [`ProvenanceError`] when any required field is missing or invalid.
+#[allow(clippy::too_many_lines)]
+pub fn build_observation_records_with_producer(
+    req: &ObservationRequest,
+    producer: &Producer,
+) -> Result<EvidenceWriteOutcome, ProvenanceError> {
+    // One shared provenance contract for the CLI and the MCP tool (issue
+    // #183): every transport validates through `validate_observation_request`.
+    validate_observation_request(req)?;
 
     let agent_kind = effective_agent_kind(&req.provenance);
 
@@ -1215,7 +1270,7 @@ pub fn build_observation_records(
         history_replay_tip: None,
         embedding_model: None,
         user_context: crate::ir::UserContextFields::empty(),
-        producer: Some(evidence_producer()),
+        producer: Some(producer.clone()),
     };
 
     let agent_node = build_agent_node(&req.provenance.agent_id, agent_kind);
@@ -1245,8 +1300,9 @@ pub fn build_observation_records(
     }
 
     // Stamp the producer envelope (issue #226): the observation writer is a
-    // first-class producer and its records must carry the envelope.
-    let producer = evidence_producer();
+    // first-class producer and its records must carry the envelope. The
+    // caller-supplied envelope identifies the transport (CLI vs MCP, issue
+    // #183); it never affects stable IDs (producer-version.md §5).
     let records = records
         .into_iter()
         .map(|mut record| {
@@ -1266,6 +1322,22 @@ pub fn build_observation_records(
         record_id: obs_id,
         records,
     })
+}
+
+/// Builds a typed `Observation` record batch stamped with the CLI writer's
+/// producer envelope.
+///
+/// This is the `eg write observation` (issue #44) entry point; it delegates to
+/// [`build_observation_records_with_producer`] with the CLI envelope (same
+/// [`ProducerKind::ObservationWriter`] kind, empty `producer_components`).
+///
+/// # Errors
+///
+/// Returns a [`ProvenanceError`] when any required field is missing or invalid.
+pub fn build_observation_records(
+    req: &ObservationRequest,
+) -> Result<EvidenceWriteOutcome, ProvenanceError> {
+    build_observation_records_with_producer(req, &evidence_producer())
 }
 
 /// Builds a typed live-authored `Failure` record batch from a

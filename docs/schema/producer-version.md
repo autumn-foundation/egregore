@@ -124,6 +124,21 @@ version bump.
 | `codex_importer` | `importer_schema_version`, `source_format_version` |
 | `claude_code_importer` | `importer_schema_version`, `source_format_version` |
 | `log_importer` | `importer_schema_version`, `source_format_version` (`plain-v1`/`jsonl-v1`), `fingerprint_algorithm` (`template-v1`) |
+| `observation_writer` | `transport` when written over the MCP transport (issue #183); absent for CLI writes |
+
+The `observation_writer` example over MCP:
+```json
+"producer_components": {
+  "transport": "mcp"
+}
+```
+
+The `transport` component distinguishes how an observation entered the store:
+`eg write observation` (CLI) stamps empty components; the MCP
+`record_observation` tool stamps `transport: "mcp"`. Both stamp the same
+`producer_kind` (`observation_writer`), so origin-aware readers can
+distinguish transport while transport-agnostic readers keep working. The key
+is additive: it never participates in stable ID composition (§5).
 
 The `code_graph_extractor` example:
 ```json

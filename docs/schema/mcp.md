@@ -92,9 +92,10 @@ The tier of every response field is recorded in the per-tool tables below.
 
 ## 4 — Tools
 
-All tools are read-only. All tool *inputs* are JSON objects; every tool
-accepts `data_dir` (default `.egregore`) and `repo_path` (default: the
-server's current directory) to locate the store and the working tree the
+Five tools are read-only; `record_observation` (§4.6) is the single write
+tool. All tool *inputs* are JSON objects; every tool accepts `data_dir`
+(default `.egregore`) to locate the store. The read tools additionally accept
+`repo_path` (default: the server's current directory) for the working tree the
 freshness verdict is computed against.
 
 ### 4.1 `inspect_store`
@@ -266,6 +267,56 @@ unresolvable handle, which is a structured error.
 (cross-repository collision, with `candidates`), `no_match` (handle resolved
 to nothing live), `stale_handle` (handle named only tombstoned records), plus
 the daemon codes.
+
+### 4.6 `record_observation`
+
+Records an evidence-backed agent observation into the `agent_memory` domain
+(issue #183) — the first write tool on the MCP transport, closing the agent
+learning loop (query → learn → persist with provenance) without leaving the
+transport. Requires a running local daemon when called over the wire.
+
+The tool enforces the same provenance contract as `eg write observation`:
+every required field must be present and non-empty, and at least one evidence
+target with its evidence domain must be cited. The persisted records carry an
+MCP-origin producer envelope (`producer_kind: observation_writer`,
+`producer_components.transport: "mcp"`), distinct from CLI-originated writes
+(which stamp empty components). The write is ingested under the `agent_memory`
+domain only — the tool exposes no domain parameter and the daemon validates
+record IDs against the ingest domain, so agent-authored observations can never
+land in the deterministic `codegraph` domain. A dangling evidence target
+rejects the whole batch atomically (`RejectBatch`): no partial record is ever
+persisted. An identical retry is idempotent: the observation's
+content-addressed `record_id` is the ingest idempotency key, so the retry
+returns the same `record_id` without duplicating records.
+
+**Inputs**
+
+| Parameter | Type | Required | Notes |
+|---|---|---|---|
+| `agent_id` | string | yes | Stable agent identity |
+| `agent_kind` | string | no | Published enum (`other`, `claude-code`, `vantage`, `codex`, `rust-swe-agent`, `human`); defaults to `other` |
+| `session_id` | string | yes | Active session identifier |
+| `observed_at` | string | no | RFC 3339 observation timestamp; defaults to now |
+| `source_handle` | string | yes | Citable source artifact path or hash |
+| `text` | string | yes | Observation body |
+| `confidence` | number | yes | Extraction confidence in `[0.0, 1.0]` |
+| `evidence` | array | yes | At least one target; items: `{ "target_record_id": string, "target_domain": string }`. `target_domain` must be `codegraph` (cited via `OBSERVES`) or `verification` (cited via `VALIDATED_BY`) |
+| `data_dir` | string | no | AletheiaDB data directory (default `.egregore`) |
+
+**Success response**
+
+| Field | Type | Tier | Notes |
+|---|---|---|---|
+| `ok` | `true` | stable | |
+| `record_id` | string | stable | Stable content-addressed ID of the new `Observation` node (`agent_memory` domain); the citable evidence handle |
+| `records_written` | integer | stable | Records the daemon accepted in the batch (Agent, AgentSession, Observation nodes plus `SESSION_OF` and `AUTHORED_BY` edges) |
+
+**Errors** — see §5.8: `missing_field` / `invalid_field` (naming the
+offending field; a call missing any required provenance field or citing zero
+evidence targets is rejected and writes nothing), `write_rejected` (the store
+refused the batch, e.g. a dangling evidence target — nothing was persisted),
+`write_failed` (transport failure during the write), plus the daemon codes
+(`daemon_not_running` / `daemon_stale` when no usable daemon is discovered).
 
 ---
 
@@ -451,7 +502,7 @@ Reuses the store-freshness contract from #186 — no new vocabulary:
 
 ## 7 — Release gate for new tools
 
-Adding an MCP tool (queued: #181, #182, #183) is a **release-gated**
+Adding an MCP tool (queued: #181, #182) is a **release-gated**
 change. Before a new tool ships, its author must, in the same commit:
 
 1. Enumerate the tool in `docs/schema/mcp.md` §4: input parameters and the
