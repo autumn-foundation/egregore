@@ -2,7 +2,7 @@
 
 `eg mcp` is the **primary way a coding agent talks to Egregore**: a stdio
 [Model Context Protocol](https://modelcontextprotocol.io/) server exposing
-six **read-only**, citation-bearing tools backed by the running local
+seven **read-only**, citation-bearing tools backed by the running local
 daemon. Register it once in your agent host; the agent then calls Egregore's
 evidence tools over MCP instead of shelling out to `eg query …` per question —
 which keeps tool discovery, the structured-output contract, and the citation
@@ -28,7 +28,7 @@ envelope intact.
    eg daemon status --data-dir /abs/path/to/.egregore   # confirm it is up
    ```
 
-   All six tools fail closed when no daemon answers for `--data-dir`
+   All seven tools fail closed when no daemon answers for `--data-dir`
    (see [Error envelope](#error-envelope) — gate on it, don't retry blindly).
 
 3. **Register the server** in your agent host with one of the copy-paste
@@ -46,7 +46,7 @@ envelope intact.
 
    The first line must contain `"serverInfo":{"name":"egregore",…}` and the
    third must list exactly `inspect_store`, `symbol_context`, `task_evidence`,
-   `store_freshness`, `failure_history`, `search_code`.
+   `store_freshness`, `failure_history`, `search_code`, `symbol_at`.
    (This is the same handshake `tests/integration/mcp_stdio.rs` proves on
    every CI run.)
 
@@ -119,7 +119,7 @@ Every tool takes an optional `data_dir` argument (string, defaults to the
 `--data-dir` the server was started with) and returns a JSON text payload.
 The top-level shape is stable: **`"ok": true`** with data fields, or
 **`"ok": false`** with an `"error"` object — never a bare string, never an
-HTTP-style status. The six tool names are stable; the response is additive
+HTTP-style status. The seven tool names are stable; the response is additive
 (fields may be added, existing fields are not renamed or removed without a
 contract change — tracked by issue #194).
 
@@ -273,6 +273,32 @@ the daemon codes below.
 
 Rows are redaction-safe: bounded handles only — no raw source text,
 summaries, or payload bytes appear anywhere.
+
+### `symbol_at`
+
+Temporal symbol lookup (issue #181) — the temporal counterpart to
+`symbol_context`, mirroring `eg query symbol --at` / `--as-of`. Looks up a
+symbol's state at a Git commit or as of a valid-time instant and returns the
+citable row for that version: `record_id`, `name`, `kind`,
+`repo_relative_path`, `span`, `git_commit`, `valid_time`.
+
+Arguments: `{ "symbol_name": string (required, non-empty), "commit"?: string,
+"as_of"?: string, "data_dir"?: string, "repo_path"?: string }`
+
+Exactly one of `commit` / `as_of` is required (both, or neither, is a
+`bad_request` parameter error, raised before any daemon is contacted).
+`commit` is a full SHA or unique prefix, as with `--at`; an ambiguous prefix
+yields the stable `ambiguous_commit_prefix` code (with `commit_prefix` and
+`matching_commits`). `as_of` is an RFC 3339 instant, as with `--as-of`; a
+malformed instant is rejected with `invalid_timestamp`. A same-name collision
+across repositories fails closed with `ambiguous_repository` (issue #67);
+a miss yields `no_match`. The transaction-time selector (`tx_as_of`) is
+rejected with `not_implemented` — the transaction-time axis currently covers
+`eg query symbol` only.
+
+Stable `ok: true` fields: `symbol_name` (echoed), `selector` (`kind` +
+`value`, echoing the validated temporal selector), `symbol` (the citable
+row), `freshness`.
 
 ## Freshness stamping
 

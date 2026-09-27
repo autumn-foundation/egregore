@@ -46,7 +46,7 @@ pub const MCP_CONTRACT_VERSION: u32 = 1;
 /// Tool names covered by the frozen contract, in `tool_router` registration
 /// order. Any new MCP tool (e.g. #181, #182) must extend this
 /// list and register its schema here before it ships.
-pub const MCP_CONTRACT_TOOLS: [&str; 7] = [
+pub const MCP_CONTRACT_TOOLS: [&str; 8] = [
     "inspect_store",
     "symbol_context",
     "task_evidence",
@@ -54,6 +54,7 @@ pub const MCP_CONTRACT_TOOLS: [&str; 7] = [
     "failure_history",
     "record_observation",
     "search_code",
+    "symbol_at",
 ];
 
 /// Returns the published JSON Schema (Draft 2020-12) for a shipped tool's
@@ -78,6 +79,7 @@ pub fn response_schema(tool_name: &str) -> Option<Value> {
         "failure_history" => Some(failure_history_schema()),
         "record_observation" => Some(record_observation_schema()),
         "search_code" => Some(search_code_schema()),
+        "symbol_at" => Some(symbol_at_schema()),
         _ => None,
     }
 }
@@ -115,7 +117,16 @@ pub fn error_schema() -> Value {
                     // `ambiguous_handle` carries plain handle strings;
                     // `ambiguous_symbol` (issue #192) carries one object per
                     // distinct identity (record_id + file:span handle).
-                    "candidates": { "type": "array", "items": { "type": ["string", "object"] } }
+                    "candidates": { "type": "array", "items": { "type": ["string", "object"] } },
+                    // `ambiguous_commit_prefix` (issue #181) carries the
+                    // offending prefix and the distinct-SHA count.
+                    "commit_prefix": { "type": "string" },
+                    "matching_commits": { "type": "integer" },
+                    // `ambiguous_repository` (issue #67 / #181) carries the
+                    // repository handles and whether unattributed rows were
+                    // among the colliding candidates.
+                    "repositories": { "type": "array", "items": { "type": "string" } },
+                    "includes_unattributed_rows": { "type": "boolean" }
                 }
             }
         }
@@ -955,4 +966,72 @@ fn search_code_schema() -> Value {
         }
     });
     merge_objects(schema, body)
+}
+
+/// The published success-response schema for `symbol_at` (issue #181).
+///
+/// The `symbol` row carries the citable fields — `record_id`, `name`,
+/// `kind`, `repo_relative_path`, `span`, `git_commit`, `valid_time` — whose
+/// CLI-emitted subset is byte-equal to `eg query symbol --at/--as-of` for
+/// the same store and inputs.
+fn symbol_at_schema() -> Value {
+    let schema = schema_head(
+        "symbol_at",
+        "Temporal symbol lookup: the symbol's state at a Git commit (full SHA or unique prefix) or as of an RFC 3339 valid-time instant — the temporal counterpart to `symbol_context`, mirroring `eg query symbol --at` / `--as-of` (issue #181).",
+    );
+    let body = json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["ok", "symbol_name", "selector", "symbol", "freshness"],
+        "properties": {
+            "ok": { "const": true },
+            "symbol_name": {
+                "type": "string",
+                "description": "The looked-up symbol name, echoed verbatim."
+            },
+            "selector": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "The validated temporal selector, echoed verbatim.",
+                "required": ["kind", "value"],
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["commit", "as_of"],
+                        "description": "Which temporal axis answered."
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The caller's commit SHA/prefix or RFC 3339 instant."
+                    }
+                }
+            },
+            "symbol": temporal_symbol_row_schema(),
+            "freshness": freshness_schema()
+        }
+    });
+    merge_objects(schema, body)
+}
+
+/// The citable symbol-version row `symbol_at` returns: bounded citation
+/// handles only, never raw source text.
+fn temporal_symbol_row_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "description": "The symbol's state at the selected commit/instant. `record_id`, `name`, `kind`, `repo_relative_path`, `span`, `git_commit`, and `valid_time` are byte-equal to `eg query symbol --at` / `--as-of` for the same store and inputs.",
+        "required": [
+            "record_id", "name", "kind", "repo_relative_path",
+            "span", "git_commit", "valid_time"
+        ],
+        "properties": {
+            "record_id": { "type": "string" },
+            "name": { "type": "string" },
+            "kind": { "type": "string", "const": "Symbol" },
+            "repo_relative_path": str_or_null(),
+            "span": span_schema(),
+            "git_commit": str_or_null(),
+            "valid_time": str_or_null()
+        }
+    })
 }

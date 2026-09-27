@@ -135,15 +135,16 @@ fn mcp_server_has_instructions() {
 
 // ── AC2: Tool registration ─────────────────────────────────────────────────────
 
-/// The MCP tool router must register exactly the six required read tools.
+/// The MCP tool router must register exactly the seven required read tools.
 #[test]
-fn tool_router_registers_exactly_six_required_read_tools() {
+fn tool_router_registers_exactly_seven_required_read_tools() {
     let inspect = EgregoreMcpServer::inspect_store_tool_attr();
     let symbol = EgregoreMcpServer::symbol_context_tool_attr();
     let task = EgregoreMcpServer::task_evidence_tool_attr();
     let freshness = EgregoreMcpServer::store_freshness_tool_attr();
     let failures = EgregoreMcpServer::failure_history_tool_attr();
     let search = EgregoreMcpServer::search_code_tool_attr();
+    let temporal = EgregoreMcpServer::symbol_at_tool_attr();
 
     assert_eq!(inspect.name, "inspect_store", "first tool name");
     assert_eq!(symbol.name, "symbol_context", "second tool name");
@@ -151,6 +152,7 @@ fn tool_router_registers_exactly_six_required_read_tools() {
     assert_eq!(freshness.name, "store_freshness", "fourth tool name");
     assert_eq!(failures.name, "failure_history", "fifth tool name");
     assert_eq!(search.name, "search_code", "sixth tool name");
+    assert_eq!(temporal.name, "symbol_at", "seventh tool name");
 }
 
 /// Each registered tool must have a non-empty description and an object input schema.
@@ -163,6 +165,7 @@ fn all_tools_have_nonempty_description_and_object_input_schema() {
         EgregoreMcpServer::store_freshness_tool_attr(),
         EgregoreMcpServer::failure_history_tool_attr(),
         EgregoreMcpServer::search_code_tool_attr(),
+        EgregoreMcpServer::symbol_at_tool_attr(),
     ] {
         let name = tool.name.as_ref();
         assert!(
@@ -400,6 +403,7 @@ fn tool_descriptions_contain_no_bearer_tokens() {
         EgregoreMcpServer::store_freshness_tool_attr(),
         EgregoreMcpServer::failure_history_tool_attr(),
         EgregoreMcpServer::search_code_tool_attr(),
+        EgregoreMcpServer::symbol_at_tool_attr(),
     ] {
         let desc = tool.description.as_deref().unwrap_or("");
         assert!(

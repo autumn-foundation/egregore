@@ -179,7 +179,13 @@ pub(crate) fn query_symbol_as_of(
             let deleted = current_deleted_ids(records);
             let mut symbol_results: Vec<SymbolResult<'_>> = results
                 .iter()
-                .filter_map(|r| symbol_result(r, name, index, records, &deleted))
+                .filter_map(|r| {
+                    let mut result = symbol_result(r, name, index, records, &deleted)?;
+                    // `--as-of` is a temporal lane (issue #181): stamp the
+                    // valid-time axis the selector resolved.
+                    stamp_valid_time(&mut result, r);
+                    Some(result)
+                })
                 .collect();
             // Package scope (issue #117), applied to the recorded attribution AT
             // the resolved instant.

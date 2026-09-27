@@ -145,6 +145,10 @@ pub(crate) fn query_file(
             crate_attribution: r.presentable_crate_attribution().map(|(a, _)| a),
             crate_attribution_disclaimer: None,
             git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+            // `valid_time` is a temporal-lane field (issue #181): the
+            // file-at-point listing is a current-state view and does not
+            // carry it.
+            valid_time: None,
             repository_id,
             repository: repository_id.and_then(|repo| index.display_of(repo)),
             freshness: None,

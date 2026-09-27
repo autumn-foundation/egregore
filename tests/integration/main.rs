@@ -76,6 +76,7 @@ mod mcp_freshness;
 mod mcp_record_observation;
 mod mcp_search_code;
 mod mcp_stdio;
+mod mcp_symbol_at;
 mod memory_audit;
 mod memory_evidence_health;
 mod memory_health;

@@ -92,7 +92,7 @@ The tier of every response field is recorded in the per-tool tables below.
 
 ## 4 — Tools
 
-Six tools are read-only; `record_observation` (§4.6) is the single write
+Seven tools are read-only; `record_observation` (§4.6) is the single write
 tool. All tool *inputs* are JSON objects; every tool accepts `data_dir`
 (default `.egregore`) to locate the store. The read tools additionally accept
 `repo_path` (default: the server's current directory) for the working tree the
@@ -382,6 +382,56 @@ the `embeddings` feature or the model failed to load), plus the daemon codes
 
 ---
 
+### 4.8 `symbol_at`
+
+Temporal symbol lookup (issue #181) — the temporal counterpart to
+`symbol_context`, mirroring `eg query symbol --at` / `--as-of`. Looks up a
+symbol's state at a Git commit or as of a valid-time instant and returns the
+citable row for that version.
+
+**Inputs**
+
+| Parameter | Type | Required | Notes |
+|---|---|---|---|
+| `symbol_name` | string | yes | Symbol name; must be non-empty. An empty name is rejected with the stable `missing_argument` envelope before any daemon is contacted |
+| `commit` | string | one of | A Git commit: full SHA or unique prefix, as with `--at`. Exactly one of `commit` / `as_of` is required — both, or neither, is a `bad_request` parameter error |
+| `as_of` | string | one of | An RFC 3339 valid-time instant, as with `--as-of`. Malformed instants are rejected with `invalid_timestamp` |
+| `data_dir` | string | no | AletheiaDB data directory (default `.egregore`) |
+| `repo_path` | string | no | Working tree for the freshness verdict (default `.`) |
+
+**Success response**
+
+| Field | Type | Tier | Notes |
+|---|---|---|---|
+| `ok` | `true` | stable | |
+| `symbol_name` | string | stable | The looked-up symbol name, echoed verbatim |
+| `selector` | object | stable | The validated temporal selector, echoed verbatim: `kind` (`commit` \| `as_of`) + `value` |
+| `symbol` | object | stable | The citable symbol-version row — see below |
+| `symbol.record_id` | string | stable | Byte-identical to `eg query symbol --at` / `--as-of` |
+| `symbol.name` | string | stable | Byte-identical to the CLI row |
+| `symbol.kind` | `"Symbol"` | stable | The row is statically a `Symbol` |
+| `symbol.repo_relative_path` | string \| null | stable | Byte-identical to the CLI row |
+| `symbol.span` | object \| null | stable | Source span handle, byte-identical to the CLI row |
+| `symbol.git_commit` | string \| null | stable | Byte-identical to the CLI row |
+| `symbol.valid_time` | string \| null | stable | The instant this version is valid as of (RFC 3339), from the temporal metadata — the additive temporal field the CLI `SymbolResult` row also carries as of issue #181 |
+| `freshness` | object | stable | §6 |
+
+Rows are redaction-safe: bounded handles only — no raw source text,
+summaries, or payload bytes appear anywhere.
+
+**Errors** — see §5.8: `missing_argument` (empty `symbol_name`),
+`bad_request` (both or neither of `commit` / `as_of` supplied),
+`invalid_timestamp` (malformed `as_of`), `not_implemented` (a `tx_as_of`
+selector — the transaction-time axis currently covers `eg query symbol`
+only), `ambiguous_commit_prefix` (the prefix matches more than one commit;
+carries `commit_prefix` and `matching_commits`), `ambiguous_repository`
+(same-name collision across repositories, issue #67; carries
+`repositories` and `includes_unattributed_rows`), `no_match` (the symbol has
+no version at the requested commit/instant), plus the daemon codes
+(`daemon_not_running` / `daemon_stale` when no usable daemon is discovered).
+
+---
+
 ## 5 — Shared shapes
 
 ### 5.1 Source-fact row
@@ -466,6 +516,11 @@ Every error shares one stable envelope:
 | `daemon_not_running` | No live daemon for the data dir | `message` | **Store missing or unreadable** — retry after `eg daemon` |
 | `daemon_stale` | Daemon metadata stale | `message` | **Store missing or unreadable** — restart the daemon |
 | `stale_handle` | Handle named only tombstoned records | `handle` | The entity was deleted — never silently treat as `no_match` |
+| `bad_request` | Parameter combination invalid | `message` | Caller bug — e.g. both/neither `commit` and `as_of` on `symbol_at` |
+| `invalid_timestamp` | RFC 3339 instant malformed | `message` | Caller bug — `symbol_at` rejects the `as_of` before any daemon contact |
+| `not_implemented` | Selector axis not exposed on this transport | `message` | `tx_as_of` on `symbol_at` (transaction-time covers `eg query symbol` only) |
+| `ambiguous_commit_prefix` | Prefix matched >1 commit | `commit_prefix`, `matching_commits` | Caller must supply a longer prefix |
+| `ambiguous_repository` | Same-name collision across repositories | `repositories`, `includes_unattributed_rows` | Caller must query a single-repository store (issue #67) |
 
 The agent rule: `no_match` ⇒ the entity does not exist; `daemon_not_running`
 / `daemon_stale` ⇒ the store cannot be read. The two are never conflated.

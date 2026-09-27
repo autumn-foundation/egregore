@@ -8,11 +8,17 @@
       "properties": {
         "candidates": {
           "items": {
-            "type": ["string", "object"]
+            "type": [
+              "string",
+              "object"
+            ]
           },
           "type": "array"
         },
         "code": {
+          "type": "string"
+        },
+        "commit_prefix": {
           "type": "string"
         },
         "field": {
@@ -24,8 +30,20 @@
         "id_or_handle": {
           "type": "string"
         },
+        "includes_unattributed_rows": {
+          "type": "boolean"
+        },
+        "matching_commits": {
+          "type": "integer"
+        },
         "message": {
           "type": "string"
+        },
+        "repositories": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "symbol_name": {
           "type": "string"

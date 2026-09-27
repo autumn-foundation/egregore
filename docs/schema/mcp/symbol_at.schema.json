@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Temporal symbol lookup: the symbol's state at a Git commit (full SHA or unique prefix) or as of an RFC 3339 valid-time instant — the temporal counterpart to `symbol_context`, mirroring `eg query symbol --at` / `--as-of` (issue #181).",
+  "properties": {
+    "freshness": {
+      "additionalProperties": true,
+      "properties": {
+        "current_dirty": {
+          "type": "boolean"
+        },
+        "current_head": {
+          "additionalProperties": true,
+          "properties": {
+            "sha": {
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "commit",
+                "no_git",
+                "unborn_head"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        "fresh": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string"
+        },
+        "repo_path": {
+          "type": "string"
+        },
+        "repository_id": {
+          "type": "string"
+        },
+        "stored_snapshot": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "properties": {
+                "dirty": {
+                  "type": "boolean"
+                },
+                "head": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "sha": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "enum": [
+                        "commit",
+                        "no_git",
+                        "unborn_head"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "state"
+                  ],
+                  "type": "object"
+                },
+                "repository_id": {
+                  "type": "string"
+                },
+                "scanned_at": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "head",
+                "dirty",
+                "repository_id",
+                "scanned_at"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Explicit marker for a pre-stamping store — never a silent absence, never a false `fresh`.",
+              "properties": {
+                "state": {
+                  "const": "pre_stamping"
+                }
+              },
+              "required": [
+                "state"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "verdict": {
+          "enum": [
+            "fresh",
+            "stale_head",
+            "stale_dirty",
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict",
+        "fresh",
+        "repository_id",
+        "repo_path",
+        "stored_snapshot",
+        "current_head",
+        "current_dirty",
+        "message"
+      ],
+      "type": "object"
+    },
+    "ok": {
+      "const": true
+    },
+    "selector": {
+      "additionalProperties": true,
+      "description": "The validated temporal selector, echoed verbatim.",
+      "properties": {
+        "kind": {
+          "description": "Which temporal axis answered.",
+          "enum": [
+            "commit",
+            "as_of"
+          ],
+          "type": "string"
+        },
+        "value": {
+          "description": "The caller's commit SHA/prefix or RFC 3339 instant.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ],
+      "type": "object"
+    },
+    "symbol": {
+      "additionalProperties": true,
+      "description": "The symbol's state at the selected commit/instant. `record_id`, `name`, `kind`, `repo_relative_path`, `span`, `git_commit`, and `valid_time` are byte-equal to `eg query symbol --at` / `--as-of` for the same store and inputs.",
+      "properties": {
+        "git_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "const": "Symbol",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "record_id": {
+          "type": "string"
+        },
+        "repo_relative_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "span": {
+          "additionalProperties": true,
+          "properties": {
+            "end_byte": {
+              "type": "integer"
+            },
+            "end_column": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "end_line": {
+              "type": "integer"
+            },
+            "start_byte": {
+              "type": "integer"
+            },
+            "start_column": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "start_line": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "start_byte",
+            "end_byte",
+            "start_line",
+            "end_line"
+          ],
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "valid_time": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "record_id",
+        "name",
+        "kind",
+        "repo_relative_path",
+        "span",
+        "git_commit",
+        "valid_time"
+      ],
+      "type": "object"
+    },
+    "symbol_name": {
+      "description": "The looked-up symbol name, echoed verbatim.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "ok",
+    "symbol_name",
+    "selector",
+    "symbol",
+    "freshness"
+  ],
+  "title": "Egregore MCP tool response: symbol_at",
+  "type": "object"
+}

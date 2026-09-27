@@ -6360,6 +6360,12 @@ pub(crate) struct SymbolResult<'a> {
     doc: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     git_commit: Option<&'a str>,
+    /// The instant this row's version is valid as of (RFC 3339), from the
+    /// temporal metadata (issue #181) — the same axis the `symbol_at` MCP
+    /// tool cites. Absent for records that predate temporal metadata: never
+    /// fabricated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_time: Option<&'a str>,
     /// Stable `Repository` record ID owning this row; absent when the store
     /// carries no repository topology for the record (legacy graphs).
     #[serde(skip_serializing_if = "Option::is_none")]

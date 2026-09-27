@@ -259,6 +259,7 @@ fn mcp_stdio_handshake_lists_tools_and_calls_symbol_context() {
             "record_observation".to_owned(),
             "search_code".to_owned(),
             "store_freshness".to_owned(),
+            "symbol_at".to_owned(),
             "symbol_context".to_owned(),
             "task_evidence".to_owned(),
         ];

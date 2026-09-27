@@ -1,12 +1,14 @@
 //! MCP server for Egregore tools — issue #53.
 //!
 //! Implements the Model Context Protocol using the [`rmcp`] crate and exposes
-//! six read-only tools backed by the existing daemon query, symbol-context,
+//! seven read-only tools backed by the existing daemon query, symbol-context,
 //! task-evidence, failure-history, and semantic-search contracts, plus one
 //! write tool:
 //!
 //! - **`inspect_store`** — store-inspection summary (record counts, domain breakdown).
 //! - **`symbol_context`** — evidence-backed symbol context, trust-separated by domain.
+//! - **`symbol_at`** — temporal symbol lookup: the symbol's state at a Git
+//!   commit or as of a valid-time instant (issue #181).
 //! - **`task_evidence`** — evidence-backed task context, trust-separated by domain.
 //! - **`store_freshness`** — store-freshness verdict for the whole store (issue #220).
 //! - **`failure_history`** — prior failed attempts for a symbol, file, or task
@@ -224,6 +226,29 @@ pub struct SearchCodeArgs {
     /// `eg query semantic` default) and is clamped to 100, the daemon verb's
     /// ceiling.
     pub limit: Option<u64>,
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
+}
+
+/// Arguments for the `symbol_at` tool: temporal symbol lookup (issue #181).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SymbolAtArgs {
+    /// Symbol name to look up (exact match against the symbol record's name);
+    /// required, must be non-empty.
+    pub symbol_name: String,
+    /// Git commit: full SHA or unique prefix, mirroring
+    /// `eg query symbol --at`. Exactly one of `commit` / `as_of` is required.
+    pub commit: Option<String>,
+    /// RFC 3339 valid-time instant, mirroring `eg query symbol --as-of`.
+    /// Exactly one of `commit` / `as_of` is required.
+    pub as_of: Option<String>,
+    /// Transaction-time selector. NOT IMPLEMENTED for `symbol_at`: the
+    /// transaction-time axis currently covers `eg query symbol` only.
+    pub tx_as_of: Option<String>,
+    /// `AletheiaDB` data directory (default: the server's configured store).
+    pub data_dir: Option<String>,
     /// Working-tree path the store freshness verdict is computed against
     /// (default: the MCP server's current directory, mirroring
     /// `eg freshness`'s default `.`).
@@ -615,6 +640,63 @@ impl EgregoreMcpServer {
             .unwrap_or_default()
         }
     }
+
+    /// Looks up a symbol's state at a Git commit or as of a valid-time
+    /// instant (issue #181): the temporal counterpart to `symbol_context`.
+    ///
+    /// Accepts exactly one temporal selector — `commit` (a full SHA or unique
+    /// prefix, mirroring `eg query symbol --at`) or `as_of` (an RFC 3339
+    /// instant, mirroring `eg query symbol --as-of`) — and returns the
+    /// citable row for that version: `record_id`, `name`, `kind`,
+    /// `repo_relative_path`, `span`, `git_commit`, `valid_time`. Supplying
+    /// both selectors is a parameter error; `tx_as_of` is rejected with
+    /// `not_implemented` (the transaction-time axis currently covers
+    /// `eg query symbol` only). An ambiguous commit prefix yields
+    /// `ambiguous_commit_prefix`; a miss yields `no_match`. Like every read
+    /// tool, a successful response carries the `freshness` stamp.
+    #[tool(
+        description = "Looks up a symbol's state at a Git commit (full SHA or \
+            unique prefix) or as of an RFC 3339 valid-time instant — the temporal \
+            counterpart to `symbol_context`, mirroring `eg query symbol --at` / \
+            `--as-of`. Exactly one of `commit` or `as_of` is required (both is a \
+            parameter error); `tx_as_of` is not implemented. Returns the citable \
+            row for that version: `record_id`, `name`, `kind`, \
+            `repo_relative_path`, `span`, `git_commit`, `valid_time`. An \
+            ambiguous commit prefix yields `ambiguous_commit_prefix`; a miss \
+            yields `no_match`. Successful responses carry a `freshness` object."
+    )]
+    #[must_use]
+    pub fn symbol_at(&self, Parameters(args): Parameters<SymbolAtArgs>) -> String {
+        if args.symbol_name.is_empty() {
+            return serde_json::to_string(&missing_argument_error("symbol_name"))
+                .unwrap_or_default();
+        }
+        let selector = match resolve_symbol_at_selector(
+            args.commit.as_deref(),
+            args.as_of.as_deref(),
+            args.tx_as_of.as_deref(),
+        ) {
+            Ok(selector) => selector,
+            Err(payload) => return serde_json::to_string(&payload).unwrap_or_default(),
+        };
+        let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let repo_path = opt_repo_path(args.repo_path.as_deref());
+        let client = match DaemonClient::from_data_dir(&data_dir) {
+            Ok(client) => client,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let (records, _unknown, _ts) = match client.get_all_records() {
+            Ok(records) => records,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let mut payload = tool_symbol_at_from_records(&records, &args.symbol_name, selector);
+        stamp_freshness_on_payload(&mut payload, &records, &repo_path, Some(&data_dir));
+        serde_json::to_string(&payload).unwrap_or_default()
+    }
 }
 
 #[tool_handler]
@@ -623,9 +705,9 @@ impl ServerHandler for EgregoreMcpServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("egregore", env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
-                "Egregore knowledge graph tools: six read-only evidence-query \
-                and semantic-search tools plus `record_observation`, which records an \
-                evidence-backed agent observation into the `agent_memory` \
+                "Egregore knowledge graph tools: seven read-only evidence-query, \
+                temporal-lookup, and semantic-search tools plus `record_observation`, \
+                which records an evidence-backed agent observation into the `agent_memory` \
                 domain (it enforces the same provenance contract as \
                 `eg write observation` and can never write into the \
                 deterministic codegraph domain). \
@@ -635,6 +717,10 @@ impl ServerHandler for EgregoreMcpServer {
                 the embedded vector index and returns the same ranked \
                 matches as `eg query semantic`, including the \
                 embedding-provenance envelope and the confidence verdict. \
+                `symbol_at` resolves a symbol's state at a Git commit \
+                (`eg query symbol --at`) or as of a valid-time instant \
+                (`eg query symbol --as-of`); the transaction-time axis is not \
+                exposed on this transport. \
                 All tools return structured JSON with `ok`, `error`, and \
                 trust-separated data sections. \
                 mcp_contract_version={MCP_CONTRACT_VERSION} (frozen tool I/O \
@@ -1282,6 +1368,282 @@ pub fn tool_failure_history_from_records(records: &[GraphRecord], handle: &str) 
         // failure cause is ever inferred — the answer states the limit.
         "safety_note": "No failure cause is inferred from this answer. A target with no recorded failures may still be unsafe: absence of recorded failure is not evidence of safety.",
     })
+}
+
+// ── Temporal symbol lookup (issue #181) ──────────────────────────────────────
+
+/// The validated temporal selector for [`tool_symbol_at_from_records`].
+///
+/// Built by [`resolve_symbol_at_selector`], which enforces the
+/// exactly-one-selector rule before any daemon contact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolAtSelector<'a> {
+    /// A Git commit: full SHA or unique prefix, as supplied by the caller.
+    Commit(&'a str),
+    /// An RFC 3339 valid-time instant, as supplied by the caller.
+    AsOf(&'a str),
+}
+
+/// Validates the temporal selector triple for `symbol_at`.
+///
+/// Exactly one of `commit` / `as_of` must be present (blank strings count as
+/// absent); supplying both — or neither — is a `bad_request` parameter
+/// error. `tx_as_of` is rejected with `not_implemented`: the
+/// transaction-time axis currently covers `eg query symbol` only. A
+/// malformed `as_of` is rejected with `invalid_timestamp`, using the same
+/// message text as the CLI diagnostic.
+///
+/// Pure: performs no I/O, so the tool method validates arguments before
+/// discovering the daemon.
+///
+/// # Errors
+///
+/// Returns the `not_implemented` envelope when `tx_as_of` is supplied, the
+/// `bad_request` envelope when both or neither of `commit` / `as_of` is
+/// supplied, and the `invalid_timestamp` envelope when `as_of` is not valid
+/// RFC 3339.
+pub fn resolve_symbol_at_selector<'a>(
+    commit: Option<&'a str>,
+    as_of: Option<&'a str>,
+    tx_as_of: Option<&str>,
+) -> Result<SymbolAtSelector<'a>, Value> {
+    if let Some(tx) = tx_as_of.map(str::trim).filter(|s| !s.is_empty()) {
+        return Err(symbol_at_error(
+            "not_implemented",
+            &format!(
+                "--tx-as-of is not implemented for symbol_at; the transaction-time axis \
+                 currently covers `eg query symbol` only (got `{tx}`)"
+            ),
+        ));
+    }
+    let commit = commit.map(str::trim).filter(|s| !s.is_empty());
+    let as_of = as_of.map(str::trim).filter(|s| !s.is_empty());
+    match (commit, as_of) {
+        (Some(prefix), None) => Ok(SymbolAtSelector::Commit(prefix)),
+        (None, Some(instant)) => match chrono::DateTime::parse_from_rfc3339(instant) {
+            Ok(_) => Ok(SymbolAtSelector::AsOf(instant)),
+            Err(e) => Err(symbol_at_error(
+                "invalid_timestamp",
+                &format!("invalid --as-of timestamp '{instant}': {e}"),
+            )),
+        },
+        (Some(_), Some(_)) => Err(symbol_at_error(
+            "bad_request",
+            "exactly one temporal selector is required: pass `commit` or `as_of`, not both",
+        )),
+        (None, None) => Err(symbol_at_error(
+            "bad_request",
+            "exactly one temporal selector is required: pass `commit` (full SHA or unique \
+             prefix) or `as_of` (RFC 3339 instant)",
+        )),
+    }
+}
+
+/// Builds a `symbol_at` error envelope sharing the frozen error shape.
+#[must_use]
+fn symbol_at_error(code: &str, message: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": { "code": code, "message": message }
+    })
+}
+
+/// Runs the `symbol_at` temporal lookup over a record slice.
+///
+/// Mirrors the `eg query symbol --at/--as-of` lanes: the commit path reuses
+/// the CLI's distinct-prefix ambiguity scan
+/// ([`crate::cli::temporal_commit_if_prefix`]) plus
+/// [`query::symbols_at_commit`]; the as-of path reuses
+/// [`query::symbol_as_of_valid_time_by_repo`]. A same-name collision across
+/// repositories yields `ambiguous_repository` instead of an implicit pick
+/// (issue #67); an ambiguous commit prefix yields `ambiguous_commit_prefix`;
+/// a miss yields `no_match`.
+///
+/// The success payload carries the citable row — `record_id`, `name`,
+/// `kind`, `repo_relative_path`, `span`, `git_commit`, `valid_time` — whose
+/// CLI-emitted fields are byte-equal to `eg query symbol --at/--as-of` for
+/// the same store and inputs. Only bounded citation handles are returned;
+/// no raw source text (redaction-safe).
+///
+/// Pure: performs no I/O.
+#[must_use]
+pub fn tool_symbol_at_from_records(
+    records: &[GraphRecord],
+    symbol_name: &str,
+    selector: SymbolAtSelector<'_>,
+) -> Value {
+    let index = query::RepositoryIndex::build(records);
+    let record = match selector {
+        SymbolAtSelector::Commit(prefix) => {
+            match commit_version_at(records, &index, symbol_name, prefix) {
+                Ok(record) => record,
+                Err(payload) => return payload,
+            }
+        }
+        SymbolAtSelector::AsOf(instant) => {
+            match as_of_version_at(records, &index, symbol_name, instant) {
+                Ok(record) => record,
+                Err(payload) => return payload,
+            }
+        }
+    };
+    let Some(row) = symbol_at_row(record) else {
+        return symbol_at_no_match(
+            symbol_name,
+            &format!("no match found for symbol `{symbol_name}`"),
+        );
+    };
+    let (kind, value) = match selector {
+        SymbolAtSelector::Commit(prefix) => ("commit", prefix),
+        SymbolAtSelector::AsOf(instant) => ("as_of", instant),
+    };
+    json!({
+        "ok": true,
+        "symbol_name": symbol_name,
+        "selector": { "kind": kind, "value": value },
+        "symbol": row,
+    })
+}
+
+/// Resolves the symbol version the CLI `--at` lane would print.
+///
+/// Scans the distinct commits matching the prefix exactly like
+/// `query_symbol_at` does: zero → `no_match`, two or more →
+/// `ambiguous_commit_prefix`, exactly one → the version at that commit, with
+/// a cross-repository collision reported as `ambiguous_repository` (never an
+/// implicit pick).
+fn commit_version_at<'records>(
+    records: &'records [GraphRecord],
+    index: &query::RepositoryIndex,
+    symbol_name: &str,
+    prefix: &str,
+) -> Result<&'records GraphRecord, Value> {
+    let matching_commits: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter_map(|record| crate::cli::temporal_commit_if_prefix(record, prefix))
+        .collect();
+    if matching_commits.len() > 1 {
+        return Err(json!({
+            "ok": false,
+            "error": {
+                "code": "ambiguous_commit_prefix",
+                "commit_prefix": prefix,
+                "matching_commits": matching_commits.len(),
+                "message": format!(
+                    "ambiguous commit prefix `{prefix}` matches {} commits",
+                    matching_commits.len()
+                ),
+            }
+        }));
+    }
+    let matches = query::symbols_at_commit(records, symbol_name, prefix);
+    check_repository_collision(index, &matches)?.ok_or_else(|| {
+        symbol_at_no_match(
+            symbol_name,
+            &format!("no match found for symbol `{symbol_name}` at commit `{prefix}`"),
+        )
+    })
+}
+
+/// Resolves the symbol version the CLI `--as-of` lane would print: the best
+/// record per repository at or before the instant, failing closed on a
+/// cross-repository collision (issue #67).
+fn as_of_version_at<'records>(
+    records: &'records [GraphRecord],
+    index: &query::RepositoryIndex,
+    symbol_name: &str,
+    instant: &str,
+) -> Result<&'records GraphRecord, Value> {
+    let results =
+        match query::symbol_as_of_valid_time_by_repo(records, symbol_name, instant, index, None) {
+            Ok(results) => results,
+            Err(message) => return Err(symbol_at_error("invalid_timestamp", &message)),
+        };
+    check_repository_collision(index, &results)?.ok_or_else(|| {
+        symbol_at_no_match(
+            symbol_name,
+            &format!("no match found for symbol `{symbol_name}` at or before `{instant}`"),
+        )
+    })
+}
+
+/// Fails closed when candidate records span more than one repository group
+/// (issue #67): returns the single record when every candidate is owned by
+/// one group, `None` when there are no candidates, and the
+/// `ambiguous_repository` envelope on a collision. Mirrors the CLI's
+/// `exit_ambiguous_repository` diagnostic, including the unattributed
+/// legacy-rows flag.
+fn check_repository_collision<'records>(
+    index: &query::RepositoryIndex,
+    matches: &[&'records GraphRecord],
+) -> Result<Option<&'records GraphRecord>, Value> {
+    let groups: std::collections::BTreeSet<Option<&str>> = matches
+        .iter()
+        .map(|record| index.owner_of(record.id()))
+        .collect();
+    if groups.len() > 1 {
+        let repositories: Vec<&str> = groups.iter().filter_map(|group| *group).collect();
+        let mut error = json!({
+            "ok": false,
+            "error": {
+                "code": "ambiguous_repository",
+                "message": "multiple repositories match; the tool cannot pick one implicitly — \
+                            query a single-repository store",
+                "repositories": repositories,
+            }
+        });
+        if groups.contains(&None) {
+            error["error"]["includes_unattributed_rows"] = Value::Bool(true);
+        }
+        return Err(error);
+    }
+    Ok(matches.first().copied())
+}
+
+/// The `no_match` envelope for `symbol_at`, sharing the frozen error shape.
+#[must_use]
+fn symbol_at_no_match(symbol_name: &str, message: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": {
+            "code": "no_match",
+            "symbol_name": symbol_name,
+            "message": message,
+        }
+    })
+}
+
+/// Projects a temporal symbol version to the citable row.
+///
+/// The CLI-emitted fields (`record_id`, `name`, `kind`,
+/// `repo_relative_path`, `span`, `git_commit`) are byte-equal to
+/// `eg query symbol --at/--as-of` for the same record; `valid_time` is the
+/// temporal field the CLI temporal row carries (issue #181). Only bounded
+/// handles — never raw source text.
+#[must_use]
+fn symbol_at_row(record: &GraphRecord) -> Option<Value> {
+    let GraphRecord::Node {
+        id,
+        name,
+        repo_relative_path,
+        span,
+        temporal,
+        valid_time,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    Some(json!({
+        "record_id": id,
+        "name": name.as_deref().unwrap_or(""),
+        "kind": "Symbol",
+        "repo_relative_path": repo_relative_path,
+        "span": span,
+        "git_commit": temporal.as_ref().map(|temporal| temporal.git_commit.as_str()),
+        "valid_time": temporal.as_ref().map(|temporal| temporal.valid_time.as_str())
+            .or(valid_time.as_deref()),
+    }))
 }
 
 // ── Tool runners (daemon I/O) ─────────────────────────────────────────────────

@@ -271,7 +271,8 @@ fn every_shipped_tool_has_a_published_schema() {
             "store_freshness",
             "failure_history",
             "record_observation",
-            "search_code"
+            "search_code",
+            "symbol_at"
         ],
         "contract covers exactly the shipped tools in registration order"
     );

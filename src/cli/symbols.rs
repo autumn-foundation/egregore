@@ -282,6 +282,24 @@ pub(crate) fn symbol_result<'a>(
     }
 }
 
+/// Stamps the temporal `valid_time` on a `SymbolResult` from its record's
+/// temporal metadata (issue #181). Called only by the temporal lanes
+/// (`query symbol --at`/`--as-of`); ordinary current-state rows leave
+/// `valid_time` absent.
+pub(crate) fn stamp_valid_time<'a>(result: &mut SymbolResult<'a>, record: &'a GraphRecord) {
+    if let GraphRecord::Node {
+        temporal,
+        valid_time,
+        ..
+    } = record
+    {
+        result.valid_time = temporal
+            .as_ref()
+            .map(|t| t.valid_time.as_str())
+            .or(valid_time.as_deref());
+    }
+}
+
 /// Builds a `SymbolResult` row for any `Symbol` node record, without a name
 /// predicate. Shared by the exact-name (`query symbol`) and partial-name
 /// (`query symbols`, issue #102) paths so both emit the same row shape.
@@ -324,6 +342,10 @@ pub(crate) fn symbol_row<'a>(
         signature: signature.as_deref(),
         doc: doc.as_deref(),
         git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+        // `valid_time` is stamped only by the temporal lanes (`--at`/`--as-of`,
+        // issue #181): ordinary current-state rows do not carry it, keeping
+        // their output and token cost unchanged.
+        valid_time: None,
         // Only a claim the resolver could have produced is presentable, read
         // through the ONE record-level boundary the text render and the package
         // catalog also use, so no two surfaces can disagree about one record and
@@ -508,6 +530,9 @@ pub(crate) fn query_symbol_at(
                     std::process::exit(2);
                 };
                 stamp_freshness(std::slice::from_mut(&mut result), freshness_code);
+                // `--at` is a temporal lane (issue #181): stamp the valid-time
+                // axis the selector resolved.
+                stamp_valid_time(&mut result, record);
                 // `--at` pins a single commit: the corpus is commit-pinned,
                 // chosen by the selector (issue #427).
                 stamp_symbol_corpus(
