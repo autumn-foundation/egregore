@@ -21,7 +21,8 @@ use aletheia_egregore::{
     mcp::{
         EgregoreMcpServer, SymbolContextArgs, missing_argument_error, stamp_freshness_on_payload,
         tool_failure_history_from_records, tool_freshness_stamp, tool_inspect_store_from_records,
-        tool_symbol_context_from_records, tool_task_evidence_from_records,
+        tool_search_code_from_verb_result, tool_symbol_context_from_records,
+        tool_task_evidence_from_records,
     },
     mcp_contract::{MCP_CONTRACT_TOOLS, MCP_CONTRACT_VERSION, error_schema, response_schema},
 };
@@ -269,7 +270,8 @@ fn every_shipped_tool_has_a_published_schema() {
             "task_evidence",
             "store_freshness",
             "failure_history",
-            "record_observation"
+            "record_observation",
+            "search_code"
         ],
         "contract covers exactly the shipped tools in registration order"
     );
@@ -339,6 +341,37 @@ fn task_evidence_success_conforms_to_published_schema() {
     stamp_freshness_on_payload(&mut payload, &records, Path::new("."), None);
     let schema = response_schema("task_evidence").expect("schema must exist");
     assert_valid(&schema, &payload, "task_evidence success");
+}
+
+/// The `search_code` success payload validates against its published schema
+/// (issue #182): the shaped verb result plus the freshness stamp every read
+/// tool carries.
+#[test]
+fn search_code_success_conforms_to_published_schema() {
+    let records = fixture_records();
+    let verb_result = serde_json::json!({
+        "verb": "semantic_search",
+        "records": [
+            {
+                "record_id": "codegraph:v4:sym",
+                "name": "alpha_fn",
+                "repo_relative_path": "src/lib.rs",
+                "score": 0.9,
+                "span": {
+                    "start_byte": 0, "end_byte": 10,
+                    "start_line": 1, "end_line": 1,
+                    "start_column": null, "end_column": null,
+                },
+            }
+        ],
+        "embedding_provenance": { "metric": "cosine" },
+        "confidence": { "verdict": "strong" },
+    });
+    let mut payload = tool_search_code_from_verb_result("alpha", 10, &verb_result);
+    assert_eq!(payload["ok"], Value::from(true));
+    stamp_freshness_on_payload(&mut payload, &records, Path::new("."), None);
+    let schema = response_schema("search_code").expect("schema must exist");
+    assert_valid(&schema, &payload, "search_code success");
 }
 
 #[test]

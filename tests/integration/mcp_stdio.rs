@@ -237,8 +237,8 @@ fn mcp_stdio_handshake_lists_tools_and_calls_symbol_context() {
         // rmcp requires the initialized notification before serving requests.
         session.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
 
-        // 2. tools/list must return exactly the six documented tools (five
-        // reads plus the record_observation write tool, issue #183).
+        // 2. tools/list must return exactly the seven documented tools (six
+        // reads plus the record_observation write tool, issues #183, #182).
         let list = session.request("tools/list", &json!({}));
         let names: Vec<String> = list["result"]["tools"]
             .as_array()
@@ -257,6 +257,7 @@ fn mcp_stdio_handshake_lists_tools_and_calls_symbol_context() {
             "failure_history".to_owned(),
             "inspect_store".to_owned(),
             "record_observation".to_owned(),
+            "search_code".to_owned(),
             "store_freshness".to_owned(),
             "symbol_context".to_owned(),
             "task_evidence".to_owned(),

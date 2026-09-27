@@ -1,8 +1,9 @@
 //! MCP server for Egregore tools — issue #53.
 //!
 //! Implements the Model Context Protocol using the [`rmcp`] crate and exposes
-//! five read-only tools backed by the existing daemon query, symbol-context,
-//! task-evidence, and failure-history contracts, plus one write tool:
+//! six read-only tools backed by the existing daemon query, symbol-context,
+//! task-evidence, failure-history, and semantic-search contracts, plus one
+//! write tool:
 //!
 //! - **`inspect_store`** — store-inspection summary (record counts, domain breakdown).
 //! - **`symbol_context`** — evidence-backed symbol context, trust-separated by domain.
@@ -11,6 +12,10 @@
 //! - **`failure_history`** — prior failed attempts for a symbol, file, or task
 //!   handle, trust-separated into runtime failures, agent failures, and
 //!   superseding successes (issue #188).
+//! - **`search_code`** — natural-language semantic code search over the embedded
+//!   vector index (issue #182). Reuses the daemon's `semantic_search` verb and
+//!   the issue #104 embedding-compatibility gate, so per-match fields and the
+//!   ranked order are identical to `eg query semantic`.
 //! - **`record_observation`** — records an evidence-backed agent observation
 //!   into the `agent_memory` domain (issue #183). The first write tool on this
 //!   transport: it enforces the same provenance contract as
@@ -66,7 +71,8 @@ use serde_json::{Value, json};
 use crate::{
     GraphRecord, NodeKind,
     adapters::DanglingCitationPolicy,
-    daemon::DaemonClient,
+    cli::semantic,
+    daemon::{DaemonClient, DaemonQueryRejection},
     evidence::{
         EvidenceProvenance, ObservationRequest, ProvenanceError,
         build_observation_records_with_producer, mcp_observation_producer, now_rfc3339,
@@ -76,6 +82,7 @@ use crate::{
     mcp_contract::MCP_CONTRACT_VERSION,
     query,
     schema_version::{UnknownSchemaVersion, record_version, validate_record_version},
+    semantic_confidence::{ConfidenceBand, SEMANTIC_CONFIDENT_THRESHOLD, SEMANTIC_SELECTION_BASIS},
 };
 
 // ── Tool parameter types ──────────────────────────────────────────────────────
@@ -195,10 +202,38 @@ pub struct RecordObservationArgs {
     pub data_dir: Option<String>,
 }
 
+/// Parameters for the `search_code` semantic code search tool (issue #182).
+///
+/// The natural-language entry point for agents: a query string is embedded
+/// with the default local model and ranked against the embedded vector index
+/// through the daemon's `semantic_search` verb, so the returned matches carry
+/// the same per-match fields and ranked order as `eg query semantic`.
+///
+/// Every field is `Option`-typed so the rmcp `Parameters` wrapper can carry a
+/// partially-filled argument object: an absent or whitespace-only `query` is
+/// rejected with the stable `missing_argument` envelope, and an absent
+/// `limit` falls back to the documented default.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchCodeArgs {
+    /// Natural-language query (symbol name, description, or code snippet);
+    /// required, must be non-empty.
+    pub query: Option<String>,
+    /// `AletheiaDB` data directory (default: the server's configured store).
+    pub data_dir: Option<String>,
+    /// Maximum number of matches to return; defaults to 10 (the
+    /// `eg query semantic` default) and is clamped to 100, the daemon verb's
+    /// ceiling.
+    pub limit: Option<u64>,
+    /// Working-tree path the store freshness verdict is computed against
+    /// (default: the MCP server's current directory, mirroring
+    /// `eg freshness`'s default `.`).
+    pub repo_path: Option<String>,
+}
+
 // ── MCP server ────────────────────────────────────────────────────────────────
 
-/// MCP server that exposes the Egregore evidence-query tools plus the
-/// `record_observation` write tool (issue #183).
+/// MCP server that exposes the Egregore evidence-query and semantic-search
+/// tools plus the `record_observation` write tool (issue #183).
 ///
 /// Created by [`run_stdio`] or constructed directly for testing via
 /// [`EgregoreMcpServer::new`].
@@ -519,6 +554,67 @@ impl EgregoreMcpServer {
             }
         }
     }
+
+    /// Semantic code search over the embedded vector index (issue #182).
+    #[tool(description = "Semantic code search: embeds a natural-language \
+            query with the default local model and ranks it against the \
+            embedded vector index, returning the same ranked matches as \
+            `eg query semantic` (record_id, score, name, repo_relative_path, \
+            span, plus the embedding-provenance envelope and the confidence \
+            verdict). Arguments: query (required, non-empty), data_dir \
+            (optional store path), limit (optional, default 10, max 100). \
+            Requires a running daemon (`eg daemon`) and a store ingested \
+            with --embed. Read-only and deterministic.")]
+    #[must_use]
+    pub fn search_code(&self, Parameters(args): Parameters<SearchCodeArgs>) -> String {
+        let trimmed = args.query.as_deref().map(str::trim).unwrap_or_default();
+        if trimmed.is_empty() {
+            let err = missing_argument_error("query");
+            return serde_json::to_string(&err).unwrap_or_default();
+        }
+        #[cfg(feature = "embeddings")]
+        {
+            let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+            let repo_path = opt_repo_path(args.repo_path.as_deref());
+            let limit = search_code_effective_limit(args.limit);
+            // Discover the daemon BEFORE loading the embedding model, so a
+            // missing or stale daemon surfaces `daemon_not_running` /
+            // `daemon_stale` exactly like the other read tools (issue #182).
+            // The helper below re-discovers for the verb call; this probe
+            // only orders the failure modes.
+            if let Err(error) = DaemonClient::from_data_dir(&data_dir) {
+                let err = daemon_error(&error.to_string());
+                return serde_json::to_string(&err).unwrap_or_default();
+            }
+            let query_vector = match semantic::embed_query_text(trimmed) {
+                Ok(vector) => vector,
+                Err(error) => {
+                    return serde_json::to_string(&json!({
+                        "ok": false,
+                        "error": {
+                            "code": "embeddings_unavailable",
+                            "message": format!("failed to embed query: {error:#}"),
+                        }
+                    }))
+                    .unwrap_or_default();
+                }
+            };
+            let payload =
+                tool_search_code_with_vector(&data_dir, &repo_path, trimmed, limit, &query_vector);
+            serde_json::to_string(&payload).unwrap_or_default()
+        }
+        #[cfg(not(feature = "embeddings"))]
+        {
+            serde_json::to_string(&json!({
+                "ok": false,
+                "error": {
+                    "code": "embeddings_unavailable",
+                    "message": "semantic search requires the `embeddings` build feature",
+                }
+            }))
+            .unwrap_or_default()
+        }
+    }
 }
 
 #[tool_handler]
@@ -527,14 +623,18 @@ impl ServerHandler for EgregoreMcpServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("egregore", env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
-                "Egregore knowledge graph tools: five read-only evidence-query \
-                tools plus `record_observation`, which records an \
+                "Egregore knowledge graph tools: six read-only evidence-query \
+                and semantic-search tools plus `record_observation`, which records an \
                 evidence-backed agent observation into the `agent_memory` \
                 domain (it enforces the same provenance contract as \
                 `eg write observation` and can never write into the \
                 deterministic codegraph domain). \
                 Connect to a running local daemon (`eg daemon`) to query the \
                 code-graph, agent observations, and task evidence. \
+                `search_code` answers natural-language code questions against \
+                the embedded vector index and returns the same ranked \
+                matches as `eg query semantic`, including the \
+                embedding-provenance envelope and the confidence verdict. \
                 All tools return structured JSON with `ok`, `error`, and \
                 trust-separated data sections. \
                 mcp_contract_version={MCP_CONTRACT_VERSION} (frozen tool I/O \
@@ -1270,6 +1370,59 @@ fn run_inspect_store(data_dir: &Path, repo_path: &Path) -> Value {
     payload
 }
 
+/// Runs the `search_code` semantic query against a live daemon with a
+/// caller-supplied query vector (issue #182).
+///
+/// The test seam behind the rmcp method: production callers embed the
+/// natural-language query first (the rmcp method does this via
+/// [`semantic::embed_query_text`]); tests inject deterministic synthetic
+/// vectors so no embedding model is needed. `limit` is the already-resolved
+/// effective limit (see [`search_code_effective_limit`]).
+///
+/// Flow:
+/// 1. Connect to the daemon for `data_dir` — a missing or stale daemon
+///    surfaces the existing `daemon_not_running` / `daemon_stale` envelope
+///    before any model loads.
+/// 2. Ask the daemon's `semantic_search` verb for `limit` matches with the
+///    given vector.
+/// 3. A [`DaemonQueryRejection`] maps through [`search_code_rejection_error`]
+///    (missing index, unreadable index, dimension mismatch); any other daemon
+///    failure keeps the existing `daemon_not_running` envelope.
+/// 4. A verb result shapes through [`tool_search_code_from_verb_result`] and,
+///    like every read tool, is stamped with the store-freshness verdict.
+///
+/// Performs daemon I/O.
+#[must_use]
+pub fn tool_search_code_with_vector(
+    data_dir: &Path,
+    repo_path: &Path,
+    query: &str,
+    limit: usize,
+    query_vector: &[f32],
+) -> Value {
+    let client = match DaemonClient::from_data_dir(data_dir) {
+        Ok(c) => c,
+        Err(e) => return daemon_error(&e.to_string()),
+    };
+    let params = json!({ "query_vector": query_vector, "limit": limit });
+    let result = match client.query_verb_raw("semantic_search", &params, None) {
+        Ok(result) => result,
+        Err(e) => {
+            if let Some(rejection) = e.downcast_ref::<DaemonQueryRejection>() {
+                return search_code_rejection_error(rejection);
+            }
+            return daemon_error(&e.to_string());
+        }
+    };
+    let mut payload = tool_search_code_from_verb_result(query, limit, &result);
+    let (records, _unknown, _ts) = match client.get_all_records() {
+        Ok(r) => r,
+        Err(e) => return daemon_error(&e.to_string()),
+    };
+    stamp_freshness_on_payload(&mut payload, &records, repo_path, Some(data_dir));
+    payload
+}
+
 // ── Record → JSON helpers ─────────────────────────────────────────────────────
 
 fn record_to_source_fact(record: &GraphRecord, trust: &query::TrustIndex<'_>) -> Option<Value> {
@@ -1578,6 +1731,150 @@ fn daemon_error(msg: &str) -> Value {
         "ok": false,
         "error": { "code": code, "message": msg }
     })
+}
+
+/// The documented safe default for `search_code`'s `limit`: the same default
+/// `eg query semantic` uses.
+pub const SEARCH_CODE_DEFAULT_LIMIT: usize = 10;
+
+/// The ceiling for `search_code`'s `limit`: the daemon `semantic_search`
+/// verb's maximum.
+pub const SEARCH_CODE_MAX_LIMIT: usize = 100;
+
+/// Resolves the effective match limit for `search_code`.
+///
+/// Absent → the documented default (10); an over-ceiling value → clamped to
+/// 100. The clamp is computed in `u64` and narrowed with a checked
+/// conversion, so extreme `u64` inputs can never truncate or panic.
+///
+/// Pure: performs no I/O.
+#[must_use]
+pub fn search_code_effective_limit(limit: Option<u64>) -> usize {
+    limit.map_or(SEARCH_CODE_DEFAULT_LIMIT, |l| {
+        usize::try_from(l.min(SEARCH_CODE_MAX_LIMIT as u64)).unwrap_or(SEARCH_CODE_MAX_LIMIT)
+    })
+}
+
+/// Maps a daemon `semantic_search` rejection to the tool's stable error
+/// envelope (issue #182).
+///
+/// - `missing_semantic_index` (structural-only store, never `--embed`ed) and
+///   `semantic_index_unreadable` (damaged index, issue #489) keep the
+///   daemon's stable codes; the former carries the re-ingest remedy.
+/// - `incompatible_embedding_dimension` (a vector width the index cannot
+///   share) is refused under the issue #104 refusal-contract code
+///   `embedding_dimension_mismatch` — the same stable code the embedded CLI
+///   path emits — so agents see one vocabulary for one condition.
+/// - Any other rejection keeps the daemon's code and message verbatim; the
+///   tool invents no new vocabulary for conditions it does not classify.
+///
+/// Pure: performs no I/O.
+#[must_use]
+pub fn search_code_rejection_error(rejection: &DaemonQueryRejection) -> Value {
+    match rejection.code.as_str() {
+        "missing_semantic_index" => json!({
+            "ok": false,
+            "error": {
+                "code": "missing_semantic_index",
+                "message": "the store has no semantic vector index; re-ingest with --embed to enable semantic search",
+            }
+        }),
+        "semantic_index_unreadable" => json!({
+            "ok": false,
+            "error": {
+                "code": "semantic_index_unreadable",
+                "message": "the semantic vector index is present but unreadable; it must be rebuilt before semantic search can run",
+            }
+        }),
+        "incompatible_embedding_dimension" => json!({
+            "ok": false,
+            "error": {
+                "code": "embedding_dimension_mismatch",
+                "message": "the query embedding's dimension does not match the index; re-ingest with the current embedding model",
+            }
+        }),
+        code => json!({
+            "ok": false,
+            "error": { "code": code, "message": rejection.message }
+        }),
+    }
+}
+
+/// Classifies a single semantic match's relevance band from its score, using
+/// the same calibrated threshold the CLI's `--daemon` row rendering uses
+/// ([`semantic_confidence`]).
+const fn search_code_confidence_band(score: f32) -> ConfidenceBand {
+    ConfidenceBand::of_score(score)
+}
+
+/// Shapes a daemon `semantic_search` verb result into the `search_code`
+/// success payload (issue #182).
+///
+/// The verb's `records` array is forwarded row-for-row in the daemon's ranked
+/// order — the rows already carry the stable per-match fields
+/// (`record_id`, `score`, `name`, `repo_relative_path`, `span`, plus the
+/// optional repository handles), so no score is recomputed and the ranking
+/// is byte-identical to `eg query semantic`. Each row is enriched with the
+/// per-row confidence rendering the CLI's `--daemon` path emits
+/// (`confidence_band`, `selection_threshold`, `selection_basis`). The issue
+/// #243 `embedding_provenance` envelope and the issue #221 `confidence`
+/// verdict ride along verbatim, so agents can audit model/index identity and
+/// the relevance-floor decision.
+///
+/// An empty `records` array is a successful, explicitly-empty answer with the
+/// stable `no_semantic_matches` marker — never a fabricated or back-filled
+/// record, never an error.
+///
+/// Pure: performs no I/O and contacts no daemon.
+#[must_use]
+pub fn tool_search_code_from_verb_result(query: &str, limit: usize, result: &Value) -> Value {
+    let empty = result
+        .get("records")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty);
+    let records: &[Value] = result
+        .get("records")
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice);
+    let matches: Vec<Value> = records
+        .iter()
+        .map(|row| {
+            let mut enriched = row.clone();
+            if let Some(obj) = enriched.as_object_mut() {
+                // The CLI's `--daemon` row rendering (src/cli/semantic.rs);
+                // the precision loss is negligible for a threshold comparison.
+                #[allow(clippy::cast_possible_truncation)]
+                let band = search_code_confidence_band(
+                    row.get("score").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                );
+                obj.insert("confidence_band".to_owned(), Value::from(band.as_str()));
+                obj.insert(
+                    "selection_threshold".to_owned(),
+                    json!(SEMANTIC_CONFIDENT_THRESHOLD),
+                );
+                obj.insert(
+                    "selection_basis".to_owned(),
+                    Value::from(SEMANTIC_SELECTION_BASIS),
+                );
+            }
+            enriched
+        })
+        .collect();
+    let mut payload = json!({
+        "ok": true,
+        "query": query,
+        "limit": limit,
+        "matches": matches,
+        "embedding_provenance": result.get("embedding_provenance").unwrap_or(&Value::Null),
+        "confidence": result.get("confidence").unwrap_or(&Value::Null),
+        "compatibility_note": "daemon-path embeddings are embedded with the daemon build's model; for the local-CLI compatibility gate (identity + dimension checks, issue #104), use `eg query semantic` against the same store",
+    });
+    if empty {
+        payload["message"] = Value::from(
+            "no_semantic_matches: no records in the semantic index cleared the relevance floor",
+        );
+    }
+    payload
 }
 
 /// Builds the [`ObservationRequest`] for the `record_observation` tool.

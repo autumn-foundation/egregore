@@ -92,7 +92,7 @@ The tier of every response field is recorded in the per-tool tables below.
 
 ## 4 — Tools
 
-Five tools are read-only; `record_observation` (§4.6) is the single write
+Six tools are read-only; `record_observation` (§4.6) is the single write
 tool. All tool *inputs* are JSON objects; every tool accepts `data_dir`
 (default `.egregore`) to locate the store. The read tools additionally accept
 `repo_path` (default: the server's current directory) for the working tree the
@@ -316,6 +316,68 @@ offending field; a call missing any required provenance field or citing zero
 evidence targets is rejected and writes nothing), `write_rejected` (the store
 refused the batch, e.g. a dangling evidence target — nothing was persisted),
 `write_failed` (transport failure during the write), plus the daemon codes
+(`daemon_not_running` / `daemon_stale` when no usable daemon is discovered).
+
+---
+
+### 4.7 `search_code`
+
+Semantic code search over the embedded vector index (issue #182) — the
+natural-language entry point the MCP surface was missing. The query is
+embedded with the default local model and ranked through the daemon's
+`semantic_search` verb, so the returned matches carry the same per-match
+fields and ranked order as `eg query semantic`. Requires a running local
+daemon and a store ingested with `--embed` when called over the wire (the
+`tool_search_code_from_verb_result` helper used in tests shapes a verb result
+directly).
+
+**Inputs**
+
+| Parameter | Type | Required | Notes |
+|---|---|---|---|
+| `query` | string | yes | Natural-language query; must be non-empty. An empty query is rejected with the stable `missing_argument` envelope before any daemon is contacted |
+| `data_dir` | string | no | AletheiaDB data directory (default `.egregore`) |
+| `limit` | integer | no | Maximum matches; defaults to 10 (the `eg query semantic` default), clamped to 100 (the daemon verb's ceiling) |
+| `repo_path` | string | no | Working tree for the freshness verdict (default `.`) |
+
+**Success response**
+
+| Field | Type | Tier | Notes |
+|---|---|---|---|
+| `ok` | `true` | stable | |
+| `query` | string | stable | The query, echoed verbatim |
+| `limit` | integer | stable | The effective match limit after default/clamp |
+| `matches` | array | stable | Ranked semantic matches in daemon order (score-descending, ties by record ID). Items: the stable `eg query semantic` per-match fields — see the match-row schema below |
+| `matches[].record_id` | string | stable | Byte-identical to `eg query semantic` |
+| `matches[].score` | number | stable | Cosine relevance score; agrees with the embedded CLI path within the documented 1e-4 daemon-vs-embedded tolerance |
+| `matches[].name` | string | stable | Absent when the daemon row omits it (same absent-when-`None` rule as the CLI) |
+| `matches[].repo_relative_path` | string | stable | Absent when the daemon row omits it |
+| `matches[].span` | object | stable | Source span handle; absent when the daemon row omits it |
+| `matches[].repository_id` / `matches[].repository` | string | stable | Owning-repository handles; absent for unattributed records |
+| `matches[].confidence_band` | string | stable | `strong` (clears the calibrated floor) or `weak`; the same per-row rendering the CLI's `--daemon` path emits |
+| `matches[].selection_threshold` | number | stable | The calibrated confident threshold the band was classified against |
+| `matches[].selection_basis` | string | stable | How the threshold was derived (`corpus_calibrated_confidence_floor`) |
+| `embedding_provenance` | object \| null | stable | The issue #243 envelope forwarded verbatim: query/index model identity, metric, index fingerprint, model-match verdict |
+| `confidence` | object \| null | stable | The issue #221 verdict forwarded verbatim (verdict, best score, thresholds, selection basis) |
+| `compatibility_note` | string | provisional | Discloses the daemon-path embedding compatibility caveat (issue #104) |
+| `message` | string | stable | Present only on the explicit empty answer; names the stable `no_semantic_matches` marker |
+| `freshness` | object | stable | §6 |
+
+Rows are redaction-safe: bounded handles only — no raw source text,
+summaries, or payload bytes appear anywhere.
+
+**Empty answer** — an index with no vectors clearing the relevance floor is
+a successful, explicitly-empty answer (`ok: true`, `matches: []`, the
+`no_semantic_matches` message) — never a fabricated or back-filled record,
+never an error.
+
+**Errors** — see §5.8: `missing_argument` (empty `query`),
+`missing_semantic_index` (structural-only store, never `--embed`ed —
+re-ingest to enable search), `semantic_index_unreadable` (present but
+damaged index, refused as data loss, never misreported as "never embedded"),
+`embedding_dimension_mismatch` (the issue #104 refusal: the query embedding's
+width disagrees with the index), `embeddings_unavailable` (the build lacks
+the `embeddings` feature or the model failed to load), plus the daemon codes
 (`daemon_not_running` / `daemon_stale` when no usable daemon is discovered).
 
 ---

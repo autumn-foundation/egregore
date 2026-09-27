@@ -74,6 +74,7 @@ mod mcp_contract;
 mod mcp_failure_history;
 mod mcp_freshness;
 mod mcp_record_observation;
+mod mcp_search_code;
 mod mcp_stdio;
 mod memory_audit;
 mod memory_evidence_health;

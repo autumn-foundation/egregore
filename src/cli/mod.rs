@@ -80,7 +80,7 @@ mod scan;
 mod scan_logs;
 mod schema;
 mod schema_constraints;
-mod semantic;
+pub(crate) mod semantic;
 mod subsystem;
 mod symbols;
 mod task;

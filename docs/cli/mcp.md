@@ -2,7 +2,7 @@
 
 `eg mcp` is the **primary way a coding agent talks to Egregore**: a stdio
 [Model Context Protocol](https://modelcontextprotocol.io/) server exposing
-five **read-only**, citation-bearing tools backed by the running local
+six **read-only**, citation-bearing tools backed by the running local
 daemon. Register it once in your agent host; the agent then calls Egregore's
 evidence tools over MCP instead of shelling out to `eg query …` per question —
 which keeps tool discovery, the structured-output contract, and the citation
@@ -28,7 +28,7 @@ envelope intact.
    eg daemon status --data-dir /abs/path/to/.egregore   # confirm it is up
    ```
 
-   All five tools fail closed when no daemon answers for `--data-dir`
+   All six tools fail closed when no daemon answers for `--data-dir`
    (see [Error envelope](#error-envelope) — gate on it, don't retry blindly).
 
 3. **Register the server** in your agent host with one of the copy-paste
@@ -46,7 +46,7 @@ envelope intact.
 
    The first line must contain `"serverInfo":{"name":"egregore",…}` and the
    third must list exactly `inspect_store`, `symbol_context`, `task_evidence`,
-   `store_freshness`, `failure_history`.
+   `store_freshness`, `failure_history`, `search_code`.
    (This is the same handshake `tests/integration/mcp_stdio.rs` proves on
    every CI run.)
 
@@ -119,7 +119,7 @@ Every tool takes an optional `data_dir` argument (string, defaults to the
 `--data-dir` the server was started with) and returns a JSON text payload.
 The top-level shape is stable: **`"ok": true`** with data fields, or
 **`"ok": false`** with an `"error"` object — never a bare string, never an
-HTTP-style status. The five tool names are stable; the response is additive
+HTTP-style status. The six tool names are stable; the response is additive
 (fields may be added, existing fields are not renamed or removed without a
 contract change — tracked by issue #194).
 
@@ -236,6 +236,43 @@ Stable error codes: `missing_argument` (empty `handle`), `unsupported_handle`
 `candidates`), `no_match` (handle resolved to nothing live),
 `stale_handle` (handle named only tombstoned records), plus the daemon codes
 below.
+
+### `search_code`
+
+Semantic code search over the embedded vector index (issue #182) — the
+natural-language entry point the MCP surface was missing. Embeds the query
+with the default local model and ranks it through the daemon's
+`semantic_search` verb, returning the same ranked matches as
+`eg query semantic`: per-match `record_id`, `score`, `name`,
+`repo_relative_path`, `span`, plus the per-row confidence rendering
+(`confidence_band`, `selection_threshold`, `selection_basis`), the issue #243
+`embedding_provenance` envelope (query/index model identity, metric, index
+fingerprint, model-match verdict), and the issue #221 `confidence` verdict.
+Requires a running daemon and a store ingested with `--embed`.
+
+Arguments: `{ "query": string (required, non-empty), "data_dir"?: string, "limit"?: integer, "repo_path"?: string }`
+
+`limit` defaults to 10 (the `eg query semantic` default) and is clamped to
+100, the daemon verb's ceiling. An empty query is rejected with the stable
+`missing_argument` envelope before any daemon is contacted.
+
+Stable `ok: true` fields: `query` (echoed), `limit` (effective),
+`matches` (ranked rows, daemon order), `embedding_provenance`,
+`confidence`, `compatibility_note`, `freshness`. An index with no vectors
+clearing the relevance floor is a successful, explicitly-empty answer
+(`matches: []` with a `no_semantic_matches` message) — never a fabricated
+record.
+
+Stable error codes: `missing_semantic_index` (structural-only store, never
+`--embed`ed — re-ingest to enable search), `semantic_index_unreadable`
+(present but damaged index, refused as data loss, never misreported as
+"never embedded"), `embedding_dimension_mismatch` (the issue #104 refusal:
+query embedding width disagrees with the index), `embeddings_unavailable`
+(the build lacks the `embeddings` feature or the model failed to load), plus
+the daemon codes below.
+
+Rows are redaction-safe: bounded handles only — no raw source text,
+summaries, or payload bytes appear anywhere.
 
 ## Freshness stamping
 

@@ -46,13 +46,14 @@ pub const MCP_CONTRACT_VERSION: u32 = 1;
 /// Tool names covered by the frozen contract, in `tool_router` registration
 /// order. Any new MCP tool (e.g. #181, #182) must extend this
 /// list and register its schema here before it ships.
-pub const MCP_CONTRACT_TOOLS: [&str; 6] = [
+pub const MCP_CONTRACT_TOOLS: [&str; 7] = [
     "inspect_store",
     "symbol_context",
     "task_evidence",
     "store_freshness",
     "failure_history",
     "record_observation",
+    "search_code",
 ];
 
 /// Returns the published JSON Schema (Draft 2020-12) for a shipped tool's
@@ -76,6 +77,7 @@ pub fn response_schema(tool_name: &str) -> Option<Value> {
         "store_freshness" => Some(store_freshness_schema()),
         "failure_history" => Some(failure_history_schema()),
         "record_observation" => Some(record_observation_schema()),
+        "search_code" => Some(search_code_schema()),
         _ => None,
     }
 }
@@ -845,6 +847,111 @@ fn record_observation_schema() -> Value {
                 "type": "integer",
                 "description": "Records the daemon accepted in the write batch (Agent, AgentSession, Observation nodes plus SESSION_OF and AUTHORED_BY edges)."
             }
+        }
+    });
+    merge_objects(schema, body)
+}
+
+/// One ranked semantic match row in a `search_code` success response.
+///
+/// The row fields are the stable `eg query semantic` per-match fields —
+/// bounded handles only (no raw source text, summaries, or payload bytes) —
+/// plus the per-row confidence rendering the CLI's `--daemon` path emits.
+fn search_code_match_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["record_id", "score", "confidence_band", "selection_threshold", "selection_basis"],
+        "properties": {
+            "record_id": {
+                "type": "string",
+                "description": "Stable record ID of the matched graph record (byte-identical to `eg query semantic`)."
+            },
+            "score": {
+                "type": "number",
+                "description": "Cosine relevance score; rows are ranked score-descending, ties by record ID."
+            },
+            "name": {
+                "type": "string",
+                "description": "Symbol/file name (absent when the daemon row omits it)."
+            },
+            "repo_relative_path": {
+                "type": "string",
+                "description": "Repo-relative file handle (absent when the daemon row omits it)."
+            },
+            "span": {
+                "type": "object",
+                "description": "Source span handle (start/end byte, line, column; absent when the daemon row omits it)."
+            },
+            "repository_id": {
+                "type": "string",
+                "description": "Canonical ID of the owning repository (absent for unattributed records)."
+            },
+            "repository": {
+                "type": "string",
+                "description": "Repository short handle (absent for unattributed records)."
+            },
+            "confidence_band": {
+                "type": "string",
+                "enum": ["strong", "weak"],
+                "description": "Relevance band from the calibrated confidence floor (`strong` clears it, `weak` does not)."
+            },
+            "selection_threshold": {
+                "type": "number",
+                "description": "The calibrated confident threshold the band was classified against."
+            },
+            "selection_basis": {
+                "type": "string",
+                "description": "How the threshold was derived (corpus-calibrated confidence floor)."
+            }
+        }
+    })
+}
+
+fn search_code_schema() -> Value {
+    let schema = schema_head(
+        "search_code",
+        "Semantic code search over the embedded vector index: the same ranked matches as `eg query semantic`, with the embedding-provenance envelope and the confidence verdict (issue #182).",
+    );
+    let body = json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+            "ok", "query", "limit", "matches",
+            "embedding_provenance", "confidence", "freshness"
+        ],
+        "properties": {
+            "ok": { "const": true },
+            "query": {
+                "type": "string",
+                "description": "The natural-language query, echoed verbatim."
+            },
+            "limit": {
+                "type": "integer",
+                "description": "The effective match limit (default 10, clamped to 100)."
+            },
+            "matches": {
+                "type": "array",
+                "description": "Ranked semantic matches, daemon order (score-descending, ties by record ID); empty with a `message` marker on no-match.",
+                "items": search_code_match_schema()
+            },
+            "embedding_provenance": {
+                "type": ["object", "null"],
+                "description": "The issue #243 provenance envelope: query/index model identity, metric, index fingerprint, and the model-match verdict (forwarded verbatim from the daemon)."
+            },
+            "confidence": {
+                "type": ["object", "null"],
+                "description": "The issue #221 confidence verdict (verdict, best score, thresholds, selection basis; forwarded verbatim from the daemon)."
+            },
+            "compatibility_note": {
+                "type": "string",
+                "description": "Discloses the daemon-path embedding compatibility caveat (issue #104)."
+            },
+            "message": {
+                "type": "string",
+                "description": "Present on the explicit empty answer (`no_semantic_matches`), naming the stable marker."
+            },
+            "freshness": freshness_schema()
         }
     });
     merge_objects(schema, body)

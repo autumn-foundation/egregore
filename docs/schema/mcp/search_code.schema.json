@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Semantic code search over the embedded vector index: the same ranked matches as `eg query semantic`, with the embedding-provenance envelope and the confidence verdict (issue #182).",
+  "properties": {
+    "compatibility_note": {
+      "description": "Discloses the daemon-path embedding compatibility caveat (issue #104).",
+      "type": "string"
+    },
+    "confidence": {
+      "description": "The issue #221 confidence verdict (verdict, best score, thresholds, selection basis; forwarded verbatim from the daemon).",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "embedding_provenance": {
+      "description": "The issue #243 provenance envelope: query/index model identity, metric, index fingerprint, and the model-match verdict (forwarded verbatim from the daemon).",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "freshness": {
+      "additionalProperties": true,
+      "properties": {
+        "current_dirty": {
+          "type": "boolean"
+        },
+        "current_head": {
+          "additionalProperties": true,
+          "properties": {
+            "sha": {
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "commit",
+                "no_git",
+                "unborn_head"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        "fresh": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string"
+        },
+        "repo_path": {
+          "type": "string"
+        },
+        "repository_id": {
+          "type": "string"
+        },
+        "stored_snapshot": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "properties": {
+                "dirty": {
+                  "type": "boolean"
+                },
+                "head": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "sha": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "enum": [
+                        "commit",
+                        "no_git",
+                        "unborn_head"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "state"
+                  ],
+                  "type": "object"
+                },
+                "repository_id": {
+                  "type": "string"
+                },
+                "scanned_at": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "head",
+                "dirty",
+                "repository_id",
+                "scanned_at"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Explicit marker for a pre-stamping store — never a silent absence, never a false `fresh`.",
+              "properties": {
+                "state": {
+                  "const": "pre_stamping"
+                }
+              },
+              "required": [
+                "state"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "verdict": {
+          "enum": [
+            "fresh",
+            "stale_head",
+            "stale_dirty",
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict",
+        "fresh",
+        "repository_id",
+        "repo_path",
+        "stored_snapshot",
+        "current_head",
+        "current_dirty",
+        "message"
+      ],
+      "type": "object"
+    },
+    "limit": {
+      "description": "The effective match limit (default 10, clamped to 100).",
+      "type": "integer"
+    },
+    "matches": {
+      "description": "Ranked semantic matches, daemon order (score-descending, ties by record ID); empty with a `message` marker on no-match.",
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "confidence_band": {
+            "description": "Relevance band from the calibrated confidence floor (`strong` clears it, `weak` does not).",
+            "enum": [
+              "strong",
+              "weak"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "description": "Symbol/file name (absent when the daemon row omits it).",
+            "type": "string"
+          },
+          "record_id": {
+            "description": "Stable record ID of the matched graph record (byte-identical to `eg query semantic`).",
+            "type": "string"
+          },
+          "repo_relative_path": {
+            "description": "Repo-relative file handle (absent when the daemon row omits it).",
+            "type": "string"
+          },
+          "repository": {
+            "description": "Repository short handle (absent for unattributed records).",
+            "type": "string"
+          },
+          "repository_id": {
+            "description": "Canonical ID of the owning repository (absent for unattributed records).",
+            "type": "string"
+          },
+          "score": {
+            "description": "Cosine relevance score; rows are ranked score-descending, ties by record ID.",
+            "type": "number"
+          },
+          "selection_basis": {
+            "description": "How the threshold was derived (corpus-calibrated confidence floor).",
+            "type": "string"
+          },
+          "selection_threshold": {
+            "description": "The calibrated confident threshold the band was classified against.",
+            "type": "number"
+          },
+          "span": {
+            "description": "Source span handle (start/end byte, line, column; absent when the daemon row omits it).",
+            "type": "object"
+          }
+        },
+        "required": [
+          "record_id",
+          "score",
+          "confidence_band",
+          "selection_threshold",
+          "selection_basis"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "message": {
+      "description": "Present on the explicit empty answer (`no_semantic_matches`), naming the stable marker.",
+      "type": "string"
+    },
+    "ok": {
+      "const": true
+    },
+    "query": {
+      "description": "The natural-language query, echoed verbatim.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "ok",
+    "query",
+    "limit",
+    "matches",
+    "embedding_provenance",
+    "confidence",
+    "freshness"
+  ],
+  "title": "Egregore MCP tool response: search_code",
+  "type": "object"
+}
