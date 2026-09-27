@@ -18,6 +18,7 @@ eg query drift            --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--f
 eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--under <PREFIX>] [--embed-model <MODEL>] [--format json|text]
 eg query semantic-context <QUERY> --data-dir <DIR> [--limit N] [--min-score F] [--repo <SELECTOR>]
 eg query semantic-memory <QUERY> --data-dir <DIR> [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
+eg query semantic-memory <QUERY> --data-dir <DIR> [--collapse] [--collapse-mode auto|embedding-cosine|normalized-text] [--similarity-threshold F] [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
 eg query implementors <TRAIT> --graph <PATH>   [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
 eg query implementors <TRAIT> --data-dir <DIR> [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
 eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>] [--max-records N] [--candidate <RECORD_ID|FILE:SPAN>]
@@ -77,7 +78,9 @@ Evidence-backed audit subcommands have their own pages:
   provenance, trust-separated from code
   ([semantic-memory-recall.md](semantic-memory-recall.md), issue #91). Supports
   recall-time filtering of superseded and contradicted memories
-  ([recall-supersession.md](recall-supersession.md), issue #92).
+  ([recall-supersession.md](recall-supersession.md), issue #92), and
+  recall-time collapse of near-duplicate observations via `--collapse`
+  (issue #163).
 - `eg query failures` — **prior failed attempts** linked to a code or task
   handle ([failure-history.md](failure-history.md), issue #63).
 - `eg query failure-hotspots` — **code targets ranked by repeated
@@ -233,7 +236,7 @@ Most subcommands accept exactly one input source:
 - `--graph <PATH>` — read from a JSONL file produced by `eg scan` or `eg scan-history`.
 - `--data-dir <DIR>` — read from an embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. Requires the `embedded-aletheiadb` feature (enabled by default). Providing both `--graph` and `--data-dir` is an error.
 
-`eg query semantic`, `eg query semantic-context`, and `eg query semantic-memory` accept **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results. `eg query semantic` returns only deterministic **code** hits; `eg query semantic-memory` returns only **agent-authored** memory hits — the two are never blended (issue #91). `eg query semantic-context` follows the `eg query context` no-match convention: on no semantic hit clearing `--min-score` it prints `{"ok":false,"error":{"code":"no_match",...}}` to **stdout** and exits `2`.
+`eg query semantic`, `eg query semantic-context`, and `eg query semantic-memory` accept **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results — except `eg query semantic-memory --collapse`, which degrades to normalized-text equality clustering over every recallable memory record without loading a model (issue #163). `eg query semantic` returns only deterministic **code** hits; `eg query semantic-memory` returns only **agent-authored** memory hits — the two are never blended (issue #91). `eg query semantic-context` follows the `eg query context` no-match convention: on no semantic hit clearing `--min-score` it prints `{"ok":false,"error":{"code":"no_match",...}}` to **stdout** and exits `2`.
 
 ### Subsystem scoping — `eg query semantic --under <PREFIX>` (issue #198)
 
@@ -272,6 +275,68 @@ Outcomes:
   outcome is worded distinctly from the `no results — store may not have
   embeddings` message so an agent can tell "nothing under this prefix" apart from
   "this store has no semantic index".
+
+### Recall-time observation collapse — `eg query semantic-memory --collapse` (issue #163)
+
+`eg query semantic-memory --collapse` groups near-duplicate observations into
+clusters and returns **one representative row per cluster** instead of every
+row, so a session that re-learned the same lesson five times costs one row
+instead of five. The answer starts with a JSON envelope naming the requested
+mode, the actual mode, the similarity threshold, and the source/representative
+counts, followed by one compact row per representative.
+
+- **Flag**: `--collapse`. Without it the recall answer is byte-for-byte
+  unchanged (existing exit-2 contract preserved).
+- **Eligibility** (conservative): agent-authored observation-class records
+  (`Observation`/`Decision`/`Failure`) sharing the **same primary cited code
+  target** — the deterministically resolved `OBSERVES` / `MENTIONS_SYMBOL`
+  target, honoring both inline evidence links and standalone outgoing edges.
+  `as_of_commit` is part of the target identity, so the same record cited at
+  two commits never merges. A record citing no code target is always its own
+  singleton; an agent-authored observation never merges with a deterministic
+  code fact.
+- **Modes** (`--collapse-mode auto|embedding-cosine|normalized-text`):
+  `embedding-cosine` reuses the **stored** vectors (cosine similarity, no
+  re-embedding; a missing vector fails closed to singleton behavior);
+  `normalized-text` clusters on case-folded, whitespace-collapsed equality of
+  the stored (redacted) body text and never loads a model. `auto` (default)
+  picks `embedding-cosine` when the store has a loaded vector index and
+  degrades to `normalized-text` when the store was never embedded — so
+  `--collapse` works on a store without embeddings while plain recall still
+  exits 2 there. An unreadable (damaged) index is refused, not degraded over.
+- **Threshold** (`--similarity-threshold <F>`, `[0.0, 1.0]`, pinned default
+  `0.85`, echoed in the envelope; ignored by normalized-text equality).
+  Raising it monotonically refines the partition — clusters only split, never
+  merge; lowering it monotonically coarsens it.
+- **Representative order** (total): highest confidence, then earliest
+  `observed_at`, then lexicographically smallest record ID — the documented
+  total order for issue #163. The representative is a real stored record with
+  its provenance (`agent_id`, `session_id`, `observed_at`, `confidence`,
+  `evidence_links`) intact.
+- **Member fields**: every representative row carries `cluster_size`, the
+  complete `member_ids` list (representative first, the rest in
+  representative order), `cluster_observed_at_min` /
+  `cluster_observed_at_max`, and a `trust_spread` histogram over the #114
+  trust classes of its members. Collapsing happens **before** `--limit` is
+  applied, so the limit bounds representatives, not source rows.
+- **Read-only**: nothing is rewritten, merged, or deleted; the store
+  fingerprint is identical before and after.
+
+This is recall-time presentation, not persistence. It differs from the three
+adjacent dedupe surfaces on purpose:
+
+- **#94** (composition-health measurement) *measures* the store's
+  composition health and explicitly never collapses anything; `--collapse`
+  groups recalled observations without measuring the store.
+- **#131** (budget-fit packing) fits an answer to a token budget but
+  collapses nothing — a budget filled with restatements is still wasted
+  tokens; `--collapse` is the upstream pre-pass that makes a budgeted pack
+  go further, and it never enforces a token ceiling itself.
+- **#92** (supersession flagging via `--supersession` /
+  [recall-supersession.md](recall-supersession.md)) flags superseded or
+  contradicted records and filters *which* records are recalled;
+  `--collapse` groups the recalled ones. A cluster may mix trust classes
+  and reports that mix in `trust_spread`.
 
 ## Capability manifest (`eg query lanes`, issue #251)
 

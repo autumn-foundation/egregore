@@ -1604,6 +1604,30 @@ pub(crate) enum OutputFormat {
     Text,
 }
 
+/// Collapse clustering mode for `eg query semantic-memory --collapse`
+/// (issue #163).
+///
+/// Only used by the `embeddings`-gated `SemanticMemory` subcommand, so the
+/// enum is gated the same way: without the feature it would be dead code.
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, clap::ValueEnum, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CollapseModeArg {
+    /// Use embedding-cosine similarity when the store has a loaded vector
+    /// index; degrade to normalized-text equality clustering when the store
+    /// was never embedded. An unreadable index is refused, not degraded over.
+    #[default]
+    Auto,
+    /// Cosine similarity over stored vectors; refused without a loaded
+    /// vector index (no silent fallback).
+    #[value(name = "embedding-cosine")]
+    EmbeddingCosine,
+    /// Normalized-text equality clustering over the stored (redacted) body
+    /// text; works without embeddings and never loads a model.
+    #[value(name = "normalized-text")]
+    NormalizedText,
+}
+
 /// Test-vs-production role selector for the scopable code lanes
 /// (`query symbol`, `query file`; issue #238).
 ///
@@ -2098,6 +2122,31 @@ pub(crate) enum QuerySubcommand {
         /// Supersession resolution mode for memory/observations.
         #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
         supersession: crate::temporal_status::SupersessionMode,
+        /// Collapse near-duplicate observations into one representative row
+        /// per cluster (issue #163).
+        ///
+        /// The answer starts with an envelope naming the requested and actual
+        /// modes, the similarity threshold, and source/representative counts,
+        /// followed by one compact row per representative carrying
+        /// `cluster_size`, `member_ids`, `cluster_observed_at_min`,
+        /// `cluster_observed_at_max`, and `trust_spread`. Without this flag the
+        /// recall answer is unchanged.
+        #[arg(long)]
+        collapse: bool,
+        /// Cosine-similarity threshold for collapse clustering, in `[0.0, 1.0]`
+        /// (issue #163). Pinned default 0.85, echoed in the answer envelope;
+        /// ignored by normalized-text equality clustering. Raising it
+        /// monotonically refines the partition (clusters only split, never
+        /// merge); lowering it monotonically coarsens it.
+        #[arg(long, default_value_t = crate::query::DEFAULT_COLLAPSE_SIMILARITY_THRESHOLD)]
+        similarity_threshold: f32,
+        /// Collapse clustering mode (issue #163). `auto` (default) uses
+        /// embedding-cosine similarity when the store has a loaded vector
+        /// index and degrades to normalized-text equality when the store was
+        /// never embedded; an unreadable index is refused rather than
+        /// degraded over.
+        #[arg(long, value_enum, default_value_t = CollapseModeArg::Auto)]
+        collapse_mode: CollapseModeArg,
     },
     /// Retrieve evidence-backed context for a named symbol.
     ///
@@ -8223,6 +8272,9 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             not_agent,
             format,
             supersession,
+            collapse,
+            similarity_threshold,
+            collapse_mode,
         } => query_semantic_memory(
             &query,
             &data_dir,
@@ -8233,6 +8285,9 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             not_agent.as_deref(),
             format,
             supersession,
+            collapse,
+            similarity_threshold,
+            collapse_mode,
         ),
         QuerySubcommand::Context {
             name,

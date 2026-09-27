@@ -51,6 +51,9 @@ eg query semantic-memory "what breaks when the input file is empty?" \
 eg query semantic-memory <QUERY> --data-dir <DIR> [--repo <SELECTOR>] \
     [--limit <N>] [--verified-only] [--agent <AGENT_ID>] [--not-agent <AGENT_ID>] \
     [--supersession <exclude|include-but-flag>] [--format json|text]
+eg query semantic-memory <QUERY> --data-dir <DIR> --collapse \
+    [--collapse-mode <auto|embedding-cosine|normalized-text>] \
+    [--similarity-threshold <F>] [--limit <N>] [--format json|text]
 ```
 
 Reads directly from an embedded AletheiaDB store (`--data-dir`). The query string
@@ -68,6 +71,9 @@ contacted.
 | `--not-agent <AGENT_ID>` | Exclude observations authored by this agent identity (see "Author scoping"). |
 | `--supersession <mode>` | `exclude` (default) or `include-but-flag` (see [recall-supersession.md](recall-supersession.md)). |
 | `--format` | `json` (default) or `text`. |
+| `--collapse` | Collapse near-duplicate observations: one representative row per cluster, preceded by an envelope naming the requested/actual mode, threshold, and source/representative counts (issue #163; see below). |
+| `--collapse-mode <mode>` | `auto` (default), `embedding-cosine`, or `normalized-text`. |
+| `--similarity-threshold <F>` | Cosine-similarity threshold in `[0.0, 1.0]` (default `0.85`, echoed in the envelope); ignored by normalized-text equality clustering. |
 
 | Condition | Exit |
 |-----------|------|
@@ -231,6 +237,53 @@ equivalent ordered results and identical aggregate metrics.
 `rg` + `jq` over transcripts are honest substitutes for literal recall, but they
 cannot retrieve by meaning, separate trust classes, or attach citable record and
 transcript handles.
+
+## Collapsing near-duplicate observations (issue #163)
+
+When several sessions re-learn the same lesson, plain recall returns every
+restatement. `--collapse` groups near-duplicates into clusters and returns one
+representative row per cluster:
+
+```sh
+eg query semantic-memory "what did past sessions learn?" \
+  --data-dir .egregore --collapse
+```
+
+The answer is an envelope line followed by one JSON row per representative
+(`--limit` bounds representatives, not source rows):
+
+```jsonc
+{"ok": true, "query": "...", "collapse": {"enabled": true, "mode": "embedding-cosine",
+  "mode_requested": "auto", "similarity_threshold": 0.85,
+  "threshold_monotonicity": "raising the threshold monotonically refines the partition …",
+  "source_records": 25, "representatives": 5, "collapsed_away": 20}}
+{"record_id": "…", "kind": "Observation", "trust_class": "agent_authored",
+  "representative_trust_class": "agent_verified", "cluster_size": 5,
+  "member_ids": ["…", "…"], "cluster_observed_at_min": "…",
+  "cluster_observed_at_max": "…", "trust_spread": {"agent_verified": 2, "agent_unverified": 3},
+  "primary_cited_target": {"record_id": "…", "relation": "OBSERVES"}, "memory_text": "…"}
+```
+
+- **Eligibility**: agent-authored observation-class records sharing the same
+  primary cited code target (`OBSERVES` / `MENTIONS_SYMBOL`, inline links and
+  standalone edges; `as_of_commit` is part of the identity). Target-less
+  records stay singletons; observations never merge with deterministic code
+  facts.
+- **Modes**: `embedding-cosine` reuses stored vectors (missing vectors fail
+  closed to singletons); `normalized-text` clusters on normalized stored-text
+  equality without loading a model. `auto` picks `embedding-cosine` when the
+  store has a vector index and degrades to `normalized-text` on a store that
+  was never embedded; a damaged index is refused, not degraded over.
+- **Representative**: highest confidence, then earliest `observed_at`, then
+  smallest record ID — a real stored record, provenance intact.
+- **Read-only**: collapse never writes; the store is untouched. This is
+  presentation, not persistence. It differs from the adjacent recall
+  surfaces on purpose: #94 (composition-health measurement) measures and
+  explicitly never collapses; #131 (budget-fit packing) fits an answer to a
+  token budget but collapses nothing; #92 (supersession flagging) flags
+  superseded/contradicted records while `--collapse` groups the recalled
+  ones. A cluster may mix trust classes and reports that mix in
+  `trust_spread`.
 
 ## Scope
 

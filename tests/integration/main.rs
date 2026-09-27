@@ -78,6 +78,7 @@ mod mcp_search_code;
 mod mcp_stdio;
 mod mcp_symbol_at;
 mod memory_audit;
+mod memory_collapse;
 mod memory_evidence_health;
 mod memory_health;
 mod memory_recall;

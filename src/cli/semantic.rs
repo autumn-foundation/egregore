@@ -810,6 +810,48 @@ pub(crate) fn code_handle_from_link(
 /// cite where it came from (a `source_handle`, source artifact path, or session
 /// handle), and — under `verified_only` — cites present verification evidence.
 /// A hit lacking provenance is rejected here so it is excluded, never returned.
+///
+/// The record-level half is factored out for the degraded collapse path
+/// (issue #163), which iterates records directly instead of vector hits.
+#[cfg(feature = "embeddings")]
+pub(crate) fn is_recallable_memory_record(
+    record: &GraphRecord,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+    edges_from: &query::OutgoingEdgeIndex<'_>,
+    tombstoned: &query::TombstonedSet<'_>,
+    verified_only: bool,
+) -> bool {
+    if !record
+        .node_kind_name()
+        .is_some_and(|k| matches!(k, "Observation" | "Decision" | "Failure"))
+    {
+        return false;
+    }
+    let GraphRecord::Node {
+        session_id,
+        source_handle,
+        source_artifact_path,
+        ..
+    } = record
+    else {
+        return false;
+    };
+    // Provenance must be a present, non-blank handle: a record carrying only
+    // empty strings is excluded, never emitted with an empty handle.
+    let has_provenance = non_empty(source_handle.as_ref()).is_some()
+        || non_empty(source_artifact_path.as_ref()).is_some()
+        || non_empty(session_id.as_ref()).is_some();
+    if !has_provenance {
+        return false;
+    }
+    if verified_only && !query::is_verified_claim(record, by_id, edges_from, tombstoned) {
+        return false;
+    }
+    true
+}
+
+/// Hit-shaped wrapper over [`is_recallable_memory_record`]: checks the hit's
+/// reported kind first, then applies the identical record-level rule.
 #[cfg(feature = "embeddings")]
 pub(crate) fn is_recallable_memory(
     m: &SemanticMatch,
@@ -828,31 +870,7 @@ pub(crate) fn is_recallable_memory(
     let Some(record) = by_id.get(m.record_id.as_str()).copied() else {
         return false;
     };
-    let GraphRecord::Node {
-        session_id,
-        source_handle,
-        source_artifact_path,
-        ..
-    } = record
-    else {
-        return false;
-    };
-    // Provenance must be a present, non-blank handle: a record carrying only
-    // empty strings is excluded, never emitted with an empty `source_handle`.
-    let has_provenance = non_empty(source_handle.as_ref()).is_some()
-        || non_empty(source_artifact_path.as_ref()).is_some()
-        || non_empty(session_id.as_ref()).is_some();
-    if !has_provenance {
-        return false;
-    }
-    // Verified-only reuses the memory-audit structural rule (issue #64): a
-    // resolvable, non-tombstoned verification record cited via VALIDATED_BY /
-    // HAS_EVIDENCE / PRODUCED_EVIDENCE, on either an inline evidence link or an
-    // outgoing edge. A triple-only citation stub never counts as verified.
-    if verified_only && !query::is_verified_claim(record, by_id, edges_from, tombstoned) {
-        return false;
-    }
-    true
+    is_recallable_memory_record(record, by_id, edges_from, tombstoned, verified_only)
 }
 
 /// Prints the explicit empty result for an author-scoped recall that matched
@@ -929,6 +947,426 @@ impl PrintText for ExcludedRecallDiagnostic<'_> {
     }
 }
 
+/// Serialization name of a [`query::CollapseMode`] for text output.
+#[cfg(feature = "embeddings")]
+const fn collapse_mode_name(mode: query::CollapseMode) -> &'static str {
+    match mode {
+        query::CollapseMode::EmbeddingCosine => "embedding-cosine",
+        query::CollapseMode::NormalizedText => "normalized-text",
+    }
+}
+
+#[cfg(feature = "embeddings")]
+impl PrintText for query::CollapseEnvelope {
+    fn as_text(&self) -> String {
+        format!(
+            "collapse mode={} (requested {}) threshold={} source_records={} representatives={} query={}",
+            collapse_mode_name(self.collapse.mode),
+            self.collapse.mode_requested,
+            self.collapse.similarity_threshold,
+            self.collapse.source_records,
+            self.collapse.representatives,
+            self.query,
+        )
+    }
+}
+
+#[cfg(feature = "embeddings")]
+impl PrintText for query::CollapsedMemoryRow {
+    fn as_text(&self) -> String {
+        let score = self
+            .retrieval_score
+            .map_or_else(|| "-".to_owned(), |value| format!("{value:.4}"));
+        format!(
+            "{} [{}] {} score={} author={} source={} cluster_size={} members={}\n  {}",
+            self.record_id,
+            self.kind,
+            self.representative_trust_class,
+            score,
+            self.agent_id.as_deref().unwrap_or("(unknown)"),
+            self.source_handle.as_deref().unwrap_or("(unknown)"),
+            self.cluster_size,
+            self.member_ids.join(","),
+            self.memory_text,
+        )
+    }
+}
+
+/// Resolves the requested collapse mode against the store's vector-index
+/// state (issue #163).
+///
+/// `auto` uses embedding-cosine similarity when the store carries a loaded
+/// vector index and degrades to normalized-text equality clustering when the
+/// store was never embedded. A damaged (present-but-unreadable) index is
+/// refused rather than silently degraded over, and a forced
+/// `embedding-cosine` without a loaded index is refused too — both fail closed
+/// in the #104 spirit: never a semantic grouping the store cannot compute.
+#[cfg(feature = "embeddings")]
+fn resolve_collapse_mode(
+    requested: CollapseModeArg,
+    index_state: &crate::embeddings::VectorIndexState,
+) -> Result<query::CollapseMode> {
+    use crate::embeddings::VectorIndexState as IndexState;
+    match requested {
+        CollapseModeArg::Auto => match index_state {
+            IndexState::Loaded { .. } => Ok(query::CollapseMode::EmbeddingCosine),
+            IndexState::Absent => Ok(query::CollapseMode::NormalizedText),
+            IndexState::Unreadable { .. } => anyhow::bail!(
+                "cannot collapse observations: the store's vector index is present but unreadable; \
+                 refusing to degrade over a damaged index (re-ingest with --embed or repair the store)"
+            ),
+        },
+        CollapseModeArg::EmbeddingCosine => match index_state {
+            IndexState::Loaded { .. } => Ok(query::CollapseMode::EmbeddingCosine),
+            IndexState::Absent => anyhow::bail!(
+                "cannot collapse observations with --collapse-mode embedding-cosine: the store has \
+                 no vector index (re-run ingest with --embed)"
+            ),
+            IndexState::Unreadable { .. } => anyhow::bail!(
+                "cannot collapse observations: the store's vector index is present but unreadable"
+            ),
+        },
+        CollapseModeArg::NormalizedText => Ok(query::CollapseMode::NormalizedText),
+    }
+}
+
+/// Resolves the primary cited code target of a memory record (issue #163).
+///
+/// Considers inline evidence links with relation `OBSERVES` / `MENTIONS_SYMBOL`
+/// plus standalone outgoing edge records with the same labels. Inline links
+/// carrying a `target_record_id` use it directly; triple-only links
+/// (`target_repo_relative_path` + `target_span` + `target_git_commit`, as
+/// stored by CLI ingest which — unlike the daemon — does not canonicalize
+/// triples at write time) are resolved against the store's records with the
+/// same matching rule the daemon uses at ingest: node path, commit, and span
+/// must all agree. A triple that resolves to nothing leaves the record
+/// ineligible (fail closed to a singleton cluster), exactly as if it cited no
+/// target. The primary target is the candidate sorting first by (relation,
+/// target record ID, `as_of_commit`); `as_of_commit` is part of the identity,
+/// so the same record cited at two commits yields two different targets.
+/// Returns `None` when the record cites no code target — such a record is
+/// never eligible for merging and stays a singleton cluster.
+#[cfg(feature = "embeddings")]
+pub(crate) fn primary_cited_target(
+    record: &GraphRecord,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+    edges_from: &query::OutgoingEdgeIndex<'_>,
+) -> Option<query::PrimaryCitedTarget> {
+    let GraphRecord::Node { evidence_links, .. } = record else {
+        return None;
+    };
+    let mut targets: Vec<(String, String, Option<String>)> = Vec::new();
+    if let Some(links) = evidence_links {
+        for link in links {
+            if !matches!(link.relation.as_str(), "OBSERVES" | "MENTIONS_SYMBOL") {
+                continue;
+            }
+            if let Some(target) = link.target_record_id.clone() {
+                targets.push((link.relation.clone(), target, link.as_of_commit.clone()));
+            } else if let Some(target) = resolve_triple_target(link, by_id) {
+                // The daemon canonicalizes a resolved triple by writing back
+                // only the target record ID; as_of_commit stays as the link
+                // carried it. Mirroring that here keeps a CLI-ingested triple
+                // citation and a daemon-ingested one of the same target on the
+                // same cluster key.
+                targets.push((link.relation.clone(), target, link.as_of_commit.clone()));
+            }
+        }
+    }
+    if let Some(outgoing) = edges_from.get(record.id()) {
+        for (label, target) in outgoing {
+            if matches!(label.as_str(), "OBSERVES" | "MENTIONS_SYMBOL") {
+                targets.push((label.as_str().to_owned(), (*target).to_owned(), None));
+            }
+        }
+    }
+    targets
+        .into_iter()
+        .min_by(|first, second| {
+            first
+                .0
+                .cmp(&second.0)
+                .then_with(|| first.1.cmp(&second.1))
+                .then_with(|| first.2.cmp(&second.2))
+        })
+        .map(
+            |(relation, target_record_id, as_of_commit)| query::PrimaryCitedTarget {
+                target_record_id,
+                relation,
+                as_of_commit,
+            },
+        )
+}
+
+/// Resolves a triple-only evidence link to its target record ID (issue #163).
+///
+/// Mirrors the daemon's ingest-time triple matching: the target is the node
+/// whose repository-relative path, temporal git commit, and source span all
+/// agree with the link's triple. Iteration is over the `BTreeMap` (sorted by
+/// record ID) so the first match is deterministic. Returns `None` when any
+/// triple field is missing or nothing matches — the caller fails closed.
+#[cfg(feature = "embeddings")]
+fn resolve_triple_target(
+    link: &crate::EvidenceLink,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+) -> Option<String> {
+    let path = link.target_repo_relative_path.as_deref()?;
+    let commit = link.target_git_commit.as_deref()?;
+    let span = link.target_span.as_ref()?;
+    by_id.values().copied().find_map(|record| {
+        if let GraphRecord::Node {
+            id,
+            repo_relative_path: Some(record_path),
+            temporal: Some(temporal),
+            span: Some(record_span),
+            ..
+        } = record
+            && record_path == path
+            && temporal.git_commit == commit
+            && record_span == span
+        {
+            Some(id.to_owned())
+        } else {
+            None
+        }
+    })
+}
+
+/// Emits the collapsed answer: one envelope line, one row per representative,
+/// then any supersession exclusion diagnostics (issue #163).
+#[cfg(feature = "embeddings")]
+fn emit_collapsed_answer(
+    query: &str,
+    outcome: &query::CollapseOutcome,
+    mode_requested: &str,
+    format: OutputFormat,
+    author_scope: &crate::query::AuthorScope,
+    excluded_recall_diagnostics: &[ExcludedRecallDiagnostic],
+) -> Result<()> {
+    if outcome.clusters.is_empty() {
+        if author_scope.is_active() {
+            print_empty_author_scope(query, author_scope, format)?;
+            return Ok(());
+        }
+        eprintln!(
+            "no memory results — store may lack embedded memory (re-run ingest with --embed) or all hits were filtered"
+        );
+        std::process::exit(2);
+    }
+    let envelope = query::collapse_envelope(
+        query,
+        outcome.mode,
+        mode_requested,
+        outcome.threshold,
+        outcome.source_candidate_count,
+        outcome.clusters.len(),
+    );
+    print_result(&envelope, format)?;
+    for row in query::render_collapsed_rows(&outcome.clusters) {
+        print_result(&row, format)?;
+    }
+    for diag in excluded_recall_diagnostics {
+        print_result(diag, format)?;
+    }
+    Ok(())
+}
+
+/// Builds one collapse candidate from a recallable memory record on the
+/// local (no-model) lane, or `None` when the record is filtered out
+/// (issue #163).
+///
+/// Without embeddings there is no meaning ranking, so the caller feeds every
+/// recallable memory record in the store as a candidate and clustering uses
+/// normalized-text equality — the query string is echoed in the envelope but
+/// never ranked against. The embedding model is never loaded on this path.
+/// All recall filters (`--verified-only`, `--agent` / `--not-agent`,
+/// `--repo`, `--supersession`) apply exactly as on the embedded lane.
+#[cfg(feature = "embeddings")]
+#[allow(clippy::too_many_arguments)]
+fn degraded_collapse_candidate<'a>(
+    record: &'a GraphRecord,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+    edges_from: &query::OutgoingEdgeIndex,
+    tombstoned: &query::TombstonedSet,
+    verified_only: bool,
+    author_scope: &crate::query::AuthorScope,
+    selected: Option<&str>,
+    index: &query::RepositoryIndex,
+    resolver: &crate::temporal_status::TemporalResolver,
+    supersession: crate::temporal_status::SupersessionMode,
+    excluded_recall_diagnostics: &mut Vec<ExcludedRecallDiagnostic<'a>>,
+) -> Option<query::CollapseCandidate> {
+    if !is_recallable_memory_record(record, by_id, edges_from, tombstoned, verified_only) {
+        return None;
+    }
+    let GraphRecord::Node {
+        text,
+        summary,
+        agent_id,
+        agent_kind,
+        session_id,
+        observed_at,
+        confidence,
+        source_handle,
+        source_artifact_path,
+        evidence_links,
+        ..
+    } = record
+    else {
+        return None;
+    };
+
+    if !author_scope.matches(agent_id.as_deref()) {
+        return None;
+    }
+
+    // Scope through the code this memory cites, exactly as on the
+    // embedded lane: memory nodes are not in the containment topology.
+    let owners = memory_repo_owners(record.id(), evidence_links.as_ref(), edges_from, index);
+    if let Some(repo) = selected
+        && !owners.contains(&repo)
+    {
+        return None;
+    }
+
+    let source_handle_value = non_empty(source_handle.as_ref())
+        .or_else(|| non_empty(source_artifact_path.as_ref()))
+        .or_else(|| non_empty(session_id.as_ref()))
+        .unwrap_or_default()
+        .to_owned();
+
+    let verified = query::is_verified_claim(record, by_id, edges_from, tombstoned);
+    let (status, superseded_by_refs, contradicted_by_refs) = resolver.resolve_status(record.id());
+    let is_superseded = status == "superseded" || status == "cycle";
+    let is_contradicted = status == "contradicted";
+    let temporal_status = if is_superseded || is_contradicted {
+        let reason = if is_superseded {
+            "superseded"
+        } else {
+            "contradicted"
+        };
+        match supersession {
+            crate::temporal_status::SupersessionMode::Exclude => {
+                excluded_recall_diagnostics.push(ExcludedRecallDiagnostic {
+                    record_id: record.id(),
+                    reason,
+                    status: "excluded",
+                    superseded_by: if superseded_by_refs.is_empty() {
+                        None
+                    } else {
+                        Some(superseded_by_refs)
+                    },
+                    contradicted_by: if contradicted_by_refs.is_empty() {
+                        None
+                    } else {
+                        Some(contradicted_by_refs)
+                    },
+                });
+                return None;
+            }
+            crate::temporal_status::SupersessionMode::IncludeButFlag => Some(status.to_owned()),
+        }
+    } else {
+        match supersession {
+            crate::temporal_status::SupersessionMode::IncludeButFlag => Some(status.to_owned()),
+            crate::temporal_status::SupersessionMode::Exclude => None,
+        }
+    };
+
+    Some(query::CollapseCandidate {
+        record_id: record.id().to_owned(),
+        kind: record.node_kind_name().unwrap_or("Observation").to_owned(),
+        trust_class: match (verified, temporal_status.as_deref()) {
+            (_, Some("contradicted" | "cycle")) => query::TrustClass::AgentContradicted,
+            (true, _) => query::TrustClass::AgentVerified,
+            (false, _) => query::TrustClass::AgentUnverified,
+        },
+        agent_authored: true,
+        primary_target: primary_cited_target(record, by_id, edges_from),
+        body_text: text.as_deref().unwrap_or(summary.as_str()).to_owned(),
+        confidence_raw: confidence.as_deref().map(str::to_owned),
+        confidence: confidence
+            .as_deref()
+            .and_then(|value| value.parse::<f32>().ok()),
+        observed_at: observed_at.as_deref().map(str::to_owned),
+        // No vectors without an index: normalized-text equality clustering
+        // needs none, and no retrieval score exists without a ranking.
+        vector: None,
+        retrieval_score: None,
+        source_handle: Some(source_handle_value),
+        agent_id: agent_id.as_deref().map(str::to_owned),
+        agent_kind: agent_kind.as_deref().map(str::to_owned),
+        session_id: session_id.as_deref().map(str::to_owned),
+        // The representative keeps its stored provenance verbatim (issue
+        // #163): links are handles/spans/commits, never raw text.
+        evidence_links: evidence_links.clone(),
+    })
+}
+/// Degraded collapse over a store with no vector index (issue #163).
+#[cfg(feature = "embeddings")]
+#[allow(clippy::too_many_arguments)]
+fn query_semantic_memory_collapsed_degraded(
+    query: &str,
+    records: &[GraphRecord],
+    limit: usize,
+    repo: Option<&str>,
+    verified_only: bool,
+    agent: Option<&str>,
+    not_agent: Option<&str>,
+    format: OutputFormat,
+    supersession: crate::temporal_status::SupersessionMode,
+    similarity_threshold: f32,
+    mode_requested: &str,
+) -> Result<()> {
+    let index = query::RepositoryIndex::build(records);
+    let selected = resolve_repo_scope(&index, repo);
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let (edges_from, tombstoned) = query::verification_support_indexes(records);
+    let resolver = crate::temporal_status::TemporalResolver::build(records);
+    let mut excluded_recall_diagnostics = Vec::new();
+    let author_scope = crate::query::AuthorScope {
+        include: agent.map(str::to_owned),
+        exclude: not_agent.map(str::to_owned),
+    };
+
+    let mut candidates: Vec<query::CollapseCandidate> = Vec::new();
+    for record in records {
+        if let Some(candidate) = degraded_collapse_candidate(
+            record,
+            &by_id,
+            &edges_from,
+            &tombstoned,
+            verified_only,
+            &author_scope,
+            selected.as_deref(),
+            &index,
+            &resolver,
+            supersession,
+            &mut excluded_recall_diagnostics,
+        ) {
+            candidates.push(candidate);
+        }
+    }
+
+    let mut outcome = query::collapse_memory_recall(
+        &candidates,
+        &query::CollapseConfig {
+            mode: query::CollapseMode::NormalizedText,
+            similarity_threshold,
+        },
+    );
+    // The `limit` bounds representatives, not source records.
+    outcome.clusters.truncate(limit);
+    emit_collapsed_answer(
+        query,
+        &outcome,
+        mode_requested,
+        format,
+        &author_scope,
+        &excluded_recall_diagnostics,
+    )
+}
+
 #[cfg(feature = "embeddings")]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn query_semantic_memory(
@@ -941,6 +1379,9 @@ pub(crate) fn query_semantic_memory(
     not_agent: Option<&str>,
     format: OutputFormat,
     supersession: crate::temporal_status::SupersessionMode,
+    collapse: bool,
+    similarity_threshold: f32,
+    collapse_mode: CollapseModeArg,
 ) -> Result<()> {
     validate_existing_embedded_store(data_dir)?;
 
@@ -958,11 +1399,47 @@ pub(crate) fn query_semantic_memory(
     let resolver = crate::temporal_status::TemporalResolver::build(&records);
     let mut excluded_recall_diagnostics = Vec::new();
 
+    // Collapse setup (issue #163): validate the threshold up front and resolve
+    // the requested mode against the store's vector-index state before any
+    // model is loaded — normalized-text mode must never touch the embedder.
+    if collapse && !(0.0..=1.0).contains(&similarity_threshold) {
+        anyhow::bail!("--similarity-threshold must lie in [0.0, 1.0], got {similarity_threshold}");
+    }
+    let collapse_mode_requested: Option<&'static str> = collapse.then_some(match collapse_mode {
+        CollapseModeArg::Auto => "auto",
+        CollapseModeArg::EmbeddingCosine => "embedding-cosine",
+        CollapseModeArg::NormalizedText => "normalized-text",
+    });
+    let collapse_mode_resolved = collapse_mode_requested
+        .map(|_| resolve_collapse_mode(collapse_mode, &sink.embedding_index_state()))
+        .transpose()?;
+
     // Memory recall reads the SAME shared vector index code search does, so it
     // carries the same cross-vector-space hazard and the same gate (issue #104).
-    if enforce_index_compatibility(&sink, &records)?
-        == crate::embeddings::IndexCompatibility::IndexAbsent
-    {
+    //
+    // Normalized-text collapse never touches the embedder: it clusters the
+    // stored (redacted) text locally, so it works on any store — embedded or
+    // not — without loading a model and without consulting the compatibility
+    // gate (issue #163).
+    if collapse_mode_resolved == Some(query::CollapseMode::NormalizedText) {
+        return query_semantic_memory_collapsed_degraded(
+            query,
+            &records,
+            limit,
+            repo,
+            verified_only,
+            agent,
+            not_agent,
+            format,
+            supersession,
+            similarity_threshold,
+            collapse_mode_requested.unwrap_or("auto"),
+        );
+    }
+    let index_absent = enforce_index_compatibility(&sink, &records)?
+        == crate::embeddings::IndexCompatibility::IndexAbsent;
+    // Without `--collapse` a missing index is a no-result exit 2, as before.
+    if index_absent {
         eprintln!(
             "no memory results — store may lack embedded memory (re-run ingest with --embed) or all hits were filtered"
         );
@@ -1167,6 +1644,70 @@ pub(crate) fn query_semantic_memory(
             .total_cmp(&a.retrieval_score)
             .then_with(|| a.record_id.cmp(b.record_id))
     });
+
+    if let Some(mode) = collapse_mode_resolved {
+        // Collapse BEFORE representative truncation: the `limit` bounds
+        // representatives, not source rows, so a large cluster is never cut
+        // off mid-answer (issue #163).
+        let fetch_vectors = mode == query::CollapseMode::EmbeddingCosine;
+        let mut candidates: Vec<query::CollapseCandidate> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(record) = by_id.get(row.record_id).copied() else {
+                continue;
+            };
+            let evidence_links = match record {
+                GraphRecord::Node { evidence_links, .. } => evidence_links.clone(),
+                _ => None,
+            };
+            candidates.push(query::CollapseCandidate {
+                record_id: row.record_id.to_owned(),
+                kind: row.kind.to_owned(),
+                trust_class: match (row.review_state, row.temporal_status.as_deref()) {
+                    (_, Some("contradicted" | "cycle")) => query::TrustClass::AgentContradicted,
+                    ("verified", _) => query::TrustClass::AgentVerified,
+                    _ => query::TrustClass::AgentUnverified,
+                },
+                agent_authored: true,
+                primary_target: primary_cited_target(record, &by_id, &edges_from),
+                body_text: row.memory_text.to_owned(),
+                confidence_raw: row.confidence.map(str::to_owned),
+                confidence: row.confidence.and_then(|value| value.parse::<f32>().ok()),
+                observed_at: row.observed_at.map(str::to_owned),
+                // Embedding mode reuses stored vectors (no re-embedding); a
+                // missing vector fails closed to singleton behavior.
+                vector: if fetch_vectors {
+                    sink.stored_embedding_vector(record)
+                } else {
+                    None
+                },
+                retrieval_score: Some(row.retrieval_score),
+                source_handle: Some(row.source_handle.clone()),
+                agent_id: row.agent_id.map(str::to_owned),
+                agent_kind: row.agent_kind.map(str::to_owned),
+                session_id: row.session_id.map(str::to_owned),
+                // The representative keeps its stored provenance verbatim
+                // (issue #163): links are handles/spans/commits, never raw
+                // text.
+                evidence_links,
+            });
+        }
+        let mut outcome = query::collapse_memory_recall(
+            &candidates,
+            &query::CollapseConfig {
+                mode,
+                similarity_threshold,
+            },
+        );
+        outcome.clusters.truncate(limit);
+        return emit_collapsed_answer(
+            query,
+            &outcome,
+            collapse_mode_requested.unwrap_or("auto"),
+            format,
+            &author_scope,
+            &excluded_recall_diagnostics,
+        );
+    }
     rows.truncate(limit);
 
     if rows.is_empty() {

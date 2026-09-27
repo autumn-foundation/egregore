@@ -40,6 +40,7 @@ pub(crate) mod liveness;
 mod locate;
 mod log_deltas;
 mod memory_audit;
+mod memory_collapse;
 mod memory_decisions;
 mod orientation;
 mod ownership;
@@ -177,3 +178,5 @@ pub(crate) use trust::{
 pub use trust_audit::*;
 // Appended (issue #228); kept at the end to minimize cross-lane merge conflicts.
 pub use neighborhood::*;
+// Appended (issue #163); kept at the end to minimize cross-lane merge conflicts.
+pub use memory_collapse::*;

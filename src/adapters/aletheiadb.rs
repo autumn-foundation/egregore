@@ -3238,6 +3238,21 @@ impl EmbeddedAletheiaSink {
             .map(<[f32]>::to_vec)
     }
 
+    /// Returns the embedding vector the store holds for `record`, if any
+    /// (issue #163).
+    ///
+    /// Recall-time observation collapse reuses the existing vector index
+    /// instead of re-embedding text: the pairwise cosine test reads each
+    /// candidate's stored vector through this accessor. Read-only: it
+    /// performs no writes, triggers no backfill, and creates no index
+    /// entries — `None` (never embedded, or an unvectorized record) is a
+    /// normal outcome the caller must handle by failing closed.
+    #[cfg(feature = "embeddings")]
+    #[must_use]
+    pub fn stored_embedding_vector(&self, record: &GraphRecord) -> Option<Vec<f32>> {
+        self.existing_embedding_for_record(record)
+    }
+
     #[cfg(feature = "embeddings")]
     fn backfill_embedding_for_matched_node(&self, record: &GraphRecord) -> AdapterResult<()> {
         let GraphRecord::Node { id, temporal, .. } = record else {
