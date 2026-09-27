@@ -70,6 +70,13 @@ context sections produced by `eg query context` (`source_facts`,
 `observations`, `project_state`, `artifacts`, `verification_evidence`, plus
 `topology_edges` and `unresolved`).
 
+> **Policy (issue #169):** policy is **not folded** into this lane. The #169
+> fold is anchored to a single identity; the bridge returns many leads per
+> query, and policy stays out of per-lead rows until a per-lead anchoring
+> contract exists. To see the policy governing one lead, call
+> `eg query context <NAME>` on its symbol — see
+> [`policy-context.md`](policy-context.md) for the lane matrix.
+
 ### Shortest workflow
 
 ```sh

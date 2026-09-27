@@ -88,6 +88,8 @@ mod blind_spots;
 mod track_record;
 // Appended (issue #259); kept at the end to minimize cross-lane merge conflicts.
 mod session_retrospective;
+// Appended (issue #169); kept at the end to minimize cross-lane merge conflicts.
+mod policy_context;
 
 pub use as_of::*;
 pub use author_scope::*;
@@ -159,6 +161,7 @@ pub use blind_spots::*;
 // Appended (issue #262); kept at the end to minimize cross-lane merge conflicts.
 pub use track_record::*;
 // Appended (issue #259); kept at the end to minimize cross-lane merge conflicts.
+pub use policy_context::*;
 pub use session_retrospective::*;
 // Appended (issue #214); kept at the end to minimize cross-lane merge conflicts.
 pub use brief::*;

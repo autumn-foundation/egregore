@@ -6818,6 +6818,11 @@ pub(crate) struct ContextResponse<'a> {
     /// signals "no drift recorded" (AC4).
     drift_history: BudgetedSection<ContextDrift<'a>>,
     unresolved: BudgetedSection<ContextUnresolved<'a>>,
+    /// Active approved policy folded into the answer (issue #169). Always
+    /// present; an empty array signals "no in-scope policy applies" (AC5).
+    /// Budgeted like every other section (issue #211): the fold keeps its
+    /// top-ranked (record-ID ordered) prefix and the remainder flows on.
+    policy: BudgetedSection<ContextPolicyRow<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     excluded: Vec<ExcludedDiagnostic<'a>>,
     /// Corpus the current-state view read (issue #427):
@@ -10933,6 +10938,32 @@ pub(crate) fn temporal_commit_if_prefix<'a>(
 // query context (issue #38)
 // ---------------------------------------------------------------------------
 
+/// One active approved policy record folded into a context answer (issue
+/// #169).
+///
+/// Mirrors [`query::PolicyEntry`]: the authorization basis is the cited
+/// approval decision (whose audit trail the fold already verified), and the
+/// trust class is `other` under the #114 closed vocabulary — distinguishable
+/// from source-derived code facts and unverified observations.
+#[derive(Serialize)]
+pub(crate) struct ContextPolicyRow<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    body: &'a str,
+    approval_decision_id: &'a str,
+    active_from: &'a str,
+    status: &'static str,
+    trust: crate::query::TrustClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_repo: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_path_glob: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_language: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_lifecycle_phase: Option<&'a str>,
+}
+
 /// The five trust-separated context sections (plus topology edges and
 /// unresolved references) rendered from a [`query::SymbolContext`].
 ///
@@ -10947,6 +10978,7 @@ pub(crate) struct ContextSections<'a> {
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
     unresolved: Vec<ContextUnresolved<'a>>,
+    policy: Vec<ContextPolicyRow<'a>>,
 }
 
 /// One stable machine-readable diagnostic in the public-api response.

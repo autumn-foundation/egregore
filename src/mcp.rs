@@ -1052,6 +1052,30 @@ fn symbol_context_payload(
         .filter_map(|(r, resolved)| record_to_drift(r, resolved, &trust))
         .collect();
     let unresolved: Vec<Value> = ctx.unresolved.iter().map(unresolved_to_json).collect();
+    // Issue #169: fold active approved policy into the twin MCP surface, same
+    // contract as the CLI — always present (possibly empty), authorization
+    // cited via the approval-decision handle.
+    let policy: Vec<Value> = ctx
+        .policy
+        .iter()
+        .map(|p| {
+            json!({
+                "record_id": p.record_id(),
+                "kind": p.kind.as_str(),
+                "body": p.body,
+                "approval_decision_id": p.approval_decision_id,
+                "active_from": p.active_from,
+                "status": p.status.as_str(),
+                "trust": trust.classify(p.record).as_str(),
+                "scope": {
+                    "repo": p.scope.repo,
+                    "path_glob": p.scope.path_glob,
+                    "language": p.scope.language,
+                    "lifecycle_phase": p.scope.lifecycle_phase,
+                },
+            })
+        })
+        .collect();
 
     json!({
         "ok": true,
@@ -1065,6 +1089,7 @@ fn symbol_context_payload(
         "verification_evidence": verification_evidence,
         "drift_history": drift_history,
         "unresolved": unresolved,
+        "policy": policy,
         // Issue #196: store-level domain presence. The twins always receive
         // the full record slice (`get_all_records`), so `from_records` reads
         // the whole store.

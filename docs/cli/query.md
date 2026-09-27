@@ -937,6 +937,15 @@ The JSON envelope carries `ok`, `prefix`, and the trust-separated sections
 `excluded`. `log_signatures` and `unresolved` are **always present** (`[]` when
 empty); `topology_edges` and `excluded` are omitted when empty.
 
+### Policy (issue #169)
+
+Policy is **not folded** into this lane. The #169 policy fold is anchored to a
+single symbol/file identity (scope auto-derived from the anchor's own facts);
+a subsystem answer aggregates a whole subtree, so there is no single anchor to
+attribute policy to. To see the policy governing a specific symbol under the
+prefix, call `eg query context <NAME>` instead. See
+[`docs/cli/policy-context.md`](policy-context.md) for the lane matrix.
+
 ### Author scoping (issue #195)
 
 `--agent <AGENT_ID>` restricts the `observations` section to memories authored
@@ -1032,6 +1041,18 @@ Evidence-backed context for a **symbol** (issue #38), trust-separated into
 `source_facts`, `topology_edges`, `observations`, `project_state`, `artifacts`,
 `verification_evidence`, `drift_history`, and `unresolved` (see
 [The context bundle](#the-context-bundle)).
+
+### Policy section (issue #169)
+
+Every symbol context also folds active approved user-context policy into a
+`policy` section: the durable `Preference` / `WorkflowRule` /
+`NamingDecision` / `Constraint` records whose scope applies to the symbol's
+own facts (owning repository, repo-relative path, language) — no
+caller-supplied filter. Each row cites its approval-decision handle and
+activation time; pending, rejected, deferred, superseded, and revoked
+records never surface. Always present, possibly empty. See
+[`docs/cli/policy-context.md`](policy-context.md) for the scope semantics,
+lane matrix, and the offline approve-then-ask workflow.
 
 ```text
 eg query context <NAME> --graph <PATH> [--repo-path <DIR>] [--max-records N] [--candidate <RECORD_ID|FILE:SPAN>]

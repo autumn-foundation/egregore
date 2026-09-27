@@ -91,6 +91,26 @@ pub(crate) fn build_context_sections<'a>(
                 verification_status: "unresolved",
             })
             .collect(),
+        // Issue #169: fold active approved policy into the context answer.
+        // Always present (possibly empty) — a context with no applicable
+        // policy carries an explicit empty `policy` section.
+        policy: ctx
+            .policy
+            .iter()
+            .map(|p| ContextPolicyRow {
+                record_id: p.record_id(),
+                kind: p.kind.as_str(),
+                body: p.body,
+                approval_decision_id: p.approval_decision_id,
+                active_from: p.active_from,
+                status: p.status.as_str(),
+                trust: trust.classify(p.record),
+                scope_repo: p.scope.repo.as_deref(),
+                scope_path_glob: p.scope.path_glob.as_deref(),
+                scope_language: p.scope.language.as_deref(),
+                scope_lifecycle_phase: p.scope.lifecycle_phase.as_deref(),
+            })
+            .collect(),
     }
 }
 
@@ -384,6 +404,9 @@ pub(crate) fn query_context_cmd(
         verification_evidence: budget.section(sections.verification_evidence),
         drift_history: budget.section(drift_history),
         unresolved: budget.section(sections.unresolved),
+        // Issue #169: policy folds into the single-symbol context answer,
+        // budgeted like every other section; always present (possibly empty).
+        policy: budget.section(sections.policy),
         excluded,
         corpus_mode: corpus_mode.as_str(),
         corpus_mode_source: corpus_mode_source.as_str(),

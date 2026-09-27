@@ -182,11 +182,12 @@ pub use ir::{
 };
 pub use local_project::import_local_tasks;
 pub use query::{
-    ChangesContext, ChangesError, PublicApiDeltas, PublicApiDeltasOptions, RangeDeltas,
-    RangeDeltasError, RepositoryIndex, RepositorySelectorError, SubsystemContext,
-    SubsystemPrefixError, SymbolContext, UnresolvedRef, active_policy, audit_trail,
-    changes_context, is_candidate_suppressed, path_is_under_prefix, pending_candidates,
-    public_api_deltas, range_deltas, subsystem_context, symbol_context,
+    ChangesContext, ChangesError, PolicyEntry, PolicyStatus, PublicApiDeltas,
+    PublicApiDeltasOptions, RangeDeltas, RangeDeltasError, RepositoryIndex,
+    RepositorySelectorError, SubsystemContext, SubsystemPrefixError, SymbolContext, UnresolvedRef,
+    active_policy, audit_trail, changes_context, is_candidate_suppressed, path_glob_matches,
+    path_is_under_prefix, pending_candidates, policy_for_anchor, policy_scope_applies,
+    policy_scope_for_record, public_api_deltas, range_deltas, subsystem_context, symbol_context,
 };
 pub use schema_version::{
     RecordLineRead, RecordReadError, RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE,

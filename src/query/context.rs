@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use super::{
-    evidence_link_triple_handle, is_bfs_relay_node, is_cross_domain_label, is_forward_only_label,
+    PolicyEntry, evidence_link_triple_handle, is_bfs_relay_node, is_cross_domain_label,
+    is_forward_only_label,
 };
 use crate::ir::{EdgeLabel, GraphRecord, NodeKind, SourceSpan};
 
@@ -134,6 +135,28 @@ pub struct SymbolContext<'a> {
     /// empty on an ambiguous result — the sections are never a merge of
     /// several identities. Empty for no-match and single-match results.
     pub candidates: Vec<SymbolCandidate<'a>>,
+    /// Active approved user-context policy records whose scope applies to
+    /// the anchor (issue #169).
+    ///
+    /// Folded from the durable policy kinds (`Preference`, `WorkflowRule`,
+    /// `NamingDecision`, `Constraint`) via
+    /// [`policy_for_anchor`][crate::query::policy_for_anchor]: only records
+    /// with a validated audit chain and no `active_to` (superseded/revoked
+    /// excluded), whose [`UserContextScope`][crate::ir::UserContextScope]
+    /// applies to the scope auto-derived from the anchor's own facts
+    /// (owning repository, repo-relative path, language) — no caller-supplied
+    /// policy filter. Pending, rejected, and deferred candidates never
+    /// surface here; they remain visible via `eg query policy`.
+    ///
+    /// Trust: rows carry the approval-decision handle that materialized them
+    /// and classify as [`TrustClass::Other`][crate::query::TrustClass] under
+    /// the #114 closed vocabulary — distinguishable from source-derived code
+    /// facts and unverified observations.
+    ///
+    /// Always present (possibly empty), like every other section: a context
+    /// with no applicable policy carries an explicit empty `policy` section,
+    /// never a missing field. Empty on ambiguous and no-match results.
+    pub policy: Vec<PolicyEntry<'a>>,
 }
 
 impl SymbolContext<'_> {
@@ -1320,8 +1343,21 @@ fn context_from_seeds<'a>(
         out
     };
 
+    // Issue #169: fold active approved policy whose scope applies to the
+    // anchor's own facts (owning repository, repo-relative path, language).
+    // Both lanes reach this constructor with exactly one anchor ID, so the
+    // policy section is always attributable to a single identity; ambiguous
+    // and no-match results return earlier with an empty (default) section.
+    let policy = symbol_ids
+        .iter()
+        .next()
+        .and_then(|anchor_id| records.iter().find(|r| r.id() == *anchor_id))
+        .map(|anchor| super::policy_for_anchor(records, anchor))
+        .unwrap_or_default();
+
     SymbolContext {
         symbol_name: symbol_name.to_owned(),
+        policy,
         source_facts: resolve(&source_facts),
         topology_edges: {
             let mut out: Vec<&'a GraphRecord> = records

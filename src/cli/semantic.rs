@@ -1354,6 +1354,10 @@ pub(crate) fn query_semantic_context(
                 artifacts: sections.artifacts,
                 verification_evidence: sections.verification_evidence,
                 unresolved: sections.unresolved,
+                // Issue #169: policy is deferred in the semantic-bridge lane.
+                // The fold is anchored to a single identity; the bridge
+                // returns many leads per query. Documented in
+                // docs/cli/policy-context.md.
                 excluded,
             }
         })

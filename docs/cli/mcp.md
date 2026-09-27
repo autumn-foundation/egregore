@@ -153,6 +153,10 @@ Arguments: `{ "symbol_name": string (required, non-empty), "data_dir"?: string, 
 Stable `ok: true` fields: `symbol_name`, then sections
 `source_facts`, `topology_edges`, `observations`, `project_state`,
 `artifacts`, `verification_evidence`, `drift_history`, `unresolved`,
+`policy` (issue #169 — active approved user-context policy whose scope
+applies to the symbol; each row cites its `approval_decision_id`; always
+present, possibly empty — see
+[`docs/cli/policy-context.md`](policy-context.md)),
 plus the `freshness` object (issue #220) — see [Freshness stamping](#freshness-stamping).
 
 Citation handles per item:

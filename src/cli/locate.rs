@@ -263,6 +263,9 @@ pub(crate) fn locate_response_value(
                 artifacts: sections.artifacts,
                 verification_evidence: sections.verification_evidence,
                 unresolved: sections.unresolved,
+                // Issue #169: policy is deferred in the locate lane (locate
+                // answers "where is X", not "what governs X"). Documented in
+                // docs/cli/policy-context.md.
                 excluded,
                 corpus_mode,
                 corpus_mode_source,

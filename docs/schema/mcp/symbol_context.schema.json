@@ -691,6 +691,88 @@
     "ok": {
       "const": true
     },
+    "policy": {
+      "description": "Active approved user-context policy whose scope applies to the symbol (issue #169). Always present; empty when no in-scope policy applies.",
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "active_from": {
+            "type": "string"
+          },
+          "approval_decision_id": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "record_id": {
+            "type": "string"
+          },
+          "scope": {
+            "additionalProperties": true,
+            "properties": {
+              "language": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "lifecycle_phase": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "path_glob": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "repo": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "status": {
+            "type": "string"
+          },
+          "trust": {
+            "enum": [
+              "source_derived",
+              "verification_evidence",
+              "agent_verified",
+              "agent_unverified",
+              "agent_contradicted",
+              "project_state",
+              "artifact",
+              "runtime_observation",
+              "other"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "record_id",
+          "kind",
+          "body",
+          "approval_decision_id",
+          "active_from",
+          "status",
+          "trust",
+          "scope"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
     "project_state": {
       "items": {
         "additionalProperties": true,
@@ -1447,6 +1529,7 @@
     "verification_evidence",
     "drift_history",
     "unresolved",
+    "policy",
     "store_coverage",
     "freshness"
   ],

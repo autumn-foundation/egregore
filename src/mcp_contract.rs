@@ -427,6 +427,44 @@ fn drift_row_schema() -> Value {
     })
 }
 
+/// One active approved policy row folded into `symbol_context` (issue #169).
+///
+/// Mirrors the payload built in `mcp::symbol_context_payload`: the record ID,
+/// durable kind, human-readable body, the approval-decision handle that
+/// materialized the record, the activation timestamp, the
+/// supersession/revocation status (always `active` — the fold never surfaces
+/// superseded or revoked rows), the #114 trust class (always `other` for
+/// policy rows), and the record's own scope echoed for auditability.
+fn policy_row_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+            "record_id", "kind", "body", "approval_decision_id",
+            "active_from", "status", "trust", "scope"
+        ],
+        "properties": {
+            "record_id": { "type": "string" },
+            "kind": { "type": "string" },
+            "body": { "type": "string" },
+            "approval_decision_id": { "type": "string" },
+            "active_from": { "type": "string" },
+            "status": { "type": "string" },
+            "trust": trust_schema(),
+            "scope": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                    "repo": { "type": ["string", "null"] },
+                    "path_glob": { "type": ["string", "null"] },
+                    "language": { "type": ["string", "null"] },
+                    "lifecycle_phase": { "type": ["string", "null"] }
+                }
+            }
+        }
+    })
+}
+
 fn unresolved_schema() -> Value {
     json!({
         "type": "object",
@@ -610,7 +648,7 @@ fn symbol_context_schema() -> Value {
             "ok", "symbol_name", "source_facts", "topology_edges",
             "observations", "decisions", "project_state", "artifacts",
             "verification_evidence", "drift_history", "unresolved",
-            "store_coverage", "freshness"
+            "policy", "store_coverage", "freshness"
         ],
         "properties": {
             "ok": { "const": true },
@@ -624,6 +662,11 @@ fn symbol_context_schema() -> Value {
             "verification_evidence": { "type": "array", "items": linked_item_schema() },
             "drift_history": { "type": "array", "items": drift_row_schema() },
             "unresolved": { "type": "array", "items": unresolved_schema() },
+            "policy": {
+                "type": "array",
+                "items": policy_row_schema(),
+                "description": "Active approved user-context policy whose scope applies to the symbol (issue #169). Always present; empty when no in-scope policy applies."
+            },
             "store_coverage": store_coverage_schema(),
             "freshness": freshness_schema()
         }

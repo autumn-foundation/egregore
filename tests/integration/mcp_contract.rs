@@ -11,13 +11,18 @@
 
 #![allow(missing_docs)]
 #![allow(clippy::doc_markdown)]
+#![allow(clippy::too_many_lines)]
 #![cfg(feature = "embedded-aletheiadb")]
 
 use std::path::Path;
 
 use aletheia_egregore::{
-    EvidenceLink, GraphRecord, NodeKind, SourceSpan,
-    ir::{AGENT_MEMORY_SCHEMA_VERSION, SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION},
+    DecideRequest, EdgeLabel, EvidenceLink, GraphRecord, NodeKind, SourceSpan, UserContextScope,
+    decide_candidate,
+    ir::{
+        AGENT_MEMORY_SCHEMA_VERSION, SCHEMA_VERSION, USER_CONTEXT_SCHEMA_VERSION,
+        VERIFICATION_SCHEMA_VERSION,
+    },
     mcp::{
         EgregoreMcpServer, SymbolContextArgs, missing_argument_error, stamp_freshness_on_payload,
         tool_failure_history_from_records, tool_freshness_stamp, tool_inspect_store_from_records,
@@ -332,6 +337,186 @@ fn symbol_context_success_conforms_to_published_schema() {
     stamp_freshness_on_payload(&mut payload, &records, Path::new("."), None);
     let schema = response_schema("symbol_context").expect("schema must exist");
     assert_valid(&schema, &payload, "symbol_context success");
+}
+
+/// Issue #169: a `symbol_context` payload whose `policy` section carries a
+/// real approved row must validate against the published schema. The schema
+/// requires `policy` on every response and pins the row shape (`record_id`,
+/// `kind`, `body`, `approval_decision_id`, `active_from`, `status`, `trust`,
+/// `scope`), so this exercises the non-empty case the success test above
+/// does not cover.
+/// Fixture for [`symbol_context_policy_rows_conform_to_published_schema`]:
+/// a repository owning a Rust file that defines `schema_fn`, three
+/// agent-memory observations, and a pending workflow-rule candidate scoped to
+/// the symbol's own path. The caller approves the candidate via
+/// `decide_candidate`.
+fn policy_schema_records() -> Vec<GraphRecord> {
+    let mut records = vec![
+        GraphRecord::node(
+            "codegraph:v1:repo:policy-schema".to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("schema".to_owned()),
+            "schema fixture repository".to_owned(),
+        ),
+        GraphRecord::syntax_node(
+            "codegraph:v1:file:schema-mod".to_owned(),
+            NodeKind::File,
+            "src/policy/mod.rs".to_owned(),
+            span(1, 10),
+            "src/policy/mod.rs".to_owned(),
+            "rust",
+            "file src/policy/mod.rs".to_owned(),
+        ),
+        GraphRecord::syntax_symbol(
+            "codegraph:v1:sym:schema-fn".to_owned(),
+            "function",
+            "src/policy/mod.rs".to_owned(),
+            span(1, 10),
+            "schema_fn".to_owned(),
+            "rust",
+            0,
+            "fn schema_fn".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            "codegraph:v1:repo:policy-schema".to_owned(),
+            "codegraph:v1:file:schema-mod".to_owned(),
+            None,
+            "repository contains file".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Defines,
+            "codegraph:v1:file:schema-mod".to_owned(),
+            "codegraph:v1:sym:schema-fn".to_owned(),
+            None,
+            "file defines symbol".to_owned(),
+        ),
+    ];
+    // Agent memory: three supporting observations across two sessions.
+    for (id, session) in [
+        ("agent_memory:v1:obs-ps1", "sess-1"),
+        ("agent_memory:v1:obs-ps2", "sess-2"),
+        ("agent_memory:v1:obs-ps3", "sess-2"),
+    ] {
+        let mut rec = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Observation,
+            None,
+            None,
+            Some("witness".to_owned()),
+            "supporting observation".to_owned(),
+        );
+        if let GraphRecord::Node {
+            schema_version,
+            domain,
+            session_id,
+            agent_id,
+            agent_kind,
+            observed_at,
+            ingested_at,
+            confidence,
+            text,
+            ..
+        } = &mut rec
+        {
+            *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+            *domain = Some("agent_memory".to_owned());
+            *session_id = Some(session.to_owned());
+            *agent_id = Some("agent_1".to_owned());
+            *agent_kind = Some("claude-code".to_owned());
+            *observed_at = Some("2026-09-01T00:00:00Z".to_owned());
+            *ingested_at = Some("2026-09-01T00:00:00Z".to_owned());
+            *confidence = Some("1.0".to_owned());
+            *text = Some("the fmt rule keeps diffs clean".to_owned());
+        }
+        records.push(rec);
+    }
+    // Pending candidate scoped to the symbol's own path.
+    let mut cand = GraphRecord::node(
+        "user_context:v1:candidate:ps".to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "candidate ps".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        confidence,
+        evidence_quality,
+        user_context,
+        ..
+    } = &mut cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *confidence = Some("0.9".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
+        user_context.proposed_rule_kind = Some("workflow_rule".to_owned());
+        user_context.proposed_rule_text =
+            Some("Always run `cargo fmt` before committing".to_owned());
+        user_context.scope = Some(UserContextScope {
+            repo: Some("codegraph:v1:repo:policy-schema".to_owned()),
+            path_glob: Some("src/policy/*".to_owned()),
+            language: None,
+            lifecycle_phase: None,
+        });
+        user_context.supporting_evidence = Some(
+            [
+                "agent_memory:v1:obs-ps1",
+                "agent_memory:v1:obs-ps2",
+                "agent_memory:v1:obs-ps3",
+            ]
+            .iter()
+            .map(|t| EvidenceLink {
+                target_record_id: Some((*t).to_owned()),
+                target_domain: "agent_memory".to_owned(),
+                relation: "PROPOSED_BY".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            })
+            .collect(),
+        );
+        user_context.contradicting_evidence = Some(vec![]);
+        user_context.triggers = Some(vec!["pre_commit".to_owned()]);
+        user_context.action_summary = Some("Run `cargo fmt` on changed files".to_owned());
+    }
+    records.push(cand);
+    records
+}
+
+#[test]
+fn symbol_context_policy_rows_conform_to_published_schema() {
+    let mut records = policy_schema_records();
+    // Approve the candidate; the materialized workflow rule is active policy.
+    let req = DecideRequest {
+        candidate_id: "user_context:v1:candidate:ps".to_owned(),
+        outcome: "approved".to_owned(),
+        edited_rule_text: None,
+        rationale: Some("reviewed".to_owned()),
+        decided_by: "operator".to_owned(),
+        prompt_surface: "cli".to_owned(),
+        prompted_to: "operator".to_owned(),
+        transaction_time: Some("2026-09-27T10:00:00Z".to_owned()),
+    };
+    let generated = decide_candidate(&records, &req).expect("decide_candidate should succeed");
+    records.extend(generated);
+
+    let mut payload = tool_symbol_context_from_records(&records, "schema_fn");
+    assert_eq!(payload["ok"], Value::from(true));
+    let policy = payload["policy"]
+        .as_array()
+        .expect("policy section must be an array");
+    assert_eq!(policy.len(), 1, "exactly one in-scope policy row expected");
+    assert_eq!(policy[0]["kind"], Value::from("WorkflowRule"));
+    assert_eq!(policy[0]["trust"], Value::from("other"));
+    stamp_freshness_on_payload(&mut payload, &records, Path::new("."), None);
+    let schema = response_schema("symbol_context").expect("schema must exist");
+    assert_valid(&schema, &payload, "symbol_context policy rows");
 }
 
 #[test]
