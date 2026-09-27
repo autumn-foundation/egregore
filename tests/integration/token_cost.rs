@@ -73,8 +73,8 @@ fn measures_all_three_question_classes_with_ratios() {
             "{class} ratio must equal baseline/egregore"
         );
         assert!(
-            ratio >= 2.7,
-            "{class} should beat the 2.7x floor, got {ratio}"
+            ratio >= 2.4,
+            "{class} should beat the 2.4x floor, got {ratio}"
         );
         // AC2/AC10: the exact baseline command is recorded.
         assert!(

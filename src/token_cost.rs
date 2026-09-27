@@ -387,6 +387,9 @@ struct SymbolAnswerRow<'a> {
     corpus_mode_source: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     corpus_disclaimer: Option<String>,
+    /// Symbol role (issue #190), mirroring the real `eg query symbol` row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'a crate::ir::SymbolRole>,
 }
 
 /// One semantic answer row, serialized like the `eg query semantic` JSON line.
@@ -621,6 +624,7 @@ where
                 corpus_mode: symbol_corpus.as_ref().map(|c| c.0),
                 corpus_mode_source: symbol_corpus.as_ref().map(|c| c.1),
                 corpus_disclaimer: symbol_corpus.as_ref().map(|c| c.2.clone()),
+                role: record.role(),
             };
             if id.as_str() == expected_record_id {
                 has_expected = true;

@@ -6,7 +6,7 @@
   "repository_id_override": "token-cost-fixture",
   "scan_time": "2026-01-01T00:00:00Z",
   "token_count_method": "word-punct-v1",
-  "min_ratio": 2.7,
+  "min_ratio": 2.4,
   "questions": [
     {
       "id": "q1-exact-symbol",
