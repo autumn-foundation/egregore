@@ -368,6 +368,11 @@ pub(crate) fn symbol_row<'a>(
         // `eg query symbol` field. Absent for ungated symbols and for
         // records that predate issue #190 — never fabricated.
         cfg: record.cfg(),
+        // Structural complexity (issue #162): the row IS the symbol's
+        // record, so its score rides along like every other `eg query
+        // symbol` field. Absent for non-callables and for records that
+        // predate issue #162 — never fabricated.
+        complexity: record.complexity(),
     })
 }
 
@@ -592,6 +597,13 @@ impl PrintText for SymbolResult<'_> {
         // semantics — the JSON array is authoritative.
         if let Some(gates) = self.cfg {
             let _ = write!(text, "\n  cfg: {}", gates.join(" && "));
+        }
+        // Structural complexity (issue #162). An ABSENT field prints
+        // NOTHING: the record predates issue #162 or the symbol is not a
+        // callable, so its score is unknown/inapplicable, and rendering a
+        // minimum would fabricate a code fact.
+        if let Some(score) = self.complexity {
+            let _ = write!(text, "\n  complexity: {score}");
         }
         // Owning Cargo package (issue #117). An ABSENT field prints NOTHING:
         // the record predates issue #117, so its attribution is unknown, and

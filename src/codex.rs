@@ -1545,6 +1545,7 @@ fn make_node(
         cfg: None,
         entry_point: None,
         role: None,
+        complexity: None,
         id,
         kind,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,

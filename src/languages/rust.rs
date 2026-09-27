@@ -2176,6 +2176,13 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         if !cfg_gates.is_empty() {
             record = record.with_cfg(cfg_gates);
         }
+        // Structural complexity (issue #162): stamped on callable symbols
+        // (`function` / `method` / `test`) — a source-derived code fact, 1
+        // plus one per decision point in the item's own body. Additive,
+        // never an identity input.
+        if matches!(symbol_kind, "function" | "method" | "test") {
+            record = record.with_complexity(control_flow_complexity(node));
+        }
         self.graph.push(record);
         self.add_edge(
             EdgeLabel::Defines,
@@ -4393,6 +4400,57 @@ fn first_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node
         }
     }
     None
+}
+
+/// Computes the structural complexity score (issue #162) for a Rust
+/// `function_item` or `function_signature_item` node: 1 plus one per
+/// decision point in the item's own body.
+///
+/// A decision point is one of:
+/// - an `if_expression` (each `else if` is its own `if_expression` node),
+/// - a `for_expression`, `while_expression`, or `loop_expression`,
+/// - a `match_arm` (every arm, including catch-alls),
+/// - a `try_expression` (the `?` operator),
+/// - a `binary_expression` whose operator token is `&&` or `||`
+///   (anonymous token kinds are the literal operator text).
+///
+/// Closure bodies are part of the enclosing item's expression tree and are
+/// counted. Nested `function_item` / `function_signature_item` subtrees are
+/// NOT descended into: a nested `fn` gets its own `Symbol` node and its own
+/// score. Items without a body (signature-only trait method declarations)
+/// score the minimum 1.
+///
+/// The walk is over the Tree-sitter AST — no regexes, no text heuristics —
+/// so the score is a deterministic function of the parsed source.
+pub(crate) fn control_flow_complexity(item: Node<'_>) -> u32 {
+    let Some(body) = item.child_by_field_name("body") else {
+        return 1;
+    };
+    let mut score = 1u32;
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            // A nested `fn` gets its own symbol: skip its whole subtree so
+            // its decisions never inflate the enclosing callable's score.
+            // The `body` root is a `block`, never a `function_item`, so the
+            // outer item's own body is always walked.
+            "function_item" | "function_signature_item" => continue,
+            "if_expression" | "for_expression" | "while_expression" | "loop_expression"
+            | "match_arm" | "try_expression" => score += 1,
+            "binary_expression" => {
+                if node
+                    .child_by_field_name("operator")
+                    .is_some_and(|op| matches!(op.kind(), "&&" | "||"))
+                {
+                    score += 1;
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    score
 }
 
 fn macro_invocation_name(text: &str) -> String {
@@ -7340,5 +7398,119 @@ fn file_scoped_fn() {}
             Some(vec![r#"feature = "slash//literal""#.to_owned()]),
             "// inside a string literal is predicate text, not a comment"
         );
+    }
+
+    // ── Issue #162: structural complexity counting rules ──────────────────
+    //
+    // RED: `control_flow_complexity` does not exist yet.
+
+    /// Drives [`control_flow_complexity`] over a real parse of `source`,
+    /// taking the first `function_item` — the same node kind the extractor
+    /// hands to `add_symbol`.
+    fn complexity_of_fn(source: &str) -> u32 {
+        let tree = parse_tree(source);
+        let item = first_descendant_of_kind(tree.root_node(), "function_item")
+            .expect("source should contain a function_item");
+        control_flow_complexity(item)
+    }
+
+    #[test]
+    fn complexity_straight_line_scores_minimum() {
+        assert_eq!(complexity_of_fn("fn f() -> i32 { 42 }"), 1);
+        assert_eq!(complexity_of_fn("fn f(a: i32, b: i32) -> i32 { a + b }"), 1);
+    }
+
+    #[test]
+    fn complexity_counts_branches_and_else_if() {
+        assert_eq!(
+            complexity_of_fn("fn f(x: bool) -> i32 { if x { 1 } else { 0 } }"),
+            2
+        );
+        // `else if` is a second `if_expression` in the AST: a second decision.
+        assert_eq!(
+            complexity_of_fn(
+                "fn f(x: i32) -> i32 { if x > 0 { 1 } else if x < 0 { 2 } else { 0 } }"
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn complexity_counts_loops() {
+        assert_eq!(complexity_of_fn("fn f() { loop { break; } }"), 2);
+        assert_eq!(complexity_of_fn("fn f(x: bool) { while x { break; } }"), 2);
+        assert_eq!(complexity_of_fn("fn f() { for _ in 0..1 {} }"), 2);
+        assert_eq!(
+            complexity_of_fn("fn f() { for _ in 0..1 {} while true { break; } loop { break; } }"),
+            4
+        );
+    }
+
+    #[test]
+    fn complexity_counts_every_match_arm() {
+        // Three arms (including the `_` catch-all): 1 + 3 = 4.
+        assert_eq!(
+            complexity_of_fn("fn f(x: i32) -> i32 { match x { 0 => 1, 1..=5 => 2, _ => 3 } }"),
+            4
+        );
+    }
+
+    #[test]
+    fn complexity_counts_try_and_short_circuit_operators() {
+        assert_eq!(
+            complexity_of_fn("fn f(x: Option<i32>) -> Option<i32> { Some(x?) }"),
+            2
+        );
+        assert_eq!(
+            complexity_of_fn("fn f(a: bool, b: bool) -> bool { a && b }"),
+            2
+        );
+        assert_eq!(
+            complexity_of_fn("fn f(a: bool, b: bool) -> bool { a || b }"),
+            2
+        );
+        assert_eq!(
+            complexity_of_fn("fn f(a: bool, b: bool, c: bool) -> bool { a && b || c }"),
+            3
+        );
+    }
+
+    #[test]
+    fn complexity_counts_closure_bodies_but_not_nested_fns() {
+        // Closure bodies are part of the enclosing function's expression
+        // tree: the `if` inside the closure counts.
+        assert_eq!(
+            complexity_of_fn("fn f() -> i32 { let g = |x: i32| if x > 0 { x } else { -x }; g(1) }"),
+            2
+        );
+        // A nested `fn` gets its own symbol: its `if` must not inflate the
+        // outer score. Outer: 1 + 1 (its own `if`) = 2.
+        let outer = complexity_of_fn(
+            "fn outer() -> i32 { fn inner(x: bool) -> i32 { if x { 1 } else { 0 } } if true { inner(true) } else { 0 } }",
+        );
+        assert_eq!(outer, 2);
+    }
+
+    #[test]
+    fn complexity_is_monotone_in_decision_points() {
+        // Each snippet adds exactly one decision point over the previous:
+        // the scores must be strictly increasing.
+        let snippets = [
+            "fn f() -> i32 { 0 }",
+            "fn f(x: bool) -> i32 { if x { 1 } else { 0 } }",
+            "fn f(x: bool) -> i32 { if x && x { 1 } else { 0 } }",
+            "fn f(x: bool) -> i32 { if x && x || x { 1 } else { 0 } }",
+            "fn f(x: bool) -> i32 { if x && x || x { if x { 1 } else { 0 } } else { 0 } }",
+            "fn f(x: bool) -> i32 { while x { break; } if x && x || x { if x { 1 } else { 0 } } else { 0 } }",
+            "fn f(x: bool) -> i32 { for _ in 0..1 {} while x { break; } if x && x || x { if x { 1 } else { 0 } } else { 0 } }",
+        ];
+        let mut previous = 0u32;
+        for (i, snippet) in snippets.iter().enumerate() {
+            let score = complexity_of_fn(snippet);
+            let expected = u32::try_from(i + 1).expect("snippet index fits in u32");
+            assert_eq!(score, expected, "snippet {i} should score {}", i + 1);
+            assert!(score > previous, "snippet {i} must score strictly higher");
+            previous = score;
+        }
     }
 }

@@ -169,6 +169,8 @@ pub(crate) fn query_file(
             // `docs/cli/query.md` promises these rows carry every `eg query
             // symbol` field but visibility/signature/doc.
             cfg: r.cfg(),
+            // Likewise the structural complexity score (issue #162).
+            complexity: r.complexity(),
         });
     }
 

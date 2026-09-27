@@ -138,6 +138,17 @@ a legacy node record with no `role` key still deserializes (as unknown), and
 it is **never an identity input**, so `stable_id`'s preimage is unchanged.
 Re-extraction from source stamps every record deterministically.
 
+Issue #162 added the optional `complexity` field (`u32`) on Rust callable
+`Symbol` node records (`function` / `method` / `test` symbol kinds) WITHOUT a
+version bump: the addition is `additive` —
+`#[serde(default, skip_serializing_if = "Option::is_none")]`, so a legacy
+node record with no `complexity` key still deserializes (as unknown), and it
+is **never an identity input**, so `stable_id`'s preimage is unchanged. The
+embedded `AletheiaDB` adapter stores it as a non-interned integer property
+and reads it back symmetrically. Re-extraction from source re-derives every
+score deterministically from the Tree-sitter parse. See
+[`complexity.md`](complexity.md).
+
 Rationale: per-domain and per-kind scoping lets #6, #11, #13, #14, and #15 land
 independently. A new project `Task` shape must not force a version bump for
 unrelated codegraph `Symbol` records in the same store. For the code-graph

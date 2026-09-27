@@ -54,6 +54,8 @@ eg query churn            --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--f
 eg query churn            --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
 eg query clones           --graph <PATH>    [--repo <SELECTOR>] [--min-size N] [--limit N] [--format json|text]
 eg query clones           --data-dir <DIR>  [--repo <SELECTOR>] [--min-size N] [--limit N] [--format json|text]
+eg query complexity       --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
+eg query complexity       --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
 eg query conflicts <SCOPE> --graph <PATH>   [--repo <SELECTOR>] [--include-resolved] [--format json|text]
 eg query conflicts <SCOPE> --data-dir <DIR> [--repo <SELECTOR>] [--include-resolved] [--format json|text]
 eg query producer-drift   --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
@@ -193,6 +195,11 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query clones` — group **exact-duplicate Rust symbol bodies** into citable
   clone classes by normalized-body content hash, so a fix or extraction lands
   on every copy of duplicated logic ([clones.md](clones.md), issue #216).
+- `eg query complexity` — rank Rust callable symbols by **deterministic
+  structural complexity** (`1 + decision points` in the item's own body),
+  highest first, for hotspot triage. A source-derived code fact, never agent
+  confidence; the complexity half of the CodeScene-style hotspot pair whose
+  other half is churn ([complexity.md](complexity.md), issue #162).
 - `eg query conflicts` — surface **recorded contradicting observations on a
   shared code target**: the pairs of agent claims, verification executions,
   and user-context records joined by `CONTRADICTS` edges within a symbol /

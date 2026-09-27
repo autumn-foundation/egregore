@@ -17,6 +17,7 @@ mod change_impact;
 mod changes;
 mod churn;
 mod clones;
+mod complexity;
 mod config;
 mod conflicts;
 mod context;
@@ -136,6 +137,7 @@ pub(crate) use change_impact::*;
 pub(crate) use changes::*;
 pub(crate) use churn::*;
 pub(crate) use clones::*;
+pub(crate) use complexity::*;
 pub(crate) use config::*;
 pub(crate) use conflicts::*;
 pub(crate) use context::*;
@@ -4210,6 +4212,44 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Rank Rust callable symbols by deterministic structural complexity,
+    /// highest first (issue #162).
+    ///
+    /// Every Rust callable (`function` / `method` / `test` symbol kind) carries
+    /// a source-derived integer `complexity`: 1 plus one per decision point in
+    /// the item's own body (`if` / `else if`, `for`, `while`, `loop`, each
+    /// `match` arm, each `?`, each `&&`, each `||`). Closure bodies count
+    /// toward the enclosing callable; nested `fn` items get their own symbol.
+    /// The score is a code fact, not agent confidence.
+    ///
+    /// Ordering is deterministic and byte-stable: complexity descending, then
+    /// qualified name ascending (documented tie-break), then symbol record ID
+    /// ascending. The answer states explicitly whether `--limit` truncated it.
+    ///
+    /// Exit codes:
+    ///   0 — ranking returned.
+    ///   1 — load error, invalid --limit, unknown/ambiguous --repo selector.
+    ///   2 — no scored callable symbols in scope (`no_match`).
+    ///
+    /// Documented in `docs/cli/complexity.md`.
+    Complexity {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the ranking to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum ranked symbols returned (default 50, max 500). Values outside
+        /// 1..=500 are rejected with an `invalid_limit` diagnostic.
+        #[arg(long, default_value_t = query::COMPLEXITY_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Surface recorded contradicting observations on a shared code target (issue #232).
     ///
     /// Returns the pairs of records joined by a recorded `CONTRADICTS` edge —
@@ -6532,6 +6572,17 @@ pub(crate) struct SymbolResult<'a> {
     /// absent chain rather than fabricating a gate.
     #[serde(skip_serializing_if = "Option::is_none")]
     cfg: Option<&'a Vec<String>>,
+    /// Deterministic structural complexity score (issue #162): 1 plus one
+    /// per decision point in the item's own body. Present on Rust callable
+    /// `Symbol` nodes (`function` / `method` / `test` symbol kinds); a
+    /// `TrustClass::SourceDerived` code fact, never agent confidence.
+    ///
+    /// OMITTED entirely for a record produced before issue #162 and for
+    /// non-callable symbols — score UNKNOWN-or-inapplicable, which is a
+    /// different fact from a present minimum. The text render likewise
+    /// prints nothing for an absent score rather than fabricating one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    complexity: Option<u32>,
 }
 
 /// Resolves the effective corpus mode for a current-state code lane and,
@@ -7555,6 +7606,35 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_churn_cmd(&records, selected.as_deref(), limit, format)
+        }
+        QuerySubcommand::Complexity {
+            graph,
+            data_dir,
+            repo,
+            limit,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic.
+            if limit == 0 || limit > query::COMPLEXITY_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::COMPLEXITY_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {} (default {})",
+                        query::COMPLEXITY_MAX_LIMIT,
+                        query::COMPLEXITY_DEFAULT_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_complexity_cmd(&records, selected.as_deref(), limit, format)
         }
         QuerySubcommand::Conflicts {
             scope,

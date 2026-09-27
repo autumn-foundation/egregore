@@ -281,6 +281,9 @@ pub fn estimate_interned_strings(records: &[GraphRecord]) -> InternEstimate {
                 cfg: _,
                 entry_point: _,
                 role: _,
+                // Structural complexity (issue #162): a plain `u32` written
+                // as a string property, not interned.
+                complexity: _,
             } => {
                 node_count += 1;
                 values.insert(id.clone());

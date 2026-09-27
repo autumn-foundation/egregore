@@ -390,6 +390,9 @@ struct SymbolAnswerRow<'a> {
     /// Symbol role (issue #190), mirroring the real `eg query symbol` row.
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<&'a crate::ir::SymbolRole>,
+    /// Structural complexity (issue #162), mirroring the real `eg query symbol` row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    complexity: Option<u32>,
 }
 
 /// One semantic answer row, serialized like the `eg query semantic` JSON line.
@@ -625,6 +628,7 @@ where
                 corpus_mode_source: symbol_corpus.as_ref().map(|c| c.1),
                 corpus_disclaimer: symbol_corpus.as_ref().map(|c| c.2.clone()),
                 role: record.role(),
+                complexity: record.complexity(),
             };
             if id.as_str() == expected_record_id {
                 has_expected = true;

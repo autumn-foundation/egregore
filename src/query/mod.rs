@@ -91,6 +91,8 @@ mod track_record;
 mod session_retrospective;
 // Appended (issue #169); kept at the end to minimize cross-lane merge conflicts.
 mod policy_context;
+// Appended (issue #162); kept at the end to minimize cross-lane merge conflicts.
+mod complexity;
 
 pub use as_of::*;
 pub use author_scope::*;
@@ -180,3 +182,5 @@ pub use trust_audit::*;
 pub use neighborhood::*;
 // Appended (issue #163); kept at the end to minimize cross-lane merge conflicts.
 pub use memory_collapse::*;
+// Appended (issue #162); kept at the end to minimize cross-lane merge conflicts.
+pub use complexity::*;

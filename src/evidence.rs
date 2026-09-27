@@ -669,6 +669,7 @@ fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
         cfg: None,
         entry_point: None,
         role: None,
+        complexity: None,
         id,
         kind: NodeKind::Agent,
         // Issue #191: decision-only fields; None for non-Decision records.
@@ -807,6 +808,7 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
         cfg: None,
         entry_point: None,
         role: None,
+        complexity: None,
         id,
         kind: NodeKind::AgentSession,
         // Issue #191: decision-only fields; None for non-Decision records.
@@ -1148,6 +1150,7 @@ pub fn build_observation_records_with_producer(
         cfg: None,
         entry_point: None,
         role: None,
+        complexity: None,
         id: obs_id.clone(),
         kind: NodeKind::Observation,
         // Issue #191: decision-only fields; None for non-Decision records.
@@ -1454,6 +1457,7 @@ pub fn build_failure_records(
         cfg: None,
         entry_point: None,
         role: None,
+        complexity: None,
         id: failure_id.clone(),
         kind: NodeKind::Failure,
         // Issue #191: decision-only fields; None for non-Decision records.
@@ -1717,6 +1721,7 @@ pub fn build_command_evidence_records(
         cfg: None,
         entry_point: None,
         role: None,
+        complexity: None,
         id: cmd_id.clone(),
         kind: NodeKind::CommandEvidence,
         // Issue #191: decision-only fields; None for non-Decision records.
@@ -1980,6 +1985,7 @@ pub fn build_artifact_records(
         cfg: None,
         entry_point: None,
         role: None,
+        complexity: None,
         id: art_id.clone(),
         kind: NodeKind::PatchArtifact,
         // Issue #191: decision-only fields; None for non-Decision records.
@@ -2216,6 +2222,7 @@ pub fn build_verification_records(
         cfg: None,
         entry_point: None,
         role: None,
+        complexity: None,
         id: ver_id.clone(),
         kind: NodeKind::Verification,
         // Issue #191: decision-only fields; None for non-Decision records.

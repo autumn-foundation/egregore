@@ -1370,6 +1370,19 @@ pub enum GraphRecord {
         /// fabricated) and on node kinds outside the code-graph domain.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<SymbolRole>,
+        // ── Structural complexity facts (issue #162) ─────────────────────
+        /// Deterministic structural complexity score for Rust callable
+        /// `Symbol` nodes (`function` / `method` / `test` symbol kinds,
+        /// issue #162): 1 plus one per decision point in the item's own
+        /// body (`if` / `else if`, `for`, `while`, `loop`, each `match`
+        /// arm, each `?`, each `&&`, each `||`). Closure bodies count
+        /// toward the enclosing callable; nested `fn` items get their own
+        /// symbol and are not counted. Signature-only items (no body) score
+        /// the minimum 1. A `TrustClass::SourceDerived` code fact — no
+        /// agent-authored confidence. Additive per
+        /// `docs/schema/schema-versioning.md` §2; never an identity input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        complexity: Option<u32>,
         // ── Owning-Cargo-package attribution (issue #117) ─────────────────────
         /// The Cargo package that owns this code fact, resolved from the
         /// NEAREST ENCLOSING `Cargo.toml`, together with that manifest's
@@ -1963,6 +1976,7 @@ impl GraphRecord {
             cfg: None,
             entry_point: None,
             role: None,
+            complexity: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2101,6 +2115,7 @@ impl GraphRecord {
             cfg: None,
             entry_point: None,
             role: None,
+            complexity: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2238,6 +2253,7 @@ impl GraphRecord {
             cfg: None,
             entry_point: None,
             role: None,
+            complexity: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2380,6 +2396,7 @@ impl GraphRecord {
             cfg: None,
             entry_point: None,
             role: None,
+            complexity: None,
             crate_attribution: None,
             temporal: None,
             semantic_drift: None,
@@ -2868,6 +2885,27 @@ impl GraphRecord {
             Self::Node {
                 content_signature, ..
             } => content_signature.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
+    /// Stamps the structural complexity score on a callable `Symbol` node
+    /// (issue #162). The value is additive metadata per
+    /// `docs/schema/schema-versioning.md` §2 and MUST NOT contribute to
+    /// stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub const fn with_complexity(mut self, score: u32) -> Self {
+        if let Self::Node { complexity, .. } = &mut self {
+            *complexity = Some(score);
+        }
+        self
+    }
+
+    /// Returns the structural complexity score when present (issue #162).
+    #[must_use]
+    pub const fn complexity(&self) -> Option<u32> {
+        match self {
+            Self::Node { complexity, .. } => *complexity,
             Self::Edge { .. } | Self::Tombstone { .. } => None,
         }
     }

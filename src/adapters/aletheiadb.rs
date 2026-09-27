@@ -2760,6 +2760,7 @@ impl EmbeddedAletheiaSink {
             cfg,
             entry_point,
             role,
+            complexity,
             crate_attribution,
             temporal,
             semantic_drift,
@@ -2930,6 +2931,14 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(role)
         {
             builder = builder.insert("role_json", json.as_str());
+        }
+        // Structural complexity (issue #162). Paired with the read at
+        // `read_node_record_internal`; the two MUST stay symmetric: the
+        // read is full structural equality of the reconstructed record, so
+        // a written-but-unread property would make every re-ingest write a
+        // new physical version forever.
+        if let Some(score) = complexity {
+            builder = builder.insert("complexity", score.to_string().as_str());
         }
         // Owning-package attribution (issue #117). Paired with the read at
         // `read_node_record_internal`; the two MUST stay symmetric.
@@ -3975,6 +3984,17 @@ impl EmbeddedAletheiaSink {
                 .map(serde_json::from_str::<SymbolRole>)
                 .transpose()
                 .map_err(|e| read_back_error(record_id, format!("role_json invalid: {e}")))?,
+            // Structural complexity (issue #162). The read MUST mirror the
+            // write, for the same structural-equality reason as above.
+            complexity: optional_str_property(
+                record_id,
+                "complexity",
+                node.get_property("complexity"),
+            )?
+            .as_deref()
+            .map(str::parse::<u32>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("complexity invalid: {e}")))?,
             // Owning-package attribution (issue #117). The read MUST mirror the
             // write: `compare_node_record` is full structural equality of the
             // reconstructed record, so a written-but-unread property would make

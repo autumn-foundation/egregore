@@ -124,6 +124,7 @@ fn make_agent_memory_node(
         deprecated: None,
         entry_point: None,
         role: None,
+        complexity: None,
         crate_attribution: None,
         temporal: None,
         semantic_drift: None,
