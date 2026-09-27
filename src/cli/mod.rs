@@ -72,6 +72,8 @@ mod recency;
 mod record_budget;
 mod records;
 mod redaction_audit;
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+mod reembed_cmd;
 mod repair_cmd;
 mod repos;
 mod resolve_frames;
@@ -798,6 +800,39 @@ pub(crate) enum Commands {
         /// Keep source-embedded secrets in raw form instead of redacting them.
         #[arg(long)]
         raw_literals: bool,
+    },
+    /// Re-embed an `--embed` store under a different local embedding model
+    /// without re-scanning sources (issue #167).
+    ///
+    /// Every node that already carries a persisted `embedding` vector is
+    /// re-embedded with the target model; the `#104` vector-index identity
+    /// record is superseded in the same transaction, and the vector index is
+    /// rebuilt when the dimension changes. No source scan, no graph
+    /// re-extraction, no remote embedding service: the target model must
+    /// already be available locally (a local directory, or a Hugging Face id
+    /// present in the local HF cache) — it is never downloaded.
+    ///
+    /// Machine-readable report on `--format json` (`candidates`,
+    /// `reembedded`, `skipped`, `failed` counts); exit `12` when the model is
+    /// not available locally, `13` for `--dry-run` with work remaining, `14`
+    /// when the store has nothing to migrate. See `docs/cli/re-embed.md`.
+    #[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+    #[command(name = "re-embed")]
+    Reembed {
+        /// Embedded `AletheiaDB` data directory holding the `--embed` store.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Re-embed target model: a local model directory, or a Hugging Face
+        /// model id resolved from the local HF cache only (never downloaded).
+        #[arg(long)]
+        model: String,
+        /// Output format for the re-embed report.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+        /// Plan without mutating: prints the candidate count and target model,
+        /// exits `13` while work remains, leaves the store byte-identical.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Inspect a graph JSONL file, an embedded store, or a running daemon.
     ///
@@ -1968,6 +2003,17 @@ pub(crate) enum QuerySubcommand {
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
+        /// Embedding model used to vectorize the query text: a local model
+        /// directory, or a Hugging Face model id resolved from the local HF
+        /// cache only (never downloaded; issue #167).
+        ///
+        /// Defaults to the built-in model. The store's `#104` vector-index
+        /// identity must match the resolved model; otherwise the query is
+        /// refused — e.g. after `eg re-embed --model <m>`, query with
+        /// `--embed-model <m>`.
+        #[cfg(feature = "embeddings")]
+        #[arg(long, conflicts_with = "daemon")]
+        embed_model: Option<String>,
     },
     /// Answer a natural-language query with evidence-backed context for the
     /// top-N semantic matches in one call (issue #90).
@@ -6305,6 +6351,13 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             embed_model,
             raw_literals,
         ),
+        #[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+        Commands::Reembed {
+            data_dir,
+            model,
+            format,
+            dry_run,
+        } => reembed_cmd::reembed_cmd(&data_dir, &model, format, dry_run),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Watch {
             data_dir,
@@ -8124,6 +8177,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             under,
             limit,
             format,
+            embed_model,
         } => {
             if daemon {
                 // `--under` conflicts with `--daemon` at the CLI layer (scoped
@@ -8138,6 +8192,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     repo.as_deref(),
                     under.as_deref(),
                     format,
+                    embed_model.as_deref(),
                 )
             }
         }

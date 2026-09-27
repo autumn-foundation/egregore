@@ -503,12 +503,11 @@ pub const SEMANTIC_INDEX_UNREADABLE_EXIT_CODE: i32 = 11;
 
 /// Operator remedy carried by every identity refusal.
 ///
-/// Points at re-ingest, never at editing the store: the store is the record of
-/// what was actually embedded, and mutating it would replace a detectable
-/// incompatibility with a silent lie.
-pub const EMBEDDING_IDENTITY_REMEDY: &str = "re-ingest the graph into a fresh --data-dir with `eg ingest <graph> --adapter embedded \
-     --data-dir <NEW_DIR> --embed` so the index and the query embedder share one vector space; \
-     do not edit the store by hand";
+/// Points at `eg re-embed` or re-ingest, never at editing the store: the store
+/// is the record of what was actually embedded, and mutating it would replace
+/// a detectable incompatibility with a silent lie. The refusal itself stays
+/// read-only — re-embed is a separate, explicit operator command (issue #167).
+pub const EMBEDDING_IDENTITY_REMEDY: &str = "re-embed the store in place with `eg re-embed --data-dir <DIR> --model <MODEL>` (no re-scan; the model must already be available locally and is never downloaded), or re-ingest the graph into a fresh --data-dir with `eg ingest <graph> --adapter embedded --data-dir <NEW_DIR> --embed` so the index and the query embedder share one vector space; for a query refusal you may instead re-run with `--embed-model` matching the store's indexed model; do not edit the store by hand";
 
 /// Operator remedy carried by the unreadable-index refusal (issue #489).
 ///

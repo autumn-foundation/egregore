@@ -113,6 +113,9 @@ pub mod query_latency;
 pub mod redaction;
 /// At-import redaction report (issue #266).
 pub mod redaction_report;
+/// In-place re-embedding of an `--embed` store under a new local model (issue #167).
+#[cfg(feature = "embeddings")]
+pub mod reembed;
 /// Offline repair workflow for Egregore stores (issue #49).
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod repair;

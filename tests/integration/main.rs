@@ -141,6 +141,7 @@ mod range_deltas;
 mod record_budget;
 mod redaction;
 mod redaction_report;
+mod reembed;
 mod refresh;
 mod repair;
 mod repo_catalog;

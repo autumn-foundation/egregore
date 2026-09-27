@@ -59,6 +59,36 @@ const VECTOR_INDEX_ARTIFACT_FILES: [&str; 4] = [
     "current.usearch.mappings",
 ];
 
+/// A node selected for re-embedding: it already carries a persisted
+/// `embedding` vector, which is exactly the previously-embedded set
+/// (issue #167).
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone)]
+pub struct ReembedNode {
+    /// Stable graph record ID.
+    pub record_id: String,
+    /// Full vector key (record ID + temporal identity): two observations of
+    /// the same stable symbol at different commits are different nodes with
+    /// different vectors, and re-embed must recover each one's own text.
+    pub vector_key: crate::embeddings::EmbeddingVectorKey,
+    /// Engine node to patch.
+    pub node_id: ::aletheiadb::NodeId,
+    /// Dimension of the currently-persisted vector.
+    pub vector_dim: usize,
+}
+
+/// One replacement vector for [`EmbeddedAletheiaSink::reembed_commit`].
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone)]
+pub struct ReembedVectorUpdate {
+    /// Stable graph record ID (for diagnostics).
+    pub record_id: String,
+    /// Engine node to patch.
+    pub node_id: ::aletheiadb::NodeId,
+    /// Replacement vector; must match the target model's dimension.
+    pub vector: Vec<f32>,
+}
+
 /// A single result from a semantic similarity search.
 #[cfg(feature = "embeddings")]
 #[derive(Debug, Clone)]
@@ -3262,6 +3292,196 @@ impl EmbeddedAletheiaSink {
         Ok(())
     }
 
+    /// One node selected for re-embedding: the node already carries a
+    /// persisted `embedding` vector, which is exactly the previously-embedded
+    /// set (issue #167).
+    ///
+    /// The fixed #104 identity record is excluded even if it ever carried a
+    /// vector: it has no embeddable text (its kind is never an embedding
+    /// candidate), and re-embedding supersedes it via the identity patch in
+    /// [`reembed_commit`], not via a vector replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::Rejected`] when a candidate's vector property
+    /// cannot be decoded.
+    #[cfg(feature = "embeddings")]
+    pub fn reembed_candidate_nodes(&self) -> AdapterResult<Vec<ReembedNode>> {
+        let identity_id = crate::embeddings::embedding_index_identity_id();
+        let records = self.read_all_records()?;
+        let mut nodes = Vec::new();
+        for record in &records {
+            let GraphRecord::Node { id, temporal, .. } = record else {
+                continue;
+            };
+            if id == &identity_id {
+                continue;
+            }
+            let Some(node_id) = self.node_id_for_observation(id, temporal.as_ref()) else {
+                continue;
+            };
+            let node = self
+                .db
+                .get_node(node_id)
+                .map_err(|error| read_back_error(id, error.to_string()))?;
+            let Some(vector) = node
+                .get_property("embedding")
+                .and_then(::aletheiadb::PropertyValue::as_vector)
+            else {
+                continue;
+            };
+            let Some(vector_key) = crate::embeddings::EmbeddingVectorKey::from_record(record)
+            else {
+                continue;
+            };
+            nodes.push(ReembedNode {
+                record_id: id.clone(),
+                vector_key,
+                node_id,
+                vector_dim: vector.len(),
+            });
+        }
+        // Deterministic order: record ID ascending, mirroring the candidate
+        // ordering in `crate::embeddings::embedding_candidates`.
+        nodes.sort_by(|left, right| left.record_id.cmp(&right.record_id));
+        Ok(nodes)
+    }
+
+    /// Reads every persisted `embedding` vector, keyed by record ID, in
+    /// deterministic (record-ID ascending) order.
+    ///
+    /// This is an introspection helper for issue #167 verification: it lets a
+    /// test prove the stored vectors are all at the target dimension with no
+    /// mixed vector spaces, and byte-identical across deterministic runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::Rejected`] when a vector property cannot be
+    /// decoded.
+    #[cfg(feature = "embeddings")]
+    pub fn read_persisted_vectors(&self) -> AdapterResult<Vec<(String, Vec<f32>)>> {
+        let mut vectors = Vec::new();
+        for node in self.reembed_candidate_nodes()? {
+            let stored = self
+                .db
+                .get_node(node.node_id)
+                .map_err(|error| read_back_error(&node.record_id, error.to_string()))?;
+            let Some(vector) = stored
+                .get_property("embedding")
+                .and_then(::aletheiadb::PropertyValue::as_vector)
+            else {
+                return Err(AdapterError::Rejected {
+                    record_id: node.record_id,
+                    message: "node lost its embedding vector".to_owned(),
+                });
+            };
+            vectors.push((node.record_id, vector.to_vec()));
+        }
+        Ok(vectors)
+    }
+
+    /// Commits a re-embedding in ONE transaction: every node's `embedding`
+    /// property is replaced and the fixed identity record is superseded with
+    /// the target model's identity (issue #167).
+    ///
+    /// Single-transaction is the whole point: a crash can never leave the
+    /// store with identity B and vectors A (or the reverse), the two states
+    /// that would silently misrank. Every vector is validated against the
+    /// target dimension BEFORE the transaction opens, so a dimension slip
+    /// fails closed without touching the store.
+    ///
+    /// Returns the number of node vectors replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::Rejected`] when the store has no #104
+    /// identity record, when any vector's dimension differs from the
+    /// target's, or when the transaction fails (it is rolled back).
+    #[cfg(feature = "embeddings")]
+    pub fn reembed_commit(
+        &self,
+        updates: &[ReembedVectorUpdate],
+        target_model: &EmbeddingModel,
+    ) -> AdapterResult<usize> {
+        for update in updates {
+            if update.vector.len() != target_model.dim as usize {
+                return Err(AdapterError::Rejected {
+                    record_id: update.record_id.clone(),
+                    message: format!(
+                        "re-embed vector for {} has {} dimensions but the target model {} has {}; \
+                         refusing before any write",
+                        update.record_id,
+                        update.vector.len(),
+                        target_model.name,
+                        target_model.dim,
+                    ),
+                });
+            }
+        }
+        let identity_id = crate::embeddings::embedding_index_identity_id();
+        let identity_node_id = self
+            .node_id_for_observation(&identity_id, None)
+            .ok_or_else(|| AdapterError::Rejected {
+                record_id: identity_id.clone(),
+                message: "re-embed requires the #104 identity record; \
+                              the store was never --embed'ed under a recorded model"
+                    .to_owned(),
+            })?;
+        let identity_patch = reembed_identity_patch(target_model)?;
+
+        self.db
+            .write(|tx| {
+                for update in updates {
+                    let properties = ::aletheiadb::PropertyMapBuilder::new()
+                        .insert_vector("embedding", &update.vector)
+                        .build();
+                    tx.update_node(update.node_id, properties)?;
+                }
+                tx.update_node(identity_node_id, identity_patch)?;
+                Ok::<(), ::aletheiadb::Error>(())
+            })
+            .map_err(|error| AdapterError::Rejected {
+                record_id: "embedded-store".to_owned(),
+                message: format!("re-embed transaction failed and was rolled back: {error}"),
+            })?;
+        Ok(updates.len())
+    }
+
+    /// Rebuilds the `embedding` vector index at `dimensions` from the node
+    /// vector properties currently in the store (issue #167).
+    ///
+    /// This is the dimension-change path: after [`remove_persisted_vector_index`]
+    /// deleted the old-dimension artifacts and [`reembed_commit`] replaced
+    /// every node vector, the fresh index is backfilled from those vectors.
+    /// `enable_vector_index` alone would create an EMPTY index (upstream
+    /// documents the overwrite footgun); `rebuild_vector_index` backfills.
+    /// Returns the number of node vectors indexed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::Rejected`] when `dimensions` is zero or the
+    /// index rebuild fails.
+    #[cfg(feature = "embeddings")]
+    pub fn reembed_rebuild_vector_index(&self, dimensions: usize) -> AdapterResult<usize> {
+        if dimensions == 0 {
+            return Err(AdapterError::Rejected {
+                record_id: "embedded-store".to_owned(),
+                message: "embedding vector dimensions must be greater than zero".to_owned(),
+            });
+        }
+        let config = ::aletheiadb::index::vector::hnsw::HnswConfig {
+            dimensions,
+            metric: ::aletheiadb::index::vector::DistanceMetric::Cosine,
+            ..Default::default()
+        };
+        self.db
+            .rebuild_vector_index(EMBEDDING_INDEX_PROPERTY, config)
+            .map_err(|error| AdapterError::Rejected {
+                record_id: "embedded-store".to_owned(),
+                message: error.to_string(),
+            })
+    }
+
     #[cfg(feature = "embeddings")]
     fn node_id_for_observation(
         &self,
@@ -5496,6 +5716,81 @@ fn probe_persisted_vector_index(
         };
     }
     VectorIndexState::Absent
+}
+
+/// Deletes the persisted `embedding` vector-index artifacts for a data dir
+/// (issue #167).
+///
+/// Used when re-embedding changes the vector dimension: `AletheiaDB` 0.2.0
+/// has no API to change a loaded vector index's dimension, so the old
+/// artifacts are removed and a fresh index is enabled at the new dimension.
+/// Only the `embedding` property directory is removed — graph data, the WAL,
+/// and every other index are untouched.
+///
+/// Returns the number of property directories removed (0, 1, or 2).
+///
+/// # Errors
+///
+/// Returns the underlying [`std::io::Error`] when a directory cannot be
+/// removed.
+#[cfg(feature = "embeddings")]
+pub fn remove_persisted_vector_index(data_dir: &Path) -> std::io::Result<usize> {
+    let mut removed = 0;
+    for dir in persisted_vector_index_dirs(data_dir, EMBEDDING_INDEX_PROPERTY) {
+        if dir.is_dir() {
+            std::fs::remove_dir_all(&dir)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Builds the property PATCH that supersedes the fixed #104 identity record
+/// with a new model's identity (issue #167).
+///
+/// The identity record's shape is fixed — it is always built by
+/// [`crate::embeddings::embedding_index_identity_record`] — so patching the
+/// four model-derived properties (`name`, `summary`, `embedding_model_json`,
+/// `producer_json`) is exactly equivalent to a full node rewrite: every other
+/// property (id, kind, domain, schema version) is identical between the old
+/// and new record.
+#[cfg(feature = "embeddings")]
+fn reembed_identity_patch(
+    target_model: &EmbeddingModel,
+) -> AdapterResult<::aletheiadb::PropertyMap> {
+    let record = crate::embeddings::embedding_index_identity_record(target_model);
+    let GraphRecord::Node {
+        name,
+        summary,
+        embedding_model: Some(model),
+        producer: Some(producer),
+        ..
+    } = &record
+    else {
+        return Err(AdapterError::Rejected {
+            record_id: crate::embeddings::embedding_index_identity_id(),
+            message: "embedding_index_identity_record did not produce the expected node shape"
+                .to_owned(),
+        });
+    };
+    let mut builder = ::aletheiadb::PropertyMapBuilder::new();
+    if let Some(name) = name {
+        builder = builder.insert("name", name.as_str());
+    }
+    builder = builder.insert("summary", summary.as_str());
+    let model_json =
+        serde_json::to_string(model.as_ref()).map_err(|error| AdapterError::Rejected {
+            record_id: crate::embeddings::embedding_index_identity_id(),
+            message: format!("failed to serialize target model identity: {error}"),
+        })?;
+    builder = builder.insert("embedding_model_json", model_json.as_str());
+    let producer_json =
+        serde_json::to_string(producer).map_err(|error| AdapterError::Rejected {
+            record_id: crate::embeddings::embedding_index_identity_id(),
+            message: format!("failed to serialize identity producer: {error}"),
+        })?;
+    builder = builder.insert("producer_json", producer_json.as_str());
+    Ok(builder.build())
 }
 
 fn is_fresh_data_dir(data_dir: &Path) -> bool {

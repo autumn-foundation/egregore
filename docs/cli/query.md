@@ -15,7 +15,7 @@ eg query who      <NAME>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] 
 eg query who      <NAME>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query drift            --graph <PATH>    [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query drift            --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
-eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--under <PREFIX>] [--format json|text]
+eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--under <PREFIX>] [--embed-model <MODEL>] [--format json|text]
 eg query semantic-context <QUERY> --data-dir <DIR> [--limit N] [--min-score F] [--repo <SELECTOR>]
 eg query semantic-memory <QUERY> --data-dir <DIR> [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
 eg query implementors <TRAIT> --graph <PATH>   [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
@@ -1558,6 +1558,7 @@ envelope shape, and the re-ingest workflow are documented in
 | `--data-dir <DIR>` | yes | Embedded `AletheiaDB` store created by `eg ingest --adapter embedded --embed`. `--graph` is not accepted by this subcommand. |
 | `--limit N` | no | Maximum number of results (default `10`). Bounds the scoped result set when `--repo` is supplied. |
 | `--repo <SELECTOR>` | no | Restrict retrieval leads to one repository. |
+| `--embed-model <MODEL>` | no | Model used to vectorize the query text: a local model directory, or a Hugging Face id from the local cache only (never downloaded; issue #167). Defaults to the built-in model. The store's #104 identity must match the resolved model — e.g. after `eg re-embed --model <m>`, query with `--embed-model <m>`. Conflicts with `--daemon`. |
 | `--format` | no | `json` (default) or `text`. |
 
 ### JSON output fields

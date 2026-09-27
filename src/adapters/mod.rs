@@ -23,6 +23,8 @@ pub use aletheiadb::EmbeddedAletheiaSink;
 pub use aletheiadb::SemanticMatch;
 #[cfg(feature = "embeddings")]
 pub use aletheiadb::compare_semantic_matches;
+#[cfg(feature = "embeddings")]
+pub use aletheiadb::{ReembedNode, ReembedVectorUpdate, remove_persisted_vector_index};
 /// Result type for adapter operations.
 pub type AdapterResult<T> = std::result::Result<T, AdapterError>;
 

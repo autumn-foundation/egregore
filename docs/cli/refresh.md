@@ -135,6 +135,10 @@ removed from the semantic index.
 
 `embed_status` in the JSON report: `"refreshed"`
 
+Refresh re-embeds changed nodes under the *same* model the store was built
+with. To move the *whole* store to a *different* model without re-scanning
+sources, use `eg re-embed` instead (issue #167) — see `docs/cli/re-embed.md`.
+
 ---
 
 ## Precondition Failures (Exit Code 2)

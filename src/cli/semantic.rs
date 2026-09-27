@@ -30,6 +30,145 @@ pub(crate) fn embed_query_text(query: &str) -> Result<Vec<f32>> {
         .map(|dense| dense.embedding)
 }
 
+/// Embeds a query with an already-loaded custom model (issue #167): the same
+/// `embed_query` + dense-conversion shape as [`embed_query_text`], minus the
+/// built-in-model builder — the caller resolved and loaded `--embed-model`.
+#[cfg(feature = "embeddings")]
+fn embed_query_text_with(
+    embedder: &crate::embeddings::aletheia_embeddings::Embedder,
+    query: &str,
+) -> Result<Vec<f32>> {
+    use crate::embeddings::aletheia_embeddings;
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    let embed_data = rt
+        .block_on(aletheia_embeddings::embed_query(&[query], embedder, None))
+        .context("failed to embed query")?;
+
+    aletheia_embeddings::embed_data_to_dense_iter(embed_data, Some(1))
+        .next()
+        .context("no embedding returned for query")?
+        .context("embedding result was not dense")
+        .map(|dense| dense.embedding)
+}
+
+/// Which model vectorizes the query text for `eg query semantic`.
+///
+/// `Default` preserves the historical behavior (the built-in model); `Custom`
+/// (issue #167) resolves a `--embed-model` argument — a local directory or a
+/// Hugging Face id from the local cache only — loads it, and derives the same
+/// complete identity `eg re-embed` persists, so the #104 gate compares the
+/// store against the model that actually produced the query vector.
+#[cfg(feature = "embeddings")]
+enum QueryEmbedder {
+    Default,
+    Custom {
+        resolved: crate::reembed::ResolvedLocalModel,
+        /// Loaded lazily via [`QueryEmbedder::load`], AFTER the
+        /// declared-identity compatibility gate passes — loading a BERT model
+        /// is expensive, and a refused query should never pay it.
+        embedder: Option<crate::embeddings::aletheia_embeddings::Embedder>,
+    },
+}
+
+#[cfg(feature = "embeddings")]
+impl QueryEmbedder {
+    /// Resolves `--embed-model`: the model must already be available locally
+    /// (never downloaded). A missing model refuses with the stable exit-12
+    /// envelope, before any store I/O beyond the open.
+    ///
+    /// This does NOT load the model weights — see [`QueryEmbedder::load`].
+    /// The declared-identity compatibility gate runs on the cheap config
+    /// read; only a query that passes the gate pays for the load.
+    fn custom(raw: &str) -> Result<Self> {
+        use crate::reembed::{self, ReembedError};
+
+        let spec = reembed::resolve_model_spec(raw);
+        let resolved = match reembed::ensure_model_available_locally(&spec) {
+            Ok(resolved) => resolved,
+            Err(ReembedError::ModelUnavailableLocally {
+                spec,
+                checked,
+                missing,
+            }) => {
+                let envelope = reembed::model_unavailable_envelope(&spec, &checked, &missing);
+                println!(
+                    "{}",
+                    serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".to_owned())
+                );
+                std::process::exit(reembed::REEMBED_MODEL_UNAVAILABLE_EXIT_CODE);
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context("failed to resolve --embed-model"));
+            }
+        };
+        Ok(Self::Custom {
+            resolved,
+            embedder: None,
+        })
+    }
+
+    /// Loads the model weights. Called after the declared-identity
+    /// compatibility gate passes; a refused query never reaches this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model weights fail to load.
+    fn load(&mut self) -> Result<()> {
+        if let Self::Custom { resolved, embedder } = self
+            && embedder.is_none()
+        {
+            let loaded = crate::reembed::load_embedder(resolved).map_err(|error| {
+                anyhow::Error::new(error).context("failed to load --embed-model")
+            })?;
+            *embedder = Some(loaded);
+        }
+        Ok(())
+    }
+
+    /// The query-side identity at the model's declared dimension — the
+    /// pre-load gate input. The measured vector length replaces the dimension
+    /// once a vector exists, mirroring [`embed_query_checked`]'s
+    /// declare-then-measure discipline.
+    fn declared_identity(&self) -> Result<crate::ir::EmbeddingModel> {
+        match self {
+            Self::Default => Ok(crate::embeddings::default_embedding_model_identity(
+                crate::embeddings::DEFAULT_EMBEDDING_MODEL_DIMENSIONS,
+            )),
+            Self::Custom { resolved, .. } => {
+                let dim = crate::reembed::declared_model_dim(resolved).map_err(|error| {
+                    anyhow::Error::new(error).context("failed to read --embed-model config")
+                })?;
+                Ok(crate::reembed::target_model_identity(resolved, dim))
+            }
+        }
+    }
+
+    /// The query-side identity at the measured dimension of an embedded query
+    /// vector — the post-load gate input and the provenance identity.
+    fn measured_identity(&self, dim: usize) -> crate::ir::EmbeddingModel {
+        match self {
+            Self::Default => crate::embeddings::default_embedding_model_identity(dim),
+            Self::Custom { resolved, .. } => crate::reembed::target_model_identity(resolved, dim),
+        }
+    }
+
+    /// Embeds the query text with the resolved model. The embedder must have
+    /// been loaded via [`QueryEmbedder::load`] first.
+    fn embed(&self, query: &str) -> Result<Vec<f32>> {
+        match self {
+            Self::Default => embed_query_text(query),
+            Self::Custom {
+                embedder: Some(embedder),
+                ..
+            } => embed_query_text_with(embedder, query),
+            Self::Custom { embedder: None, .. } => {
+                anyhow::bail!("--embed-model was not loaded before embedding")
+            }
+        }
+    }
+}
+
 /// Refuses a semantic query whose embedder does not share the store's vector
 /// space (issue #104).
 ///
@@ -65,15 +204,31 @@ pub(crate) fn enforce_index_compatibility(
     sink: &EmbeddedAletheiaSink,
     records: &[GraphRecord],
 ) -> Result<crate::embeddings::IndexCompatibility> {
-    use crate::embeddings::{
-        DEFAULT_EMBEDDING_MODEL_DIMENSIONS, classify_index_compatibility,
-        default_embedding_model_identity, indexed_identities,
-    };
+    use crate::embeddings::{DEFAULT_EMBEDDING_MODEL_DIMENSIONS, default_embedding_model_identity};
+
+    enforce_index_compatibility_with(
+        sink,
+        records,
+        &default_embedding_model_identity(DEFAULT_EMBEDDING_MODEL_DIMENSIONS),
+    )
+}
+
+/// [`enforce_index_compatibility`] against an explicit query-side identity
+/// (issue #167): `--embed-model` queries gate on the custom model's identity,
+/// not the built-in default's, so a store re-embedded under model B answers a
+/// `--embed-model <B>` query and still refuses the default-model query.
+#[cfg(feature = "embeddings")]
+pub(crate) fn enforce_index_compatibility_with(
+    sink: &EmbeddedAletheiaSink,
+    records: &[GraphRecord],
+    query_identity: &crate::ir::EmbeddingModel,
+) -> Result<crate::embeddings::IndexCompatibility> {
+    use crate::embeddings::{classify_index_compatibility, indexed_identities};
 
     let verdict = classify_index_compatibility(
         &sink.embedding_index_state(),
         &indexed_identities(records),
-        &default_embedding_model_identity(DEFAULT_EMBEDDING_MODEL_DIMENSIONS),
+        query_identity,
     );
     refuse_verdict(&verdict)?;
     Ok(verdict)
@@ -338,6 +493,7 @@ pub(crate) fn query_semantic(
     repo: Option<&str>,
     under: Option<&str>,
     format: OutputFormat,
+    embed_model: Option<&str>,
 ) -> Result<()> {
     // Validate + normalize the scope prefix before any store I/O so a malformed
     // input fails fast with a machine-readable diagnostic (AC5), mirroring the
@@ -378,41 +534,61 @@ pub(crate) fn query_semantic(
     let index = query::RepositoryIndex::build(&records);
     let selected = resolve_repo_scope(&index, repo);
 
-    // Vector-space compatibility gate (issue #104), before the model is loaded.
-    // A store with no vector index at all is not an identity failure: report the
-    // documented no-embeddings outcome here rather than letting the vector search
-    // below surface an opaque engine error at exit 1.
-    if enforce_index_compatibility(&sink, &records)?
+    // Issue #167: which model vectorizes the query text. The default preserves
+    // historical behavior; `--embed-model` resolves a local directory or a
+    // locally-cached Hugging Face id — never downloaded; a missing model
+    // refuses with the stable exit-12 envelope — and gates the store against
+    // that model's complete identity. The weights load only after the gate
+    // below passes, so a refused query never pays for it.
+    let mut query_embedder = match embed_model {
+        Some(raw) => QueryEmbedder::custom(raw)?,
+        None => QueryEmbedder::Default,
+    };
+    let query_identity = query_embedder.declared_identity()?;
+
+    // Vector-space compatibility gate (issue #104), before the model weights
+    // are loaded. A store with no vector index at all is not an identity
+    // failure: report the documented no-embeddings outcome here rather than
+    // letting the vector search below surface an opaque engine error at
+    // exit 1.
+    if enforce_index_compatibility_with(&sink, &records, &query_identity)?
         == crate::embeddings::IndexCompatibility::IndexAbsent
     {
         // Issue #243: even a never-embedded store gets a provenance envelope —
         // the answer still names the query model and the absent index, with the
         // absent-marker fingerprint. Built before the model is loaded, exactly
         // like the gate above.
-        use crate::embeddings::{
-            DEFAULT_EMBEDDING_MODEL_DIMENSIONS, default_embedding_model_identity,
-            embedding_provenance, indexed_identities,
-        };
-        let provenance = embedding_provenance(
-            &default_embedding_model_identity(DEFAULT_EMBEDDING_MODEL_DIMENSIONS),
-            &indexed_identities(&records),
-        );
+        use crate::embeddings::{embedding_provenance, indexed_identities};
+        let provenance = embedding_provenance(&query_identity, &indexed_identities(&records));
         print_embedding_provenance(format, &provenance)?;
         report_empty_semantic_result(under_prefix, false, true);
     }
 
-    let query_vector = embed_query_checked(query, &sink, &records)?;
+    // Embed the query text, then re-check the ACTUAL vector length against the
+    // index (issue #104's declare-then-measure discipline): the pre-load gate
+    // above can only compare the model's DECLARED dimension; the vector the
+    // model actually returns is the ground truth. The weights load here —
+    // after the gate passed — so a refused query never paid for them.
+    query_embedder.load()?;
+    let query_vector = query_embedder.embed(query)?;
+    {
+        use crate::embeddings::{classify_index_compatibility, indexed_identities};
+        let verdict = classify_index_compatibility(
+            &sink.embedding_index_state(),
+            &indexed_identities(&records),
+            &query_embedder.measured_identity(query_vector.len()),
+        );
+        refuse_verdict(&verdict)?;
+    }
 
     // Issue #243: stamp the embedding-provenance envelope once, before any
     // rows or verdicts. The query identity is derived from the actual embedded
-    // vector's length — the same derivation `embed_query_checked` gated on —
-    // and the index identity from the store that produced the ranking below.
+    // vector's length — the same derivation the gate above checked — and the
+    // index identity from the store that produced the ranking below.
     {
-        use crate::embeddings::{
-            default_embedding_model_identity, embedding_provenance, indexed_identities,
-        };
+        use crate::embeddings::{embedding_provenance, indexed_identities};
         let provenance = embedding_provenance(
-            &default_embedding_model_identity(query_vector.len()),
+            &query_embedder.measured_identity(query_vector.len()),
             &indexed_identities(&records),
         );
         print_embedding_provenance(format, &provenance)?;
