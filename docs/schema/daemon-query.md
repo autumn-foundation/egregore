@@ -136,6 +136,12 @@ Error responses follow the standard envelope in
 
 ## 5 — Verb table
 
+The runtime source of truth for this table is `GET /v1/capabilities` (§10):
+it is built from the same `QUERY_VERB_TABLE` registry that `POST /v1/query`
+dispatches through, so the two cannot drift. The table below is the
+human-readable copy — if it ever disagrees with the endpoint, the endpoint
+wins and this document needs a fix.
+
 | Verb                    | Status      | Params                        | Notes |
 |-------------------------|-------------|-------------------------------|-------|
 | `get_records`           | implemented | `record_ids: [string]`        | Batch read by stable ID |
@@ -745,3 +751,76 @@ Cursor-based pagination is reserved for a future slice.
 - Breaking changes (renamed verbs, removed fields, changed `record` shapes for
   existing verbs) require bumping `DAEMON_QUERY_SCHEMA_VERSION` and updating
   this document and `daemon-api.md`.
+
+---
+
+## 10 — Capability discovery (`GET /v1/capabilities`, issue #166)
+
+`GET /v1/capabilities` is the daemon's self-description endpoint: one request
+tells a client the full live verb set and the query schema version, with zero
+`not_implemented` round-trips. It requires no knowledge of the verb set to
+call (plain GET route, Bearer <redacted> like `GET /v1/status`), and exists so
+integration bridges (the MCP stdio bridge, SDKs) can derive their tool list
+from the running daemon instead of hard-coding it from this document.
+
+### Contract
+
+Flat JSON, HTTP 200, no `ok`/`result` envelope (same shape as the
+observability endpoints in `daemon-api.md` §8):
+
+```json
+{
+  "api_version": "v1",
+  "daemon_query_schema_version": 1,
+  "verbs": [
+    { "name": "agent_sessions_for_repo", "status": "implemented" },
+    { "name": "clone_classes",           "status": "implemented" },
+    { "name": "criteria_for_task",       "status": "implemented" },
+    { "name": "drift",                   "status": "reserved" },
+    { "name": "drift_top_n",             "status": "implemented" },
+    { "name": "file_defines",            "status": "implemented" },
+    { "name": "get_records",             "status": "implemented" },
+    { "name": "locate",                  "status": "implemented" },
+    { "name": "observations_for_symbol", "status": "implemented" },
+    { "name": "semantic_search",         "status": "implemented" },
+    { "name": "symbol_at_commit",        "status": "implemented" },
+    { "name": "symbol_by_name",          "status": "implemented" }
+  ],
+  "accepted_record_tuples": [
+    { "domain": "agent_memory", "kind": "*", "schema_version": 1 },
+    { "domain": "artifact",     "kind": "*", "schema_version": 1 },
+    { "domain": "codegraph",    "kind": "*", "schema_version": 1 },
+    { "domain": "codegraph",    "kind": "*", "schema_version": 2 }
+  ]
+}
+```
+
+| Field | Type | Stability |
+|-------|------|-----------|
+| `api_version` | string | Always `"v1"` while this route lives under `/v1/` |
+| `daemon_query_schema_version` | integer | The value of the `DAEMON_QUERY_SCHEMA_VERSION` Rust constant in `src/daemon.rs` |
+| `verbs` | array of `{name: string, status: string}` | Sorted by `name`. `status` is exactly `implemented` or `reserved` — the closed set never gains a third value without a `/v2/` API prefix change |
+| `accepted_record_tuples` | array of `{domain: string, kind: string, schema_version: integer}` | Sorted by `(domain, schema_version)`. Every tuple the daemon accepts on ingest/read |
+
+### Semantics
+
+- **Verbs.** The `verbs` array is built from the same
+  `QUERY_VERB_TABLE` registry in `src/daemon.rs` that `POST /v1/query`
+  dispatches through — adding a verb to the daemon means adding a registry
+  row, so the manifest cannot drift from reality. `implemented` means the
+  verb is callable in *this* daemon build; `reserved` means it answers HTTP
+  501 `not_implemented`. `semantic_search` is `implemented` only in builds
+  with the `embeddings` feature, `reserved` otherwise.
+- **Record tuples.** `accepted_record_tuples` enumerates the
+  `(domain, kind, schema_version)` tuples the daemon's reader-side gate
+  (`is_known_record_version` in `src/schema_version.rs`) accepts — the same
+  gate that produces `unknown_schema_version` on ingest/read. A client
+  holding a record whose `(domain, schema_version)` pair is absent from this
+  list would be rejected, and can detect that before sending.
+- **`kind: "*"`** is a wildcard, not a literal kind. The gate checks domain +
+  schema_version only, never the record kind, so the wildcard is the honest
+  contract: any kind under a listed domain + version is accepted. Match your
+  tuple by domain + schema_version and treat `"*"` as any-kind.
+- **Not store inspection.** This endpoint reports what the daemon
+  *supports/accepts*, never which tuples are *present* in the store (store
+  inspection is tracked by issue #125).

@@ -327,7 +327,42 @@ Verb set: `get_records`, `symbol_by_name`, `symbol_at_commit`, `file_defines`,
 `drift_top_n`, `semantic_search`, `observations_for_symbol`,
 `criteria_for_task`, `agent_sessions_for_repo` (issue #112; see
 [`daemon-query.md`](daemon-query.md) for the full verb table); reserved:
-`drift`.
+`drift`. Clients should derive the verb set at runtime from
+`GET /v1/capabilities` rather than hard-coding this list.
+
+### `GET /v1/capabilities` — auth required
+
+Discovery endpoint (issue #166). Reports the daemon's live query surface and
+the record schema versions it accepts, so integration bridges (MCP/SDK) can
+negotiate features at startup with zero `not_implemented` round-trips. Flat
+JSON, no `ok`/`result` envelope (same shape as the observability endpoints):
+
+```json
+{
+  "api_version": "v1",
+  "daemon_query_schema_version": 1,
+  "verbs": [
+    { "name": "agent_sessions_for_repo", "status": "implemented" },
+    { "name": "drift", "status": "reserved" }
+  ],
+  "accepted_record_tuples": [
+    { "domain": "codegraph", "kind": "*", "schema_version": 11 }
+  ]
+}
+```
+
+- `verbs` lists every verb in the dispatch registry, sorted by name, each
+  with an explicit `implemented` or `reserved` status. The set reported
+  `implemented` is exactly the set of verbs that do not return
+  `not_implemented` under live dispatch (proven by the manifest-vs-dispatch
+  cross-check test).
+- `accepted_record_tuples` lists every `(domain, kind, schema_version)`
+  tuple the daemon accepts on ingest/read. `kind` is the `"*"` wildcard: the
+  gate checks domain + schema_version only, never the record kind. A client
+  whose tuple's domain + schema_version is absent from this list would get
+  `unknown_schema_version`, and can detect that before sending records.
+
+Full field contract: [`docs/schema/daemon-query.md`](daemon-query.md) §10.
 
 ### `POST /v1/agents/register`
 

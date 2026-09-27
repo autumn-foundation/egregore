@@ -39,7 +39,8 @@ use crate::{
     },
     query as graph_query,
     schema_version::{
-        RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE, UnknownSchemaVersion, validate_record_version,
+        RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE, UnknownSchemaVersion, accepted_record_tuples,
+        validate_record_version,
     },
 };
 
@@ -1855,6 +1856,29 @@ impl DaemonClient {
             return Err(anyhow!("daemon status failed with HTTP {status}: {body}"));
         }
         serde_json::from_str(&body).context("failed to parse daemon status response")
+    }
+
+    /// Fetches the daemon's capability manifest: the live query verbs with
+    /// `implemented`/`reserved` statuses, the query schema version, and the
+    /// accepted record `(domain, kind, schema_version)` tuples — the
+    /// discovery surface integration bridges (MCP/SDK) negotiate against at
+    /// startup instead of hard-coding the verb list.
+    ///
+    /// The returned JSON is the stable `GET /v1/capabilities` contract
+    /// documented in `docs/schema/daemon-query.md`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon does not respond successfully or the
+    /// response cannot be parsed.
+    pub fn capabilities(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.request("GET", "/v1/capabilities", None, CLIENT_TIMEOUT, true)?;
+        if status != 200 {
+            return Err(anyhow!(
+                "daemon capabilities failed with HTTP {status}: {body}"
+            ));
+        }
+        serde_json::from_str(&body).context("failed to parse daemon capabilities response")
     }
 
     /// Fetches all records from the daemon.
@@ -8428,6 +8452,7 @@ fn dispatch_request(request: &HttpRequest, state: &ServerState) -> HttpResponse 
 
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/v1/status") => handle_status(state),
+        ("GET", "/v1/capabilities") => handle_capabilities(),
         ("POST", "/v1/records/ingest") => handle_ingest(request, state),
         ("POST", "/v1/query") => handle_query(request, state),
         ("POST", "/v1/agents/register") => handle_agent_register(request, state),
@@ -11561,6 +11586,346 @@ fn handle_verb_agent_sessions_for_repo(
     )
 }
 
+// ── Query-verb dispatch registry (issue #166) ───────────────────────────────
+///
+// This table is the single source of truth for the query surface: both
+// `handle_query` dispatch and the `GET /v1/capabilities` manifest derive
+// from it, so the manifest cannot drift from reality. Adding a verb means
+// adding a row here — there is no other dispatch list to keep in sync.
+///
+/// Lifecycle status of a query verb in the capability manifest.
+///
+/// The closed two-value set keeps the contract stable: a verb is either
+/// callable or it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryVerbStatus {
+    Implemented,
+    Reserved,
+}
+
+impl QueryVerbStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Implemented => "implemented",
+            Self::Reserved => "reserved",
+        }
+    }
+}
+
+/// The argument bundle threaded to every table-dispatched verb handler.
+struct QueryVerbArgs<'a> {
+    pub request_id: &'a str,
+    pub params: &'a serde_json::Value,
+    pub domain: &'a str,
+    pub limit: usize,
+    pub started: Instant,
+    pub budget: Option<Duration>,
+    pub as_of_valid_time: Option<&'a str>,
+    pub as_of_transaction_time: Option<&'a str>,
+}
+
+/// Unified handler signature for verbs invoked through [`QUERY_VERB_TABLE`].
+type QueryVerbHandler = for<'a> fn(&QueryVerbArgs<'a>, &ServerState) -> HttpResponse;
+
+/// One entry of the query-verb dispatch registry.
+///
+/// `handler` is `Some` exactly when `status` is
+/// [`QueryVerbStatus::Implemented`]; reserved verbs answer HTTP 501
+/// `not_implemented` with [`QueryVerbSpec::reserved_reason`] (or the default
+/// reserved message when it is `None`) without ever reaching a handler.
+struct QueryVerbSpec {
+    pub name: &'static str,
+    pub status: QueryVerbStatus,
+    pub reserved_reason: Option<&'static str>,
+    pub handler: Option<QueryVerbHandler>,
+}
+
+fn verb_get_records(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_get_records(
+        args.request_id,
+        args.params,
+        args.domain,
+        args.limit,
+        args.started,
+        args.budget,
+        state,
+    )
+}
+
+fn verb_symbol_by_name(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_symbol_by_name(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.as_of_transaction_time,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+fn verb_symbol_at_commit(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_symbol_at_commit(
+        args.request_id,
+        args.params,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+fn verb_file_defines(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_file_defines(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+fn verb_locate(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_locate(
+        args.request_id,
+        args.params,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+fn verb_drift_top_n(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_drift_top_n(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+fn verb_clone_classes(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_clone_classes(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+#[cfg(feature = "embeddings")]
+fn verb_semantic_search(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_semantic_search(
+        args.request_id,
+        args.params,
+        args.limit,
+        args.started,
+        args.budget,
+        state,
+    )
+}
+
+fn verb_observations_for_symbol(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_observations_for_symbol(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.limit,
+        args.started,
+        args.budget,
+        state,
+    )
+}
+
+fn verb_criteria_for_task(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_criteria_for_task(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.limit,
+        args.started,
+        args.budget,
+        state,
+    )
+}
+
+fn verb_agent_sessions_for_repo(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_agent_sessions_for_repo(
+        args.request_id,
+        args.params,
+        args.as_of_valid_time,
+        args.limit,
+        args.started,
+        args.budget,
+        state,
+    )
+}
+
+/// Every query verb the daemon knows, in alphabetical order.
+///
+/// `semantic_search` is `implemented` only when the daemon is built with the
+/// `embeddings` feature; otherwise it is `reserved` (HTTP 501
+/// `not_implemented`), keeping the manifest byte-equal to live dispatch in
+/// every feature configuration.
+const QUERY_VERB_TABLE: &[QueryVerbSpec] = &[
+    QueryVerbSpec {
+        // The daemon face of `eg query sessions <REPO>` (issue #112).
+        name: "agent_sessions_for_repo",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_agent_sessions_for_repo),
+    },
+    QueryVerbSpec {
+        name: "clone_classes",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_clone_classes),
+    },
+    QueryVerbSpec {
+        name: "criteria_for_task",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_criteria_for_task),
+    },
+    QueryVerbSpec {
+        name: "drift",
+        status: QueryVerbStatus::Reserved,
+        reserved_reason: None,
+        handler: None,
+    },
+    QueryVerbSpec {
+        name: "drift_top_n",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_drift_top_n),
+    },
+    QueryVerbSpec {
+        name: "file_defines",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_file_defines),
+    },
+    QueryVerbSpec {
+        name: "get_records",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_get_records),
+    },
+    QueryVerbSpec {
+        name: "locate",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_locate),
+    },
+    QueryVerbSpec {
+        name: "observations_for_symbol",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_observations_for_symbol),
+    },
+    QueryVerbSpec {
+        name: "semantic_search",
+        #[cfg(feature = "embeddings")]
+        status: QueryVerbStatus::Implemented,
+        #[cfg(not(feature = "embeddings"))]
+        status: QueryVerbStatus::Reserved,
+        reserved_reason: Some(
+            "verb 'semantic_search' requires the daemon to be built with the 'embeddings' feature",
+        ),
+        #[cfg(feature = "embeddings")]
+        handler: Some(verb_semantic_search),
+        #[cfg(not(feature = "embeddings"))]
+        handler: None,
+    },
+    QueryVerbSpec {
+        name: "symbol_at_commit",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_symbol_at_commit),
+    },
+    QueryVerbSpec {
+        name: "symbol_by_name",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_symbol_by_name),
+    },
+];
+
+/// Looks up a verb in the dispatch registry.
+fn query_verb_spec(verb: &str) -> Option<&'static QueryVerbSpec> {
+    QUERY_VERB_TABLE.iter().find(|spec| spec.name == verb)
+}
+
+/// Builds the `GET /v1/capabilities` discovery document (issue #166).
+///
+/// Stable contract documented in `docs/schema/daemon-query.md`:
+/// - `api_version`: the daemon API version (`"v1"`).
+/// - `daemon_query_schema_version`: the value of
+///   [`DAEMON_QUERY_SCHEMA_VERSION`].
+/// - `verbs`: every verb in [`QUERY_VERB_TABLE`], sorted by name, each with
+///   an explicit `implemented`/`reserved` status.
+/// - `accepted_record_tuples`: every `(domain, kind, schema_version)` tuple
+///   the daemon accepts on ingest/read, from [`accepted_record_tuples`]
+///   (kind is always the `*` wildcard — the gate checks `domain` +
+///   `schema_version` only).
+fn capability_manifest_json() -> serde_json::Value {
+    let mut verbs: Vec<serde_json::Value> = QUERY_VERB_TABLE
+        .iter()
+        .map(|spec| {
+            json!({
+                "name": spec.name,
+                "status": spec.status.as_str(),
+            })
+        })
+        .collect();
+    verbs.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["name"].as_str().unwrap_or_default())
+    });
+    let record_tuples: Vec<serde_json::Value> = accepted_record_tuples()
+        .iter()
+        .map(|tuple| {
+            json!({
+                "domain": tuple.domain,
+                "kind": tuple.kind,
+                "schema_version": tuple.version,
+            })
+        })
+        .collect();
+    json!({
+        "api_version": "v1",
+        "daemon_query_schema_version": DAEMON_QUERY_SCHEMA_VERSION,
+        "verbs": verbs,
+        "accepted_record_tuples": record_tuples,
+    })
+}
+
+/// Serves `GET /v1/capabilities` — auth required, like `GET /v1/status`.
+/// Flat JSON (no `ok`/`result` envelope), matching the observability
+/// endpoints' shape.
+fn handle_capabilities() -> HttpResponse {
+    HttpResponse::json(200, capability_manifest_json())
+}
+
 // ── Main query handler ────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
@@ -11662,119 +12027,46 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         );
     }
 
-    match verb.as_str() {
-        "get_records" => {
-            handle_verb_get_records(&request_id, &params, &domain, limit, started, budget, state)
-        }
-        "symbol_by_name" => handle_verb_symbol_by_name(
-            &request_id,
-            &params,
-            as_of_valid_time.as_deref(),
-            as_of_transaction_time.as_deref(),
-            limit,
-            started,
-            budget,
-            &domain,
-            state,
-        ),
-        "symbol_at_commit" => handle_verb_symbol_at_commit(
-            &request_id,
-            &params,
-            limit,
-            started,
-            budget,
-            &domain,
-            state,
-        ),
-        "file_defines" => handle_verb_file_defines(
-            &request_id,
-            &params,
-            as_of_valid_time.as_deref(),
-            limit,
-            started,
-            budget,
-            &domain,
-            state,
-        ),
-        "locate" => {
-            handle_verb_locate(&request_id, &params, limit, started, budget, &domain, state)
-        }
-        "drift_top_n" => handle_verb_drift_top_n(
-            &request_id,
-            &params,
-            as_of_valid_time.as_deref(),
-            limit,
-            started,
-            budget,
-            &domain,
-            state,
-        ),
-        "clone_classes" => handle_verb_clone_classes(
-            &request_id,
-            &params,
-            as_of_valid_time.as_deref(),
-            limit,
-            started,
-            budget,
-            &domain,
-            state,
-        ),
-        "observations_for_symbol" => handle_verb_observations_for_symbol(
-            &request_id,
-            &params,
-            as_of_valid_time.as_deref(),
-            limit,
-            started,
-            budget,
-            state,
-        ),
-        "criteria_for_task" => handle_verb_criteria_for_task(
-            &request_id,
-            &params,
-            as_of_valid_time.as_deref(),
-            limit,
-            started,
-            budget,
-            state,
-        ),
-        "semantic_search" => {
-            #[cfg(feature = "embeddings")]
-            {
-                handle_verb_semantic_search(&request_id, &params, limit, started, budget, state)
-            }
-            #[cfg(not(feature = "embeddings"))]
-            {
-                HttpResponse::error_with_id(
-                    &request_id,
-                    ApiError::new(
-                        ErrorCode::NotImplemented,
-                        "verb 'semantic_search' requires the daemon to be built with the 'embeddings' feature",
-                    ),
-                )
-            }
-        }
-        // The daemon face of `eg query sessions <REPO>` (issue #112).
-        "agent_sessions_for_repo" => handle_verb_agent_sessions_for_repo(
-            &request_id,
-            &params,
-            as_of_valid_time.as_deref(),
-            limit,
-            started,
-            budget,
-            state,
-        ),
-        "drift" => HttpResponse::error_with_id(
-            &request_id,
-            ApiError::new(
-                ErrorCode::NotImplemented,
-                format!("verb '{verb}' is reserved and not yet implemented"),
-            ),
-        ),
-        _ => HttpResponse::error_with_id(
+    // Dispatch through the registry (issue #166): the table is the single
+    // source of truth, so a verb cannot be added to dispatch without also
+    // appearing in the capability manifest.
+    let Some(spec) = query_verb_spec(verb.as_str()) else {
+        return HttpResponse::error_with_id(
             &request_id,
             ApiError::bad_request_field(format!("unknown verb '{verb}'"), "verb"),
-        ),
+        );
+    };
+    if spec.status == QueryVerbStatus::Reserved {
+        let reason = spec.reserved_reason.map_or_else(
+            || format!("verb '{verb}' is reserved and not yet implemented"),
+            str::to_owned,
+        );
+        return HttpResponse::error_with_id(
+            &request_id,
+            ApiError::new(ErrorCode::NotImplemented, reason),
+        );
     }
+    let args = QueryVerbArgs {
+        request_id: &request_id,
+        params: &params,
+        domain: &domain,
+        limit,
+        started,
+        budget,
+        as_of_valid_time: as_of_valid_time.as_deref(),
+        as_of_transaction_time: as_of_transaction_time.as_deref(),
+    };
+    spec.handler.map_or_else(
+        || {
+            HttpResponse::error_with_id(
+                &request_id,
+                ApiError::internal(format!(
+                    "verb '{verb}' is marked implemented but has no handler wired"
+                )),
+            )
+        },
+        |handler| handler(&args, state),
+    )
 }
 
 fn check_query_budget(
@@ -16095,5 +16387,317 @@ mod tests {
         );
         assert_eq!(obj["record_id"], "semantic:v1:unresolved");
         assert_eq!(obj["score"], 0.5);
+    }
+
+    // ── Issue #166: daemon capability manifest ─────────────────────────────
+    // RED: these tests fail until the capability manifest (GET
+    // /v1/capabilities, the QUERY_VERB_TABLE registry, and
+    // schema_version::accepted_record_tuples) exists.
+
+    /// Builds an empty-store daemon state for capability tests.
+    fn capability_test_state() -> Result<(ServerState, tempfile::TempDir)> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let sink = Arc::new(RwLock::new(
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?,
+        ));
+        let (write_tx, _write_rx) = mpsc::sync_channel(1);
+        let idempotency = Arc::new(Mutex::new(
+            IdempotencyStore::load(temp.path().join("idempotency.json"))
+                .context("idempotency store")?,
+        ));
+        let state = ServerState {
+            token: "cap-test-token".to_owned(),
+            store_identity: store_identity_text(temp.path()),
+            sink,
+            write_tx,
+            jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            agents: Arc::new(Mutex::new(BTreeMap::new())),
+            idempotency,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            pressure: Arc::new(PressureTracker::new(1)),
+            error_counters: Arc::new(ErrorCounters::new()),
+        };
+        Ok((state, temp))
+    }
+
+    /// Builds a Bearer <redacted> request for capability tests.
+    fn capability_request(method: &str, path: &str, body: &serde_json::Value) -> HttpRequest {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_owned(),
+            "Bearer cap-test-token".to_owned(),
+        );
+        HttpRequest {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            headers,
+            body: serde_json::to_vec(&body).expect("test body serializes"),
+        }
+    }
+
+    /// Minimal per-verb params that must NOT trip `not_implemented` for an
+    /// implemented verb against an empty store. The `panic!` is deliberate: a
+    /// verb added to the dispatch table without probe params fails loudly
+    /// here instead of silently skipping the cross-check.
+    fn capability_probe_params(verb: &str) -> serde_json::Value {
+        match verb {
+            "get_records" => json!({ "record_ids": [] }),
+            "symbol_by_name" | "observations_for_symbol" => {
+                json!({ "name": "capability-probe-missing-symbol" })
+            }
+            "symbol_at_commit" => json!({
+                "name": "capability-probe-missing-symbol",
+                "commit": "deadbee",
+            }),
+            "file_defines" => json!({ "repo_relative_path": "capability-probe-missing.rs" }),
+            "locate" => json!({
+                "repo_relative_path": "capability-probe-missing.rs",
+                "line": 1,
+            }),
+            "drift_top_n" | "clone_classes" | "semantic_search" | "drift" => json!({}),
+            "criteria_for_task" => json!({ "task_id": "capability-probe-missing-task" }),
+            "agent_sessions_for_repo" => json!({ "repo": "capability-probe-missing-repo" }),
+            other => panic!(
+                "capability probe has no canned params for verb '{other}'; \
+                 add them to capability_probe_params"
+            ),
+        }
+    }
+
+    /// Fetches the live capability manifest through the real route.
+    fn get_capabilities(state: &ServerState) -> HttpResponse {
+        dispatch_request(
+            &capability_request("GET", "/v1/capabilities", &json!({})),
+            state,
+        )
+    }
+
+    /// AC1 + AC2: discovery needs no verb knowledge (plain GET route) and
+    /// reports the API version plus `DAEMON_QUERY_SCHEMA_VERSION`.
+    #[test]
+    fn capabilities_reports_api_and_query_schema_versions() -> Result<()> {
+        let (state, _temp) = capability_test_state()?;
+        let response = get_capabilities(&state);
+        assert_eq!(
+            response.status, 200,
+            "GET /v1/capabilities must succeed: {}",
+            response.body
+        );
+        assert_eq!(
+            response.body["api_version"].as_str(),
+            Some("v1"),
+            "manifest must report api_version \"v1\""
+        );
+        assert_eq!(
+            response.body["daemon_query_schema_version"],
+            serde_json::Value::from(DAEMON_QUERY_SCHEMA_VERSION),
+            "manifest must report the DAEMON_QUERY_SCHEMA_VERSION value"
+        );
+        Ok(())
+    }
+
+    /// AC3 + AC7: the manifest lists every verb in the dispatch registry with
+    /// an explicit `implemented`/`reserved` status, byte-equal after sorting;
+    /// every advertised verb is genuinely dispatchable (never "unknown verb").
+    #[test]
+    fn capabilities_manifest_matches_dispatch_table_without_drift() -> Result<()> {
+        let (state, _temp) = capability_test_state()?;
+        let response = get_capabilities(&state);
+        assert_eq!(response.status, 200, "{}", response.body);
+        let verbs = response.body["verbs"]
+            .as_array()
+            .expect("manifest must carry a verbs array");
+        let mut manifest: Vec<(String, String)> = verbs
+            .iter()
+            .map(|v| {
+                (
+                    v["name"].as_str().expect("verb name").to_owned(),
+                    v["status"].as_str().expect("verb status").to_owned(),
+                )
+            })
+            .collect();
+        manifest.sort();
+        let mut expected: Vec<(String, String)> = QUERY_VERB_TABLE
+            .iter()
+            .map(|spec| (spec.name.to_owned(), spec.status.as_str().to_owned()))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            manifest, expected,
+            "capability manifest must list every dispatch-table verb with its \
+             status (no silent drift either way)"
+        );
+        for (name, status) in &manifest {
+            assert!(
+                status == "implemented" || status == "reserved",
+                "verb '{name}' has unexpected status '{status}'"
+            );
+            // AC7, reverse direction: everything the manifest advertises must
+            // be dispatchable — an "unknown verb" here means the manifest and
+            // the dispatcher disagree.
+            let body = json!({
+                "request_id": format!("cap-drift-{name}"),
+                "verb": name,
+                "params": capability_probe_params(name),
+            });
+            let dispatched = handle_query(&capability_request("POST", "/v1/query", &body), &state);
+            let message = dispatched.body["error"]["message"].as_str().unwrap_or("");
+            assert!(
+                !message.contains("unknown verb"),
+                "manifest advertises verb '{name}' but dispatch rejects it: {message}"
+            );
+        }
+        Ok(())
+    }
+
+    /// AC4: the set of verbs reported `implemented` is byte-equal (after
+    /// sorting) to the set of verbs that do NOT return `not_implemented` when
+    /// actually invoked against the same daemon.
+    #[test]
+    fn capabilities_implemented_set_matches_live_dispatch() -> Result<()> {
+        let (state, _temp) = capability_test_state()?;
+        let mut live_implemented: Vec<&str> = Vec::new();
+        for spec in QUERY_VERB_TABLE {
+            let body = json!({
+                "request_id": format!("cap-probe-{}", spec.name),
+                "verb": spec.name,
+                "params": capability_probe_params(spec.name),
+            });
+            let response = handle_query(&capability_request("POST", "/v1/query", &body), &state);
+            let code = response.body["error"]["code"].as_str();
+            match spec.status {
+                QueryVerbStatus::Implemented => {
+                    assert_ne!(
+                        code,
+                        Some("not_implemented"),
+                        "verb '{}' is manifest-implemented but live dispatch \
+                         returned not_implemented: {}",
+                        spec.name,
+                        response.body
+                    );
+                    live_implemented.push(spec.name);
+                }
+                QueryVerbStatus::Reserved => {
+                    assert_eq!(
+                        response.status, 501,
+                        "reserved verb '{}' must answer HTTP 501: {}",
+                        spec.name, response.body
+                    );
+                    assert_eq!(
+                        code,
+                        Some("not_implemented"),
+                        "reserved verb '{}' must return not_implemented: {}",
+                        spec.name,
+                        response.body
+                    );
+                }
+            }
+        }
+        live_implemented.sort_unstable();
+        let mut manifest_implemented: Vec<&str> = QUERY_VERB_TABLE
+            .iter()
+            .filter(|spec| spec.status == QueryVerbStatus::Implemented)
+            .map(|spec| spec.name)
+            .collect();
+        manifest_implemented.sort_unstable();
+        assert_eq!(
+            live_implemented, manifest_implemented,
+            "verbs not returning not_implemented under live dispatch must be \
+             byte-equal (after sorting) to the manifest's implemented set"
+        );
+        Ok(())
+    }
+
+    /// AC5: the manifest lists the record `(domain, kind, schema_version)`
+    /// tuples the daemon accepts, with zero drift from the real
+    /// `is_known_record_version` gate — a client can detect an
+    /// `unknown_schema_version` mismatch before sending records.
+    #[test]
+    fn capabilities_record_tuples_match_schema_gate_without_drift() -> Result<()> {
+        // Function-scoped: the lib build must not carry an import used only
+        // by this test.
+        use crate::schema_version::is_known_record_version;
+        let (state, _temp) = capability_test_state()?;
+        let response = get_capabilities(&state);
+        assert_eq!(response.status, 200, "{}", response.body);
+        let tuples = response.body["accepted_record_tuples"]
+            .as_array()
+            .expect("manifest must carry an accepted_record_tuples array");
+        assert!(
+            !tuples.is_empty(),
+            "manifest must list at least one accepted record tuple"
+        );
+        // Every manifest tuple is accepted by the real gate (kind is not
+        // gated by the daemon, so probe with a concrete kind).
+        for tuple in tuples {
+            let domain = tuple["domain"].as_str().expect("tuple domain");
+            let kind = tuple["kind"].as_str().expect("tuple kind");
+            let version = u32::try_from(
+                tuple["schema_version"]
+                    .as_u64()
+                    .expect("tuple schema_version"),
+            )
+            .expect("schema_version fits in u32");
+            assert_eq!(
+                kind, "*",
+                "tuple kind must be the documented wildcard: {tuple}"
+            );
+            assert!(
+                is_known_record_version(&RecordVersion::new(domain, "ProbeKind", version)),
+                "manifest tuple ({domain}, v{version}) is rejected by \
+                 is_known_record_version"
+            );
+        }
+        // No drift either way: sweep the gate's input space and require the
+        // manifest to agree exactly.
+        let manifest_set: std::collections::BTreeSet<(String, u32)> = tuples
+            .iter()
+            .map(|tuple| {
+                (
+                    tuple["domain"].as_str().expect("tuple domain").to_owned(),
+                    u32::try_from(
+                        tuple["schema_version"]
+                            .as_u64()
+                            .expect("tuple schema_version"),
+                    )
+                    .expect("schema_version fits in u32"),
+                )
+            })
+            .collect();
+        // Sanity: the builder and the manifest agree (the response is built
+        // from `accepted_record_tuples`).
+        let built_set: std::collections::BTreeSet<(String, u32)> = accepted_record_tuples()
+            .iter()
+            .map(|tuple| (tuple.domain.clone(), tuple.version))
+            .collect();
+        assert_eq!(
+            manifest_set, built_set,
+            "GET /v1/capabilities must be built from accepted_record_tuples"
+        );
+        let max_probe = crate::ir::SCHEMA_VERSION + 2;
+        for domain in [
+            "codegraph",
+            "agent_memory",
+            "verification",
+            "artifact",
+            "project",
+            "semantic",
+            "user_context",
+            "log",
+            "control_catalog",
+            "bogus_domain",
+        ] {
+            for version in 0..=max_probe {
+                let known =
+                    is_known_record_version(&RecordVersion::new(domain, "ProbeKind", version));
+                let listed = manifest_set.contains(&(domain.to_owned(), version));
+                assert_eq!(
+                    known, listed,
+                    "manifest disagrees with is_known_record_version for \
+                     ({domain}, v{version})"
+                );
+            }
+        }
+        Ok(())
     }
 }
