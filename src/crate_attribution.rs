@@ -495,6 +495,11 @@ pub const fn carries_crate_attribution(kind: NodeKind) -> bool {
         | NodeKind::CommandRun
         | NodeKind::FileEdit
         | NodeKind::PatchArtifact
+        // Design-doc artifacts (issue #149): artifact-domain nodes with a
+        // repo-relative doc path, not crate-attributed code-graph facts.
+        | NodeKind::Adr
+        | NodeKind::Prd
+        | NodeKind::PlanDoc
         | NodeKind::Failure
         | NodeKind::Decision
         | NodeKind::TestRun

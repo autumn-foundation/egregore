@@ -5259,6 +5259,9 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "CommandRun" => Ok(NodeKind::CommandRun),
         "FileEdit" => Ok(NodeKind::FileEdit),
         "PatchArtifact" => Ok(NodeKind::PatchArtifact),
+        "ADR" => Ok(NodeKind::Adr),
+        "PRD" => Ok(NodeKind::Prd),
+        "PlanDoc" => Ok(NodeKind::PlanDoc),
         "Failure" => Ok(NodeKind::Failure),
         "Decision" => Ok(NodeKind::Decision),
         "TestRun" => Ok(NodeKind::TestRun),
@@ -5612,6 +5615,9 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::CommandRun
         | NodeKind::FileEdit
         | NodeKind::PatchArtifact
+        | NodeKind::Adr
+        | NodeKind::Prd
+        | NodeKind::PlanDoc
         | NodeKind::Failure
         | NodeKind::Decision
         | NodeKind::TestRun

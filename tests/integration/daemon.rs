@@ -4628,10 +4628,16 @@ fn all_node_kinds_have_documented_schema() {
         NodeKind::AgentRun | NodeKind::AgentTurn | NodeKind::Failure | NodeKind::Decision => {
             "agent-memory-m2-traj-importer"
         }
-        NodeKind::ToolCall | NodeKind::FileEdit | NodeKind::PatchArtifact => {
-            "agent-actions-documented"
-        }
-        // Documented in docs/schema/verification.md (full schema, day-one shapes)
+        // Design-doc artifact kinds (issue #149): the reserved ADR/PRD/Plan
+        // shapes, documented in docs/schema/agent-actions.md §10 and
+        // docs/schema/doc-ingest.md — same documented status as the other
+        // agent-actions kinds.
+        NodeKind::ToolCall
+        | NodeKind::FileEdit
+        | NodeKind::PatchArtifact
+        | NodeKind::Adr
+        | NodeKind::Prd
+        | NodeKind::PlanDoc => "agent-actions-documented",
         NodeKind::Verification => "verification-documented",
         // Reserved in docs/schema/verification.md §5 with one-line definitions
         NodeKind::CommandRun

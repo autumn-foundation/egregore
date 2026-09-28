@@ -100,6 +100,7 @@ pub const fn producer_trust_class(kind: ProducerKind) -> Option<ProducerTrustCla
         | ProducerKind::HistoryReplay
         | ProducerKind::IncrementalCache
         | ProducerKind::LogImporter
+        | ProducerKind::DocImporter
         | ProducerKind::DriftEngine => Some(ProducerTrustClass::Deterministic),
         ProducerKind::TrajImporter
         | ProducerKind::CodexImporter
@@ -155,6 +156,9 @@ pub const fn node_trust_class(kind: NodeKind) -> NodeTrustClass {
         | NodeKind::CommandRun
         | NodeKind::FileEdit
         | NodeKind::PatchArtifact
+        | NodeKind::Adr
+        | NodeKind::Prd
+        | NodeKind::PlanDoc
         | NodeKind::Failure
         | NodeKind::Decision
         | NodeKind::CostUsage
@@ -466,7 +470,8 @@ mod tests {
     fn node_classes_partition_every_node_kind() {
         // The classifier is total over `NodeKind::ALL`: the no-wildcard match
         // fails to compile on a new variant, and this pins the documented
-        // partition counts (23 code-fact + 40 agent-authored).
+        // partition counts (23 code-fact + 45 agent-authored; the three
+        // design-doc kinds from issue #149 are agent-authored artifacts).
         let mut code_fact = 0_usize;
         let mut agent_authored = 0_usize;
         for kind in NodeKind::ALL {
@@ -475,9 +480,9 @@ mod tests {
                 NodeTrustClass::AgentAuthored => agent_authored += 1,
             }
         }
-        assert_eq!(NodeKind::ALL.len(), 65);
+        assert_eq!(NodeKind::ALL.len(), 68);
         assert_eq!(code_fact, 23, "documented code-fact count");
-        assert_eq!(agent_authored, 42, "documented agent-authored count");
+        assert_eq!(agent_authored, 45, "documented agent-authored count");
         assert_eq!(node_trust_class(NodeKind::Symbol), NodeTrustClass::CodeFact);
         assert_eq!(
             node_trust_class(NodeKind::Observation),

@@ -1696,6 +1696,35 @@ pub(crate) enum ImportSource {
         #[arg(long, hide = true)]
         no_backoff: bool,
     },
+    /// Import repo-local design docs (ADR/PRD/Plan markdown) as artifact-domain
+    /// records (issue #149).
+    ///
+    /// Deterministic and filesystem-local: scans the documented doc roots
+    /// (`docs/adr/`, `docs/prd/`, `docs/plans/`), emits one node per markdown
+    /// doc plus `RELATES_TO` / `MENTIONS_SYMBOL` edges only for explicit
+    /// literal references resolved against a supplied code graph. Any
+    /// diagnostic (empty doc, unknown root, unresolved reference, zero
+    /// resolvable references, …) exits 2 with stable machine-readable JSON
+    /// diagnostics on stderr; output carries no raw body text.
+    Docs {
+        /// Repo root containing the doc roots (defaults to `.`).
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
+        /// Doc roots to scan, relative to the repo root. Repeatable.
+        /// Defaults to `docs/adr`, `docs/prd`, `docs/plans`.
+        #[arg(long)]
+        root: Vec<String>,
+        /// Seeded code-graph JSONL (from `scan`) for reference resolution.
+        /// Without it every reference is an `unresolved_reference` diagnostic.
+        #[arg(long)]
+        code_graph: Option<PathBuf>,
+        /// Output JSONL path (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Fixed RFC 3339 transaction time for deterministic output (tests).
+        #[arg(long)]
+        transaction_time: Option<String>,
+    },
 }
 
 /// Output format for query results.
@@ -6615,6 +6644,19 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
                 api_base.as_deref(),
                 transaction_time.as_deref(),
                 no_backoff,
+            ),
+            ImportSource::Docs {
+                repo_root,
+                root,
+                code_graph,
+                out,
+                transaction_time,
+            } => import_docs_cmd(
+                repo_root.as_deref(),
+                &root,
+                code_graph.as_deref(),
+                out.as_deref(),
+                transaction_time.as_deref(),
             ),
         },
         Commands::LinkEvidence {

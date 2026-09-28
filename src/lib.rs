@@ -35,6 +35,8 @@ pub mod criteria_coverage;
 pub mod daemon;
 /// Decision record generation for user-context candidates.
 pub mod decide;
+/// Design-doc (ADR/PRD/Plan) markdown importer (issue #149).
+pub mod doc_ingest;
 /// Semantic enrichment and embedding boundaries.
 pub mod embeddings;
 /// Error and result types.

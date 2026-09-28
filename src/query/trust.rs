@@ -167,7 +167,8 @@ pub enum TrustClass {
     /// Imported external work state (`Task`, `PR`, `Review`, …). A claim made by
     /// an issue tracker, not verified by Egregore.
     ProjectState,
-    /// Produced bytes (`Artifact`, `PatchArtifact`, `FileEdit`).
+    /// Produced bytes (`Artifact`, `PatchArtifact`, `FileEdit`, and the
+    /// design-doc kinds `Adr`, `Prd`, `PlanDoc`).
     Artifact,
     /// A program's own claim about its execution (`ErrorSignature`, `LogEvent`,
     /// …): deterministically parsed but never verified.
@@ -370,9 +371,12 @@ impl<'a> TrustIndex<'a> {
             | NodeKind::LocalTask => TrustClass::ProjectState,
 
             // ── produced bytes ───────────────────────────────────────────────
-            NodeKind::Artifact | NodeKind::PatchArtifact | NodeKind::FileEdit => {
-                TrustClass::Artifact
-            }
+            NodeKind::Artifact
+            | NodeKind::PatchArtifact
+            | NodeKind::Adr
+            | NodeKind::Prd
+            | NodeKind::PlanDoc
+            | NodeKind::FileEdit => TrustClass::Artifact,
 
             // ── a program's own claim about its execution ────────────────────
             NodeKind::LogSource
@@ -1046,6 +1050,9 @@ mod tests {
             NodeKind::CommandRun,
             NodeKind::FileEdit,
             NodeKind::PatchArtifact,
+            NodeKind::Adr,
+            NodeKind::Prd,
+            NodeKind::PlanDoc,
             NodeKind::Failure,
             NodeKind::Decision,
             NodeKind::TestRun,

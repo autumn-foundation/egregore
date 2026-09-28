@@ -233,6 +233,74 @@ pub(crate) fn query_symbol_all(
     for result in &results {
         print_result(result, format)?;
     }
+    print_linked_design_docs(records, &results, format)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// linked design docs (issue #149)
+// ---------------------------------------------------------------------------
+
+/// One explicitly-linked design doc (ADR/PRD/Plan) surfaced by `query symbol`.
+///
+/// Carries the artifact record id, kind, repo-relative path, and BLAKE3
+/// content hash — never body text.
+#[derive(Serialize)]
+pub(crate) struct DesignDocRow<'a> {
+    record_id: &'a str,
+    doc_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    repo_relative_path: &'a str,
+    content_hash: &'a str,
+    relation: &'static str,
+}
+
+impl PrintText for DesignDocRow<'_> {
+    fn as_text(&self) -> String {
+        let title = self
+            .title
+            .map_or_else(|| "(untitled)".to_owned(), |t| format!("\"{t}\""));
+        format!(
+            "design-doc: {} ({}) @ {} [{}] blake3:{} {}",
+            self.record_id,
+            self.doc_kind,
+            self.repo_relative_path,
+            self.relation,
+            self.content_hash,
+            title
+        )
+    }
+}
+
+/// Prints the design docs explicitly linked to the matched symbols, after the
+/// symbol rows. With no governing docs nothing prints: honest empty, never
+/// fabricated.
+fn print_linked_design_docs(
+    records: &[GraphRecord],
+    results: &[SymbolResult<'_>],
+    format: OutputFormat,
+) -> Result<()> {
+    let symbol_ids: std::collections::BTreeSet<&str> =
+        results.iter().map(|r| r.record_id).collect();
+    let links = crate::doc_ingest::linked_design_docs(
+        records,
+        &symbol_ids,
+        &std::collections::BTreeSet::new(),
+    );
+    for link in links {
+        print_result(
+            &DesignDocRow {
+                record_id: link.record_id,
+                doc_kind: link.doc_kind,
+                title: link.title,
+                repo_relative_path: link.repo_relative_path,
+                content_hash: link.content_hash,
+                relation: link.relation,
+            },
+            format,
+        )?;
+    }
     Ok(())
 }
 

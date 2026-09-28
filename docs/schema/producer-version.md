@@ -92,6 +92,7 @@ top-level `producer` field. The value is a single embedded `Producer` object
 | `task_writer` | `TaskWriter` | Project / task writer. |
 | `drift_engine` | `DriftEngine` | Semantic drift engine. |
 | `log_importer` | `LogImporter` | `scan-logs` log-signature importer (issues #319/#320). |
+| `doc_importer` | `DocImporter` | Repo-local design-doc importer (issue #149). |
 | `other` | `Other` | Any producer not enumerated above. |
 
 Adding a new `producer_kind` is **additive** (no schema version bump required).
@@ -124,6 +125,7 @@ version bump.
 | `codex_importer` | `importer_schema_version`, `source_format_version` |
 | `claude_code_importer` | `importer_schema_version`, `source_format_version` |
 | `log_importer` | `importer_schema_version`, `source_format_version` (`plain-v1`/`jsonl-v1`), `fingerprint_algorithm` (`template-v1`) |
+| `doc_importer` | `importer_schema_version`, `source_format_version` (`doc-ingest/v1`) |
 | `observation_writer` | `transport` when written over the MCP transport (issue #183); absent for CLI writes |
 
 The `observation_writer` example over MCP:

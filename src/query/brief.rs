@@ -324,7 +324,12 @@ fn compute_store_coverage(records: &[GraphRecord]) -> StoreCoverage {
             | NodeKind::Product => {
                 coverage.project = true;
             }
-            NodeKind::Artifact | NodeKind::PatchArtifact | NodeKind::CommandEvidence => {
+            NodeKind::Artifact
+            | NodeKind::PatchArtifact
+            | NodeKind::Adr
+            | NodeKind::Prd
+            | NodeKind::PlanDoc
+            | NodeKind::CommandEvidence => {
                 coverage.artifact = true;
             }
             NodeKind::Verification

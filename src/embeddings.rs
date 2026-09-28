@@ -241,6 +241,11 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::LogSource
         | NodeKind::ErrorSignature
         | NodeKind::LogEvent
+        // Design-doc nodes carry only templated summary text, not source bytes
+        // (issue #149): they link via explicit literal references only.
+        | NodeKind::Adr
+        | NodeKind::Prd
+        | NodeKind::PlanDoc
         | NodeKind::LogOccurrenceBucket => return None,
     };
 

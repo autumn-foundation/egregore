@@ -134,7 +134,7 @@ const fn domain_of_kind(kind: NodeKind) -> Domain {
         | NodeKind::BenchmarkRun
         | NodeKind::CoverageReport
         | NodeKind::ProofResult => Domain::Verification,
-        NodeKind::Artifact => Domain::Artifact,
+        NodeKind::Artifact | NodeKind::Adr | NodeKind::Prd | NodeKind::PlanDoc => Domain::Artifact,
         NodeKind::Task
         | NodeKind::AcceptanceCriterion
         | NodeKind::ExternalLink

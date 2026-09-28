@@ -113,7 +113,8 @@ pub struct SymbolContext<'a> {
     pub decisions: Vec<&'a GraphRecord>,
     /// `Task` and `AcceptanceCriterion` nodes linked to the symbol.
     pub project_state: Vec<&'a GraphRecord>,
-    /// `Artifact` and `PatchArtifact` nodes linked to the symbol.
+    /// `Artifact`, `PatchArtifact`, `FileEdit`, and the design-doc kinds
+    /// (`Adr`, `Prd`, `PlanDoc`) nodes linked to the symbol.
     pub artifacts: Vec<&'a GraphRecord>,
     /// `Verification`, `TestRun`, `CommandRun`, and `CommandEvidence` nodes
     /// linked to the symbol.
@@ -226,9 +227,12 @@ pub(super) const fn classify_node(kind: NodeKind) -> Option<ContextSection> {
         // request transition — so it surfaces alongside the Review it concerns.
         | NodeKind::ReviewStateTransition => Some(ContextSection::ProjectState),
         // artifact domain
-        NodeKind::Artifact | NodeKind::PatchArtifact | NodeKind::FileEdit => {
-            Some(ContextSection::Artifact)
-        }
+        NodeKind::Artifact
+        | NodeKind::PatchArtifact
+        | NodeKind::Adr
+        | NodeKind::Prd
+        | NodeKind::PlanDoc
+        | NodeKind::FileEdit => Some(ContextSection::Artifact),
         // verification domain
         NodeKind::Verification
         | NodeKind::CommandEvidence

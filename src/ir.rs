@@ -120,6 +120,10 @@ pub enum ProducerKind {
     DriftEngine,
     /// Log-signature importer (`scan-logs` command, issues #319 / #320).
     LogImporter,
+    /// Repo-local design-doc importer (`import docs`, issue #149). Deterministic:
+    /// emits one artifact-domain node per markdown doc plus edges only for
+    /// explicit literal references resolved against a supplied code graph.
+    DocImporter,
     /// Any other producer not enumerated above, including future additive variants
     /// from newer binary versions read by an older binary.
     #[serde(other)]
@@ -141,6 +145,7 @@ impl ProducerKind {
             Self::TaskWriter => "task_writer",
             Self::DriftEngine => "drift_engine",
             Self::LogImporter => "log_importer",
+            Self::DocImporter => "doc_importer",
             Self::Other => "other",
         }
     }
@@ -2597,6 +2602,38 @@ impl GraphRecord {
         }
     }
 
+    /// Builds an artifact-domain edge record between artifact-stable IDs
+    /// (issue #149). Mirrors [`GraphRecord::project_edge`]: the edge id uses
+    /// the artifact stable-id namespace and schema version, and the record
+    /// carries no producer envelope (the caller stamps one when needed).
+    #[must_use]
+    pub fn artifact_edge(
+        label: EdgeLabel,
+        source: String,
+        target: String,
+        confidence: Option<String>,
+        summary: String,
+    ) -> Self {
+        let id = artifact_stable_id(&["artifact", "edge", label.as_str(), &source, &target]);
+        Self::Edge {
+            id,
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            label,
+            source,
+            target,
+            confidence,
+            resolution: None,
+            frame_resolution: None,
+            frame_index: None,
+            basis: None,
+            call_site_spans: None,
+            is_exhaustive: None,
+            temporal: None,
+            summary,
+            producer: None,
+        }
+    }
+
     /// Attaches a cross-file call resolution status to an edge record (issue #152).
     ///
     /// No-op on node and tombstone records.
@@ -3490,6 +3527,30 @@ impl GraphRecord {
         self
     }
 
+    /// Sets the display title on a node record (issue #149). No-op on edges
+    /// and tombstones.
+    #[must_use]
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        if let Self::Node { title: t, .. } = &mut self {
+            *t = Some(title.into());
+        }
+        self
+    }
+
+    /// Sets the BLAKE3 content hash of the raw source bytes on a node record
+    /// (issue #149). No-op on edges and tombstones.
+    #[must_use]
+    pub fn with_source_artifact_hash(mut self, hash: impl Into<String>) -> Self {
+        if let Self::Node {
+            source_artifact_hash: h,
+            ..
+        } = &mut self
+        {
+            *h = Some(hash.into());
+        }
+        self
+    }
+
     /// Stamps the producer identity envelope on this record.
     ///
     /// The `producer` field is a non-identity envelope: it MUST NOT contribute
@@ -3831,6 +3892,21 @@ pub enum NodeKind {
     FileEdit,
     /// Patch content, validation status, and source trajectory (M2).
     PatchArtifact,
+    // ── Design-doc node kinds (docs/schema/doc-ingest.md, issue #149) ────────
+    /// Architecture decision document artifact (artifact domain). Materializes
+    /// the reserved `ADR` shape from `docs/schema/agent-actions.md` §10.
+    #[serde(rename = "ADR")]
+    Adr,
+    /// Product requirements document artifact (artifact domain). Materializes
+    /// the reserved `PRD` shape from `docs/schema/agent-actions.md` §10.
+    #[serde(rename = "PRD")]
+    Prd,
+    /// Implementation or project plan document artifact (artifact domain).
+    /// Materializes the reserved `Plan` shape from
+    /// `docs/schema/agent-actions.md` §10; named `PlanDoc` because `Plan` is
+    /// already the project-domain task-plan kind.
+    #[serde(rename = "PlanDoc")]
+    PlanDoc,
     /// Failed command, invalid patch, or blocked workflow (M2).
     Failure,
     /// Durable decision inferred from explicit context (reserved, agent-memory §4a).
@@ -3911,7 +3987,7 @@ impl NodeKind {
     /// macro regenerates from the enum definition itself. Adding a variant
     /// without listing it here fails that test. (A guard that merely iterated
     /// this array would be circular and could not fail.)
-    pub const ALL: [Self; 65] = [
+    pub const ALL: [Self; 68] = [
         Self::Repository,
         Self::File,
         Self::Module,
@@ -3955,6 +4031,9 @@ impl NodeKind {
         Self::CommandRun,
         Self::FileEdit,
         Self::PatchArtifact,
+        Self::Adr,
+        Self::Prd,
+        Self::PlanDoc,
         Self::Failure,
         Self::Decision,
         Self::TestRun,
@@ -4026,6 +4105,9 @@ impl NodeKind {
             Self::CommandRun => "CommandRun",
             Self::FileEdit => "FileEdit",
             Self::PatchArtifact => "PatchArtifact",
+            Self::Adr => "ADR",
+            Self::Prd => "PRD",
+            Self::PlanDoc => "PlanDoc",
             Self::Failure => "Failure",
             Self::Decision => "Decision",
             Self::TestRun => "TestRun",

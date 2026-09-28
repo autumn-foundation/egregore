@@ -33,6 +33,7 @@ mod cross_file_constructs;
 mod daemon;
 mod deps;
 mod deterministic_scan;
+mod doc_ingest;
 mod doctor;
 mod embeddings;
 mod error_context;

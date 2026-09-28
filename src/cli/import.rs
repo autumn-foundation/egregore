@@ -1,5 +1,74 @@
 use super::*;
 
+/// Imports repo-local design docs (ADR/PRD/Plan markdown) as artifact-domain
+/// records (issue #149).
+///
+/// Writes one JSONL record per ingested doc plus one per resolved explicit
+/// reference to `out` (or stdout). Diagnostics go to stderr as JSON lines.
+/// Any diagnostic (empty doc, unknown root, unresolved reference, zero
+/// resolvable references, …) exits 2 — the distinct machine-readable failure
+/// code. Output carries no raw body text.
+pub(crate) fn import_docs_cmd(
+    repo_root: Option<&Path>,
+    roots: &[String],
+    code_graph: Option<&Path>,
+    out: Option<&Path>,
+    transaction_time: Option<&str>,
+) -> Result<()> {
+    let repo_root = match repo_root {
+        Some(r) => r.to_path_buf(),
+        None => std::env::current_dir().context("failed to determine current directory")?,
+    };
+    let code_graph_records = match code_graph {
+        Some(path) => {
+            let jsonl = fs::read_to_string(path).with_context(|| {
+                format!("failed to read code-graph JSONL from {}", path.display())
+            })?;
+            records_from_jsonl(&jsonl).with_context(|| {
+                format!("failed to parse code-graph JSONL from {}", path.display())
+            })?
+        }
+        None => Vec::new(),
+    };
+    let opts = crate::doc_ingest::DocIngestOptions {
+        repo_root,
+        // Empty means the documented defaults; absent default roots are
+        // skipped silently by the importer.
+        roots: roots.to_vec(),
+        code_graph: code_graph_records,
+        transaction_time: transaction_time.map(str::to_owned),
+    };
+    let result = crate::doc_ingest::import_docs(&opts).context("failed to import design docs")?;
+
+    let mut content = String::new();
+    for record in &result.records {
+        let line = serde_json::to_string(record).context("failed to serialize doc record")?;
+        content.push_str(&line);
+        content.push('\n');
+    }
+    match out {
+        Some(path) => fs::write(path, &content)
+            .with_context(|| format!("failed to write JSONL to {}", path.display()))?,
+        None => print!("{content}"),
+    }
+
+    for diagnostic in &result.diagnostics {
+        let line = serde_json::to_string(diagnostic).context("failed to serialize diagnostic")?;
+        eprintln!("{line}");
+    }
+
+    eprintln!(
+        "imported {} records ({} diagnostics)",
+        result.records.len(),
+        result.diagnostics.len()
+    );
+    if result.diagnostics.is_empty() {
+        Ok(())
+    } else {
+        std::process::exit(2);
+    }
+}
+
 pub(crate) fn import_local_tasks_cmd(
     tasks_path: &Path,
     out: &Path,
