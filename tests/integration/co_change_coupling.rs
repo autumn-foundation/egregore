@@ -1292,3 +1292,84 @@ fn git_output<const N: usize>(repo: &Path, args: [&str; N]) -> String {
         .trim()
         .to_owned()
 }
+
+/// The `--data-dir` form of the lane (AC 1) reads the same embedded store
+/// other lanes use: ingest the fixture history graph into an embedded
+/// `AletheiaDB` dir and the coupling answer must match the `--graph` answer
+/// row-for-row — same target, same scope, same ranked partners with the
+/// same counts and metrics.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn coupling_embedded_data_dir_matches_graph() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let [_c1, _c2, _c3, _c4, _c5] = seed_coupling_fixture_repo(&repo);
+    let graph_path = temp.path().join("history.graph.jsonl");
+
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan-history")
+        .arg(&repo)
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let data_dir = temp.path().join("store");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let run_coupling = |source_flag: &str, source: &Path| -> serde_json::Value {
+        let assert = CargoCommand::cargo_bin("egregore")
+            .expect("binary should run")
+            .args(["query", "coupling", "src/alpha.rs"])
+            .arg(source_flag)
+            .arg(source)
+            .assert()
+            .success();
+        let out =
+            String::from_utf8(assert.get_output().stdout.clone()).expect("stdout should be utf-8");
+        serde_json::from_str(&out).expect("stdout should be one JSON envelope")
+    };
+
+    let from_graph = run_coupling("--graph", &graph_path);
+    let from_store = run_coupling("--data-dir", &data_dir);
+
+    assert_eq!(from_store["ok"], true);
+    for key in [
+        "target",
+        "scope",
+        "min_support",
+        "limit",
+        "coupling_metric",
+        "total_partners",
+        "truncated",
+        "partners",
+        "diagnostics",
+    ] {
+        assert_eq!(
+            from_store[key], from_graph[key],
+            "embedded store must agree with the graph JSONL path on {key}"
+        );
+    }
+
+    // The engineered fixture still surfaces through the embedded store:
+    // beta is alpha's top partner with 3 of alpha's 4 in-scope changes.
+    let partners = from_store["partners"].as_array().expect("partners array");
+    assert_eq!(partners[0]["repo_relative_path"], "src/beta.rs");
+    assert_eq!(partners[0]["co_change_count"], 3);
+    assert_eq!(partners[0]["target_change_count"], 4);
+
+    let status_after = git_output(&repo, ["status", "--porcelain"]);
+    assert!(
+        status_after.is_empty(),
+        "embedded query must not mutate the tree"
+    );
+}
