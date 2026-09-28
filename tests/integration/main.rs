@@ -151,6 +151,7 @@ mod repair;
 mod repo_catalog;
 mod repo_scope;
 mod resolve_frames;
+mod retire;
 mod review_coverage;
 mod route_registration;
 mod scan_coverage;

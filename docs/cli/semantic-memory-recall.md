@@ -125,6 +125,29 @@ silently promoted to a fact.
 
 Controls how superseded or contradicted observations are filtered or annotated. By default (`exclude`), they are excluded from the `observations` list and added to `excluded` diagnostics. With `include-but-flag`, they are returned alongside their temporal status and forward references. See [recall-supersession.md](recall-supersession.md) for full details.
 
+### `--include-retired` (issue #156)
+
+Records retired from recall ([`eg retire`](retire.md)) are excluded from
+default recall with an exclusion diagnostic — on the vector path, the
+`--collapse` path, and the normalized-text degraded collapse path.
+`--include-retired` keeps them and labels every returned row with its
+`retirement_state`:
+
+```sh
+eg query semantic-memory "what breaks when the input file is empty?" --include-retired
+```
+
+```json
+"retirement_state": { "state": "retired", "reason": "superseded", "retired_by": "op-1", "retired_at": "2026-09-28T12:00:00Z" }
+```
+
+Active records label as `{ "state": "active" }` when the flag is passed. The
+label is omitted entirely in default recall, where retired records never
+reach the row stage. Retirement is the recall-state switch; it is distinct
+from [`eg forget`](forget.md) (logical retraction from every read surface)
+and from supersession (a provenance relationship that recall also filters
+on).
+
 ### Author scoping (issue #195)
 
 In multi-agent deployments many agents write observations into one shared

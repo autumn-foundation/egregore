@@ -290,8 +290,7 @@ fn non_string_depends_on_entry_emits_invalid_dependency_and_keeps_task() {
         .filter(|m| m.starts_with("[invalid_dependency]"))
         .count();
     assert_eq!(
-        invalid,
-        2,
+        invalid, 2,
         "expected one [invalid_dependency] diagnostic per non-string entry, got: {diags:?}"
     );
 }

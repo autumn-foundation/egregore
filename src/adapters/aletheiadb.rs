@@ -5275,6 +5275,8 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "Constraint" => Ok(NodeKind::Constraint),
         "CostUsage" => Ok(NodeKind::CostUsage),
         "Retraction" => Ok(NodeKind::Retraction),
+        "RetirementReceipt" => Ok(NodeKind::RetirementReceipt),
+        "ReinstatementReceipt" => Ok(NodeKind::ReinstatementReceipt),
         "DependencyDeclaration" => Ok(NodeKind::DependencyDeclaration),
         "ScanCoverage" => Ok(NodeKind::ScanCoverage),
         // History-replay window summary (issue #256).
@@ -5626,6 +5628,8 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::Constraint
         | NodeKind::CostUsage
         | NodeKind::Retraction
+        | NodeKind::RetirementReceipt
+        | NodeKind::ReinstatementReceipt
         | NodeKind::DependencyDeclaration
         | NodeKind::ScanCoverage
         | NodeKind::HistoryReplayWindow

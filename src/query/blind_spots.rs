@@ -154,7 +154,9 @@ const fn domain_of_kind(kind: NodeKind) -> Domain {
         | NodeKind::WorkflowRule
         | NodeKind::NamingDecision
         | NodeKind::Constraint
-        | NodeKind::Retraction => Domain::UserContext,
+        | NodeKind::Retraction
+        | NodeKind::RetirementReceipt
+        | NodeKind::ReinstatementReceipt => Domain::UserContext,
         NodeKind::LogSource
         | NodeKind::ErrorSignature
         | NodeKind::LogEvent

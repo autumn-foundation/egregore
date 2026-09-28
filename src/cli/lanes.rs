@@ -567,6 +567,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "retirement",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["agent_verified", "agent_unverified", "agent_contradicted"],
+            citable_handles: true,
+            freshness: &["store_live", "valid_time"],
+        },
+    ),
+    (
         "risk-markers",
         LaneStatic {
             store_mode: StoreMode::Structural,

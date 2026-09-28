@@ -204,6 +204,53 @@ set:
 
 The record shape itself is unchanged.
 
+#### `RetirementReceipt` record shape
+
+The auditable event `eg retire` writes when an operator retires an
+observation-class agent-memory record from recall without erasing its history
+(issue #156). Retirement is purely additive: the target record and its
+provenance are never mutated. See [`docs/cli/retire.md`](../cli/retire.md).
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | `agent_memory:v1:{hash}` | yes | Stable per (target, transaction time, reason, actor, superseder, evidence handle): `["node", "retirement-receipt", target_id, transaction_time, reason, retired_by, superseded_by, evidence_handle]`. |
+| `kind` | `"RetirementReceipt"` | yes | |
+| `schema_version` | `1` | yes | |
+| `text` | string | yes | Typed reason code: `superseded`, `drifted`, `contradicted`, or `operator-decision`. |
+| `summary` | string | yes | `Retirement receipt for {target_record_id}` |
+| `agent_id` | string | yes | Operator handle recorded as the retiring actor. |
+| `transaction_time` | RFC 3339 | yes | When the retirement was committed (the transaction-time axis `--as-of` pins). |
+| `source_handle` | record ID | yes | The retired record's stable ID. |
+| `valid_time` | RFC 3339 | yes | Mirrors `transaction_time`. |
+| `valid_time_source` | `"inferred_from_transaction_time"` | yes | |
+| `evidence_links` | list | when reason carries evidence | `superseded`: `SUPERSEDES` + `SUPERSEDED_BY` links to the superseder. `drifted`: `DRIFTED_EVIDENCE` link to the cited, now-unresolved handle. `contradicted` / `operator-decision`: `CONTRADICTED_BY` / `CITED_EVIDENCE` link when `--evidence-handle` was supplied. |
+
+Only observation-class records (`Observation`, `Decision`, `Failure`) are
+retireable; deterministic code-graph facts are refused. `superseded` also
+writes a normal `SUPERSEDES` evidence edge from the target to the superseder
+(§6a), so existing supersession views stay consistent; recall exclusion is
+controlled by the receipt.
+
+#### `ReinstatementReceipt` record shape
+
+The auditable event `eg reinstate` writes when an operator returns a retired
+record to active recall (issue #156). The retirement receipt stays in history;
+the newest receipt on the transaction-time axis controls the state. See
+[`docs/cli/retire.md`](../cli/retire.md).
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | `agent_memory:v1:{hash}` | yes | Stable per (target, transaction time, reason, actor): `["node", "reinstatement-receipt", target_id, transaction_time, reason, reinstated_by]`. |
+| `kind` | `"ReinstatementReceipt"` | yes | |
+| `schema_version` | `1` | yes | |
+| `text` | string | yes | Free-text reinstatement reason. |
+| `summary` | string | yes | `Reinstatement receipt for {target_record_id}` |
+| `agent_id` | string | yes | Operator handle recorded as the reinstating actor. |
+| `transaction_time` | RFC 3339 | yes | When the reinstatement was committed. |
+| `source_handle` | record ID | yes | The reinstated record's stable ID. |
+| `valid_time` | RFC 3339 | yes | Mirrors `transaction_time`. |
+| `valid_time_source` | `"inferred_from_transaction_time"` | yes | |
+
 #### `AgentRun` record shape
 
 | Field | Type | Required | Notes |

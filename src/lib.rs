@@ -97,6 +97,8 @@ pub mod memory_evidence_health;
 pub mod memory_health;
 /// Agent-memory recall evaluation harness (issue #91).
 pub mod memory_recall_eval;
+/// Agent-memory record retirement from recall (issue #156).
+pub mod memory_retire;
 /// Parser orchestration.
 pub mod parser;
 /// Local setup preflight report for the `eg doctor` command (issue #75).

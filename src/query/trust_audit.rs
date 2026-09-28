@@ -171,6 +171,8 @@ pub const fn node_trust_class(kind: NodeKind) -> NodeTrustClass {
         | NodeKind::NamingDecision
         | NodeKind::Constraint
         | NodeKind::Retraction
+        | NodeKind::RetirementReceipt
+        | NodeKind::ReinstatementReceipt
         | NodeKind::Task
         | NodeKind::AcceptanceCriterion
         | NodeKind::ExternalLink
@@ -473,9 +475,9 @@ mod tests {
                 NodeTrustClass::AgentAuthored => agent_authored += 1,
             }
         }
-        assert_eq!(NodeKind::ALL.len(), 63);
+        assert_eq!(NodeKind::ALL.len(), 65);
         assert_eq!(code_fact, 23, "documented code-fact count");
-        assert_eq!(agent_authored, 40, "documented agent-authored count");
+        assert_eq!(agent_authored, 42, "documented agent-authored count");
         assert_eq!(node_trust_class(NodeKind::Symbol), NodeTrustClass::CodeFact);
         assert_eq!(
             node_trust_class(NodeKind::Observation),

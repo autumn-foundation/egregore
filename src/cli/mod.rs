@@ -80,6 +80,7 @@ mod repair_cmd;
 mod repos;
 mod resolve;
 mod resolve_frames;
+mod retire;
 mod risk_markers;
 mod scan;
 mod scan_logs;
@@ -198,6 +199,7 @@ pub(crate) use repair_cmd::*;
 pub(crate) use repos::*;
 pub(crate) use resolve::*;
 pub(crate) use resolve_frames::*;
+pub(crate) use retire::*;
 pub(crate) use risk_markers::*;
 pub(crate) use scan::*;
 pub(crate) use scan_logs::*;
@@ -1417,6 +1419,93 @@ pub(crate) enum Commands {
         #[arg(long)]
         confirm: bool,
     },
+    /// Retire an agent-memory record from recall without erasing its history
+    /// (issue #156).
+    ///
+    /// Appends a `RetirementReceipt` node recording who retired the record,
+    /// when, and why; the target record and its provenance are never mutated.
+    /// The retired record is excluded from default `eg query semantic-memory`
+    /// recall until reinstated. Retiring an already-retired record is an
+    /// idempotent success returning the existing receipt.
+    ///
+    /// Only observation-class agent-memory records (Observation, Decision,
+    /// Failure) are retireable. Deterministic code-graph facts are refused
+    /// with a machine-readable error and zero writes.
+    ///
+    /// Reasons: `superseded` (requires `--superseded-by` naming a live,
+    /// active, observation-class record; also writes a normal `SUPERSEDES`
+    /// edge), `drifted` (requires `--evidence-handle` naming an evidence
+    /// handle the target cited that no longer resolves), `contradicted`
+    /// (optional `--evidence-handle` naming a live record), and
+    /// `operator-decision` (no evidence required).
+    ///
+    /// Success prints a JSON envelope on stdout and exits 0. Failures print a
+    /// machine-readable JSON envelope on stderr and exit 1 (refused or
+    /// malformed) or 2 (handle not found). See `docs/cli/retire.md`.
+    #[cfg(feature = "embedded-aletheiadb")]
+    Retire {
+        /// Stable record ID of the record to retire.
+        handle: String,
+        /// Graph JSONL file to append the receipt to (offline mode; mutually
+        /// exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with
+        /// --graph; defaults to `.egregore`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Typed retirement reason: `superseded`, `drifted`, `contradicted`,
+        /// or `operator-decision` (`operator_decision` is also accepted).
+        #[arg(long)]
+        reason: String,
+        /// Superseding record (required for `superseded`).
+        #[arg(long)]
+        superseded_by: Option<String>,
+        /// Evidence handle (required for `drifted`; optional for
+        /// `contradicted` and `operator-decision`).
+        #[arg(long)]
+        evidence_handle: Option<String>,
+        /// Operator handle recorded as the retiring actor.
+        #[arg(long, default_value = "operator")]
+        retired_by: String,
+        /// Fixed RFC 3339 transaction time for deterministic output (useful for
+        /// tests). Defaults to the current wall-clock instant.
+        #[arg(long)]
+        transaction_time: Option<String>,
+    },
+    /// Reinstate a retired agent-memory record to active recall (issue #156).
+    ///
+    /// Appends a `ReinstatementReceipt` node; the retirement receipt stays in
+    /// history and the record returns to default recall because the
+    /// reinstatement is the newest receipt. Reinstating a record that is not
+    /// retired is a refusal, not a silent no-op.
+    ///
+    /// Success prints a JSON envelope on stdout and exits 0. Failures print a
+    /// machine-readable JSON envelope on stderr and exit 1 (refused or
+    /// malformed) or 2 (handle not found). See `docs/cli/retire.md`.
+    #[cfg(feature = "embedded-aletheiadb")]
+    Reinstate {
+        /// Stable record ID of the record to reinstate.
+        handle: String,
+        /// Graph JSONL file to append the receipt to (offline mode; mutually
+        /// exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with
+        /// --graph; defaults to `.egregore`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Free-text reason for the reinstatement, recorded on the receipt.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Operator handle recorded as the reinstating actor.
+        #[arg(long, default_value = "operator")]
+        reinstated_by: String,
+        /// Fixed RFC 3339 transaction time for deterministic output (useful for
+        /// tests). Defaults to the current wall-clock instant.
+        #[arg(long)]
+        transaction_time: Option<String>,
+    },
     /// Offline repair workflow for Egregore stores.
     ///
     /// Use `repair preflight` first to inspect ownership, then `repair run --confirm`
@@ -2155,6 +2244,11 @@ pub(crate) enum QuerySubcommand {
         /// degraded over.
         #[arg(long, value_enum, default_value_t = CollapseModeArg::Auto)]
         collapse_mode: CollapseModeArg,
+        /// Include records retired from recall (issue #156), labeled with
+        /// their `retirement_state`. By default retired records are excluded
+        /// from recall with an exclusion diagnostic.
+        #[arg(long)]
+        include_retired: bool,
     },
     /// Retrieve evidence-backed context for a named symbol.
     ///
@@ -2311,6 +2405,35 @@ pub(crate) enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually `exclusive_with` --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Query the retirement state and receipt trail of one agent-memory
+    /// record (issue #156).
+    ///
+    /// Reports whether the record is currently retired from recall (or was at
+    /// the `--as-of` pin) plus the ordered receipt trail — retirements and
+    /// reinstatements with actor, transaction time, reason, and metadata —
+    /// without mutating anything. The target's original provenance is
+    /// reported from the untouched record.
+    ///
+    /// Documented in `docs/cli/retire.md`.
+    Retirement {
+        /// Agent-memory record ID (`agent_memory:v1:...`) whose retirement
+        /// state and receipt trail to report.
+        handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Pin the recall state to this RFC 3339 transaction-time instant:
+        /// receipts after the pin are invisible, so the reported state is
+        /// what recall would have shown then.
+        #[arg(long)]
+        as_of: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -6511,6 +6634,42 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             confirm,
         ),
         #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Retire {
+            handle,
+            graph,
+            data_dir,
+            reason,
+            superseded_by,
+            evidence_handle,
+            retired_by,
+            transaction_time,
+        } => retire_cmd(RetireCmdArgs {
+            handle: &handle,
+            graph: graph.as_deref(),
+            data_dir: data_dir.as_deref(),
+            reason: &reason,
+            superseded_by,
+            evidence_handle,
+            retired_by,
+            transaction_time,
+        }),
+        #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Reinstate {
+            handle,
+            graph,
+            data_dir,
+            reason,
+            reinstated_by,
+            transaction_time,
+        } => reinstate_cmd(ReinstateCmdArgs {
+            handle: &handle,
+            graph: graph.as_deref(),
+            data_dir: data_dir.as_deref(),
+            reason,
+            reinstated_by,
+            transaction_time,
+        }),
+        #[cfg(feature = "embedded-aletheiadb")]
         Commands::Repair { action } => repair_cmd(action),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Mcp { data_dir } => crate::mcp::run_stdio(&data_dir),
@@ -8487,6 +8646,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             collapse,
             similarity_threshold,
             collapse_mode,
+            include_retired,
         } => query_semantic_memory(
             &query,
             &data_dir,
@@ -8500,6 +8660,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             collapse,
             similarity_threshold,
             collapse_mode,
+            include_retired,
         ),
         QuerySubcommand::Context {
             name,
@@ -8659,6 +8820,19 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_memory_cmd(&records, &id_or_handle, verified_only, max_records)
         }
+        QuerySubcommand::Retirement {
+            handle,
+            graph,
+            data_dir,
+            as_of,
+            format,
+        } => query_retirement_cmd(
+            &handle,
+            graph.as_deref(),
+            data_dir.as_deref(),
+            as_of.as_deref(),
+            format,
+        ),
         QuerySubcommand::BeliefTimeline {
             target,
             graph,

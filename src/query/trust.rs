@@ -400,7 +400,9 @@ impl<'a> TrustIndex<'a> {
             | NodeKind::Preference
             | NodeKind::WorkflowRule
             | NodeKind::NamingDecision
-            | NodeKind::Constraint => TrustClass::Other,
+            | NodeKind::Constraint
+            | NodeKind::RetirementReceipt
+            | NodeKind::ReinstatementReceipt => TrustClass::Other,
         }
     }
 
@@ -1060,6 +1062,8 @@ mod tests {
             NodeKind::Constraint,
             NodeKind::CostUsage,
             NodeKind::Retraction,
+            NodeKind::RetirementReceipt,
+            NodeKind::ReinstatementReceipt,
             NodeKind::LogSource,
             NodeKind::ErrorSignature,
             NodeKind::LogEvent,

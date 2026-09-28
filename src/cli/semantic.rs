@@ -703,6 +703,11 @@ pub(crate) struct MemoryRecallResult<'a> {
     superseded_by_records: Option<Vec<crate::temporal_status::TemporalReference>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     contradicted_by: Option<Vec<crate::temporal_status::TemporalReference>>,
+    /// Recall-state label (issue #156). Present only with
+    /// `--include-retired`; retired records are excluded from default recall
+    /// before the row stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retirement_state: Option<crate::memory_retire::RetirementStateLabel>,
 }
 
 #[cfg(feature = "embeddings")]
@@ -1132,6 +1137,16 @@ fn resolve_triple_target(
     })
 }
 
+/// Retirement view for memory recall (issue #156): the resolved per-record
+/// retirement states plus whether the caller asked to keep retired records in
+/// recall (`--include-retired`). Shared by the vector and degraded collapse
+/// lanes so exclusion and labeling stay consistent.
+#[cfg(feature = "embeddings")]
+struct RetirementRecallView {
+    states: std::collections::BTreeMap<String, crate::memory_retire::RetirementState>,
+    include_retired: bool,
+}
+
 /// Emits the collapsed answer: one envelope line, one row per representative,
 /// then any supersession exclusion diagnostics (issue #163).
 #[cfg(feature = "embeddings")]
@@ -1142,6 +1157,7 @@ fn emit_collapsed_answer(
     format: OutputFormat,
     author_scope: &crate::query::AuthorScope,
     excluded_recall_diagnostics: &[ExcludedRecallDiagnostic],
+    retirement: &RetirementRecallView,
 ) -> Result<()> {
     if outcome.clusters.is_empty() {
         if author_scope.is_active() {
@@ -1162,13 +1178,49 @@ fn emit_collapsed_answer(
         outcome.clusters.len(),
     );
     print_result(&envelope, format)?;
-    for row in query::render_collapsed_rows(&outcome.clusters) {
+    let mut rows = query::render_collapsed_rows(&outcome.clusters);
+    // Retirement labels (issue #156): only when retired records were kept.
+    if retirement.include_retired {
+        for row in &mut rows {
+            row.retirement_state = Some(crate::memory_retire::retirement_label(
+                &retirement.states,
+                &row.record_id,
+            ));
+        }
+    }
+    for row in rows {
         print_result(&row, format)?;
     }
     for diag in excluded_recall_diagnostics {
         print_result(diag, format)?;
     }
     Ok(())
+}
+
+/// Retirement exclusion for the degraded collapse lane (issue #156): a
+/// retired record is dropped from recall with a diagnostic unless the caller
+/// passed `--include-retired`. Returns true when the record was excluded.
+#[cfg(feature = "embeddings")]
+fn exclude_retired_candidate<'a>(
+    record: &'a GraphRecord,
+    retirement: &RetirementRecallView,
+    excluded_recall_diagnostics: &mut Vec<ExcludedRecallDiagnostic<'a>>,
+) -> bool {
+    if matches!(
+        retirement.states.get(record.id()),
+        Some(crate::memory_retire::RetirementState::Retired { .. })
+    ) && !retirement.include_retired
+    {
+        excluded_recall_diagnostics.push(ExcludedRecallDiagnostic {
+            record_id: record.id(),
+            reason: "retired",
+            status: "excluded",
+            superseded_by: None,
+            contradicted_by: None,
+        });
+        return true;
+    }
+    false
 }
 
 /// Builds one collapse candidate from a recallable memory record on the
@@ -1195,8 +1247,13 @@ fn degraded_collapse_candidate<'a>(
     resolver: &crate::temporal_status::TemporalResolver,
     supersession: crate::temporal_status::SupersessionMode,
     excluded_recall_diagnostics: &mut Vec<ExcludedRecallDiagnostic<'a>>,
+    retirement: &RetirementRecallView,
 ) -> Option<query::CollapseCandidate> {
     if !is_recallable_memory_record(record, by_id, edges_from, tombstoned, verified_only) {
+        return None;
+    }
+    // Retirement (issue #156): same exclusion contract as the vector lane.
+    if exclude_retired_candidate(record, retirement, excluded_recall_diagnostics) {
         return None;
     }
     let GraphRecord::Node {
@@ -1317,9 +1374,16 @@ fn query_semantic_memory_collapsed_degraded(
     supersession: crate::temporal_status::SupersessionMode,
     similarity_threshold: f32,
     mode_requested: &str,
+    include_retired: bool,
 ) -> Result<()> {
     let index = query::RepositoryIndex::build(records);
     let selected = resolve_repo_scope(&index, repo);
+    // Retirement states (issue #156): same exclusion/labeling contract as the
+    // vector lane.
+    let retirement = RetirementRecallView {
+        states: crate::memory_retire::retirement_states(records, None),
+        include_retired,
+    };
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
     let (edges_from, tombstoned) = query::verification_support_indexes(records);
     let resolver = crate::temporal_status::TemporalResolver::build(records);
@@ -1343,6 +1407,7 @@ fn query_semantic_memory_collapsed_degraded(
             &resolver,
             supersession,
             &mut excluded_recall_diagnostics,
+            &retirement,
         ) {
             candidates.push(candidate);
         }
@@ -1364,6 +1429,7 @@ fn query_semantic_memory_collapsed_degraded(
         format,
         &author_scope,
         &excluded_recall_diagnostics,
+        &retirement,
     )
 }
 
@@ -1382,6 +1448,7 @@ pub(crate) fn query_semantic_memory(
     collapse: bool,
     similarity_threshold: f32,
     collapse_mode: CollapseModeArg,
+    include_retired: bool,
 ) -> Result<()> {
     validate_existing_embedded_store(data_dir)?;
 
@@ -1391,6 +1458,13 @@ pub(crate) fn query_semantic_memory(
     let records = sink
         .read_all_records()
         .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    // Retirement states (issue #156): retired records are excluded from
+    // default recall on every path below; `--include-retired` keeps them and
+    // labels each row.
+    let retirement = RetirementRecallView {
+        states: crate::memory_retire::retirement_states(&records, None),
+        include_retired,
+    };
     let index = query::RepositoryIndex::build(&records);
     let selected = resolve_repo_scope(&index, repo);
 
@@ -1434,6 +1508,7 @@ pub(crate) fn query_semantic_memory(
             supersession,
             similarity_threshold,
             collapse_mode_requested.unwrap_or("auto"),
+            include_retired,
         );
     }
     let index_absent = enforce_index_compatibility(&sink, &records)?
@@ -1472,6 +1547,23 @@ pub(crate) fn query_semantic_memory(
         let Some(record) = by_id.get(m.record_id.as_str()).copied() else {
             continue;
         };
+        // Retirement (issue #156): retired records are excluded from default
+        // recall with an explicit diagnostic; `--include-retired` keeps them
+        // and labels the row below.
+        if matches!(
+            retirement.states.get(record.id()),
+            Some(crate::memory_retire::RetirementState::Retired { .. })
+        ) && !retirement.include_retired
+        {
+            excluded_recall_diagnostics.push(ExcludedRecallDiagnostic {
+                record_id: record.id(),
+                reason: "retired",
+                status: "excluded",
+                superseded_by: None,
+                contradicted_by: None,
+            });
+            continue;
+        }
         let GraphRecord::Node {
             text,
             summary,
@@ -1599,6 +1691,9 @@ pub(crate) fn query_semantic_memory(
                         } else {
                             Some(contradicted_by_refs)
                         },
+                        retirement_state: include_retired.then(|| {
+                            crate::memory_retire::retirement_label(&retirement.states, record.id())
+                        }),
                     });
                 }
             }
@@ -1631,6 +1726,9 @@ pub(crate) fn query_semantic_memory(
                 },
                 superseded_by_records: None,
                 contradicted_by: None,
+                retirement_state: include_retired.then(|| {
+                    crate::memory_retire::retirement_label(&retirement.states, record.id())
+                }),
             });
         }
     }
@@ -1706,6 +1804,7 @@ pub(crate) fn query_semantic_memory(
             format,
             &author_scope,
             &excluded_recall_diagnostics,
+            &retirement,
         );
     }
     rows.truncate(limit);

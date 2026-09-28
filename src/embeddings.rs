@@ -136,6 +136,7 @@ const fn memory_target(kind: NodeKind) -> Option<&'static str> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
     let GraphRecord::Node {
         id,
@@ -225,6 +226,8 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::Constraint
         | NodeKind::CostUsage
         | NodeKind::Retraction
+        | NodeKind::RetirementReceipt
+        | NodeKind::ReinstatementReceipt
         | NodeKind::DependencyDeclaration
         // The scan-coverage summary is counts, not source text (issue #135).
         | NodeKind::ScanCoverage

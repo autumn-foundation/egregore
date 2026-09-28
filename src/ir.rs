@@ -3869,6 +3869,22 @@ pub enum NodeKind {
     /// retracted the target, when (transaction time), the reason, and the prior
     /// record handle, so logical retraction never leaves a silent hole.
     Retraction,
+    // ── Retirement receipt node kinds (issue #156) ───────────────────────────
+    /// Auditable retirement receipt for an agent-memory observation-class
+    /// record. Records who retired the target (`agent_id`), when on the
+    /// transaction-time axis (`transaction_time`), the typed reason from the
+    /// closed set (`text`: `superseded` / `drifted` / `contradicted` /
+    /// `operator-decision`), and the cited evidence handle(s)
+    /// (`evidence_links`). The receipt never mutates the target's provenance
+    /// in place: retirement is logical, and recall excludes the target while
+    /// the latest receipt for it is a retirement.
+    RetirementReceipt,
+    /// Auditable reinstatement receipt returning a retired record to active
+    /// recall (issue #156). Records who reinstated the target (`agent_id`),
+    /// when (`transaction_time`), and why (`text`, free text). The latest
+    /// receipt for a target decides its recall state, so the retire/reinstate
+    /// trail stays complete and queryable.
+    ReinstatementReceipt,
     // ── Log-signature node kinds (docs/schema/log-graph.md, issues #319/#320) ─
     /// A captured log source artifact (one scanned log file). Carries the
     /// artifact hash, format, and line count in its `log` payload.
@@ -3895,7 +3911,7 @@ impl NodeKind {
     /// macro regenerates from the enum definition itself. Adding a variant
     /// without listing it here fails that test. (A guard that merely iterated
     /// this array would be circular and could not fail.)
-    pub const ALL: [Self; 63] = [
+    pub const ALL: [Self; 65] = [
         Self::Repository,
         Self::File,
         Self::Module,
@@ -3955,6 +3971,8 @@ impl NodeKind {
         Self::Constraint,
         Self::CostUsage,
         Self::Retraction,
+        Self::RetirementReceipt,
+        Self::ReinstatementReceipt,
         Self::LogSource,
         Self::ErrorSignature,
         Self::LogEvent,
@@ -4024,6 +4042,8 @@ impl NodeKind {
             Self::Constraint => "Constraint",
             Self::CostUsage => "CostUsage",
             Self::Retraction => "Retraction",
+            Self::RetirementReceipt => "RetirementReceipt",
+            Self::ReinstatementReceipt => "ReinstatementReceipt",
             Self::LogSource => "LogSource",
             Self::ErrorSignature => "ErrorSignature",
             Self::LogEvent => "LogEvent",

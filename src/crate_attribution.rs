@@ -511,6 +511,8 @@ pub const fn carries_crate_attribution(kind: NodeKind) -> bool {
         | NodeKind::Constraint
         | NodeKind::CostUsage
         | NodeKind::Retraction
+        | NodeKind::RetirementReceipt
+        | NodeKind::ReinstatementReceipt
         | NodeKind::LogSource
         | NodeKind::ErrorSignature
         | NodeKind::LogEvent

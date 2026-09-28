@@ -4596,9 +4596,14 @@ fn all_node_kinds_have_documented_schema() {
         // Documented in docs/schema/agent-memory.md (full schema).
         // Retraction is the operator retraction event (issue #231):
         // docs/schema/agent-memory.md §4a and docs/cli/forget.md.
-        NodeKind::Agent | NodeKind::AgentSession | NodeKind::Observation | NodeKind::Retraction => {
-            "agent-memory-documented"
-        }
+        // Retirement receipts (issue #156): docs/schema/agent-memory.md
+        // and docs/cli/retire.md.
+        NodeKind::Agent
+        | NodeKind::AgentSession
+        | NodeKind::Observation
+        | NodeKind::Retraction
+        | NodeKind::RetirementReceipt
+        | NodeKind::ReinstatementReceipt => "agent-memory-documented",
         // Project-domain day-one shapes documented in docs/schema/project-graph.md
         NodeKind::Task | NodeKind::AcceptanceCriterion | NodeKind::ExternalLink => {
             "project-domain-documented"

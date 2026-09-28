@@ -266,6 +266,11 @@ pub struct CollapsedMemoryRow {
     /// the representative keeps its full provenance; never synthesized.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_links: Option<Vec<crate::EvidenceLink>>,
+    /// Recall-state label (issue #156). Present only when the caller asked
+    /// for retired records to be included in recall; otherwise retired
+    /// records never reach the row stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retirement_state: Option<crate::memory_retire::RetirementStateLabel>,
 }
 
 /// Collapse envelope emitted before the representative rows.
@@ -563,6 +568,7 @@ pub fn render_collapsed_rows(clusters: &[CollapsedCluster]) -> Vec<CollapsedMemo
                     .as_ref()
                     .map(PrimaryCitedTargetView::from),
                 evidence_links: representative.evidence_links.clone(),
+                retirement_state: None,
             }
         })
         .collect()
