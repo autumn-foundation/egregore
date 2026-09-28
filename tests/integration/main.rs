@@ -113,6 +113,7 @@ mod query_latency_budget;
 mod query_lifeline;
 mod query_locate;
 mod query_orient;
+mod query_origin;
 mod query_ownership;
 mod query_path;
 mod query_public_api;

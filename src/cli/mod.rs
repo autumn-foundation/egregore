@@ -61,6 +61,7 @@ mod manifest_deps;
 mod memory;
 mod memory_audit;
 mod orientation;
+mod origin;
 mod output;
 mod ownership;
 mod policy;
@@ -181,6 +182,7 @@ pub(crate) use manifest_deps::*;
 pub(crate) use memory::*;
 pub(crate) use memory_audit::*;
 pub(crate) use orientation::*;
+pub(crate) use origin::*;
 pub(crate) use output::*;
 pub(crate) use ownership::*;
 pub(crate) use policy::*;
@@ -4089,6 +4091,58 @@ pub(crate) enum QuerySubcommand {
         /// it was truncated).
         #[arg(long, default_value_t = query::OWNERSHIP_DEFAULT_LIMIT)]
         limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Trace a code symbol to the commit that introduced it, plus the
+    /// project-graph PR / issue / review records whose `merge_commit_sha`
+    /// equals that commit (issue #159).
+    ///
+    /// The introducing commit is the first commit whose snapshot contains the
+    /// symbol (reintroductions never move the origin). The project link is
+    /// deterministic commit-SHA byte equality ONLY — no fuzzy title or body
+    /// matching, and no live GitHub calls: the lane resolves entirely offline
+    /// against the already-ingested store.
+    ///
+    /// Code facts (the introducing commit) and project facts (PR/issue/review
+    /// rows) render in trust-separated `code` / `project` sections, mirroring
+    /// `eg query context`'s contract. When the store carries code history but
+    /// no GitHub import, the answer degrades to a commit-only result with an
+    /// explicit `github_import_absent` note — never an error, and never
+    /// implying no PR exists.
+    ///
+    /// Exit codes:
+    ///   0 — origin traced (possibly with empty project sections).
+    ///   1 — ambiguous symbol name, ambiguous commit prefix, or malformed
+    ///       `--as-of` timestamp (JSON diagnostic on stdout).
+    ///   2 — unknown symbol (`no_match`), symbol without commit-linked
+    ///       history (`no_history`), or `--at` commit absent from the store
+    ///       (`missing_commit`).
+    ///
+    /// Documented in `docs/cli/origin.md` and `docs/cli/query.md`.
+    Origin {
+        /// Symbol stable ID or exact symbol name.
+        #[arg(index = 1)]
+        symbol: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict symbol resolution to one repository (issue #67).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Resolve the origin against the code state as of this commit SHA or
+        /// unique prefix (valid-time axis). Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Resolve the origin against the code state as of the most recent
+        /// commit at or before this RFC 3339 instant (valid-time axis).
+        /// Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -9795,6 +9849,27 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 limit,
             };
             query_ownership_cmd(&records, &options, format)
+        }
+        QuerySubcommand::Origin {
+            symbol,
+            graph,
+            data_dir,
+            repo,
+            at,
+            as_of,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_origin_cmd(
+                &records,
+                &symbol,
+                selected.as_deref(),
+                at.as_deref(),
+                as_of.as_deref(),
+                format,
+            )
         }
         QuerySubcommand::At {
             location,

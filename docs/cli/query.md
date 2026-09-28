@@ -35,6 +35,7 @@ eg query deps     <HANDLE> --graph <PATH>   [--repo <SELECTOR>] [--at <COMMIT> |
 eg query deltas   <BASE> <HEAD> --graph <PATH> [--repo <SELECTOR>]
 eg query coupling <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--base <COMMIT> --head <COMMIT> | --at <COMMIT> | --as-of <RFC3339>] [--min-support N] [--limit N] [--format json|text]
 eg query lifeline <SYMBOL> --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
+eg query origin   <SYMBOL> --graph <PATH>   [--repo <SELECTOR>] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
 eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--include-private] [--format json|text]
 eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--threshold <PERCENT>] [--limit N] [--format json|text]
@@ -142,6 +143,12 @@ Evidence-backed audit subcommands have their own pages:
   history: introduced, each modifying commit with its drift record, removal
   and reintroduction, as newline-delimited JSON events
   ([lifeline.md](lifeline.md), issues #96, #215).
+- `eg query origin` — **the commit that introduced one symbol, plus the
+  project-graph PR / issue / review records whose `merge_commit_sha`
+  byte-equals that commit**: deterministic SHA-equality linking only, no
+  fuzzy matching, no live GitHub calls; degrades to a commit-only answer
+  with a `github_import_absent` note when the store has no GitHub import
+  ([origin.md](origin.md), issue #159).
 - `eg query public-api` — the crate's **externally-reachable public API
   surface** from recorded visibility and module containment, re-exports
   included, trapped `pub` items excluded
@@ -1492,6 +1499,9 @@ fabricated symbol, never an empty success:
   want that one symbol's state at a point.
 - **`eg query lifeline` (issue #96)** — one symbol's full lifecycle across all
   history, not a per-file snapshot.
+- **`eg query origin` (issue #159)** — the commit that *introduced* one
+  symbol, plus the PR / issue / review whose `merge_commit_sha` equals it;
+  not a timeline and not line blame.
 - **`eg query deltas <BASE> <HEAD>` (issue #118)** — what changed *between* two
   commits, not what existed *at* one.
 - **`eg query symbol --tx-as-of` (issue #66)** — what the *store* knew at a
