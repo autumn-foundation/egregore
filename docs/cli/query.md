@@ -19,6 +19,7 @@ eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--u
 eg query semantic-context <QUERY> --data-dir <DIR> [--limit N] [--min-score F] [--repo <SELECTOR>]
 eg query semantic-memory <QUERY> --data-dir <DIR> [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
 eg query semantic-memory <QUERY> --data-dir <DIR> [--collapse] [--collapse-mode auto|embedding-cosine|normalized-text] [--similarity-threshold F] [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
+eg query similar <HANDLE> --data-dir <DIR>  [--limit N] [--format json|text]
 eg query implementors <TRAIT> --graph <PATH>   [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
 eg query implementors <TRAIT> --data-dir <DIR> [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
 eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>] [--max-records N] [--candidate <RECORD_ID|FILE:SPAN>]
@@ -255,7 +256,7 @@ Most subcommands accept exactly one input source:
 - `--graph <PATH>` — read from a JSONL file produced by `eg scan` or `eg scan-history`.
 - `--data-dir <DIR>` — read from an embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. Requires the `embedded-aletheiadb` feature (enabled by default). Providing both `--graph` and `--data-dir` is an error.
 
-`eg query semantic`, `eg query semantic-context`, and `eg query semantic-memory` accept **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results — except `eg query semantic-memory --collapse`, which degrades to normalized-text equality clustering over every recallable memory record without loading a model (issue #163). `eg query semantic` returns only deterministic **code** hits; `eg query semantic-memory` returns only **agent-authored** memory hits — the two are never blended (issue #91). `eg query semantic-context` follows the `eg query context` no-match convention: on no semantic hit clearing `--min-score` it prints `{"ok":false,"error":{"code":"no_match",...}}` to **stdout** and exits `2`.
+`eg query semantic`, `eg query semantic-context`, `eg query semantic-memory`, and `eg query similar` accept **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results — except `eg query semantic-memory --collapse`, which degrades to normalized-text equality clustering over every recallable memory record without loading a model (issue #163). `eg query semantic` returns only deterministic **code** hits; `eg query semantic-memory` returns only **agent-authored** memory hits — the two are never blended (issue #91). `eg query similar` returns only **code** hits (symbol/file nodes) ranked against the anchor's stored embedding — it never loads a model and never embeds the handle (issue #154). `eg query semantic-context` follows the `eg query context` no-match convention: on no semantic hit clearing `--min-score` it prints `{"ok":false,"error":{"code":"no_match",...}}` to **stdout** and exits `2`.
 
 ### Subsystem scoping — `eg query semantic --under <PREFIX>` (issue #198)
 
@@ -356,6 +357,40 @@ adjacent dedupe surfaces on purpose:
   contradicted records and filters *which* records are recalled;
   `--collapse` groups the recalled ones. A cluster may mix trust classes
   and reports that mix in `trust_spread`.
+
+### Similar-symbol search — `eg query similar <HANDLE>` (issue #154)
+
+`eg query similar` answers "which code does the same thing as this symbol?"
+— the reuse lookup. It ranks the symbol/file nodes most similar to an
+existing symbol by cosine similarity of **stored** embeddings and returns the
+top `--limit` (default 10) as `SemanticResult` rows.
+
+- **Handle**: a qualified symbol name (`nested::Widget::new`) or a
+  `record_id` (`codegraph:v1:…`). An exact `record_id` wins over a name; a
+  name shared by several live nodes is an error listing every candidate
+  `record_id` (`ambiguous_symbol_handle`) — never a guess.
+- **No model, no re-scan**: the anchor's already-stored embedding is the
+  query vector. The lane never loads an embedding model, never touches the
+  network, and never re-embeds the corpus — so there is no model-identity
+  gate (unlike `eg query semantic`, issue #104).
+- **Never self**: the anchor is always excluded from its own answer.
+- **Floor**: only candidates scoring strictly above `0.0` cosine count as
+  similar; orthogonal or opposed vectors are not reuse candidates.
+- **Order** (total, issue #199): score descending, then `record_id`
+  ascending — byte-stable across repeated runs on an unchanged store.
+- **Rows** follow the semantic-result citation contract: `record_id`,
+  `name`, `repo_relative_path`, `span`, `score` (plus repository
+  attribution and the confidence band).
+- **Exit codes**: `0` — at least one similar node; `1` — malformed,
+  unresolvable, or ambiguous handle, anchor without a stored embedding
+  (`anchor_not_embedded`), or a store ingested without `--embed`
+  (`semantic_index_absent`); `2` — the anchor resolved and is embedded, but
+  no other node scored above the floor (`no_similar_matches`, stderr only,
+  stdout empty).
+
+```text
+eg query similar nested::Widget::new --data-dir .egregore --limit 5
+```
 
 ## Capability manifest (`eg query lanes`, issue #251)
 

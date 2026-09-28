@@ -47,10 +47,12 @@ lanes are sorted by id, and every list field uses a canonical order.
   `--data-dir` only for the embedding lanes, which accept no `--graph`).
 - **`store_mode`** — `structural` (JSONL graph or embedded store; no embedding
   model needed) or `semantic` (embedded store ingested with `--embed`; the
-  lane needs a vector index and refuses a mismatched embedder identity).
-  Exactly the `semantic`, `semantic-context`, and `semantic-memory` lanes are
-  `semantic` (all three are only built with the `embeddings` cargo feature;
-  without it the manifest lists just the structural lanes).
+  lane needs a vector index and refuses a mismatched embedder identity —
+  except `similar`, which queries with the anchor's stored vector and so
+  needs no query-side model identity).
+  Exactly the `semantic`, `semantic-context`, `semantic-memory`, and `similar`
+  lanes are `semantic` (all four are only built with the `embeddings` cargo
+  feature; without it the manifest lists just the structural lanes).
 - **`trust_classes`** — the answer trust class(es), from the closed
   [`TrustClass`](../../src/query/trust.rs) vocabulary (`source_derived`,
   `verification_evidence`, `agent_verified`, `agent_unverified`,

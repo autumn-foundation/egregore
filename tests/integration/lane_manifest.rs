@@ -303,6 +303,9 @@ fn expected_semantic_lanes() -> BTreeSet<String> {
         "semantic".to_owned(),
         "semantic-context".to_owned(),
         "semantic-memory".to_owned(),
+        // `similar` ranks by stored embeddings (issue #154); it needs the
+        // vector index but no query-side model.
+        "similar".to_owned(),
     ])
 }
 

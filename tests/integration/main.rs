@@ -169,6 +169,7 @@ mod semantic_provenance;
 mod semantic_relevance;
 mod semantic_relevance_gate;
 mod session_retrospective;
+mod similar_symbols;
 mod store_contention;
 mod store_export;
 mod supersede_write;

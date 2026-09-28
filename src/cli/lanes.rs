@@ -641,6 +641,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "similar",
+        LaneStatic {
+            store_mode: StoreMode::Semantic,
+            trust_classes: &["source_derived"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot"],
+        },
+    ),
+    (
         "session",
         LaneStatic {
             store_mode: StoreMode::Structural,
@@ -1214,6 +1223,7 @@ mod tests {
             expected.insert("semantic".to_owned());
             expected.insert("semantic-context".to_owned());
             expected.insert("semantic-memory".to_owned());
+            expected.insert("similar".to_owned());
         }
         assert_eq!(
             semantic, expected,

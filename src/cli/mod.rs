@@ -128,6 +128,8 @@ mod trust_audit;
 mod diagram;
 // Appended (issue #227); kept at the end to minimize cross-lane merge conflicts.
 mod suppressions;
+// Appended (issue #154); kept at the end to minimize cross-lane merge conflicts.
+mod similar;
 
 pub(crate) use as_of::*;
 pub(crate) use at::*;
@@ -2135,6 +2137,42 @@ pub(crate) enum QuerySubcommand {
         #[cfg(feature = "embeddings")]
         #[arg(long, conflicts_with = "daemon")]
         embed_model: Option<String>,
+    },
+    /// Find symbols semantically similar to a given symbol (issue #154).
+    ///
+    /// Ranks the symbol/file nodes most similar to an existing symbol by
+    /// cosine similarity of stored embeddings — the "who else does this?"
+    /// lookup for surfacing reusable code. The anchor's already-stored
+    /// embedding is the query: no model is loaded, nothing is re-scanned,
+    /// and the anchor itself is never returned.
+    ///
+    /// Rows are `SemanticResult` records (`record_id`, `name`,
+    /// `repo_relative_path`, `span`, `score`), ordered by score descending
+    /// with ties broken by `record_id` ascending; the answer is byte-stable
+    /// across repeated runs on an unchanged store.
+    ///
+    /// Exit codes:
+    ///   0 — at least one similar node returned.
+    ///   1 — malformed/unresolvable/ambiguous handle, anchor without a stored
+    ///       embedding, or a store ingested without `--embed`.
+    ///   2 — the anchor resolved and is embedded, but no other node scored
+    ///       above the similarity floor.
+    ///
+    /// Documented in `docs/cli/query.md`.
+    #[cfg(feature = "embeddings")]
+    Similar {
+        /// Anchor handle: a qualified symbol name (e.g. `nested::Widget::new`)
+        /// or a `record_id` (`codegraph:v1:…`).
+        handle: String,
+        /// Embedded `AletheiaDB` data directory (must be ingested with `--embed`).
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Maximum number of similar nodes returned (default 10).
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
     /// Answer a natural-language query with evidence-backed context for the
     /// top-N semantic matches in one call (issue #90).
@@ -7048,7 +7086,7 @@ pub(crate) struct SemanticResult<'a> {
 
 #[cfg(feature = "embeddings")]
 impl<'a> SemanticResult<'a> {
-    fn from_match(m: &'a SemanticMatch, index: &'a query::RepositoryIndex) -> Self {
+    pub(crate) fn from_match(m: &'a SemanticMatch, index: &'a query::RepositoryIndex) -> Self {
         let repository_id = index.owner_of(&m.record_id);
         Self {
             record_id: &m.record_id,
@@ -8616,6 +8654,13 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 )
             }
         }
+        #[cfg(feature = "embeddings")]
+        QuerySubcommand::Similar {
+            handle,
+            data_dir,
+            limit,
+            format,
+        } => similar::query_similar_cmd(&handle, &data_dir, limit, format),
         #[cfg(feature = "embeddings")]
         QuerySubcommand::SemanticContext {
             query,
