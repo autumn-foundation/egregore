@@ -4688,6 +4688,7 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::ClosesAcceptanceCriterion
         | EdgeLabel::OwnedByTask
         | EdgeLabel::ExternalHandle
+        | EdgeLabel::DependsOn
         | EdgeLabel::TouchesFile
         | EdgeLabel::MergedAs
         | EdgeLabel::ReviewsCommit

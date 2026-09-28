@@ -117,6 +117,21 @@ Field set:
 | `labels` | string array | yes | Operator labels. |
 | `created_at` | RFC3339 string | yes | Original creation timestamp for this task. |
 | `updated_at` | RFC3339 string | yes | Mutation timestamp for this line. |
+| `depends_on` | string array | no | Author-declared prerequisite task `local_id`s (issue #161). Each entry must name a task in the same file; resolution is file-wide so forward references are allowed. Duplicate entries collapse to one edge; unknown targets keep the task importable but blocked (see Diagnostics). |
+
+Rule: `depends_on` declares prerequisites, never judgment. The importer
+resolves each entry against every task `local_id` in the file and emits one
+`DEPENDS_ON` edge per distinct known target, FROM the dependent task TO the
+prerequisite. Only the latest revision's declarations are emitted: a later
+revision that omits a dependency removes the edge. A self-dependency is
+imported as written and surfaces as a cycle diagnostic at query time.
+
+Rule: an entry naming no task in the file emits no edge. The importer emits
+one `[unresolved_dependency]` project `Diagnostic` whose summary is the
+prefix `[unresolved_dependency] ` followed by a JSON object
+`{"task_local_id": "...", "file": "<repo-relative path>", "line": <1-based
+line number>, "unknown_dep": "..."}`. The declaring task is still imported;
+`eg query task-ready` reports it blocked with `resolution: "unresolved"`.
 
 Rule: `local_id` is the stable identifier; duplicate `local_id` lines are valid only as revisions of the same record kind. The importer sets project-graph `valid_time` to this line's `updated_at` and sets `valid_time_source` to `local_jsonl_updated_at`.
 

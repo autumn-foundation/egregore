@@ -361,6 +361,7 @@ removing a label is a schema version bump.
 | `EMITTED_DURING` | `log` | `agent_memory`, `verification` | `ErrorSignature` | `AgentRun`, `AgentTurn`, `CommandRun` | many:many | yes |
 | `CLOSES_ACCEPTANCE_CRITERION` | `project` | `verification` | `AcceptanceCriterion` | `Verification`, `CommandRun`, `TestRun` | many:1 | no |
 | `OWNED_BY_TASK` | `project` | `project` | `AcceptanceCriterion` | `Task` | many:1 | no |
+| `DEPENDS_ON` | `project` | `project` | `Task` | `Task` | many:many | no |
 | `EXTERNAL_HANDLE` | `project` | `project` | `Task`, `AcceptanceCriterion` | `ExternalLink` | many:1 | no |
 | `TOUCHES_FILE` | `project` | `codegraph` | `Task` | `File` | many:many | no |
 | `DRIFTS_FROM` | `semantic` | `codegraph` | `SemanticDrift` | `File`, `Symbol` | many:1 | no |

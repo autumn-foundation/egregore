@@ -2897,6 +2897,7 @@ const PROJECT_EDGE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::ClosesAcceptanceCriterion,
     EdgeLabel::OwnedByTask,
     EdgeLabel::ExternalHandle,
+    EdgeLabel::DependsOn,
     EdgeLabel::TouchesFile,
     EdgeLabel::MergedAs,
     EdgeLabel::ReviewsCommit,
@@ -3698,6 +3699,18 @@ fn validate_project_edge(
                 &[NodeKind::Task, NodeKind::AcceptanceCriterion],
                 target_kind,
                 &[NodeKind::ExternalLink],
+            )?;
+        }
+        // Task dependency edge (issue #161): Task -> Task only. Self-loops are
+        // structural input; the query surfaces them as cycle diagnostics.
+        EdgeLabel::DependsOn => {
+            validate_project_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                &[NodeKind::Task],
+                target_kind,
+                &[NodeKind::Task],
             )?;
         }
         EdgeLabel::ClosesAcceptanceCriterion => {
@@ -16698,6 +16711,87 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn depends_on_edge_validation_requires_task_endpoints() -> Result<()> {
+        // Issue #161: the daemon admits DEPENDS_ON only as Task -> Task.
+        // Self-loops pass validation as structural input; the query lane
+        // reports them as cycle diagnostics.
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let sink =
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?;
+        let records = vec![
+            GraphRecord::node(
+                "t:1".to_owned(),
+                NodeKind::Task,
+                None,
+                None,
+                None,
+                "task one".to_owned(),
+            ),
+            GraphRecord::node(
+                "t:2".to_owned(),
+                NodeKind::Task,
+                None,
+                None,
+                None,
+                "task two".to_owned(),
+            ),
+            GraphRecord::node(
+                "ac:1".to_owned(),
+                NodeKind::AcceptanceCriterion,
+                None,
+                None,
+                None,
+                "criterion".to_owned(),
+            ),
+        ];
+        let validate = |source: &str, target: &str| {
+            validate_project_edge(
+                "edge:probe",
+                PROJECT_SCHEMA_VERSION,
+                EdgeLabel::DependsOn,
+                source,
+                target,
+                None,
+                &records,
+                &sink,
+            )
+        };
+
+        assert!(
+            validate("t:1", "t:2").is_ok(),
+            "Task -> Task DEPENDS_ON must be accepted"
+        );
+        assert!(
+            validate("t:1", "t:1").is_ok(),
+            "self-loop DEPENDS_ON must pass validation as structural input"
+        );
+
+        let err = validate("t:1", "ac:1")
+            .expect_err("Task -> AcceptanceCriterion DEPENDS_ON must be rejected");
+        assert!(
+            err.message.contains("invalid target kind"),
+            "unexpected rejection message: {}",
+            err.message
+        );
+
+        let err = validate("ac:1", "t:1")
+            .expect_err("AcceptanceCriterion -> Task DEPENDS_ON must be rejected");
+        assert!(
+            err.message.contains("invalid source kind"),
+            "unexpected rejection message: {}",
+            err.message
+        );
+
+        let err = validate("t:1", "missing").expect_err("dangling target must be rejected");
+        assert!(
+            err.message.contains("target not found"),
+            "unexpected rejection message: {}",
+            err.message
+        );
         Ok(())
     }
 }

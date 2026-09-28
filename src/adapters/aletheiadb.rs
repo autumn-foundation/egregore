@@ -5337,6 +5337,7 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "CLOSES_ACCEPTANCE_CRITERION" => Ok(EdgeLabel::ClosesAcceptanceCriterion),
         "OWNED_BY_TASK" => Ok(EdgeLabel::OwnedByTask),
         "EXTERNAL_HANDLE" => Ok(EdgeLabel::ExternalHandle),
+        "DEPENDS_ON" => Ok(EdgeLabel::DependsOn),
         "TOUCHES_FILE" => Ok(EdgeLabel::TouchesFile),
         "MERGED_AS" => Ok(EdgeLabel::MergedAs),
         "REVIEWS_COMMIT" => Ok(EdgeLabel::ReviewsCommit),

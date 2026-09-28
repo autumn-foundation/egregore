@@ -4087,6 +4087,13 @@ pub enum EdgeLabel {
     OwnedByTask,
     /// Project record points to its external source handle.
     ExternalHandle,
+    /// Project task depends on another project task (issue #161). FROM
+    /// `project.Task` TO `project.Task`; emitted only from the latest revision
+    /// of the declaring task's local JSONL row. Edges never name unresolved
+    /// targets: unknown `depends_on` entries become `[unresolved_dependency]`
+    /// diagnostics instead. Self-dependencies are emitted as edges and surface
+    /// as query-time cycle diagnostics.
+    DependsOn,
     /// Project task intends to touch a code-graph file.
     TouchesFile,
     /// Project PR `Task` was merged as a specific code-graph `Commit`
@@ -4176,7 +4183,7 @@ impl EdgeLabel {
     /// of edge types Egregore can ever write (issue #486).
     /// `edge_label_all_matches_the_enum_definition` pins it exhaustive against
     /// the same independent `serde` oracle [`NodeKind::ALL`] uses.
-    pub const ALL: [Self; 49] = [
+    pub const ALL: [Self; 50] = [
         Self::Contains,
         Self::Defines,
         Self::Imports,
@@ -4201,6 +4208,7 @@ impl EdgeLabel {
         Self::ClosesAcceptanceCriterion,
         Self::OwnedByTask,
         Self::ExternalHandle,
+        Self::DependsOn,
         Self::TouchesFile,
         Self::MergedAs,
         Self::ReviewsCommit,
@@ -4256,6 +4264,7 @@ impl EdgeLabel {
             "CLOSES_ACCEPTANCE_CRITERION" => Some(Self::ClosesAcceptanceCriterion),
             "OWNED_BY_TASK" => Some(Self::OwnedByTask),
             "EXTERNAL_HANDLE" => Some(Self::ExternalHandle),
+            "DEPENDS_ON" => Some(Self::DependsOn),
             "TOUCHES_FILE" => Some(Self::TouchesFile),
             "MERGED_AS" => Some(Self::MergedAs),
             "REVIEWS_COMMIT" => Some(Self::ReviewsCommit),
@@ -4303,6 +4312,7 @@ impl EdgeLabel {
                 | Self::ClosesAcceptanceCriterion
                 | Self::OwnedByTask
                 | Self::ExternalHandle
+                | Self::DependsOn
                 | Self::TouchesFile
                 | Self::MergedAs
                 | Self::ReviewsCommit
@@ -4375,6 +4385,7 @@ impl EdgeLabel {
             Self::ClosesAcceptanceCriterion => "CLOSES_ACCEPTANCE_CRITERION",
             Self::OwnedByTask => "OWNED_BY_TASK",
             Self::ExternalHandle => "EXTERNAL_HANDLE",
+            Self::DependsOn => "DEPENDS_ON",
             Self::TouchesFile => "TOUCHES_FILE",
             Self::MergedAs => "MERGED_AS",
             Self::ReviewsCommit => "REVIEWS_COMMIT",

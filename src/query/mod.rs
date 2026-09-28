@@ -55,6 +55,8 @@ mod semantic;
 mod subsystem;
 mod symbols;
 mod task_evidence;
+// Appended (issue #161); kept at the end to minimize cross-lane merge conflicts.
+mod task_ready;
 mod transaction_time;
 mod transitive_callees;
 mod transitive_callers;
@@ -184,3 +186,5 @@ pub use neighborhood::*;
 pub use memory_collapse::*;
 // Appended (issue #162); kept at the end to minimize cross-lane merge conflicts.
 pub use complexity::*;
+// Appended (issue #161); kept at the end to minimize cross-lane merge conflicts.
+pub use task_ready::*;

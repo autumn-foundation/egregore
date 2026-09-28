@@ -104,7 +104,7 @@ const ALL_EDGE_LABELS: &[EdgeLabel] = &[
 pub(crate) const fn is_integrity_checked_evidence_edge(label: EdgeLabel) -> bool {
     use EdgeLabel::{
         Aggregates, AuthoredBy, Calls, CapturedFrom, ChangedIn, ClosesAcceptanceCriterion,
-        Constructs, Contains, Contradicts, DecidedOn, Defines, DriftsFrom, DriftsPrior,
+        Constructs, Contains, Contradicts, DecidedOn, Defines, DependsOn, DriftsFrom, DriftsPrior,
         EmittedDuring, ExplainsChange, ExternalHandle, FailedOn, FingerprintedAs, FrameResolvesTo,
         HasEvidence, Implements, Imports, MaterializedAs, MeasuredBy, Mentions, MentionsSymbol,
         MergedAs, Observes, OwnedByTask, ParentOf, ProducedEvidence, ProducedPatch, PromptedFor,
@@ -125,6 +125,7 @@ pub(crate) const fn is_integrity_checked_evidence_edge(label: EdgeLabel) -> bool
         | ClosesAcceptanceCriterion
         | OwnedByTask
         | ExternalHandle
+        | DependsOn
         | TouchesFile
         | MergedAs
         | ReviewsCommit

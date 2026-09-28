@@ -405,7 +405,7 @@ pub fn active_eviction_tombstoned_ids(
 const fn is_evidence_edge(label: EdgeLabel) -> bool {
     use EdgeLabel::{
         Aggregates, AuthoredBy, Calls, CapturedFrom, ChangedIn, ClosesAcceptanceCriterion,
-        Constructs, Contains, Contradicts, DecidedOn, Defines, DriftsFrom, DriftsPrior,
+        Constructs, Contains, Contradicts, DecidedOn, Defines, DependsOn, DriftsFrom, DriftsPrior,
         EmittedDuring, ExplainsChange, ExternalHandle, FailedOn, FingerprintedAs, FrameResolvesTo,
         HasEvidence, Implements, Imports, MaterializedAs, MeasuredBy, Mentions, MentionsSymbol,
         MergedAs, Observes, OwnedByTask, ParentOf, ProducedEvidence, ProducedPatch, PromptedFor,
@@ -425,6 +425,7 @@ const fn is_evidence_edge(label: EdgeLabel) -> bool {
         | ClosesAcceptanceCriterion
         | OwnedByTask
         | ExternalHandle
+        | DependsOn
         | TouchesFile
         | MergedAs
         | ReviewsCommit

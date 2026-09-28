@@ -162,6 +162,7 @@ project-domain side of the contract, but the registry remains the one from #6.
 | `REFERENCES_TASK` | `agent_memory`, `project` | `project` | `Observation`, `Decision`, `Failure`, `Lesson`; `Review` | `Task` | many:many | no |
 | `CLOSES_ACCEPTANCE_CRITERION` | `project` | `verification` | `AcceptanceCriterion` | `Verification`, `CommandRun`, `TestRun` | many:1 | no |
 | `OWNED_BY_TASK` | `project` | `project` | `AcceptanceCriterion` | `Task` | many:1 | no |
+| `DEPENDS_ON` | `project` | `project` | `Task` | `Task` | many:many | no |
 | `EXTERNAL_HANDLE` | `project` | `project` | `Task`, `AcceptanceCriterion` | `ExternalLink` | many:1 | no |
 | `TOUCHES_FILE` | `project` | `codegraph` | `Task`; `Review` | `File` | many:many | no |
 | `MERGED_AS` | `project` | `codegraph` | `Task` *(`source_kind: github_pr`)* | `Commit` | many:1 | no |
@@ -173,6 +174,20 @@ project-domain side of the contract, but the registry remains the one from #6.
 
 `REFERENCES_TASK` is promoted from reserved to defined: #6 already reserved the
 label, and this slice fills in `project.Task` as the target.
+
+**Task dependencies (issue #161).** `DEPENDS_ON` (FROM `project.Task`, TO
+`project.Task`) records an author-declared prerequisite: the source task
+cannot be dispatched until the target is `closed_completed`. The local
+project importer mints it from the `depends_on` array on task JSONL lines;
+each edge carries project-domain identity (`project:v1:` record IDs,
+`schema_version = PROJECT_SCHEMA_VERSION`) and is validated by the daemon
+project-edge validator like the other project labels. Resolution is
+file-wide (forward references allowed); duplicate declarations collapse to
+one edge; only the latest revision's declarations are emitted. An unknown
+target emits an `[unresolved_dependency]` project `Diagnostic` instead of an
+edge — the declaring task stays importable and `eg query task-ready` reports
+it blocked. The edge declares a prerequisite, never a judgment: readiness is
+eligibility, and `closed_dropped` does not satisfy a dependency.
 
 The daemon applier synthesizes `OWNED_BY_TASK`, `EXTERNAL_HANDLE`, and
 `CLOSES_ACCEPTANCE_CRITERION` from the denormalized project fields. Directly

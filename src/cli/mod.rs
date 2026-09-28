@@ -87,6 +87,7 @@ pub(crate) mod semantic;
 mod subsystem;
 mod symbols;
 mod task;
+mod task_ready;
 mod transaction_time;
 mod transitive_callees;
 mod transitive_callers;
@@ -202,6 +203,7 @@ pub(crate) use semantic::*;
 pub(crate) use subsystem::*;
 pub(crate) use symbols::*;
 pub(crate) use task::*;
+pub(crate) use task_ready::*;
 pub(crate) use transaction_time::*;
 pub(crate) use transitive_callees::*;
 pub(crate) use transitive_callers::*;
@@ -2246,6 +2248,18 @@ pub(crate) enum QuerySubcommand {
         #[cfg(feature = "embedded-aletheiadb")]
         #[arg(long, requires = "data_dir", conflicts_with = "graph")]
         daemon: bool,
+    },
+    /// Surface ready-to-dispatch tasks by resolving task dependencies (issue #161).
+    TaskReady {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
     /// List pending promotion candidates.
     Candidates {
@@ -8473,6 +8487,14 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_task_cmd(&records, &id_or_handle)
+        }
+        QuerySubcommand::TaskReady {
+            graph,
+            data_dir,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_task_ready_cmd(&records, format)
         }
         QuerySubcommand::Candidates {
             graph,
