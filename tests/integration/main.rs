@@ -141,6 +141,7 @@ mod query_who_imports;
 mod range_delta_repo_gating;
 mod range_deltas;
 mod record_budget;
+mod record_resolve;
 mod redaction;
 mod redaction_report;
 mod reembed;

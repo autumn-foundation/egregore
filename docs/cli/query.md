@@ -51,6 +51,9 @@ eg query cycles   [SCOPE] --graph <PATH>   [--repo <SELECTOR>] [--format json|te
 eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR>]
 eg query locate   <PATH>:<LINE> --graph <PATH> [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
 eg query locate   <PATH>:<LINE> --data-dir <DIR> [--daemon] [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
+eg query resolve  <RECORD_ID> --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
+eg query resolve  <RECORD_ID> --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
+eg query resolve  <RECORD_ID> --data-dir <DIR>  --daemon [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query manifest-deps    --graph <PATH>   [--name <CRATE>] [--repo <SELECTOR>] [--format json|text]
 eg query churn            --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
 eg query churn            --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
@@ -361,7 +364,56 @@ ingested store, no project config. See [query-lanes.md](query-lanes.md).
 |------|---------|
 | `0` | At least one result was found and printed. |
 | `1` | An error occurred (missing file, malformed JSONL, ambiguous commit prefix, unknown/ambiguous repository selector, ambiguous unscoped repository collision). A single-line message is written to stderr. No partial JSON appears on stdout. |
-| `2` | No match found. A single-line message is written to stderr. Stdout is empty. |
+| `2` | No match found. A single-line message is written to stderr. Stdout is empty. (Exception: `eg query resolve` reports a dangling handle as a structured `dangling_handle` JSON envelope on stdout — see the read-back citation contract below.) |
+
+## Read-back citation contract (`eg query resolve`, issue #160)
+
+Query lanes that emit `record_id` handles (`query symbol`, `query file`,
+`query semantic`, …) make a promise: the handle dereferences back to its
+record. `eg query resolve` is the read half of that promise. It is read-only:
+it never writes the store, never heals a handle, and never guesses.
+
+### Verdicts (closed vocabulary)
+
+| Verdict | Meaning |
+|---------|---------|
+| `valid` | The handle names a live record. With no temporal selector the answer's `repo_relative_path` and `span` are byte-identical to the cited row at the same commit. |
+| `drifted` | The record exists at the pinned `--at`/`--as-of` snapshot but its cited coordinates or content differ from the current view — or it is gone there. Still a successful dereference: exit 0, with `current_repo_relative_path` / `current_span` disclosing where it lives now (absent when it is gone). |
+| `dangling` | No record matches the id in the requested view. A structured `{"ok": false, "error": {"code": "dangling_handle", …}}` envelope on stdout, exit 2 — never a silent empty answer, never a fuzzy nearest-match guess. |
+
+### What `drifted` compares
+
+The verdict compares the identity-adjacent stored fields —
+`repo_relative_path`, `span`, `signature`, `content_signature` — between the
+pinned snapshot's record and the current view's record for the same id. The
+stable id itself is deliberately excluded: symbol identity
+([ADR-0004](../adr/0004-symbol-identity.md)) excludes span and content
+precisely so an id survives coordinate/content changes, so comparing the
+recomputed id would always agree with itself and could never report drift.
+
+### Scope and errors
+
+- Codegraph ids only (`codegraph:v<N>:<suffix>`). A malformed handle exits 1
+  with a `malformed_handle` envelope; a well-formed handle from another id
+  domain (`agent_memory:v1:…`, …) exits 1 with `unsupported_handle_domain`
+  — refused explicitly, never misread as dangling. Out of scope: fuzzy
+  recovery, migration/auto-healing, cross-store identity recovery.
+- `--at` and `--as-of` are mutually exclusive; an ambiguous commit prefix or
+  a malformed RFC 3339 instant exits 1. Both selectors reuse the
+  `query symbol` temporal rules: the prefix-ambiguity check is
+  repository-wide (never a guess), and `--as-of` picks the greatest valid
+  time at or before the instant, skipping records without a parseable valid
+  time.
+- `--daemon` resolves through the daemon's `resolve_record` query verb, which
+  computes the verdict server-side with the same selection and tombstone
+  rules as the local lanes — including `--at`/`--as-of`. No client-side
+  store copy is needed.
+- Forget tombstones suppress the current view unless the record carries a
+  temporal block (issue #231); repository-eviction tombstones suppress
+  everywhere, including temporal snapshots (issue #472).
+- The answer is deterministic: the same invocation against the same store
+  bytes produces byte-identical output (covered by a round-trip test in
+  `tests/integration/record_resolve.rs`).
 
 ## Output format
 

@@ -50,6 +50,7 @@ mod public_api_deltas;
 mod recency;
 mod redaction_audit;
 mod repo;
+pub(crate) mod resolve;
 mod risk_markers;
 mod semantic;
 mod subsystem;

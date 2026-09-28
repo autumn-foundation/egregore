@@ -77,6 +77,7 @@ mod redaction_audit;
 mod reembed_cmd;
 mod repair_cmd;
 mod repos;
+mod resolve;
 mod resolve_frames;
 mod risk_markers;
 mod scan;
@@ -193,6 +194,7 @@ pub(crate) use records::*;
 pub(crate) use redaction_audit::*;
 pub(crate) use repair_cmd::*;
 pub(crate) use repos::*;
+pub(crate) use resolve::*;
 pub(crate) use resolve_frames::*;
 pub(crate) use risk_markers::*;
 pub(crate) use scan::*;
@@ -4996,6 +4998,43 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Dereference a cited record-id handle back to its live source record
+    /// with a typed drift verdict (issue #160).
+    ///
+    /// The read-back half of the citation contract: a `record_id` emitted by
+    /// `query symbol|file|semantic` resolves to its record and reports
+    /// `valid` (live, coordinates unchanged), `drifted` (the pinned
+    /// `--at`/`--as-of` snapshot's record differs from the current view), or
+    /// `dangling` (no record matches — structured envelope, exit 2, never a
+    /// fuzzy guess). Codegraph ids only; other domains are refused as
+    /// `unsupported_handle_domain`.
+    Resolve {
+        /// The cited record id (e.g. `codegraph:v1:<suffix>`).
+        record_id: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir / --daemon).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Route the query through the running daemon (requires --data-dir, conflicts with --graph).
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir", conflicts_with = "graph")]
+        daemon: bool,
+        /// Resolve the record at this commit SHA or unique prefix, then
+        /// compare against the current view for the drift verdict. Mutually
+        /// exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Resolve the record at the most recent commit at or before this
+        /// RFC 3339 instant (valid-time axis), then compare against the
+        /// current view for the drift verdict. Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -7667,6 +7706,31 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &index,
                 selected.as_deref(),
                 include_resolved,
+                format,
+            )
+        }
+        QuerySubcommand::Resolve {
+            record_id,
+            graph,
+            data_dir,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
+            at,
+            as_of,
+            format,
+        } => {
+            // Validate the handle before touching any store so a malformed
+            // or non-codegraph id fails fast with a machine-readable
+            // diagnostic (the lane itself re-validates; this keeps the
+            // dispatch honest about the contract).
+            query_resolve_cmd(
+                &record_id,
+                graph.as_deref(),
+                data_dir,
+                #[cfg(feature = "embedded-aletheiadb")]
+                daemon,
+                at.as_deref(),
+                as_of.as_deref(),
                 format,
             )
         }

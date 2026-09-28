@@ -14938,3 +14938,213 @@ fn agent_sessions_for_repo_pre_digest_delay_hook_does_not_fire_without_the_env_v
         "without the delay hook armed, a normal query must succeed, got {res}"
     );
 }
+
+// ── `query resolve` through the daemon's `resolve_record` verb (issue #160) ──
+
+/// A fixed, well-formed codegraph handle for daemon resolve tests.
+const RESOLVE_TEST_ID: &str =
+    "codegraph:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+/// Builds a minimal Symbol node with a temporal block for daemon resolve tests.
+fn resolve_test_symbol(start_line: u32, commit: &str, valid_time: &str) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": RESOLVE_TEST_ID,
+        "kind": "Symbol",
+        "schema_version": 1,
+        "summary": "daemon resolve test fixture",
+        "user_context": {},
+        "name": "target",
+        "repo_relative_path": "src/lib.rs",
+        "span": {
+            "start_byte": 0,
+            "end_byte": 10,
+            "start_line": start_line,
+            "end_line": start_line,
+            "start_column": 1,
+            "end_column": 10
+        },
+        "signature": "pub fn target() -> u32",
+        "content_signature": format!("content@{start_line}"),
+        "temporal": {
+            "git_commit": commit,
+            "git_parent_commits": [],
+            "valid_time": valid_time,
+            "observed_at": valid_time
+        },
+    })
+}
+
+/// Ingests `records` into the daemon at `metadata` and asserts HTTP 200.
+fn ingest_records_for_resolve(metadata: &DaemonMetadata, records: &[serde_json::Value]) {
+    let res = http_json(
+        metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "resolve-ingest",
+            "agent_id": "resolve-agent",
+            "session_id": "resolve-session",
+            "idempotency_key": "resolve-ingest-key",
+            "domain": "codegraph",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": { "records": records }
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "resolve ingest should succeed, got {res}"
+    );
+}
+
+/// Starts a daemon with two temporal versions of one symbol ingested:
+/// c1 (`aaa…`, line 1, 2026-03-01) and c2 (`bbb…`, line 5, 2026-03-03).
+/// Returns the temp dir guard, the running daemon, and the data dir.
+fn start_daemon_with_resolve_history() -> (tempfile::TempDir, RunningDaemon, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    ingest_records_for_resolve(
+        &metadata,
+        &[
+            resolve_test_symbol(
+                1,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "2026-03-01T00:00:00Z",
+            ),
+            resolve_test_symbol(
+                5,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "2026-03-03T00:00:00Z",
+            ),
+        ],
+    );
+    // Re-read metadata after ingest so the daemon has flushed; the CLI only
+    // needs the data dir.
+    (temp, daemon, data_dir)
+}
+
+#[test]
+fn eg_query_resolve_daemon_current_is_valid() {
+    let (_temp, mut daemon, data_dir) = start_daemon_with_resolve_history();
+    let output = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("query")
+        .arg("resolve")
+        .arg(RESOLVE_TEST_ID)
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("query resolve should run");
+    daemon.stop();
+    assert!(
+        output.status.success(),
+        "daemon resolve should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answer: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(answer["record_id"], RESOLVE_TEST_ID);
+    assert_eq!(answer["verdict"], "valid");
+    assert_eq!(answer["repo_relative_path"], "src/lib.rs");
+    // The current view is the c2 version (line 5).
+    assert_eq!(answer["span"]["start_line"], 5);
+}
+
+#[test]
+fn eg_query_resolve_daemon_at_pins_the_old_snapshot() {
+    let (_temp, mut daemon, data_dir) = start_daemon_with_resolve_history();
+    let output = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("query")
+        .arg("resolve")
+        .arg(RESOLVE_TEST_ID)
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--at")
+        .arg("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("query resolve should run");
+    daemon.stop();
+    assert!(
+        output.status.success(),
+        "daemon resolve --at should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answer: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(answer["record_id"], RESOLVE_TEST_ID);
+    // c1's coordinates (line 1) differ from the current view (line 5).
+    assert_eq!(answer["verdict"], "drifted");
+    assert_eq!(answer["span"]["start_line"], 1);
+    assert_eq!(answer["current_span"]["start_line"], 5);
+    assert!(answer["detail"].is_string());
+}
+
+#[test]
+fn eg_query_resolve_daemon_as_of_pins_the_old_snapshot() {
+    let (_temp, mut daemon, data_dir) = start_daemon_with_resolve_history();
+    let output = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("query")
+        .arg("resolve")
+        .arg(RESOLVE_TEST_ID)
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--as-of")
+        .arg("2026-03-02T00:00:00Z")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("query resolve should run");
+    daemon.stop();
+    assert!(
+        output.status.success(),
+        "daemon resolve --as-of should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answer: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(answer["record_id"], RESOLVE_TEST_ID);
+    assert_eq!(answer["verdict"], "drifted");
+    assert_eq!(answer["span"]["start_line"], 1);
+    assert_eq!(answer["current_span"]["start_line"], 5);
+}
+
+#[test]
+fn eg_query_resolve_daemon_dangling_is_exit_two() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let output = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("query")
+        .arg("resolve")
+        .arg("codegraph:v1:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("query resolve should run");
+    daemon.stop();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "dangling daemon resolve should exit 2, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "dangling_handle");
+}

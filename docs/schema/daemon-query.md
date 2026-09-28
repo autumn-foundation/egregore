@@ -122,7 +122,10 @@ Error responses follow the standard envelope in
 |-------------------------|------|------|
 | `missing_field`         | 400  | `verb` is absent or blank; or `semantic_search` called without `params.query_vector` |
 | `bad_request`           | 400  | Unknown verb, or required `params` field missing or malformed |
-| `ambiguous_commit_prefix` | 400 | `symbol_at_commit` prefix matches > 1 commit |
+| `ambiguous_commit_prefix` | 400 | `symbol_at_commit` prefix matches > 1 commit; `resolve_record` `at` prefix matches > 1 commit |
+| `dangling_handle`       | 404  | `resolve_record`: no record matches the handle in the requested view (issue #160) |
+| `malformed_handle`      | 400  | `resolve_record`: `record_id` is not a `codegraph:vN:<suffix>` handle (issue #160) |
+| `unsupported_handle_domain` | 400 | `resolve_record`: well-formed handle from another id domain (issue #160) |
 | `unknown_repository_selector` | 400 | `params.repo` matches no repository identity in the store (issue #67) |
 | `ambiguous_repository_selector` | 400 | `params.repo` matches more than one repository identity; ambiguity is never resolved implicitly. The error object carries a `candidates` array with every matching repository record ID so callers can retry with an exact selector (issue #67) |
 | `missing_semantic_index` | 422 | `semantic_search` against a store with no embedding index (re-ingest with `--embed`) |
@@ -147,6 +150,7 @@ wins and this document needs a fix.
 | `get_records`           | implemented | `record_ids: [string]`        | Batch read by stable ID |
 | `symbol_by_name`        | implemented | `name: string`, `kind?: string`, `repo?: string` | Exact name match; honours `as_of.valid_time` |
 | `symbol_at_commit`      | implemented | `name: string`, `commit: string`, `repo?: string` | Prefix-safe commit lookup |
+| `resolve_record`        | implemented | `record_id: string`, `at?: string`, `as_of?: string` | Record-id handle resolution with drift verdict (issue #160) |
 | `file_defines`          | implemented | `repo_relative_path: string`, `repo?: string` | Symbols defined in a file |
 | `locate`                | implemented | `repo_relative_path: string`, `line: u64`, `repo?: string`, `at?: string`, `as_of?: string`, `supersession?: string` | Positional query: innermost symbol at `file:line` plus the full trust-separated context bundle (issue #212); daemon face of `eg query locate` |
 | `drift_top_n`           | implemented | `limit?: u64` (default 10, max 100), `repo?: string` | SemanticDrift records ranked by score |
@@ -316,6 +320,39 @@ is ambiguous (matches > 1 commit), returns HTTP 400 `ambiguous_commit_prefix`.
 ```
 
 **Record shape:** same as `symbol_by_name`.
+
+---
+
+### `resolve_record`
+
+Resolves a cited `codegraph:vN:<suffix>` record-id handle to its live source
+record with a drift verdict (issue #160) — the daemon face of
+`eg query resolve --daemon`.
+
+**Params:**
+```json
+{ "record_id": "codegraph:v1:…", "at": "abc1234", "as_of": "2026-03-02T00:00:00Z" }
+```
+
+`at` (commit SHA prefix) and `as_of` (RFC 3339 valid-time instant) are
+optional and mutually exclusive. The selection and tombstone rules match the
+local lanes exactly: forget tombstones keep the issue #231 temporal
+exemption, repository-eviction tombstones suppress everywhere (issue #472),
+and an ambiguous `at` prefix is rejected, never guessed.
+
+**Record shape:** a single object with the citation fields
+(`record_id`, `kind`, `name`, `repo_relative_path`, `span`, `git_commit`,
+`valid_time`) plus `verdict` (`valid` | `drifted`; `drifted` adds `detail`,
+`current_repo_relative_path`, and `current_span`).
+
+**Errors:**
+
+| Code | HTTP | When |
+|------|------|------|
+| `dangling_handle` | 404 | No record matches the handle in the requested view |
+| `malformed_handle` | 400 | `record_id` is not a `codegraph:vN:<suffix>` handle |
+| `unsupported_handle_domain` | 400 | Well-formed handle from another id domain |
+| `ambiguous_commit_prefix` | 400 | `at` matches more than one commit |
 
 ---
 

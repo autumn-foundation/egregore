@@ -935,6 +935,18 @@ enum ErrorCode {
     /// [`Self::BadRequest`] so a caller can tell "not a number" from
     /// "out of range", matching the CLI's `invalid_limit` diagnostic code.
     InvalidLimit,
+    /// Added by #160 (`resolve_record` verb): no record matches the cited
+    /// handle in the requested view. The CLI maps this to its `dangling_handle`
+    /// envelope and exit 2.
+    DanglingHandle,
+    /// Added by #160 (`resolve_record` verb): `params.record_id` is not a
+    /// `codegraph:vN:<suffix>` handle at all. The CLI maps this to its
+    /// `malformed_handle` envelope and exit 1.
+    MalformedHandle,
+    /// Added by #160 (`resolve_record` verb): `params.record_id` is a
+    /// well-formed handle from another id domain. The CLI maps this to its
+    /// `unsupported_handle_domain` envelope and exit 1.
+    UnsupportedHandleDomain,
 }
 
 impl ErrorCode {
@@ -975,6 +987,9 @@ impl ErrorCode {
             Self::UnknownRepositorySelector => "unknown_repository_selector",
             Self::AmbiguousRepositorySelector => "ambiguous_repository_selector",
             Self::InvalidLimit => "invalid_limit",
+            Self::DanglingHandle => "dangling_handle",
+            Self::MalformedHandle => "malformed_handle",
+            Self::UnsupportedHandleDomain => "unsupported_handle_domain",
         }
     }
 
@@ -988,9 +1003,11 @@ impl ErrorCode {
             | Self::AmbiguousCommitPrefix
             | Self::UnknownRepositorySelector
             | Self::AmbiguousRepositorySelector
+            | Self::MalformedHandle
+            | Self::UnsupportedHandleDomain
             | Self::InvalidLimit => 400,
             Self::IdempotencyConflict => 409,
-            Self::NotFound => 404,
+            Self::NotFound | Self::DanglingHandle => 404,
             Self::PayloadTooLarge => 413,
             Self::QueueFull => 429,
             Self::QueryTimeout => 408,
@@ -9594,6 +9611,179 @@ fn handle_verb_symbol_at_commit(
     )
 }
 
+// ── Verb handler: resolve_record ────────────────────────────────────────────
+
+/// Serializes one dereferenced record to the citation fields the
+/// `resolve_record` verb returns for it.
+fn resolve_record_to_query_json(record_id: &str, record: &GraphRecord) -> serde_json::Value {
+    let fields = crate::query::resolve::resolved_record_fields(record);
+    serde_json::json!({
+        "record_id": record_id,
+        "kind": fields.kind,
+        "name": fields.name,
+        "repo_relative_path": fields.repo_relative_path,
+        "span": fields.span,
+        "git_commit": fields.git_commit,
+        "valid_time": fields.valid_time,
+    })
+}
+
+/// Resolves a cited `codegraph:vN:<suffix>` record-id handle to its live
+/// source record with a drift verdict (issue #160), server-side.
+///
+/// Params: `record_id` (required), `at` (optional commit SHA prefix),
+/// `as_of` (optional RFC 3339 valid-time instant). `at` and `as_of` are
+/// mutually exclusive. The response `records` array holds exactly one object
+/// with the citation fields plus `verdict` (`valid` | `drifted` | `dangling`
+/// semantics) and, for `drifted`, `detail`, `current_repo_relative_path`,
+/// and `current_span`. A dangling handle answers `dangling_handle` (HTTP
+/// 404); a malformed handle `malformed_handle` and a foreign id domain
+/// `unsupported_handle_domain` (both HTTP 400); an ambiguous `at` prefix
+/// `ambiguous_commit_prefix` (HTTP 400).
+#[allow(clippy::too_many_lines)]
+fn handle_verb_resolve_record(
+    request_id: &str,
+    params: &serde_json::Value,
+    started: Instant,
+    budget: Option<Duration>,
+    domain: &str,
+    state: &ServerState,
+) -> HttpResponse {
+    use crate::query::resolve as resolve_core;
+
+    let Some(record_id) = params.get("record_id").and_then(serde_json::Value::as_str) else {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::missing_field("params.record_id"),
+        );
+    };
+    let at = params.get("at").and_then(serde_json::Value::as_str);
+    let as_of = params.get("as_of").and_then(serde_json::Value::as_str);
+    if at.is_some() && as_of.is_some() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::new(
+                ErrorCode::BadRequest,
+                "params.at and params.as_of are mutually exclusive",
+            ),
+        );
+    }
+    match resolve_core::validate_resolve_handle(record_id) {
+        Ok(()) => {}
+        Err(resolve_core::ResolveHandleError::Malformed) => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::new(
+                    ErrorCode::MalformedHandle,
+                    format!(
+                        "malformed record-id handle '{record_id}': expected codegraph:vN:<suffix>"
+                    ),
+                ),
+            );
+        }
+        Err(resolve_core::ResolveHandleError::UnsupportedDomain) => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::new(
+                    ErrorCode::UnsupportedHandleDomain,
+                    format!(
+                        "unsupported handle domain for '{record_id}': this verb resolves codegraph handles only"
+                    ),
+                ),
+            );
+        }
+    }
+
+    let (records, snapshot, _, _) =
+        match load_all_records_for_verb(state, started, budget, domain, false) {
+            Ok(r) => r,
+            Err(e) => return HttpResponse::error_with_id(request_id, e),
+        };
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
+
+    // Tombstone sets: ordinary `forget` tombstones keep the issue #231
+    // temporal exemption; repository-eviction tombstones suppress everywhere
+    // (issue #472). `read_all_records` already drops stale tombstone records,
+    // so every tombstone present here is active.
+    let deleted = resolve_core::forget_tombstoned_ids(&records);
+    let evicted: std::collections::HashSet<String> = records
+        .iter()
+        .filter_map(|record| match record {
+            GraphRecord::Tombstone { deleted_id, .. }
+                if crate::repo_evict::is_eviction_tombstone(record) =>
+            {
+                Some(deleted_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
+    // The pinned record: current view, or the `--at`/`--as-of` snapshot.
+    let pinned = if let Some(commit_prefix) = at {
+        match resolve_core::find_record_at_commit(&records, record_id, commit_prefix, &evicted) {
+            Ok(found) => found,
+            Err(message) => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::new(ErrorCode::AmbiguousCommitPrefix, message),
+                );
+            }
+        }
+    } else if let Some(as_of_instant) = as_of {
+        match resolve_core::find_record_as_of(&records, record_id, as_of_instant, &evicted) {
+            Ok(found) => found,
+            Err(message) => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::new(ErrorCode::BadRequest, message),
+                );
+            }
+        }
+    } else {
+        resolve_core::find_current_record(&records, record_id, &deleted, &evicted)
+    };
+    let Some(pinned) = pinned else {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::new(
+                ErrorCode::DanglingHandle,
+                format!("no record matches handle '{record_id}' in the requested view"),
+            ),
+        );
+    };
+
+    // The verdict: temporal pins compare against the HEAD-anchored current
+    // view, exactly like the CLI transport.
+    let (verdict, detail, current) = if at.is_some() || as_of.is_some() {
+        let current = resolve_core::find_current_record(&records, record_id, &deleted, &evicted);
+        let (verdict, detail) = resolve_core::drift_verdict_for(pinned, current);
+        (verdict, detail, current)
+    } else {
+        (resolve_core::ResolveVerdict::Valid, None, None)
+    };
+
+    let mut answer = resolve_record_to_query_json(record_id, pinned);
+    answer["verdict"] = serde_json::json!(verdict.as_str());
+    if let Some(detail) = detail {
+        answer["detail"] = serde_json::json!(detail);
+    }
+    if verdict == resolve_core::ResolveVerdict::Drifted
+        && let Some(current) = current
+    {
+        let current_fields = resolve_core::resolved_record_fields(current);
+        answer["current_repo_relative_path"] = serde_json::json!(current_fields.repo_relative_path);
+        answer["current_span"] = serde_json::json!(current_fields.span);
+    }
+
+    HttpResponse::success(
+        Some(request_id),
+        200,
+        verb_success_result("resolve_record", &snapshot, &[answer]),
+    )
+}
+
 // ── Verb handler: file_defines ────────────────────────────────────────────────
 
 /// Collects the symbols defined in `path` as of `as_of_dt`.
@@ -11692,6 +11882,17 @@ fn verb_symbol_at_commit(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpR
     )
 }
 
+fn verb_resolve_record(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_resolve_record(
+        args.request_id,
+        args.params,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
 fn verb_file_defines(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
     handle_verb_file_defines(
         args.request_id,
@@ -11872,6 +12073,12 @@ const QUERY_VERB_TABLE: &[QueryVerbSpec] = &[
         status: QueryVerbStatus::Implemented,
         reserved_reason: None,
         handler: Some(verb_symbol_at_commit),
+    },
+    QueryVerbSpec {
+        name: "resolve_record",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_resolve_record),
     },
     QueryVerbSpec {
         name: "symbol_by_name",
