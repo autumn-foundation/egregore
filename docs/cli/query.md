@@ -1971,8 +1971,10 @@ eg query at <PATH>:<LINE> --data-dir <DIR> [--at <COMMIT>] [--repo <SELECTOR>]
   `impl` inside a module), the primary `symbol` is the one with the narrowest
   containing span (line width, then byte width, then record ID — all
   ascending). The full enclosing chain of containing `Module` and `Symbol`
-  nodes is also reported, ordered **outermost → innermost**; the last chain
-  entry is always the primary symbol.
+  nodes is also reported, ordered **outermost → innermost**; the chain's
+  innermost entry is the primary `symbol` whenever the innermost containing
+  node is a `Symbol` (a `Module` nested inside a function body can be the
+  innermost entry while the primary answer is the enclosing `Symbol`).
 - **Absence is the answer.** A line outside every symbol span (blank line,
   file-level `use`/attribute, inter-item whitespace — even inside a module)
   yields the typed `no_enclosing_symbol` error, never a nearest-neighbor
@@ -2000,7 +2002,7 @@ for identical inputs and store state:
 | `path` | string | yes | Queried repo-relative path, echoed back. |
 | `line` | number | yes | Queried 1-based line, echoed back. |
 | `symbol` | object | yes | The smallest enclosing `Symbol` node. |
-| `enclosing_chain` | array | yes | Containing `Module`/`Symbol` nodes, outermost → innermost. The innermost entry is the primary `symbol`. |
+| `enclosing_chain` | array | yes | Containing `Module`/`Symbol` nodes, outermost → innermost. The innermost entry is the primary `symbol` whenever it is a `Symbol`; a `Module` nested inside a function body can be the innermost entry while the primary answer is the enclosing `Symbol`. |
 | `repository_id` | string | when attributable | Stable `Repository` record ID owning the answer. |
 | `repository` | string | when attributable | Human-usable repository identity handle. |
 
