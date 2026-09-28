@@ -50,11 +50,14 @@ Readiness derives **only** from author-written `status` and author-declared
 A READY verdict is an **eligibility lead**, not a judgment: "no declared
 prerequisite blocks this task." It never claims the task is correct, safe, or
 non-colliding. Dispatching parallel work needs eligibility **and**
-non-collision — pair this lane with footprint-overlap analysis (issue #150)
-before dispatching. Readiness complements status listing (issue #119, *what*
-each task's status is) with dependency resolution (*which* tasks nothing
-blocks): status + dependencies establish eligibility; overlap analysis
-establishes non-collision; dispatch now requires both.
+non-collision — pair this lane with footprint-overlap analysis (issue #150,
+`eg query task-overlap`, documented in `task-overlap.md`) before dispatching.
+Readiness complements status listing (issue #119, *what* each task's status is)
+with dependency resolution (*which* tasks nothing blocks): status +
+dependencies establish eligibility; overlap analysis establishes
+non-collision; dispatch now requires both. For the full when-to-use
+comparison (task-ready vs task-overlap vs conflicts), see
+`task-overlap.md`'s "When to use which lane".
 
 ## Blocked rows
 

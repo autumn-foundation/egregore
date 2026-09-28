@@ -745,6 +745,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "task-overlap",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["project_state", "source_derived"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot", "store_live"],
+        },
+    ),
+    (
         "track-record",
         LaneStatic {
             store_mode: StoreMode::Structural,

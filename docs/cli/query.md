@@ -26,6 +26,8 @@ eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>] [--max-records N
 eg query task     <HANDLE> --graph <PATH>
 eg query task-ready       --graph <PATH>    [--format json|text]
 eg query task-ready       --data-dir <DIR>  [--format json|text]
+eg query task-overlap     --graph <PATH>    [--format json|text] [--status <LIST>]
+eg query task-overlap     --data-dir <DIR>  [--format json|text] [--status <LIST>]
 eg query memory   <HANDLE> --graph <PATH>   [--verified-only] [--max-records N]
 eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>] [--max-records N]
 eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N] [--max-records N]
@@ -730,6 +732,7 @@ Several **single-domain** lanes already emit a top-level `trust` field with a
 | `path`, `transitive-callers` | `reachability_lead` | ” |
 | `coupling` | `historical_co_change_lead` | ” |
 | `task-ready` | `eligibility_lead` | the row is a dispatch-eligibility lead — every declared dependency is `closed_completed` — not a safety or correctness claim |
+| `task-overlap` | `inspection_lead` | the row is a footprint-overlap inspection lead — two in-flight tasks name the same code-graph handle(s) — never proof of edit conflict, correctness, or verification |
 
 Those lanes return rows from **one** domain, so there is nothing to
 disambiguate: their `trust` names the kind of answer the whole lane gives. The

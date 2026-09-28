@@ -91,6 +91,9 @@ mod subsystem;
 mod symbols;
 mod task;
 mod task_ready;
+// Appended (issue #150); kept at the end of the module list to minimize
+// cross-lane merge conflicts.
+mod task_overlap;
 mod transaction_time;
 mod transitive_callees;
 mod transitive_callers;
@@ -212,6 +215,8 @@ pub(crate) use subsystem::*;
 pub(crate) use symbols::*;
 pub(crate) use task::*;
 pub(crate) use task_ready::*;
+// Appended (issue #150).
+pub(crate) use task_overlap::*;
 pub(crate) use transaction_time::*;
 pub(crate) use transitive_callees::*;
 pub(crate) use transitive_callers::*;
@@ -2393,6 +2398,35 @@ pub(crate) enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Flag in-flight tasks whose code footprints overlap (issue #150).
+    ///
+    /// Compares the deterministic code footprint of every in-flight task —
+    /// direct `MENTIONS_SYMBOL`/`TOUCHES_FILE` edges plus the two-hop
+    /// `REFERENCES_TASK` → session → `TOUCHED_FILE`/`MENTIONS_SYMBOL` path —
+    /// and reports each pair sharing at least one live `Symbol`/`File`
+    /// handle. Rows are inspection leads, never proof of edit conflict.
+    /// Exit 0 with an empty `pairs` list and `zero_overlaps: true` when
+    /// nothing overlaps; exit 2 (`no_project_data`) when no `Task` records
+    /// exist; exit 3 (`invalid_status_filter`) on a malformed `--status`
+    /// filter; exit 1 on malformed input.
+    ///
+    /// Documented in `docs/cli/task-overlap.md` and `docs/cli/query.md`.
+    TaskOverlap {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Comma-separated in-flight statuses to compare (default
+        /// `open,in_progress,blocked`). Only in-flight statuses are
+        /// eligible; any other value is rejected with exit 3.
+        #[arg(long)]
+        status: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -8819,6 +8853,15 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_task_ready_cmd(&records, format)
+        }
+        QuerySubcommand::TaskOverlap {
+            graph,
+            data_dir,
+            status,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_task_overlap_cmd(&records, status.as_deref(), format)
         }
         QuerySubcommand::Candidates {
             graph,
