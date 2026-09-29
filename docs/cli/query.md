@@ -22,7 +22,7 @@ eg query semantic-memory <QUERY> --data-dir <DIR> [--collapse] [--collapse-mode 
 eg query similar <HANDLE> --data-dir <DIR>  [--limit N] [--format json|text]
 eg query implementors <TRAIT> --graph <PATH>   [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
 eg query implementors <TRAIT> --data-dir <DIR> [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
-eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>] [--max-records N] [--candidate <RECORD_ID|FILE:SPAN>]
+eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>] [--max-records N] [--candidate <RECORD_ID|FILE:SPAN>] [--max-tokens N | --max-bytes N]
 eg query task     <HANDLE> --graph <PATH>
 eg query task-ready       --graph <PATH>    [--format json|text]
 eg query task-ready       --data-dir <DIR>  [--format json|text]
@@ -1231,8 +1231,104 @@ records never surface. Always present, possibly empty. See
 lane matrix, and the offline approve-then-ask workflow.
 
 ```text
-eg query context <NAME> --graph <PATH> [--repo-path <DIR>] [--max-records N] [--candidate <RECORD_ID|FILE:SPAN>]
+eg query context <NAME> --graph <PATH> [--repo-path <DIR>] [--max-records N] [--candidate <RECORD_ID|FILE:SPAN>] [--max-tokens N | --max-bytes N]
 ```
+
+### Budgeted context packs (issue #131)
+
+Pass `--max-tokens N` or `--max-bytes N` to fit the context bundle into a
+caller-supplied size ceiling instead of printing the full answer. The pack is
+assembled from the same resolved context, trust index, supersession, corpus,
+freshness, and section builders as the un-budgeted answer — only the
+rendering changes.
+
+- `--max-tokens N` counts with the pinned deterministic `word-punct-v1`
+  method (issue #84); `--max-bytes N` counts the rendered JSON's UTF-8
+  bytes. The two are mutually exclusive — pick one ceiling.
+- Both are mutually exclusive with `--max-records`: a pack's sections are
+  bare arrays (see below), so the #211 truncated-section accounting cannot
+  render inside one, and exclusivity avoids a new silent-omission class.
+- The pack prints as **compact** JSON: the budget counts rendered bytes, so
+  the printed text is exactly what was measured — stdout carries no
+  trailing newline, so `budget.measured` in byte mode equals the stdout
+  byte length.
+
+The envelope keeps the un-budgeted answer's shape — `ok`, `symbol_name`,
+`freshness`, the ten sections as bare arrays (an empty `topology_edges`
+section is omitted, exactly as the un-budgeted answer omits it),
+`excluded`, `corpus_mode`/`corpus_mode_source`/`corpus_disclaimer`,
+`store_coverage` — plus a `budget` accounting block:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `budget.mode` | string | `"tokens"` or `"bytes"`. |
+| `budget.budget` | number | The caller-supplied ceiling. |
+| `budget.measured` | number | Measured size of the printed pack in the budget's units. Never exceeds `budget`. |
+| `budget.result_complete` | boolean | `true` when nothing was shed. |
+| `budget.token_count_method` | string | `"word-punct-v1"` in token mode; absent in byte mode. |
+| `budget.drop_account` | object | Present only when `result_complete` is `false`. |
+
+The drop account is explicit, never silent:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `drop_account.dropped_count` | number | How many ROWS the budget shed (not unique IDs — see below). |
+| `drop_account.dropped_record_ids` | string[] | The shed rows' stable IDs, lowest-priority first (worst-first shed order). |
+
+**Drop-account identity.** `dropped_count` counts shed rows. Each entry in
+`dropped_record_ids` is the shed row's stable ID. For unresolved rows the ID
+is the `source_record_id`: this may duplicate the ID of a kept source-fact
+row, because the unresolved entry is a separate row (a dangling reference)
+from the source fact itself. The duplication is honest — the source fact was
+kept, the unresolved reference was shed.
+
+**AC8 projection.** The pack projects rows for citability, not raw payloads.
+The raw `text` field (transcript/command-output/patch body) is stripped from
+observation rows in the pack. The summary, provenance handles, and evidence
+links remain — they are the citable handles. This projection applies to the
+budgeted pack only; the un-budgeted `query context` output is unchanged. A
+complete pack (nothing shed) is therefore identical to the un-budgeted
+answer's sections except for the AC8 `text` redaction.
+
+**Fill priority (deterministic).** Records shed worst-first; a record is
+never split — rows are kept or dropped whole, in their original section
+order. The assembler evaluates every nonempty prefix in priority order and
+keeps the largest one that fits. Pack size is not monotonic in the prefix
+length (shedding a row removes its bytes but adds its ID to the drop
+account), so greedy shedding could miss a fitting pack; exhaustive prefix
+evaluation cannot. Priority is a total order:
+
+1. Trust class, highest first: `source_derived`, `verification_evidence`,
+   `agent_verified`, `project_state`, `artifact`, `runtime_observation`,
+   `agent_unverified`, `agent_contradicted`, `other` (the stable wire
+   strings from the `trust` field). Deterministic code
+   facts always outrank every agent-authored class, so budget pressure can
+   never promote a guess into source truth.
+2. Within one trust class, section relevance: source facts, topology edges,
+   verification evidence, decisions, project state, artifacts, drift
+   history, unresolved references, policy, and agent observations last.
+3. Ties break on record ID, then original row position.
+
+**Complete pack.** When everything fits, `result_complete` is `true`, there
+is no `drop_account`, and every section is identical to the un-budgeted
+answer's — the pack is the same answer plus the `budget` block.
+
+**Too-small budget.** A budget that cannot hold even one whole record —
+measured against the fixed envelope plus the single highest-priority
+record — fails instead of returning a half-record. The command prints a
+stable machine-readable envelope to stdout and exits `3`:
+
+```json
+{"ok":false,"error":{"code":"budget_too_small","symbol_name":"Widget",
+ "budget_mode":"tokens","budget":1,"first_record_cost":183,
+ "message":"budget of 1 tokens cannot hold even one whole record; the smallest possible pack costs 183 tokens"}}
+```
+
+`first_record_cost` is the minimum budget that could succeed. The envelope
+is deterministic: identical inputs produce identical bytes.
+
+Budgeted queries are read-only — the graph file is never modified — and
+deterministic: five runs of the same query produce byte-identical output.
 
 ### Ambiguous names (issue #192)
 
@@ -1272,6 +1368,7 @@ guess.
 | `0` | Context printed (single match, or `--candidate` re-query). |
 | `1` | `ambiguous_symbol` — the name matches more than one distinct symbol; the envelope lists the candidates. |
 | `2` | `no_match` — no symbol carries the name (or the `--candidate` selector resolved to nothing). |
+| `3` | `budget_too_small` — the `--max-tokens`/`--max-bytes` budget cannot hold even one whole record; the envelope carries `first_record_cost`. |
 
 ---
 

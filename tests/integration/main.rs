@@ -24,6 +24,7 @@ mod cli;
 mod clones;
 mod co_change_coupling;
 mod codex;
+mod context_pack;
 mod control_catalog;
 mod corpus_flip_456;
 mod crate_attribution;

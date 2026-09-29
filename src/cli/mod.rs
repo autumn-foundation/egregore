@@ -21,6 +21,7 @@ mod complexity;
 mod config;
 mod conflicts;
 mod context;
+mod context_pack;
 mod cost;
 mod coupling;
 mod cycles;
@@ -2388,6 +2389,29 @@ pub(crate) enum QuerySubcommand {
         /// byte-identical to the un-budgeted one. Omit for the full answer.
         #[arg(long)]
         max_records: Option<usize>,
+        /// Token ceiling for a budgeted context pack (issue #131), counted
+        /// with the pinned `word-punct-v1` method (issue #84).
+        ///
+        /// The pack sheds the lowest-priority records first (unverified agent
+        /// observations before code facts) until the measured pack fits, and
+        /// reports `result_complete` plus an explicit drop account when it
+        /// shed anything. Mutually exclusive with `--max-bytes`: pick one
+        /// ceiling. Also mutually exclusive with `--max-records` — a pack's
+        /// sections are bare arrays (a complete pack's sections are identical
+        /// to the un-budgeted answer's), so the #211 truncated-section
+        /// accounting cannot render inside one; exclusivity avoids a new
+        /// silent-omission class. Omit both for the full answer.
+        #[arg(long, conflicts_with_all = ["max_bytes", "max_records"])]
+        max_tokens: Option<usize>,
+        /// Byte ceiling for a budgeted context pack (issue #131), measured
+        /// over the rendered JSON's UTF-8 bytes.
+        ///
+        /// Same pack semantics as `--max-tokens`: deterministic
+        /// trust-first fill priority, `result_complete`, and an explicit
+        /// drop account. Mutually exclusive with `--max-tokens` and
+        /// `--max-records` (see above). Omit both for the full answer.
+        #[arg(long, conflicts_with_all = ["max_tokens", "max_records"])]
+        max_bytes: Option<usize>,
     },
     /// Return the latest captured benchmark run for a benchmark id, symbol, or file.
     Bench {
@@ -8922,6 +8946,8 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             all_history,
             supersession,
             max_records,
+            max_tokens,
+            max_bytes,
             candidate,
         } => {
             // Sidecar-index fast path (issue #447): the plain context bundle is a
@@ -8988,6 +9014,19 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 max_records,
                 store_coverage,
                 candidate.as_deref(),
+                // Issue #131: clap's `conflicts_with_all` rules out two
+                // ceilings at once; fail closed rather than guess if one ever
+                // slips through.
+                match (max_tokens, max_bytes) {
+                    (Some(n), None) => Some(context_pack::PackBudget::Tokens(n)),
+                    (None, Some(n)) => Some(context_pack::PackBudget::Bytes(n)),
+                    (None, None) => None,
+                    (Some(_), Some(_)) => {
+                        return Err(anyhow::anyhow!(
+                            "--max-tokens and --max-bytes are mutually exclusive"
+                        ));
+                    }
+                },
             )
         }
         QuerySubcommand::Bench {

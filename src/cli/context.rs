@@ -334,6 +334,10 @@ pub(crate) fn query_context_cmd(
     max_records: Option<usize>,
     store_coverage: query::StoreCoverage,
     candidate: Option<&str>,
+    // Size budget (issue #131): `Some` renders a token/byte-bounded pack via
+    // `context_pack::emit_context_pack` instead of the full answer; `None`
+    // preserves the existing un-budgeted behavior exactly.
+    pack_budget: Option<context_pack::PackBudget>,
 ) -> Result<()> {
     // Corpus-mode selection (issue #456): head-anchor by default over a
     // scan-history store; `--all-history` opts into the union. Pre-filter drops
@@ -349,6 +353,19 @@ pub(crate) fn query_context_cmd(
 
     let trust = query::TrustIndex::build(records);
     let sections = build_context_sections(records, &ctx, &trust);
+    // Destructure so the supersession passes below can move the observation
+    // and decision rows out without partially moving `sections`.
+    let ContextSections {
+        source_facts,
+        topology_edges,
+        observations: pre_observations,
+        decisions: pre_decisions,
+        project_state,
+        artifacts,
+        verification_evidence,
+        unresolved,
+        policy,
+    } = sections;
 
     // Attach the freshness verdict only when every source fact belongs to the
     // repository the verdict was computed for (PR #186): `query context` has no
@@ -369,12 +386,12 @@ pub(crate) fn query_context_cmd(
     // (one O(n) build per answer) so `trust` and `temporal_status` can never be
     // computed from different corpora.
     let (observations, mut excluded) =
-        apply_supersession(sections.observations, trust.resolver(), supersession);
+        apply_supersession(pre_observations, trust.resolver(), supersession);
 
     // Decisions get their own supersession pass (issue #191): same
     // temporal-status semantics, surfaced in the decisions section.
     let (decisions, decision_excluded) =
-        apply_supersession(sections.decisions, trust.resolver(), supersession);
+        apply_supersession(pre_decisions, trust.resolver(), supersession);
     excluded.extend(decision_excluded);
 
     let resolved_drift_targets = query::resolve_drift_targets(records, &ctx.drift_history);
@@ -388,6 +405,34 @@ pub(crate) fn query_context_cmd(
 
     let corpus_disclaimer = corpus_mode.disclaimer().to_owned();
 
+    // Budgeted pack (issue #131): the same resolved sections, rendered
+    // under a token/byte ceiling instead of the full answer.
+    if let Some(pack_budget) = pack_budget {
+        let sections = ContextSections {
+            source_facts,
+            topology_edges,
+            observations,
+            decisions,
+            project_state,
+            artifacts,
+            verification_evidence,
+            unresolved,
+            policy,
+        };
+        return context_pack::emit_context_pack(
+            display_name,
+            freshness_code,
+            sections,
+            drift_history,
+            excluded,
+            corpus_mode,
+            corpus_mode_source,
+            corpus_disclaimer,
+            store_coverage,
+            pack_budget,
+        );
+    }
+
     // Record budget (issue #211): sections fill sequentially in envelope
     // order; each keeps its top-ranked prefix and the remainder flows on.
     let mut budget = RecordBudget::new(max_records);
@@ -395,18 +440,18 @@ pub(crate) fn query_context_cmd(
         ok: true,
         symbol_name: display_name,
         freshness: freshness_code,
-        source_facts: budget.section(sections.source_facts),
-        topology_edges: budget.section(sections.topology_edges),
+        source_facts: budget.section(source_facts),
+        topology_edges: budget.section(topology_edges),
         observations: budget.section(observations),
         decisions: budget.section(decisions),
-        project_state: budget.section(sections.project_state),
-        artifacts: budget.section(sections.artifacts),
-        verification_evidence: budget.section(sections.verification_evidence),
+        project_state: budget.section(project_state),
+        artifacts: budget.section(artifacts),
+        verification_evidence: budget.section(verification_evidence),
         drift_history: budget.section(drift_history),
-        unresolved: budget.section(sections.unresolved),
+        unresolved: budget.section(unresolved),
         // Issue #169: policy folds into the single-symbol context answer,
         // budgeted like every other section; always present (possibly empty).
-        policy: budget.section(sections.policy),
+        policy: budget.section(policy),
         excluded,
         corpus_mode: corpus_mode.as_str(),
         corpus_mode_source: corpus_mode_source.as_str(),
