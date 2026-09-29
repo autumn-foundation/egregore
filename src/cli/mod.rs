@@ -21,6 +21,7 @@ mod complexity;
 mod config;
 mod conflicts;
 mod context;
+mod cost;
 mod coupling;
 mod cycles;
 mod daemon;
@@ -153,6 +154,7 @@ pub(crate) use complexity::*;
 pub(crate) use config::*;
 pub(crate) use conflicts::*;
 pub(crate) use context::*;
+pub(crate) use cost::*;
 pub(crate) use coupling::*;
 pub(crate) use cycles::*;
 pub(crate) use daemon::*;
@@ -4599,6 +4601,47 @@ pub(crate) enum QuerySubcommand {
     /// is valid but has no recorded conflicts; exit 2 (`no_match`) when the
     /// scope resolves to nothing; exit 1 on malformed input.
     ///
+    /// Per-run agent cost rollup from imported trajectory `CostUsage` records
+    /// (issue #132).
+    ///
+    /// One row per `AgentRun` whose source trajectory `info` block carried any
+    /// cost, token, or duration field: the values verbatim from the transcript
+    /// (absent values are `null`/unknown, never zero), the `CostUsage` record
+    /// ID, the owning run/session IDs, and the source handle — plus aggregate
+    /// sums over the full filtered set. Cost figures are transcript-derived
+    /// claims, never deterministic code facts; the envelope carries the
+    /// epistemic disclaimer verbatim.
+    ///
+    /// Output is deterministic and byte-stable across repeated runs on an
+    /// unchanged store.
+    ///
+    /// Documented in `docs/cli/query.md`.
+    Cost {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict to runs whose task handle starts with this prefix. The
+        /// handle is the BLAKE3 hash of the trajectory's task text; copy it
+        /// from a previous `eg query cost` row.
+        #[arg(long)]
+        task: Option<String>,
+        /// Restrict to the session with this ID (exact or leading prefix).
+        #[arg(long)]
+        session: Option<String>,
+        /// Restrict by the run's recorded verification outcome.
+        #[arg(long, value_parser = ["verified", "failed"])]
+        verification: Option<String>,
+        /// Maximum rows returned. Totals always cover the full filtered set;
+        /// `totals.rows_truncated` reports truncation.
+        #[arg(long, default_value_t = query::COST_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Documented in `docs/cli/conflicts.md` and `docs/cli/query.md`.
     Conflicts {
         /// Symbol name / record ID, repo-relative file path, or subsystem
@@ -8047,6 +8090,61 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_complexity_cmd(&records, selected.as_deref(), limit, format)
+        }
+        QuerySubcommand::Cost {
+            graph,
+            data_dir,
+            task,
+            session,
+            verification,
+            limit,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic (same
+            // contract as `eg query churn`).
+            if limit == 0 || limit > query::COST_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::COST_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {} (default {})",
+                        query::COST_MAX_LIMIT,
+                        query::COST_DEFAULT_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            let verification = match verification.as_deref() {
+                None => None,
+                Some("verified") => Some(query::CostVerificationOutcome::Verified),
+                Some("failed") => Some(query::CostVerificationOutcome::Failed),
+                // Unreachable: clap's value_parser rejects anything else.
+                Some(other) => {
+                    let diag = serde_json::json!({
+                        "code": "invalid_verification",
+                        "verification": other,
+                        "allowed": ["verified", "failed"],
+                        "message": "--verification must be \"verified\" or \"failed\"",
+                    });
+                    eprintln!("{diag}");
+                    std::process::exit(1);
+                }
+            };
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_cost_cmd(
+                &records,
+                &query::CostFilters {
+                    task,
+                    session,
+                    verification,
+                },
+                limit,
+                format,
+            )
         }
         QuerySubcommand::Conflicts {
             scope,

@@ -4603,7 +4603,12 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::Observation
         | NodeKind::Retraction
         | NodeKind::RetirementReceipt
-        | NodeKind::ReinstatementReceipt => "agent-memory-documented",
+        | NodeKind::ReinstatementReceipt
+        // `CostUsage` (issue #132): promoted from a reserved kind to a
+        // specified record — docs/schema/agent-memory.md §4a
+        // ("`CostUsage` record shape"). The M3 Codex importer also emits
+        // `CostUsage` nodes (per-turn, legacy text shape).
+        | NodeKind::CostUsage => "agent-memory-documented",
         // Project-domain day-one shapes documented in docs/schema/project-graph.md
         NodeKind::Task | NodeKind::AcceptanceCriterion | NodeKind::ExternalLink => {
             "project-domain-documented"
@@ -4653,8 +4658,6 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::WorkflowRule
         | NodeKind::NamingDecision
         | NodeKind::Constraint => "user-context-documented",
-        // M3 Codex importer node kinds (issue #21)
-        NodeKind::CostUsage => "agent-memory-m3-codex-importer",
         // Log-signature node kinds (issues #319 / #320), documented in
         // docs/schema/log-graph.md and docs/cli/scan-logs.md.
         NodeKind::LogSource

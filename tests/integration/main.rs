@@ -187,6 +187,7 @@ mod token_cost;
 mod trait_dispatch;
 mod trait_method_signatures;
 mod traj;
+mod traj_cost;
 mod transaction_time;
 mod transitive_callees;
 mod transitive_callers;

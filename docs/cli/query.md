@@ -57,6 +57,7 @@ eg query cycles   [SCOPE] --graph <PATH>   [--repo <SELECTOR>] [--format json|te
 eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR>]
 eg query locate   <PATH>:<LINE> --graph <PATH> [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
 eg query locate   <PATH>:<LINE> --data-dir <DIR> [--daemon] [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
+eg query cost             --graph <PATH> [--task <HANDLE>] [--session <ID>] [--verification verified|failed] [--limit N] [--format json|text]
 eg query resolve  <RECORD_ID> --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query resolve  <RECORD_ID> --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query resolve  <RECORD_ID> --data-dir <DIR>  --daemon [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
@@ -1675,6 +1676,66 @@ eg query drift --graph <PATH> [--limit N] [--format json|text]
 Ties in `score` are broken by `record_id` ascending. Drift records from
 different repositories are never merged: each row carries its own repository
 identity.
+
+---
+
+## eg query cost
+
+Per-run agent cost rollup from imported trajectory `CostUsage` records
+(issue #132).
+
+```text
+eg query cost --graph <PATH> [--task <HANDLE>] [--session <ID>] [--verification verified|failed] [--limit N] [--format json|text]
+eg query cost --data-dir <DIR> [--task <HANDLE>] [--session <ID>] [--verification verified|failed] [--limit N] [--format json|text]
+```
+
+One row per `AgentRun` whose source trajectory `info` block carried any
+cost, token, or duration field. Values are verbatim from the transcript;
+absent values are `null` (unknown), never zero. Cost figures are
+transcript-derived claims, never deterministic code facts: every row carries
+`derivation: "transcript_derived"` and `trust_class: "other"`, and the
+envelope carries the epistemic disclaimer verbatim.
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--graph <PATH>` | yes (one of) | Graph JSONL, e.g. from a `.traj` import. |
+| `--data-dir <DIR>` | yes (one of) | Embedded `AletheiaDB` data directory. |
+| `--task <HANDLE>` | no | Restrict to runs whose task handle starts with this prefix. The handle is the BLAKE3 hash of the trajectory's task text; copy it from a previous `eg query cost` row. |
+| `--session <ID>` | no | Restrict to the session with this ID (exact or leading prefix). |
+| `--verification verified\|failed` | no | Restrict by the run's recorded verification outcome. |
+| `--limit N` | no | Maximum rows returned (default `100`, max `1000`). Totals always cover the full filtered set; `totals.rows_truncated` reports truncation. |
+| `--format` | no | `json` (default) or `text`. |
+
+### JSON output fields
+
+| Field | Type | Always present | Description |
+|-------|------|----------------|-------------|
+| `ok` | boolean | yes | `true` on success. |
+| `lane` | string | yes | `"cost"`. |
+| `disclaimer` | string | yes | The standing epistemic disclaimer, verbatim. |
+| `rows` | array | yes | Per-run rows, sorted by `record_id` ascending, truncated to `--limit`. |
+| `totals` | object | yes | Aggregate sums over the full filtered set (pre-limit). |
+| `diagnostics` | array | yes | Non-fatal diagnostics, sorted by `record_id`. |
+
+Row fields: `record_id`, `run_id` (resolved via the `AuthoredBy` edge),
+`session_id`, `source_handle` (`path:blake3`), `model_name`,
+`task_handle`, `verification_outcome`, `actual_cost_usd`, `total_cost_usd`,
+`baseline_cost_usd`, `baseline_cost_model`, `prompt_tokens`,
+`cache_read_tokens`, `completion_tokens`, `duration_secs`,
+`derivation` (`"transcript_derived"`), `trust_class` (`"other"`).
+
+`totals` fields: `matching_rows` (filtered rows before `--limit`),
+`rows_truncated`, and sums `actual_cost_usd`, `total_cost_usd`,
+`baseline_cost_usd`, `prompt_tokens`, `cache_read_tokens`,
+`completion_tokens`, `duration_secs`. A sum is `null` when no matching row
+carries that measurement — an empty or all-unknown set never sums to zero.
+
+`CostUsage` records whose `text` is not the canonical transcript-derived
+payload (e.g. the per-turn Codex/Claude-Code shapes from issue #21) are
+excluded from rows and reported as `unrecognized_cost_payload` diagnostics —
+never silently dropped and never misread as run-level cost.
 
 ---
 

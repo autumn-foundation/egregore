@@ -346,6 +346,87 @@ pub struct NodeProvenance {
     pub redaction_policy_version: Option<String>,
 }
 
+/// Derivation label stamped on every [`CostUsagePayload`].
+///
+/// The values were read verbatim from a trajectory transcript's `info` block,
+/// never computed by the importer. Cost figures are transcript-derived claims,
+/// not deterministic code facts.
+pub const COST_USAGE_DERIVATION_TRANSCRIPT: &str = "transcript_derived";
+
+/// Canonical JSON payload carried on a `CostUsage` node's `text` field by the
+/// `.traj` importer (issue #132).
+///
+/// Documented in `docs/schema/agent-memory.md` §4a ("`CostUsage` record
+/// shape"). Every `Option` field serializes as JSON `null` when the source
+/// trajectory's `info` block does not carry that field — `null` is the
+/// explicit unknown marker: a missing cost or token count is never
+/// fabricated, defaulted to zero, or inferred. A present zero (e.g.
+/// `cache_read_tokens: 0`) is real data and serializes as `0`.
+///
+/// The Codex and Claude-Code importers (issue #21) emit `CostUsage` nodes with
+/// a different, per-turn `text` shape; those legacy payloads do not parse as
+/// this struct and are excluded from the `eg query cost` rollup with a
+/// diagnostic rather than being silently dropped or misread.
+#[derive(schemars::JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CostUsagePayload {
+    /// Derivation label: always [`COST_USAGE_DERIVATION_TRANSCRIPT`].
+    pub derivation: String,
+    /// Provider model name from the trajectory `info` block.
+    #[serde(default)]
+    pub model_name: Option<String>,
+    /// Billed cost in USD as reported by the trajectory source.
+    #[serde(default)]
+    pub actual_cost_usd: Option<f64>,
+    /// Total cost in USD as reported by the trajectory source.
+    #[serde(default)]
+    pub total_cost_usd: Option<f64>,
+    /// Reference/baseline cost in USD as reported by the trajectory source.
+    #[serde(default)]
+    pub baseline_cost_usd: Option<f64>,
+    /// Model the baseline cost was computed against.
+    #[serde(default)]
+    pub baseline_cost_model: Option<String>,
+    /// Prompt (input) token count.
+    #[serde(default)]
+    pub prompt_tokens: Option<u64>,
+    /// Cache-read token count.
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
+    /// Completion (output) token count.
+    #[serde(default)]
+    pub completion_tokens: Option<u64>,
+    /// Wall-clock run duration in seconds.
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
+    /// BLAKE3 hex of the raw `info.task` text: the run's task handle. `None`
+    /// when the source carries no task text. The raw text is never inlined
+    /// into the graph (see `raw_traj_body_is_not_inlined`).
+    #[serde(default)]
+    pub task_handle: Option<String>,
+    /// Run verification outcome from the trajectory `info` block
+    /// (`"verified"` / `"failed"` / …), verbatim.
+    #[serde(default)]
+    pub verification_outcome: Option<String>,
+}
+
+impl CostUsagePayload {
+    /// Returns `true` when the payload carries at least one cost, token, or
+    /// duration measurement (the emission condition for issue #132: a
+    /// trajectory with no cost/token/duration data at all produces no
+    /// `CostUsage` record).
+    #[must_use]
+    pub const fn has_any_measurement(&self) -> bool {
+        self.actual_cost_usd.is_some()
+            || self.total_cost_usd.is_some()
+            || self.baseline_cost_usd.is_some()
+            || self.baseline_cost_model.is_some()
+            || self.prompt_tokens.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.completion_tokens.is_some()
+            || self.duration_secs.is_some()
+    }
+}
+
 /// How a `Repository` node's stable ID was determined.
 ///
 /// Documented in `docs/schema/repository-identity.md`.

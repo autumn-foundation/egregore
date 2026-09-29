@@ -30,8 +30,8 @@ use serde::Deserialize;
 use crate::{
     error::Result,
     ir::{
-        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, Graph, GraphRecord, NodeKind, OutputHandle,
-        agent_memory_stable_id,
+        AGENT_MEMORY_SCHEMA_VERSION, COST_USAGE_DERIVATION_TRANSCRIPT, CostUsagePayload, EdgeLabel,
+        Graph, GraphRecord, NodeKind, OutputHandle, agent_memory_stable_id,
     },
 };
 
@@ -120,19 +120,48 @@ struct TrajInfo {
     outcome: Option<String>,
     #[serde(default)]
     started_at: Option<String>,
-    // Fields present in trajectories but not used by the importer yet.
-    #[allow(dead_code)]
+    // Task text: hashed into the CostUsage `task_handle`; never inlined raw.
     #[serde(default)]
     task: Option<String>,
+    // Run verification outcome (e.g. "verified" / "failed"): carried verbatim
+    // on the CostUsage record for `eg query cost --verification` filtering.
+    #[serde(default)]
+    verification_status: Option<String>,
+    // Cost/token/duration fields (issue #132): presence-gated emission of one
+    // CostUsage record per AgentRun. All optional — absent means unknown.
+    #[serde(default)]
+    actual_cost_usd: Option<f64>,
+    #[serde(default)]
+    total_cost_usd: Option<f64>,
+    #[serde(default)]
+    baseline_cost_usd: Option<f64>,
+    #[serde(default)]
+    baseline_cost_model: Option<String>,
+    #[serde(default)]
+    token_usage: Option<TrajTokenUsage>,
+    #[serde(default)]
+    duration_secs: Option<f64>,
+    // Fields present in trajectories but not used by the importer yet.
     #[allow(dead_code)]
     #[serde(default)]
     ended_at: Option<String>,
     #[allow(dead_code)]
     #[serde(default)]
-    verification_status: Option<String>,
-    #[allow(dead_code)]
-    #[serde(default)]
     steps: Option<u64>,
+}
+
+/// Token usage block inside a trajectory `info` section (issue #132).
+///
+/// Field names mirror the trajectory JSON keys verbatim.
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Deserialize)]
+struct TrajTokenUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +274,12 @@ pub fn import_traj(path: &Path, opts: &ImportOptions) -> Result<Graph> {
         NodeExtra::default(),
     ));
 
+    // ── CostUsage (issue #132) ──────────────────────────────────────────────
+    // Exactly one record per AgentRun, and only when the source `info` block
+    // carries any cost, token, or duration field. Built before `traj.info`
+    // is partially moved below.
+    let cost_payload = build_cost_usage_payload(&traj.info, opts);
+
     // ── AgentRun ──────────────────────────────────────────────────────────────
     let outcome = traj.info.outcome.as_deref().unwrap_or("unknown");
     let exit_reason = traj.info.exit_reason.as_deref().unwrap_or("unknown");
@@ -268,6 +303,10 @@ pub fn import_traj(path: &Path, opts: &ImportOptions) -> Result<Graph> {
         "AgentRun belongs to AgentSession",
         &ctx,
     ));
+
+    if let Some(payload) = cost_payload {
+        emit_cost_usage(&mut graph, &run_id, &payload, &ctx)?;
+    }
 
     // ── Diagnostic for unrecognized trajectory format ─────────────────────────
     emit_format_diagnostic(&mut graph, &run_id, &ctx);
@@ -383,6 +422,96 @@ fn emit_unknown_key_diagnostics(
             ));
         }
     }
+}
+
+// ── CostUsage emission (issue #132) ──────────────────────────────────────────
+
+/// Build the canonical [`CostUsagePayload`] from a trajectory `info` block.
+///
+/// Returns `None` when the source carries no cost, token, or duration field
+/// at all — no empty/placeholder `CostUsage` record is created. Absent fields
+/// stay `None` (serialized as JSON `null`, the explicit unknown marker): a
+/// missing cost or token count is never fabricated, defaulted to zero, or
+/// inferred. Present zeros are real data and are preserved.
+///
+/// Free-text fields pass through the redaction closure like other
+/// transcript-derived records. The raw task text is never inlined into the
+/// graph — only its BLAKE3 hash is stored as the task handle.
+fn build_cost_usage_payload(info: &TrajInfo, opts: &ImportOptions) -> Option<CostUsagePayload> {
+    let tokens = info.token_usage.as_ref();
+    let payload = CostUsagePayload {
+        derivation: COST_USAGE_DERIVATION_TRANSCRIPT.to_owned(),
+        model_name: info.model_name.as_deref().map(|m| redact(m, opts)),
+        actual_cost_usd: info.actual_cost_usd,
+        total_cost_usd: info.total_cost_usd,
+        baseline_cost_usd: info.baseline_cost_usd,
+        baseline_cost_model: info.baseline_cost_model.as_deref().map(|m| redact(m, opts)),
+        prompt_tokens: tokens.and_then(|t| t.prompt_tokens),
+        cache_read_tokens: tokens.and_then(|t| t.cache_read_tokens),
+        completion_tokens: tokens.and_then(|t| t.completion_tokens),
+        duration_secs: info.duration_secs,
+        task_handle: info.task.as_deref().map(|t| blake3_hex(t.as_bytes())),
+        verification_outcome: info.verification_status.as_deref().map(|s| redact(s, opts)),
+    };
+    payload.has_any_measurement().then_some(payload)
+}
+
+/// Render an optional cost/duration value for the human-readable summary:
+/// present values verbatim, absent values as the explicit `unknown` marker.
+fn fmt_cost_value(value: Option<f64>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |v| v.to_string())
+}
+
+/// Render an optional token count for the human-readable summary.
+fn fmt_token_value(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |v| v.to_string())
+}
+
+/// Emit the per-run [`NodeKind::CostUsage`] record and its `AuthoredBy` edge
+/// to the owning `AgentRun` (which in turn reaches the `AgentSession` via the
+/// existing `SessionOf` edge, and the touched code via the run's
+/// `TouchedFile` / `MentionsSymbol` edges).
+/// Returns an error instead of writing a placeholder when the payload cannot
+/// be serialized: a `CostUsage` node with an empty `text` would silently
+/// corrupt the query lane.
+fn emit_cost_usage(
+    graph: &mut Graph,
+    run_id: &str,
+    payload: &CostUsagePayload,
+    ctx: &ImportCtx,
+) -> Result<()> {
+    let cost_id = agent_memory_stable_id(&["node", "cost_usage", run_id]);
+    let summary = format!(
+        "CostUsage actual={} total={} baseline={} tokens={}/{}/{} duration={}s model={}",
+        fmt_cost_value(payload.actual_cost_usd),
+        fmt_cost_value(payload.total_cost_usd),
+        fmt_cost_value(payload.baseline_cost_usd),
+        fmt_token_value(payload.prompt_tokens),
+        fmt_token_value(payload.cache_read_tokens),
+        fmt_token_value(payload.completion_tokens),
+        fmt_cost_value(payload.duration_secs),
+        payload.model_name.as_deref().unwrap_or("unknown"),
+    );
+    let text = serde_json::to_string(payload)?;
+    graph.push(make_node(
+        cost_id.clone(),
+        NodeKind::CostUsage,
+        summary,
+        ctx,
+        NodeExtra {
+            text: Some(text),
+            agent_kind: Some("rust-swe-agent".to_owned()),
+            ..Default::default()
+        },
+    ));
+    graph.push(make_edge(
+        EdgeLabel::AuthoredBy,
+        cost_id,
+        run_id.to_owned(),
+        "CostUsage belongs to AgentRun",
+        ctx,
+    ));
+    Ok(())
 }
 
 // ── Turn emission ─────────────────────────────────────────────────────────────

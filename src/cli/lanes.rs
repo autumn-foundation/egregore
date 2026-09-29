@@ -250,6 +250,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "cost",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["other"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot"],
+        },
+    ),
+    (
         "coupling",
         LaneStatic {
             store_mode: StoreMode::Structural,
