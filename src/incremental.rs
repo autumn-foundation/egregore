@@ -18,7 +18,7 @@ use crate::{
     languages::cross_file::{
         FileFacts, apply_out_of_line_cfg_gates, apply_out_of_line_test_roles,
         apply_out_of_line_test_scope, cross_file_call_records, cross_file_implements_records,
-        label_same_file_call_resolutions,
+        cross_file_macro_records, label_same_file_call_resolutions,
     },
     repository_record_from_identity, scan_source_file_records,
     schema_version::validate_record_version,
@@ -144,10 +144,17 @@ use crate::{
 /// prefix (and adds the `HistoryReplayWindow` node kind), so a cache holding
 /// v9 IDs would replay records whose endpoints no longer match freshly-minted
 /// v10 ones.
+/// 29 -> 30: #148 macro-definition symbols and repo-wide macro-invocation
+/// resolution. Per-file extraction no longer emits `unsupported macro
+/// invocation` Diagnostics eagerly: it now emits `macro` Symbol records plus
+/// the `FileFacts.macro_definitions`/`macro_invocations` vectors, and the new
+/// repo-wide pass re-derives resolved `CALLS` edges and diagnostics from
+/// those facts. Older caches would replay the pre-#148 diagnostic record set
+/// and miss the macro symbols and their edges, so they must rebuild.
 /// Independent of this version, the cache records the writing binary's
 /// producer signature (issue #234): a signature mismatch invalidates reuse
 /// without a schema bump, and caches missing the signature always rebuild.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 29;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 30;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -495,6 +502,12 @@ fn scan_repository_incremental_at_inner(
         &repository_id,
         &facts_by_file,
     ));
+    // Repo-wide macro-invocation resolution (issue #148): recomputed from
+    // the same `facts_by_file` as the CALLS pass, so a macro added, removed,
+    // or renamed re-derives its CALLS edges and diagnostics here. Folded
+    // into the same stream and ID set so stale records are tombstoned on
+    // removal exactly like cross-file CALLS edges.
+    cross_file_records.extend(cross_file_macro_records(&repository_id, &facts_by_file));
     // Inbound IMPORTS edges to imported Module/File targets (issue #444):
     // recomputed from the same assembled graph as the CALLS pass, so an
     // import added, removed, or retargeted re-derives its edge here. Folded

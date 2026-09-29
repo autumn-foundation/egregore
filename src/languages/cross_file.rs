@@ -109,6 +109,53 @@ pub struct BlockLocalDefinitionFact {
     pub repo_relative_path: String,
 }
 
+/// A `macro_rules!` definition exported by the Rust extractor for repo-wide
+/// macro-invocation resolution (issue #148).
+///
+/// The macro's body is NEVER carried: the trust boundary is parsed source
+/// only, and macro bodies are not expanded.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MacroDefinitionFact {
+    /// Stable record ID of the macro Symbol node.
+    pub id: String,
+    /// Unqualified macro name, as written after `macro_rules!`.
+    pub simple_name: String,
+    /// Module-qualified display name (e.g. `helpers::greet`).
+    pub qualified_name: String,
+    /// Repo-relative path of the defining file.
+    pub repo_relative_path: String,
+}
+
+/// A `macro_invocation` site whose resolution is deferred to the repo-wide
+/// macro pass (issue #148).
+///
+/// Per-file extraction records the site but emits nothing for it: the
+/// repo-wide [`cross_file_macro_records`] pass mints either a resolved
+/// `CALLS` edge to the unique repo-defined macro or the pre-existing
+/// `unsupported macro invocation` Diagnostic.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MacroInvocationFact {
+    /// Stable record ID of the invoking scope: the lexically-enclosing
+    /// function symbol when the site sits inside one, else the enclosing
+    /// module or the file itself.
+    pub caller_id: String,
+    /// Display name of the invoking scope.
+    pub caller_name: String,
+    /// Invocation as written, e.g. `println!` or `crate::helpers::greet!`.
+    pub invocation_display: String,
+    /// Simple macro name: the last `::` segment with the trailing `!`
+    /// stripped.
+    pub simple_name: String,
+    /// Span of the invocation site.
+    pub span: SourceSpan,
+    /// Walk-order ordinal per invocation display, so a site that stays
+    /// unresolved mints the same Diagnostic ID the pre-#148 per-file
+    /// extractor minted (external-macro diagnostics stay byte-identical).
+    pub diagnostic_disambiguator: u64,
+    /// Repo-relative path of the invoking file.
+    pub repo_relative_path: String,
+}
+
 /// How a call site names its callee.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -474,6 +521,14 @@ pub struct FileFacts {
     /// self-dispatch call-resolution join (issue #414).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub impl_trait_relations: Vec<ImplTraitRelationFact>,
+    /// `macro_rules!` definitions in the file (issue #148), for the
+    /// repo-wide macro-invocation resolution pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macro_definitions: Vec<MacroDefinitionFact>,
+    /// `macro_invocation` sites in the file (issue #148), deferred to the
+    /// repo-wide macro-invocation resolution pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macro_invocations: Vec<MacroInvocationFact>,
     /// Normalized `#[cfg(...)]` / `#[cfg_attr(...)]` predicates from `#![…]`
     /// inner attributes at the file top level (issue #190). Not a cross-file
     /// resolution fact — it rides `FileFacts` as the single channel from the
@@ -500,6 +555,8 @@ impl FileFacts {
             && self.pending_impls.is_empty()
             && self.use_trait_imports.is_empty()
             && self.impl_trait_relations.is_empty()
+            && self.macro_definitions.is_empty()
+            && self.macro_invocations.is_empty()
     }
 }
 
@@ -2031,6 +2088,114 @@ pub fn cross_file_call_records(
     );
     records.extend(cross_file_construct_records(repository_id, facts_by_file));
     records.extend(cross_file_route_records(repository_id, facts_by_file));
+    records
+}
+
+/// Repo-wide macro-invocation resolution (issue #148).
+///
+/// Every `macro_invocation` site the Rust extractor recorded resolves against
+/// the repo-wide pool of `macro_rules!` definitions, matched on the
+/// invocation's simple name:
+///
+/// - exactly one repo-defined macro → a `CALLS` edge from the invoking scope
+///   to the macro's Symbol node, stamped `resolved`, carrying the invocation
+///   spans — INSTEAD OF an `unsupported macro invocation` Diagnostic;
+/// - zero definitions (external macros such as `println!`, dependency
+///   macros) → the pre-existing Diagnostic, with the same stable ID scheme
+///   the per-file extractor used, so external-macro diagnostics stay
+///   byte-identical;
+/// - two or more definitions → the name is ambiguous and must never silently
+///   bind one definition (the issue #134 direction); the site keeps its
+///   Diagnostic.
+///
+/// Purely syntactic and filesystem-local: simple-name matching over parsed
+/// source only — no macro-body expansion, no network, no embeddings, no
+/// agent-authored observations (the trust-separation boundary).
+///
+/// Deterministic: definitions index in sorted path order, invocation sites
+/// iterate in (path, source) order, and repeated invocations between one
+/// (caller, macro) pair collapse to a single edge.
+#[must_use]
+pub fn cross_file_macro_records(
+    repository_id: &str,
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> Vec<GraphRecord> {
+    let mut index: BTreeMap<&str, Vec<&MacroDefinitionFact>> = BTreeMap::new();
+    for facts in facts_by_file.values() {
+        for definition in &facts.macro_definitions {
+            index
+                .entry(definition.simple_name.as_str())
+                .or_default()
+                .push(definition);
+        }
+    }
+    // (caller, macro) -> (caller name, simple name, invocation spans):
+    // repeated invocations between one pair collapse to a single edge, with
+    // every site's span retained (the issue #462 fabrication-guard rule:
+    // only provably single-target pairs keep spans).
+    let mut edges: BTreeMap<(String, String), (String, String, Vec<SourceSpan>)> = BTreeMap::new();
+    let mut diagnostics: Vec<GraphRecord> = Vec::new();
+    for (path, facts) in facts_by_file {
+        for invocation in &facts.macro_invocations {
+            let candidates: &[&MacroDefinitionFact] = index
+                .get(invocation.simple_name.as_str())
+                .map_or(&[], Vec::as_slice);
+            if candidates.len() == 1 {
+                let definition = candidates[0];
+                let entry = edges
+                    .entry((invocation.caller_id.clone(), definition.id.clone()))
+                    .or_insert_with(|| {
+                        (
+                            invocation.caller_name.clone(),
+                            invocation.simple_name.clone(),
+                            Vec::new(),
+                        )
+                    });
+                if !entry.2.contains(&invocation.span) {
+                    entry.2.push(invocation.span);
+                }
+                continue;
+            }
+            // Unresolvable here: either no repo-defined macro carries this
+            // name (external / dependency macro) or several do (ambiguous).
+            // Keep the pre-existing Diagnostic with its legacy stable ID.
+            let id = stable_id(&[
+                "node",
+                "diagnostic",
+                repository_id,
+                path,
+                &invocation.invocation_display,
+                &invocation.diagnostic_disambiguator.to_string(),
+            ]);
+            diagnostics.push(GraphRecord::syntax_node(
+                id,
+                NodeKind::Diagnostic,
+                path.clone(),
+                invocation.span,
+                invocation.invocation_display.clone(),
+                "rust",
+                format!(
+                    "unsupported macro invocation {}",
+                    invocation.invocation_display
+                ),
+            ));
+        }
+    }
+    let mut records: Vec<GraphRecord> = Vec::with_capacity(edges.len() + diagnostics.len());
+    for ((source, target), (caller_name, simple_name, spans)) in edges {
+        records.push(
+            GraphRecord::edge(
+                EdgeLabel::Calls,
+                source,
+                target,
+                Some("1.0".to_owned()),
+                format!("{caller_name} invokes macro {simple_name} (resolved)"),
+            )
+            .with_resolution(CallResolution::Resolved)
+            .with_call_site_spans(spans),
+        );
+    }
+    records.extend(diagnostics);
     records
 }
 
@@ -7129,5 +7294,244 @@ mod tests {
             records, once,
             "a second pass run must not change already-stamped records"
         );
+    }
+
+    // ── Issue #148: macro invocation resolution ──────────────────────────
+
+    fn macro_definition_fact(id: &str, name: &str, path: &str) -> MacroDefinitionFact {
+        MacroDefinitionFact {
+            id: id.to_owned(),
+            simple_name: name.to_owned(),
+            qualified_name: name.to_owned(),
+            repo_relative_path: path.to_owned(),
+        }
+    }
+
+    fn macro_invocation_fact(
+        caller_id: &str,
+        display: &str,
+        simple_name: &str,
+        path: &str,
+        disambiguator: u64,
+    ) -> MacroInvocationFact {
+        MacroInvocationFact {
+            caller_id: caller_id.to_owned(),
+            caller_name: caller_id.to_owned(),
+            invocation_display: display.to_owned(),
+            simple_name: simple_name.to_owned(),
+            span: span(),
+            diagnostic_disambiguator: disambiguator,
+            repo_relative_path: path.to_owned(),
+        }
+    }
+
+    fn macro_facts(
+        path: &str,
+        definitions: Vec<MacroDefinitionFact>,
+        invocations: Vec<MacroInvocationFact>,
+    ) -> (String, FileFacts) {
+        (
+            path.to_owned(),
+            FileFacts {
+                macro_definitions: definitions,
+                macro_invocations: invocations,
+                ..FileFacts::default()
+            },
+        )
+    }
+
+    fn calls_edges(records: &[GraphRecord]) -> Vec<&GraphRecord> {
+        records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Edge {
+                        label: EdgeLabel::Calls,
+                        ..
+                    }
+                )
+            })
+            .collect()
+    }
+
+    fn diagnostic_nodes(records: &[GraphRecord]) -> Vec<&GraphRecord> {
+        records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Node {
+                        kind: NodeKind::Diagnostic,
+                        ..
+                    }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn macro_unique_resolution_emits_resolved_calls_edge() {
+        let facts: BTreeMap<String, FileFacts> = [
+            macro_facts(
+                "src/lib.rs",
+                vec![macro_definition_fact("macro-id", "greet", "src/lib.rs")],
+                vec![macro_invocation_fact(
+                    "caller-id",
+                    "greet!",
+                    "greet",
+                    "src/lib.rs",
+                    0,
+                )],
+            ),
+            macro_facts(
+                "src/main.rs",
+                vec![],
+                vec![macro_invocation_fact(
+                    "other-caller",
+                    "greet!",
+                    "greet",
+                    "src/main.rs",
+                    0,
+                )],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let records = cross_file_macro_records("repo-id", &facts);
+        let edges = calls_edges(&records);
+        assert_eq!(edges.len(), 2, "one CALLS edge per invoking scope");
+        for edge in &edges {
+            let GraphRecord::Edge {
+                source,
+                target,
+                resolution,
+                ..
+            } = edge
+            else {
+                panic!("expected an edge record");
+            };
+            assert_eq!(target, "macro-id");
+            assert!(
+                source == "caller-id" || source == "other-caller",
+                "unexpected edge source {source}"
+            );
+            assert_eq!(
+                *resolution,
+                Some(CallResolution::Resolved),
+                "a unique repo-defined macro resolves"
+            );
+        }
+        assert!(
+            diagnostic_nodes(&records).is_empty(),
+            "a resolved invocation must not mint a diagnostic"
+        );
+    }
+
+    #[test]
+    fn macro_external_invocation_keeps_legacy_diagnostic() {
+        let facts: BTreeMap<String, FileFacts> = BTreeMap::from([macro_facts(
+            "src/main.rs",
+            vec![],
+            vec![macro_invocation_fact(
+                "caller-id",
+                "println!",
+                "println",
+                "src/main.rs",
+                0,
+            )],
+        )]);
+        let records = cross_file_macro_records("repo-id", &facts);
+        assert!(
+            calls_edges(&records).is_empty(),
+            "no edge may bind an external macro name"
+        );
+        let diagnostics = diagnostic_nodes(&records);
+        assert_eq!(diagnostics.len(), 1);
+        let GraphRecord::Node {
+            id, name, summary, ..
+        } = diagnostics[0]
+        else {
+            panic!("expected a diagnostic node");
+        };
+        // The pass preserves the pre-#148 per-file diagnostic ID scheme, so
+        // external-macro diagnostics stay byte-identical.
+        let expected = stable_id(&[
+            "node",
+            "diagnostic",
+            "repo-id",
+            "src/main.rs",
+            "println!",
+            "0",
+        ]);
+        assert_eq!(id, &expected, "diagnostic ID scheme must not change");
+        assert_eq!(name.as_deref(), Some("println!"));
+        assert_eq!(summary.as_str(), "unsupported macro invocation println!");
+    }
+
+    #[test]
+    fn macro_ambiguous_name_keeps_diagnostic_and_no_edge() {
+        let facts: BTreeMap<String, FileFacts> = [
+            macro_facts(
+                "src/a.rs",
+                vec![macro_definition_fact("macro-a", "greet", "src/a.rs")],
+                vec![],
+            ),
+            macro_facts(
+                "src/b.rs",
+                vec![macro_definition_fact("macro-b", "greet", "src/b.rs")],
+                vec![macro_invocation_fact(
+                    "caller-id",
+                    "greet!",
+                    "greet",
+                    "src/b.rs",
+                    0,
+                )],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let records = cross_file_macro_records("repo-id", &facts);
+        assert!(
+            calls_edges(&records).is_empty(),
+            "an ambiguous macro name must never silently bind one definition"
+        );
+        assert_eq!(
+            diagnostic_nodes(&records).len(),
+            1,
+            "an ambiguous invocation stays a diagnostic"
+        );
+    }
+
+    #[test]
+    fn macro_resolution_is_deterministic_across_runs() {
+        let facts: BTreeMap<String, FileFacts> = [
+            macro_facts(
+                "src/lib.rs",
+                vec![macro_definition_fact("macro-id", "greet", "src/lib.rs")],
+                vec![
+                    macro_invocation_fact("caller-id", "greet!", "greet", "src/lib.rs", 0),
+                    macro_invocation_fact("caller-id", "println!", "println", "src/lib.rs", 0),
+                ],
+            ),
+            macro_facts(
+                "src/main.rs",
+                vec![],
+                vec![macro_invocation_fact(
+                    "other-caller",
+                    "greet!",
+                    "greet",
+                    "src/main.rs",
+                    0,
+                )],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let first = cross_file_macro_records("repo-id", &facts);
+        for _ in 0..5 {
+            let again = cross_file_macro_records("repo-id", &facts);
+            assert_eq!(first, again, "the macro pass must be deterministic");
+        }
     }
 }

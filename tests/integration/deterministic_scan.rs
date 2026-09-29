@@ -25,6 +25,87 @@ fn impl_collision_fixture_repo() -> PathBuf {
 }
 
 #[test]
+fn five_unchanged_macro_scans_are_byte_identical() {
+    // Issue #148: the repo-wide macro-resolution pass must not introduce
+    // nondeterminism — five consecutive scans of the unchanged fixture
+    // (which defines and invokes `local_macro`) produce identical bytes.
+    let fixed_time = "2026-05-19T00:00:00Z";
+    let repo_id = Some("macro-scan-stability");
+    let first = scan_repository_at_with_override(fixture_repo(), fixed_time, repo_id)
+        .expect("fixture repo should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    for run in 2..=5 {
+        let next = scan_repository_at_with_override(fixture_repo(), fixed_time, repo_id)
+            .expect("fixture repo should rescan")
+            .to_jsonl()
+            .expect("graph should serialize");
+        assert_eq!(first, next, "scan run {run} should be byte-identical");
+    }
+    assert!(
+        first.contains(r#""symbol_kind":"macro""#),
+        "fixture scans should carry the macro symbol"
+    );
+}
+
+#[test]
+fn macro_resolution_survives_crlf_line_endings() {
+    // Issue #148: CRLF checkouts normalize to LF before extraction, so a
+    // macro defined and invoked in a CRLF file still resolves with the
+    // correct call-site spans.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    fs::create_dir_all(repo.join("src")).expect("src dir should be created");
+    let crlf_source = "macro_rules! shout {\r\n    () => {};\r\n}\r\n\r\npub fn loud() {\r\n    shout!();\r\n}\r\n";
+    fs::write(repo.join("src/lib.rs"), crlf_source).expect("crlf source should be written");
+
+    let jsonl = scan_repository(repo)
+        .expect("crlf repo should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let records = parse_jsonl(&jsonl);
+
+    let macro_id = records
+        .iter()
+        .find(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Symbol"
+                && record["symbol_kind"] == "macro"
+                && record["name"] == "shout"
+        })
+        .and_then(|record| record["id"].as_str())
+        .expect("crlf macro symbol should exist");
+    let caller_id = records
+        .iter()
+        .find(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Symbol"
+                && record["symbol_kind"] == "function"
+                && record["name"] == "loud"
+        })
+        .and_then(|record| record["id"].as_str())
+        .expect("caller symbol should exist");
+    let edge = records
+        .iter()
+        .find(|record| {
+            record["record_type"] == "edge"
+                && record["label"] == "CALLS"
+                && record["source"] == caller_id
+                && record["target"] == macro_id
+        })
+        .expect("crlf macro CALLS edge should exist");
+    assert_eq!(edge["resolution"], "resolved");
+    let spans = edge["call_site_spans"]
+        .as_array()
+        .expect("edge should carry call-site spans");
+    assert_eq!(spans.len(), 1, "one invocation site should yield one span");
+    assert!(
+        spans[0]["start_line"].as_u64().unwrap_or(0) > 0,
+        "call-site span should be populated, not synthesized"
+    );
+}
+
+#[test]
 fn deterministic_scan_produces_stable_jsonl() {
     let repo = fixture_repo();
     // Fix the transaction time so that valid_time in output is identical across both calls.
@@ -101,6 +182,13 @@ fn symbol_ids_survive_non_semantic_byte_shift() {
         diagnostic_ids(&base_records),
         diagnostic_ids(&shifted_records),
         "macro diagnostic IDs should also survive byte shifts"
+    );
+    // Issue #148: the `local_macro` fixture macro resolves repo-wide, so
+    // the two trees mint the same resolved CALLS edge ID across the shift.
+    assert_eq!(
+        resolved_macro_calls_edge_ids(&base_records),
+        resolved_macro_calls_edge_ids(&shifted_records),
+        "resolved macro CALLS edge IDs should also survive byte shifts"
     );
 }
 
@@ -201,7 +289,14 @@ fn rust_fixture_covers_common_symbols() {
     assert_symbol(&records, "type_alias", "nested::Alias");
     assert_symbol(&records, "test", "nested::widget_runs");
 
-    assert_diagnostic(&records, "macro invocation local_macro!");
+    assert_symbol(&records, "macro", "local_macro");
+
+    // Issue #148: a macro defined and used in the repo resolves instead of
+    // diagnosing. The `local_macro!()` site inside `answer()` mints a
+    // resolved `CALLS` edge with call-site spans, and the
+    // `unsupported macro invocation` Diagnostic for it disappears.
+    assert_no_diagnostic(&records, "macro invocation local_macro!");
+    assert_resolved_macro_calls_edge(&records, "answer", "local_macro");
 
     assert_edge_label(&records, "CONTAINS");
     assert_edge_label(&records, "DEFINES");
@@ -502,16 +597,105 @@ fn has_symbol_in_path(records: &[Value], symbol_kind: &str, name: &str, path: &s
     })
 }
 
-fn assert_diagnostic(records: &[Value], summary_fragment: &str) {
+fn assert_no_diagnostic(records: &[Value], summary_fragment: &str) {
     let found = records.iter().any(|record| {
         record["record_type"] == "node"
             && record["kind"] == "Diagnostic"
-            && record["repo_relative_path"] == "src/lib.rs"
             && record["summary"]
                 .as_str()
                 .is_some_and(|summary| summary.contains(summary_fragment))
     });
-    assert!(found, "missing diagnostic containing {summary_fragment}");
+    assert!(
+        !found,
+        "unexpected diagnostic containing {summary_fragment}"
+    );
+}
+
+/// The set of resolved `CALLS` edge IDs whose target is a `macro` Symbol
+/// (issue #148).
+fn resolved_macro_calls_edge_ids(records: &[Value]) -> BTreeSet<String> {
+    let macro_ids = records
+        .iter()
+        .filter(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Symbol"
+                && record["symbol_kind"] == "macro"
+        })
+        .map(|record| {
+            record["id"]
+                .as_str()
+                .expect("macro symbol should have an ID")
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    records
+        .iter()
+        .filter(|record| {
+            record["record_type"] == "edge"
+                && record["label"] == "CALLS"
+                && record["resolution"] == "resolved"
+                && record["target"]
+                    .as_str()
+                    .is_some_and(|target| macro_ids.contains(target))
+        })
+        .map(|record| {
+            record["id"]
+                .as_str()
+                .expect("edge should have an ID")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// A resolved `CALLS` edge from the `function` Symbol named `caller_name` to
+/// the `macro` Symbol named `macro_name`, carrying the invocation's
+/// call-site spans (issue #148).
+fn assert_resolved_macro_calls_edge(records: &[Value], caller_name: &str, macro_name: &str) {
+    let macro_id = records
+        .iter()
+        .find(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Symbol"
+                && record["symbol_kind"] == "macro"
+                && record["name"] == macro_name
+        })
+        .and_then(|record| record["id"].as_str())
+        .expect("macro symbol should exist");
+    let caller_id = records
+        .iter()
+        .find(|record| {
+            record["record_type"] == "node"
+                && record["kind"] == "Symbol"
+                && record["symbol_kind"] == "function"
+                && record["name"] == caller_name
+        })
+        .and_then(|record| record["id"].as_str())
+        .expect("caller symbol should exist");
+    let edge = records
+        .iter()
+        .find(|record| {
+            record["record_type"] == "edge"
+                && record["label"] == "CALLS"
+                && record["source"] == caller_id
+                && record["target"] == macro_id
+        })
+        .expect("resolved macro CALLS edge should exist");
+    assert_eq!(
+        edge["resolution"], "resolved",
+        "macro CALLS edge should be resolved"
+    );
+    assert!(
+        edge["call_site_spans"]
+            .as_array()
+            .is_some_and(|spans| !spans.is_empty()),
+        "resolved macro CALLS edge should carry call-site spans"
+    );
+    assert!(
+        edge["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("invokes macro")),
+        "resolved macro CALLS edge summary should name the macro invocation"
+    );
 }
 
 fn assert_edge_label(records: &[Value], label: &str) {

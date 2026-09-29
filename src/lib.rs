@@ -421,6 +421,14 @@ fn scan_repository_at_with_override_inner(
     {
         graph.push(record.with_valid_time_inferred(transaction_time));
     }
+    // Repo-wide macro-invocation resolution (issue #148): each
+    // `macro_invocation` site resolves against the repo-wide pool of
+    // `macro_rules!` definitions. A unique match mints a resolved `CALLS`
+    // edge from the invoking scope to the macro symbol; anything else keeps
+    // the pre-existing `unsupported macro invocation` Diagnostic.
+    for record in languages::cross_file::cross_file_macro_records(&repository_id, &facts_by_file) {
+        graph.push(record.with_valid_time_inferred(transaction_time));
+    }
     // Declared Cargo manifests, harvested BEFORE the import-target pass: the
     // pass resolves absolute `<crate_name>::…` imports against owning-package
     // names. Harvesting is a pure function of the repo root, so moving it

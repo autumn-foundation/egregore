@@ -22,8 +22,9 @@ use crate::{
         },
         cross_file::{
             BlockLocalDefinitionFact, CallKind, CallPathRoot, CallSiteFact, ConstructSiteFact,
-            DefinitionFact, FileFacts, ImplTargetFact, ImplTraitRelationFact, OutOfLineModFact,
-            PendingImplFact, RouteRegistrationFact, UseImportFact, crate_root_id,
+            DefinitionFact, FileFacts, ImplTargetFact, ImplTraitRelationFact, MacroDefinitionFact,
+            MacroInvocationFact, OutOfLineModFact, PendingImplFact, RouteRegistrationFact,
+            UseImportFact, crate_root_id,
         },
     },
     redaction::REDACTION_POLICY_VERSION,
@@ -275,6 +276,11 @@ struct RustExtractor<'graph, 'source> {
     /// are not symbols), so calls inside a closure body correctly inherit the
     /// enclosing function's scope.
     enclosing_fn_ids: Vec<String>,
+    /// Display names parallel to [`Self::enclosing_fn_ids`] (issue #148): the
+    /// qualified name of each enclosing function/method/test, so a macro
+    /// invocation site can record its invoking scope's human-readable name
+    /// alongside the ID.
+    enclosing_fn_names: Vec<String>,
 }
 
 /// The callee-side components of a [`CallSiteFact`]: everything the callee
@@ -336,6 +342,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             type_env: BTreeMap::new(),
             dispatch_trait_env: BTreeMap::new(),
             enclosing_fn_ids: Vec::new(),
+            enclosing_fn_names: Vec::new(),
         }
     }
 
@@ -351,7 +358,8 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             "const_item" => self.extract_named_symbol(node, "const"),
             "static_item" => self.extract_named_symbol(node, "static"),
             "type_item" => self.extract_named_symbol(node, "type_alias"),
-            "macro_invocation" => self.extract_macro_diagnostic(node),
+            "macro_definition" => self.extract_macro_definition(node),
+            "macro_invocation" => self.extract_macro_invocation(node),
             "call_expression" => self.extract_call_expression(node),
             "line_comment" | "block_comment" => self.extract_comment_markers(node),
             "attribute_item" | "inner_attribute_item" => self.extract_lint_suppression(node),
@@ -819,6 +827,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         // no call site can carry a matching caller id, so its calls stay
         // unresolved — a MISS, never a WRONG edge.
         self.enclosing_fn_ids.push(id.clone());
+        self.enclosing_fn_names.push(qualified_name.clone());
         // Build this function's provable receiver-type environment (issue #441)
         // and trait-dispatch environment (issue #267) and install them for the
         // duration of the call-site collection, then restore the caller's
@@ -846,6 +855,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             self.test_scope_depth -= 1;
         }
         self.enclosing_fn_ids.pop();
+        self.enclosing_fn_names.pop();
     }
 
     /// Match segments for a callable definition: the module path, plus the
@@ -1553,26 +1563,100 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         current
     }
 
-    fn extract_macro_diagnostic(&mut self, node: Node<'_>) {
-        let invocation = macro_invocation_name(self.node_text(node));
-        let disambiguator = self.next_diagnostic_disambiguator(&invocation);
-        let id = stable_id(&[
-            "node",
-            "diagnostic",
-            self.repository_id,
-            &self.file.repo_relative_path,
-            &invocation,
-            &disambiguator.to_string(),
-        ]);
-        self.graph.push(GraphRecord::syntax_node(
+    /// Extracts a `macro_rules!` definition as a `macro` symbol (issue #148):
+    /// the Symbol record plus its DEFINES edge (via [`Self::add_symbol`]),
+    /// and a [`MacroDefinitionFact`] for the repo-wide macro-resolution
+    /// pass. `#[macro_export]` is detected from the preceding attribute
+    /// siblings and surfaces as `public` visibility; any other macro is
+    /// `private` (`macro_rules!` has no `pub` modifier of its own).
+    ///
+    /// The macro body is deliberately NOT walked: token trees are opaque to
+    /// the grammar and macro bodies are never expanded (the trust-separation
+    /// boundary — parsed source only, no expansion).
+    fn extract_macro_definition(&mut self, node: Node<'_>) {
+        let Some(local_name) = node_name(node, self.source) else {
+            return;
+        };
+        let qualified_name = self.qualify(&local_name);
+        let id = self.add_symbol(node, "macro", &qualified_name);
+        self.facts.macro_definitions.push(MacroDefinitionFact {
             id,
-            NodeKind::Diagnostic,
-            self.file.repo_relative_path.clone(),
-            span(node),
-            invocation.clone(),
-            "rust",
-            format!("unsupported macro invocation {invocation}"),
-        ));
+            simple_name: local_name,
+            qualified_name,
+            repo_relative_path: self.file.repo_relative_path.clone(),
+        });
+    }
+
+    /// `true` when an `#[macro_export]` attribute item immediately precedes
+    /// the node (comments are skipped), mirroring
+    /// [`Self::deprecation_attribute`].
+    fn has_macro_export_attribute(&self, node: Node<'_>) -> bool {
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "attribute_item" => {
+                    let text: String = self
+                        .node_text(sibling)
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    if text == "#[macro_export]" {
+                        return true;
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        false
+    }
+
+    /// Maps a `macro_rules!` definition onto the closed visibility set from
+    /// issue #124: `#[macro_export]` publishes the macro at the crate root
+    /// (effectively `public`); a plain `macro_rules!` is textually scoped to
+    /// its module (`private`). `macro_rules!` accepts no `pub` modifier, so
+    /// [`Self::symbol_visibility`] does not apply.
+    fn macro_visibility(&self, node: Node<'_>) -> &'static str {
+        if self.has_macro_export_attribute(node) {
+            "public"
+        } else {
+            "private"
+        }
+    }
+
+    /// Records a `macro_invocation` site as a [`MacroInvocationFact`] for
+    /// the repo-wide macro-resolution pass (issue #148). Nothing is emitted
+    /// here: the pass mints either a resolved `CALLS` edge to the unique
+    /// repo-defined macro or the pre-existing `unsupported macro invocation`
+    /// Diagnostic, so external macros (e.g. `println!`) keep byte-identical
+    /// diagnostics.
+    ///
+    /// The invoking scope is the lexically-enclosing function symbol when the
+    /// site sits inside one, else the enclosing module or the file itself.
+    fn extract_macro_invocation(&mut self, node: Node<'_>) {
+        let invocation = macro_invocation_name(self.node_text(node));
+        let simple_name = invocation
+            .trim_end_matches('!')
+            .rsplit("::")
+            .next()
+            .unwrap_or("")
+            .to_owned();
+        let disambiguator = self.next_diagnostic_disambiguator(&invocation);
+        let (caller_id, caller_name) =
+            match (self.enclosing_fn_ids.last(), self.enclosing_fn_names.last()) {
+                (Some(id), Some(name)) => (id.clone(), name.clone()),
+                _ => (self.owner_id(), self.owner_name()),
+            };
+        self.facts.macro_invocations.push(MacroInvocationFact {
+            caller_id,
+            caller_name,
+            invocation_display: invocation,
+            simple_name,
+            span: span(node),
+            diagnostic_disambiguator: disambiguator,
+            repo_relative_path: self.file.repo_relative_path.clone(),
+        });
     }
 
     /// Visits a `call_expression`: emits a deterministic `PanicRiskSite`
@@ -2136,8 +2220,15 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         if carries_declaration_surface(symbol_kind) {
             let doc = self.symbol_doc(node);
             let doc_present = doc.is_some();
+            // `macro_rules!` accepts no `pub` modifier: its visibility is the
+            // `#[macro_export]` signal (issue #148), not `symbol_visibility`.
+            let visibility = if symbol_kind == "macro" {
+                self.macro_visibility(node)
+            } else {
+                self.symbol_visibility(node)
+            };
             record = record.with_declaration_surface(
-                Some(self.symbol_visibility(node).to_owned()),
+                Some(visibility.to_owned()),
                 Some(self.symbol_signature(node)),
                 doc,
             );
@@ -2220,17 +2311,28 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     /// or the item header for type-defining items. The visibility modifier is
     /// excluded (it is carried by the `visibility` field), the body is
     /// excluded, and interior whitespace is collapsed via [`normalize_code`].
+    ///
+    /// A `macro_definition` has no `body` field (its rules are `macro_rule`
+    /// children): the header ends at the macro name, i.e. `macro_rules!
+    /// name`, so the (never expanded) rule bodies stay out of the signature.
     fn symbol_signature(&self, node: Node<'_>) -> String {
         let start = visibility_modifier(node).map_or_else(|| node.start_byte(), |v| v.end_byte());
-        let end = node
-            .child_by_field_name("body")
-            .filter(|body| {
-                matches!(
-                    body.kind(),
-                    "block" | "field_declaration_list" | "enum_variant_list" | "declaration_list"
-                )
-            })
-            .map_or_else(|| node.end_byte(), |body| body.start_byte());
+        let end = if node.kind() == "macro_definition" {
+            node.child_by_field_name("name")
+                .map_or_else(|| node.end_byte(), |name| name.end_byte())
+        } else {
+            node.child_by_field_name("body")
+                .filter(|body| {
+                    matches!(
+                        body.kind(),
+                        "block"
+                            | "field_declaration_list"
+                            | "enum_variant_list"
+                            | "declaration_list"
+                    )
+                })
+                .map_or_else(|| node.end_byte(), |body| body.start_byte())
+        };
         normalize_code(self.source.get(start..end).unwrap_or(""))
     }
 
@@ -2784,6 +2886,7 @@ fn carries_declaration_surface(symbol_kind: &str) -> bool {
             | "type_alias"
             | "const"
             | "static"
+            | "macro"
     )
 }
 
@@ -7512,5 +7615,205 @@ fn file_scoped_fn() {}
             assert!(score > previous, "snippet {i} must score strictly higher");
             previous = score;
         }
+    }
+
+    // ── Issue #148: macro_rules! symbol extraction ────────────────────────
+
+    fn extract_with_facts(source: &str) -> (Graph, FileFacts) {
+        let file = SourceFile {
+            path: PathBuf::from("src/lib.rs"),
+            repo_relative_path: "src/lib.rs".to_owned(),
+        };
+        let mut graph = Graph::default();
+        let facts = extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        (graph, facts)
+    }
+
+    fn macro_symbols(graph: &Graph) -> Vec<&GraphRecord> {
+        graph
+            .records()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Node {
+                        kind: NodeKind::Symbol,
+                        symbol_kind: Some(kind),
+                        ..
+                    } if kind == "macro"
+                )
+            })
+            .collect()
+    }
+
+    fn diagnostic_records(graph: &Graph) -> Vec<&GraphRecord> {
+        graph
+            .records()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Node {
+                        kind: NodeKind::Diagnostic,
+                        ..
+                    }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn macro_definition_emits_macro_symbol_with_defines_edge() {
+        let (graph, _) = extract_with_facts("macro_rules! greet {\n    () => {};\n}\n");
+        let macros = macro_symbols(&graph);
+        assert_eq!(macros.len(), 1, "one macro symbol expected");
+        let GraphRecord::Node {
+            name,
+            span,
+            repo_relative_path,
+            ..
+        } = macros[0]
+        else {
+            panic!("macro record must be a node");
+        };
+        assert_eq!(name.as_deref(), Some("greet"));
+        assert_eq!(repo_relative_path.as_deref(), Some("src/lib.rs"));
+        assert!(span.is_some(), "macro symbol must carry a span");
+        let defines = graph
+            .records()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Edge {
+                        label: EdgeLabel::Defines,
+                        target,
+                        ..
+                    } if target == macros[0].id()
+                )
+            })
+            .count();
+        assert_eq!(
+            defines, 1,
+            "macro symbol must carry exactly one DEFINES edge"
+        );
+    }
+
+    #[test]
+    fn macro_definition_in_module_is_qualified() {
+        let (graph, _) =
+            extract_with_facts("mod m {\n    macro_rules! greet {\n        () => {};\n    }\n}\n");
+        let macros = macro_symbols(&graph);
+        assert_eq!(macros.len(), 1, "one macro symbol expected");
+        let GraphRecord::Node { name, .. } = macros[0] else {
+            panic!("macro record must be a node");
+        };
+        assert_eq!(name.as_deref(), Some("m::greet"));
+    }
+
+    #[test]
+    fn macro_export_marks_public_visibility() {
+        let (graph, _) =
+            extract_with_facts("#[macro_export]\nmacro_rules! greet {\n    () => {};\n}\n");
+        let macros = macro_symbols(&graph);
+        assert_eq!(macros.len(), 1, "one macro symbol expected");
+        let GraphRecord::Node { visibility, .. } = macros[0] else {
+            panic!("macro record must be a node");
+        };
+        assert_eq!(
+            visibility.as_deref(),
+            Some("public"),
+            "#[macro_export] must surface as public visibility"
+        );
+    }
+
+    #[test]
+    fn macro_without_export_is_private() {
+        let (graph, _) = extract_with_facts("macro_rules! greet {\n    () => {};\n}\n");
+        let macros = macro_symbols(&graph);
+        assert_eq!(macros.len(), 1, "one macro symbol expected");
+        let GraphRecord::Node { visibility, .. } = macros[0] else {
+            panic!("macro record must be a node");
+        };
+        assert_eq!(
+            visibility.as_deref(),
+            Some("private"),
+            "a non-exported macro_rules! must surface as private visibility"
+        );
+    }
+
+    #[test]
+    fn macro_definition_registers_resolution_fact() {
+        let (graph, facts) = extract_with_facts("macro_rules! greet {\n    () => {};\n}\n");
+        assert_eq!(facts.macro_definitions.len(), 1);
+        let def = &facts.macro_definitions[0];
+        assert_eq!(def.simple_name, "greet");
+        assert_eq!(def.qualified_name, "greet");
+        assert_eq!(def.repo_relative_path, "src/lib.rs");
+        let macros = macro_symbols(&graph);
+        assert_eq!(
+            def.id,
+            macros[0].id(),
+            "the resolution fact must point at the emitted symbol"
+        );
+    }
+
+    #[test]
+    fn macro_invocation_records_fact_and_no_diagnostic() {
+        let (graph, facts) = extract_with_facts(
+            "macro_rules! greet {\n    () => {};\n}\nfn f() {\n    greet!();\n}\n",
+        );
+        assert_eq!(
+            facts.macro_invocations.len(),
+            1,
+            "one invocation fact expected"
+        );
+        let invocation = &facts.macro_invocations[0];
+        assert_eq!(invocation.simple_name, "greet");
+        assert_eq!(invocation.invocation_display, "greet!");
+        assert_eq!(invocation.repo_relative_path, "src/lib.rs");
+        assert!(
+            diagnostic_records(&graph).is_empty(),
+            "extraction must defer macro diagnostics to the repo-wide resolution pass"
+        );
+    }
+
+    #[test]
+    fn macro_invocation_inside_function_names_function_caller() {
+        let (graph, facts) = extract_with_facts(
+            "macro_rules! greet {\n    () => {};\n}\nfn f() {\n    greet!();\n}\n",
+        );
+        let invocation = &facts.macro_invocations[0];
+        let fn_symbol = graph
+            .records()
+            .iter()
+            .find(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Node {
+                        kind: NodeKind::Symbol,
+                        name: Some(name),
+                        ..
+                    } if name == "f"
+                )
+            })
+            .expect("function symbol present");
+        assert_eq!(
+            invocation.caller_id,
+            fn_symbol.id(),
+            "the invoking scope of a call inside a function is that function"
+        );
+    }
+
+    #[test]
+    fn macro_invocation_simple_name_strips_path_and_bang() {
+        let (_, facts) = extract_with_facts("fn f() {\n    crate::helpers::greet!();\n}\n");
+        assert_eq!(facts.macro_invocations.len(), 1);
+        assert_eq!(facts.macro_invocations[0].simple_name, "greet");
+        assert_eq!(
+            facts.macro_invocations[0].invocation_display,
+            "crate::helpers::greet!"
+        );
     }
 }

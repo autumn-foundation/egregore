@@ -1214,6 +1214,16 @@ fn replay_commit_cross_file_passes(
     {
         graph.push(record.with_temporal(commit.temporal()));
     }
+    // Repo-wide macro-invocation resolution (issue #148) for this commit's
+    // tree: a `macro_invocation` naming the commit's unique repo-defined
+    // macro edge-backs here; external/ambiguous names keep their
+    // Diagnostics. Stamped with the commit's temporal provenance like the
+    // CALLS/IMPLEMENTS passes above.
+    for record in
+        crate::languages::cross_file::cross_file_macro_records(repository_id, facts_by_file)
+    {
+        graph.push(record.with_temporal(commit.temporal()));
+    }
     // Inbound IMPORTS edges to imported Module/File targets (issue #444)
     // for this commit's tree: each resolvable Rust `use` mints
     // `File —IMPORTS→ Module|File`, stamped with the commit's temporal

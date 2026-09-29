@@ -21,9 +21,16 @@ the scanner mints:
 
 | Marker | Example `summary` | Meaning |
 |--------|-------------------|---------|
-| unsupported macro invocation | `unsupported macro invocation println!` | a `macro_invocation` the extractor does not expand |
+| unsupported macro invocation | `unsupported macro invocation println!` | a `macro_invocation` naming no uniquely resolvable repo-defined macro: external macros (e.g. `println!`), or a repo name defined zero or ≥2 times |
 | unresolved call | `unresolved call external_crate::missing_fn` | a call with no in-repo resolution target |
 | unresolved dispatch | `unresolved trait-dispatch target Trait::method (no in-crate implementor method)` | a trait call with no matching implementor |
+
+A `macro_invocation` that names exactly one repo-defined `macro_rules!`
+macro does not surface here at all: it resolves repo-wide to a `CALLS`
+edge from the invoking scope to the macro symbol, stamped `resolved` and
+carrying the call-site spans (see `docs/cli/query.md` — the callers lane).
+Only external, missing, or ambiguously-defined macro names keep the
+`unsupported macro invocation` diagnostic.
 
 ### What this lane deliberately does NOT report
 
