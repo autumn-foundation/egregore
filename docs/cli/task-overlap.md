@@ -179,7 +179,11 @@ dispatch gate:
   observations, or verification records about the same code entity
   contradict each other. Use it when you need the adjudication lead on what
   is true about a piece of code, not which tasks touch it.
+- **`eg query task-evidence-gate`** (issue #147) — *completion*: whether a
+  task's every acceptance criterion has a live passing verification record.
+  Use it when deciding whether a task may *close*. It says nothing about
+  whether the work is correct — only that the recorded evidence is live.
 
 In short: `task-ready` says what may start, `task-overlap` says what may
-start *together*, `conflicts` says what is disputed about the code they
-would touch.
+start *together*, `task-evidence-gate` says what may *close*, `conflicts`
+says what is disputed about the code they would touch.

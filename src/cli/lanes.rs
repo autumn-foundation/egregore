@@ -753,6 +753,16 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
             freshness: &["ingest_snapshot", "store_live"],
         },
     ),
+    // Appended (issue #147); kept at the end to minimize cross-lane merge conflicts.
+    (
+        "task-evidence-gate",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["project_state", "verification_evidence"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot", "store_live"],
+        },
+    ),
     (
         "track-record",
         LaneStatic {

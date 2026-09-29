@@ -61,6 +61,8 @@ mod task_evidence;
 mod task_ready;
 // Appended (issue #150); kept at the end to minimize cross-lane merge conflicts.
 mod task_overlap;
+// Appended (issue #147); kept at the end to minimize cross-lane merge conflicts.
+mod task_evidence_gate;
 mod transaction_time;
 mod transitive_callees;
 mod transitive_callers;
@@ -195,3 +197,5 @@ pub use complexity::*;
 pub use task_ready::*;
 // Appended (issue #150); kept at the end to minimize cross-lane merge conflicts.
 pub use task_overlap::*;
+// Appended (issue #147); kept at the end to minimize cross-lane merge conflicts.
+pub use task_evidence_gate::*;

@@ -94,6 +94,9 @@ mod task_ready;
 // Appended (issue #150); kept at the end of the module list to minimize
 // cross-lane merge conflicts.
 mod task_overlap;
+// Appended (issue #147); kept at the end of the module list to minimize
+// cross-lane merge conflicts.
+mod task_evidence_gate;
 mod transaction_time;
 mod transitive_callees;
 mod transitive_callers;
@@ -217,6 +220,8 @@ pub(crate) use task::*;
 pub(crate) use task_ready::*;
 // Appended (issue #150).
 pub(crate) use task_overlap::*;
+// Appended (issue #147).
+pub(crate) use task_evidence_gate::*;
 pub(crate) use transaction_time::*;
 pub(crate) use transitive_callees::*;
 pub(crate) use transitive_callers::*;
@@ -2456,6 +2461,33 @@ pub(crate) enum QuerySubcommand {
         /// eligible; any other value is rejected with exit 3.
         #[arg(long)]
         status: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    // Appended (issue #147); kept at the end to minimize cross-lane merge conflicts.
+    /// Gate task completion on live verification evidence for every acceptance
+    /// criterion (issue #147).
+    ///
+    /// Read-only, deterministic: for one task, every linked `AcceptanceCriterion`
+    /// is checked against the verification records that close it. A criterion
+    /// is satisfied only by a passing record (the shared
+    /// `verification_outcome` rule) whose cited code has not drifted since the
+    /// run (the issue #111 freshness signal). `ready: true` means every
+    /// criterion is satisfied; reasons are `missing_evidence`,
+    /// `failing_evidence`, or `stale_evidence`. Exit 0 for a verdict,
+    /// exit 2 (`no_match`) when the task does not exist.
+    ///
+    /// Documented in `docs/cli/task-evidence-gate.md` and `docs/cli/query.md`.
+    TaskEvidenceGate {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Task ID or handle (`p:<project-id>` / local external handle / record ID).
+        id_or_handle: String,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -8904,6 +8936,16 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_task_overlap_cmd(&records, status.as_deref(), format)
+        }
+        // Appended (issue #147); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::TaskEvidenceGate {
+            graph,
+            data_dir,
+            id_or_handle,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_task_evidence_gate_cmd(&records, &id_or_handle, format)
         }
         QuerySubcommand::Candidates {
             graph,

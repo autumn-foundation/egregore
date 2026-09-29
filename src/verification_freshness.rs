@@ -822,7 +822,9 @@ const fn is_codegraph_temporal_kind(kind: NodeKind) -> bool {
 /// check the daemon's own write-time validator applies
 /// (`validate_verification_domain_records`): `id.starts_with("verification:v1:")
 /// || domain == Some("verification")`.
-fn is_verification_kind(id: &str, kind: NodeKind, domain: Option<&str>) -> bool {
+/// Whether a node is a verification-domain record, shared with the
+/// task-evidence-gate lane (issue #147) so both agree on what counts.
+pub(crate) fn is_verification_kind(id: &str, kind: NodeKind, domain: Option<&str>) -> bool {
     matches!(
         kind,
         NodeKind::CommandRun
