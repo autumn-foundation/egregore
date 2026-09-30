@@ -47,6 +47,23 @@ pub(crate) fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
             source,
             format,
         } => audit_query_latency_cmd(&corpus, samples, budget_p50_ms, source, format),
+        AuditSubcommand::QueryBudget {
+            corpus,
+            samples,
+            warm_samples,
+            scale_factor,
+            max_ratio,
+            budget_p95_ms,
+            format,
+        } => audit_query_budget_cmd(
+            &corpus,
+            samples,
+            warm_samples,
+            scale_factor,
+            max_ratio,
+            budget_p95_ms,
+            format,
+        ),
         AuditSubcommand::Accuracy {
             corpus_dir,
             labels,
@@ -1444,6 +1461,602 @@ pub(crate) fn audit_query_latency_cmd(
                 if source.pass { "PASS" } else { "FAIL" },
             );
         }
+    }
+    std::process::exit(i32::from(!report.ok));
+}
+
+/// Loads the query-budget corpus manifest, applies the CLI overrides, and
+/// validates them. Exits 2 on any load/usage error (issue #120).
+pub(crate) fn load_query_budget_corpus(
+    corpus_path: &Path,
+    samples_override: Option<usize>,
+    warm_samples_override: Option<usize>,
+    scale_factor_override: Option<usize>,
+    max_ratio_override: Option<f64>,
+    budget_p95_override: Option<f64>,
+) -> crate::query_budget::QueryBudgetCorpus {
+    use crate::query_budget::QueryBudgetCorpus;
+
+    let display = corpus_path.display().to_string();
+    // Overrides that would silently disable the gate are rejected before any
+    // measurement runs.
+    if samples_override == Some(0) {
+        query_latency_exit("invalid_samples", &display, "--samples must be at least 1");
+    }
+    if warm_samples_override == Some(0) {
+        query_latency_exit(
+            "invalid_warm_samples",
+            &display,
+            "--warm-samples must be at least 1",
+        );
+    }
+    if scale_factor_override.is_some_and(|scale| scale < 2) {
+        query_latency_exit(
+            "invalid_scale_factor",
+            &display,
+            "--scale-factor must be at least 2",
+        );
+    }
+    if max_ratio_override.is_some_and(|ratio| !ratio.is_finite() || ratio <= 0.0) {
+        query_latency_exit(
+            "invalid_max_ratio",
+            &display,
+            "--max-ratio must be a finite, positive value",
+        );
+    }
+    if budget_p95_override.is_some_and(|budget| !budget.is_finite() || budget <= 0.0) {
+        query_latency_exit(
+            "invalid_budget_p95_ms",
+            &display,
+            "--budget-p95-ms must be a finite, positive value",
+        );
+    }
+    let text = std::fs::read_to_string(corpus_path).unwrap_or_else(|error| {
+        query_latency_exit("corpus_read_error", &display, &error.to_string())
+    });
+    let mut corpus: QueryBudgetCorpus = serde_json::from_str(&text).unwrap_or_else(|error| {
+        query_latency_exit("corpus_parse_error", &display, &error.to_string())
+    });
+    if let Some(samples) = samples_override {
+        corpus.samples = samples;
+    }
+    if let Some(warm_samples) = warm_samples_override {
+        corpus.warm_samples = warm_samples;
+    }
+    if let Some(scale_factor) = scale_factor_override {
+        corpus.scale_factor = scale_factor;
+    }
+    if let Some(max_ratio) = max_ratio_override {
+        corpus.max_scaling_ratio = max_ratio;
+    }
+    if let Some(budget) = budget_p95_override {
+        corpus.budget_p95_ms = budget;
+    }
+    // Manifest values get the same validation as CLI overrides.
+    if corpus.samples == 0 {
+        query_latency_exit(
+            "invalid_samples",
+            &display,
+            "manifest `samples` must be at least 1",
+        );
+    }
+    if corpus.warm_samples == 0 {
+        query_latency_exit(
+            "invalid_warm_samples",
+            &display,
+            "manifest `warm_samples` must be at least 1",
+        );
+    }
+    if corpus.scale_factor < 2 {
+        query_latency_exit(
+            "invalid_scale_factor",
+            &display,
+            "manifest `scale_factor` must be at least 2",
+        );
+    }
+    if !corpus.max_scaling_ratio.is_finite() || corpus.max_scaling_ratio <= 0.0 {
+        query_latency_exit(
+            "invalid_max_ratio",
+            &display,
+            "manifest `max_scaling_ratio` must be a finite, positive value",
+        );
+    }
+    if !corpus.budget_p50_ms.is_finite() || corpus.budget_p50_ms <= 0.0 {
+        query_latency_exit(
+            "invalid_budget_p50_ms",
+            &display,
+            "manifest `budget_p50_ms` must be a finite, positive value",
+        );
+    }
+    if !corpus.budget_p95_ms.is_finite() || corpus.budget_p95_ms <= 0.0 {
+        query_latency_exit(
+            "invalid_budget_p95_ms",
+            &display,
+            "manifest `budget_p95_ms` must be a finite, positive value",
+        );
+    }
+    corpus
+}
+
+/// The two fixture stores for the scaling assertion, with their record
+/// counts. The 1x store is exactly the first slice of the scaled store.
+struct QueryBudgetStores {
+    /// 1x store path (`store-1x.jsonl`).
+    single: std::path::PathBuf,
+    /// Scaled store path (`store-10x.jsonl`).
+    scaled: std::path::PathBuf,
+    /// Record count of the 1x store.
+    single_count: u64,
+    /// Record count of the scaled store.
+    scaled_count: u64,
+}
+
+/// Builds an `eg query` argv vector for one benchmarked query against a
+/// store path.
+type QueryArgv = Box<dyn Fn(&str) -> Vec<String>>;
+
+/// Builds the 1x and scaled fixture stores in a temp dir (issue #120).
+///
+/// Scans the fixture corpus `scale_factor` times with disjoint repository
+/// identities (`<override>-sNN`), appending deterministic synthetic drift
+/// nodes per copy so `eg query drift` has a stable answer. Writes
+/// `store-1x.jsonl` (copy 0 alone) and `store-10x.jsonl` (all copies
+/// concatenated), so the 1x store is exactly the first slice of the scaled
+/// store. Setup only — not timed. Returns the temp-dir guard (keeping it
+/// alive keeps both store files on disk) and the stores.
+fn build_query_budget_stores(
+    corpus: &crate::query_budget::QueryBudgetCorpus,
+    source_dir: &Path,
+) -> (tempfile::TempDir, QueryBudgetStores) {
+    use crate::query_budget::{MIN_REFERENCE_RECORDS, synthetic_drift_records};
+
+    let dir = source_dir.display().to_string();
+    let work = tempfile::tempdir()
+        .unwrap_or_else(|error| query_latency_exit("tempdir_error", &dir, &error.to_string()));
+
+    let mut copies: Vec<Vec<crate::ir::GraphRecord>> = Vec::with_capacity(corpus.scale_factor);
+    for copy in 0..corpus.scale_factor {
+        let repo_tag = format!("{}-s{copy:02}", corpus.repository_id_override);
+        let graph =
+            crate::scan_repository_at_with_override(source_dir, &corpus.scan_time, Some(&repo_tag))
+                .unwrap_or_else(|error| {
+                    query_latency_exit("corpus_scan_error", &dir, &error.to_string())
+                });
+        let mut records: Vec<crate::ir::GraphRecord> = graph.records().to_vec();
+        records.extend(synthetic_drift_records(
+            &records,
+            &repo_tag,
+            &corpus.scan_time,
+            corpus.synthetic_drift_nodes_per_repo,
+        ));
+        copies.push(records);
+    }
+
+    let single_count = copies[0].len() as u64;
+    if single_count < MIN_REFERENCE_RECORDS {
+        // A collapsed corpus would make the gate pass vacuously; refuse to
+        // measure instead of rubber-stamping a meaningless number.
+        query_latency_exit(
+            "corpus_too_small",
+            &dir,
+            &format!(
+                "reference corpus has {single_count} records, below the {MIN_REFERENCE_RECORDS} minimum"
+            ),
+        );
+    }
+
+    let write_store = |name: &str, records: &[crate::ir::GraphRecord]| -> std::path::PathBuf {
+        let mut lines: Vec<String> = records
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|error| {
+                query_latency_exit("corpus_serialize_error", name, &error.to_string())
+            });
+        // Canonically ordered lines, mirroring `Graph::to_jsonl`, so the
+        // store is byte-stable across runs.
+        lines.sort_unstable();
+        let path = work.path().join(name);
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap_or_else(|error| {
+            query_latency_exit(
+                "corpus_write_error",
+                &path.display().to_string(),
+                &error.to_string(),
+            )
+        });
+        path
+    };
+
+    let single = write_store("store-1x.jsonl", &copies[0]);
+    let all_copies: Vec<crate::ir::GraphRecord> = copies.into_iter().flatten().collect();
+    let scaled_count = all_copies.len() as u64;
+    let scaled = write_store("store-10x.jsonl", &all_copies);
+    (
+        work,
+        QueryBudgetStores {
+            single,
+            scaled,
+            single_count,
+            scaled_count,
+        },
+    )
+}
+
+/// Times one query x temperature x store-size cell (issue #120).
+///
+/// Cold samples are fresh processes back-to-back. Warm samples are fresh
+/// processes too, but the cell is preceded by one unmeasured priming
+/// invocation of the identical query so the OS page cache is hot — the
+/// process itself still cold-starts, so warm isolates page-cache effects.
+/// Exits 2 when a sample fails (fail-closed: an unanswered query has no
+/// time-to-first-answer).
+fn sample_query_budget_cell(
+    exe: &Path,
+    base_args: &[String],
+    samples: usize,
+    warm: bool,
+    cell_name: &str,
+) -> Vec<f64> {
+    use crate::query_budget::measure_query_sample;
+
+    let args: Vec<&str> = base_args.iter().map(String::as_str).collect();
+    if warm {
+        // Priming run: unmeasured, but its failure is still a real query
+        // failure, so fail closed exactly like a sample.
+        if let Err(error) = measure_query_sample(exe, &args) {
+            query_latency_exit("query_prime_error", cell_name, &error);
+        }
+    }
+    let mut samples_ms = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        match measure_query_sample(exe, &args) {
+            Ok(ms) => samples_ms.push(ms),
+            Err(error) => query_latency_exit("query_sample_error", cell_name, &error),
+        }
+    }
+    samples_ms
+}
+
+/// Measures the ripgrep baseline for the equivalent symbol lookup
+/// (`rg <symbol> <corpus source>`) with the same spawn-to-first-line harness,
+/// or returns an explicit skip record when ripgrep is not on `PATH` — never
+/// silently absent.
+fn measure_ripgrep_baseline(
+    corpus: &crate::query_budget::QueryBudgetCorpus,
+    source_dir: &Path,
+    samples: usize,
+) -> crate::query_budget::RipgrepBaseline {
+    use crate::query_budget::{measure_query_sample, skipped_ripgrep, summarize_ripgrep};
+
+    let source = source_dir.display().to_string();
+    let command = format!(
+        "rg -n --no-heading --no-messages {} {source}",
+        corpus.query_symbol
+    );
+    // Probe once: a missing ripgrep is an explicit skip, not a silent gap.
+    let available = std::process::Command::new("rg")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !available {
+        return skipped_ripgrep(
+            &command,
+            corpus.budget_p50_ms,
+            corpus.budget_p95_ms,
+            "ripgrep not found on PATH",
+        );
+    }
+    let mut samples_ms = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let args = [
+            "-n",
+            "--no-heading",
+            "--no-messages",
+            corpus.query_symbol.as_str(),
+            source.as_str(),
+        ];
+        match measure_query_sample(Path::new("rg"), &args) {
+            Ok(ms) => samples_ms.push(ms),
+            Err(error) => query_latency_exit("ripgrep_sample_error", &command, &error),
+        }
+    }
+    summarize_ripgrep(
+        &command,
+        samples_ms,
+        corpus.budget_p50_ms,
+        corpus.budget_p95_ms,
+    )
+}
+
+/// Renders the budget report as a human-readable table (`--format text`).
+fn render_query_budget_text(report: &crate::query_budget::BudgetReport) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "query-budget {} — 1x: {} records, {}x: {} records ({} cold + {} warm samples per cell)",
+        report.corpus_name,
+        report.record_count_1x,
+        report.scale_factor,
+        report.record_count_10x,
+        report.samples,
+        report.warm_samples,
+    );
+    let _ = writeln!(
+        out,
+        "  {:<6} {:<4} {:<9} {:>9} {:>9}",
+        "query", "temp", "size", "p50", "p95"
+    );
+    for (query, temps) in &report.queries {
+        for (temp, sizes) in temps {
+            for (size, cell) in sizes {
+                let _ = writeln!(
+                    out,
+                    "  {query:<6} {temp:<4} {size:<9} {:>7.0}ms {:>7.0}ms",
+                    cell.p50_ms, cell.p95_ms,
+                );
+            }
+        }
+    }
+    if report.ripgrep.skipped {
+        let _ = writeln!(
+            out,
+            "  ripgrep baseline: skipped ({})",
+            report.ripgrep.skip_reason.as_deref().unwrap_or(""),
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  ripgrep ({}): p50 {:.0}ms, p95 {:.0}ms over {} samples",
+            report.ripgrep.command,
+            report.ripgrep.p50_ms,
+            report.ripgrep.p95_ms,
+            report.ripgrep.samples_ms.len(),
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  scaling ({} {}): 10x/1x = {:.2}x p50, {:.2}x p95 (ceiling {:.1}x) — {}",
+        report.scaling.query,
+        report.scaling.temp,
+        report.scaling.ratio_p50,
+        report.scaling.ratio_p95,
+        report.scaling.max_ratio,
+        if report.scaling.pass { "PASS" } else { "FAIL" },
+    );
+    let over: Vec<&crate::query_budget::AdvisoryP95> = report
+        .advisory_p95
+        .iter()
+        .filter(|entry| !entry.within_budget)
+        .collect();
+    if over.is_empty() {
+        let _ = writeln!(
+            out,
+            "  advisory budgets (p50 {:.0}ms, p95 {:.0}ms): all cells within budget",
+            report.budgets.p50_ms, report.budgets.p95_ms,
+        );
+    } else {
+        let _ = writeln!(out, "  advisory budget exceedances (not gating):");
+        for entry in over {
+            let _ = writeln!(
+                out,
+                "    {}/{} on {}: p95 {:.0}ms > {:.0}ms",
+                entry.query, entry.temp, entry.size, entry.p95_ms, entry.budget_p95_ms,
+            );
+        }
+    }
+    out
+}
+
+/// Handles `eg audit query-budget` (issue #120).
+#[allow(clippy::too_many_lines)] // flat orchestration: build stores, sample 12 cells, baseline, gate, report
+pub(crate) fn audit_query_budget_cmd(
+    corpus_path: &Path,
+    samples_override: Option<usize>,
+    warm_samples_override: Option<usize>,
+    scale_factor_override: Option<usize>,
+    max_ratio_override: Option<f64>,
+    budget_p95_override: Option<f64>,
+    format: OutputFormat,
+) -> Result<()> {
+    use crate::query_budget::{
+        AdvisoryBudgets, BudgetReport, QueryCell, ScalingAssertion, advisory_p95_entries,
+        current_machine_info, scaling_passes, scaling_ratio, summarize_cell,
+    };
+    use std::collections::BTreeMap;
+
+    let corpus = load_query_budget_corpus(
+        corpus_path,
+        samples_override,
+        warm_samples_override,
+        scale_factor_override,
+        max_ratio_override,
+        budget_p95_override,
+    );
+
+    // Resolve the corpus source directory relative to the manifest's parent so
+    // the benchmark is runnable regardless of the working directory.
+    let manifest_dir = corpus_path.parent().unwrap_or_else(|| Path::new("."));
+    let source_dir = manifest_dir.join(&corpus.source_dir);
+
+    // The temp-dir guard is held for its `Drop`: keeping `_guard` alive keeps
+    // both store files on disk for the whole benchmark.
+    let (_guard, fixture) = build_query_budget_stores(&corpus, &source_dir);
+
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|error| query_latency_exit("current_exe_error", "", &error.to_string()));
+
+    let drift_limit = corpus.drift_limit.to_string();
+    let stores: [(&str, String, u64); 2] = [
+        (
+            "store_1x",
+            fixture.single.display().to_string(),
+            fixture.single_count,
+        ),
+        (
+            "store_10x",
+            fixture.scaled.display().to_string(),
+            fixture.scaled_count,
+        ),
+    ];
+    // Each benchmarked query as (name, argv builder). The argv shape is the
+    // exact agent-facing invocation being budgeted. The builders own their
+    // captured strings (`move`) so the boxed closures are `'static`.
+    let query_symbol = corpus.query_symbol.clone();
+    let query_file = corpus.query_file.clone();
+    let query_argv: Vec<(&str, QueryArgv)> = vec![
+        (
+            "symbol",
+            Box::new(move |store: &str| {
+                vec![
+                    "query".to_owned(),
+                    "symbol".to_owned(),
+                    query_symbol.clone(),
+                    "--graph".to_owned(),
+                    store.to_owned(),
+                    "--format".to_owned(),
+                    "text".to_owned(),
+                ]
+            }),
+        ),
+        (
+            "file",
+            Box::new(move |store: &str| {
+                vec![
+                    "query".to_owned(),
+                    "file".to_owned(),
+                    query_file.clone(),
+                    "--graph".to_owned(),
+                    store.to_owned(),
+                    "--format".to_owned(),
+                    "text".to_owned(),
+                ]
+            }),
+        ),
+        (
+            "drift",
+            Box::new(move |store: &str| {
+                vec![
+                    "query".to_owned(),
+                    "drift".to_owned(),
+                    "--graph".to_owned(),
+                    store.to_owned(),
+                    "--limit".to_owned(),
+                    drift_limit.clone(),
+                    "--format".to_owned(),
+                    "text".to_owned(),
+                ]
+            }),
+        ),
+    ];
+
+    let mut queries: BTreeMap<String, BTreeMap<String, BTreeMap<String, QueryCell>>> =
+        BTreeMap::new();
+    let mut all_cells: Vec<QueryCell> = Vec::new();
+    for (query_name, make_argv) in &query_argv {
+        let mut temps: BTreeMap<String, BTreeMap<String, QueryCell>> = BTreeMap::new();
+        for (temp_name, warm, sample_count) in [
+            ("cold", false, corpus.samples),
+            ("warm", true, corpus.warm_samples),
+        ] {
+            let mut sizes: BTreeMap<String, QueryCell> = BTreeMap::new();
+            for (size_name, store_path, record_count) in &stores {
+                let argv = make_argv(store_path);
+                let cell_name = format!("{query_name}/{temp_name}/{size_name}");
+                let samples_ms =
+                    sample_query_budget_cell(&exe, &argv, sample_count, warm, &cell_name);
+                let cell =
+                    summarize_cell(query_name, temp_name, size_name, samples_ms, *record_count)
+                        .unwrap_or_else(|| {
+                            query_latency_exit("no_samples", &cell_name, "no samples measured")
+                        });
+                all_cells.push(cell.clone());
+                sizes.insert((*size_name).to_owned(), cell);
+            }
+            temps.insert(temp_name.to_owned(), sizes);
+        }
+        queries.insert((*query_name).to_owned(), temps);
+    }
+
+    let ripgrep = measure_ripgrep_baseline(&corpus, &source_dir, corpus.samples);
+
+    // The gate: cold targeted single-symbol lookup, scaled store vs 1x store.
+    // Relative and machine-independent — only this assertion fails the gate.
+    // Copy the gated percentiles out before `queries` moves into the report.
+    let symbol_cold_single = &queries["symbol"]["cold"]["store_1x"];
+    let symbol_cold_scaled = &queries["symbol"]["cold"]["store_10x"];
+    let (p50_single, p95_single) = (symbol_cold_single.p50_ms, symbol_cold_single.p95_ms);
+    let (p50_scaled, p95_scaled) = (symbol_cold_scaled.p50_ms, symbol_cold_scaled.p95_ms);
+    let ratio_p50 = scaling_ratio(p50_single, p50_scaled);
+    let scaling = ScalingAssertion {
+        query: "symbol".to_owned(),
+        temp: "cold".to_owned(),
+        ratio_p50,
+        ratio_p95: scaling_ratio(p95_single, p95_scaled),
+        max_ratio: corpus.max_scaling_ratio,
+        pass: scaling_passes(ratio_p50, corpus.max_scaling_ratio),
+    };
+
+    let cell_refs: Vec<&QueryCell> = all_cells.iter().collect();
+    let advisory_p95 = advisory_p95_entries(&cell_refs, corpus.budget_p95_ms);
+
+    let ok = scaling.pass;
+    let report = BudgetReport {
+        corpus_name: corpus.corpus_name.clone(),
+        corpus_version: corpus.corpus_version.clone(),
+        query_symbol: corpus.query_symbol.clone(),
+        query_file: corpus.query_file.clone(),
+        drift_limit: corpus.drift_limit,
+        record_count_1x: fixture.single_count,
+        record_count_10x: fixture.scaled_count,
+        scale_factor: corpus.scale_factor,
+        reference_record_count: corpus.reference_record_count,
+        reference_machine_class: corpus.reference_machine_class.clone(),
+        machine: current_machine_info(),
+        samples: corpus.samples,
+        warm_samples: corpus.warm_samples,
+        budgets: AdvisoryBudgets {
+            p50_ms: corpus.budget_p50_ms,
+            p95_ms: corpus.budget_p95_ms,
+            advisory: true,
+        },
+        queries,
+        ripgrep,
+        scaling,
+        advisory_p95,
+        ok,
+    };
+
+    match format {
+        OutputFormat::Json => {
+            let output = serde_json::to_string_pretty(&report).unwrap_or_else(|error| {
+                query_latency_exit("serialize_error", "", &error.to_string())
+            });
+            println!("{output}");
+        }
+        OutputFormat::Text => print!("{}", render_query_budget_text(&report)),
+    }
+    eprintln!(
+        "query-budget[symbol/cold]: 1x p50 {:.0}ms -> {}x p50 {:.0}ms (ratio {:.2}x, ceiling {:.1}x) — {}",
+        p50_single,
+        corpus.scale_factor,
+        p50_scaled,
+        report.scaling.ratio_p50,
+        report.scaling.max_ratio,
+        if report.scaling.pass { "PASS" } else { "FAIL" },
+    );
+    let over_budget = report
+        .advisory_p95
+        .iter()
+        .filter(|entry| !entry.within_budget)
+        .count();
+    if over_budget > 0 {
+        eprintln!(
+            "query-budget: {over_budget} cell(s) exceed the advisory p95 budget of {:.0}ms (reported, not gating)",
+            report.budgets.p95_ms,
+        );
     }
     std::process::exit(i32::from(!report.ok));
 }

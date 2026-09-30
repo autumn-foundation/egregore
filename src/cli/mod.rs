@@ -5971,6 +5971,62 @@ pub(crate) enum AuditSubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Measure the structural query latency budget and enforce the scaling
+    /// gate (issue #120).
+    ///
+    /// Builds the pinned reference corpus at two store sizes (1x and 10x
+    /// record counts), then times wall-clock from process start to the first
+    /// emitted result line of `eg query symbol`, `eg query file`, and
+    /// `eg query drift` — cold and warm invocations — reporting p50/p95 per
+    /// query x temperature x size cell. Records a ripgrep baseline for the
+    /// equivalent symbol lookup so the comparison to the boring substitute
+    /// is explicit. The gate enforces the scaling assertion (the 10x store
+    /// must answer a targeted single-symbol lookup within 2x of the 1x
+    /// latency); the absolute p50/p95 budgets are advisory and never fail
+    /// the gate, so hardware variance cannot red CI. Local-first and offline.
+    ///
+    /// Exit codes:
+    ///   0 — scaling assertion passed (`ok: true`).
+    ///   1 — scaling assertion violated (`ok: false`); the full JSON report
+    ///       is still printed.
+    ///   2 — usage/load error (bad manifest path, corpus build error, no result).
+    QueryBudget {
+        /// Path to the query-budget corpus manifest JSON.
+        #[arg(long, default_value = "corpus/query_budget_corpus.json")]
+        corpus: PathBuf,
+        /// Cold samples measured per query x temperature x size cell.
+        ///
+        /// Defaults to the manifest's `samples`. When supplied, overrides it.
+        #[arg(long)]
+        samples: Option<usize>,
+        /// Warm samples measured per query x size cell (each preceded by one
+        /// unmeasured priming invocation).
+        ///
+        /// Defaults to the manifest's `warm_samples`. When supplied,
+        /// overrides it.
+        #[arg(long)]
+        warm_samples: Option<usize>,
+        /// Store-size multiplier for the scaled store.
+        ///
+        /// Defaults to the manifest's `scale_factor`. Must be at least 2.
+        #[arg(long)]
+        scale_factor: Option<usize>,
+        /// Scaling ceiling: the scaled store must answer within this multiple
+        /// of the 1x cold symbol p50.
+        ///
+        /// Defaults to the manifest's `max_scaling_ratio`. Must be positive.
+        #[arg(long)]
+        max_ratio: Option<f64>,
+        /// Advisory absolute p95 budget in milliseconds (reported, not gated).
+        ///
+        /// Defaults to the manifest's `budget_p95_ms`. When supplied,
+        /// overrides it.
+        #[arg(long)]
+        budget_p95_ms: Option<f64>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Measure code-graph extraction accuracy against a ground-truth labeled corpus (issue #93).
     Accuracy {
         /// Path to the Rust test corpus directory.

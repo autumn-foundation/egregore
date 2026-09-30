@@ -84,3 +84,35 @@ jobs:
         # (corpus/query_latency_corpus.json, ~10k records). Fails when any
         # source p50 exceeds the 2s budget.
         run: ./target/debug/egregore audit query-latency
+
+  query-budget:
+    name: structural query latency budget + scaling gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Expected-red until the optimization slice lands (issue #120 is the
+    # measurement slice; current scaling is ~10x vs the 2.0x ceiling because
+    # the query path loads the whole store per invocation). The failure stays
+    # visible in the UI without blocking CI; remove this once the gate is green.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: query-budget
+      - name: install ripgrep
+        # The benchmark records a ripgrep baseline for the equivalent symbol
+        # lookup; without rg on PATH the baseline is an explicit skip, but
+        # the reference run should measure it.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+      - name: build
+        run: cargo build
+      - name: query-budget gate
+        # Full gate (issue #120): cold+warm `eg query symbol` /
+        # `eg query file` / `eg query drift` against 1x and 10x fixture
+        # stores (corpus/query_budget_corpus.json, ~10k / ~100k records),
+        # plus the ripgrep baseline for the equivalent symbol lookup. Fails
+        # when the cold symbol 10x/1x p50 ratio exceeds 2.0x (the scaling
+        # assertion); the absolute p95 budget is advisory and never fails
+        # the gate.
+        run: ./target/debug/egregore audit query-budget

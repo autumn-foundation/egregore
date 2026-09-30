@@ -101,6 +101,7 @@ mod python_scan;
 mod query;
 mod query_at;
 mod query_belief_timeline;
+mod query_budget;
 mod query_churn;
 mod query_cli;
 mod query_completeness;
