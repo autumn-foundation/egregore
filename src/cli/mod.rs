@@ -98,6 +98,7 @@ mod task_ready;
 mod task_overlap;
 // Appended (issue #147); kept at the end of the module list to minimize
 // cross-lane merge conflicts.
+pub(crate) mod covering_tests;
 mod task_evidence_gate;
 mod transaction_time;
 mod transitive_callees;
@@ -224,6 +225,7 @@ pub(crate) use task_ready::*;
 // Appended (issue #150).
 pub(crate) use task_overlap::*;
 // Appended (issue #147).
+pub(crate) use covering_tests::*;
 pub(crate) use task_evidence_gate::*;
 pub(crate) use transaction_time::*;
 pub(crate) use transitive_callees::*;
@@ -3000,6 +3002,65 @@ pub(crate) enum QuerySubcommand {
         /// `unsupported_combination` envelope).
         #[arg(long)]
         all_history: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Map a symbol to the tests that exercise it before an edit (issue #126).
+    ///
+    /// Given a symbol record ID (`codegraph:vN:<hex>`) or exact symbol name,
+    /// walks inbound `CALLS` edges and reports every test symbol (extractor-
+    /// stamped `role == "test"`) that can reach the target. Non-test callers
+    /// are traversed but never reported: a test that calls through a helper
+    /// surfaces as `transitive` (hop > 1) with its full call path. Rows are
+    /// reachability LEADS, not proof of coverage: absence of a covering test
+    /// is not proof the symbol is untested by other means.
+    ///
+    /// Output is NDJSON: a summary header line (target, direction, edge
+    /// labels, max depth, totals, truncation, diagnostics, corpus-mode
+    /// provenance, and the reachability-lead disclaimer) followed by one line
+    /// per covering test (`--format text` renders the human view).
+    ///
+    /// Exit codes:
+    ///   0 — completed, including the explicit empty result when the symbol
+    ///       has no covering test in this view.
+    ///   1 — malformed / ambiguous / unsupported handle, invalid --max-depth,
+    ///       or unsupported combination; machine-readable JSON on stderr.
+    ///   2 — handle resolves to no live record (stale or unknown), or
+    ///       --at/--as-of names no resolvable commit.
+    ///
+    /// Documented in `docs/cli/tests.md` and `docs/cli/query.md`.
+    Tests {
+        /// Symbol record ID (`codegraph:vN:<hex>`) or exact symbol name.
+        handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict symbol resolution to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Inbound walk depth bound (hops from the queried symbol).
+        /// Reaching the bound yields a truncation diagnostic with dropped
+        /// frontier counts per depth rather than silently omitting reachable
+        /// callers.
+        #[arg(long, default_value_t = 5)]
+        max_depth: usize,
+        /// Restrict the walk to the graph state at this commit SHA or unique
+        /// prefix (requires a history graph). Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Restrict the walk to the graph state at the most recent commit at
+        /// or before this RFC 3339 instant. Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Route the query through the running daemon's `tests_for_symbol`
+        /// verb instead of reading the local store.
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir")]
+        daemon: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -9366,6 +9427,76 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 format,
             )
         }
+        QuerySubcommand::Tests {
+            handle,
+            graph,
+            data_dir,
+            repo,
+            max_depth,
+            at,
+            as_of,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
+            format,
+        } => {
+            // Validate the bound before any store I/O: a zero-hop walk can
+            // never return the direct-caller set and is malformed input.
+            if max_depth == 0 {
+                let diag = serde_json::json!({
+                    "code": "invalid_max_depth",
+                    "max_depth": 0,
+                    "message": "--max-depth must be at least 1",
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            #[cfg(feature = "embedded-aletheiadb")]
+            if daemon {
+                let dir = data_dir
+                    .as_deref()
+                    .expect("clap requires --data-dir with --daemon");
+                return query_tests_via_daemon(
+                    &handle,
+                    dir,
+                    max_depth,
+                    at.as_deref(),
+                    as_of.as_deref(),
+                    repo.as_deref(),
+                    format,
+                );
+            }
+            // Strictly read-only lane (issue #424): opening the embedded engine
+            // in place re-persists its on-disk index files, so `--data-dir` reads
+            // from a throwaway copy, never the live store (same contract as
+            // `query path`/`query implementors`). Temporal selectors need the
+            // history-inclusive store view; the current-state read suffices
+            // otherwise. A JSONL graph is read identically either way.
+            let data_dir = resolve_query_data_dir(graph.as_deref(), data_dir);
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, Some(dir)) if at.is_some() || as_of.is_some() => {
+                    load_records_from_db_history_readonly(dir)?
+                }
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_tests_cmd(
+                &records,
+                &handle,
+                &index,
+                selected.as_deref(),
+                max_depth,
+                at.as_deref(),
+                as_of.as_deref(),
+                format,
+            );
+            Ok(())
+        }
         QuerySubcommand::Diagram {
             handle,
             graph,
@@ -9914,7 +10045,7 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     repo_scope.as_deref(),
                     at.as_deref(),
                     None,
-                )?)
+                ))
             } else {
                 None
             };

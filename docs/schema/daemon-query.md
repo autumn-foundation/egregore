@@ -160,6 +160,7 @@ wins and this document needs a fix.
 | `observations_for_symbol` | implemented | `name: string`, `supersession?: string` | Cross-domain symbol context (issue #86); parity with `eg query context`. |
 | `agent_sessions_for_repo` | implemented | `repo: string` (alias `repository_id`), `limit?: u64` (default 20, max 200) | Repo-scoped recency digest of recent agent sessions (issue #112); daemon face of `eg query sessions`. |
 | `criteria_for_task`      | implemented | `task_id: string`            | Task acceptance-criteria/evidence context over [`docs/schema/project-graph.md`](project-graph.md); daemon face of `eg query task`. |
+| `tests_for_symbol`       | implemented | `handle: string`, `max_depth?: u64` (default 5, min 1), `repo?: string`, `at?: string`, `as_of?: string` | Tests that exercise a symbol over inbound `CALLS` edges (issue #126); daemon face of `eg query tests`. |
 
 Partial-name symbol matching (`eg query symbols <PATTERN>`, issue #102) is
 **CLI-only in this slice**: the daemon exposes no substring/glob symbol verb,
@@ -436,6 +437,63 @@ machine-readable envelope:
 | 400 | `ambiguous_commit_prefix` | `at` matches more than one commit (`candidates` listed). |
 | 400 | `malformed_timestamp` | `as_of` is not a valid RFC 3339 instant. |
 | 400 | `empty_history` | Temporal pin on a history-less store. |
+
+---
+
+### `tests_for_symbol`
+
+Map a symbol to the tests that exercise it before an edit (issue #126): the
+daemon face of `eg query tests`. Walks inbound `CALLS` edges from the target
+symbol and reports every extractor-stamped test symbol (`role == "test"`) that
+can reach it, with the concrete connecting call path for each row.
+
+**Params:**
+```json
+{
+  "handle": "process_order",
+  "max_depth": 5,
+  "repo": "optional repository selector (same contract as every other verb)",
+  "at": "optional commit prefix (mutually exclusive with as_of)",
+  "as_of": "optional RFC 3339 instant (mutually exclusive with at)"
+}
+```
+
+`handle` accepts a stable symbol record ID (`codegraph:vN:<hex>`) or an exact
+symbol name; `max_depth` must be a positive integer (default 5). `at` /
+`as_of` reuse the same commit-pin machinery as the CLI `--at` / `--as-of`
+flags, so the temporal + repository-collision contract is identical. The
+request-level `as_of` selector is not applied: temporal pins are verb params
+here. The request-level row `limit` truncates the returned row set (the
+`tests` summary always reports the full counts).
+
+**Result shape:** `result.tests` is the `eg query tests` header verbatim
+(resolved `target`, `direction: "inbound"`, `edge_labels: ["CALLS"]`,
+`max_depth`, `total_covering_tests` / `direct_tests` / `transitive_tests`
+counts, `truncation`, `diagnostics`, corpus-mode provenance, and the
+reachability-lead disclaimer); the rows are returned as `result.records` with
+the standard `page` envelope.
+
+Traversal semantics (inbound `CALLS` only; `REFERENCES` excluded; non-test
+callers traversed but never reported; hop 1 = `direct`, hop > 1 =
+`transitive`; level-synchronized BFS with deterministic shortest paths;
+`trust: "reachability_lead"` on every row) are identical to the CLI lane —
+both faces run the same shared response computation. Rows are reachability
+leads, not coverage proof; see [`docs/cli/tests.md`](../cli/tests.md).
+
+**Typed errors:** failures are `ok:false` bodies whose `error.code` matches
+the CLI's typed codes:
+
+| HTTP | `error.code` | Meaning |
+|------|--------------|---------|
+| 404 | `no_match` | Handle resolves to no live record. |
+| 404 | `stale_handle` | Handle names a tombstoned record. |
+| 404 | `missing_commit` / `no_commit_at_or_before` | The `at` / `as_of` pin resolved to nothing. |
+| 404 | `empty_history` | Temporal pin on a history-less store. |
+| 400 | `ambiguous_handle` | Name matches more than one live symbol (`candidates` listed). |
+| 400 | `ambiguous_commit_prefix` | `at` matches more than one commit. |
+| 400 | `invalid_as_of_timestamp` | `as_of` is not a valid RFC 3339 instant. |
+| 400 | `unsupported_handle` | Handle resolved to a non-symbol node. |
+| 400 | `bad_request` | `max_depth` is not a positive integer, `at` and `as_of` are both set, or a param has the wrong JSON type. |
 
 ---
 

@@ -68,6 +68,8 @@ mod transaction_time;
 mod transitive_callees;
 mod transitive_callers;
 mod tx_delta;
+// Appended (issue #126); kept at the end to minimize cross-lane merge conflicts.
+mod covering_tests;
 mod undocumented;
 mod unreferenced;
 mod unsafe_sites;
@@ -154,6 +156,8 @@ pub use transitive_callers::*;
 pub use tx_delta::*;
 pub use undocumented::*;
 pub use unreferenced::*;
+// Appended (issue #126).
+pub use covering_tests::*;
 pub use unsafe_sites::*;
 pub use unwrap_expect::*;
 pub use verification_coverage::*;

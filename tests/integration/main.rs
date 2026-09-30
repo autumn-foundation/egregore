@@ -202,6 +202,8 @@ mod verify_scan;
 mod watch;
 // Appended (issue #246); kept at the end to minimize cross-lane merge conflicts.
 mod query_diagnostics;
+// Appended (issue #126); kept at the end to minimize cross-lane merge conflicts.
+mod covering_tests;
 // Appended (issue #240); kept at the end to minimize cross-lane merge conflicts.
 mod query_dead_code;
 // Appended (issue #196); kept at the end to minimize cross-lane merge conflicts.

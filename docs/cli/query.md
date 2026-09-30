@@ -35,6 +35,7 @@ eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>] [--max-records N
 eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N] [--max-records N]
 eg query transitive-callers <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query transitive-callees <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
+eg query tests <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--daemon --data-dir <DIR>] [--format json|text]
 eg query diagram <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N] [--max-nodes N] [--at <COMMIT> | --as-of <RFC3339>] [--format mermaid|dot|json|text]
 eg query deps     <HANDLE> --graph <PATH>   [--repo <SELECTOR>] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query deltas   <BASE> <HEAD> --graph <PATH> [--repo <SELECTOR>]
@@ -120,6 +121,12 @@ Evidence-backed audit subcommands have their own pages:
   `--max-depth`, deterministic under cycles, honoring `--at`/`--as-of`
   temporal views, with `CALLS` resolution labels propagated along each path
   ([transitive-callers.md](transitive-callers.md), issue #139).
+- `eg query tests` — the **tests that exercise a symbol**: walks inbound
+  `CALLS` edges and reports every extractor-stamped test symbol that can reach
+  the target — `direct` when the test calls it itself, `transitive` when it
+  reaches it through other callers (non-test callers are traversed but never
+  reported). Rows are reachability leads, not proof of coverage
+  ([tests.md](tests.md), issue #126).
 - `eg query transitive-callees` — the **transitive outbound-reachable set** of a
   symbol (its callees/dependencies) with one concrete connecting dependency
   path per row, bounded by `--max-depth`, deterministic under cycles, honoring
@@ -733,6 +740,7 @@ Several **single-domain** lanes already emit a top-level `trust` field with a
 | `change-impact` | `impact_lead` | the row is a lead to inspect, not a fact |
 | `deps`, `transitive-callees` | `dependency_lead` | ” |
 | `path`, `transitive-callers` | `reachability_lead` | ” |
+| `tests` | `reachability_lead` | the row is a test symbol with a `CALLS` path to the target — a lead to run, not proof the test covers it |
 | `coupling` | `historical_co_change_lead` | ” |
 | `task-ready` | `eligibility_lead` | the row is a dispatch-eligibility lead — every declared dependency is `closed_completed` — not a safety or correctness claim |
 | `task-overlap` | `inspection_lead` | the row is a footprint-overlap inspection lead — two in-flight tasks name the same code-graph handle(s) — never proof of edit conflict, correctness, or verification |

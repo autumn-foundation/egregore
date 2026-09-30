@@ -833,6 +833,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "tests",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["source_derived"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot", "valid_time"],
+        },
+    ),
+    (
         "undocumented",
         LaneStatic {
             store_mode: StoreMode::Structural,

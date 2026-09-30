@@ -28,6 +28,7 @@ use crate::{
         AdapterError, DanglingCitationPolicy, EmbeddedAletheiaSink, ExpectedRecordState,
         IngestReport, ingest_records_with_policy,
     },
+    cli::covering_tests::covering_tests_response_value,
     cli::locate::locate_response_value,
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
@@ -10320,6 +10321,146 @@ fn default_locate_error_message(
     }
 }
 
+// ── Verb handler: tests_for_symbol (issue #126) ───────────────────────────────
+
+/// The daemon face of `eg query tests <handle>`: walks inbound `CALLS` edges
+/// and returns the test symbols that can reach the target.
+fn verb_tests_for_symbol(args: &QueryVerbArgs<'_>, state: &ServerState) -> HttpResponse {
+    handle_verb_tests_for_symbol(
+        args.request_id,
+        args.params,
+        args.limit,
+        args.started,
+        args.budget,
+        args.domain,
+        state,
+    )
+}
+
+#[allow(clippy::too_many_lines)] // the verb's error taxonomy, one branch per failure mode
+fn handle_verb_tests_for_symbol(
+    request_id: &str,
+    params: &serde_json::Value,
+    limit: usize,
+    started: Instant,
+    budget: Option<Duration>,
+    domain: &str,
+    state: &ServerState,
+) -> HttpResponse {
+    let handle = match params.get("handle").and_then(serde_json::Value::as_str) {
+        Some(h) => h.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::missing_field("params.handle"),
+            );
+        }
+    };
+    let max_depth = match params.get("max_depth") {
+        None | Some(serde_json::Value::Null) => 5,
+        Some(v) => match v.as_u64() {
+            Some(n) if n >= 1 => usize::try_from(n).unwrap_or(usize::MAX),
+            _ => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request("params.max_depth must be a positive integer"),
+                );
+            }
+        },
+    };
+    // Optional string params: reject non-string values rather than silently
+    // ignoring them (same discipline as `handle_verb_locate`).
+    let optional_param = |name: &str| -> Result<Option<String>, HttpResponse> {
+        match params.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request(format!("params.{name} must be a string")),
+            )),
+        }
+    };
+    let at = match optional_param("at") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let as_of = match optional_param("as_of") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if at.is_some() && as_of.is_some() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request("params.at and params.as_of are mutually exclusive"),
+        );
+    }
+
+    let (records, snapshot, _store_tx_bounds, repo_index) =
+        match load_all_records_for_verb(state, started, budget, domain, false) {
+            Ok(r) => r,
+            Err(e) => return HttpResponse::error_with_id(request_id, e),
+        };
+    let selected_repo = match resolve_verb_repo_selector(params, &repo_index) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+
+    // Enforce timeout after the in-memory load phase.
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
+
+    match covering_tests_response_value(
+        &records,
+        &handle,
+        &repo_index,
+        selected_repo.as_deref(),
+        max_depth,
+        at.as_deref(),
+        as_of.as_deref(),
+    ) {
+        Ok((header, rows)) => {
+            let rows: Vec<serde_json::Value> = rows.into_iter().take(limit).collect();
+            let mut result = verb_success_result("tests_for_symbol", &snapshot, &rows);
+            result["tests"] = header;
+            HttpResponse::success(Some(request_id), 200, result)
+        }
+        Err(failure) => {
+            // The shared failure payloads carry the typed code either at top
+            // level (`code`) or nested under `error.code`; promote the nested
+            // form to the top level so the client's `DaemonQueryRejection`
+            // extraction (`error.code`) sees the CLI's typed code verbatim.
+            let mut error = failure.payload.clone();
+            if error.get("code").is_none()
+                && let Some(code) = failure.payload.pointer("/error/code").cloned()
+                && let Some(obj) = error.as_object_mut()
+            {
+                obj.insert("code".to_owned(), code);
+            }
+            let code = error
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let status = match code {
+                "no_match"
+                | "stale_handle"
+                | "empty_history"
+                | "missing_commit"
+                | "no_commit_at_or_before" => 404,
+                _ => 400,
+            };
+            HttpResponse::json(
+                status,
+                json!({
+                    "ok": false,
+                    "request_id": request_id,
+                    "error": error,
+                }),
+            )
+        }
+    }
+}
+
 // ── Verb handler: drift_top_n ─────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -12109,6 +12250,13 @@ const QUERY_VERB_TABLE: &[QueryVerbSpec] = &[
         status: QueryVerbStatus::Implemented,
         reserved_reason: None,
         handler: Some(verb_symbol_by_name),
+    },
+    QueryVerbSpec {
+        // The daemon face of `eg query tests <handle>` (issue #126).
+        name: "tests_for_symbol",
+        status: QueryVerbStatus::Implemented,
+        reserved_reason: None,
+        handler: Some(verb_tests_for_symbol),
     },
 ];
 
@@ -16713,6 +16861,7 @@ mod tests {
             "drift_top_n" | "clone_classes" | "semantic_search" | "drift" => json!({}),
             "criteria_for_task" => json!({ "task_id": "capability-probe-missing-task" }),
             "agent_sessions_for_repo" => json!({ "repo": "capability-probe-missing-repo" }),
+            "tests_for_symbol" => json!({ "handle": "capability-probe-missing-symbol" }),
             other => panic!(
                 "capability probe has no canned params for verb '{other}'; \
                  add them to capability_probe_params"

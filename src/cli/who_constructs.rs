@@ -155,7 +155,7 @@ pub(crate) fn query_who_constructs_cmd(
     let mut at_commit: Option<String> = None;
     let filtered: Option<Vec<GraphRecord>> =
         if matches!(corpus_mode, query::CorpusMode::CommitPinned) {
-            let sha = resolve_transitive_commit_view(records, index, repo_scope, at, as_of)?;
+            let sha = resolve_transitive_commit_view(records, index, repo_scope, at, as_of);
             let view: Vec<GraphRecord> = records
                 .iter()
                 .filter(|r| match r {

@@ -388,11 +388,11 @@ fn narrow_to_commit_view(
     repo_scope: Option<&str>,
     at: Option<&str>,
     as_of: Option<&str>,
-) -> Result<(Option<Vec<GraphRecord>>, Option<String>)> {
+) -> (Option<Vec<GraphRecord>>, Option<String>) {
     if at.is_none() && as_of.is_none() {
-        return Ok((None, None));
+        return (None, None);
     }
-    let sha = resolve_transitive_commit_view(records, index, repo_scope, at, as_of)?;
+    let sha = resolve_transitive_commit_view(records, index, repo_scope, at, as_of);
     let view: Vec<GraphRecord> = records
         .iter()
         .filter(|r| match r {
@@ -406,7 +406,7 @@ fn narrow_to_commit_view(
         })
         .cloned()
         .collect();
-    Ok((Some(view), Some(sha)))
+    (Some(view), Some(sha))
 }
 
 /// Resolve the CLI handle to exactly one live symbol's record ID, exiting
@@ -613,7 +613,7 @@ pub(crate) fn query_diagram_cmd(
     format: DiagramFormat,
 ) -> Result<()> {
     // ── temporal narrowing: one commit's snapshot view (issues #8/#66) ────────
-    let (filtered, at_commit) = narrow_to_commit_view(records, index, repo_scope, at, as_of)?;
+    let (filtered, at_commit) = narrow_to_commit_view(records, index, repo_scope, at, as_of);
     let records: &[GraphRecord] = filtered.as_deref().unwrap_or(records);
 
     // ── handle resolution (symbol record ID or exact symbol name only) ────────
