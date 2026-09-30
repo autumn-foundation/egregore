@@ -143,14 +143,33 @@ pub fn is_string_interner_capacity_error(message: &str) -> bool {
         || message.contains("DoS protection")
 }
 
+/// Outcome of a single record write through a [`GraphSink`] (issue #130).
+///
+/// Re-ingesting an unchanged source must converge to a no-op: when the sink
+/// already holds byte-identical state for the record's stable ID it writes
+/// nothing and reports [`WriteOutcome::Unchanged`], so the ingest report can
+/// surface a no-op re-ingest explicitly instead of looking like silent `+N`
+/// growth.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum WriteOutcome {
+    /// The record was newly written (or superseded a prior version).
+    Inserted,
+    /// The record was byte-identical to stored state; nothing was written.
+    Unchanged,
+}
+
 /// Destination for graph records.
 pub trait GraphSink {
     /// Writes one graph record.
     ///
+    /// Returns [`WriteOutcome::Unchanged`] when the sink already holds
+    /// byte-identical state for the record's stable ID and wrote nothing, or
+    /// [`WriteOutcome::Inserted`] when a physical write landed.
+    ///
     /// # Errors
     ///
     /// Returns an error if the sink cannot durably accept the record.
-    fn write_record(&mut self, record: &GraphRecord) -> AdapterResult<()>;
+    fn write_record(&mut self, record: &GraphRecord) -> AdapterResult<WriteOutcome>;
 
     /// Reads a graph record back by its stable ID.
     ///
@@ -180,6 +199,13 @@ pub trait GraphSink {
 }
 
 /// Summary of an ingest attempt.
+///
+/// The upsert breakdown (issue #130): `inserted` counts records that were
+/// newly written or superseded a prior version, `unchanged` counts records
+/// skipped because the sink already held byte-identical state. Invariant:
+/// `succeeded == inserted + unchanged`. A no-op re-ingest of an unchanged
+/// source therefore reports `inserted: 0, unchanged: N` instead of silent
+/// `+N` growth.
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct IngestReport {
     /// Number of records attempted.
@@ -190,6 +216,10 @@ pub struct IngestReport {
     pub failed: usize,
     /// Per-record failures.
     pub failures: Vec<IngestFailure>,
+    /// Records newly written (or superseding a prior version) by this ingest.
+    pub inserted: usize,
+    /// Records skipped because the sink already held byte-identical state.
+    pub unchanged: usize,
 }
 
 impl IngestReport {
@@ -548,7 +578,14 @@ pub fn ingest_records_with_policy<S: GraphSink>(
             continue;
         }
         match write_and_verify(record, sink) {
-            Ok(()) => report.succeeded += 1,
+            Ok(WriteOutcome::Inserted) => {
+                report.succeeded += 1;
+                report.inserted += 1;
+            }
+            Ok(WriteOutcome::Unchanged) => {
+                report.succeeded += 1;
+                report.unchanged += 1;
+            }
             Err(error) => {
                 report.failed += 1;
                 report.failures.push(IngestFailure {
@@ -622,9 +659,17 @@ pub struct DryRunSink {
 }
 
 impl GraphSink for DryRunSink {
-    fn write_record(&mut self, record: &GraphRecord) -> AdapterResult<()> {
-        self.records.insert(record.id().to_owned(), record.clone());
-        Ok(())
+    fn write_record(&mut self, record: &GraphRecord) -> AdapterResult<WriteOutcome> {
+        // A dry run has no store to compare against, so "unchanged" means the
+        // batch itself already carried this exact record: nothing new would be
+        // written for it.
+        match self.records.get(record.id()) {
+            Some(existing) if existing == record => Ok(WriteOutcome::Unchanged),
+            _ => {
+                self.records.insert(record.id().to_owned(), record.clone());
+                Ok(WriteOutcome::Inserted)
+            }
+        }
     }
 
     fn read_back(&self, record_id: &str) -> AdapterResult<Option<GraphRecord>> {
@@ -653,7 +698,16 @@ impl FakeSink {
 }
 
 impl GraphSink for FakeSink {
-    fn write_record(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+    fn write_record(&mut self, record: &GraphRecord) -> AdapterResult<WriteOutcome> {
+        // A no-op re-write can never fail: the data is already there, so it
+        // neither consumes the failure budget nor counts as a write.
+        if self
+            .records
+            .get(record.id())
+            .is_some_and(|existing| existing == record)
+        {
+            return Ok(WriteOutcome::Unchanged);
+        }
         if self.fail_after.is_some_and(|limit| self.written >= limit) {
             return Err(AdapterError::Rejected {
                 record_id: record.id().to_owned(),
@@ -663,7 +717,7 @@ impl GraphSink for FakeSink {
 
         self.records.insert(record.id().to_owned(), record.clone());
         self.written += 1;
-        Ok(())
+        Ok(WriteOutcome::Inserted)
     }
 
     fn read_back(&self, record_id: &str) -> AdapterResult<Option<GraphRecord>> {
@@ -671,10 +725,14 @@ impl GraphSink for FakeSink {
     }
 }
 
-fn write_and_verify<S: GraphSink>(record: &GraphRecord, sink: &mut S) -> AdapterResult<()> {
+fn write_and_verify<S: GraphSink>(
+    record: &GraphRecord,
+    sink: &mut S,
+) -> AdapterResult<WriteOutcome> {
     validate_adapter_record_version(record)?;
-    sink.write_record(record)?;
-    sink.verify_record(record)
+    let outcome = sink.write_record(record)?;
+    sink.verify_record(record)?;
+    Ok(outcome)
 }
 
 pub(crate) fn validate_adapter_record_version(record: &GraphRecord) -> AdapterResult<()> {
@@ -1153,5 +1211,89 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("capacity exceeded for string interner"));
         assert!(rendered.contains("100000"));
+    }
+
+    // -----------------------------------------------------------------------------------------------------------
+    // Issue #130: re-ingesting an unchanged source converges to a no-op.
+    //
+    // The ingest report must distinguish records that were newly written
+    // (`inserted`) from records that were skipped because the sink already
+    // holds byte-identical state (`unchanged`), so a no-op re-ingest is
+    // observable in the report instead of looking like silent `+N` growth.
+    // Invariant: `succeeded == inserted + unchanged`.
+    // -----------------------------------------------------------------------------------------------------------
+
+    fn reingest_fixture_records() -> Vec<GraphRecord> {
+        vec![
+            plain_node("codegraph:v1:reingest-a", NodeKind::File),
+            plain_node("codegraph:v1:reingest-b", NodeKind::Symbol),
+        ]
+    }
+
+    #[test]
+    fn first_ingest_reports_all_inserted_none_unchanged() {
+        let records = reingest_fixture_records();
+        let mut sink = FakeSink::default();
+        let report = ingest_records(&records, &mut sink);
+        assert!(report.is_success());
+        assert_eq!(report.attempted, records.len());
+        assert_eq!(report.succeeded, records.len());
+        assert_eq!(report.inserted, records.len());
+        assert_eq!(report.unchanged, 0);
+        assert_eq!(report.succeeded, report.inserted + report.unchanged);
+    }
+
+    #[test]
+    fn reingest_of_unchanged_batch_reports_all_unchanged_none_inserted() {
+        let records = reingest_fixture_records();
+        let mut sink = FakeSink::default();
+        let first = ingest_records(&records, &mut sink);
+        assert!(first.is_success());
+
+        let second = ingest_records(&records, &mut sink);
+        assert!(second.is_success());
+        assert_eq!(second.attempted, records.len());
+        assert_eq!(second.succeeded, records.len());
+        assert_eq!(
+            second.inserted, 0,
+            "a no-op re-ingest must not report new writes"
+        );
+        assert_eq!(second.unchanged, records.len());
+        assert_eq!(second.succeeded, second.inserted + second.unchanged);
+        assert_eq!(second.failed, 0);
+    }
+
+    #[test]
+    fn changed_record_reingest_reports_inserted_not_unchanged() {
+        let mut sink = FakeSink::default();
+        let first = ingest_records(&reingest_fixture_records(), &mut sink);
+        assert!(first.is_success());
+
+        // Same stable IDs, different payload: the changed record must count
+        // as an insert (a superseding write), not as unchanged.
+        let mut changed = reingest_fixture_records();
+        if let GraphRecord::Node { summary, .. } = &mut changed[0] {
+            *summary = "changed summary".to_owned();
+        }
+        let second = ingest_records(&changed, &mut sink);
+        assert!(second.is_success());
+        assert_eq!(second.inserted, 1);
+        assert_eq!(second.unchanged, 1);
+    }
+
+    #[test]
+    fn write_outcome_distinguishes_insert_from_noop() {
+        let mut sink = FakeSink::default();
+        let records = reingest_fixture_records();
+        assert_eq!(
+            sink.write_record(&records[0]),
+            Ok(WriteOutcome::Inserted),
+            "first write of a record is an insert"
+        );
+        assert_eq!(
+            sink.write_record(&records[0]),
+            Ok(WriteOutcome::Unchanged),
+            "byte-identical re-write is a no-op"
+        );
     }
 }

@@ -15,7 +15,7 @@ use crate::embeddings::{EmbeddingVectorKey, EmbeddingVectorMap};
 use crate::{
     adapters::{
         AdapterError, AdapterResult, ExpectedRecordState, GraphSink, InspectStoreReport,
-        validate_adapter_record_version,
+        WriteOutcome, validate_adapter_record_version,
     },
     daemon::StoreLease,
     identity::{is_local_remote_url, repository_id_matches_payload},
@@ -2550,7 +2550,7 @@ impl EmbeddedAletheiaSink {
 }
 
 impl GraphSink for EmbeddedAletheiaSink {
-    fn write_record(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+    fn write_record(&mut self, record: &GraphRecord) -> AdapterResult<WriteOutcome> {
         validate_adapter_record_version(record)?;
         match record {
             GraphRecord::Node { .. } => self.write_node(record),
@@ -2725,7 +2725,7 @@ impl EmbeddedAletheiaSink {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn write_node(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+    fn write_node(&mut self, record: &GraphRecord) -> AdapterResult<WriteOutcome> {
         // Same revive-after-tombstone guard as `write_edge` (#333 Codex round-7):
         // a byte-identical node whose stable ID is actively tombstoned must write
         // a fresh version so the newer NodeId supersedes the tombstone and the
@@ -2736,7 +2736,7 @@ impl EmbeddedAletheiaSink {
         {
             #[cfg(feature = "embeddings")]
             self.backfill_embedding_for_matched_node(record)?;
-            return Ok(());
+            return Ok(WriteOutcome::Unchanged);
         }
         let GraphRecord::Node {
             id,
@@ -3221,7 +3221,7 @@ impl EmbeddedAletheiaSink {
         self.node_lookup.insert(id.clone(), node_id, temporal_key);
         self.record_handles
             .insert(id.clone(), StoredRecord::Node(node_id));
-        Ok(())
+        Ok(WriteOutcome::Inserted)
     }
 
     #[cfg(feature = "embeddings")]
@@ -3527,7 +3527,7 @@ impl EmbeddedAletheiaSink {
         }
     }
 
-    fn write_tombstone(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+    fn write_tombstone(&mut self, record: &GraphRecord) -> AdapterResult<WriteOutcome> {
         // A byte-identical tombstone is only a no-op while the stored copy is
         // still active. Once a newer write of the deleted ID supersedes it
         // (a revived record), re-issuing the same tombstone must land as a
@@ -3536,7 +3536,7 @@ impl EmbeddedAletheiaSink {
         if self.expected_record_state(record)? == ExpectedRecordState::Matched
             && !self.stored_tombstone_is_stale(record.id())?
         {
-            return Ok(());
+            return Ok(WriteOutcome::Unchanged);
         }
         let GraphRecord::Tombstone {
             id,
@@ -3589,10 +3589,10 @@ impl EmbeddedAletheiaSink {
         self.tombstone_node_seqs.insert(node_id, seq);
         self.record_handles
             .insert(id.clone(), StoredRecord::Tombstone(node_id));
-        Ok(())
+        Ok(WriteOutcome::Inserted)
     }
 
-    fn write_edge(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+    fn write_edge(&mut self, record: &GraphRecord) -> AdapterResult<WriteOutcome> {
         // A re-emitted edge whose bytes match an existing physical edge is
         // normally a no-op. But when the edge's stable ID is CURRENTLY actively
         // tombstoned, that matching physical edge is being SUPPRESSED by the
@@ -3605,7 +3605,7 @@ impl EmbeddedAletheiaSink {
         if self.expected_record_state(record)? == ExpectedRecordState::Matched
             && !self.active_deleted_ids()?.contains(record.id())
         {
-            return Ok(());
+            return Ok(WriteOutcome::Unchanged);
         }
 
         let GraphRecord::Edge {
@@ -3707,7 +3707,7 @@ impl EmbeddedAletheiaSink {
         self.record_handles
             .insert(id.clone(), StoredRecord::Edge(edge_id));
         self.edge_seqs.insert(id.clone(), seq);
-        Ok(())
+        Ok(WriteOutcome::Inserted)
     }
 
     fn resolve_node_id(

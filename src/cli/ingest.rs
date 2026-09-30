@@ -249,6 +249,8 @@ pub(crate) fn ingest(
                 dangling_citation_policy,
             )?;
             println!("attempted: {}", response.attempted);
+            println!("inserted: {}", response.inserted);
+            println!("unchanged: {}", response.unchanged);
             println!("succeeded: {}", response.succeeded);
             println!("failed: {}", response.failed);
             println!("idempotent: {}", response.idempotent);
@@ -262,7 +264,14 @@ pub(crate) fn ingest(
         }
     };
 
+    // Upsert summary (issue #130): `inserted` counts records newly written by
+    // this ingest, `unchanged` counts records skipped because the sink already
+    // held byte-identical state. A no-op re-ingest of an unchanged source
+    // reports `inserted: 0` / `unchanged: N` instead of silent `+N` growth.
+    // `succeeded` is kept as the `inserted + unchanged` total for back-compat.
     println!("attempted: {}", report.attempted);
+    println!("inserted: {}", report.inserted);
+    println!("unchanged: {}", report.unchanged);
     println!("succeeded: {}", report.succeeded);
     println!("failed: {}", report.failed);
 

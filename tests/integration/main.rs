@@ -36,6 +36,8 @@ mod deps;
 mod deterministic_scan;
 mod doc_ingest;
 mod doctor;
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+mod embed_fixture;
 mod embeddings;
 mod error_context;
 mod evidence_freshness;
@@ -149,6 +151,7 @@ mod redaction;
 mod redaction_report;
 mod reembed;
 mod refresh;
+mod reingest_noop;
 mod repair;
 mod repo_catalog;
 mod repo_scope;

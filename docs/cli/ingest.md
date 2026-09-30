@@ -34,6 +34,65 @@ Read the identity back with `eg inspect --data-dir <DIR>`; the full contract and
 the re-ingest workflow are in
 [`semantic-index-identity.md`](semantic-index-identity.md).
 
+## Re-ingest convergence: an unchanged source is a no-op (issue #130)
+
+Record IDs are stable content hashes (blake3, issue #12), so re-ingesting the
+same `graph.jsonl` bytes addresses the same records. Before writing, the
+embedded sink compares each record byte-for-byte against the stored state
+(`ExpectedRecordState::Matched`); a record that matches is **skipped** — no
+duplicate physical version is written, no transaction-time history inflates the
+census, and every code-graph node/edge identity keeps resolving to exactly one
+current record. The one exception is deliberate: a byte-identical re-emit of a
+record whose stable ID is *actively tombstoned* writes a fresh version so the
+newer write supersedes the tombstone and the record is revived (issues #231,
+#333); tombstones themselves are likewise re-issued only once they go stale.
+
+Every ingest therefore reports an explicit upsert summary:
+
+```powershell
+eg ingest graph.jsonl --adapter embedded --data-dir .egregore
+# attempted: 1234
+# inserted: 1234
+# unchanged: 0
+# succeeded: 1234
+# failed: 0
+```
+
+- `inserted` — records newly written (or superseding a prior version).
+- `unchanged` — records skipped because the store already held
+  byte-identical state.
+- `succeeded` — the `inserted + unchanged` total, kept for back-compat.
+
+Re-ingesting the identical graph converges to a visible no-op:
+
+```powershell
+eg ingest graph.jsonl --adapter embedded --data-dir .egregore
+# attempted: 1234
+# inserted: 0
+# unchanged: 1234
+# succeeded: 1234
+# failed: 0
+```
+
+`inserted: 0` / `unchanged: N` is the convergence signal — it replaces what
+used to look like silent `+N` growth (`succeeded: N` on every run gave no way
+to tell a fresh ingest from a no-op). The daemon adapter reports the same
+breakdown in its response (`inserted` / `unchanged` alongside `idempotent`).
+
+After a no-op re-ingest, `eg inspect --data-dir <DIR>` produces a
+byte-identical census (records, nodes, edges, tombstones), and
+`eg query symbol <NAME>` / `eg query file <PATH>` return the same id set with
+the same count as after the first ingest — no duplicate current nodes or
+edges. Net new *current* (queryable) logical records added by a no-op
+re-ingest is 0. This holds for structural-only stores and for `--embed`
+stores alike, and for `eg import-traj` artifacts: the importer derives stable
+IDs from the trajectory bytes, so ingesting the same trajectory twice does
+not duplicate `AgentSession` / `AgentRun` / `Observation` / `Failure` records.
+
+Out of scope: incremental refresh from working-tree *edits* (issue #98) and
+daemon request-level idempotency keys (already in `src/daemon.rs`) are
+separate mechanisms with their own contracts.
+
 ## Capacity preflight and fatal capacity classification (issue #439)
 
 `AletheiaDB` bounds its **process-global string interner** — a DoS-protection

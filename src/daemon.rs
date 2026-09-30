@@ -177,6 +177,16 @@ pub struct DaemonIngestResponse {
     pub record_ids: Vec<String>,
     /// True when returned from the idempotency cache.
     pub idempotent: bool,
+    /// Records newly written (or superseding a prior version) by this ingest
+    /// (issue #130). `#[serde(default)]` keeps idempotency-cache entries
+    /// persisted by older binaries deserializable.
+    #[serde(default)]
+    pub inserted: usize,
+    /// Records skipped because the store already held byte-identical state
+    /// (issue #130). `#[serde(default)]` keeps idempotency-cache entries
+    /// persisted by older binaries deserializable.
+    #[serde(default)]
+    pub unchanged: usize,
 }
 
 /// One daemon ingest failure.
@@ -204,6 +214,8 @@ impl DaemonIngestResponse {
                 .collect(),
             record_ids,
             idempotent,
+            inserted: report.inserted,
+            unchanged: report.unchanged,
         }
     }
 }
@@ -2222,8 +2234,12 @@ fn recover_pending_write_pre_validation(
         succeeded: pending_record_ids.len(),
         failed: 0,
         failures: Vec::new(),
-        record_ids: pending_record_ids,
+        record_ids: pending_record_ids.clone(),
         idempotent: true,
+        // Recovery verified every record already matches the store: nothing
+        // new was written by this call (issue #130).
+        inserted: 0,
+        unchanged: pending_record_ids.len(),
     };
     complete_idempotency_entry(
         &command.idempotency_key,
@@ -2435,6 +2451,10 @@ fn recover_pending_write(
             .map(|record| record.id().to_owned())
             .collect::<Vec<_>>(),
         idempotent: false,
+        // Every record verified Matched against the committed store: this
+        // recovery wrote nothing new (issue #130).
+        inserted: 0,
+        unchanged: records.len(),
     };
     complete_idempotency_entry(idempotency_key, payload_hash, &response, idempotency)?;
     let mut response = response;
@@ -8220,6 +8240,10 @@ fn finalized_entry(payload_hash: &str, record_ids: &[String]) -> IdempotencyEntr
             failures: Vec::new(),
             record_ids: record_ids.to_vec(),
             idempotent: false,
+            // A finalized receipt describes an already-durable write: nothing
+            // new is written when it is served (issue #130).
+            inserted: 0,
+            unchanged: record_ids.len(),
         },
     }
 }
@@ -12675,6 +12699,8 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
                                 }],
                                 record_ids: Vec::new(),
                                 idempotent: false,
+                                inserted: 0,
+                                unchanged: 0,
                             };
                             update_job(
                                 &state_clone,
@@ -12752,6 +12778,8 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
                     }],
                     record_ids: Vec::new(),
                     idempotent: false,
+                    inserted: 0,
+                    unchanged: 0,
                 };
                 update_job(&state, &job_id_for_thread, "failed", "failed", Some(report));
             }
@@ -14425,6 +14453,10 @@ mod tests {
             failures: Vec::new(),
             record_ids: vec![record.id().to_owned()],
             idempotent: false,
+            // The cached entry describes the original committed write
+            // (issue #130).
+            inserted: 1,
+            unchanged: 0,
         };
         let idempotency = Arc::new(Mutex::new(IdempotencyStore {
             path: temp.path().join("idempotency.json"),
@@ -16409,6 +16441,10 @@ mod tests {
                     failures: Vec::new(),
                     record_ids: vec!["codegraph:v1:clean".to_owned()],
                     idempotent: false,
+                    // The receipt describes the original committed write
+                    // (issue #130).
+                    inserted: 1,
+                    unchanged: 0,
                 },
             },
         );
