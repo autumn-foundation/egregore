@@ -165,7 +165,7 @@ fn resolve_similar_anchor<'r>(
 /// (score descending, `record_id` ascending) before the limit truncation, so
 /// both the row sequence and the truncation boundary are stable across runs
 /// against an unchanged store (issue #199).
-fn rank_similar_matches(matches: &mut Vec<SemanticMatch>, anchor_id: &str, limit: usize) {
+fn rank_similar_matches(matches: &mut Vec<SemanticMatch>, anchor_id: &str, limit: usize) -> usize {
     matches.retain(|m| {
         m.record_id != anchor_id
             // Code search must never blend agent-authored memory hits into
@@ -175,7 +175,11 @@ fn rank_similar_matches(matches: &mut Vec<SemanticMatch>, anchor_id: &str, limit
             && m.score > SIMILAR_SCORE_FLOOR
     });
     matches.sort_by(crate::adapters::compare_semantic_matches);
+    // Issue #121: the pre-truncate pool size feeds the per-row completeness
+    // stamp — bind it before the limit narrows the rows.
+    let total_matches = matches.len();
     matches.truncate(limit);
+    total_matches
 }
 
 /// Refuses a `similar` query against a store whose vector index is absent or
@@ -250,7 +254,7 @@ pub(crate) fn query_similar_cmd(
     };
     // The anchor's stored vector is the query: no model load, no re-scan.
     let mut matches = sink.semantic_search(&anchor_vector, records.len().max(1))?;
-    rank_similar_matches(&mut matches, &anchor_id, limit);
+    let total_matches = rank_similar_matches(&mut matches, &anchor_id, limit);
     if matches.is_empty() {
         eprintln!(
             "{NO_SIMILAR_MATCHES_CODE}: no nodes similar to '{}' scored above {SIMILAR_SCORE_FLOOR}",
@@ -259,8 +263,10 @@ pub(crate) fn query_similar_cmd(
         std::process::exit(2);
     }
     let index = query::RepositoryIndex::build(&records);
+    // Issue #121: the top-`limit` cut narrows the scored pool — stamp every row.
+    let completeness = RowCompleteness::capped(total_matches, limit);
     for m in &matches {
-        print_result(&SemanticResult::from_match(m, &index), format)?;
+        print_result(&SemanticResult::from_match(m, &index, completeness), format)?;
     }
     Ok(())
 }
@@ -420,9 +426,13 @@ mod tests {
             test_match("id-b", "b", 0.8),
         ];
 
-        rank_similar_matches(&mut matches, "id-anchor", 2);
+        let total_matches = rank_similar_matches(&mut matches, "id-anchor", 2);
 
         let ids: Vec<&str> = matches.iter().map(|m| m.record_id.as_str()).collect();
         assert_eq!(ids, vec!["id-a", "id-b"]);
+        assert_eq!(
+            total_matches, 3,
+            "the pre-truncate pool size feeds the issue #121 completeness stamp"
+        );
     }
 }

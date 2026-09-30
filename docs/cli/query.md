@@ -481,6 +481,48 @@ One human-readable line per result for terminal use. The exact format is not sta
 
 ---
 
+## Answer completeness signal (issue #121)
+
+Every `eg query` JSON answer carries a stable completeness signal on each
+result row, so a machine consumer can tell a complete answer from one a cap or
+a single-winner selection silently truncated.
+
+| Field | Type | Always present | Description |
+|-------|------|----------------|-------------|
+| `result_complete` | boolean | yes | `true` when the printed row set is the complete match set — no cap or selection hid further rows. |
+| `total_matches` | number | only when narrowed | Candidate count before the cap or selection narrowed the set. |
+| `applied_limit` | number | only when narrowed | The cap that narrowed the set: the `--limit` value, or `1` for a single-winner selection. |
+
+The rule is uniform across lanes: `result_complete` is `true` exactly when the
+printed rows ARE the full match set. `total_matches` and `applied_limit` are
+reported if and only if a cap or selection actually narrowed the set — their
+presence is equivalent to `result_complete == false`. When the answer is
+complete they are omitted; `result_complete` is the authoritative "more
+available" signal, not the absence of the totals.
+
+Lane semantics:
+
+- `query drift --limit N`, `query semantic --limit N`, `query similar
+  --limit N`: top-N cuts. `total_matches` counts the candidates before the
+  cut (after repository scoping), `applied_limit` echoes the effective limit.
+- `query symbol --at`, `query symbol --as-of`: single-winner selections. One
+  row is kept from `total_matches` candidates; `applied_limit` is `1`.
+- `query file`, uncapped `query symbol`, `query symbols`: exhaustive
+  listings — `result_complete: true`, totals omitted.
+
+The exit-2 no-match path prints no JSON answer at all (a single-line message
+goes to stderr), so it cannot contradict the signal: a no-match outcome is
+definitionally complete with zero total matches.
+
+Over `--daemon`, the signal is stamped client-side from the pre-truncate pool
+the daemon reports in the verb `page` envelope. A daemon predating this
+signal reports no pool — then the rows carry no stamp rather than a guess.
+
+Field names are stable across releases. Machine consumers should depend only
+on the fields documented here; additional fields may be added later.
+
+---
+
 ## Record budget (`--max-records`, issue #211)
 
 The composite evidence answers — `eg query context`, `eg query memory`,
@@ -1416,6 +1458,9 @@ eg query symbol <NAME> --graph <PATH> [--at <COMMIT>] [--format json|text]
 | `git_commit` | string | only in history graphs | Full commit SHA for history-backed records. |
 | `repository_id` | string | when attributable | Stable `Repository` record ID owning the row. Absent only for legacy graphs without repository topology. |
 | `repository` | string | when attributable | Human-usable repository identity handle, e.g. `acme/widget`. |
+| `result_complete` | boolean | yes | Completeness signal (issue #121): `true` for the full name lookup; `false` when `--at` / `--as-of` picked a single winner from several candidates. |
+| `total_matches` | number | only when narrowed | Candidate count before the `--at` / `--as-of` single-winner selection. |
+| `applied_limit` | number | only when narrowed | `1` for the single-winner selection. |
 
 ### Example
 
@@ -1777,6 +1822,9 @@ eg query drift --graph <PATH> [--limit N] [--format json|text]
 | `name` | string or null | when resolvable | Name of the drift target. |
 | `repository_id` | string | when attributable | Stable `Repository` record ID of the drift target's repository. |
 | `repository` | string | when attributable | Human-usable repository identity handle. |
+| `result_complete` | boolean | yes | Completeness signal (issue #121): `false` when the `--limit` cap narrowed the ranked pool. |
+| `total_matches` | number | only when narrowed | Drift candidate count before the `--limit` cut (after repository scoping). |
+| `applied_limit` | number | only when narrowed | The effective `--limit` that narrowed the answer. |
 
 Ties in `score` are broken by `record_id` ascending. Drift records from
 different repositories are never merged: each row carries its own repository
@@ -1921,6 +1969,9 @@ One JSON object per line (JSONL). The default output format is `json`. Field nam
 | `confidence_band` | string | yes | Per-row confidence band (issue #263): `\"strong\"` when `score >= 0.39`, else `\"weak\"`. A pure deterministic function of `score`. |
 | `selection_threshold` | number | yes | The calibrated confident threshold (`0.39`) this row was judged against. |
 | `selection_basis` | string | yes | How the threshold was set: `\"corpus_calibrated_confidence_floor\"`; mirrors drift's `selection_basis`. |
+| `result_complete` | boolean | yes | Completeness signal (issue #121): `false` when the `--limit` top-k cut narrowed the candidate pool. |
+| `total_matches` | number | only when narrowed | Candidate count before the `--limit` cut (after repository scoping). |
+| `applied_limit` | number | only when narrowed | The effective `--limit` that narrowed the answer. |
 
 Every non-empty JSON answer additionally carries a top-level `{"confidence": {...}}` answer line between the embedding-provenance envelope and the result rows — the calibrated answer-level verdict (issues #263, #221). It is a separate JSONL line, not a row field; see "Confidence verdicts" below for its contract.
 

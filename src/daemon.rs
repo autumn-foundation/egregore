@@ -8807,6 +8807,29 @@ fn verb_success_result(
     })
 }
 
+/// Reports the pre-truncate pool in a verb result's `page` envelope
+/// (issue #121): `total_matches` is the candidate count before the cap
+/// narrowed the rows, `applied_limit` the effective cap. Additive — existing
+/// `page` consumers are unaffected. The CLI rebuilds each row's completeness
+/// stamp from these two fields.
+fn verb_result_with_completeness(
+    mut result: serde_json::Value,
+    total_matches: usize,
+    applied_limit: usize,
+) -> serde_json::Value {
+    if let Some(page) = result.get_mut("page").and_then(|p| p.as_object_mut()) {
+        page.insert(
+            "total_matches".to_owned(),
+            serde_json::Value::from(total_matches as u64),
+        );
+        page.insert(
+            "applied_limit".to_owned(),
+            serde_json::Value::from(applied_limit as u64),
+        );
+    }
+    result
+}
+
 /// Loads all records from the embedded sink, respecting the read budget.
 /// Returns the records filtered to the given domain and the RFC3339 snapshot
 /// timestamp captured at read-lock acquisition time.
@@ -10555,6 +10578,9 @@ fn handle_verb_drift_top_n(
     if let Some(repo) = selected_repo.as_deref() {
         drifts.retain(|r| repo_index.owner_of(r.id()) == Some(repo));
     }
+    // Issue #121: bind the pre-truncate pool size before the cap narrows it —
+    // the CLI stamps every row's completeness signal from the page envelope.
+    let total_matches = drifts.len();
     drifts.truncate(effective_limit);
     let mut result_records = drifts
         .into_iter()
@@ -10570,7 +10596,11 @@ fn handle_verb_drift_top_n(
     HttpResponse::success(
         Some(request_id),
         200,
-        verb_success_result("drift_top_n", &snapshot, &result_records),
+        verb_result_with_completeness(
+            verb_success_result("drift_top_n", &snapshot, &result_records),
+            total_matches,
+            effective_limit,
+        ),
     )
 }
 
@@ -10904,6 +10934,9 @@ fn handle_verb_semantic_search(
     attach_repository_fields(&mut result_records, &repo_index);
 
     let mut result = verb_success_result("semantic_search", &snapshot, &result_records);
+    // Issue #121: report the pre-truncate pool and the effective cap in the
+    // page envelope so the CLI can stamp each row's completeness signal.
+    result = verb_result_with_completeness(result, total_candidates, effective_limit);
     // Issue #243: stamp the embedding-provenance envelope on the verb result
     // so CLI (`--daemon`) and future MCP consumers get the same answer
     // contract as the embedded lane. The query identity assumes the query

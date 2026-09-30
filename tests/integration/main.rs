@@ -103,6 +103,7 @@ mod query_at;
 mod query_belief_timeline;
 mod query_churn;
 mod query_cli;
+mod query_completeness;
 mod query_complexity;
 mod query_conflicts;
 mod query_cycles;

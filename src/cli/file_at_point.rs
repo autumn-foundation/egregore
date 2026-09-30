@@ -171,6 +171,9 @@ pub(crate) fn query_file(
             cfg: r.cfg(),
             // Likewise the structural complexity score (issue #162).
             complexity: r.complexity(),
+            // Answer completeness (issue #121): the DEFINES listing is
+            // exhaustive — every symbol the file defines is printed.
+            completeness: RowCompleteness::exhaustive(),
         });
     }
 

@@ -17,6 +17,7 @@ mod change_impact;
 mod changes;
 mod churn;
 mod clones;
+mod completeness;
 mod complexity;
 mod config;
 mod conflicts;
@@ -152,6 +153,7 @@ pub(crate) use change_impact::*;
 pub(crate) use changes::*;
 pub(crate) use churn::*;
 pub(crate) use clones::*;
+pub(crate) use completeness::*;
 pub(crate) use complexity::*;
 pub(crate) use config::*;
 pub(crate) use conflicts::*;
@@ -7123,6 +7125,11 @@ pub(crate) struct SymbolResult<'a> {
     /// prints nothing for an absent score rather than fabricating one.
     #[serde(skip_serializing_if = "Option::is_none")]
     complexity: Option<u32>,
+    /// Answer completeness signal (issue #121): whether the printed row set
+    /// is the complete match set, plus `total_matches` / `applied_limit`
+    /// exactly when a cap or selection narrowed the answer.
+    #[serde(flatten)]
+    completeness: RowCompleteness,
 }
 
 /// Resolves the effective corpus mode for a current-state code lane and,
@@ -7287,6 +7294,11 @@ pub(crate) struct DriftResult<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<&'a str>,
     status: &'static str,
+    /// Answer completeness signal (issue #121): whether the printed row set
+    /// is the complete match set, plus `total_matches` / `applied_limit`
+    /// exactly when the `--limit` cap narrowed the answer.
+    #[serde(flatten)]
+    completeness: RowCompleteness,
 }
 
 /// Output row for a semantic similarity result.
@@ -7318,11 +7330,20 @@ pub(crate) struct SemanticResult<'a> {
     selection_threshold: f32,
     /// How the threshold was set (issue #263); mirrors drift's `selection_basis`.
     selection_basis: &'static str,
+    /// Answer completeness signal (issue #121): whether the printed row set
+    /// is the complete match set, plus `total_matches` / `applied_limit`
+    /// exactly when the `--limit` cap narrowed the answer.
+    #[serde(flatten)]
+    completeness: RowCompleteness,
 }
 
 #[cfg(feature = "embeddings")]
 impl<'a> SemanticResult<'a> {
-    pub(crate) fn from_match(m: &'a SemanticMatch, index: &'a query::RepositoryIndex) -> Self {
+    pub(crate) fn from_match(
+        m: &'a SemanticMatch,
+        index: &'a query::RepositoryIndex,
+        completeness: RowCompleteness,
+    ) -> Self {
         let repository_id = index.owner_of(&m.record_id);
         Self {
             record_id: &m.record_id,
@@ -7335,6 +7356,7 @@ impl<'a> SemanticResult<'a> {
             confidence_band: crate::semantic_confidence::ConfidenceBand::of_score(m.score).as_str(),
             selection_threshold: crate::semantic_confidence::SEMANTIC_CONFIDENT_THRESHOLD,
             selection_basis: crate::semantic_confidence::SEMANTIC_SELECTION_BASIS,
+            completeness,
         }
     }
 }

@@ -441,6 +441,10 @@ pub(crate) fn symbol_row<'a>(
         // symbol` field. Absent for non-callables and for records that
         // predate issue #162 — never fabricated.
         complexity: record.complexity(),
+        // Answer completeness (issue #121): the shared constructor is the
+        // exhaustive default — lanes that list every match keep it.
+        // Selecting lanes (`--at`, `--as-of`) overwrite it after the pick.
+        completeness: RowCompleteness::exhaustive(),
     })
 }
 
@@ -586,6 +590,10 @@ pub(crate) fn query_symbol_at(
         }
     }
 
+    // Issue #121: `--at` is a single-winner selection — bind the candidate
+    // count before the pick so the printed row can report what the
+    // selection narrowed.
+    let candidates = matches.len();
     match matches.into_iter().next() {
         None => {
             eprintln!("error: no match found for symbol `{name}` at commit `{prefix}`");
@@ -613,6 +621,9 @@ pub(crate) fn query_symbol_at(
                     query::CorpusMode::CommitPinned,
                     query::CorpusModeSource::Selector,
                 );
+                // Issue #121: one row was picked from `candidates` — the
+                // stamp reports the selection, not a complete listing.
+                result.completeness = RowCompleteness::single_winner(candidates);
                 print_result(&result, format)?;
             }
         }

@@ -648,8 +648,11 @@ pub(crate) fn query_semantic(
         total_candidates,
     );
     print_semantic_confidence_verdict(format, &verdict)?;
+    // Issue #121: the top-`limit` cut narrows the scoped candidate pool —
+    // stamp every row so a truncated answer says so.
+    let completeness = RowCompleteness::capped(total_candidates, limit);
     for m in &matches {
-        print_result(&SemanticResult::from_match(m, &index), format)?;
+        print_result(&SemanticResult::from_match(m, &index, completeness), format)?;
     }
     Ok(())
 }
@@ -1950,8 +1953,18 @@ pub(crate) fn query_semantic_via_daemon(
     };
     print_semantic_confidence_verdict(format, &verdict)?;
 
+    // Issue #121: the daemon reports the pre-truncate pool in the page
+    // envelope; stamp every row so the --daemon answer carries the same
+    // completeness signal as the embedded lane. A daemon predating the signal
+    // reports nothing — then the rows carry no stamp rather than a guess.
+    let completeness =
+        RowCompleteness::from_daemon_page(result.get("page").unwrap_or(&serde_json::Value::Null));
     for rec in &records {
-        print_daemon_semantic_record(rec, format)?;
+        let mut stamped = rec.clone();
+        if let Some(completeness) = completeness {
+            stamp_json_row(&mut stamped, completeness);
+        }
+        print_daemon_semantic_record(&stamped, format)?;
     }
     Ok(())
 }
@@ -2368,6 +2381,63 @@ mod scoped_semantic {
         scope_and_rank_semantic_matches(&mut matches, None, 10);
         assert_eq!(matches.len(), 2);
     }
+
+    /// Issue #121 (AC4): when the candidate pool exceeds the top-k limit, the
+    /// rows the lane prints must carry `result_complete: false` with the
+    /// pre-truncate pool size and the applied limit. The embedder cannot run
+    /// in this harness, so the test drives the same helper + row constructor
+    /// the lane uses, with a fixed match set.
+    #[test]
+    fn truncated_pool_stamps_rows_incomplete() {
+        let mut matches = vec![
+            match_at("a", "src/a.rs", 0.9),
+            match_at("b", "src/b.rs", 0.8),
+            match_at("c", "src/c.rs", 0.7),
+            match_at("d", "src/d.rs", 0.6),
+            match_at("e", "src/e.rs", 0.5),
+        ];
+        let total_candidates = scope_and_rank_semantic_matches(&mut matches, None, 2);
+        assert_eq!(
+            total_candidates, 5,
+            "the helper reports the pre-truncate pool"
+        );
+        assert_eq!(matches.len(), 2, "the limit narrows the printed rows");
+
+        let index = query::RepositoryIndex::build(&[]);
+        let completeness = RowCompleteness::capped(total_candidates, 2);
+        for m in &matches {
+            let json = serde_json::to_value(SemanticResult::from_match(m, &index, completeness))
+                .expect("row serializes");
+            assert_eq!(
+                json["result_complete"], false,
+                "a narrowed top-k answer must report result_complete: false, got {json}"
+            );
+            assert_eq!(json["total_matches"], 5, "got {json}");
+            assert_eq!(json["applied_limit"], 2, "got {json}");
+        }
+    }
+
+    /// Issue #121 (AC4): when the pool fits the limit, the rows report
+    /// `result_complete: true` and omit the totals.
+    #[test]
+    fn pool_within_limit_stamps_rows_complete() {
+        let mut matches = vec![
+            match_at("a", "src/a.rs", 0.9),
+            match_at("b", "src/b.rs", 0.8),
+        ];
+        let total_candidates = scope_and_rank_semantic_matches(&mut matches, None, 10);
+        assert_eq!(matches.len(), 2);
+
+        let index = query::RepositoryIndex::build(&[]);
+        let completeness = RowCompleteness::capped(total_candidates, 10);
+        for m in &matches {
+            let json = serde_json::to_value(SemanticResult::from_match(m, &index, completeness))
+                .expect("row serializes");
+            assert_eq!(json["result_complete"], true, "got {json}");
+            assert!(json.get("total_matches").is_none(), "got {json}");
+            assert!(json.get("applied_limit").is_none(), "got {json}");
+        }
+    }
 }
 
 #[cfg(all(test, feature = "embeddings"))]
@@ -2399,6 +2469,7 @@ mod semantic_contract {
             confidence_band: "strong",
             selection_threshold: crate::semantic_confidence::SEMANTIC_CONFIDENT_THRESHOLD,
             selection_basis: "corpus_calibrated_confidence_floor",
+            completeness: RowCompleteness::exhaustive(),
         };
         let json =
             serde_json::to_value(&result).expect("SemanticResult must serialize to JSON value");
@@ -2451,6 +2522,7 @@ mod semantic_contract {
             confidence_band: "weak",
             selection_threshold: crate::semantic_confidence::SEMANTIC_CONFIDENT_THRESHOLD,
             selection_basis: "corpus_calibrated_confidence_floor",
+            completeness: RowCompleteness::exhaustive(),
         };
         let json = serde_json::to_value(&result).expect("serialize");
 
