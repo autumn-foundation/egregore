@@ -5541,6 +5541,13 @@ pub(crate) enum DaemonAction {
         /// Bounded write queue capacity.
         #[arg(long, default_value_t = 64)]
         write_queue_capacity: usize,
+        /// Access-token lifetime in milliseconds (issue #70). When set, the
+        /// daemon rotates its bearer token every `token_ttl_ms`, publishes
+        /// the new token in `egregored.json`, and keeps each superseded token
+        /// valid for a cutover window of half the lifetime. Omit to disable
+        /// rotation (one token for the daemon lifetime).
+        #[arg(long)]
+        token_ttl_ms: Option<u64>,
     },
     /// Run the daemon in the current process.
     #[command(hide = true)]
@@ -5557,6 +5564,9 @@ pub(crate) enum DaemonAction {
         /// Bounded write queue capacity.
         #[arg(long, default_value_t = 64)]
         write_queue_capacity: usize,
+        /// Access-token lifetime in milliseconds (issue #70). See `Start`.
+        #[arg(long)]
+        token_ttl_ms: Option<u64>,
     },
     /// Report daemon status.
     Status {

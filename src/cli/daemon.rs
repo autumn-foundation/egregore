@@ -8,11 +8,13 @@ pub(crate) fn daemon(action: DaemonAction) -> Result<()> {
             host,
             port,
             write_queue_capacity,
+            token_ttl_ms,
         } => {
             let mut config = DaemonConfig::new(data_dir);
             config.host = host;
             config.port = port;
             config.write_queue_capacity = write_queue_capacity;
+            config.token_ttl_ms = token_ttl_ms;
             let metadata = crate::daemon::start_background(&config)?;
             println!("daemon started at {}", metadata.address);
             Ok(())
@@ -22,11 +24,13 @@ pub(crate) fn daemon(action: DaemonAction) -> Result<()> {
             host,
             port,
             write_queue_capacity,
+            token_ttl_ms,
         } => {
             let mut config = DaemonConfig::new(data_dir);
             config.host = host;
             config.port = port;
             config.write_queue_capacity = write_queue_capacity;
+            config.token_ttl_ms = token_ttl_ms;
             crate::daemon::run_foreground(&config)
         }
         DaemonAction::Status { data_dir } => {

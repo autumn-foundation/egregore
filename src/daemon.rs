@@ -75,6 +75,13 @@ pub struct DaemonConfig {
     pub port: u16,
     /// Bounded write queue capacity.
     pub write_queue_capacity: usize,
+    /// Access-token lifetime in milliseconds (issue #70). `Some(ttl)` enables
+    /// token rotation: the daemon issues a fresh bearer token every `ttl`
+    /// milliseconds, publishes it in `egregored.json`
+    /// (`token_expires_at_unix_ms`), and keeps the superseded token valid for
+    /// a cutover window of `ttl / 2`. `None` disables rotation (v1 behavior:
+    /// one token for the daemon lifetime, `token_expires_at_unix_ms` is null).
+    pub token_ttl_ms: Option<u64>,
 }
 
 impl DaemonConfig {
@@ -86,6 +93,7 @@ impl DaemonConfig {
             host: DEFAULT_HOST.to_owned(),
             port: DEFAULT_PORT,
             write_queue_capacity: 64,
+            token_ttl_ms: None,
         }
     }
 }
@@ -448,7 +456,7 @@ fn already_running_error(data_dir: &Path, metadata: &DaemonMetadata) -> anyhow::
 
 #[derive(Clone)]
 struct ServerState {
-    token: String,
+    tokens: Arc<TokenRotationState>,
     store_identity: String,
     sink: Arc<RwLock<EmbeddedAletheiaSink>>,
     write_tx: mpsc::SyncSender<WriteCommand>,
@@ -459,6 +467,196 @@ struct ServerState {
     pressure: Arc<PressureTracker>,
     /// Monotonic per-class error counters surfaced in `GET /v1/status` (#61).
     error_counters: Arc<ErrorCounters>,
+}
+
+/// Verdict of bearer-token validation against the daemon's rotation state
+/// (issue #70).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthVerdict {
+    /// The presented bearer is the current token, or a superseded token still
+    /// inside the documented cutover window.
+    Authorized,
+    /// The presented bearer is a token the daemon issued but superseded past
+    /// the cutover window. The request is rejected with `token_rotated` so the
+    /// client can re-read `egregored.json` and retry once.
+    Superseded,
+    /// No bearer was presented, or the bearer is not a token this daemon
+    /// issued (or issued so long ago it left the bounded history). The
+    /// request is rejected with `unauthorized`.
+    Denied,
+}
+
+/// Constant-time byte equality for bearer-token validation (issue #70).
+///
+/// Differences accumulate with bitwise OR and no data-dependent branches, so
+/// validation time does not leak token content. Length mismatch short-circuits:
+/// daemon tokens are fixed-length, so length is not a secret.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// One issued token generation: the raw bearer value plus its lifecycle
+/// timestamps. Raw values live only in daemon memory, never in logs,
+/// diagnostics, or wire output (issue #70 redaction policy).
+struct TokenGeneration {
+    token: String,
+    issued_at_unix_ms: u128,
+    /// `None` while this generation is current; `Some(t)` once superseded at `t`.
+    superseded_at_unix_ms: Option<u128>,
+}
+
+/// Live access-token rotation state for one daemon process (issue #70).
+///
+/// The daemon accepts the current token plus superseded tokens inside the
+/// cutover window (`ttl / 2`). Superseded tokens past the window but inside
+/// the bounded history (`ttl` beyond the window) report [`AuthVerdict::Superseded`];
+/// anything older or unknown reports [`AuthVerdict::Denied`], so history stays
+/// bounded and stale tokens fail closed.
+struct TokenRotationState {
+    generations: RwLock<Vec<TokenGeneration>>,
+    /// Token lifetime in milliseconds; `None` disables rotation.
+    ttl_ms: Option<u64>,
+    /// Total rotations performed; surfaced in `GET /v1/status`.
+    rotations: AtomicU64,
+}
+
+impl TokenRotationState {
+    fn new(token: String, ttl_ms: Option<u64>) -> Self {
+        let now = unix_ms();
+        Self {
+            generations: RwLock::new(vec![TokenGeneration {
+                token,
+                issued_at_unix_ms: now,
+                superseded_at_unix_ms: None,
+            }]),
+            ttl_ms,
+            rotations: AtomicU64::new(0),
+        }
+    }
+
+    const fn rotation_enabled(&self) -> bool {
+        self.ttl_ms.is_some()
+    }
+
+    /// Cutover window in milliseconds: half the token lifetime.
+    fn cutover_grace_ms(&self) -> u128 {
+        self.ttl_ms.map_or(0, |ttl| u128::from(ttl) / 2)
+    }
+
+    /// How long past the cutover window a superseded token stays
+    /// distinguishable from an unknown one: one full token lifetime.
+    fn history_retention_ms(&self) -> u128 {
+        self.ttl_ms.map_or(0, u128::from)
+    }
+
+    /// Validates a presented bearer with the wall clock.
+    fn authorize(&self, presented: &str) -> AuthVerdict {
+        self.authorize_at(presented, unix_ms())
+    }
+
+    /// Validates a presented bearer at an explicit instant (deterministic
+    /// under test; the daemon always passes the wall clock).
+    fn authorize_at(&self, presented: &str, now_unix_ms: u128) -> AuthVerdict {
+        let presented = presented.as_bytes();
+        let generations = self
+            .generations
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let grace_ms = self.cutover_grace_ms();
+        let retention_ms = self.history_retention_ms();
+        for generation in generations.iter().rev() {
+            if constant_time_eq(generation.token.as_bytes(), presented) {
+                return match generation.superseded_at_unix_ms {
+                    None => AuthVerdict::Authorized,
+                    Some(superseded_at) if now_unix_ms < superseded_at + grace_ms => {
+                        AuthVerdict::Authorized
+                    }
+                    Some(superseded_at)
+                        if now_unix_ms < superseded_at + grace_ms + retention_ms =>
+                    {
+                        AuthVerdict::Superseded
+                    }
+                    _ => AuthVerdict::Denied,
+                };
+            }
+        }
+        AuthVerdict::Denied
+    }
+
+    /// Validates the `authorization` header against the rotation state.
+    fn authorize_presented(&self, headers: &HashMap<String, String>) -> AuthVerdict {
+        let presented = headers
+            .get("authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or("");
+        self.authorize(presented)
+    }
+
+    /// Commits a rotation at an explicit instant: the current generation is
+    /// superseded and `token` becomes current. Prunes generations that aged
+    /// out of the bounded history so memory stays proportional to the token
+    /// lifetime, not daemon uptime.
+    fn commit_rotation_at(&self, token: String, now_unix_ms: u128) {
+        let grace_ms = self.cutover_grace_ms();
+        let retention_ms = self.history_retention_ms();
+        {
+            let mut generations = self
+                .generations
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            generations.retain(|generation| {
+                generation
+                    .superseded_at_unix_ms
+                    .is_none_or(|superseded_at| {
+                        now_unix_ms < superseded_at + grace_ms + retention_ms
+                    })
+            });
+            if let Some(current) = generations.last_mut() {
+                current.superseded_at_unix_ms = Some(now_unix_ms);
+            }
+            generations.push(TokenGeneration {
+                token,
+                issued_at_unix_ms: now_unix_ms,
+                superseded_at_unix_ms: None,
+            });
+        }
+        self.rotations.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Unix milliseconds when the current token rotates, or `None` when
+    /// rotation is disabled. Published in `egregored.json` and `GET /v1/status`.
+    fn current_expiry_unix_ms(&self) -> Option<u128> {
+        let ttl_ms = self.ttl_ms?;
+        let generations = self
+            .generations
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        generations
+            .last()
+            .map(|current| current.issued_at_unix_ms + u128::from(ttl_ms))
+    }
+
+    fn rotation_count(&self) -> u64 {
+        self.rotations.load(Ordering::SeqCst)
+    }
+
+    /// Rotation block for `GET /v1/status`: expiry state and rotation status
+    /// only — never token material (issue #70 redaction policy).
+    fn status_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": self.rotation_enabled(),
+            "token_expires_at_unix_ms": self.current_expiry_unix_ms(),
+            "cutover_grace_ms": self.ttl_ms.map(|ttl| ttl / 2),
+            "rotations": self.rotation_count(),
+        })
+    }
 }
 
 struct WriteCommand {
@@ -903,8 +1101,9 @@ enum ErrorCode {
     /// Reserved by #18: daemon startup refused to create or keep runtime files
     /// with unsafe permissions.
     RuntimePermissionsUnsafe,
-    /// Reserved by #18: future token rotation asks clients to re-read
-    /// `egregored.json` and retry with the fresh token.
+    /// Added by #70: the presented bearer token was superseded by a rotation
+    /// past the documented cutover window. Clients must re-read
+    /// `egregored.json` and retry once with the fresh token.
     TokenRotated,
     /// Added by #14 (project graph schema): a verified `AcceptanceCriterion` is
     /// missing the verification record that closed it.
@@ -1086,6 +1285,16 @@ impl ApiError {
 
     fn unauthorized() -> Self {
         Self::new(ErrorCode::Unauthorized, "missing or invalid bearer token")
+    }
+
+    /// The presented bearer is a daemon token superseded past the cutover
+    /// window (issue #70). The message names the recovery step and never
+    /// carries token material.
+    fn token_rotated() -> Self {
+        Self::new(
+            ErrorCode::TokenRotated,
+            "daemon access token was rotated; re-read egregored.json and retry with the fresh token",
+        )
     }
 
     fn bad_request(message: impl Into<String>) -> Self {
@@ -1489,6 +1698,9 @@ pub fn start_background(config: &DaemonConfig) -> Result<DaemonMetadata> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(token_ttl_ms) = config.token_ttl_ms {
+        command.arg("--token-ttl-ms").arg(token_ttl_ms.to_string());
+    }
 
     #[cfg(windows)]
     {
@@ -1500,6 +1712,85 @@ pub fn start_background(config: &DaemonConfig) -> Result<DaemonMetadata> {
     wait_until_running(&config.data_dir)
 }
 
+/// Shared connection state for the foreground daemon plus the handles the
+/// accept loop keeps after the write worker is spawned.
+struct ForegroundShared {
+    state: Arc<ServerState>,
+    idempotency: Arc<Mutex<IdempotencyStore>>,
+    shutdown: Arc<AtomicBool>,
+    pressure: Arc<PressureTracker>,
+}
+
+/// Builds the shared [`ServerState`] handed to each accepted connection.
+///
+/// # Errors
+///
+/// Returns an error if the idempotency store cannot be loaded from the
+/// runtime directory.
+fn build_server_state(
+    config: &DaemonConfig,
+    tokens: &Arc<TokenRotationState>,
+    sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
+    write_tx: mpsc::SyncSender<WriteCommand>,
+) -> Result<ForegroundShared> {
+    let idempotency_path = runtime_dir(&config.data_dir).join(IDEMPOTENCY_FILE);
+    let idempotency = Arc::new(Mutex::new(IdempotencyStore::load(idempotency_path)?));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let pressure = Arc::new(PressureTracker::new(config.write_queue_capacity));
+    let state = Arc::new(ServerState {
+        tokens: Arc::clone(tokens),
+        store_identity: store_identity_text(&config.data_dir),
+        sink: Arc::clone(sink),
+        write_tx,
+        jobs: Arc::new(Mutex::new(BTreeMap::new())),
+        agents: Arc::new(Mutex::new(BTreeMap::new())),
+        idempotency: Arc::clone(&idempotency),
+        shutdown: Arc::clone(&shutdown),
+        pressure: Arc::clone(&pressure),
+        error_counters: Arc::new(ErrorCounters::new()),
+    });
+    Ok(ForegroundShared {
+        state,
+        idempotency,
+        shutdown,
+        pressure,
+    })
+}
+
+/// Runs one scheduled token rotation when its instant has passed (issue #70).
+///
+/// Commits the new token to the in-memory rotation state FIRST (the old token
+/// stays valid through the cutover window), then publishes the new metadata.
+/// If the metadata write fails, the schedule does not advance: the next
+/// accept-loop pass retries the same publish.
+fn maybe_rotate_token(
+    config: &DaemonConfig,
+    tokens: &TokenRotationState,
+    metadata: &mut DaemonMetadata,
+    lease: &mut StoreLease,
+    next_rotation_at_unix_ms: &mut Option<u128>,
+) {
+    let Some(rotation_at) = *next_rotation_at_unix_ms else {
+        return;
+    };
+    let now = unix_ms();
+    if now < rotation_at {
+        return;
+    }
+    let new_token = random_token();
+    tokens.commit_rotation_at(new_token.clone(), now);
+    metadata.token = new_token;
+    metadata.token_expires_at_unix_ms = tokens.current_expiry_unix_ms();
+    match write_metadata(&config.data_dir, metadata).and_then(|()| lease.write_metadata(metadata)) {
+        Ok(()) => {
+            *next_rotation_at_unix_ms = config.token_ttl_ms.map(|ttl_ms| now + u128::from(ttl_ms));
+        }
+        Err(error) => {
+            eprintln!("egregored: token rotation metadata write failed: {error:#}");
+        }
+    }
+}
+
 /// Runs the daemon in the current process.
 ///
 /// # Errors
@@ -1507,6 +1798,9 @@ pub fn start_background(config: &DaemonConfig) -> Result<DaemonMetadata> {
 /// Returns an error if the store cannot be opened, the data-dir lease cannot be
 /// acquired, or the HTTP listener fails.
 pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
+    if config.token_ttl_ms.is_some_and(|ttl_ms| ttl_ms == 0) {
+        anyhow::bail!("--token-ttl-ms must be positive when token rotation is enabled");
+    }
     fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("failed to create {}", config.data_dir.display()))?;
     if let Some(metadata) = active_metadata(&config.data_dir)? {
@@ -1545,18 +1839,20 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
         .context("failed to read daemon listener address")?
         .to_string();
     let token = random_token();
-    let metadata = DaemonMetadata {
+    let tokens = Arc::new(TokenRotationState::new(token.clone(), config.token_ttl_ms));
+    let started_at_unix_ms = unix_ms();
+    let mut metadata = DaemonMetadata {
         schema_version: DAEMON_RUNTIME_SCHEMA_VERSION,
         pid: std::process::id(),
         address,
-        token: token.clone(),
+        token,
         data_dir: store_identity_dir(&config.data_dir),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        started_at_unix_ms: unix_ms(),
+        started_at_unix_ms,
         state: DaemonState::Running,
         api_version: None,
         transports: None,
-        token_expires_at_unix_ms: None,
+        token_expires_at_unix_ms: tokens.current_expiry_unix_ms(),
         daemons_index_url: None,
     };
     write_metadata(&config.data_dir, &metadata)?;
@@ -1564,25 +1860,26 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
 
     let sink = Arc::new(RwLock::new(sink));
     let (write_tx, write_rx) = mpsc::sync_channel(config.write_queue_capacity);
-    let idempotency_path = runtime_dir(&config.data_dir).join(IDEMPOTENCY_FILE);
-    let idempotency = Arc::new(Mutex::new(IdempotencyStore::load(idempotency_path)?));
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let pressure = Arc::new(PressureTracker::new(config.write_queue_capacity));
-    let state = Arc::new(ServerState {
-        token,
-        store_identity: store_identity_text(&config.data_dir),
-        sink: Arc::clone(&sink),
-        write_tx,
-        jobs: Arc::new(Mutex::new(BTreeMap::new())),
-        agents: Arc::new(Mutex::new(BTreeMap::new())),
-        idempotency: Arc::clone(&idempotency),
-        shutdown: Arc::clone(&shutdown),
-        pressure: Arc::clone(&pressure),
-        error_counters: Arc::new(ErrorCounters::new()),
-    });
-    let worker = spawn_write_worker(write_rx, sink, idempotency, pressure);
+    let shared = build_server_state(config, &tokens, &sink, write_tx)?;
+    let state = shared.state;
+    let shutdown = shared.shutdown;
+    let worker = spawn_write_worker(write_rx, sink, shared.idempotency, shared.pressure);
+
+    // Token-rotation schedule (issue #70): when rotation is enabled, the next
+    // rotation instant is tracked here and checked every accept-loop pass
+    // (see `maybe_rotate_token`).
+    let mut next_rotation_at_unix_ms = config
+        .token_ttl_ms
+        .map(|ttl_ms| started_at_unix_ms + u128::from(ttl_ms));
 
     while !shutdown.load(Ordering::SeqCst) {
+        maybe_rotate_token(
+            config,
+            &tokens,
+            &mut metadata,
+            &mut lease,
+            &mut next_rotation_at_unix_ms,
+        );
         match listener.accept() {
             Ok((stream, _)) => {
                 let state = Arc::clone(&state);
@@ -1743,6 +2040,49 @@ impl DaemonClient {
         Ok(Self::for_data_dir(metadata, data_dir))
     }
 
+    /// Re-reads `egregored.json` through the documented runtime discovery flow
+    /// and returns a client bound to the fresh metadata (issue #70).
+    ///
+    /// This runs the same staleness (runtime-lock) and liveness checks as the
+    /// initial connect, so rotation never weakens stale-file detection or
+    /// daemon ownership guarantees: a stopped, crashed, copied, or tampered
+    /// metadata file fails closed here instead of yielding a trusted token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata is missing, stale, or unreadable.
+    fn refreshed(&self) -> Result<Self> {
+        Self::from_data_dir(&self.metadata.data_dir)
+    }
+
+    /// Sends a request, retrying exactly once after a `token_rotated`
+    /// rejection (issue #70).
+    ///
+    /// On the first `token_rotated` response the client re-reads runtime
+    /// metadata (with the lock + liveness checks from [`Self::refreshed`])
+    /// and retries the identical request — same body, same `request_id`,
+    /// same idempotency key — with the fresh token. The retry result is
+    /// returned as-is: a second `token_rotated` (or any other failure)
+    /// surfaces to the caller, never a third attempt.
+    fn request_with_rotation_retry(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+        timeout: Duration,
+        include_auth: bool,
+    ) -> Result<(u16, String)> {
+        let (status, response_body) =
+            self.request(method, path, body.clone(), timeout, include_auth)?;
+        if !response_is_token_rotated(status, &response_body) {
+            return Ok((status, response_body));
+        }
+        let fresh = self
+            .refreshed()
+            .context("daemon rotated its access token but runtime metadata could not be re-read")?;
+        fresh.request(method, path, body, timeout, include_auth)
+    }
+
     /// Sends graph records to the daemon.
     ///
     /// The records are ingested under the `codegraph` domain.
@@ -1829,7 +2169,7 @@ impl DaemonClient {
                 "dangling_citation_policy": dangling_citation_policy.as_str(),
             },
         });
-        let (status, body) = self.request(
+        let (status, body) = self.request_with_rotation_retry(
             "POST",
             "/v1/records/ingest",
             Some(body),
@@ -1918,8 +2258,13 @@ impl DaemonClient {
     /// Returns an error if the daemon does not respond successfully or the
     /// response cannot be parsed.
     pub fn get_all_records(&self) -> Result<(Vec<GraphRecord>, Vec<UnknownSchemaVersion>, String)> {
-        let (status, body) =
-            self.request("GET", "/v1/records", None, CLIENT_OPERATION_TIMEOUT, true)?;
+        let (status, body) = self.request_with_rotation_retry(
+            "GET",
+            "/v1/records",
+            None,
+            CLIENT_OPERATION_TIMEOUT,
+            true,
+        )?;
         if status != 200 {
             return Err(anyhow!(
                 "daemon get_all_records failed with HTTP {status}: {body}"
@@ -1968,7 +2313,7 @@ impl DaemonClient {
             "params": params,
             "as_of": as_of,
         });
-        let (status, body_str) = self.request(
+        let (status, body_str) = self.request_with_rotation_retry(
             "POST",
             "/v1/query",
             Some(body),
@@ -2021,7 +2366,7 @@ impl DaemonClient {
             "params": params,
             "as_of": as_of,
         });
-        let (status, body_str) = self.request(
+        let (status, body_str) = self.request_with_rotation_retry(
             "POST",
             "/v1/query",
             Some(body),
@@ -2075,7 +2420,7 @@ impl DaemonClient {
             "params": params,
             "as_of": as_of,
         });
-        let (status, body_str) = self.request(
+        let (status, body_str) = self.request_with_rotation_retry(
             "POST",
             "/v1/query",
             Some(body),
@@ -2169,6 +2514,26 @@ impl DaemonClient {
             .context("failed to read daemon response")?;
         parse_http_response(&response)
     }
+}
+
+/// True when a daemon response is the `token_rotated` auth diagnostic
+/// (issue #70): HTTP 401 with the stable `token_rotated` error code in the
+/// envelope. Anything else — including a bare 401 `unauthorized` — is not a
+/// rotation signal and must not trigger a metadata re-read.
+fn response_is_token_rotated(status: u16, body: &str) -> bool {
+    if status != 401 {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|envelope| {
+            envelope
+                .get("error")?
+                .get("code")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .is_some_and(|code| code == ErrorCode::TokenRotated.as_str())
 }
 
 fn spawn_write_worker(
@@ -8453,7 +8818,7 @@ fn scan_under_held_lease(
 }
 
 fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
-    let response = match read_http_request(&mut stream, &state.token) {
+    let response = match read_http_request(&mut stream, &state.tokens) {
         Ok(request) => handle_request(&request, &state),
         Err(error) if error.to_string() == "request body too large" => {
             HttpResponse::error(ApiError::payload_too_large())
@@ -8492,8 +8857,14 @@ fn dispatch_request(request: &HttpRequest, state: &ServerState) -> HttpResponse 
             }),
         );
     }
-    if !is_authorized(request, &state.token) {
-        return HttpResponse::error(ApiError::unauthorized());
+    // Authentication is verdict-based (issue #70): a superseded token past the
+    // cutover window is rejected with `token_rotated` so the client can
+    // re-read `egregored.json` and retry once, instead of the opaque
+    // `unauthorized` a never-issued bearer gets.
+    match authorize_request(request, &state.tokens) {
+        AuthVerdict::Authorized => {}
+        AuthVerdict::Superseded => return HttpResponse::error(ApiError::token_rotated()),
+        AuthVerdict::Denied => return HttpResponse::error(ApiError::unauthorized()),
     }
     // Shutdown is handled before the gate so concurrent/retried stop calls
     // succeed even after the flag is set (idempotent drain behavior).
@@ -8591,6 +8962,7 @@ fn handle_status(state: &ServerState) -> HttpResponse {
             "oldest_active_job": oldest_active_job,
             "error_counts": state.error_counters.snapshot_json(),
             "pressure": state.pressure.snapshot_json(),
+            "token_rotation": state.tokens.status_json(),
         }),
     )
 }
@@ -13157,17 +13529,14 @@ fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> std::result::Result<
     serde_json::from_slice(body).map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
-fn is_authorized(request: &HttpRequest, token: &str) -> bool {
-    headers_authorized(&request.headers, token)
+fn authorize_request(request: &HttpRequest, tokens: &TokenRotationState) -> AuthVerdict {
+    tokens.authorize_presented(&request.headers)
 }
 
-fn headers_authorized(headers: &HashMap<String, String>, token: &str) -> bool {
-    headers
-        .get("authorization")
-        .is_some_and(|header| header == &format!("Bearer {token}"))
-}
-
-fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequest> {
+fn read_http_request(
+    stream: &mut TcpStream,
+    tokens: &TokenRotationState,
+) -> io::Result<HttpRequest> {
     let started = Instant::now();
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 1024];
@@ -13215,7 +13584,10 @@ fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequ
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_default();
-    if !headers_authorized(&headers, token) {
+    if !matches!(
+        tokens.authorize_presented(&headers),
+        AuthVerdict::Authorized
+    ) {
         return Ok(HttpRequest {
             method,
             path,
@@ -14530,7 +14902,10 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("client should connect");
             let started = Instant::now();
-            let result = read_http_request(&mut stream, "test-token");
+            let result = read_http_request(
+                &mut stream,
+                &TokenRotationState::new("test-token".to_owned(), None),
+            );
             (started.elapsed(), result.map_err(|error| error.kind()))
         });
         let client = thread::spawn(move || {
@@ -14576,7 +14951,7 @@ mod tests {
             IdempotencyStore::load(idempotency_path).context("idempotency store")?,
         ));
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp.path()),
             sink: Arc::clone(&sink),
             write_tx,
@@ -14693,7 +15068,7 @@ mod tests {
             entries: BTreeMap::new(),
         }));
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp.path()),
             sink,
             write_tx,
@@ -14800,7 +15175,7 @@ mod tests {
             entries: BTreeMap::new(),
         }));
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp.path()),
             sink,
             write_tx,
@@ -14925,7 +15300,7 @@ mod tests {
             entries: BTreeMap::new(),
         }));
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp.path()),
             sink,
             write_tx,
@@ -15052,7 +15427,7 @@ mod tests {
             entries: BTreeMap::new(),
         }));
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp.path()),
             sink,
             write_tx,
@@ -15328,7 +15703,7 @@ mod tests {
             entries: BTreeMap::new(),
         }));
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp),
             sink,
             write_tx: write_tx.clone(),
@@ -15787,6 +16162,7 @@ mod tests {
             "oldest_active_job",
             "pressure",
             "status",
+            "token_rotation",
         ];
         let actual: Vec<String> = keys.iter().map(|k| (*k).clone()).collect();
         assert_eq!(
@@ -15811,6 +16187,16 @@ mod tests {
             assert!(
                 value.is_u64() || value.is_i64(),
                 "oldest_active_job.{field} must be an integer, got {value}"
+            );
+        }
+        // token_rotation carries rotation metadata only — never token material.
+        for (field, value) in body["token_rotation"]
+            .as_object()
+            .expect("token_rotation object")
+        {
+            assert!(
+                value.is_boolean() || value.is_u64() || value.is_i64() || value.is_null(),
+                "token_rotation.{field} must be a bool/integer/null, got {value}"
             );
         }
         Ok(())
@@ -16056,7 +16442,7 @@ mod tests {
 
         let (write_tx, _write_rx) = mpsc::sync_channel(1);
         let state = ServerState {
-            token: "test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("test-token".to_owned(), None)),
             store_identity: store_identity_text(temp.path()),
             sink,
             write_tx,
@@ -16843,7 +17229,7 @@ mod tests {
                 .context("idempotency store")?,
         ));
         let state = ServerState {
-            token: "cap-test-token".to_owned(),
+            tokens: Arc::new(TokenRotationState::new("cap-test-token".to_owned(), None)),
             store_identity: store_identity_text(temp.path()),
             sink,
             write_tx,
@@ -17216,6 +17602,433 @@ mod tests {
             err.message.contains("target not found"),
             "unexpected rejection message: {}",
             err.message
+        );
+        Ok(())
+    }
+
+    // ---- Issue #70: daemon access-token rotation ----
+    //
+    // RED tests: these reference the rotation API (`TokenRotationState`,
+    // `AuthVerdict`, `constant_time_eq`, `ApiError::token_rotated`,
+    // `DaemonConfig::token_ttl_ms`, `DaemonClient::refreshed`) before it
+    // exists. They must fail to compile until the implementation lands.
+
+    #[test]
+    fn token_constant_time_eq_matches_only_identical_bytes() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"ab", b"abc"));
+        assert!(!constant_time_eq(b"", b"a"));
+    }
+
+    #[test]
+    fn token_rotation_authorize_verdicts() {
+        // ttl 60_000 ms -> cutover grace = 30_000 ms, history retention = 60_000 ms.
+        let state = TokenRotationState::new("current-token".to_owned(), Some(60_000));
+        assert!(state.rotation_enabled());
+        assert_eq!(state.rotation_count(), 0);
+        assert_eq!(
+            state.authorize_at("current-token", 1_000),
+            AuthVerdict::Authorized
+        );
+        assert_eq!(
+            state.authorize_at("never-issued", 1_000),
+            AuthVerdict::Denied
+        );
+        assert_eq!(state.authorize_at("", 1_000), AuthVerdict::Denied);
+
+        // Rotate at t=2_000: the old token enters the cutover window.
+        state.commit_rotation_at("next-token".to_owned(), 2_000);
+        assert_eq!(state.rotation_count(), 1);
+        assert_eq!(
+            state.authorize_at("next-token", 2_001),
+            AuthVerdict::Authorized
+        );
+        assert_eq!(
+            state.authorize_at("current-token", 2_001),
+            AuthVerdict::Authorized,
+            "superseded token must stay valid inside the cutover window"
+        );
+        // Past the cutover window (t + grace): the old token is superseded.
+        assert_eq!(
+            state.authorize_at("current-token", 2_000 + 30_000),
+            AuthVerdict::Superseded
+        );
+        assert_eq!(
+            state.authorize_at("current-token", 2_000 + 30_000 + 59_999),
+            AuthVerdict::Superseded
+        );
+        // Unknown tokens are never reported as rotated.
+        assert_eq!(
+            state.authorize_at("never-issued", 40_000),
+            AuthVerdict::Denied
+        );
+        // Past history retention (t + grace + ttl): the old token is
+        // indistinguishable from an unknown one and fails closed.
+        assert_eq!(
+            state.authorize_at("current-token", 2_000 + 30_000 + 60_000),
+            AuthVerdict::Denied
+        );
+    }
+
+    #[test]
+    fn token_rotation_tracks_expiry() {
+        let before = unix_ms();
+        let state = TokenRotationState::new("t0".to_owned(), Some(10_000));
+        let expiry = state
+            .current_expiry_unix_ms()
+            .expect("rotation enabled: expiry must be bounded");
+        assert!(
+            expiry >= before + 10_000,
+            "expiry must be issued-at + ttl, got {expiry}"
+        );
+        state.commit_rotation_at("t1".to_owned(), before + 10_000);
+        assert_eq!(
+            state.current_expiry_unix_ms(),
+            Some(before + 20_000),
+            "expiry must advance one full ttl per rotation"
+        );
+
+        let disabled = TokenRotationState::new("t0".to_owned(), None);
+        assert!(!disabled.rotation_enabled());
+        assert_eq!(disabled.current_expiry_unix_ms(), None);
+        assert_eq!(
+            disabled.authorize_at("t0", before + 1_000_000),
+            AuthVerdict::Authorized,
+            "without rotation the single token never expires"
+        );
+    }
+
+    #[test]
+    fn token_rotated_error_is_stable_and_redacted() {
+        let response = HttpResponse::error(ApiError::token_rotated());
+        assert_eq!(response.status, 401);
+        assert_eq!(response.body["error"]["code"], "token_rotated");
+        let message = response.body["error"]["message"]
+            .as_str()
+            .expect("token_rotated carries a message");
+        assert!(
+            message.contains("re-read"),
+            "diagnostic must name the recovery step, got: {message}"
+        );
+        let wire = serde_json::to_string(&response.body).expect("envelope serializes");
+        assert!(
+            !wire.contains("Bearer"),
+            "error envelope must never carry token material: {wire}"
+        );
+    }
+
+    #[test]
+    fn token_rotated_response_detection() {
+        let rotated =
+            json!({"ok": false, "error": {"code": "token_rotated", "message": "rotated"}})
+                .to_string();
+        assert!(response_is_token_rotated(401, &rotated));
+        let unauthorized =
+            json!({"ok": false, "error": {"code": "unauthorized", "message": "nope"}}).to_string();
+        assert!(!response_is_token_rotated(401, &unauthorized));
+        assert!(!response_is_token_rotated(200, &rotated));
+        assert!(!response_is_token_rotated(401, "not json"));
+        assert!(!response_is_token_rotated(401, "{}"));
+    }
+
+    #[test]
+    fn daemon_client_errors_never_carry_token_material() -> Result<()> {
+        let sentinel = "SENTINEL-TOKEN-MUST-NOT-LEAK-12345";
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let metadata = DaemonMetadata {
+            schema_version: DAEMON_RUNTIME_SCHEMA_VERSION,
+            pid: 1,
+            address: "127.0.0.1:1".to_owned(),
+            token: sentinel.to_owned(),
+            data_dir: temp.path().to_path_buf(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            started_at_unix_ms: 0,
+            state: DaemonState::Running,
+            api_version: None,
+            transports: None,
+            token_expires_at_unix_ms: None,
+            daemons_index_url: None,
+        };
+        let client = DaemonClient::new(metadata);
+        let error = client
+            .status()
+            .expect_err("dead port must fail the status request");
+        let rendered = format!("{error:?}");
+        assert!(
+            !rendered.contains(sentinel),
+            "client error leaked token material: {rendered}"
+        );
+        Ok(())
+    }
+
+    /// Spawns a real daemon via `run_foreground` in a background thread and
+    /// waits until it is healthy. The caller must shut it down with
+    /// [`stop_foreground_daemon`].
+    fn spawn_foreground_daemon(
+        data_dir: &Path,
+        token_ttl_ms: Option<u64>,
+    ) -> Result<(thread::JoinHandle<Result<()>>, DaemonMetadata)> {
+        let mut config = DaemonConfig::new(data_dir.to_path_buf());
+        config.host = "127.0.0.1".to_owned();
+        config.port = 0;
+        config.token_ttl_ms = token_ttl_ms;
+        let handle = thread::spawn(move || run_foreground(&config));
+        let metadata = wait_until_running(data_dir)?;
+        Ok((handle, metadata))
+    }
+
+    fn stop_foreground_daemon(
+        handle: thread::JoinHandle<Result<()>>,
+        data_dir: &Path,
+    ) -> Result<()> {
+        let metadata = read_metadata(data_dir)?;
+        DaemonClient::new(metadata).shutdown()?;
+        wait_until_stopped(data_dir)?;
+        handle
+            .join()
+            .map_err(|_| anyhow!("daemon thread panicked"))?
+    }
+
+    /// Polls `egregored.json` until the daemon publishes a different token.
+    fn wait_for_token_change(data_dir: &Path, old_token: &str) -> Result<String> {
+        let start = Instant::now();
+        loop {
+            let current = read_metadata(data_dir)?.token;
+            if current != old_token {
+                return Ok(current);
+            }
+            if start.elapsed() > Duration::from_secs(15) {
+                anyhow::bail!("daemon did not rotate its token within 15s");
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn rotation_probe_record(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("repo".to_owned()),
+            "rotation probe".to_owned(),
+        )
+    }
+
+    #[test]
+    fn rotation_preserves_client_continuity_across_five_cycles() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let data_dir = temp.path().join("store");
+        // ttl 1500 ms -> cutover grace 750 ms. Attempt each cycle after the
+        // old token is firmly superseded so the re-read + retry path is
+        // exercised deterministically.
+        let ttl_ms = 1_500u64;
+        let (handle, _metadata) = spawn_foreground_daemon(&data_dir, Some(ttl_ms))?;
+        let mut max_reconnect = Duration::ZERO;
+        for cycle in 0..5 {
+            // Build the client from the pre-rotation metadata so it is exactly
+            // one generation stale: the daemon reports token_rotated and the
+            // client recovers via metadata re-read. A client that never
+            // re-reads would age past the distinguishability window (one ttl
+            // past supersession) and fail closed with unauthorized by design,
+            // so the client must be refreshed to the pre-rotation token each
+            // cycle rather than reused across all five.
+            let stale_client = DaemonClient::from_data_dir(&data_dir)?;
+            let old_token = read_metadata(&data_dir)?.token;
+            wait_for_token_change(&data_dir, &old_token)?;
+            thread::sleep(Duration::from_millis(ttl_ms / 2 + 200));
+            let started = Instant::now();
+            let (records, _, _) = stale_client.get_all_records().with_context(|| {
+                format!("cycle {cycle}: stale client must recover via metadata re-read")
+            })?;
+            let elapsed = started.elapsed();
+            max_reconnect = max_reconnect.max(elapsed);
+            let _ = records;
+        }
+        assert!(
+            max_reconnect < Duration::from_secs(1),
+            "post-rotation reconnect must stay under 1s, took {max_reconnect:?}"
+        );
+        stop_foreground_daemon(handle, &data_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_token_accepted_inside_cutover_window() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let data_dir = temp.path().join("store");
+        let (handle, metadata) = spawn_foreground_daemon(&data_dir, Some(1_500))?;
+        let old_token = metadata.token;
+        wait_for_token_change(&data_dir, &old_token)?;
+        // Immediately after rotation the old token is inside the cutover
+        // window (grace = ttl / 2) and must still authenticate.
+        let stale = DaemonClient::new(DaemonMetadata {
+            token: old_token,
+            ..read_metadata(&data_dir)?
+        });
+        let (status, _) = stale.request("GET", "/v1/status", None, CLIENT_TIMEOUT, true)?;
+        assert_eq!(
+            status, 200,
+            "superseded token must authenticate inside the cutover window"
+        );
+        stop_foreground_daemon(handle, &data_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_token_rejected_after_cutover_window() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let data_dir = temp.path().join("store");
+        let ttl_ms = 1_500u64;
+        let (handle, metadata) = spawn_foreground_daemon(&data_dir, Some(ttl_ms))?;
+        let old_token = metadata.token;
+        wait_for_token_change(&data_dir, &old_token)?;
+        thread::sleep(Duration::from_millis(ttl_ms / 2 + 200));
+        let stale = DaemonClient::new(DaemonMetadata {
+            token: old_token.clone(),
+            ..read_metadata(&data_dir)?
+        });
+        for attempt in 0..10 {
+            let body_value = json!({
+                "request_id": format!("rotation-reject-{attempt}"),
+                "agent_id": "agent-1",
+                "session_id": "sess-1",
+                "idempotency_key": format!("rotation-reject-key-{attempt}"),
+                "domain": "codegraph",
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "payload": {
+                    "records": [rotation_probe_record(
+                        &format!("codegraph:v3:rotation-rejected-{attempt}")
+                    )],
+                    "dangling_citation_policy": "quarantine",
+                },
+            });
+            let (status, body) = stale.request(
+                "POST",
+                "/v1/records/ingest",
+                Some(body_value),
+                CLIENT_OPERATION_TIMEOUT,
+                true,
+            )?;
+            assert_eq!(
+                status, 401,
+                "attempt {attempt}: superseded token must be rejected"
+            );
+            let envelope: serde_json::Value =
+                serde_json::from_str(&body).context("rejection must be a JSON envelope")?;
+            assert_eq!(
+                envelope["error"]["code"], "token_rotated",
+                "attempt {attempt}: rejection must carry the stable diagnostic"
+            );
+            assert!(
+                !body.contains(&old_token),
+                "attempt {attempt}: rejection must not echo token material"
+            );
+        }
+        // None of the rejected writes may have executed.
+        let fresh = DaemonClient::from_data_dir(&data_dir)?;
+        let (records, _, _) = fresh.get_all_records()?;
+        assert!(
+            records.is_empty(),
+            "rejected writes must never execute; store holds {} records",
+            records.len()
+        );
+        stop_foreground_daemon(handle, &data_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn restart_invalidates_old_tokens_without_duplicating_writes() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let data_dir = temp.path().join("store");
+        let (handle, metadata) = spawn_foreground_daemon(&data_dir, None)?;
+        let old_token = metadata.token.clone();
+        let client = DaemonClient::new(metadata);
+        let record = rotation_probe_record("codegraph:v3:restart-once");
+        let response = client.ingest_records(
+            std::slice::from_ref(&record),
+            "agent-1",
+            "sess-1",
+            "restart-key-1",
+            DanglingCitationPolicy::default(),
+        )?;
+        assert_eq!(response.succeeded, 1);
+        stop_foreground_daemon(handle, &data_dir)?;
+
+        let (handle2, metadata2) = spawn_foreground_daemon(&data_dir, None)?;
+        assert_ne!(
+            metadata2.token, old_token,
+            "restart must issue a fresh token"
+        );
+        // The pre-restart token is unknown to the new daemon: fail closed.
+        let stale = DaemonClient::new(DaemonMetadata {
+            token: old_token,
+            ..metadata2.clone()
+        });
+        let (status, body) = stale.request("GET", "/v1/status", None, CLIENT_TIMEOUT, true)?;
+        assert_eq!(status, 401);
+        assert!(
+            body.contains("unauthorized"),
+            "restarted daemon must not report a rotated token it never issued: {body}"
+        );
+        // Replaying the same idempotency key against the new daemon must be
+        // idempotent, not a duplicate commit.
+        let fresh = DaemonClient::new(metadata2);
+        let replay = fresh.ingest_records(
+            std::slice::from_ref(&record),
+            "agent-1",
+            "sess-1",
+            "restart-key-1",
+            DanglingCitationPolicy::default(),
+        )?;
+        assert!(
+            replay.idempotent,
+            "same idempotency key after restart must replay, got: {replay:?}"
+        );
+        let (records, _, _) = fresh.get_all_records()?;
+        assert_eq!(
+            records.len(),
+            1,
+            "committed write must not be duplicated during retry"
+        );
+        stop_foreground_daemon(handle2, &data_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_retry_rereads_through_staleness_checks() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let data_dir = temp.path().join("store");
+        let (handle, metadata) = spawn_foreground_daemon(&data_dir, None)?;
+        let client = DaemonClient::new(metadata);
+        // While the daemon is live, re-reading passes the lock + liveness checks.
+        let _fresh = client.refreshed()?;
+        stop_foreground_daemon(handle, &data_dir)?;
+        // After stop the metadata is stale: re-reading must fail closed and
+        // never trust the leftover token.
+        let error = client
+            .refreshed()
+            .expect_err("re-read after stop must fail closed");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("stale"),
+            "expected a stale-metadata refusal, got: {rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_rejects_zero_token_ttl() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let mut config = DaemonConfig::new(temp.path().join("store"));
+        config.token_ttl_ms = Some(0);
+        let error = run_foreground(&config).expect_err("zero ttl must be refused");
+        assert!(
+            format!("{error:?}").contains("token-ttl"),
+            "refusal must name the flag, got: {error:?}"
         );
         Ok(())
     }
