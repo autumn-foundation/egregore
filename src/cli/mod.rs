@@ -101,6 +101,9 @@ mod task_overlap;
 // cross-lane merge conflicts.
 pub(crate) mod covering_tests;
 mod task_evidence_gate;
+// Appended (issue #119); kept at the end of the module list to minimize
+// cross-lane merge conflicts.
+mod task_list;
 mod transaction_time;
 mod transitive_callees;
 mod transitive_callers;
@@ -229,6 +232,8 @@ pub(crate) use task_overlap::*;
 // Appended (issue #147).
 pub(crate) use covering_tests::*;
 pub(crate) use task_evidence_gate::*;
+// Appended (issue #119).
+pub(crate) use task_list::*;
 pub(crate) use transaction_time::*;
 pub(crate) use transitive_callees::*;
 pub(crate) use transitive_callers::*;
@@ -5475,6 +5480,36 @@ pub(crate) enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    // Appended (issue #119); kept at the end to minimize cross-lane merge conflicts.
+    /// List project tasks filtered by status (issue #119).
+    ///
+    /// Read-only, deterministic: every project `Task` resolves to its latest
+    /// `transaction_time` version per stable entity, then filters to the
+    /// requested statuses and groups rows by status. `--status active` (the
+    /// default) selects `open,in_progress,blocked`. Exit 0 with
+    /// `zero_matches: true` when the filter matches nothing; exit 2
+    /// (`no_project_data`) when no `Task` records exist; exit 3
+    /// (`invalid_status_filter`) on a malformed `--status` filter; exit 1 on
+    /// malformed input.
+    ///
+    /// Documented in `docs/cli/task-list.md` and `docs/cli/query.md`.
+    TaskList {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Comma-separated task statuses to list, or the `active`
+        /// convenience filter (`open,in_progress,blocked`; the default).
+        /// Every member of the project task-status vocabulary is eligible;
+        /// an unknown or malformed value fails with exit 3.
+        #[arg(long)]
+        status: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -9222,6 +9257,16 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_task_evidence_gate_cmd(&records, &id_or_handle, format)
+        }
+        // Appended (issue #119); kept at the end to minimize cross-lane merge conflicts.
+        QuerySubcommand::TaskList {
+            graph,
+            data_dir,
+            status,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_task_list_cmd(&records, status.as_deref(), format)
         }
         QuerySubcommand::Candidates {
             graph,

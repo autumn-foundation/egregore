@@ -30,6 +30,8 @@ eg query task-overlap     --graph <PATH>    [--format json|text] [--status <LIST
 eg query task-overlap     --data-dir <DIR>  [--format json|text] [--status <LIST>]
 eg query task-evidence-gate <HANDLE> --graph <PATH>    [--format json|text]
 eg query task-evidence-gate <HANDLE> --data-dir <DIR>  [--format json|text]
+eg query task-list            --graph <PATH>    [--format json|text] [--status <FILTER>]
+eg query task-list            --data-dir <DIR>  [--format json|text] [--status <FILTER>]
 eg query memory   <HANDLE> --graph <PATH>   [--verified-only] [--max-records N]
 eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>] [--max-records N]
 eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N] [--max-records N]
@@ -787,6 +789,7 @@ Several **single-domain** lanes already emit a top-level `trust` field with a
 | `task-ready` | `eligibility_lead` | the row is a dispatch-eligibility lead — every declared dependency is `closed_completed` — not a safety or correctness claim |
 | `task-overlap` | `inspection_lead` | the row is a footprint-overlap inspection lead — two in-flight tasks name the same code-graph handle(s) — never proof of edit conflict, correctness, or verification |
 | `task-evidence-gate` | `evidence_gate` | the row is a completion-gating lead — every acceptance criterion has a live passing verification record — not a claim the task is correct, safe, or complete |
+| `task-list` | `status_lead` | the row is an imported-intent status lead — the source system says this work is in this status — never proof the code changed, the criteria hold, or any verification passed |
 
 Those lanes return rows from **one** domain, so there is nothing to
 disambiguate: their `trust` names the kind of answer the whole lane gives. The

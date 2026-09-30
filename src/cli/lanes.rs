@@ -772,6 +772,16 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
             freshness: &["ingest_snapshot", "store_live"],
         },
     ),
+    // Appended (issue #119); placed next to the other task lanes.
+    (
+        "task-list",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["project_state"],
+            citable_handles: true,
+            freshness: &["ingest_snapshot", "store_live"],
+        },
+    ),
     (
         "track-record",
         LaneStatic {

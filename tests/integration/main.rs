@@ -182,6 +182,7 @@ mod store_export;
 mod supersede_write;
 mod symbol_metadata;
 mod task_evidence_gate;
+mod task_list_cli;
 mod task_overlap_cli;
 mod task_query;
 mod task_ready;
