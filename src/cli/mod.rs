@@ -6138,6 +6138,63 @@ pub(crate) enum AuditSubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Measure time-to-first-citable-answer and enforce the hard warm-p95
+    /// product gate (issue #57).
+    ///
+    /// Builds the pinned reference corpus (a local Rust fixture: 41,919 LOC,
+    /// 25 deterministic synthetic git commits), then times wall-clock from
+    /// process start to the first emitted result line of `eg query symbol`,
+    /// `eg query file`, `eg query symbol --at <sha>`, and `eg query drift` —
+    /// warm invocations only, 5 consecutive runs per query class. Every
+    /// measured answer is checked against a fixture expectation and must
+    /// carry a record ID plus a repo-relative file/span or commit handle:
+    /// latency without correctness does not count. Setup phases (cold scan,
+    /// history replay, ingest, embedding setup) are timed and reported
+    /// separately from warm query latency. Boring substitutes (`rg`,
+    /// `git grep`, `git show`) are timed where applicable, with an
+    /// explicit "not comparable" note when a substitute cannot return
+    /// citable graph handles. The gate is hard: any query class whose warm
+    /// p95 exceeds the budget fails with a stable diagnostic naming the
+    /// class and the observed p95. Local-first and offline.
+    ///
+    /// Exit codes:
+    ///   0 — gate passed (`ok: true`).
+    ///   1 — gate failed (`ok: false`); the full JSON report is still printed.
+    ///   2 — usage/load error (bad manifest path, corpus build error, no result).
+    SymbolLatency {
+        /// Path to the symbol-latency corpus manifest JSON.
+        #[arg(long, default_value = "corpus/symbol_latency_corpus.json")]
+        corpus: PathBuf,
+        /// Warm samples measured per query class (each preceded by one
+        /// unmeasured priming invocation).
+        ///
+        /// Defaults to the manifest's `warm_samples`. When supplied,
+        /// overrides it.
+        #[arg(long)]
+        warm_samples: Option<usize>,
+        /// Hard warm-p95 budget in milliseconds each query class must meet.
+        ///
+        /// Defaults to the manifest's `budget_p95_ms`. When supplied,
+        /// overrides it. Unlike `audit query-budget`, this budget gates.
+        #[arg(long)]
+        budget_p95_ms: Option<f64>,
+        /// Depth of the deterministic synthetic git history.
+        ///
+        /// Defaults to the manifest's `history_commits`. When supplied,
+        /// overrides it. Must be at least 2.
+        #[arg(long)]
+        history_commits: Option<usize>,
+        /// Which synthetic-history commit (0-based, oldest first) the
+        /// symbol-at-commit lookup targets.
+        ///
+        /// Defaults to the manifest's `at_commit_index`. When supplied,
+        /// overrides it. Must be below the effective `history_commits`.
+        #[arg(long)]
+        at_commit_index: Option<usize>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Measure code-graph extraction accuracy against a ground-truth labeled corpus (issue #93).
     Accuracy {
         /// Path to the Rust test corpus directory.

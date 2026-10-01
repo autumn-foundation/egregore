@@ -181,6 +181,7 @@ mod similar_symbols;
 mod store_contention;
 mod store_export;
 mod supersede_write;
+mod symbol_latency;
 mod symbol_metadata;
 mod task_evidence_gate;
 mod task_list_cli;

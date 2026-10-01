@@ -101,12 +101,36 @@ pub const MIN_REFERENCE_RECORDS: u64 = 8000;
 /// ranked answer is byte-stable across runs. Node IDs embed `repo_tag`,
 /// keeping per-copy nodes disjoint when the corpus is replicated for the
 /// scaled store.
+///
+/// This is the issue #120 entry point: it delegates to
+/// [`synthetic_drift_records_namespaced`] with the `"query-budget"`
+/// namespace, preserving the exact record bytes the #120 benchmark pins.
 #[must_use]
-#[allow(clippy::cast_precision_loss)]
-// SAFETY: `index` is bounded by `synthetic_drift_nodes_per_repo` (tens), far
-// below the 2^53 exact-representation limit for f64.
 pub fn synthetic_drift_records(
     records: &[GraphRecord],
+    repo_tag: &str,
+    scan_time: &str,
+    count: usize,
+) -> Vec<GraphRecord> {
+    synthetic_drift_records_namespaced(records, "query-budget", repo_tag, scan_time, count)
+}
+
+/// Builds deterministic synthetic `SemanticDrift` node records under an
+/// explicit fixture namespace.
+///
+/// Issue #57 reuses the #120 construction with the `"symbol-latency"`
+/// namespace so its fixture records are honestly labeled.
+///
+/// `namespace` enters the stable-ID preimage and the record description, so
+/// fixtures built under different namespaces never share node IDs. See
+/// [`synthetic_drift_records`] for the construction contract.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+// SAFETY: `index` is bounded by the requested count (tens), far below the
+// 2^53 exact-representation limit for f64.
+pub fn synthetic_drift_records_namespaced(
+    records: &[GraphRecord],
+    namespace: &str,
     repo_tag: &str,
     scan_time: &str,
     count: usize,
@@ -134,7 +158,7 @@ pub fn synthetic_drift_records(
             // stable; all stay above the 0.5 selection threshold.
             let score = (index as f64).mul_add(-0.01, 0.95);
             let drift_id = semantic_stable_id(&[
-                "query-budget",
+                namespace,
                 "synthetic-drift",
                 repo_tag,
                 &target_id,
@@ -142,7 +166,7 @@ pub fn synthetic_drift_records(
             ]);
             let drift = SemanticDriftMetadata {
                 embedding_model: EmbeddingModel {
-                    provider: "query-budget-fixture".to_owned(),
+                    provider: format!("{namespace}-fixture"),
                     name: "synthetic".to_owned(),
                     version: "1".to_owned(),
                     dim: 8,
@@ -166,7 +190,7 @@ pub fn synthetic_drift_records(
                 None,
                 name,
                 format!(
-                    "Synthetic semantic drift fixture for the issue #120 query budget: {target_id} scored {score:.2}"
+                    "Synthetic semantic drift fixture for the {namespace} benchmark: {target_id} scored {score:.2}"
                 ),
             )
             .with_domain("semantic", SEMANTIC_SCHEMA_VERSION)

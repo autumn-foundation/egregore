@@ -146,6 +146,8 @@ pub mod semantic_confidence;
 pub mod semantic_eval;
 /// Write-time supersession / contradiction authoring for `eg write observation` (issue #184).
 pub mod supersede_write;
+/// Time-to-first-citable-answer product gate (issue #57).
+pub mod symbol_latency;
 /// Transitive memory supersession and contradiction resolution (issue #92).
 pub mod temporal_status;
 /// Capture `cargo test` / libtest JSON runs as citable `TestRun` records (issue #165).
