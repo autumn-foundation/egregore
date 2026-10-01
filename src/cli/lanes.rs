@@ -426,6 +426,15 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     (
+        "keygen",
+        LaneStatic {
+            store_mode: StoreMode::Structural,
+            trust_classes: &["other"],
+            citable_handles: false,
+            freshness: &[],
+        },
+    ),
+    (
         "lifeline",
         LaneStatic {
             store_mode: StoreMode::Structural,

@@ -327,6 +327,52 @@ impl EmbeddedAletheiaSink {
         Self::open_inner(data_dir, None)
     }
 
+    /// Enable encrypted-at-rest mode on an already-open store (issue #54).
+    ///
+    /// Flips the engine's durable encryption authority (`encryption.state`)
+    /// via [`AletheiaDB::enable_encryption`](::aletheiadb::AletheiaDB::enable_encryption),
+    /// then writes Egregore's storage-mode marker. The marker is written only
+    /// *after* the authority flip, so the marker never leads the authority.
+    /// Called exactly once per store, at creation, by `eg ingest --encrypted`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::Rejected`] when the key source is a KMS/Vault
+    /// variant Egregore does not offer, when the engine refuses the flip, or
+    /// when the marker cannot be written.
+    pub fn enable_store_encryption(
+        &mut self,
+        key_source: &::aletheiadb::encryption::KeyProviderConfig,
+    ) -> AdapterResult<()> {
+        // Issue #54: for fresh stores, `prepare_encrypted_ingest` already
+        // wrote the authority file and marker before the first open, so the
+        // engine enabled encryption from the start. Skip the migration path.
+        if crate::encrypted_store::read_marker(&self.data_dir)
+            .map_err(|error| error.to_adapter_error())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let descriptor =
+            crate::encrypted_store::KeySourceDescriptor::from_provider_config(key_source)
+                .ok_or_else(|| AdapterError::Rejected {
+                    record_id: "embedded-store".to_owned(),
+                    message: "unsupported key source: Egregore supports key files and \
+                              passphrase-wrapped key files only, not KMS/Vault sources"
+                        .to_owned(),
+                })?;
+        self.db
+            .enable_encryption(key_source.clone())
+            .map_err(|error| AdapterError::Rejected {
+                record_id: "embedded-store".to_owned(),
+                message: format!("failed to enable encryption on the store: {error}"),
+            })?;
+        let marker = crate::encrypted_store::StoreMarker::new(descriptor);
+        crate::encrypted_store::write_marker(&self.data_dir, &marker)
+            .map_err(|error| error.to_adapter_error())?;
+        Ok(())
+    }
+
     fn open_inner(data_dir: &Path, lease: Option<StoreLease>) -> AdapterResult<Self> {
         // Test-only: cap concurrent embedded stores (and serialise under disk
         // pressure) before spinning up the store's background flush thread.
@@ -336,6 +382,13 @@ impl EmbeddedAletheiaSink {
         if is_fresh_data_dir(data_dir) {
             config.persistence.load_on_startup = false;
         }
+        // Issue #54: resolve the store's storage mode from the Egregore
+        // marker cross-checked against the engine's durable encryption
+        // authority, fail-closed. Absent marker = legacy plaintext; the
+        // default workflow is unchanged.
+        let resolved = crate::encrypted_store::resolve_encryption_config(data_dir)
+            .map_err(|error| error.to_adapter_error())?;
+        config.encryption = resolved.config;
         // Pin the string-interner cap to Egregore's own constant rather than
         // inheriting AletheiaDB's default (issue #439). `MAX_INTERNED_STRINGS`
         // also bounds the ingest preflight estimate, so configuring the store
@@ -346,6 +399,18 @@ impl EmbeddedAletheiaSink {
         config.persistence.max_interned_strings =
             usize::try_from(super::preflight::MAX_INTERNED_STRINGS).unwrap_or(usize::MAX);
         let db = ::aletheiadb::AletheiaDB::with_unified_config(config).map_err(|error| {
+            // Issue #54: the key material loaded (checked pre-open), so a
+            // failed open under an encrypted marker means a wrong key.
+            if let (crate::encrypted_store::StorageMode::Encrypted, Some(descriptor)) =
+                (resolved.mode, &resolved.key_source)
+            {
+                return crate::encrypted_store::classify_encrypted_open_error(
+                    data_dir,
+                    descriptor,
+                    &error.to_string(),
+                )
+                .to_adapter_error();
+            }
             AdapterError::Rejected {
                 record_id: "embedded-store".to_owned(),
                 message: classify_open_error(data_dir, &error.to_string()),

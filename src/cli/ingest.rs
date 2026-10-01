@@ -105,10 +105,38 @@ pub(crate) fn embedded_write_open_error(data_dir: &Path, error: AdapterError) ->
         println!("{envelope}");
         return anyhow::anyhow!("{error}");
     }
-    anyhow::Error::new(error).context(format!(
-        "failed to open embedded store {}",
-        data_dir.display()
-    ))
+    // Issue #54: machine-readable envelopes for the encrypted-store refusals.
+    // The `message` already names the diagnosis and remedy; the envelope adds
+    // the stable code for programmatic handling. Key material is never echoed.
+    let (code, message) = match &error {
+        AdapterError::StorageModeMismatch { message, .. } => {
+            (crate::encrypted_store::STORAGE_MODE_MISMATCH_CODE, message)
+        }
+        AdapterError::EncryptedStoreKeyUnavailable { message, .. } => (
+            crate::encrypted_store::ENCRYPTED_STORE_KEY_UNAVAILABLE_CODE,
+            message,
+        ),
+        AdapterError::EncryptedStoreKeyError { message, .. } => (
+            crate::encrypted_store::ENCRYPTED_STORE_KEY_ERROR_CODE,
+            message,
+        ),
+        _ => {
+            return anyhow::Error::new(error).context(format!(
+                "failed to open embedded store {}",
+                data_dir.display()
+            ));
+        }
+    };
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": message,
+            "data_dir": data_dir.display().to_string(),
+        },
+    });
+    println!("{envelope}");
+    anyhow::anyhow!("{error}")
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -122,6 +150,10 @@ pub(crate) fn ingest(
     #[cfg(feature = "embeddings")] embed: bool,
     #[cfg(feature = "embeddings")] embed_model: Option<String>,
     #[cfg(feature = "embedded-aletheiadb")] force: bool,
+    // Encrypted local store mode (issue #54): creation-time opt-in.
+    #[cfg(feature = "embedded-aletheiadb")] encrypted: bool,
+    #[cfg(feature = "embedded-aletheiadb")] key_file: Option<&Path>,
+    #[cfg(feature = "embedded-aletheiadb")] passphrase_env: Option<&str>,
     // Dangling cross-domain evidence citation policy (issue #241).
     dangling_citation_policy: DanglingCitationPolicy,
 ) -> Result<()> {
@@ -133,6 +165,28 @@ pub(crate) fn ingest(
 
     #[cfg(not(feature = "embedded-aletheiadb"))]
     let _ = (data_dir, agent_id, session_id, idempotency_key);
+
+    // Encrypted local store mode (issue #54): validate the flag combination
+    // before touching the store. The key source is pinned at creation; the
+    // flags are refused for non-embedded adapters and refused without
+    // `--encrypted`.
+    #[cfg(feature = "embedded-aletheiadb")]
+    if !encrypted && (key_file.is_some() || passphrase_env.is_some()) {
+        anyhow::bail!(
+            "--key-file/--passphrase-env require --encrypted; refusing to ignore key material silently"
+        );
+    }
+    #[cfg(feature = "embedded-aletheiadb")]
+    if encrypted && adapter != IngestAdapter::Embedded {
+        anyhow::bail!("--encrypted requires --adapter embedded");
+    }
+    #[cfg(feature = "embedded-aletheiadb")]
+    let enable_encryption_key_source = if encrypted {
+        crate::encrypted_store::prepare_encrypted_ingest(&data_dir, key_file, passphrase_env)
+            .map_err(|error| embedded_write_open_error(&data_dir, error.to_adapter_error()))?
+    } else {
+        None
+    };
 
     #[cfg(feature = "embeddings")]
     if embed && adapter != IngestAdapter::Embedded {
@@ -198,6 +252,14 @@ pub(crate) fn ingest(
             #[cfg(not(feature = "embeddings"))]
             let mut sink = EmbeddedAletheiaSink::open(&data_dir)
                 .map_err(|error| embedded_write_open_error(&data_dir, error))?;
+            // Issue #54: fresh store + --encrypted — flip the engine's
+            // durable encryption authority, then the marker is written inside
+            // `enable_store_encryption`. Must happen before any record is
+            // written so the store is encrypted from the first byte.
+            if let Some(key_source) = &enable_encryption_key_source {
+                sink.enable_store_encryption(key_source)
+                    .map_err(|error| embedded_write_open_error(&data_dir, error))?;
+            }
             let report = ingest_records_with_policy(&records, &mut sink, dangling_citation_policy);
             // A capacity overflow surfaced as a per-record write failure is
             // fatal (never a generic exit-1 failure): a partial store whose

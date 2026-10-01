@@ -39,6 +39,9 @@ pub mod decide;
 pub mod doc_ingest;
 /// Semantic enrichment and embedding boundaries.
 pub mod embeddings;
+/// Encrypted local store mode (issue #54).
+#[cfg(feature = "embedded-aletheiadb")]
+pub mod encrypted_store;
 /// Error and result types.
 pub mod error;
 /// Typed evidence write workflows for observations, command evidence, artifacts, and verification.

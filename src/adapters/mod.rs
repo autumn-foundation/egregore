@@ -79,6 +79,53 @@ pub enum AdapterError {
         message: String,
     },
 
+    /// The requested storage mode disagrees with the store's durable state
+    /// (issue #54).
+    ///
+    /// Raised when `--encrypted` targets an existing plaintext store (no live
+    /// migration), or when the Egregore storage-mode marker and `AletheiaDB`'s
+    /// durable encryption authority disagree. The refused open performed no
+    /// write. The display form is prefixed with the stable
+    /// [`crate::encrypted_store::STORAGE_MODE_MISMATCH_CODE`] machine code.
+    #[error("storage_mode_mismatch: {message}")]
+    StorageModeMismatch {
+        /// Data directory the refusal concerns.
+        data_dir: String,
+        /// Diagnosis naming the disagreement and the remedy.
+        message: String,
+    },
+
+    /// An encrypted store's key material cannot be loaded (issue #54).
+    ///
+    /// Raised before any open attempt when the key file is missing/unreadable
+    /// or the passphrase env var is unset. The display form is prefixed with
+    /// the stable
+    /// [`crate::encrypted_store::ENCRYPTED_STORE_KEY_UNAVAILABLE_CODE`]
+    /// machine code. The `key_source` names the source (path / variable
+    /// name), never key material.
+    #[error("encrypted_store_key_unavailable: {message}")]
+    EncryptedStoreKeyUnavailable {
+        /// Non-secret key-source reference.
+        key_source: String,
+        /// Diagnosis naming what is missing and the remedy.
+        message: String,
+    },
+
+    /// An encrypted store failed to open under its key material (issue #54).
+    ///
+    /// Raised when the key material loaded but decryption failed (wrong key,
+    /// or the key file changed since creation). Nothing was modified. The
+    /// display form is prefixed with the stable
+    /// [`crate::encrypted_store::ENCRYPTED_STORE_KEY_ERROR_CODE`] machine
+    /// code.
+    #[error("encrypted_store_key_error: {message}")]
+    EncryptedStoreKeyError {
+        /// Non-secret key-source reference.
+        key_source: String,
+        /// Upstream detail plus the remedy.
+        message: String,
+    },
+
     /// A write succeeded but read-back did not return the same record.
     #[error("read-back verification failed for record {record_id}: {message}")]
     ReadBack {

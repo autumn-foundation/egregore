@@ -1229,6 +1229,8 @@ fn daemon_health_probe_bounds_unroutable_connect() {
         transports: None,
         token_expires_at_unix_ms: None,
         daemons_index_url: None,
+        storage_mode: "plaintext".to_owned(),
+        key_source: None,
     });
 
     let started = Instant::now();

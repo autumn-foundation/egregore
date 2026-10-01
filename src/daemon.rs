@@ -165,10 +165,25 @@ pub struct DaemonMetadata {
     /// Reserved future multi-daemon index pointer. Null in v1 runtime metadata.
     #[serde(default)]
     pub daemons_index_url: Option<String>,
+    /// Storage mode of the store the daemon serves (issue #54): `plaintext`
+    /// (default) or `encrypted`. Defaults to plaintext for metadata written
+    /// before the field existed.
+    #[serde(default = "default_storage_mode")]
+    pub storage_mode: String,
+    /// Non-secret key-source type token for an encrypted store (issue #54):
+    /// `file` or `passphrase_file`. `None` for plaintext stores. Never key
+    /// material.
+    #[serde(default)]
+    pub key_source: Option<String>,
 }
 
 const fn daemon_runtime_schema_version() -> u32 {
     DAEMON_RUNTIME_SCHEMA_VERSION
+}
+
+/// Default storage mode for daemon metadata written before issue #54.
+fn default_storage_mode() -> String {
+    "plaintext".to_owned()
 }
 
 /// Response returned by daemon-backed ingestion.
@@ -467,6 +482,10 @@ struct ServerState {
     pressure: Arc<PressureTracker>,
     /// Monotonic per-class error counters surfaced in `GET /v1/status` (#61).
     error_counters: Arc<ErrorCounters>,
+    /// Storage mode of the served store (issue #54): `plaintext`/`encrypted`.
+    storage_mode: String,
+    /// Non-secret key-source type token (`file`/`passphrase_file`), if encrypted.
+    key_source: Option<String>,
 }
 
 /// Verdict of bearer-token validation against the daemon's rotation state
@@ -1732,6 +1751,8 @@ fn build_server_state(
     tokens: &Arc<TokenRotationState>,
     sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
     write_tx: mpsc::SyncSender<WriteCommand>,
+    storage_mode: String,
+    key_source: Option<String>,
 ) -> Result<ForegroundShared> {
     let idempotency_path = runtime_dir(&config.data_dir).join(IDEMPOTENCY_FILE);
     let idempotency = Arc::new(Mutex::new(IdempotencyStore::load(idempotency_path)?));
@@ -1748,6 +1769,8 @@ fn build_server_state(
         shutdown: Arc::clone(&shutdown),
         pressure: Arc::clone(&pressure),
         error_counters: Arc::new(ErrorCounters::new()),
+        storage_mode,
+        key_source,
     });
     Ok(ForegroundShared {
         state,
@@ -1791,12 +1814,28 @@ fn maybe_rotate_token(
     }
 }
 
+/// Non-secret storage-mode descriptors for daemon metadata (issue #54).
+///
+/// Reads the Egregore storage-mode marker; returns `("plaintext", None)`
+/// when there is no marker or it cannot be read. Key material is never
+/// read here.
+fn daemon_storage_mode(data_dir: &Path) -> (String, Option<String>) {
+    match crate::encrypted_store::read_marker(data_dir) {
+        Ok(Some(marker)) => (
+            marker.storage_mode.as_str().to_owned(),
+            Some(marker.key_source.kind_str().to_owned()),
+        ),
+        Ok(None) | Err(_) => ("plaintext".to_owned(), None),
+    }
+}
+
 /// Runs the daemon in the current process.
 ///
 /// # Errors
 ///
 /// Returns an error if the store cannot be opened, the data-dir lease cannot be
 /// acquired, or the HTTP listener fails.
+#[allow(clippy::too_many_lines)] // Startup sequence; was already at the lint threshold on trunk.
 pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
     if config.token_ttl_ms.is_some_and(|ttl_ms| ttl_ms == 0) {
         anyhow::bail!("--token-ttl-ms must be positive when token rotation is enabled");
@@ -1829,6 +1868,11 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
             config.data_dir.display()
         )
     })?;
+    // Issue #54: the sink open resolved the storage mode (marker vs engine
+    // authority, fail-closed). Surface the non-secret mode + key-source type
+    // in the daemon metadata so `eg daemon status` and GET /v1/status report
+    // it. Key material is never read here.
+    let (storage_mode, key_source) = daemon_storage_mode(&config.data_dir);
     let listener = TcpListener::bind((config.host.as_str(), config.port))
         .with_context(|| format!("failed to bind {}:{}", config.host, config.port))?;
     listener
@@ -1854,13 +1898,15 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
         transports: None,
         token_expires_at_unix_ms: tokens.current_expiry_unix_ms(),
         daemons_index_url: None,
+        storage_mode: storage_mode.clone(),
+        key_source: key_source.clone(),
     };
     write_metadata(&config.data_dir, &metadata)?;
     lease.write_metadata(&metadata)?;
 
     let sink = Arc::new(RwLock::new(sink));
     let (write_tx, write_rx) = mpsc::sync_channel(config.write_queue_capacity);
-    let shared = build_server_state(config, &tokens, &sink, write_tx)?;
+    let shared = build_server_state(config, &tokens, &sink, write_tx, storage_mode, key_source)?;
     let state = shared.state;
     let shutdown = shared.shutdown;
     let worker = spawn_write_worker(write_rx, sink, shared.idempotency, shared.pressure);
@@ -8963,6 +9009,8 @@ fn handle_status(state: &ServerState) -> HttpResponse {
             "error_counts": state.error_counters.snapshot_json(),
             "pressure": state.pressure.snapshot_json(),
             "token_rotation": state.tokens.status_json(),
+            "storage_mode": state.storage_mode.as_str(),
+            "key_source": state.key_source.as_deref(),
         }),
     )
 }
@@ -14961,6 +15009,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
         let request = HttpRequest {
             method: "POST".to_owned(),
@@ -15078,6 +15128,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
 
         let read_response = handle_get_record(&record_id, &state);
@@ -15185,6 +15237,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
 
         // Direct lookup must not serve the retracted record's content.
@@ -15310,6 +15364,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
 
         let response = handle_get_all_records(&state);
@@ -15437,6 +15493,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
 
         let response = handle_get_all_records(&state);
@@ -15508,6 +15566,8 @@ mod tests {
             transports: None,
             token_expires_at_unix_ms: None,
             daemons_index_url: None,
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
         write_metadata(&data_dir, &metadata)?;
 
@@ -15540,6 +15600,8 @@ mod tests {
             transports: None,
             token_expires_at_unix_ms: None,
             daemons_index_url: None,
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
         write_metadata(&data_dir, &metadata)?;
         let runtime_dir = runtime_dir(&data_dir);
@@ -15713,6 +15775,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(capacity)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
         // The caller keeps `write_rx` alive so the bounded channel reports
         // `Full` (not `Disconnected`) once its buffer fills.
@@ -16159,9 +16223,11 @@ mod tests {
             "idempotency_store_size",
             "jobs",
             "jobs_by_state",
+            "key_source",
             "oldest_active_job",
             "pressure",
             "status",
+            "storage_mode",
             "token_rotation",
         ];
         let actual: Vec<String> = keys.iter().map(|k| (*k).clone()).collect();
@@ -16452,6 +16518,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
 
         let response = handle_get_record(&obs_id, &state);
@@ -17239,6 +17307,8 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             pressure: Arc::new(PressureTracker::new(1)),
             error_counters: Arc::new(ErrorCounters::new()),
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
         Ok((state, temp))
     }
@@ -17751,6 +17821,8 @@ mod tests {
             transports: None,
             token_expires_at_unix_ms: None,
             daemons_index_url: None,
+            storage_mode: "plaintext".to_owned(),
+            key_source: None,
         };
         let client = DaemonClient::new(metadata);
         let error = client

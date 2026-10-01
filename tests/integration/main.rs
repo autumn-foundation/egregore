@@ -40,6 +40,7 @@ mod doctor;
 #[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
 mod embed_fixture;
 mod embeddings;
+mod encrypted_store;
 mod error_context;
 mod evidence_freshness;
 mod evidence_link_audit;

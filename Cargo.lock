@@ -109,6 +109,7 @@ dependencies = [
  "tree-sitter-typescript",
  "unicode-ident",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]
@@ -146,6 +147,7 @@ dependencies = [
  "rand 0.8.6",
  "rayon",
  "redb",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "sha2 0.11.0",

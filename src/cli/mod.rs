@@ -56,6 +56,8 @@ mod ingest;
 #[cfg(feature = "embedded-aletheiadb")]
 mod init;
 mod inspect;
+#[cfg(feature = "embedded-aletheiadb")]
+mod keygen;
 mod lanes;
 mod lifeline;
 mod link_logs;
@@ -192,6 +194,8 @@ pub(crate) use ingest::*;
 #[cfg(feature = "embedded-aletheiadb")]
 pub(crate) use init::*;
 pub(crate) use inspect::*;
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) use keygen::*;
 pub(crate) use lanes::*;
 pub(crate) use lifeline::*;
 pub(crate) use link_logs::*;
@@ -1155,6 +1159,30 @@ pub(crate) enum Commands {
         /// Embedded `AletheiaDB` data directory.
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Create the store with encrypted-at-rest mode (issue #54).
+        ///
+        /// Creation-time opt-in only: requires a fresh `--data-dir` and
+        /// `--key-file`. There is no live migration of an existing plaintext
+        /// store, and the flags are redundant (ignored) when the store is
+        /// already encrypted — the pinned store marker governs afterwards.
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long)]
+        encrypted: bool,
+        /// Key file for `--encrypted` (created with `eg keygen`).
+        ///
+        /// Without `--passphrase-env` this must be a raw 32-byte key file;
+        /// with `--passphrase-env` it must be the passphrase-wrapped AEKF file
+        /// whose passphrase lives in the named env var.
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Env var holding the passphrase for a passphrase-wrapped key file.
+        ///
+        /// Only meaningful with `--encrypted --key-file`. The passphrase is
+        /// read from the environment, never from the command line.
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long)]
+        passphrase_env: Option<String>,
         /// Agent ID for daemon-backed writes.
         #[arg(long, default_value = "egregore-cli")]
         agent_id: String,
@@ -1408,6 +1436,24 @@ pub(crate) enum Commands {
         /// Daemon action.
         #[command(subcommand)]
         action: DaemonAction,
+    },
+    /// Generate a key file for encrypted local store mode (issue #54).
+    ///
+    /// Writes a raw 32-byte key file (0600) for `eg ingest --encrypted
+    /// --key-file`, or — with `--passphrase-env` — a passphrase-wrapped AEKF
+    /// file (Argon2id) whose passphrase is read from the named env var.
+    /// Refuses to overwrite an existing file. Never prints key material.
+    #[cfg(feature = "embedded-aletheiadb")]
+    Keygen {
+        /// Output path for the key file.
+        #[arg(long)]
+        out: PathBuf,
+        /// Env var holding the passphrase for a passphrase-wrapped key file.
+        ///
+        /// When set, the passphrase is read from this env var (never the
+        /// command line) and the output is an AEKF file instead of a raw key.
+        #[arg(long)]
+        passphrase_env: Option<String>,
     },
     /// Record an operator decision for a promotion candidate.
     Decide {
@@ -6977,6 +7023,12 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             embed_model,
             #[cfg(feature = "embedded-aletheiadb")]
             force,
+            #[cfg(feature = "embedded-aletheiadb")]
+            encrypted,
+            #[cfg(feature = "embedded-aletheiadb")]
+            key_file,
+            #[cfg(feature = "embedded-aletheiadb")]
+            passphrase_env,
             dangling_citation_policy,
         } => ingest(
             &graph,
@@ -6991,6 +7043,12 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             embed_model,
             #[cfg(feature = "embedded-aletheiadb")]
             force,
+            #[cfg(feature = "embedded-aletheiadb")]
+            encrypted,
+            #[cfg(feature = "embedded-aletheiadb")]
+            key_file.as_deref(),
+            #[cfg(feature = "embedded-aletheiadb")]
+            passphrase_env.as_deref(),
             dangling_citation_policy,
         ),
         Commands::Export {
@@ -7117,6 +7175,11 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
         } => eval_memory_recall_cmd(&corpus, &data_dir, top_k, threshold, verified_only),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
+        #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Keygen {
+            out,
+            passphrase_env,
+        } => keygen(&out, passphrase_env.as_deref()),
         Commands::Decide {
             candidate_id,
             outcome,
