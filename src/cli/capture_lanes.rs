@@ -18,6 +18,12 @@
 //! verification-evidence capture lanes. The `capture` protected-artifact
 //! storage command is a different kind (a storage operator, not a
 //! verification-evidence producer) and is out of scope.
+//!
+//! Exception: `capture-proof` (issue #69) EXECUTES the verifier binary
+//! instead of ingesting a pre-made artefact — the proof only exists after
+//! the run. It is still a `capture-*` lane for the anti-drift contract
+//! (it emits `verification`-domain records from a tool run), but its doc
+//! states the execution contract explicitly.
 
 // The table is a first-class registry consumed by the drift tests below;
 // a future `eg capture lanes` command could render it the way
@@ -50,6 +56,13 @@ const CAPTURE_LANE_TABLE: &[(&str, CaptureLaneStatic)] = &[
         CaptureLaneStatic {
             doc: "docs/cli/capture-coverage.md",
             record_kind: "CoverageReport",
+        },
+    ),
+    (
+        "capture-proof",
+        CaptureLaneStatic {
+            doc: "docs/cli/capture-proof.md",
+            record_kind: "ProofResult",
         },
     ),
     (

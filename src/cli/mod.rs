@@ -12,6 +12,7 @@ mod candidates;
 mod capture_bench;
 mod capture_coverage;
 mod capture_lanes;
+mod capture_proof;
 mod capture_tests;
 mod change_impact;
 mod changes;
@@ -555,6 +556,71 @@ pub(crate) enum Commands {
         /// Input format. Only `criterion-estimates` (the default) is accepted.
         #[arg(long, default_value = "criterion-estimates")]
         format: String,
+    },
+    /// Capture a local Verus proof run as citable verification-domain records
+    /// (issue #69).
+    ///
+    /// EXECUTES the verifier: runs the local `verus` binary on `--target` and
+    /// records the outcome as a `ProofResult` node (normalized proof summary in
+    /// `stdout_handle`) plus a `CommandRun` node (exact argv, exit code,
+    /// redacted stdout/stderr handles), the proof linked to the command via an
+    /// `evidence_links` `HAS_EVIDENCE` citation. Proof statuses are `pass`,
+    /// `fail`, `timeout`, and `error` (fail-closed: unrecognized verifier
+    /// output is never a silent pass).
+    ///
+    /// Exit codes: 0 captured (any proof status — a failing PROOF is still a
+    /// successful CAPTURE); 1 usage error; 2 pre-execution failure (missing /
+    /// non-executable verifier binary, unsupported verifier version, or
+    /// missing / stale / ambiguous proof target — a stable diagnostic is
+    /// written to `--out`, never a `ProofResult`); 3 protected-store I/O
+    /// failure. See `docs/cli/capture-proof.md`.
+    CaptureProof {
+        /// Path to the local `verus` binary. A bare name is resolved against
+        /// PATH; the operator must have a real Verus installed.
+        #[arg(long, default_value = "verus")]
+        verus_bin: PathBuf,
+        /// Extra argument passed to the verifier before the target.
+        /// Repeatable.
+        #[arg(long = "verus-arg")]
+        verus_arg: Vec<String>,
+        /// Proof target file to verify.
+        #[arg(long)]
+        target: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Stable session identity (part of the record ID).
+        #[arg(long)]
+        session: String,
+        /// Commit SHA the target is evaluated at (part of the record ID).
+        #[arg(long)]
+        commit: String,
+        /// Caller-supplied RFC 3339 timestamp. Validated. This is what makes
+        /// the capture deterministic: no wall clock enters the record IDs.
+        #[arg(long)]
+        executed_at: String,
+        /// Skip the `verus --version` probe and use this version string.
+        #[arg(long)]
+        verifier_version: Option<String>,
+        /// Repository identity label (stored on the records).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Wall-clock budget in seconds for the verifier run.
+        #[arg(long, default_value_t = 600)]
+        timeout_secs: u64,
+        /// Wall-clock budget in seconds for the `verus --version` probe.
+        #[arg(long, default_value_t = 30)]
+        probe_timeout_secs: u64,
+        /// Also store the raw (unredacted) verifier stdout/stderr in the
+        /// protected store for audit. Requires --protected-store and --producer.
+        #[arg(long)]
+        protected_raw_artifacts: bool,
+        /// Protected store directory for raw artifacts.
+        #[arg(long)]
+        protected_store: Option<PathBuf>,
+        /// Producer identity for protected-store writes.
+        #[arg(long)]
+        producer: Option<String>,
     },
     /// Capture a `cargo test` / libtest JSON run as a citable verification-domain
     /// `TestRun` record (issue #165).
@@ -6635,6 +6701,37 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             graph: graph.as_deref(),
             format: &format,
             repo: repo.as_deref(),
+        }),
+        Commands::CaptureProof {
+            verus_bin,
+            verus_arg,
+            target,
+            out,
+            session,
+            commit,
+            executed_at,
+            verifier_version,
+            repo,
+            timeout_secs,
+            probe_timeout_secs,
+            protected_raw_artifacts,
+            protected_store,
+            producer,
+        } => capture_proof::capture_proof_cmd(&capture_proof::CaptureProofArgs {
+            verus_bin: &verus_bin,
+            verus_arg: &verus_arg,
+            target: &target,
+            out: &out,
+            session_id: &session,
+            commit: &commit,
+            executed_at: &executed_at,
+            verifier_version: verifier_version.as_deref(),
+            repo: repo.as_deref(),
+            timeout_secs,
+            probe_timeout_secs,
+            protected_raw_artifacts,
+            protected_store: protected_store.as_deref(),
+            producer: producer.as_deref(),
         }),
         Commands::CaptureTests {
             input,

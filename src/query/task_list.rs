@@ -216,6 +216,7 @@ fn transaction_time_key(record: &GraphRecord) -> Option<DateTime<chrono::FixedOf
 ///
 /// Panics only on a violated internal invariant: every entity group holds at
 /// least one row by construction (groups are created by pushing a row).
+#[must_use]
 pub fn task_list_report(records: &[GraphRecord], filter: &BTreeSet<String>) -> TaskListOutcome {
     let liveness = Liveness::new(records);
 

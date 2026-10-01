@@ -15,6 +15,7 @@ mod brief;
 mod bundle;
 mod capture_bench;
 mod capture_coverage;
+mod capture_proof;
 mod capture_tests;
 mod change_impact;
 mod changes_query;

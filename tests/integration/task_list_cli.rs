@@ -2,9 +2,9 @@
 //!
 //! Written RED-first per SPEC-PROOF-RED-GREEN-REFACTOR. These drive the real
 //! `eg` binary over a hand-built project-graph JSONL fixture mirroring the
-//! AC fixture: one `Task` per status value (open, in_progress, blocked,
-//! closed_completed, closed_dropped, unknown) from each source_kind
-//! (github_issue via `ExternalLink`, local_jsonl via its own JSONL handle),
+//! AC fixture: one `Task` per status value (`open`, `in_progress`, `blocked`,
+//! `closed_completed`, `closed_dropped`, `unknown`) from each `source_kind`
+//! (`github_issue` via `ExternalLink`, `local_jsonl` via its own JSONL handle),
 //! plus a bi-temporal status-transition pair (same `entity_id`, two
 //! `transaction_time` rows) proving the older row is excluded, plus canary
 //! nodes proving raw bodies / transcripts never leak.

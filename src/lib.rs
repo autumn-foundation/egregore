@@ -107,6 +107,9 @@ pub mod parser;
 pub mod preflight;
 /// Checked-in per-repo project configuration — `egregore.toml` (issue #261).
 pub mod project_config;
+/// Capture a local Verus proof run as citable `ProofResult` + `CommandRun`
+/// records (issue #69).
+pub mod proof_capture;
 /// Protected raw-artifact capture and retrieval (issue #60).
 pub mod protected;
 /// Agent-facing graph query helpers.
