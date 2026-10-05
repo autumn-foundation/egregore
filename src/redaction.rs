@@ -284,6 +284,7 @@ pub(crate) const fn is_code_graph_kind(kind: NodeKind) -> bool {
             | NodeKind::PanicRiskSite
             | NodeKind::DebtMarker
             | NodeKind::UnsafeSite
+            | NodeKind::LintSuppression
             | NodeKind::ScanCoverage
             | NodeKind::HistoryReplayWindow
             | NodeKind::HistoryReplayTip

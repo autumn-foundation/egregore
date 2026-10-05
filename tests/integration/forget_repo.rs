@@ -1407,7 +1407,18 @@ mod embedded {
                 "evicted repo-A snapshot {id} must not leak into `query symbols`: {unscoped_symbols}"
             );
         }
-        let (code, unscoped_context, _) = run(&store, &["query", "context", "widget"]);
+        // Repo B keeps two historical snapshots of `widget`, so the bare name
+        // is (correctly) ambiguous between them; pin one of B's candidates.
+        let (code, unscoped_context, _) = run(
+            &store,
+            &[
+                "query",
+                "context",
+                "widget",
+                "--candidate",
+                b.temporal_symbol_ids[1].as_str(),
+            ],
+        );
         assert_eq!(code, 0, "unscoped context lane still resolves repo B");
         for id in a
             .temporal_symbol_ids

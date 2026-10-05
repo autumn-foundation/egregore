@@ -149,6 +149,8 @@ The read is strictly read-only and the JSON line is byte-identical across runs
 on an unchanged store. See [docs/cli/inspect.md](docs/cli/inspect.md) for the
 documented JSON contract.
 
+The graph holds nodes (files, modules, symbols, imports, diagnostics) and edges (DEFINES, CALLS, IMPORTS, REFERENCES, CONTAINS). `MENTIONS` is a reserved edge label that no current language extractor emits; resolved usage is recorded as `REFERENCES`. See the [PRD schema](docs/prd/0001-codebase-knowledge-graph.md).
+
 #### Scoping and Ignore Rules
 
 When run in a Git repository root, `eg scan` automatically scopes the scan to **Git-tracked files only** (both committed and staged changes in the Git index). It honors `.gitignore` rules (including nested gitignores and negation `!`) by ignoring any untracked or ignored files.

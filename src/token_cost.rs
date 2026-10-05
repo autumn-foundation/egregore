@@ -393,6 +393,10 @@ struct SymbolAnswerRow<'a> {
     /// Structural complexity (issue #162), mirroring the real `eg query symbol` row.
     #[serde(skip_serializing_if = "Option::is_none")]
     complexity: Option<u32>,
+    /// Completeness stamp (issue #121): the measured answer is the full,
+    /// uncapped match set, so the real lanes stamp `result_complete: true` on
+    /// every row and the measured text must carry it too.
+    result_complete: bool,
 }
 
 /// One semantic answer row, serialized like the `eg query semantic` JSON line.
@@ -629,6 +633,7 @@ where
                 corpus_disclaimer: symbol_corpus.as_ref().map(|c| c.2.clone()),
                 role: record.role(),
                 complexity: record.complexity(),
+                result_complete: true,
             };
             if id.as_str() == expected_record_id {
                 has_expected = true;

@@ -5295,6 +5295,7 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "PanicRiskSite" => Ok(NodeKind::PanicRiskSite),
         "DebtMarker" => Ok(NodeKind::DebtMarker),
         "UnsafeSite" => Ok(NodeKind::UnsafeSite),
+        "LintSuppression" => Ok(NodeKind::LintSuppression),
         "Commit" => Ok(NodeKind::Commit),
         "Change" => Ok(NodeKind::Change),
         "SemanticDrift" => Ok(NodeKind::SemanticDrift),

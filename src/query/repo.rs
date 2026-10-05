@@ -306,6 +306,49 @@ impl RepositoryIndex {
             }
         }
 
+        // Stand-alone `Diagnostic` markers (the extractor's macro and
+        // skipped-source diagnostics mint no anchoring edge) sit off the
+        // containment topology too, so attribute each through the `File` that
+        // holds its repo-relative path. A path held by Files of two different
+        // repositories proves nothing about which one a marker belongs to, so
+        // it stays unattributed (fail closed) rather than guess.
+        let mut file_owners_by_path: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for record in records {
+            if let GraphRecord::Node {
+                id,
+                kind: NodeKind::File,
+                repo_relative_path: Some(path),
+                ..
+            } = record
+                && let Some(repo_id) = owner.get(id.as_str())
+            {
+                file_owners_by_path
+                    .entry(path.as_str())
+                    .or_default()
+                    .insert(repo_id.as_str());
+            }
+        }
+        let mut diagnostic_owners: Vec<(String, String)> = Vec::new();
+        for record in records {
+            if let GraphRecord::Node {
+                id,
+                kind: NodeKind::Diagnostic,
+                repo_relative_path: Some(path),
+                ..
+            } = record
+                && !owner.contains_key(id.as_str())
+                && !liveness.deleted(id.as_str())
+                && let Some(repos_for_path) = file_owners_by_path.get(path.as_str())
+                && repos_for_path.len() == 1
+                && let Some(repo_id) = repos_for_path.iter().next()
+            {
+                diagnostic_owners.push((id.clone(), (*repo_id).to_owned()));
+            }
+        }
+        for (id, repo_id) in diagnostic_owners {
+            owner.entry(id).or_insert(repo_id);
+        }
+
         // SemanticDrift nodes hang off their target symbol, not the
         // containment topology: attribute them through DRIFTS_FROM (preferred)
         // or the drift metadata's record handles.

@@ -203,13 +203,21 @@ pub(crate) fn query_symbol_tx_as_of(
             // preserved; unknown roles survive only `RoleFilter::All`. A
             // filter that empties the answer is the lane's no-match, reported
             // through the same error envelope the resolver uses (exit 1).
-            let rows: Vec<TxSymbolRow<'_>> = result
+            let projected: Vec<TxSymbolRow<'_>> = result
                 .records
                 .iter()
                 .filter_map(|r| tx_symbol_row(r, index, records, &deleted))
+                .collect();
+            let projected_count = projected.len();
+            let rows: Vec<TxSymbolRow<'_>> = projected
+                .into_iter()
                 .filter(|row| role.matches(row.role.copied()))
                 .collect();
-            if rows.is_empty() {
+            // Only a role filter that EMPTIES a non-empty answer is the
+            // no-match; an answer that was already empty (e.g. an instant
+            // before the first transaction) keeps its structured envelope and
+            // diagnostics.
+            if rows.is_empty() && projected_count > 0 {
                 print_tx_error(
                     "no_named_symbol",
                     &format!(
