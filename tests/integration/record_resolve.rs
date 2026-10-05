@@ -188,6 +188,49 @@ fn resolve_text_format_is_a_human_readable_line() {
 // Dangling handles: structured envelope, exit 2, never silent (AC4)
 // ---------------------------------------------------------------------------
 
+/// Latest-write-wins over an append-only `--graph`: a record re-ingested AFTER
+/// its own forget tombstone is live again, so it resolves `valid` exactly as it
+/// does over the embedded store — not `dangling_handle`.
+#[test]
+fn resolve_revived_record_is_live_over_graph() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let graph = temp.path().join("graph.jsonl");
+    scan_graph(&graph);
+
+    let row = query_file_row(&graph, "src/lib.rs");
+    let record_id = row["record_id"].as_str().expect("row carries record_id");
+    let original = fs::read_to_string(&graph).expect("graph readable");
+    let node_line = original
+        .lines()
+        .find(|line| {
+            serde_json::from_str::<Value>(line)
+                .is_ok_and(|v| v["record_type"] == "node" && v["id"] == record_id)
+        })
+        .expect("the file's node line");
+    let tombstone = serde_json::json!({
+        "record_type": "tombstone",
+        "id": format!("tomb:{record_id}"),
+        "deleted_id": record_id,
+        "schema_version": 1,
+        "summary": "tombstone",
+    })
+    .to_string();
+
+    // Tombstoned and NOT revived: dangling.
+    let tombstoned = temp.path().join("tombstoned.jsonl");
+    fs::write(&tombstoned, format!("{original}\n{tombstone}\n")).expect("write");
+    let (code, stdout, _) = resolve(&tombstoned, &[record_id]);
+    assert_eq!(code, 2, "a live tombstone still dangles:\n{stdout}");
+
+    // Tombstoned, then re-ingested: the later write wins.
+    let revived = temp.path().join("revived.jsonl");
+    fs::write(&revived, format!("{original}\n{tombstone}\n{node_line}\n")).expect("write");
+    let (code, stdout, _) = resolve(&revived, &[record_id]);
+    assert_eq!(code, 0, "a revived record resolves live:\n{stdout}");
+    let answer: Value = serde_json::from_str(stdout.trim()).expect("answer is JSON");
+    assert_eq!(answer["verdict"], "valid");
+}
+
 #[test]
 fn resolve_dangling_handle_returns_envelope_and_exit_2() {
     let temp = tempfile::tempdir().expect("temp dir should be created");

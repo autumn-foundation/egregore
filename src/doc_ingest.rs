@@ -351,7 +351,17 @@ fn collect_markdown(dir: &Path, repo_root: &Path, out: &mut Vec<String>) -> Resu
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
-        if path.is_dir() {
+        // Inspect the entry WITHOUT following links: a symlinked directory
+        // could import Markdown from outside the repository under a synthetic
+        // repo-relative path, or loop on a link to an ancestor. Symlinks are
+        // skipped entirely (directories and files alike).
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             collect_markdown(&path, repo_root, out)?;
         } else if path
             .extension()

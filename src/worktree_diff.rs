@@ -273,7 +273,9 @@ fn tracked_changes(repo_root: &Path, staged_only: bool) -> Result<Vec<ChangedPat
     for (status, path, old_path) in parse_name_status(&status_out.stdout) {
         let path_status = match status {
             'A' => PathStatus::Added,
-            'M' => PathStatus::Modified,
+            // `T` (file type change, e.g. a regular file replaced by a symlink)
+            // is a modification of the path for brief purposes.
+            'M' | 'T' => PathStatus::Modified,
             'D' => PathStatus::Deleted,
             'R' => PathStatus::Renamed {
                 from: old_path.unwrap_or_default(),
@@ -863,5 +865,25 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "new bar.rs");
         assert_eq!(files[0].hunks.new.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn type_change_is_reported_as_a_modified_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "t@example.com"]);
+        git(root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").expect("write");
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "init"]);
+        // Replace the regular file with a symlink: git reports status `T`.
+        std::fs::remove_file(root.join("a.rs")).expect("rm");
+        std::os::unix::fs::symlink("elsewhere", root.join("a.rs")).expect("symlink");
+        let diff = working_tree_diff(root, false).expect("a type change must not abort");
+        assert_eq!(diff.paths.len(), 1);
+        assert_eq!(diff.paths[0].path, "a.rs");
+        assert_eq!(diff.paths[0].status, PathStatus::Modified);
     }
 }

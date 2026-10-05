@@ -176,6 +176,42 @@ fn import_docs_unresolved_reference_diagnostic_exit_2_and_no_body_leak() {
     assert_eq!(read_records(&out).len(), 0);
 }
 
+/// A symlinked directory under a documented root must not be followed: it could
+/// import Markdown from outside the repository under a synthetic repo-relative
+/// path, or recurse forever through a link to an ancestor.
+#[cfg(unix)]
+#[test]
+fn import_docs_does_not_follow_symlinked_directories() {
+    let (tmp, root) = repo_with_docs(&[]);
+    let graph_path = root.join("graph.jsonl");
+    scan_repo(&root, &graph_path);
+    let (symbol_name, file_path) = first_symbol_and_file(&graph_path);
+
+    // An outside directory holding a doc that WOULD resolve if it were imported.
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join("0002-outside.md"),
+        format!("---\ntitle: Outside\n---\n# Outside\n\nUses `{file_path}` and `{symbol_name}`.\n"),
+    )
+    .unwrap();
+    let adr = root.join("docs").join("adr");
+    fs::create_dir_all(&adr).unwrap();
+    std::os::unix::fs::symlink(&outside, adr.join("linked-outside")).unwrap();
+    // A link back to an ancestor: following it would never terminate.
+    std::os::unix::fs::symlink(&root, adr.join("loop")).unwrap();
+
+    let out = root.join("docs.jsonl");
+    let assert = import_docs(&root, &graph_path, &out);
+    let output = assert.get_output();
+    let records = read_records(&out);
+    assert!(
+        records.iter().all(|r| !r.to_string().contains("Outside")),
+        "outside docs must not be imported, got {records:?} (exit {:?})",
+        output.status.code()
+    );
+}
+
 #[test]
 fn import_docs_unknown_root_exit_2() {
     let (_tmp, root) = repo_with_docs(&[]);
