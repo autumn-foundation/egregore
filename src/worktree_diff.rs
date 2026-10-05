@@ -421,13 +421,34 @@ fn parse_unified_hunks(text: &str) -> Vec<(String, Vec<LineRange>)> {
         .collect()
 }
 
+/// For an unquoted `a/<p> b/<p>` header with identical old/new paths, returns
+/// the new-side `b/<p>` (spaces inside `<p>` preserved); `None` when the two
+/// halves differ (a rename) or the header is not of that shape.
+fn equal_path_header_new_path(rest: &str) -> Option<&str> {
+    let middle = rest.len().checked_sub(1)? / 2;
+    if rest.len() % 2 == 0 || !rest.is_char_boundary(middle) {
+        return None;
+    }
+    let (old, new_with_space) = rest.split_at(middle);
+    let new = new_with_space.strip_prefix(' ')?;
+    (old.strip_prefix("a/")? == new.strip_prefix("b/")?).then_some(new)
+}
+
 /// Extracts the new-side path from a `diff --git <old> <new>` header line
 /// (the part after the `diff --git ` prefix). Handles quoted paths that
 /// contain spaces: git emits `"a/<old>" "b/<new>"` when quoting is on; with
 /// `core.quotePath=false` paths are literal and space-free.
 fn parse_diff_git_new_path(rest: &str) -> String {
     let path = rest.strip_prefix('"').map_or_else(
-        || rest.rsplit_once(' ').map_or(rest, |(_, b)| b),
+        || {
+            // Unquoted (`core.quotePath=false`) paths are literal and may
+            // contain spaces. For the common non-rename header the old and new
+            // paths are identical (`a/<p> b/<p>`), which is unambiguous even
+            // with spaces; only a rename header falls back to the last space.
+            equal_path_header_new_path(rest)
+                .or_else(|| rest.rsplit_once(' ').map(|(_, b)| b))
+                .unwrap_or(rest)
+        },
         |quoted| {
             // `"a/<old>" "b/<new>"` — split on the `" "b/` separator.
             quoted
@@ -805,5 +826,20 @@ mod tests {
         );
         assert!(diff.paths[0].old_ranges.is_empty());
         assert_eq!(diff.paths[0].changed_lines, 0);
+    }
+
+    #[test]
+    fn diff_header_path_with_spaces_is_preserved() {
+        assert_eq!(
+            parse_diff_git_new_path("a/foo bar.rs b/foo bar.rs"),
+            "foo bar.rs"
+        );
+        assert_eq!(
+            parse_diff_git_new_path("a/dir one/x y.rs b/dir one/x y.rs"),
+            "dir one/x y.rs"
+        );
+        assert_eq!(parse_diff_git_new_path("a/plain.rs b/plain.rs"), "plain.rs");
+        // A rename keeps the last-space fallback.
+        assert_eq!(parse_diff_git_new_path("a/old.rs b/new.rs"), "new.rs");
     }
 }
