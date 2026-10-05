@@ -426,7 +426,7 @@ fn parse_unified_hunks(text: &str) -> Vec<(String, Vec<LineRange>)> {
 /// halves differ (a rename) or the header is not of that shape.
 fn equal_path_header_new_path(rest: &str) -> Option<&str> {
     let middle = rest.len().checked_sub(1)? / 2;
-    if rest.len() % 2 == 0 || !rest.is_char_boundary(middle) {
+    if rest.len().is_multiple_of(2) || !rest.is_char_boundary(middle) {
         return None;
     }
     let (old, new_with_space) = rest.split_at(middle);
