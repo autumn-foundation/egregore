@@ -980,3 +980,33 @@ fn embed_uses_default_model_when_nothing_pinned() {
         "the vector-index identity must name the built-in default model"
     );
 }
+
+/// `eg query similar` must honor the config-pinned `data_dir` like the other
+/// store-backed query lanes: with `--data-dir` omitted it reaches the store
+/// lookup (here an absent semantic index) instead of failing in argument
+/// parsing for a "required" flag.
+#[cfg(feature = "embeddings")]
+#[test]
+fn query_similar_resolves_the_config_pinned_data_dir() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_config(temp.path(), "data_dir = \"pinned-store\"\n");
+    eg_in(temp.path())
+        .args(["query", "similar", "some::handle"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required").not())
+        .stdout(predicate::str::contains("semantic_index_absent"));
+}
+
+/// With neither `--data-dir` nor a pinned `data_dir`, the failure names both
+/// ways to supply the store.
+#[cfg(feature = "embeddings")]
+#[test]
+fn query_similar_without_any_store_names_the_remedy() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    eg_in(temp.path())
+        .args(["query", "similar", "some::handle"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--data-dir"));
+}

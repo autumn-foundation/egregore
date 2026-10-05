@@ -2327,9 +2327,10 @@ pub(crate) enum QuerySubcommand {
         /// Anchor handle: a qualified symbol name (e.g. `nested::Widget::new`)
         /// or a `record_id` (`codegraph:v1:…`).
         handle: String,
-        /// Embedded `AletheiaDB` data directory (must be ingested with `--embed`).
+        /// Embedded `AletheiaDB` data directory (must be ingested with
+        /// `--embed`). Falls back to the `data_dir` pinned in `egregore.toml`.
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         /// Maximum number of similar nodes returned (default 10).
         #[arg(long, default_value_t = 10)]
         limit: usize,
@@ -9291,7 +9292,14 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             data_dir,
             limit,
             format,
-        } => similar::query_similar_cmd(&handle, &data_dir, limit, format),
+        } => {
+            let Some(data_dir) = resolve_query_data_dir(None, data_dir) else {
+                anyhow::bail!(
+                    "`eg query similar` needs a store: pass --data-dir or pin `data_dir` in egregore.toml"
+                );
+            };
+            similar::query_similar_cmd(&handle, &data_dir, limit, format)
+        }
         #[cfg(feature = "embeddings")]
         QuerySubcommand::SemanticContext {
             query,

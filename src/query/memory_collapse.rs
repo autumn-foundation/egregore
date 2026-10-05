@@ -399,7 +399,16 @@ fn representative_order(
     second_confidence
         .total_cmp(&first_confidence)
         .then_with(|| match (&first.observed_at, &second.observed_at) {
-            (Some(a), Some(b)) => a.cmp(b),
+            // Earliest INSTANT first: text order disagrees with time order
+            // across differing RFC 3339 offsets. Unparseable stamps fall back
+            // to text order.
+            (Some(a), Some(b)) => match (
+                chrono::DateTime::parse_from_rfc3339(a),
+                chrono::DateTime::parse_from_rfc3339(b),
+            ) {
+                (Ok(left), Ok(right)) => left.cmp(&right),
+                _ => a.cmp(b),
+            },
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
             (None, None) => Ordering::Equal,
@@ -689,5 +698,20 @@ mod tests {
             },
         );
         assert_eq!(outcome.clusters.len(), 2);
+    }
+
+    #[test]
+    fn representative_prefers_earliest_instant_across_offsets() {
+        // `00:30+01:00` is 23:30Z the day before: EARLIER than `00:00Z` as an
+        // instant, though it sorts AFTER it as text.
+        let mut earlier = candidate("agent_memory:v1:b");
+        earlier.observed_at = Some("2026-01-01T00:30:00+01:00".to_owned());
+        let mut later = candidate("agent_memory:v1:a");
+        later.observed_at = Some("2026-01-01T00:00:00Z".to_owned());
+        assert_eq!(
+            representative_order(&earlier, &later),
+            std::cmp::Ordering::Less,
+            "the earlier instant must rank first"
+        );
     }
 }

@@ -484,6 +484,13 @@ fn parse_unified_hunk_ranges(text: &str) -> Vec<FileHunks> {
                 });
                 Some(files.len() - 1)
             });
+        } else if let Some(renamed_to) = line.strip_prefix("rename to ") {
+            // A rename header (`a/<old> b/<new>`) is ambiguous when either path
+            // contains spaces; git's own `rename to <new>` line is not, and is
+            // the literal new path name-status reports (quotePath=false).
+            if let Some(idx) = current {
+                renamed_to.clone_into(&mut files[idx].path);
+            }
         } else if line.strip_prefix("@@ ").is_some() {
             let Some(idx) = current else { continue };
             // Pass the full line: the header parser expects the `@@ ` prefix.
@@ -841,5 +848,20 @@ mod tests {
         assert_eq!(parse_diff_git_new_path("a/plain.rs b/plain.rs"), "plain.rs");
         // A rename keeps the last-space fallback.
         assert_eq!(parse_diff_git_new_path("a/old.rs b/new.rs"), "new.rs");
+    }
+
+    #[test]
+    fn renamed_path_with_spaces_comes_from_the_rename_to_line() {
+        let diff = "diff --git a/old foo.rs b/new bar.rs\n\
+                    similarity index 90%\n\
+                    rename from old foo.rs\n\
+                    rename to new bar.rs\n\
+                    --- a/old foo.rs\n\
+                    +++ b/new bar.rs\n\
+                    @@ -1,0 +2,2 @@\n";
+        let files = parse_unified_hunk_ranges(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "new bar.rs");
+        assert_eq!(files[0].hunks.new.len(), 1);
     }
 }
