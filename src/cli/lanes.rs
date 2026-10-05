@@ -612,6 +612,7 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     #[cfg(feature = "embeddings")]
+    #[cfg(feature = "embeddings")]
     (
         "semantic",
         LaneStatic {
@@ -621,6 +622,7 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
             freshness: &["ingest_snapshot"],
         },
     ),
+    #[cfg(feature = "embeddings")]
     #[cfg(feature = "embeddings")]
     (
         "semantic-context",
@@ -640,6 +642,7 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
         },
     ),
     #[cfg(feature = "embeddings")]
+    #[cfg(feature = "embeddings")]
     (
         "semantic-memory",
         LaneStatic {
@@ -649,6 +652,7 @@ const LANE_TABLE: &[(&str, LaneStatic)] = &[
             freshness: &["ingest_snapshot", "store_live"],
         },
     ),
+    #[cfg(feature = "embeddings")]
     (
         "similar",
         LaneStatic {

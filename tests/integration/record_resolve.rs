@@ -524,6 +524,7 @@ fn ingest_graph_to_data_dir(graph: &Path, data_dir: &Path) {
         .success();
 }
 
+#[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn resolve_round_trip_data_dir_is_byte_identical_and_valid() {
     let temp = tempfile::tempdir().expect("temp dir should be created");

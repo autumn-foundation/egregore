@@ -211,6 +211,7 @@ fn import_docs_empty_document_diagnostic_exit_2() {
     assert!(stderr.contains("empty_document"), "stderr: {stderr}");
 }
 
+#[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn query_symbol_surfaces_design_doc_row() {
     let (_tmp, root) = repo_with_docs(&[]);

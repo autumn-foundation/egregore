@@ -12,6 +12,7 @@
 //! fixture-unique canary string used by the AC5 plaintext scan.
 
 #![allow(missing_docs)]
+#![cfg(feature = "embedded-aletheiadb")]
 
 use std::{
     fs,
