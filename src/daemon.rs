@@ -17351,6 +17351,7 @@ mod tests {
             "criteria_for_task" => json!({ "task_id": "capability-probe-missing-task" }),
             "agent_sessions_for_repo" => json!({ "repo": "capability-probe-missing-repo" }),
             "tests_for_symbol" => json!({ "handle": "capability-probe-missing-symbol" }),
+            "resolve_record" => json!({ "record_id": "capability-probe-missing-record" }),
             other => panic!(
                 "capability probe has no canned params for verb '{other}'; \
                  add them to capability_probe_params"

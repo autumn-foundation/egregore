@@ -282,7 +282,7 @@ text, so it is dropped rather than forwarded.
 ### Which nodes carry it
 
 `File`, `Module`, `Symbol`, `Import`, `Diagnostic`, `PanicRiskSite`,
-`DebtMarker`, `UnsafeSite`, `DependencyDeclaration`, and `Change` — every
+`DebtMarker`, `UnsafeSite`, `DependencyDeclaration`, `LintSuppression`, and `Change` — every
 code-graph node that carries a `repo_relative_path`. The classifier is an exhaustive match with
 no wildcard arm, so a future node kind fails to compile until it is deliberately
 classified.

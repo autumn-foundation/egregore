@@ -586,7 +586,13 @@ mod tests {
                 ("s:caller", "s:anchor", "CALLS"),
             ]
         );
-        assert!(n.depth_truncation.is_none());
+        // `s:unrelated` is one hop beyond the bound (via the admitted
+        // container `f:lib`), so the depth truncation honestly counts it.
+        let truncation = n
+            .depth_truncation
+            .as_ref()
+            .expect("s:unrelated lies beyond the depth bound");
+        assert_eq!(truncation.dropped_total, 1);
         assert!(n.budget_truncation.is_none());
     }
 

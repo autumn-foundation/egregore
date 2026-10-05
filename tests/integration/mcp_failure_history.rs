@@ -16,6 +16,8 @@
 //   results, never silent empty success or transcript-text fallback.
 // - AC6: no raw transcript text, stdout/stderr, or patch hunks anywhere.
 
+#![cfg(feature = "embedded-aletheiadb")]
+
 mod failure_history_tests {
     use aletheia_egregore::ir::{
         AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, OutputHandle, PatchHandle,

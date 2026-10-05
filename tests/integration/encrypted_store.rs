@@ -34,6 +34,7 @@ struct Fixture {
     canaries: Vec<(String, String)>,
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_fixture(dir: &Path, tag: &str) -> Fixture {
     let src_dir = dir.join("src");
     fs::create_dir_all(&src_dir).expect("fixture src dir");
@@ -62,7 +63,7 @@ fn build_fixture(dir: &Path, tag: &str) -> Fixture {
         .find_map(|line| {
             line.find("\"id\":\"").map(|i| {
                 let start = i + 6;
-                let end = line[start..].find("\"").map(|e| start + e).unwrap_or(start);
+                let end = line[start..].find('"').map_or(start, |e| start + e);
                 line[start..end].to_owned()
             })
         })
@@ -83,9 +84,7 @@ fn build_fixture(dir: &Path, tag: &str) -> Fixture {
         .arg("--source-handle")
         .arg("src/lib.rs:sha256:eg54")
         .arg("--text")
-        .arg(format!(
-            "noted observation while holding sk-eg54testsecret123456789"
-        ))
+        .arg("noted observation while holding sk-eg54testsecret123456789")
         .arg("--confidence")
         .arg("0.9")
         .arg("--evidence-target")
@@ -327,11 +326,14 @@ fn ac1_plaintext_ingest_leaves_default_workflow_unchanged() {
 }
 
 fn hex_of_file(path: &Path) -> String {
+    use std::fmt::Write as _;
     fs::read(path)
         .expect("read file")
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
 }
 
 // ── AC4: fail-closed opens ───────────────────────────────────────────────
